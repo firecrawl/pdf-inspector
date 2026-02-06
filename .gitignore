@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+debug/
+*.pdb
+
+# Cargo lock (optional for libraries)
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+*.pdf
+!tests/fixtures/*.pdf
+
+# Build cache
+**/*.rs.bk

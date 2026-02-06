@@ -1,0 +1,34 @@
+[package]
+name = "pdf-to-markdown"
+version = "0.1.0"
+edition = "2021"
+authors = ["Firecrawl Team"]
+description = "Fast PDF to Markdown conversion with smart detection"
+license = "MIT"
+
+[dependencies]
+# PDF parsing - use local firecrawl lopdf
+lopdf = { path = "../../lopdf", features = ["rayon"] }
+
+# Error handling
+thiserror = "2.0"
+
+# Parallel processing
+rayon = "1.10"
+
+# Logging
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3.3"
+
+[features]
+default = []
+
+[[bin]]
+name = "pdf2md"
+path = "src/bin/pdf2md.rs"
+
+[[bin]]
+name = "detect-pdf"
+path = "src/bin/detect_pdf.rs"
