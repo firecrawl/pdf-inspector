@@ -251,13 +251,12 @@ fn is_list_item(text: &str) -> bool {
     }
 
     // Letter list: "a.", "a)", "(a)"
-    if trimmed.len() >= 2 {
-        let first = trimmed.chars().next().unwrap();
-        let second = trimmed.chars().nth(1).unwrap();
+    let mut chars = trimmed.chars();
+    if let (Some(first), Some(second)) = (chars.next(), chars.next()) {
         if first.is_ascii_alphabetic() && (second == '.' || second == ')') {
             return true;
         }
-        if first == '(' && trimmed.chars().nth(2) == Some(')') {
+        if first == '(' && chars.next() == Some(')') {
             return true;
         }
     }
