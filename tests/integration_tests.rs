@@ -250,11 +250,17 @@ fn test_markdown_options_custom() {
         detect_lists: true,
         detect_code: false,
         base_font_size: Some(14.0),
+        remove_page_numbers: false,
+        format_urls: false,
+        fix_hyphenation: false,
     };
     assert!(!opts.detect_headers);
     assert!(opts.detect_lists);
     assert!(!opts.detect_code);
     assert_eq!(opts.base_font_size, Some(14.0));
+    assert!(!opts.remove_page_numbers);
+    assert!(!opts.format_urls);
+    assert!(!opts.fix_hyphenation);
 }
 
 // ============================================================================

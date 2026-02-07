@@ -9,6 +9,8 @@
 use crate::extractor::{group_into_lines, TextItem, TextLine};
 use std::collections::HashMap;
 
+use regex::Regex;
+
 /// Options for markdown conversion
 #[derive(Debug, Clone)]
 pub struct MarkdownOptions {
@@ -20,6 +22,12 @@ pub struct MarkdownOptions {
     pub detect_code: bool,
     /// Base font size for comparison
     pub base_font_size: Option<f32>,
+    /// Remove standalone page numbers
+    pub remove_page_numbers: bool,
+    /// Convert URLs to markdown links
+    pub format_urls: bool,
+    /// Fix hyphenation (broken words across lines)
+    pub fix_hyphenation: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -29,6 +37,9 @@ impl Default for MarkdownOptions {
             detect_lists: true,
             detect_code: true,
             base_font_size: None,
+            remove_page_numbers: true,
+            format_urls: true,
+            fix_hyphenation: true,
         }
     }
 }
@@ -211,8 +222,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         output.push('\n');
     }
 
-    // Clean up excessive newlines
-    clean_markdown(output)
+    // Clean up and post-process
+    clean_markdown(output, &options)
 }
 
 /// Merge drop caps with the appropriate line
@@ -474,8 +485,23 @@ fn is_monospace_font(font_name: &str) -> bool {
     patterns.iter().any(|p| lower.contains(p))
 }
 
-/// Clean up markdown output
-fn clean_markdown(mut text: String) -> String {
+/// Clean up markdown output with post-processing
+fn clean_markdown(mut text: String, options: &MarkdownOptions) -> String {
+    // Fix hyphenation first (before other processing)
+    if options.fix_hyphenation {
+        text = fix_hyphenation(&text);
+    }
+
+    // Remove standalone page numbers
+    if options.remove_page_numbers {
+        text = remove_page_numbers(&text);
+    }
+
+    // Format URLs as markdown links
+    if options.format_urls {
+        text = format_urls(&text);
+    }
+
     // Remove excessive newlines (more than 2 in a row)
     while text.contains("\n\n\n") {
         text = text.replace("\n\n\n", "\n\n");
@@ -486,6 +512,112 @@ fn clean_markdown(mut text: String) -> String {
     text.push('\n');
 
     text
+}
+
+/// Fix words broken across lines with spaces before the continuation
+/// e.g., "Limoeiro do Nort e" -> "Limoeiro do Norte"
+fn fix_hyphenation(text: &str) -> String {
+    use once_cell::sync::Lazy;
+
+    // Fix "word - word" patterns that should be "word-word" (compound words)
+    // But be careful not to break list items (which start with "- ")
+    static SPACED_HYPHEN_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"([a-zA-ZáàâãéèêíïóôõöúçñÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ]) - ([a-zA-ZáàâãéèêíïóôõöúçñÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ])").unwrap()
+    });
+
+    let result = SPACED_HYPHEN_RE
+        .replace_all(text, |caps: &regex::Captures| {
+            format!("{}-{}", &caps[1], &caps[2])
+        })
+        .to_string();
+
+    result
+}
+
+/// Remove standalone page numbers (lines that are just 1-4 digit numbers)
+fn remove_page_numbers(text: &str) -> String {
+    let mut result = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        // Check if this line is just a number (1-4 digits)
+        if trimmed.len() <= 4 && !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit())
+        {
+            // Check context to determine if this is a page number
+            let prev_is_break = i > 0 && lines[i - 1].trim() == "---";
+            let next_is_break = i + 1 < lines.len() && lines[i + 1].trim() == "---";
+            let prev_is_empty = i > 0 && lines[i - 1].trim().is_empty();
+            let next_is_empty = i + 1 < lines.len() && lines[i + 1].trim().is_empty();
+
+            // Check if it's on its own line (surrounded by empty lines or page breaks)
+            let is_isolated = (prev_is_break || prev_is_empty || i == 0)
+                && (next_is_break || next_is_empty || i + 1 == lines.len());
+
+            // Also remove numbers that appear right before a page break
+            // (common pattern: content ends, page number, then ---)
+            let before_break = i + 1 < lines.len()
+                && (lines[i + 1].trim() == "---"
+                    || (i + 2 < lines.len()
+                        && lines[i + 1].trim().is_empty()
+                        && lines[i + 2].trim() == "---"));
+
+            if is_isolated || before_break {
+                continue;
+            }
+        }
+
+        result.push(*line);
+    }
+
+    result.join("\n")
+}
+
+/// Convert URLs to markdown links
+fn format_urls(text: &str) -> String {
+    use once_cell::sync::Lazy;
+
+    // Match URLs - we'll check context manually to avoid formatting already-linked URLs
+    static URL_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"https?://[^\s<>\)\]]+[^\s<>\)\]\.\,;]").unwrap());
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for mat in URL_RE.find_iter(text) {
+        let start = mat.start();
+        let url = mat.as_str();
+
+        // Check if this URL is already in a markdown link by looking at preceding chars
+        let before = if start >= 2 {
+            &text[start - 2..start]
+        } else {
+            ""
+        };
+        let already_linked = before.ends_with("](") || before.ends_with("](");
+
+        // Also check if it's inside square brackets (link text)
+        let prefix = &text[..start];
+        let open_brackets = prefix.matches('[').count();
+        let close_brackets = prefix.matches(']').count();
+        let inside_link_text = open_brackets > close_brackets;
+
+        if already_linked || inside_link_text {
+            // Already formatted, keep as-is
+            result.push_str(&text[last_end..mat.end()]);
+        } else {
+            // Add text before this URL
+            result.push_str(&text[last_end..start]);
+            // Format as markdown link
+            result.push_str(&format!("[{}]({})", url, url));
+        }
+        last_end = mat.end();
+    }
+
+    // Add remaining text
+    result.push_str(&text[last_end..]);
+    result
 }
 
 #[cfg(test)]
