@@ -175,14 +175,15 @@ fn extract_page_text_items(
                         extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font)
                     {
                         if !text.trim().is_empty() {
+                            let rendered_size = effective_font_size(current_font_size, &text_matrix);
                             items.push(TextItem {
                                 text,
                                 x: text_matrix[4],
                                 y: text_matrix[5],
                                 width: 0.0, // Would need glyph widths
-                                height: current_font_size,
+                                height: rendered_size,
                                 font: current_font.clone(),
-                                font_size: current_font_size,
+                                font_size: rendered_size,
                                 page: page_num,
                             });
                         }
@@ -202,14 +203,15 @@ fn extract_page_text_items(
                             }
                         }
                         if !combined_text.trim().is_empty() {
+                            let rendered_size = effective_font_size(current_font_size, &text_matrix);
                             items.push(TextItem {
                                 text: combined_text,
                                 x: text_matrix[4],
                                 y: text_matrix[5],
                                 width: 0.0,
-                                height: current_font_size,
+                                height: rendered_size,
                                 font: current_font.clone(),
-                                font_size: current_font_size,
+                                font_size: rendered_size,
                                 page: page_num,
                             });
                         }
@@ -225,14 +227,15 @@ fn extract_page_text_items(
                         extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font)
                     {
                         if !text.trim().is_empty() {
+                            let rendered_size = effective_font_size(current_font_size, &text_matrix);
                             items.push(TextItem {
                                 text,
                                 x: text_matrix[4],
                                 y: text_matrix[5],
                                 width: 0.0,
-                                height: current_font_size,
+                                height: rendered_size,
                                 font: current_font.clone(),
-                                font_size: current_font_size,
+                                font_size: rendered_size,
                                 page: page_num,
                             });
                         }
@@ -253,6 +256,19 @@ fn get_number(obj: &Object) -> Option<f32> {
         Object::Real(r) => Some(*r),
         _ => None,
     }
+}
+
+/// Compute effective font size from base size and text matrix
+/// Text matrix is [a, b, c, d, tx, ty] where a,d are scale factors
+fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32 {
+    // The scale factor is typically the magnitude of the transformation
+    // For most PDFs, text_matrix[0] (a) is the horizontal scale
+    // and text_matrix[3] (d) is the vertical scale
+    let scale_x = (text_matrix[0].powi(2) + text_matrix[1].powi(2)).sqrt();
+    let scale_y = (text_matrix[2].powi(2) + text_matrix[3].powi(2)).sqrt();
+    // Use the larger of the two scales (usually they're equal for non-rotated text)
+    let scale = scale_x.max(scale_y);
+    base_size * scale
 }
 
 /// Extract text from a text operand, handling encoding

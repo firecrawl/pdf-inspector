@@ -11,7 +11,7 @@ pub mod markdown;
 
 pub use detector::{detect_pdf_type, PdfType, PdfTypeResult};
 pub use extractor::{extract_text, extract_text_with_positions, TextItem};
-pub use markdown::{to_markdown, MarkdownOptions};
+pub use markdown::{to_markdown, to_markdown_from_items, MarkdownOptions};
 
 use std::path::Path;
 
@@ -44,13 +44,13 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
 
     let result = match detection.pdf_type {
         PdfType::TextBased => {
-            // Step 2: Full extraction for text-based PDFs
-            let text = extract_text(&path)?;
-            let markdown = to_markdown(&text, MarkdownOptions::default());
+            // Step 2: Full extraction with position-aware reading order
+            let items = extract_text_with_positions(&path)?;
+            let markdown = to_markdown_from_items(items, MarkdownOptions::default());
 
             PdfProcessResult {
                 pdf_type: PdfType::TextBased,
-                text: Some(text),
+                text: None, // We now produce markdown directly
                 markdown: Some(markdown),
                 page_count: detection.page_count,
                 processing_time_ms: start.elapsed().as_millis() as u64,
@@ -67,15 +67,13 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
             }
         }
         PdfType::Mixed => {
-            // Try to extract what we can
-            let text = extract_text(&path).ok();
-            let markdown = text
-                .as_ref()
-                .map(|t| to_markdown(t, MarkdownOptions::default()));
+            // Try to extract what we can with position-aware reading order
+            let items = extract_text_with_positions(&path).ok();
+            let markdown = items.map(|i| to_markdown_from_items(i, MarkdownOptions::default()));
 
             PdfProcessResult {
                 pdf_type: PdfType::Mixed,
-                text,
+                text: None,
                 markdown,
                 page_count: detection.page_count,
                 processing_time_ms: start.elapsed().as_millis() as u64,
@@ -95,13 +93,13 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
 
     let result = match detection.pdf_type {
         PdfType::TextBased => {
-            // Step 2: Full extraction for text-based PDFs
-            let text = extractor::extract_text_mem(buffer)?;
-            let markdown = to_markdown(&text, MarkdownOptions::default());
+            // Step 2: Full extraction with position-aware reading order
+            let items = extractor::extract_text_with_positions_mem(buffer)?;
+            let markdown = to_markdown_from_items(items, MarkdownOptions::default());
 
             PdfProcessResult {
                 pdf_type: PdfType::TextBased,
-                text: Some(text),
+                text: None,
                 markdown: Some(markdown),
                 page_count: detection.page_count,
                 processing_time_ms: start.elapsed().as_millis() as u64,
@@ -115,14 +113,12 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
             processing_time_ms: start.elapsed().as_millis() as u64,
         },
         PdfType::Mixed => {
-            let text = extractor::extract_text_mem(buffer).ok();
-            let markdown = text
-                .as_ref()
-                .map(|t| to_markdown(t, MarkdownOptions::default()));
+            let items = extractor::extract_text_with_positions_mem(buffer).ok();
+            let markdown = items.map(|i| to_markdown_from_items(i, MarkdownOptions::default()));
 
             PdfProcessResult {
                 pdf_type: PdfType::Mixed,
-                text,
+                text: None,
                 markdown,
                 page_count: detection.page_count,
                 processing_time_ms: start.elapsed().as_millis() as u64,

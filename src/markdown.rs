@@ -140,7 +140,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         }
 
         // Detect headers by font size
-        if options.detect_headers {
+        // Skip very short text (likely drop caps or labels)
+        if options.detect_headers && trimmed.len() > 3 {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) = detect_header_level(line_font_size, base_size) {
                 let prefix = "#".repeat(header_level);
