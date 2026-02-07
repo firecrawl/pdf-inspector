@@ -7,8 +7,8 @@ description = "Fast PDF to Markdown conversion with smart detection"
 license = "MIT"
 
 [dependencies]
-# PDF parsing - use local firecrawl lopdf
-lopdf = { path = "../../lopdf", features = ["rayon"] }
+# PDF parsing
+lopdf = { git = "https://github.com/J-F-Liu/lopdf", features = ["rayon"] }
 
 # Error handling
 thiserror = "2.0"

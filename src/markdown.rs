@@ -270,12 +270,11 @@ fn format_list_item(text: &str) -> String {
     let trimmed = text.trim_start();
 
     // Convert various bullet styles to markdown
-    if trimmed.starts_with("• ")
-        || trimmed.starts_with("○ ")
-        || trimmed.starts_with("● ")
-        || trimmed.starts_with("◦ ")
-    {
-        return format!("- {}", &trimmed[2..].trim_start());
+    // Note: bullet characters like • are multi-byte in UTF-8, use char indices
+    for bullet in &['•', '○', '●', '◦'] {
+        if let Some(rest) = trimmed.strip_prefix(*bullet) {
+            return format!("- {}", rest.trim_start());
+        }
     }
 
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
