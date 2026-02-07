@@ -202,7 +202,11 @@ fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextLine> {
         // 3. The character is uppercase
         let is_drop_cap = trimmed.len() <= 2
             && line.items.first().map(|i| i.font_size).unwrap_or(0.0) >= base_size * 2.5
-            && trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+            && trimmed
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false);
 
         if is_drop_cap {
             let drop_char = trimmed.chars().next().unwrap();
@@ -220,7 +224,12 @@ fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextLine> {
                 let prev_trimmed = prev_text.trim();
 
                 // Check if this line starts with lowercase
-                if prev_trimmed.chars().next().map(|c| c.is_lowercase()).unwrap_or(false) {
+                if prev_trimmed
+                    .chars()
+                    .next()
+                    .map(|c| c.is_lowercase())
+                    .unwrap_or(false)
+                {
                     // Check if previous line exists and doesn't start with lowercase
                     // (meaning this is the start of a paragraph)
                     let is_para_start = if idx == 0 {
@@ -228,7 +237,11 @@ fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextLine> {
                     } else {
                         let before = result[idx - 1].text();
                         let before_trimmed = before.trim();
-                        !before_trimmed.chars().next().map(|c| c.is_lowercase()).unwrap_or(true)
+                        !before_trimmed
+                            .chars()
+                            .next()
+                            .map(|c| c.is_lowercase())
+                            .unwrap_or(true)
                     };
 
                     if is_para_start {

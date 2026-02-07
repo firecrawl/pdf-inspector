@@ -175,7 +175,8 @@ fn extract_page_text_items(
                         extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font)
                     {
                         if !text.trim().is_empty() {
-                            let rendered_size = effective_font_size(current_font_size, &text_matrix);
+                            let rendered_size =
+                                effective_font_size(current_font_size, &text_matrix);
                             items.push(TextItem {
                                 text,
                                 x: text_matrix[4],
@@ -203,7 +204,8 @@ fn extract_page_text_items(
                             }
                         }
                         if !combined_text.trim().is_empty() {
-                            let rendered_size = effective_font_size(current_font_size, &text_matrix);
+                            let rendered_size =
+                                effective_font_size(current_font_size, &text_matrix);
                             items.push(TextItem {
                                 text: combined_text,
                                 x: text_matrix[4],
@@ -227,7 +229,8 @@ fn extract_page_text_items(
                         extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font)
                     {
                         if !text.trim().is_empty() {
-                            let rendered_size = effective_font_size(current_font_size, &text_matrix);
+                            let rendered_size =
+                                effective_font_size(current_font_size, &text_matrix);
                             items.push(TextItem {
                                 text,
                                 x: text_matrix[4],
