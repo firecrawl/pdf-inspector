@@ -367,8 +367,8 @@ fn clean_markdown(mut text: String) -> String {
         text = text.replace("\n\n\n", "\n\n");
     }
 
-    // Ensure ends with single newline
-    text = text.trim_end().to_string();
+    // Trim leading and trailing whitespace, ensure ends with single newline
+    text = text.trim().to_string();
     text.push('\n');
 
     text
