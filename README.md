@@ -1,6 +1,6 @@
-# pdf-to-markdown
+# pdf-inspector
 
-Fast Rust library for PDF to Markdown conversion with smart scanned vs text-based detection.
+Fast Rust library for PDF inspection, classification, and text extraction. Intelligently detects scanned vs text-based PDFs to enable smart routing decisions.
 
 ## Features
 
@@ -15,7 +15,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pdf-to-markdown = "0.1"
+pdf-inspector = { git = "https://github.com/firecrawl/pdf-inspector" }
 ```
 
 ## Usage
@@ -25,16 +25,16 @@ pdf-to-markdown = "0.1"
 The simplest way to convert a PDF to Markdown:
 
 ```rust
-use pdf_to_markdown::process_pdf;
+use pdf_inspector::process_pdf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = process_pdf("document.pdf")?;
 
     match result.pdf_type {
-        pdf_to_markdown::PdfType::TextBased => {
+        pdf_inspector::PdfType::TextBased => {
             println!("Markdown:\n{}", result.markdown.unwrap());
         }
-        pdf_to_markdown::PdfType::Scanned => {
+        pdf_inspector::PdfType::Scanned => {
             println!("PDF is scanned - OCR required");
         }
         _ => {}
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Quickly detect if a PDF is text-based or scanned without full extraction:
 
 ```rust
-use pdf_to_markdown::{detect_pdf_type, PdfType};
+use pdf_inspector::{detect_pdf_type, PdfType};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = detect_pdf_type("document.pdf")?;
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Extract plain text from a PDF:
 
 ```rust
-use pdf_to_markdown::extract_text;
+use pdf_inspector::extract_text;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text = extract_text("document.pdf")?;
@@ -92,8 +92,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Get text items with position data for advanced processing:
 
 ```rust
-use pdf_to_markdown::{extract_text_with_positions, TextItem};
-use pdf_to_markdown::extractor::group_into_lines;
+use pdf_inspector::{extract_text_with_positions, TextItem};
+use pdf_inspector::extractor::group_into_lines;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let items = extract_text_with_positions("document.pdf")?;
@@ -118,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Convert text to Markdown with custom options:
 
 ```rust
-use pdf_to_markdown::{to_markdown, MarkdownOptions};
+use pdf_inspector::{to_markdown, MarkdownOptions};
 
 fn main() {
     let text = "• First item\n• Second item\n\nconst x = 5;";
@@ -144,8 +144,8 @@ fn main() {
 All functions have memory buffer variants for processing PDFs already in memory:
 
 ```rust
-use pdf_to_markdown::{process_pdf_mem, detector::detect_pdf_type_mem};
-use pdf_to_markdown::extractor::{extract_text_mem, extract_text_with_positions_mem};
+use pdf_inspector::{process_pdf_mem, detector::detect_pdf_type_mem};
+use pdf_inspector::extractor::{extract_text_mem, extract_text_with_positions_mem};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let buffer = std::fs::read("document.pdf")?;
@@ -168,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Fine-tune the detection algorithm:
 
 ```rust
-use pdf_to_markdown::detector::{detect_pdf_type_with_config, DetectionConfig};
+use pdf_inspector::detector::{detect_pdf_type_with_config, DetectionConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = DetectionConfig {

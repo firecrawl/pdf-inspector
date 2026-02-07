@@ -1,11 +1,11 @@
 //! Integration tests for pdf-to-markdown library
 
-use pdf_to_markdown::{
-    detect_pdf_type, extract_text, extract_text_with_positions, to_markdown,
-    MarkdownOptions, PdfType, TextItem,
+use pdf_inspector::detector::DetectionConfig;
+use pdf_inspector::extractor::{group_into_lines, TextLine};
+use pdf_inspector::{
+    detect_pdf_type, extract_text, extract_text_with_positions, to_markdown, MarkdownOptions,
+    PdfType, TextItem,
 };
-use pdf_to_markdown::detector::DetectionConfig;
-use pdf_to_markdown::extractor::{group_into_lines, TextLine};
 
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
@@ -21,7 +21,14 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
     }
 }
 
-fn make_text_item_with_font(text: &str, x: f32, y: f32, font_size: f32, font: &str, page: u32) -> TextItem {
+fn make_text_item_with_font(
+    text: &str,
+    x: f32,
+    y: f32,
+    font_size: f32,
+    font: &str,
+    page: u32,
+) -> TextItem {
     TextItem {
         text: text.to_string(),
         x,
@@ -347,7 +354,7 @@ fn test_to_markdown_whitespace_only_lines() {
 
 #[test]
 fn test_markdown_from_items_empty() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
     let items: Vec<TextItem> = vec![];
     let md = to_markdown_from_items(items, MarkdownOptions::default());
     assert!(md.is_empty());
@@ -355,7 +362,7 @@ fn test_markdown_from_items_empty() {
 
 #[test]
 fn test_markdown_from_items_single() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
     let items = vec![make_text_item("Hello", 100.0, 700.0, 12.0, 1)];
     let md = to_markdown_from_items(items, MarkdownOptions::default());
     assert!(md.contains("Hello"));
@@ -363,10 +370,10 @@ fn test_markdown_from_items_single() {
 
 #[test]
 fn test_markdown_from_items_header_detection() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
     // Need multiple body items to establish base font size
     let items = vec![
-        make_text_item("Title", 100.0, 750.0, 24.0, 1),  // Large font = H1
+        make_text_item("Title", 100.0, 750.0, 24.0, 1), // Large font = H1
         make_text_item("Body text one", 100.0, 700.0, 12.0, 1),
         make_text_item("Body text two", 100.0, 680.0, 12.0, 1),
         make_text_item("Body text three", 100.0, 660.0, 12.0, 1),
@@ -378,10 +385,13 @@ fn test_markdown_from_items_header_detection() {
 
 #[test]
 fn test_markdown_from_items_h2_detection() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
+    // Need multiple body items to establish base font size
     let items = vec![
-        make_text_item("Subtitle", 100.0, 750.0, 18.0, 1),  // 1.5x = H2
-        make_text_item("Body text", 100.0, 700.0, 12.0, 1),
+        make_text_item("Subtitle", 100.0, 750.0, 18.0, 1), // 1.5x = H2
+        make_text_item("Body text one", 100.0, 700.0, 12.0, 1),
+        make_text_item("Body text two", 100.0, 680.0, 12.0, 1),
+        make_text_item("Body text three", 100.0, 660.0, 12.0, 1),
     ];
     let md = to_markdown_from_items(items, MarkdownOptions::default());
     assert!(md.contains("## Subtitle"));
@@ -389,10 +399,15 @@ fn test_markdown_from_items_h2_detection() {
 
 #[test]
 fn test_markdown_from_items_monospace_code() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
-    let items = vec![
-        make_text_item_with_font("let x = 5", 100.0, 700.0, 12.0, "Courier", 1),
-    ];
+    use pdf_inspector::markdown::to_markdown_from_items;
+    let items = vec![make_text_item_with_font(
+        "let x = 5",
+        100.0,
+        700.0,
+        12.0,
+        "Courier",
+        1,
+    )];
     let md = to_markdown_from_items(items, MarkdownOptions::default());
     assert!(md.contains("```"));
     assert!(md.contains("let x = 5"));
@@ -400,7 +415,7 @@ fn test_markdown_from_items_monospace_code() {
 
 #[test]
 fn test_markdown_from_items_page_breaks() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
     let items = vec![
         make_text_item("Page 1", 100.0, 700.0, 12.0, 1),
         make_text_item("Page 2", 100.0, 700.0, 12.0, 2),
@@ -415,7 +430,7 @@ fn test_markdown_from_items_page_breaks() {
 
 #[test]
 fn test_markdown_from_lines_empty() {
-    use pdf_to_markdown::markdown::to_markdown_from_lines;
+    use pdf_inspector::markdown::to_markdown_from_lines;
     let lines: Vec<TextLine> = vec![];
     let md = to_markdown_from_lines(lines, MarkdownOptions::default());
     assert!(md.is_empty());
@@ -423,7 +438,7 @@ fn test_markdown_from_lines_empty() {
 
 #[test]
 fn test_markdown_from_lines_basic() {
-    use pdf_to_markdown::markdown::to_markdown_from_lines;
+    use pdf_inspector::markdown::to_markdown_from_lines;
     let lines = vec![
         TextLine {
             items: vec![make_text_item("First", 100.0, 700.0, 12.0, 1)],
@@ -527,9 +542,9 @@ fn test_code_keywords() {
 fn test_code_syntax_patterns() {
     // Patterns that start with code keywords/syntax
     let patterns = [
-        "=> value",        // Starts with =>
-        "-> Result",       // Starts with ->
-        ":: io::Result",   // Starts with ::
+        "=> value",      // Starts with =>
+        "-> Result",     // Starts with ->
+        ":: io::Result", // Starts with ::
     ];
     for code in &patterns {
         let md = to_markdown(code, MarkdownOptions::default());
@@ -557,18 +572,32 @@ fn test_non_code_text() {
 
 #[test]
 fn test_monospace_font_names() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
     // Font names that contain the patterns in is_monospace_font
     let monospace_fonts = [
-        "Courier", "Consolas", "Monaco", "Menlo",
-        "Fira Code", "JetBrains Mono", "Inconsolata",
-        "DejaVu Sans Mono", "Liberation Mono", "Fixed", "Terminal",
+        "Courier",
+        "Consolas",
+        "Monaco",
+        "Menlo",
+        "Fira Code",
+        "JetBrains Mono",
+        "Inconsolata",
+        "DejaVu Sans Mono",
+        "Liberation Mono",
+        "Fixed",
+        "Terminal",
     ];
 
     for font in &monospace_fonts {
-        let items = vec![make_text_item_with_font("code", 100.0, 700.0, 12.0, font, 1)];
+        let items = vec![make_text_item_with_font(
+            "code", 100.0, 700.0, 12.0, font, 1,
+        )];
         let md = to_markdown_from_items(items, MarkdownOptions::default());
-        assert!(md.contains("```"), "Font not detected as monospace: {}", font);
+        assert!(
+            md.contains("```"),
+            "Font not detected as monospace: {}",
+            font
+        );
     }
 }
 
@@ -578,7 +607,7 @@ fn test_monospace_font_names() {
 
 #[test]
 fn test_header_level_h1() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
     // 24.0 / 12.0 = 2.0x = H1
     // Need multiple body items to establish base font size
     let items = vec![
@@ -593,7 +622,7 @@ fn test_header_level_h1() {
 
 #[test]
 fn test_header_level_h2() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
     // 18.0 / 12.0 = 1.5x = H2
     // Need multiple body items to establish base font size
     let items = vec![
@@ -608,7 +637,7 @@ fn test_header_level_h2() {
 
 #[test]
 fn test_header_level_h3() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
     // 15.0 / 12.0 = 1.25x = H3
     // Need multiple body items to establish base font size
     let items = vec![
@@ -623,7 +652,7 @@ fn test_header_level_h3() {
 
 #[test]
 fn test_header_level_h4() {
-    use pdf_to_markdown::markdown::to_markdown_from_items;
+    use pdf_inspector::markdown::to_markdown_from_items;
     // 13.5 / 12.0 = 1.125x = H4 (>= 1.1)
     // Need multiple body items to establish base font size
     let items = vec![

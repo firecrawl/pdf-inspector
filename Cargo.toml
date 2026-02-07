@@ -1,10 +1,11 @@
 [package]
-name = "pdf-to-markdown"
+name = "pdf-inspector"
 version = "0.1.0"
 edition = "2021"
 authors = ["Firecrawl Team"]
-description = "Fast PDF to Markdown conversion with smart detection"
+description = "Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection"
 license = "MIT"
+repository = "https://github.com/firecrawl/pdf-inspector"
 
 [dependencies]
 # PDF parsing

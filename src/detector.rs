@@ -263,18 +263,13 @@ fn scan_content_for_text_operators(content: &[u8]) -> (u32, bool) {
             }
         }
 
-        // Look for BT (Begin Text) as additional confirmation
-        if b == b'B' && i + 1 < content.len() && content[i + 1] == b'T' {
-            if i + 2 >= content.len() || content[i + 2].is_ascii_whitespace() {
-                // BT found - text block marker
-            }
-        }
-
         // Look for 'Do' operator (XObject/image placement)
-        if b == b'D' && i + 1 < content.len() && content[i + 1] == b'o' {
-            if i + 2 >= content.len() || content[i + 2].is_ascii_whitespace() {
-                has_images = true;
-            }
+        if b == b'D'
+            && i + 1 < content.len()
+            && content[i + 1] == b'o'
+            && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace())
+        {
+            has_images = true;
         }
 
         i += 1;

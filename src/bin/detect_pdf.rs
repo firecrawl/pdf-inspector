@@ -1,6 +1,6 @@
 //! CLI tool for detecting PDF type (text-based vs scanned)
 
-use pdf_to_markdown::{detect_pdf_type, PdfType};
+use pdf_inspector::{detect_pdf_type, PdfType};
 use std::env;
 use std::process;
 use std::time::Instant;
@@ -36,7 +36,11 @@ fn main() {
                     result.pages_sampled,
                     result.pages_with_text,
                     result.confidence,
-                    result.title.as_ref().map(|t| format!("\"{}\"", t.replace('"', "\\\""))).unwrap_or_else(|| "null".to_string()),
+                    result
+                        .title
+                        .as_ref()
+                        .map(|t| format!("\"{}\"", t.replace('"', "\\\"")))
+                        .unwrap_or_else(|| "null".to_string()),
                     elapsed.as_millis()
                 );
             } else {
@@ -77,7 +81,9 @@ fn main() {
                         println!("Recommendation: Use OCR for best results");
                     }
                     PdfType::Mixed => {
-                        println!("Recommendation: Try text extraction first, use OCR for image pages");
+                        println!(
+                            "Recommendation: Try text extraction first, use OCR for image pages"
+                        );
                     }
                 }
             }

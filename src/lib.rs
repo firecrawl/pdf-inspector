@@ -69,7 +69,9 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
         PdfType::Mixed => {
             // Try to extract what we can
             let text = extract_text(&path).ok();
-            let markdown = text.as_ref().map(|t| to_markdown(t, MarkdownOptions::default()));
+            let markdown = text
+                .as_ref()
+                .map(|t| to_markdown(t, MarkdownOptions::default()));
 
             PdfProcessResult {
                 pdf_type: PdfType::Mixed,
@@ -105,18 +107,18 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
                 processing_time_ms: start.elapsed().as_millis() as u64,
             }
         }
-        PdfType::Scanned | PdfType::ImageBased => {
-            PdfProcessResult {
-                pdf_type: detection.pdf_type,
-                text: None,
-                markdown: None,
-                page_count: detection.page_count,
-                processing_time_ms: start.elapsed().as_millis() as u64,
-            }
-        }
+        PdfType::Scanned | PdfType::ImageBased => PdfProcessResult {
+            pdf_type: detection.pdf_type,
+            text: None,
+            markdown: None,
+            page_count: detection.page_count,
+            processing_time_ms: start.elapsed().as_millis() as u64,
+        },
         PdfType::Mixed => {
             let text = extractor::extract_text_mem(buffer).ok();
-            let markdown = text.as_ref().map(|t| to_markdown(t, MarkdownOptions::default()));
+            let markdown = text
+                .as_ref()
+                .map(|t| to_markdown(t, MarkdownOptions::default()));
 
             PdfProcessResult {
                 pdf_type: PdfType::Mixed,

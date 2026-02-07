@@ -1,6 +1,6 @@
 //! CLI tool for PDF to Markdown conversion
 
-use pdf_to_markdown::{process_pdf, PdfType};
+use pdf_inspector::{process_pdf, PdfType};
 use std::env;
 use std::fs;
 use std::process;
@@ -32,7 +32,11 @@ fn main() {
                 let md_escaped = result
                     .markdown
                     .as_ref()
-                    .map(|m| m.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
+                    .map(|m| {
+                        m.replace('\\', "\\\\")
+                            .replace('"', "\\\"")
+                            .replace('\n', "\\n")
+                    })
                     .unwrap_or_default();
 
                 println!(

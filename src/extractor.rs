@@ -37,7 +37,11 @@ pub struct TextLine {
 
 impl TextLine {
     pub fn text(&self) -> String {
-        self.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>().join(" ")
+        self.items
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -101,11 +105,11 @@ fn extract_page_text_items(
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
 
     // Get content
-    let content_data = doc.get_page_content(page_id)
+    let content_data = doc
+        .get_page_content(page_id)
         .map_err(|e| PdfError::Parse(e.to_string()))?;
 
-    let content = Content::decode(&content_data)
-        .map_err(|e| PdfError::Parse(e.to_string()))?;
+    let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
 
     // Text state tracking
     let mut current_font = String::new();
@@ -153,7 +157,8 @@ fn extract_page_text_items(
                 // Set text matrix
                 if op.operands.len() >= 6 {
                     for (i, operand) in op.operands.iter().take(6).enumerate() {
-                        text_matrix[i] = get_number(operand).unwrap_or(if i == 0 || i == 3 { 1.0 } else { 0.0 });
+                        text_matrix[i] =
+                            get_number(operand).unwrap_or(if i == 0 || i == 3 { 1.0 } else { 0.0 });
                     }
                     line_matrix = text_matrix;
                 }
@@ -166,7 +171,9 @@ fn extract_page_text_items(
             "Tj" => {
                 // Show text string
                 if in_text_block && !op.operands.is_empty() {
-                    if let Some(text) = extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font) {
+                    if let Some(text) =
+                        extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font)
+                    {
                         if !text.trim().is_empty() {
                             items.push(TextItem {
                                 text,
@@ -188,7 +195,9 @@ fn extract_page_text_items(
                     if let Ok(array) = op.operands[0].as_array() {
                         let mut combined_text = String::new();
                         for item in array {
-                            if let Some(text) = extract_text_from_operand(item, doc, &fonts, &current_font) {
+                            if let Some(text) =
+                                extract_text_from_operand(item, doc, &fonts, &current_font)
+                            {
                                 combined_text.push_str(&text);
                             }
                         }
@@ -212,7 +221,9 @@ fn extract_page_text_items(
                 line_matrix[5] -= current_font_size * 1.2;
                 text_matrix = line_matrix;
                 if !op.operands.is_empty() {
-                    if let Some(text) = extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font) {
+                    if let Some(text) =
+                        extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font)
+                    {
                         if !text.trim().is_empty() {
                             items.push(TextItem {
                                 text,
@@ -239,7 +250,7 @@ fn extract_page_text_items(
 fn get_number(obj: &Object) -> Option<f32> {
     match obj {
         Object::Integer(i) => Some(*i as f32),
-        Object::Real(r) => Some(*r as f32),
+        Object::Real(r) => Some(*r),
         _ => None,
     }
 }
@@ -286,7 +297,8 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
     // Sort by page, then by Y (descending for PDF coords), then by X
     let mut sorted = items;
     sorted.sort_by(|a, b| {
-        a.page.cmp(&b.page)
+        a.page
+            .cmp(&b.page)
             .then(b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
     });

@@ -6,7 +6,7 @@
 //! - Code blocks (monospace fonts, indentation)
 //! - Paragraphs
 
-use crate::extractor::{TextItem, TextLine, group_into_lines};
+use crate::extractor::{group_into_lines, TextItem, TextLine};
 use std::collections::HashMap;
 
 /// Options for markdown conversion
@@ -103,7 +103,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
     // Calculate font statistics
     let font_stats = calculate_font_stats(&lines);
-    let base_size = options.base_font_size.unwrap_or(font_stats.most_common_size);
+    let base_size = options
+        .base_font_size
+        .unwrap_or(font_stats.most_common_size);
 
     let mut output = String::new();
     let mut current_page = 0u32;
@@ -201,9 +203,7 @@ fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
         .map(|(size, _)| *size as f32 / 10.0)
         .unwrap_or(12.0);
 
-    FontStats {
-        most_common_size,
-    }
+    FontStats { most_common_size }
 }
 
 /// Detect header level from font size
@@ -242,7 +242,7 @@ fn is_list_item(text: &str) -> bool {
     let first_chars: String = trimmed.chars().take(5).collect();
     if first_chars.contains(|c: char| c.is_ascii_digit()) {
         // Check for "1.", "1)", "10."
-        if let Some(idx) = first_chars.find(|c: char| c == '.' || c == ')') {
+        if let Some(idx) = first_chars.find(['.', ')']) {
             let prefix = &first_chars[..idx];
             if prefix.chars().all(|c| c.is_ascii_digit()) {
                 return true;
@@ -292,10 +292,24 @@ fn is_code_like(text: &str) -> bool {
     // Code patterns
     let code_patterns = [
         // Language keywords
-        "import ", "export ", "from ", "const ", "let ", "var ", "function ",
-        "class ", "def ", "pub fn ", "fn ", "async fn ", "impl ",
+        "import ",
+        "export ",
+        "from ",
+        "const ",
+        "let ",
+        "var ",
+        "function ",
+        "class ",
+        "def ",
+        "pub fn ",
+        "fn ",
+        "async fn ",
+        "impl ",
         // Syntax patterns
-        "=> ", "-> ", ":: ", ":= ",
+        "=> ",
+        "-> ",
+        ":: ",
+        ":= ",
         // Common code endings
     ];
 
@@ -306,7 +320,8 @@ fn is_code_like(text: &str) -> bool {
     }
 
     // Check for code-like syntax
-    let special_chars: usize = trimmed.chars()
+    let special_chars: usize = trimmed
+        .chars()
         .filter(|c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | ';' | '=' | '<' | '>'))
         .count();
 
@@ -326,9 +341,20 @@ fn is_code_like(text: &str) -> bool {
 fn is_monospace_font(font_name: &str) -> bool {
     let lower = font_name.to_lowercase();
     let patterns = [
-        "courier", "consolas", "monaco", "menlo", "mono", "fixed",
-        "terminal", "typewriter", "source code", "fira code",
-        "jetbrains", "inconsolata", "dejavu sans mono", "liberation mono",
+        "courier",
+        "consolas",
+        "monaco",
+        "menlo",
+        "mono",
+        "fixed",
+        "terminal",
+        "typewriter",
+        "source code",
+        "fira code",
+        "jetbrains",
+        "inconsolata",
+        "dejavu sans mono",
+        "liberation mono",
     ];
 
     patterns.iter().any(|p| lower.contains(p))
