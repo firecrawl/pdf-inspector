@@ -107,6 +107,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         .base_font_size
         .unwrap_or(font_stats.most_common_size);
 
+    // Merge drop caps with following text
+    let lines = merge_drop_caps(lines, base_size);
+
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
@@ -181,6 +184,75 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
     // Clean up excessive newlines
     clean_markdown(output)
+}
+
+/// Merge drop caps with the appropriate line
+/// A drop cap is a single large letter at the start of a paragraph
+/// Due to PDF coordinate sorting, the drop cap may appear AFTER the line it belongs to
+fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextLine> {
+    let mut result: Vec<TextLine> = Vec::with_capacity(lines.len());
+
+    for line in &lines {
+        let text = line.text();
+        let trimmed = text.trim();
+
+        // Check if this looks like a drop cap:
+        // 1. Single character (or single char + space)
+        // 2. Much larger than base font (3x or more)
+        // 3. The character is uppercase
+        let is_drop_cap = trimmed.len() <= 2
+            && line.items.first().map(|i| i.font_size).unwrap_or(0.0) >= base_size * 2.5
+            && trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+
+        if is_drop_cap {
+            let drop_char = trimmed.chars().next().unwrap();
+
+            // Find the first line that starts with lowercase and is at the START of a paragraph
+            // (i.e., preceded by a header or non-lowercase-starting line)
+            let mut target_idx: Option<usize> = None;
+
+            for (idx, prev_line) in result.iter().enumerate() {
+                if prev_line.page != line.page {
+                    continue;
+                }
+
+                let prev_text = prev_line.text();
+                let prev_trimmed = prev_text.trim();
+
+                // Check if this line starts with lowercase
+                if prev_trimmed.chars().next().map(|c| c.is_lowercase()).unwrap_or(false) {
+                    // Check if previous line exists and doesn't start with lowercase
+                    // (meaning this is the start of a paragraph)
+                    let is_para_start = if idx == 0 {
+                        true
+                    } else {
+                        let before = result[idx - 1].text();
+                        let before_trimmed = before.trim();
+                        !before_trimmed.chars().next().map(|c| c.is_lowercase()).unwrap_or(true)
+                    };
+
+                    if is_para_start {
+                        target_idx = Some(idx);
+                        break;
+                    }
+                }
+            }
+
+            // Merge with the target line
+            if let Some(idx) = target_idx {
+                if let Some(first_item) = result[idx].items.first_mut() {
+                    let prev_text = first_item.text.trim().to_string();
+                    first_item.text = format!("{}{}", drop_char, prev_text);
+                }
+            }
+            // Don't add the drop cap line itself
+            continue;
+        }
+
+        result.push(line.clone());
+    }
+
+    result
 }
 
 /// Font statistics for a document

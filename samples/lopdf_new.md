@@ -1,13 +1,9 @@
-
-
 Introduction
 
 ### Introduction to Crimp Contacts SAE-AS39029
 
-lenair brings a new perspective to the supply of high-performance Mil-Spec and commercial contacts:  High Availability! Whether you need a standard duty socket for a MIL-DTL-28840 connector or an  extended duty pin for MIL-DTL-38999  Series III, we have you covered with products that are always in
+Glenair brings a new perspective to the supply of high-performance Mil-Spec and commercial contacts: High Availability! Whether you need a standard duty socket for a MIL-DTL-28840 connector or an  extended duty pin for MIL-DTL-38999  Series III, we have you covered with products that are always in
 stock—with no dollar or quantity minimums. In addition to the broadest selection and availability, Glenair also  delivers outstanding interconnection compatibility. Glenair QPL SAE-AS39029 as well as our proprietary contact  series are guaranteed to mate properly and perform at the upper limits of application requirements.
-
-G
 
 ### About SAE AS39029 Crimp Contacts
 
