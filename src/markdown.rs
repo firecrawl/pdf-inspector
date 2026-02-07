@@ -114,12 +114,17 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
     let mut in_list = false;
+    let mut in_paragraph = false;
 
     for line in lines {
         // Page break
         if line.page != current_page {
             if current_page > 0 {
-                output.push_str("\n---\n\n");
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                output.push_str("---\n\n");
             }
             current_page = line.page;
             prev_y = f32::MAX;
@@ -127,11 +132,15 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
         // Paragraph break (large Y gap)
         let y_gap = prev_y - line.y;
-        if y_gap > base_size * 2.0 && !output.ends_with("\n\n") {
+        let is_para_break = y_gap > base_size * 2.0;
+        if is_para_break {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+            }
             if in_list {
                 in_list = false;
             }
-            output.push('\n');
         }
         prev_y = line.y;
 
@@ -147,6 +156,10 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         if options.detect_headers && trimmed.len() > 3 {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) = detect_header_level(line_font_size, base_size) {
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
                 let prefix = "#".repeat(header_level);
                 output.push_str(&format!("{} {}\n\n", prefix, trimmed));
                 in_list = false;
@@ -156,6 +169,10 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
         // Detect list items
         if options.detect_lists && is_list_item(trimmed) {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+            }
             let formatted = format_list_item(trimmed);
             output.push_str(&formatted);
             output.push('\n');
@@ -172,13 +189,25 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         if options.detect_code {
             let is_mono = line.items.iter().any(|i| is_monospace_font(&i.font));
             if is_mono {
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
                 output.push_str(&format!("```\n{}\n```\n", trimmed));
                 continue;
             }
         }
 
-        // Regular text
+        // Regular text - join lines within same paragraph with space
+        if in_paragraph {
+            output.push(' ');
+        }
         output.push_str(trimmed);
+        in_paragraph = true;
+    }
+
+    // Close final paragraph
+    if in_paragraph {
         output.push('\n');
     }
 
