@@ -91,6 +91,22 @@ fn extract_positioned_text_from_doc(doc: &Document) -> Result<Vec<TextItem>, Pdf
     Ok(all_items)
 }
 
+/// Multiply two 2D transformation matrices
+/// Matrix format: [a, b, c, d, e, f] representing:
+/// | a  b  0 |
+/// | c  d  0 |
+/// | e  f  1 |
+fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
+    [
+        m1[0] * m2[0] + m1[1] * m2[2],
+        m1[0] * m2[1] + m1[1] * m2[3],
+        m1[2] * m2[0] + m1[3] * m2[2],
+        m1[2] * m2[1] + m1[3] * m2[3],
+        m1[4] * m2[0] + m1[5] * m2[2] + m2[4],
+        m1[4] * m2[1] + m1[5] * m2[3] + m2[5],
+    ]
+}
+
 /// Extract text items from a single page
 fn extract_page_text_items(
     doc: &Document,
@@ -111,6 +127,10 @@ fn extract_page_text_items(
 
     let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
 
+    // Graphics state tracking
+    let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
+    let mut ctm_stack: Vec<[f32; 6]> = Vec::new();
+
     // Text state tracking
     let mut current_font = String::new();
     let mut current_font_size: f32 = 12.0;
@@ -120,6 +140,30 @@ fn extract_page_text_items(
 
     for op in &content.operations {
         match op.operator.as_str() {
+            "q" => {
+                // Save graphics state
+                ctm_stack.push(ctm);
+            }
+            "Q" => {
+                // Restore graphics state
+                if let Some(saved) = ctm_stack.pop() {
+                    ctm = saved;
+                }
+            }
+            "cm" => {
+                // Concatenate matrix to CTM
+                if op.operands.len() >= 6 {
+                    let new_matrix = [
+                        get_number(&op.operands[0]).unwrap_or(1.0),
+                        get_number(&op.operands[1]).unwrap_or(0.0),
+                        get_number(&op.operands[2]).unwrap_or(0.0),
+                        get_number(&op.operands[3]).unwrap_or(1.0),
+                        get_number(&op.operands[4]).unwrap_or(0.0),
+                        get_number(&op.operands[5]).unwrap_or(0.0),
+                    ];
+                    ctm = multiply_matrices(&new_matrix, &ctm);
+                }
+            }
             "BT" => {
                 // Begin text block
                 in_text_block = true;
@@ -177,10 +221,13 @@ fn extract_page_text_items(
                         if !text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
+                            // Transform position through CTM
+                            let combined = multiply_matrices(&text_matrix, &ctm);
+                            let (x, y) = (combined[4], combined[5]);
                             items.push(TextItem {
                                 text,
-                                x: text_matrix[4],
-                                y: text_matrix[5],
+                                x,
+                                y,
                                 width: 0.0, // Would need glyph widths
                                 height: rendered_size,
                                 font: current_font.clone(),
@@ -206,10 +253,13 @@ fn extract_page_text_items(
                         if !combined_text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
+                            // Transform position through CTM
+                            let combined = multiply_matrices(&text_matrix, &ctm);
+                            let (x, y) = (combined[4], combined[5]);
                             items.push(TextItem {
                                 text: combined_text,
-                                x: text_matrix[4],
-                                y: text_matrix[5],
+                                x,
+                                y,
                                 width: 0.0,
                                 height: rendered_size,
                                 font: current_font.clone(),
@@ -231,10 +281,13 @@ fn extract_page_text_items(
                         if !text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
+                            // Transform position through CTM
+                            let combined = multiply_matrices(&text_matrix, &ctm);
+                            let (x, y) = (combined[4], combined[5]);
                             items.push(TextItem {
                                 text,
-                                x: text_matrix[4],
-                                y: text_matrix[5],
+                                x,
+                                y,
                                 width: 0.0,
                                 height: rendered_size,
                                 font: current_font.clone(),
@@ -307,49 +360,210 @@ fn extract_text_from_operand(
     }
 }
 
-/// Group text items into lines based on Y position
+/// Represents a column region on a page
+#[derive(Debug, Clone)]
+struct ColumnRegion {
+    x_min: f32,
+    x_max: f32,
+}
+
+/// Detect column boundaries on a page based on X-position gaps
+fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion> {
+    // Get items for this page
+    let page_items: Vec<&TextItem> = items.iter().filter(|i| i.page == page).collect();
+
+    if page_items.is_empty() {
+        return vec![];
+    }
+
+    // Find page bounds
+    let x_min = page_items.iter().map(|i| i.x).fold(f32::INFINITY, f32::min);
+    let x_max = page_items
+        .iter()
+        .map(|i| i.x + i.width.max(50.0)) // Estimate right edge
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let page_width = x_max - x_min;
+    if page_width < 200.0 {
+        // Page too narrow for multi-column, single column
+        return vec![ColumnRegion { x_min, x_max }];
+    }
+
+    // Need enough items to reliably detect columns
+    if page_items.len() < 20 {
+        return vec![ColumnRegion { x_min, x_max }];
+    }
+
+    // Collect all X positions (left edge of each text item)
+    let mut x_positions: Vec<f32> = page_items.iter().map(|i| i.x).collect();
+    x_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Find gaps in X positions
+    // A gap > 20% of page width suggests column boundary
+    let gap_threshold = page_width * 0.20;
+    let mut column_boundaries = vec![x_min];
+
+    for window in x_positions.windows(2) {
+        let gap = window[1] - window[0];
+        if gap > gap_threshold {
+            // Found a column boundary - use midpoint of gap
+            let boundary = (window[0] + window[1]) / 2.0;
+            column_boundaries.push(boundary);
+        }
+    }
+    column_boundaries.push(x_max + 1.0);
+
+    // Convert boundaries to column regions
+    let mut columns = Vec::new();
+    for i in 0..column_boundaries.len() - 1 {
+        columns.push(ColumnRegion {
+            x_min: column_boundaries[i],
+            x_max: column_boundaries[i + 1],
+        });
+    }
+
+    // Only use multi-column if we have exactly 2 columns
+    // (most common case; 3+ columns are rare and error-prone)
+    if columns.len() == 2 {
+        // Verify both columns have substantial content
+        let col_counts: Vec<usize> = columns
+            .iter()
+            .map(|col| {
+                page_items
+                    .iter()
+                    .filter(|i| i.x >= col.x_min && i.x < col.x_max)
+                    .count()
+            })
+            .collect();
+
+        // Each column should have at least 20% of the content
+        let total: usize = col_counts.iter().sum();
+        let min_threshold = total / 5;
+        if col_counts.iter().all(|&c| c >= min_threshold) {
+            return columns;
+        }
+    }
+
+    // For 3+ detected columns, try merging adjacent small columns
+    if columns.len() > 2 {
+        let col_counts: Vec<usize> = columns
+            .iter()
+            .map(|col| {
+                page_items
+                    .iter()
+                    .filter(|i| i.x >= col.x_min && i.x < col.x_max)
+                    .count()
+            })
+            .collect();
+
+        // Find the largest gap between columns that have substantial content
+        let total: usize = col_counts.iter().sum();
+        let min_items = total / 5; // 20% minimum
+
+        // Find first and last columns with enough content
+        let first_substantial = col_counts.iter().position(|&c| c >= min_items);
+        let last_substantial = col_counts.iter().rposition(|&c| c >= min_items);
+
+        if let (Some(first), Some(last)) = (first_substantial, last_substantial) {
+            if first != last {
+                // Create two columns: merge everything before the gap and after
+                return vec![
+                    ColumnRegion {
+                        x_min: columns[0].x_min,
+                        x_max: columns[first].x_max,
+                    },
+                    ColumnRegion {
+                        x_min: columns[last].x_min,
+                        x_max: columns[columns.len() - 1].x_max,
+                    },
+                ];
+            }
+        }
+    }
+
+    // Default to single column
+    vec![ColumnRegion { x_min, x_max }]
+}
+
+/// Group text items into lines, with multi-column support
 pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
     }
 
-    // Sort by page, then by Y (descending for PDF coords), then by X
-    let mut sorted = items;
-    sorted.sort_by(|a, b| {
-        a.page
-            .cmp(&b.page)
-            .then(b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal))
-            .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
-    });
+    // Get unique pages
+    let mut pages: Vec<u32> = items.iter().map(|i| i.page).collect();
+    pages.sort();
+    pages.dedup();
 
-    let mut lines = Vec::new();
-    let mut current_line: Option<TextLine> = None;
-    let y_tolerance = 3.0; // Tolerance for same-line grouping
+    let mut all_lines = Vec::new();
 
-    for item in sorted {
-        match &mut current_line {
-            Some(line) if line.page == item.page && (line.y - item.y).abs() < y_tolerance => {
-                // Same line
-                line.items.push(item);
-            }
-            _ => {
-                // New line
-                if let Some(line) = current_line.take() {
-                    lines.push(line);
-                }
-                let y = item.y;
-                let page = item.page;
-                current_line = Some(TextLine {
-                    items: vec![item],
-                    y,
-                    page,
-                });
+    for page in pages {
+        let page_items: Vec<TextItem> = items.iter().filter(|i| i.page == page).cloned().collect();
+
+        // Detect columns for this page
+        let columns = detect_columns(&page_items, page);
+
+        if columns.len() <= 1 {
+            // Single column - use simple sorting
+            let lines = group_single_column(page_items);
+            all_lines.extend(lines);
+        } else {
+            // Multi-column - process each column separately, then concatenate
+            for column in &columns {
+                let col_items: Vec<TextItem> = page_items
+                    .iter()
+                    .filter(|i| i.x >= column.x_min && i.x < column.x_max)
+                    .cloned()
+                    .collect();
+
+                let lines = group_single_column(col_items);
+                all_lines.extend(lines);
             }
         }
     }
 
-    if let Some(line) = current_line {
-        lines.push(line);
+    all_lines
+}
+
+/// Group items from a single column into lines
+/// Preserves PDF stream order (which is typically reading order) and only groups
+/// consecutive items on the same line by their X position.
+fn group_single_column(items: Vec<TextItem>) -> Vec<TextLine> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    // DO NOT sort by Y - preserve PDF stream order which is usually reading order
+    // Only merge consecutive items that are on the same line (same Y within tolerance)
+    let mut lines: Vec<TextLine> = Vec::new();
+    let y_tolerance = 3.0;
+
+    for item in items {
+        // Only check the most recent line for merging (to preserve stream order)
+        let should_merge = lines.last().map_or(false, |last_line| {
+            last_line.page == item.page && (last_line.y - item.y).abs() < y_tolerance
+        });
+
+        if should_merge {
+            // Add to the most recent line
+            lines.last_mut().unwrap().items.push(item);
+        } else {
+            // Create new line
+            let y = item.y;
+            let page = item.page;
+            lines.push(TextLine {
+                items: vec![item],
+                y,
+                page,
+            });
+        }
+    }
+
+    // Sort items within each line by X position (left to right)
+    for line in &mut lines {
+        line.items
+            .sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
     }
 
     lines
