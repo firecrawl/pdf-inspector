@@ -140,9 +140,35 @@ fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
         }
     }
 
-    // Validate: most rows should have content in first column (not sparse)
+    // Validation 1: most rows should have content in first column
     let rows_with_first_col = cells.iter().filter(|row| !row[0].is_empty()).count();
     if rows_with_first_col < rows.len() / 2 {
+        return None;
+    }
+
+    // Validation 2: real tables have content in MULTIPLE columns, not just first
+    // At least 30% of rows should have content in 2+ columns
+    let rows_with_multi_cols = cells
+        .iter()
+        .filter(|row| row.iter().filter(|c| !c.is_empty()).count() >= 2)
+        .count();
+    if rows_with_multi_cols < rows.len() / 3 {
+        return None;
+    }
+
+    // Validation 3: tables shouldn't have too many rows (likely misdetected text)
+    if rows.len() > 30 {
+        return None;
+    }
+
+    // Validation 4: average cells per row should be reasonable
+    let total_filled: usize = cells
+        .iter()
+        .map(|row| row.iter().filter(|c| !c.is_empty()).count())
+        .sum();
+    let avg_cells_per_row = total_filled as f32 / rows.len() as f32;
+    if avg_cells_per_row < 1.5 {
+        // Less than 1.5 cells per row on average - probably not a table
         return None;
     }
 
