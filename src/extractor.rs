@@ -632,7 +632,7 @@ fn group_single_column(items: Vec<TextItem>) -> Vec<TextLine> {
 
     for item in items {
         // Only check the most recent line for merging
-        let should_merge = lines.last().map_or(false, |last_line| {
+        let should_merge = lines.last().is_some_and(|last_line| {
             last_line.page == item.page && (last_line.y - item.y).abs() < y_tolerance
         });
 
