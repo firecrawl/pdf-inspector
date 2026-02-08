@@ -7,7 +7,7 @@
 //! - Paragraphs
 
 use crate::extractor::{group_into_lines, TextItem, TextLine};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use regex::Regex;
 
@@ -102,8 +102,247 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
 
 /// Convert positioned text items to markdown with structure detection
 pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) -> String {
-    let lines = group_into_lines(items);
-    to_markdown_from_lines(lines, options)
+    use crate::tables::{detect_tables, table_to_markdown};
+    use std::collections::HashSet;
+
+    if items.is_empty() {
+        return String::new();
+    }
+
+    // Calculate base font size for table detection
+    let font_stats = calculate_font_stats_from_items(&items);
+    let base_size = options.base_font_size.unwrap_or(font_stats.most_common_size);
+
+    // Detect tables on each page
+    let mut table_items: HashSet<usize> = HashSet::new();
+    let mut page_tables: std::collections::HashMap<u32, Vec<(f32, String)>> =
+        std::collections::HashMap::new();
+
+    // Group items by page for table detection
+    let mut pages: Vec<u32> = items.iter().map(|i| i.page).collect();
+    pages.sort();
+    pages.dedup();
+
+    for page in pages {
+        let page_items: Vec<TextItem> = items
+            .iter()
+            .filter(|i| i.page == page)
+            .cloned()
+            .collect();
+
+        let tables = detect_tables(&page_items, base_size);
+
+        for table in tables {
+            // Mark items as belonging to a table
+            for &idx in &table.item_indices {
+                // Find the global index
+                let global_idx = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, i)| i.page == page)
+                    .nth(idx)
+                    .map(|(i, _)| i);
+                if let Some(gi) = global_idx {
+                    table_items.insert(gi);
+                }
+            }
+
+            // Get Y position for table insertion (use highest Y in table)
+            let table_y = table.rows.first().copied().unwrap_or(0.0);
+            let table_md = table_to_markdown(&table);
+
+            page_tables
+                .entry(page)
+                .or_default()
+                .push((table_y, table_md));
+        }
+    }
+
+    // Filter out table items and process the rest
+    let non_table_items: Vec<TextItem> = items
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| !table_items.contains(idx))
+        .map(|(_, item)| item)
+        .collect();
+
+    let lines = group_into_lines(non_table_items);
+
+    // Convert to markdown, inserting tables at appropriate positions
+    to_markdown_from_lines_with_tables(lines, options, page_tables)
+}
+
+/// Calculate font stats directly from items (before grouping into lines)
+fn calculate_font_stats_from_items(items: &[TextItem]) -> FontStats {
+    let mut size_counts: HashMap<i32, usize> = HashMap::new();
+
+    for item in items {
+        if item.font_size >= 9.0 {
+            let size_key = (item.font_size * 10.0) as i32;
+            *size_counts.entry(size_key).or_insert(0) += 1;
+        }
+    }
+
+    let most_common_size = size_counts
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(size, _)| *size as f32 / 10.0)
+        .unwrap_or(12.0);
+
+    FontStats { most_common_size }
+}
+
+/// Convert text lines to markdown, inserting tables at appropriate Y positions
+fn to_markdown_from_lines_with_tables(
+    lines: Vec<TextLine>,
+    options: MarkdownOptions,
+    page_tables: std::collections::HashMap<u32, Vec<(f32, String)>>,
+) -> String {
+    if lines.is_empty() && page_tables.is_empty() {
+        return String::new();
+    }
+
+    // Calculate font statistics
+    let font_stats = calculate_font_stats(&lines);
+    let base_size = options
+        .base_font_size
+        .unwrap_or(font_stats.most_common_size);
+
+    // Merge drop caps with following text
+    let lines = merge_drop_caps(lines, base_size);
+
+    let mut output = String::new();
+    let mut current_page = 0u32;
+    let mut prev_y = f32::MAX;
+    let mut in_list = false;
+    let mut in_paragraph = false;
+    let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
+
+    for line in lines {
+        // Page break
+        if line.page != current_page {
+            if current_page > 0 {
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                output.push_str("---\n\n");
+            }
+            current_page = line.page;
+            prev_y = f32::MAX;
+        }
+
+        // Check if we should insert a table before this line
+        if let Some(tables) = page_tables.get(&current_page) {
+            for (idx, (table_y, table_md)) in tables.iter().enumerate() {
+                // Insert table when we pass its Y position
+                if *table_y > line.y && !inserted_tables.contains(&(current_page, idx)) {
+                    if in_paragraph {
+                        output.push_str("\n\n");
+                        in_paragraph = false;
+                    }
+                    output.push('\n');
+                    output.push_str(table_md);
+                    output.push('\n');
+                    inserted_tables.insert((current_page, idx));
+                }
+            }
+        }
+
+        // Paragraph break (large Y gap)
+        let y_gap = prev_y - line.y;
+        let is_para_break = y_gap > base_size * 2.0;
+        if is_para_break {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+            }
+            if in_list {
+                in_list = false;
+            }
+        }
+        prev_y = line.y;
+
+        let text = line.text();
+        let trimmed = text.trim();
+
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Detect headers by font size
+        if options.detect_headers && trimmed.len() > 3 {
+            let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
+            if let Some(header_level) = detect_header_level(line_font_size, base_size) {
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                let prefix = "#".repeat(header_level);
+                output.push_str(&format!("{} {}\n\n", prefix, trimmed));
+                in_list = false;
+                continue;
+            }
+        }
+
+        // Detect list items
+        if options.detect_lists && is_list_item(trimmed) {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+            }
+            let formatted = format_list_item(trimmed);
+            output.push_str(&formatted);
+            output.push('\n');
+            in_list = true;
+            continue;
+        } else if in_list && !trimmed.starts_with(char::is_whitespace) {
+            in_list = false;
+        }
+
+        // Detect code blocks by font
+        if options.detect_code {
+            let is_mono = line.items.iter().any(|i| is_monospace_font(&i.font));
+            if is_mono {
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                output.push_str(&format!("```\n{}\n```\n", trimmed));
+                continue;
+            }
+        }
+
+        // Regular text - join lines within same paragraph with space
+        if in_paragraph {
+            output.push(' ');
+        }
+        output.push_str(trimmed);
+        in_paragraph = true;
+    }
+
+    // Insert any remaining tables at the end
+    for (page, tables) in &page_tables {
+        for (idx, (_, table_md)) in tables.iter().enumerate() {
+            if !inserted_tables.contains(&(*page, idx)) {
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                output.push('\n');
+                output.push_str(table_md);
+                output.push('\n');
+            }
+        }
+    }
+
+    // Close final paragraph
+    if in_paragraph {
+        output.push('\n');
+    }
+
+    // Clean up and post-process
+    clean_markdown(output, &options)
 }
 
 /// Convert text lines to markdown
