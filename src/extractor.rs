@@ -43,13 +43,32 @@ impl TextLine {
             if i == 0 {
                 result.push_str(text);
             } else {
+                let prev_item = &self.items[i - 1];
+
                 // Don't add space before/after hyphens for hyphenated words
                 let prev_ends_with_hyphen = result.ends_with('-');
                 let curr_is_hyphen = text.trim() == "-";
                 let curr_starts_with_hyphen = text.starts_with('-');
 
-                if prev_ends_with_hyphen || curr_is_hyphen || curr_starts_with_hyphen {
-                    // No space for hyphenated words
+                // Detect subscript/superscript: smaller font size and/or Y offset
+                // Subscripts/superscripts are typically 60-80% of normal font size
+                // and have a vertical offset of 1-3 points
+                let font_ratio = item.font_size / prev_item.font_size;
+                let reverse_font_ratio = prev_item.font_size / item.font_size;
+                let y_diff = (item.y - prev_item.y).abs();
+
+                // Current item is subscript/superscript (smaller than previous)
+                let is_sub_super = font_ratio < 0.85 && y_diff > 1.0;
+                // Previous item was subscript/superscript (returning to normal size)
+                let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
+
+                if prev_ends_with_hyphen
+                    || curr_is_hyphen
+                    || curr_starts_with_hyphen
+                    || is_sub_super
+                    || was_sub_super
+                {
+                    // No space for hyphenated words or subscript/superscript
                     result.push_str(text);
                 } else {
                     result.push(' ');

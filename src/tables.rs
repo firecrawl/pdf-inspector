@@ -123,8 +123,9 @@ fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
         return None;
     }
 
-    // Build the table grid
-    let mut cells: Vec<Vec<String>> = vec![vec![String::new(); columns.len()]; rows.len()];
+    // Build the table grid - first collect items per cell, then join properly
+    let mut cell_items: Vec<Vec<Vec<&TextItem>>> =
+        vec![vec![Vec::new(); columns.len()]; rows.len()];
     let mut item_indices = Vec::new();
 
     for (idx, item) in items {
@@ -132,12 +133,24 @@ fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
         let row = find_row_index(&rows, item.y);
 
         if let (Some(col), Some(row)) = (col, row) {
-            if !cells[row][col].is_empty() {
-                cells[row][col].push(' ');
-            }
-            cells[row][col].push_str(item.text.trim());
+            cell_items[row][col].push(item);
             item_indices.push(*idx);
         }
+    }
+
+    // Sort items within each cell by X position and join with subscript-aware spacing
+    let mut cells: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    for row_items in &mut cell_items {
+        let mut row_cells = Vec::with_capacity(columns.len());
+        for col_items in row_items.iter_mut() {
+            // Sort by X position
+            col_items.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Join items with subscript-aware spacing
+            let text = join_cell_items(col_items);
+            row_cells.push(text);
+        }
+        cells.push(row_cells);
     }
 
     // Validation 1: most rows should have content in first column
@@ -298,6 +311,54 @@ fn find_row_index(rows: &[f32], y: f32) -> Option<usize> {
         })
         .filter(|(_, row_y)| (y - *row_y).abs() < threshold)
         .map(|(idx, _)| idx)
+}
+
+/// Join cell items with subscript/superscript-aware spacing
+/// Same logic as TextLine::text() but for table cells
+fn join_cell_items(items: &[&TextItem]) -> String {
+    let mut result = String::new();
+
+    for (i, item) in items.iter().enumerate() {
+        let text = item.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        if result.is_empty() {
+            result.push_str(text);
+        } else {
+            let prev_item = items[i - 1];
+
+            // Don't add space before/after hyphens
+            let prev_ends_with_hyphen = result.ends_with('-');
+            let curr_is_hyphen = text == "-";
+            let curr_starts_with_hyphen = text.starts_with('-');
+
+            // Detect subscript/superscript: smaller font size and/or Y offset
+            let font_ratio = item.font_size / prev_item.font_size;
+            let reverse_font_ratio = prev_item.font_size / item.font_size;
+            let y_diff = (item.y - prev_item.y).abs();
+
+            // Current item is subscript/superscript (smaller than previous)
+            let is_sub_super = font_ratio < 0.85 && y_diff > 1.0;
+            // Previous item was subscript/superscript (returning to normal size)
+            let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
+
+            if prev_ends_with_hyphen
+                || curr_is_hyphen
+                || curr_starts_with_hyphen
+                || is_sub_super
+                || was_sub_super
+            {
+                result.push_str(text);
+            } else {
+                result.push(' ');
+                result.push_str(text);
+            }
+        }
+    }
+
+    result
 }
 
 /// Format a table as markdown
