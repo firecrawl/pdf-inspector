@@ -37,11 +37,27 @@ pub struct TextLine {
 
 impl TextLine {
     pub fn text(&self) -> String {
-        self.items
-            .iter()
-            .map(|i| i.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
+        let mut result = String::new();
+        for (i, item) in self.items.iter().enumerate() {
+            let text = item.text.as_str();
+            if i == 0 {
+                result.push_str(text);
+            } else {
+                // Don't add space before/after hyphens for hyphenated words
+                let prev_ends_with_hyphen = result.ends_with('-');
+                let curr_is_hyphen = text.trim() == "-";
+                let curr_starts_with_hyphen = text.starts_with('-');
+
+                if prev_ends_with_hyphen || curr_is_hyphen || curr_starts_with_hyphen {
+                    // No space for hyphenated words
+                    result.push_str(text);
+                } else {
+                    result.push(' ');
+                    result.push_str(text);
+                }
+            }
+        }
+        result
     }
 }
 
@@ -399,8 +415,9 @@ fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion> {
     x_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     // Find gaps in X positions
-    // A gap > 20% of page width suggests column boundary
-    let gap_threshold = page_width * 0.20;
+    // A gap > 30% of page width suggests column boundary
+    // (increased from 20% to reduce false positives from text with varying indentation)
+    let gap_threshold = page_width * 0.30;
     let mut column_boundaries = vec![x_min];
 
     for window in x_positions.windows(2) {
@@ -485,11 +502,34 @@ fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion> {
     vec![ColumnRegion { x_min, x_max }]
 }
 
+/// Check if a text item is likely a page number
+fn is_page_number(item: &TextItem) -> bool {
+    let text = item.text.trim();
+
+    // Must be 1-4 digits only
+    if text.is_empty() || text.len() > 4 {
+        return false;
+    }
+    if !text.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    // Must be at top (y > 800) or bottom (y < 100) of page
+    // These thresholds work for standard page sizes
+    item.y > 800.0 || item.y < 100.0
+}
+
 /// Group text items into lines, with multi-column support
 pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
     }
+
+    // Filter out page numbers (standalone numbers at top/bottom of page)
+    let items: Vec<TextItem> = items
+        .into_iter()
+        .filter(|item| !is_page_number(item))
+        .collect();
 
     // Get unique pages
     let mut pages: Vec<u32> = items.iter().map(|i| i.page).collect();
