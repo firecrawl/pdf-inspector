@@ -111,7 +111,9 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
 
     // Calculate base font size for table detection
     let font_stats = calculate_font_stats_from_items(&items);
-    let base_size = options.base_font_size.unwrap_or(font_stats.most_common_size);
+    let base_size = options
+        .base_font_size
+        .unwrap_or(font_stats.most_common_size);
 
     // Detect tables on each page
     let mut table_items: HashSet<usize> = HashSet::new();
@@ -124,11 +126,7 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
     pages.dedup();
 
     for page in pages {
-        let page_items: Vec<TextItem> = items
-            .iter()
-            .filter(|i| i.page == page)
-            .cloned()
-            .collect();
+        let page_items: Vec<TextItem> = items.iter().filter(|i| i.page == page).cloned().collect();
 
         let tables = detect_tables(&page_items, base_size);
 

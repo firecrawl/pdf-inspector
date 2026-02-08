@@ -159,9 +159,7 @@ fn check_column_alignment(items: &[(usize, &TextItem)], columns: &[f32]) -> f32 
     let tolerance = 40.0;
     let aligned = items
         .iter()
-        .filter(|(_, item)| {
-            columns.iter().any(|&col| (item.x - col).abs() < tolerance)
-        })
+        .filter(|(_, item)| columns.iter().any(|&col| (item.x - col).abs() < tolerance))
         .count();
 
     aligned as f32 / items.len() as f32
