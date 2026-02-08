@@ -526,21 +526,72 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
     all_lines
 }
 
+/// Determine if Y-sorting should be used instead of stream order.
+/// Returns true if the stream order appears chaotic (items jump around in Y position).
+fn should_use_y_sorting(items: &[TextItem]) -> bool {
+    if items.len() < 5 {
+        return false; // Not enough items to judge
+    }
+
+    // Sample Y positions from stream order
+    let y_positions: Vec<f32> = items.iter().map(|i| i.y).collect();
+
+    // Count "order violations" - cases where Y increases (going up) when it should decrease
+    // In proper reading order, Y should generally decrease (top to bottom)
+    let mut large_jumps_up = 0;
+    let mut large_jumps_down = 0;
+    let jump_threshold = 50.0; // Significant Y jump
+
+    for window in y_positions.windows(2) {
+        let delta = window[1] - window[0];
+        if delta > jump_threshold {
+            large_jumps_up += 1; // Y increased significantly (jumped up on page)
+        } else if delta < -jump_threshold {
+            large_jumps_down += 1; // Y decreased significantly (normal reading direction)
+        }
+    }
+
+    // If there are many upward jumps relative to downward jumps, order is chaotic
+    // A well-ordered document should have mostly downward progression
+    let total_jumps = large_jumps_up + large_jumps_down;
+    if total_jumps < 3 {
+        return false; // Not enough jumps to judge
+    }
+
+    // If more than 40% of large jumps are upward, use Y-sorting
+    let chaos_ratio = large_jumps_up as f32 / total_jumps as f32;
+    chaos_ratio > 0.4
+}
+
 /// Group items from a single column into lines
-/// Preserves PDF stream order (which is typically reading order) and only groups
-/// consecutive items on the same line by their X position.
+/// Uses heuristics to decide between PDF stream order and Y-position sorting.
 fn group_single_column(items: Vec<TextItem>) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
     }
 
-    // DO NOT sort by Y - preserve PDF stream order which is usually reading order
-    // Only merge consecutive items that are on the same line (same Y within tolerance)
+    // Decide whether to use stream order or Y-sorting
+    let use_y_sorting = should_use_y_sorting(&items);
+
+    let items = if use_y_sorting {
+        // Sort by Y descending (top to bottom in PDF coords)
+        let mut sorted = items;
+        sorted.sort_by(|a, b| {
+            b.y.partial_cmp(&a.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        sorted
+    } else {
+        items
+    };
+
+    // Group items into lines
     let mut lines: Vec<TextLine> = Vec::new();
     let y_tolerance = 3.0;
 
     for item in items {
-        // Only check the most recent line for merging (to preserve stream order)
+        // Only check the most recent line for merging
         let should_merge = lines.last().map_or(false, |last_line| {
             last_line.page == item.page && (last_line.y - item.y).abs() < y_tolerance
         });
