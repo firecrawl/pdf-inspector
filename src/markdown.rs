@@ -219,7 +219,22 @@ fn to_markdown_from_lines_with_tables(
     for line in lines {
         // Page break
         if line.page != current_page {
+            // Before leaving the current page, insert any remaining tables for that page
             if current_page > 0 {
+                if let Some(tables) = page_tables.get(&current_page) {
+                    for (idx, (_, table_md)) in tables.iter().enumerate() {
+                        if !inserted_tables.contains(&(current_page, idx)) {
+                            if in_paragraph {
+                                output.push_str("\n\n");
+                                in_paragraph = false;
+                            }
+                            output.push('\n');
+                            output.push_str(table_md);
+                            output.push('\n');
+                            inserted_tables.insert((current_page, idx));
+                        }
+                    }
+                }
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;
@@ -319,10 +334,10 @@ fn to_markdown_from_lines_with_tables(
         in_paragraph = true;
     }
 
-    // Insert any remaining tables at the end
-    for (page, tables) in &page_tables {
+    // Insert any remaining tables for the last page
+    if let Some(tables) = page_tables.get(&current_page) {
         for (idx, (_, table_md)) in tables.iter().enumerate() {
-            if !inserted_tables.contains(&(*page, idx)) {
+            if !inserted_tables.contains(&(current_page, idx)) {
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;
