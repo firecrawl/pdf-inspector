@@ -318,8 +318,12 @@ fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
 
     for line in lines {
         for item in &line.items {
-            let size_key = (item.font_size * 10.0) as i32; // Round to 0.1
-            *size_counts.entry(size_key).or_insert(0) += 1;
+            // Only count fonts >= 9pt as potential body text
+            // Smaller fonts are typically table cells, footnotes, or captions
+            if item.font_size >= 9.0 {
+                let size_key = (item.font_size * 10.0) as i32; // Round to 0.1
+                *size_counts.entry(size_key).or_insert(0) += 1;
+            }
         }
     }
 
