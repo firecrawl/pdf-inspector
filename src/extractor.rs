@@ -2,6 +2,7 @@
 //!
 //! This module extracts text with position information for structure detection.
 
+use crate::tounicode::FontCMaps;
 use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
 use std::path::Path;
@@ -143,23 +144,33 @@ fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
 
 /// Extract text with position information from PDF file
 pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextItem>, PdfError> {
-    let doc = Document::load(path)?;
-    extract_positioned_text_from_doc(&doc)
+    // Read the raw PDF bytes for ToUnicode extraction
+    let pdf_bytes = std::fs::read(path.as_ref())?;
+    let font_cmaps = FontCMaps::from_pdf_bytes(&pdf_bytes);
+
+    let doc = Document::load_mem(&pdf_bytes)?;
+    extract_positioned_text_from_doc(&doc, &font_cmaps)
 }
 
 /// Extract text with positions from memory buffer
 pub fn extract_text_with_positions_mem(buffer: &[u8]) -> Result<Vec<TextItem>, PdfError> {
+    // Extract ToUnicode CMaps from raw PDF bytes
+    let font_cmaps = FontCMaps::from_pdf_bytes(buffer);
+
     let doc = Document::load_mem(buffer)?;
-    extract_positioned_text_from_doc(&doc)
+    extract_positioned_text_from_doc(&doc, &font_cmaps)
 }
 
 /// Extract positioned text from loaded document
-fn extract_positioned_text_from_doc(doc: &Document) -> Result<Vec<TextItem>, PdfError> {
+fn extract_positioned_text_from_doc(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+) -> Result<Vec<TextItem>, PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
 
     for (page_num, &page_id) in pages.iter() {
-        let items = extract_page_text_items(doc, page_id, *page_num)?;
+        let items = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
         all_items.extend(items);
     }
 
@@ -187,6 +198,7 @@ fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
     page_num: u32,
+    font_cmaps: &FontCMaps,
 ) -> Result<Vec<TextItem>, PdfError> {
     use lopdf::content::Content;
 
@@ -194,6 +206,19 @@ fn extract_page_text_items(
 
     // Get fonts for encoding
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
+
+    // Build a map of font resource names to their base font names (for CMap lookup)
+    let mut font_base_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (font_name, font_dict) in &fonts {
+        let resource_name = String::from_utf8_lossy(font_name).to_string();
+        if let Ok(base_font) = font_dict.get(b"BaseFont") {
+            if let Ok(name) = base_font.as_name() {
+                let base_name = String::from_utf8_lossy(name).to_string();
+                font_base_names.insert(resource_name, base_name);
+            }
+        }
+    }
 
     // Get content
     let content_data = doc
@@ -290,9 +315,14 @@ fn extract_page_text_items(
             "Tj" => {
                 // Show text string
                 if in_text_block && !op.operands.is_empty() {
-                    if let Some(text) =
-                        extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font)
-                    {
+                    if let Some(text) = extract_text_from_operand(
+                        &op.operands[0],
+                        doc,
+                        &fonts,
+                        &current_font,
+                        font_cmaps,
+                        &font_base_names,
+                    ) {
                         if !text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
@@ -319,9 +349,14 @@ fn extract_page_text_items(
                     if let Ok(array) = op.operands[0].as_array() {
                         let mut combined_text = String::new();
                         for item in array {
-                            if let Some(text) =
-                                extract_text_from_operand(item, doc, &fonts, &current_font)
-                            {
+                            if let Some(text) = extract_text_from_operand(
+                                item,
+                                doc,
+                                &fonts,
+                                &current_font,
+                                font_cmaps,
+                                &font_base_names,
+                            ) {
                                 combined_text.push_str(&text);
                             }
                         }
@@ -350,9 +385,14 @@ fn extract_page_text_items(
                 line_matrix[5] -= current_font_size * 1.2;
                 text_matrix = line_matrix;
                 if !op.operands.is_empty() {
-                    if let Some(text) =
-                        extract_text_from_operand(&op.operands[0], doc, &fonts, &current_font)
-                    {
+                    if let Some(text) = extract_text_from_operand(
+                        &op.operands[0],
+                        doc,
+                        &fonts,
+                        &current_font,
+                        font_cmaps,
+                        &font_base_names,
+                    ) {
                         if !text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
@@ -408,9 +448,31 @@ fn extract_text_from_operand(
     doc: &Document,
     fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
     current_font: &str,
+    font_cmaps: &FontCMaps,
+    font_base_names: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     if let Object::String(bytes, _) = obj {
-        // Try to decode using font encoding
+        // First, check if this font has a ToUnicode CMap we can use
+        // This is especially important for Identity-H encoded fonts (Type0/CIDFont)
+        if let Some(base_name) = font_base_names.get(current_font) {
+            if let Some(cmap) = font_cmaps.get(base_name) {
+                // Use the ToUnicode CMap to decode CID bytes
+                let decoded = cmap.decode_cids(bytes);
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+        }
+
+        // Also try looking up by resource name directly
+        if let Some(cmap) = font_cmaps.get(current_font) {
+            let decoded = cmap.decode_cids(bytes);
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+
+        // Try to decode using font encoding from lopdf
         if let Some(font_dict) = fonts.get(current_font.as_bytes()) {
             if let Ok(encoding) = font_dict.get_font_encoding(doc) {
                 if let Ok(text) = Document::decode_text(&encoding, bytes) {

@@ -9,6 +9,7 @@ pub mod detector;
 pub mod extractor;
 pub mod markdown;
 pub mod tables;
+pub mod tounicode;
 
 pub use detector::{detect_pdf_type, PdfType, PdfTypeResult};
 pub use extractor::{extract_text, extract_text_with_positions, TextItem};

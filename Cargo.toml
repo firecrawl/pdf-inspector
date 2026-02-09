@@ -11,6 +11,9 @@ repository = "https://github.com/firecrawl/pdf-inspector"
 # PDF parsing
 lopdf = { git = "https://github.com/J-F-Liu/lopdf", features = ["rayon"] }
 
+# Compression
+flate2 = "1.0"
+
 # Error handling
 thiserror = "2.0"
 

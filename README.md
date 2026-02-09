@@ -15,6 +15,8 @@ Fast Rust library for PDF inspection, classification, and text extraction. Intel
 | | Position-Aware | Text with X/Y coordinates, font info, page numbers |
 | | Multi-Column Support | Automatic detection and proper reading order |
 | | Text Encoding | UTF-16BE, UTF-8, and Latin-1 |
+| | ToUnicode CMap | Proper decoding of CID-keyed fonts (Type0/Identity-H) |
+| | Linearized PDFs | Raw stream extraction for optimized PDFs |
 | **Headers** | Auto Detection | H1-H4 based on font size ratios |
 | **Lists** | Bullet Points | `•`, `-`, `*`, `○`, `●`, `◦` |
 | | Numbered Lists | `1.`, `1)`, `(1)` |
