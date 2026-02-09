@@ -73,7 +73,7 @@ fn find_table_regions(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
 
     // Find clusters of Y positions (table regions)
     let mut regions = Vec::new();
-    let gap_threshold = 50.0; // Large Y gap suggests separate regions
+    let gap_threshold = 30.0; // Smaller gap threshold to separate header from content
 
     let mut region_start = y_positions[0];
     let mut region_end = y_positions[0];
@@ -106,7 +106,7 @@ fn find_table_regions(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
 fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
     // Find column boundaries
     let columns = find_column_boundaries(items);
-    if columns.len() < 2 || columns.len() > 8 {
+    if columns.len() < 2 || columns.len() > 15 {
         return None;
     }
 
@@ -137,6 +137,25 @@ fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
             item_indices.push(*idx);
         }
     }
+
+    // Detect form header rows and exclude their items
+    // We need to do this BEFORE finalizing item_indices
+    let (first_table_row, excluded_items) = find_first_table_row(&cell_items, &rows, items);
+
+    // Remove excluded items from item_indices
+    let item_indices: Vec<usize> = item_indices
+        .into_iter()
+        .filter(|idx| !excluded_items.contains(idx))
+        .collect();
+
+    // If we excluded rows, adjust the cell_items and rows
+    let (rows, mut cell_items) = if first_table_row > 0 {
+        let new_rows = rows[first_table_row..].to_vec();
+        let new_cell_items = cell_items[first_table_row..].to_vec();
+        (new_rows, new_cell_items)
+    } else {
+        (rows, cell_items)
+    };
 
     // Sort items within each cell by X position and join with subscript-aware spacing
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(rows.len());
@@ -185,12 +204,143 @@ fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
         return None;
     }
 
+    // Validation 5: Check for key-value pair layout (NOT a table)
+    // Key-value layouts have: mostly 2 filled columns, first column is labels
+    if is_key_value_layout(&cells) {
+        return None;
+    }
+
+    // Validation 6: Check column count consistency
+    // Real tables have similar column counts across rows
+    if !has_consistent_columns(&cells) {
+        return None;
+    }
+
+    // Validation 7: Tables should have some numeric/data content
+    // (not just text labels)
+    if !has_table_like_content(&cells) {
+        return None;
+    }
+
     Some(Table {
         columns,
         rows,
         cells,
         item_indices,
     })
+}
+
+/// Check if this looks like a key-value pair layout rather than a table
+fn is_key_value_layout(cells: &[Vec<String>]) -> bool {
+    if cells.is_empty() {
+        return false;
+    }
+
+    let num_cols = cells[0].len();
+
+    // Key-value layouts typically have 2-3 effective columns
+    // where the first column contains labels ending with ":"
+    let mut label_like_first_col = 0;
+    let mut rows_with_two_or_less = 0;
+
+    for row in cells {
+        let filled_count = row.iter().filter(|c| !c.is_empty()).count();
+        if filled_count <= 2 {
+            rows_with_two_or_less += 1;
+        }
+
+        // Check if first column looks like a label (ends with : or is all caps)
+        let first = row.first().map(|s| s.trim()).unwrap_or("");
+        if first.ends_with(':') || (first.len() > 3 && first.chars().all(|c| c.is_uppercase() || c.is_whitespace() || c == '(' || c == ')')) {
+            label_like_first_col += 1;
+        }
+    }
+
+    // If most rows have only 2 columns filled and first column is label-like
+    let pct_two_or_less = rows_with_two_or_less as f32 / cells.len() as f32;
+    let pct_label_like = label_like_first_col as f32 / cells.len() as f32;
+
+    // This is likely a key-value layout if:
+    // - Most rows have 2 or fewer filled columns
+    // - First column often looks like labels
+    // - Total columns detected is 6 or fewer (real tables often have more)
+    pct_two_or_less > 0.7 && pct_label_like > 0.5 && num_cols <= 6
+}
+
+/// Check if columns are consistent across rows (real tables have this)
+fn has_consistent_columns(cells: &[Vec<String>]) -> bool {
+    if cells.len() < 3 {
+        return true; // Not enough rows to judge
+    }
+
+    // Count filled columns per row
+    let filled_counts: Vec<usize> = cells
+        .iter()
+        .map(|row| row.iter().filter(|c| !c.is_empty()).count())
+        .collect();
+
+    // Find the most common filled count
+    let mut count_freq: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for &count in &filled_counts {
+        *count_freq.entry(count).or_insert(0) += 1;
+    }
+
+    let most_common_count = count_freq
+        .iter()
+        .max_by_key(|(_, freq)| *freq)
+        .map(|(count, _)| *count)
+        .unwrap_or(0);
+
+    // At least 40% of rows should have the most common column count (or close to it)
+    let consistent_rows = filled_counts
+        .iter()
+        .filter(|&&c| c >= most_common_count.saturating_sub(2) && c <= most_common_count + 2)
+        .count();
+
+    consistent_rows as f32 / cells.len() as f32 > 0.4
+}
+
+/// Check if the content looks like table data (numbers, short values)
+fn has_table_like_content(cells: &[Vec<String>]) -> bool {
+    let mut numeric_cells = 0;
+    let mut total_cells = 0;
+
+    for row in cells.iter().skip(1) {
+        // Skip header row
+        for cell in row {
+            let trimmed = cell.trim();
+            if !trimmed.is_empty() {
+                total_cells += 1;
+                // Check if it looks like a number (including decimals)
+                if looks_like_number(trimmed) {
+                    numeric_cells += 1;
+                }
+            }
+        }
+    }
+
+    if total_cells == 0 {
+        return false;
+    }
+
+    // At least 20% numeric content suggests a data table
+    // OR the table has many columns (structural table)
+    let pct_numeric = numeric_cells as f32 / total_cells as f32;
+    let num_cols = cells.first().map(|r| r.len()).unwrap_or(0);
+
+    pct_numeric > 0.2 || num_cols >= 5
+}
+
+/// Check if a string looks like a number
+fn looks_like_number(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+
+    // Handle common number formats: 9.0, 10, 8.6, etc.
+    s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',' || c == '-' || c == '+')
+        && s.chars().any(|c| c.is_ascii_digit())
 }
 
 /// Check what fraction of items align to detected columns
@@ -213,8 +363,18 @@ fn find_column_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
         return vec![];
     }
 
-    // Use larger threshold for column detection
-    let cluster_threshold = 60.0;
+    // Calculate adaptive threshold based on X-position density
+    // For dense tables (like grade tables), use smaller threshold
+    let x_range = x_positions.last().unwrap() - x_positions.first().unwrap();
+    let avg_gap = if x_positions.len() > 1 {
+        x_range / (x_positions.len() - 1) as f32
+    } else {
+        60.0
+    };
+
+    // Use smaller threshold for dense data, larger for sparse
+    let cluster_threshold = avg_gap.clamp(25.0, 50.0);
+
     let mut columns = Vec::new();
     let mut cluster_items: Vec<f32> = vec![x_positions[0]];
 
@@ -236,7 +396,7 @@ fn find_column_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
     }
 
     // Filter columns - each should have multiple items
-    let min_items_per_col = (items.len() / columns.len().max(1) / 3).max(2);
+    let min_items_per_col = (items.len() / columns.len().max(1) / 4).max(2);
     columns
         .into_iter()
         .filter(|&col_x| {
@@ -284,7 +444,17 @@ fn find_row_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
 
 /// Find which column index an X position belongs to
 fn find_column_index(columns: &[f32], x: f32) -> Option<usize> {
-    let threshold = 60.0;
+    // Calculate adaptive threshold based on column spacing
+    let threshold = if columns.len() >= 2 {
+        let min_gap = columns
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(f32::INFINITY, f32::min);
+        (min_gap / 2.0).clamp(25.0, 50.0)
+    } else {
+        50.0
+    };
+
     columns
         .iter()
         .enumerate()
@@ -472,6 +642,125 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
     (cleaned, footnotes)
 }
 
+/// Find the first row that looks like actual table data (not form header)
+/// Returns (first_table_row_index, set of item indices to exclude)
+fn find_first_table_row(
+    cell_items: &[Vec<Vec<&TextItem>>],
+    rows: &[f32],
+    original_items: &[(usize, &TextItem)],
+) -> (usize, std::collections::HashSet<usize>) {
+    let mut excluded_items = std::collections::HashSet::new();
+
+    // Build string cells for analysis
+    let cells: Vec<Vec<String>> = cell_items
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|col| join_cell_items(col))
+                .collect()
+        })
+        .collect();
+
+    if cells.is_empty() {
+        return (0, excluded_items);
+    }
+
+    // Strategy: Skip leading rows that look like form metadata
+    //
+    // Form/metadata rows have:
+    // 1. Cells ending with ":" (form labels)
+    // 2. Very sparse fill with document metadata (grade level, year, etc.)
+    //
+    // Table rows have:
+    // 1. Dense fill (headers spanning columns)
+    // 2. Numeric content (data rows)
+    // 3. No form label patterns
+
+    let total_cols = cells[0].len();
+    let mut first_table_row = 0;
+
+    for (row_idx, row) in cells.iter().enumerate() {
+        let filled_cells: Vec<&String> = row.iter().filter(|c| !c.trim().is_empty()).collect();
+        let filled_count = filled_cells.len();
+        let fill_ratio = filled_count as f32 / total_cols as f32;
+
+        // Check for form-like patterns (cells with colons)
+        let has_form_patterns = filled_cells.iter().any(|c| {
+            let text = c.trim();
+            (text.ends_with(':') && text.len() > 1)
+                || (text.contains(": ") && !looks_like_number(text))
+        });
+
+        // Check for numeric content
+        let numeric_count = filled_cells
+            .iter()
+            .filter(|c| looks_like_number(c.trim()))
+            .count();
+        let has_data = numeric_count >= 2;
+
+        // Skip rows with form patterns (regardless of density)
+        if has_form_patterns {
+            continue;
+        }
+
+        // Data rows are definitely table content
+        if has_data {
+            first_table_row = row_idx;
+            break;
+        }
+
+        // Dense rows without form patterns are likely table headers
+        if fill_ratio >= 0.4 {
+            first_table_row = row_idx;
+            break;
+        }
+
+        // Very sparse rows at the start are likely metadata - skip them
+        if fill_ratio < 0.3 {
+            continue;
+        }
+
+        // Moderately sparse row without form patterns - could be multi-line header
+        // Look ahead to decide
+        if row_idx + 1 < cells.len() {
+            let next_row = &cells[row_idx + 1];
+            let next_filled = next_row.iter().filter(|c| !c.trim().is_empty()).count();
+            let next_fill_ratio = next_filled as f32 / total_cols as f32;
+            let next_has_form = next_row.iter().any(|c| {
+                let text = c.trim();
+                (text.ends_with(':') && text.len() > 1)
+                    || (text.contains(": ") && !looks_like_number(text))
+            });
+
+            // If next row is dense or has data (and no form patterns), this row starts the table
+            if (next_fill_ratio >= 0.4 || next_row.iter().filter(|c| looks_like_number(c.trim())).count() >= 2)
+                && !next_has_form
+            {
+                first_table_row = row_idx;
+                break;
+            }
+        }
+
+        // Otherwise skip this sparse row
+    }
+
+    // Collect item indices from excluded rows
+    if first_table_row > 0 {
+        let y_tolerance = 15.0;
+        for (idx, item) in original_items {
+            // Check if this item is in one of the excluded rows
+            for row_y in rows.iter().take(first_table_row) {
+                if (item.y - *row_y).abs() < y_tolerance {
+                    excluded_items.insert(*idx);
+                    break;
+                }
+            }
+        }
+    }
+
+    (first_table_row, excluded_items)
+}
+
 /// Check if a cell value indicates a footnote row
 fn is_footnote_row(text: &str) -> bool {
     let trimmed = text.trim();
@@ -526,19 +815,34 @@ mod tests {
 
     #[test]
     fn test_table_detection() {
+        // Create a more realistic table with numeric data (like grades)
         let items = vec![
-            make_item("Header 1", 100.0, 500.0, 8.0),
-            make_item("Header 2", 200.0, 500.0, 8.0),
-            make_item("Cell 1", 100.0, 480.0, 8.0),
-            make_item("Cell 2", 200.0, 480.0, 8.0),
-            make_item("Cell 3", 100.0, 460.0, 8.0),
-            make_item("Cell 4", 200.0, 460.0, 8.0),
+            // Header row
+            make_item("Subject", 100.0, 500.0, 8.0),
+            make_item("Q1", 200.0, 500.0, 8.0),
+            make_item("Q2", 280.0, 500.0, 8.0),
+            make_item("Q3", 360.0, 500.0, 8.0),
+            // Data row 1
+            make_item("Math", 100.0, 480.0, 8.0),
+            make_item("9.0", 200.0, 480.0, 8.0),
+            make_item("8.5", 280.0, 480.0, 8.0),
+            make_item("9.5", 360.0, 480.0, 8.0),
+            // Data row 2
+            make_item("Science", 100.0, 460.0, 8.0),
+            make_item("8.0", 200.0, 460.0, 8.0),
+            make_item("9.0", 280.0, 460.0, 8.0),
+            make_item("8.5", 360.0, 460.0, 8.0),
+            // Data row 3
+            make_item("English", 100.0, 440.0, 8.0),
+            make_item("9.5", 200.0, 440.0, 8.0),
+            make_item("9.0", 280.0, 440.0, 8.0),
+            make_item("9.5", 360.0, 440.0, 8.0),
         ];
 
         let tables = detect_tables(&items, 10.0);
         assert_eq!(tables.len(), 1);
-        assert_eq!(tables[0].columns.len(), 2);
-        assert_eq!(tables[0].rows.len(), 3);
+        assert_eq!(tables[0].columns.len(), 4);
+        assert_eq!(tables[0].rows.len(), 4);
     }
 
     #[test]
