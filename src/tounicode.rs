@@ -106,7 +106,8 @@ impl ToUnicodeCMap {
             chars.next(); // consume >
 
             // Parse and store mapping
-            if let (Some(src), Some(dst)) = (parse_hex_u16(&src_hex), hex_to_unicode_string(&dst_hex))
+            if let (Some(src), Some(dst)) =
+                (parse_hex_u16(&src_hex), hex_to_unicode_string(&dst_hex))
             {
                 self.char_map.insert(src, dst);
             }
@@ -345,7 +346,9 @@ pub fn extract_tounicode_cmaps(pdf_bytes: &[u8]) -> HashMap<u32, ToUnicodeCMap> 
 
         // Skip whitespace
         let mut p = ref_start;
-        while p < pdf_bytes.len() && (pdf_bytes[p] == b' ' || pdf_bytes[p] == b'\n' || pdf_bytes[p] == b'\r') {
+        while p < pdf_bytes.len()
+            && (pdf_bytes[p] == b' ' || pdf_bytes[p] == b'\n' || pdf_bytes[p] == b'\r')
+        {
             p += 1;
         }
 
@@ -376,6 +379,8 @@ pub fn extract_tounicode_cmaps(pdf_bytes: &[u8]) -> HashMap<u32, ToUnicodeCMap> 
 pub struct FontCMaps {
     /// Map of font name (e.g., "FNotoSans0") to ToUnicodeCMap
     pub by_name: HashMap<String, ToUnicodeCMap>,
+    /// Map of ToUnicode object number to CMap (for direct lookup)
+    pub by_obj_num: HashMap<u32, ToUnicodeCMap>,
 }
 
 impl FontCMaps {
@@ -400,8 +405,8 @@ impl FontCMaps {
 
                 // Search backwards and forwards for << and >>
                 let dict_start = find_dict_start(&pdf_bytes[..font_start]);
-                let dict_end = find_pattern(&pdf_bytes[font_start..], b">>")
-                    .map(|e| font_start + e + 2);
+                let dict_end =
+                    find_pattern(&pdf_bytes[font_start..], b">>").map(|e| font_start + e + 2);
 
                 if let (Some(start), Some(end)) = (dict_start, dict_end) {
                     let dict_region = &pdf_bytes[start..end];
@@ -413,6 +418,11 @@ impl FontCMaps {
                             let ref_part = &dict_region[tounicode_idx + 10..];
                             if let Some(obj_num) = extract_obj_reference(ref_part) {
                                 if let Some(cmap) = cmaps_by_obj.get(&obj_num) {
+                                    // Use combined key to handle multiple fonts with same BaseFont
+                                    let unique_key = format!("{}_{}", font_name, obj_num);
+                                    by_name.insert(unique_key, cmap.clone());
+                                    // Also keep base font name for backwards compatibility
+                                    // (last one wins, but that's better than nothing)
                                     by_name.insert(font_name, cmap.clone());
                                 }
                             }
@@ -426,7 +436,13 @@ impl FontCMaps {
             }
         }
 
-        FontCMaps { by_name }
+        // Copy the by_obj map
+        let by_obj_num = cmaps_by_obj;
+
+        FontCMaps {
+            by_name,
+            by_obj_num,
+        }
     }
 
     /// Get a CMap for a font name
@@ -446,6 +462,22 @@ impl FontCMaps {
 
         None
     }
+
+    /// Get a CMap by ToUnicode object number
+    pub fn get_by_obj(&self, obj_num: u32) -> Option<&ToUnicodeCMap> {
+        self.by_obj_num.get(&obj_num)
+    }
+
+    /// Get a CMap for a base font name with specific ToUnicode object number
+    pub fn get_with_obj(&self, font_name: &str, obj_num: u32) -> Option<&ToUnicodeCMap> {
+        // Try the unique key first
+        let unique_key = format!("{}_{}", font_name, obj_num);
+        if let Some(cmap) = self.by_name.get(&unique_key) {
+            return Some(cmap);
+        }
+        // Fall back to direct object lookup
+        self.by_obj_num.get(&obj_num)
+    }
 }
 
 /// Find the start of a dictionary (<<) searching backwards from a position
@@ -464,7 +496,7 @@ fn extract_font_name(dict: &[u8]) -> Option<String> {
     // Look for /BaseFont /Name
     if let Some(idx) = find_pattern(dict, b"/BaseFont") {
         let after = &dict[idx + 9..]; // "/BaseFont" is 9 chars
-        // Skip whitespace
+                                      // Skip whitespace
         let mut p = 0;
         while p < after.len() && (after[p] == b' ' || after[p] == b'\n' || after[p] == b'\r') {
             p += 1;
@@ -473,7 +505,11 @@ fn extract_font_name(dict: &[u8]) -> Option<String> {
         if p < after.len() && after[p] == b'/' {
             p += 1;
             let mut name = String::new();
-            while p < after.len() && !after[p].is_ascii_whitespace() && after[p] != b'/' && after[p] != b'>' {
+            while p < after.len()
+                && !after[p].is_ascii_whitespace()
+                && after[p] != b'/'
+                && after[p] != b'>'
+            {
                 name.push(after[p] as char);
                 p += 1;
             }

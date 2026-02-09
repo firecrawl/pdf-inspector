@@ -36,6 +36,9 @@ pub struct PdfTypeResult {
     pub confidence: f32,
     /// Title from metadata (if available)
     pub title: Option<String>,
+    /// Whether OCR is recommended for better extraction
+    /// True when images provide essential context (e.g., template-based PDFs)
+    pub ocr_recommended: bool,
 }
 
 /// Configuration for PDF type detection
@@ -140,6 +143,7 @@ fn detect_from_document(
 
     let mut pages_with_text = 0u32;
     let mut pages_with_images = 0u32;
+    let mut pages_with_template_images = 0u32;
     let mut total_text_ops = 0u32;
 
     for page_num in &sample_indices {
@@ -150,6 +154,9 @@ fn detect_from_document(
             }
             if analysis.has_images {
                 pages_with_images += 1;
+            }
+            if analysis.has_template_image {
+                pages_with_template_images += 1;
             }
             total_text_ops += analysis.text_operator_count;
         }
@@ -162,20 +169,44 @@ fn detect_from_document(
         0.0
     };
 
+    // Check if this is a template-based PDF (images provide essential context)
+    // Template PDFs have text AND large background images on most pages
+    let has_template_images = pages_with_template_images > 0;
+    let template_ratio = if pages_sampled > 0 {
+        pages_with_template_images as f32 / pages_sampled as f32
+    } else {
+        0.0
+    };
+
+    // OCR is recommended when:
+    // 1. Template images are present (text alone is insufficient), OR
+    // 2. PDF is scanned/image-based
+    let ocr_recommended: bool;
+
     // Classification logic
-    let (pdf_type, confidence) = if text_ratio >= config.text_page_ratio_threshold {
+    let (pdf_type, confidence) = if has_template_images && pages_with_text > 0 {
+        // Template-based PDF: has text but images provide essential context
+        // Classify as Mixed with lower confidence
+        ocr_recommended = true;
+        (PdfType::Mixed, 0.5 + (0.3 * (1.0 - template_ratio)))
+    } else if text_ratio >= config.text_page_ratio_threshold {
+        ocr_recommended = false;
         (PdfType::TextBased, text_ratio)
     } else if pages_with_text == 0 && pages_with_images > 0 {
+        ocr_recommended = true;
         if total_text_ops == 0 {
             (PdfType::Scanned, 0.95)
         } else {
             (PdfType::ImageBased, 0.8)
         }
     } else if pages_with_text > 0 && pages_with_images > 0 {
+        ocr_recommended = true;
         (PdfType::Mixed, 0.7)
     } else if total_text_ops == 0 {
+        ocr_recommended = true;
         (PdfType::Scanned, 0.9)
     } else {
+        ocr_recommended = false;
         (PdfType::TextBased, text_ratio.max(0.5))
     };
 
@@ -189,6 +220,7 @@ fn detect_from_document(
         pages_with_text,
         confidence,
         title,
+        ocr_recommended,
     })
 }
 
@@ -196,6 +228,11 @@ fn detect_from_document(
 struct PageAnalysis {
     text_operator_count: u32,
     has_images: bool,
+    /// Whether page has a large background/template image (>50% coverage)
+    has_template_image: bool,
+    /// Total image area in pixels (reserved for future use)
+    #[allow(dead_code)]
+    total_image_area: u64,
 }
 
 /// Analyze a page's content stream for text operators and images
@@ -221,14 +258,18 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         }
     }
 
-    // Also check for XObject images in page resources
-    if !has_images {
-        has_images = page_has_images(doc, page_id);
+    // Check for XObject images and calculate coverage
+    let (found_images, total_image_area, has_template_image) = analyze_page_images(doc, page_id);
+
+    if found_images {
+        has_images = true;
     }
 
     PageAnalysis {
         text_operator_count: text_ops,
         has_images,
+        has_template_image,
+        total_image_area,
     }
 }
 
@@ -278,10 +319,22 @@ fn scan_content_for_text_operators(content: &[u8]) -> (u32, bool) {
     (text_ops, has_images)
 }
 
-/// Check if page has image XObjects in resources
-fn page_has_images(doc: &Document, page_id: ObjectId) -> bool {
+/// Analyze page images: returns (has_images, total_area, has_template_image)
+///
+/// A template image is one that covers >50% of a standard page area.
+/// Standard page: 612x792 points (US Letter) = ~485,000 sq points
+/// At 2x resolution that's ~1.9M pixels, so we use 250K pixels as threshold
+/// (accounting for varying DPI and page sizes)
+fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
+    // Threshold: image covering roughly half a page at 150+ DPI
+    // 612 * 792 / 2 * (150/72)^2 ≈ 1M pixels, but we'll be conservative
+    const TEMPLATE_IMAGE_THRESHOLD: u64 = 500_000; // 500K pixels
+
+    let mut has_images = false;
+    let mut total_area: u64 = 0;
+    let mut has_template_image = false;
+
     if let Ok(page_dict) = doc.get_dictionary(page_id) {
-        // Get Resources
         let resources = match page_dict.get(b"Resources") {
             Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
             Ok(Object::Dictionary(dict)) => Some(dict),
@@ -289,7 +342,6 @@ fn page_has_images(doc: &Document, page_id: ObjectId) -> bool {
         };
 
         if let Some(resources) = resources {
-            // Check XObject dictionary
             if let Ok(xobject) = resources.get(b"XObject") {
                 let xobject_dict = match xobject {
                     Object::Reference(id) => doc.get_dictionary(*id).ok(),
@@ -306,7 +358,31 @@ fn page_has_images(doc: &Document, page_id: ObjectId) -> bool {
                                     if let Ok(subtype) = stream.dict.get(b"Subtype") {
                                         if let Ok(name) = subtype.as_name() {
                                             if name == b"Image" {
-                                                return true;
+                                                has_images = true;
+
+                                                // Get image dimensions
+                                                let width = stream
+                                                    .dict
+                                                    .get(b"Width")
+                                                    .ok()
+                                                    .and_then(|w| w.as_i64().ok())
+                                                    .unwrap_or(0)
+                                                    as u64;
+                                                let height = stream
+                                                    .dict
+                                                    .get(b"Height")
+                                                    .ok()
+                                                    .and_then(|h| h.as_i64().ok())
+                                                    .unwrap_or(0)
+                                                    as u64;
+
+                                                let area = width * height;
+                                                total_area += area;
+
+                                                // Check if this is a large template image
+                                                if area >= TEMPLATE_IMAGE_THRESHOLD {
+                                                    has_template_image = true;
+                                                }
                                             }
                                         }
                                     }
@@ -319,7 +395,7 @@ fn page_has_images(doc: &Document, page_id: ObjectId) -> bool {
         }
     }
 
-    false
+    (has_images, total_area, has_template_image)
 }
 
 /// Get document title from Info dictionary

@@ -25,7 +25,7 @@ fn main() {
 
             if json_output {
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},"title":{},"detection_time_ms":{}}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},"title":{},"ocr_recommended":{},"detection_time_ms":{}}}"#,
                     match result.pdf_type {
                         PdfType::TextBased => "text_based",
                         PdfType::Scanned => "scanned",
@@ -41,6 +41,7 @@ fn main() {
                         .as_ref()
                         .map(|t| format!("\"{}\"", t.replace('"', "\\\"")))
                         .unwrap_or_else(|| "null".to_string()),
+                    result.ocr_recommended,
                     elapsed.as_millis()
                 );
             } else {
@@ -62,6 +63,10 @@ fn main() {
                 println!("Page count: {}", result.page_count);
                 println!("Pages sampled: {}", result.pages_sampled);
                 println!("Pages with text: {}", result.pages_with_text);
+                println!(
+                    "OCR recommended: {}",
+                    if result.ocr_recommended { "YES" } else { "NO" }
+                );
                 if let Some(title) = &result.title {
                     println!("Title: {}", title);
                 }
@@ -70,21 +75,23 @@ fn main() {
                 println!();
 
                 // Recommendations
-                match result.pdf_type {
-                    PdfType::TextBased => {
-                        println!("Recommendation: Use direct text extraction (fast)");
+                if result.ocr_recommended {
+                    match result.pdf_type {
+                        PdfType::Mixed => {
+                            println!("Recommendation: Use OCR - images provide essential context (template PDF)");
+                        }
+                        PdfType::Scanned => {
+                            println!("Recommendation: Use OCR (MinerU or similar)");
+                        }
+                        PdfType::ImageBased => {
+                            println!("Recommendation: Use OCR for best results");
+                        }
+                        _ => {
+                            println!("Recommendation: Use OCR for complete extraction");
+                        }
                     }
-                    PdfType::Scanned => {
-                        println!("Recommendation: Use OCR (MinerU or similar)");
-                    }
-                    PdfType::ImageBased => {
-                        println!("Recommendation: Use OCR for best results");
-                    }
-                    PdfType::Mixed => {
-                        println!(
-                            "Recommendation: Try text extraction first, use OCR for image pages"
-                        );
-                    }
+                } else {
+                    println!("Recommendation: Use direct text extraction (fast)");
                 }
             }
         }

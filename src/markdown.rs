@@ -866,10 +866,9 @@ fn remove_page_numbers(text: &str) -> String {
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
 
-        // Check if this line is just a number (1-4 digits)
-        if trimmed.len() <= 4 && !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit())
-        {
-            // Check context to determine if this is a page number
+        // Check for page number patterns
+        if is_page_number_line(trimmed) {
+            // Check context to determine if this is isolated
             let prev_is_break = i > 0 && lines[i - 1].trim() == "---";
             let next_is_break = i + 1 < lines.len() && lines[i + 1].trim() == "---";
             let prev_is_empty = i > 0 && lines[i - 1].trim().is_empty();
@@ -880,7 +879,6 @@ fn remove_page_numbers(text: &str) -> String {
                 && (next_is_break || next_is_empty || i + 1 == lines.len());
 
             // Also remove numbers that appear right before a page break
-            // (common pattern: content ends, page number, then ---)
             let before_break = i + 1 < lines.len()
                 && (lines[i + 1].trim() == "---"
                     || (i + 2 < lines.len()
@@ -896,6 +894,69 @@ fn remove_page_numbers(text: &str) -> String {
     }
 
     result.join("\n")
+}
+
+/// Check if a line looks like a page number
+fn is_page_number_line(trimmed: &str) -> bool {
+    // Empty lines are not page numbers
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Pattern 1: Just a number (1-4 digits)
+    if trimmed.len() <= 4 && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+
+    // Pattern 2: "Page X of Y" or "Page X" or "Page   of" (placeholder)
+    let lower = trimmed.to_lowercase();
+    if let Some(rest) = lower.strip_prefix("page") {
+        let rest = rest.trim();
+        // "Page   of" (empty page numbers)
+        if rest == "of" || rest.starts_with("of ") {
+            return true;
+        }
+        // "Page X" or "Page X of Y"
+        if rest
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Just "Page" followed by whitespace and maybe "of"
+        if rest.is_empty()
+            || rest
+                .split_whitespace()
+                .all(|w| w == "of" || w.chars().all(|c| c.is_ascii_digit()))
+        {
+            return true;
+        }
+    }
+
+    // Pattern 3: "X of Y" where X and Y are numbers
+    if let Some(of_idx) = trimmed.find(" of ") {
+        let before = trimmed[..of_idx].trim();
+        let after = trimmed[of_idx + 4..].trim();
+        if before.chars().all(|c| c.is_ascii_digit())
+            && after.chars().all(|c| c.is_ascii_digit())
+            && !before.is_empty()
+            && !after.is_empty()
+        {
+            return true;
+        }
+    }
+
+    // Pattern 4: "- X -" centered page number
+    if trimmed.starts_with('-') && trimmed.ends_with('-') {
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if inner.chars().all(|c| c.is_ascii_digit()) && !inner.is_empty() {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Convert URLs to markdown links

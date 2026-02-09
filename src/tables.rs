@@ -251,7 +251,12 @@ fn is_key_value_layout(cells: &[Vec<String>]) -> bool {
 
         // Check if first column looks like a label (ends with : or is all caps)
         let first = row.first().map(|s| s.trim()).unwrap_or("");
-        if first.ends_with(':') || (first.len() > 3 && first.chars().all(|c| c.is_uppercase() || c.is_whitespace() || c == '(' || c == ')')) {
+        if first.ends_with(':')
+            || (first.len() > 3
+                && first
+                    .chars()
+                    .all(|c| c.is_uppercase() || c.is_whitespace() || c == '(' || c == ')'))
+        {
             label_like_first_col += 1;
         }
     }
@@ -339,7 +344,8 @@ fn looks_like_number(s: &str) -> bool {
     }
 
     // Handle common number formats: 9.0, 10, 8.6, etc.
-    s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',' || c == '-' || c == '+')
+    s.chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == ',' || c == '-' || c == '+')
         && s.chars().any(|c| c.is_ascii_digit())
 }
 
@@ -654,11 +660,7 @@ fn find_first_table_row(
     // Build string cells for analysis
     let cells: Vec<Vec<String>> = cell_items
         .iter()
-        .map(|row| {
-            row.iter()
-                .map(|col| join_cell_items(col))
-                .collect()
-        })
+        .map(|row| row.iter().map(|col| join_cell_items(col)).collect())
         .collect();
 
     if cells.is_empty() {
@@ -733,7 +735,12 @@ fn find_first_table_row(
             });
 
             // If next row is dense or has data (and no form patterns), this row starts the table
-            if (next_fill_ratio >= 0.4 || next_row.iter().filter(|c| looks_like_number(c.trim())).count() >= 2)
+            if (next_fill_ratio >= 0.4
+                || next_row
+                    .iter()
+                    .filter(|c| looks_like_number(c.trim()))
+                    .count()
+                    >= 2)
                 && !next_has_form
             {
                 first_table_row = row_idx;

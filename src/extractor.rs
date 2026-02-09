@@ -63,19 +63,26 @@ impl TextLine {
                 // Previous item was subscript/superscript (returning to normal size)
                 let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
 
-                // Detect word fragments that should be joined without space
-                // This happens when a word is broken across text elements
-                // e.g., "ve" + "ntos" should become "ventos" not "ve ntos"
-                let is_word_fragment = is_word_continuation(&result, text);
+                // Use position-based spacing detection
+                // This is more reliable than character-case heuristics for determining
+                // whether text fragments should be joined (e.g., "CONST" + "ANCIA" → "CONSTANCIA")
+                let should_join = should_join_items(prev_item, item);
+
+                // Check if space already exists to avoid double spaces
+                let prev_ends_with_space = result.ends_with(' ');
+                let curr_starts_with_space = text.starts_with(' ');
+                let space_already_exists = prev_ends_with_space || curr_starts_with_space;
 
                 if prev_ends_with_hyphen
                     || curr_is_hyphen
                     || curr_starts_with_hyphen
                     || is_sub_super
                     || was_sub_super
-                    || is_word_fragment
+                    || should_join
+                    || space_already_exists
                 {
-                    // No space for hyphenated words, subscript/superscript, or word fragments
+                    // No space for hyphenated words, subscript/superscript, closely positioned items,
+                    // or when space already exists
                     result.push_str(text);
                 } else {
                     result.push(' ');
@@ -87,38 +94,81 @@ impl TextLine {
     }
 }
 
-/// Check if the current text is a continuation of a word from the previous text
-/// Returns true if the items should be joined without a space
-fn is_word_continuation(prev_text: &str, curr_text: &str) -> bool {
-    // Get the last character of previous text (excluding trailing spaces)
-    let prev_trimmed = prev_text.trim_end();
-    let last_char = match prev_trimmed.chars().last() {
-        Some(c) => c,
-        None => return false,
-    };
+/// Determine if two adjacent text items should be joined without a space
+/// based on their physical positions on the page and character case.
+/// Uses a hybrid approach: position-based with case-aware thresholds.
+fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
+    // If either text explicitly has leading/trailing spaces, respect them
+    if prev_item.text.ends_with(' ') || curr_item.text.starts_with(' ') {
+        return false;
+    }
 
-    // Get the first character of current text (excluding leading spaces)
-    let curr_trimmed = curr_text.trim_start();
-    let first_char = match curr_trimmed.chars().next() {
-        Some(c) => c,
-        None => return false,
-    };
+    // Get the last character of previous and first character of current
+    let prev_last = prev_item.text.trim_end().chars().last();
+    let curr_first = curr_item.text.trim_start().chars().next();
 
-    // If previous ends with a letter and current starts with a lowercase letter,
-    // this is likely a word fragment that should be joined
-    // e.g., "ve" + "ntos" -> "ventos"
-    if last_char.is_alphabetic() && first_char.is_lowercase() {
-        // Additional check: previous should not end with a space
-        // and current should not start with a space in the original
-        let prev_ends_with_space = prev_text.ends_with(' ');
-        let curr_starts_with_space = curr_text.starts_with(' ');
-
-        if !prev_ends_with_space && !curr_starts_with_space {
+    // Always join if current starts with punctuation that typically follows without space
+    // e.g., "www" + ".com" → "www.com", not "www .com"
+    if let Some(c) = curr_first {
+        if matches!(c, '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}' | '\'') {
             return true;
         }
     }
 
-    false
+    // After colons, add space if followed by alphanumeric (typical label:value pattern)
+    // e.g., "Clave:" + "T9N2I6" → "Clave: T9N2I6"
+    if let (Some(p), Some(c)) = (prev_last, curr_first) {
+        if p == ':' && c.is_alphanumeric() {
+            return false;
+        }
+    }
+
+    // Estimate the average character width from font size
+    // Use a conservative estimate (0.45) since fonts vary
+    let char_width = prev_item.font_size * 0.45;
+
+    // Estimate the width of the previous text
+    let prev_text_len = prev_item.text.chars().count() as f32;
+    let estimated_prev_width = if prev_item.width > 0.0 {
+        prev_item.width // Use actual width if available
+    } else {
+        prev_text_len * char_width
+    };
+
+    // Calculate expected end position of previous item
+    let prev_end_x = prev_item.x + estimated_prev_width;
+
+    // Calculate gap between items
+    let gap = curr_item.x - prev_end_x;
+
+    // Use different thresholds based on character case
+    // Same-case sequences (ALL CAPS or all lowercase) are more likely to be
+    // word fragments that got split. Mixed case suggests word boundaries.
+    match (prev_last, curr_first) {
+        (Some(p), Some(c)) if p.is_alphabetic() && c.is_alphabetic() => {
+            let same_case =
+                (p.is_uppercase() && c.is_uppercase()) || (p.is_lowercase() && c.is_lowercase());
+            if same_case {
+                // Same case: use generous threshold (likely same word fragment)
+                // e.g., "CONST" + "ANCIA" → "CONSTANCIA"
+                gap < char_width * 0.8
+            } else if p.is_lowercase() && c.is_uppercase() {
+                // Lowercase to uppercase transition (e.g., "presente" → "CONSTANCIA")
+                // This is typically a word boundary. In Spanish/English, words don't
+                // transition from lowercase to uppercase mid-word.
+                // Always add a space for this case, regardless of position.
+                false
+            } else {
+                // Uppercase to lowercase (e.g., "REGISTRO" → "para")
+                // Use stricter threshold (likely word boundary)
+                gap < char_width * 0.3
+            }
+        }
+        _ => {
+            // Non-alphabetic: use moderate threshold
+            gap < char_width * 0.5
+        }
+    }
 }
 
 /// Extract text from PDF file as plain string
@@ -207,15 +257,23 @@ fn extract_page_text_items(
     // Get fonts for encoding
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
 
-    // Build a map of font resource names to their base font names (for CMap lookup)
+    // Build maps of font resource names to their base font names and ToUnicode object refs
     let mut font_base_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut font_tounicode_refs: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
     for (font_name, font_dict) in &fonts {
         let resource_name = String::from_utf8_lossy(font_name).to_string();
         if let Ok(base_font) = font_dict.get(b"BaseFont") {
             if let Ok(name) = base_font.as_name() {
                 let base_name = String::from_utf8_lossy(name).to_string();
-                font_base_names.insert(resource_name, base_name);
+                font_base_names.insert(resource_name.clone(), base_name);
+            }
+        }
+        // Track ToUnicode object reference
+        if let Ok(tounicode) = font_dict.get(b"ToUnicode") {
+            if let Ok(obj_ref) = tounicode.as_reference() {
+                font_tounicode_refs.insert(resource_name, obj_ref.0 as u32);
             }
         }
     }
@@ -322,6 +380,7 @@ fn extract_page_text_items(
                         &current_font,
                         font_cmaps,
                         &font_base_names,
+                        &font_tounicode_refs,
                     ) {
                         if !text.trim().is_empty() {
                             let rendered_size =
@@ -356,6 +415,7 @@ fn extract_page_text_items(
                                 &current_font,
                                 font_cmaps,
                                 &font_base_names,
+                                &font_tounicode_refs,
                             ) {
                                 combined_text.push_str(&text);
                             }
@@ -392,6 +452,7 @@ fn extract_page_text_items(
                         &current_font,
                         font_cmaps,
                         &font_base_names,
+                        &font_tounicode_refs,
                     ) {
                         if !text.trim().is_empty() {
                             let rendered_size =
@@ -450,13 +511,36 @@ fn extract_text_from_operand(
     current_font: &str,
     font_cmaps: &FontCMaps,
     font_base_names: &std::collections::HashMap<String, String>,
+    font_tounicode_refs: &std::collections::HashMap<String, u32>,
 ) -> Option<String> {
     if let Object::String(bytes, _) = obj {
-        // First, check if this font has a ToUnicode CMap we can use
-        // This is especially important for Identity-H encoded fonts (Type0/CIDFont)
+        // First, try to look up CMap by ToUnicode object reference (most reliable)
+        // This handles cases where multiple fonts have the same BaseFont but different ToUnicode
+        if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
+            if let Some(cmap) = font_cmaps.get_by_obj(obj_num) {
+                let decoded = cmap.decode_cids(bytes);
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+        }
+
+        // Fall back to base name lookup with object number
+        if let (Some(base_name), Some(&obj_num)) = (
+            font_base_names.get(current_font),
+            font_tounicode_refs.get(current_font),
+        ) {
+            if let Some(cmap) = font_cmaps.get_with_obj(base_name, obj_num) {
+                let decoded = cmap.decode_cids(bytes);
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+        }
+
+        // Try base name only (legacy fallback)
         if let Some(base_name) = font_base_names.get(current_font) {
             if let Some(cmap) = font_cmaps.get(base_name) {
-                // Use the ToUnicode CMap to decode CID bytes
                 let decoded = cmap.decode_cids(bytes);
                 if !decoded.is_empty() {
                     return Some(decoded);
