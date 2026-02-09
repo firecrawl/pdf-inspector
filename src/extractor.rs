@@ -62,13 +62,19 @@ impl TextLine {
                 // Previous item was subscript/superscript (returning to normal size)
                 let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
 
+                // Detect word fragments that should be joined without space
+                // This happens when a word is broken across text elements
+                // e.g., "ve" + "ntos" should become "ventos" not "ve ntos"
+                let is_word_fragment = is_word_continuation(&result, text);
+
                 if prev_ends_with_hyphen
                     || curr_is_hyphen
                     || curr_starts_with_hyphen
                     || is_sub_super
                     || was_sub_super
+                    || is_word_fragment
                 {
-                    // No space for hyphenated words or subscript/superscript
+                    // No space for hyphenated words, subscript/superscript, or word fragments
                     result.push_str(text);
                 } else {
                     result.push(' ');
@@ -78,6 +84,40 @@ impl TextLine {
         }
         result
     }
+}
+
+/// Check if the current text is a continuation of a word from the previous text
+/// Returns true if the items should be joined without a space
+fn is_word_continuation(prev_text: &str, curr_text: &str) -> bool {
+    // Get the last character of previous text (excluding trailing spaces)
+    let prev_trimmed = prev_text.trim_end();
+    let last_char = match prev_trimmed.chars().last() {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // Get the first character of current text (excluding leading spaces)
+    let curr_trimmed = curr_text.trim_start();
+    let first_char = match curr_trimmed.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // If previous ends with a letter and current starts with a lowercase letter,
+    // this is likely a word fragment that should be joined
+    // e.g., "ve" + "ntos" -> "ventos"
+    if last_char.is_alphabetic() && first_char.is_lowercase() {
+        // Additional check: previous should not end with a space
+        // and current should not start with a space in the original
+        let prev_ends_with_space = prev_text.ends_with(' ');
+        let curr_starts_with_space = curr_text.starts_with(' ');
+
+        if !prev_ends_with_space && !curr_starts_with_space {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Extract text from PDF file as plain string

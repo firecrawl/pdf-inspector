@@ -264,7 +264,7 @@ fn to_markdown_from_lines_with_tables(
 
         // Paragraph break (large Y gap)
         let y_gap = prev_y - line.y;
-        let is_para_break = y_gap > base_size * 2.0;
+        let is_para_break = y_gap > base_size * 1.8; // Slightly lower threshold
         if is_para_break {
             if in_paragraph {
                 output.push_str("\n\n");
@@ -280,6 +280,18 @@ fn to_markdown_from_lines_with_tables(
         let trimmed = text.trim();
 
         if trimmed.is_empty() {
+            continue;
+        }
+
+        // Detect figure/table captions and source citations
+        // These should be on their own line followed by a paragraph break
+        if is_caption_line(trimmed) {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+            }
+            output.push_str(trimmed);
+            output.push_str("\n\n");
             continue;
         }
 
@@ -395,7 +407,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
         // Paragraph break (large Y gap)
         let y_gap = prev_y - line.y;
-        let is_para_break = y_gap > base_size * 2.0;
+        let is_para_break = y_gap > base_size * 1.8; // Slightly lower threshold
         if is_para_break {
             if in_paragraph {
                 output.push_str("\n\n");
@@ -411,6 +423,18 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         let trimmed = text.trim();
 
         if trimmed.is_empty() {
+            continue;
+        }
+
+        // Detect figure/table captions and source citations
+        // These should be on their own line followed by a paragraph break
+        if is_caption_line(trimmed) {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+            }
+            output.push_str(trimmed);
+            output.push_str("\n\n");
             continue;
         }
 
@@ -603,6 +627,50 @@ fn detect_header_level(font_size: f32, base_size: f32) -> Option<usize> {
     } else {
         None // Regular text
     }
+}
+
+/// Check if text is a figure/table caption or source citation
+fn is_caption_line(text: &str) -> bool {
+    let trimmed = text.trim();
+
+    // Common caption prefixes in multiple languages
+    let caption_prefixes = [
+        "Figure ",
+        "Figura ",
+        "Fig. ",
+        "Fig ",
+        "Table ",
+        "Tabela ",
+        "Source:",
+        "Fonte:",
+        "Source ",
+        "Fonte ",
+        "Note:",
+        "Nota:",
+        "Chart ",
+        "Gráfico ",
+        "Graph ",
+        "Diagram ",
+        "Image ",
+        "Imagem ",
+        "Photo ",
+        "Foto ",
+    ];
+
+    // Check if line starts with a caption prefix
+    for prefix in &caption_prefixes {
+        if trimmed.starts_with(prefix) {
+            return true;
+        }
+    }
+
+    // Check case-insensitive patterns
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("figure ") || lower.starts_with("table ") || lower.starts_with("source:") {
+        return true;
+    }
+
+    false
 }
 
 /// Check if text looks like a list item
