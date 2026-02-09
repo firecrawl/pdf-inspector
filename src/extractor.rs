@@ -273,7 +273,7 @@ fn extract_page_text_items(
         // Track ToUnicode object reference
         if let Ok(tounicode) = font_dict.get(b"ToUnicode") {
             if let Ok(obj_ref) = tounicode.as_reference() {
-                font_tounicode_refs.insert(resource_name, obj_ref.0 as u32);
+                font_tounicode_refs.insert(resource_name, obj_ref.0);
             }
         }
     }
