@@ -2,220 +2,77 @@
 
 Fast Rust library for PDF inspection, classification, and text extraction. Intelligently detects scanned vs text-based PDFs to enable smart routing decisions.
 
-## Features
+## Supported Features
 
-- **Smart Detection** - Detects scanned vs text-based PDFs in ~10-50ms by sampling content streams for text operators (`Tj`/`TJ`) without loading the full document
-- **Direct Extraction** - Text extraction using [lopdf](https://github.com/J-F-Liu/lopdf) with no external dependencies
-- **Structure Detection** - Headers (by font size), lists, code blocks (monospace fonts)
-- **CLI Tools** - `detect-pdf` and `pdf2md` binaries included
+| Category | Feature | Description |
+|----------|---------|-------------|
+| **Detection** | Fast Classification | ~10-50ms by sampling content streams |
+| | PDF Types | TextBased, Scanned, ImageBased, Mixed |
+| | Confidence Scoring | 0.0-1.0 scale for classification certainty |
+| | Configurable Thresholds | Tune sampling depth and detection sensitivity |
+| | Metadata Extraction | Document title from PDF Info dictionary |
+| **Text Extraction** | Plain Text | Direct extraction from text-based PDFs |
+| | Position-Aware | Text with X/Y coordinates, font info, page numbers |
+| | Multi-Column Support | Automatic detection and proper reading order |
+| | Text Encoding | UTF-16BE, UTF-8, and Latin-1 |
+| **Headers** | Auto Detection | H1-H4 based on font size ratios |
+| **Lists** | Bullet Points | `•`, `-`, `*`, `○`, `●`, `◦` |
+| | Numbered Lists | `1.`, `1)`, `(1)` |
+| | Letter Lists | `a.`, `a)`, `(a)` |
+| **Code Blocks** | Monospace Fonts | Courier, Consolas, Monaco, Menlo, Fira Code, JetBrains Mono |
+| | Keyword Detection | Language keywords and syntax patterns |
+| **Tables** | Region Detection | Automatic table boundary identification |
+| | Column/Row Detection | Position clustering for structure |
+| | Markdown Output | Proper alignment and formatting |
+| | Footnotes | Extraction and formatting |
+| **Text Processing** | Subscript/Superscript | Font size and Y-offset detection |
+| | Hyphenation Fixing | Rejoins words broken across lines |
+| | Page Number Filtering | Removes isolated page numbers |
+| | URL Formatting | Converts URLs to markdown links |
+| | Drop Cap Merging | Handles large initial letters |
 
-## Installation
+## Output Formats
 
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-pdf-inspector = { git = "https://github.com/firecrawl/pdf-inspector" }
-```
-
-## Usage
-
-### Quick Start
-
-The simplest way to convert a PDF to Markdown:
-
-```rust
-use pdf_inspector::process_pdf;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let result = process_pdf("document.pdf")?;
-
-    match result.pdf_type {
-        pdf_inspector::PdfType::TextBased => {
-            println!("Markdown:\n{}", result.markdown.unwrap());
-        }
-        pdf_inspector::PdfType::Scanned => {
-            println!("PDF is scanned - OCR required");
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-```
-
-### PDF Type Detection
-
-Quickly detect if a PDF is text-based or scanned without full extraction:
-
-```rust
-use pdf_inspector::{detect_pdf_type, PdfType};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let result = detect_pdf_type("document.pdf")?;
-
-    println!("Type: {:?}", result.pdf_type);
-    println!("Pages: {}", result.page_count);
-    println!("Confidence: {:.0}%", result.confidence * 100.0);
-
-    if let Some(title) = result.title {
-        println!("Title: {}", title);
-    }
-
-    match result.pdf_type {
-        PdfType::TextBased => println!("Ready for text extraction"),
-        PdfType::Scanned => println!("Needs OCR"),
-        PdfType::ImageBased => println!("Mostly images"),
-        PdfType::Mixed => println!("Mix of text and images"),
-    }
-
-    Ok(())
-}
-```
-
-### Text Extraction
-
-Extract plain text from a PDF:
-
-```rust
-use pdf_inspector::extract_text;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let text = extract_text("document.pdf")?;
-    println!("{}", text);
-    Ok(())
-}
-```
-
-### Extract Text with Position Information
-
-Get text items with position data for advanced processing:
-
-```rust
-use pdf_inspector::{extract_text_with_positions, TextItem};
-use pdf_inspector::extractor::group_into_lines;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let items = extract_text_with_positions("document.pdf")?;
-
-    for item in &items {
-        println!("'{}' at ({}, {}) size={}",
-            item.text, item.x, item.y, item.font_size);
-    }
-
-    // Group items into lines
-    let lines = group_into_lines(items);
-    for line in lines {
-        println!("Line: {}", line.text());
-    }
-
-    Ok(())
-}
-```
-
-### Custom Markdown Conversion
-
-Convert text to Markdown with custom options:
-
-```rust
-use pdf_inspector::{to_markdown, MarkdownOptions};
-
-fn main() {
-    let text = "• First item\n• Second item\n\nconst x = 5;";
-
-    // With all detection enabled (default)
-    let md = to_markdown(text, MarkdownOptions::default());
-    println!("{}", md);
-
-    // Disable code detection
-    let opts = MarkdownOptions {
-        detect_headers: true,
-        detect_lists: true,
-        detect_code: false,
-        base_font_size: None,
-    };
-    let md = to_markdown(text, opts);
-    println!("{}", md);
-}
-```
-
-### Processing from Memory
-
-All functions have memory buffer variants for processing PDFs already in memory:
-
-```rust
-use pdf_inspector::{process_pdf_mem, detector::detect_pdf_type_mem};
-use pdf_inspector::extractor::{extract_text_mem, extract_text_with_positions_mem};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let buffer = std::fs::read("document.pdf")?;
-
-    // Process from memory
-    let result = process_pdf_mem(&buffer)?;
-
-    // Or detect only
-    let detection = detect_pdf_type_mem(&buffer)?;
-
-    // Or extract text
-    let text = extract_text_mem(&buffer)?;
-
-    Ok(())
-}
-```
-
-### Custom Detection Configuration
-
-Fine-tune the detection algorithm:
-
-```rust
-use pdf_inspector::detector::{detect_pdf_type_with_config, DetectionConfig};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = DetectionConfig {
-        max_pages_to_sample: 10,        // Sample more pages
-        min_text_ops_per_page: 5,       // Require more text operators
-        text_page_ratio_threshold: 0.8, // Stricter text classification
-    };
-
-    let result = detect_pdf_type_with_config("document.pdf", config)?;
-    println!("{:?}", result.pdf_type);
-
-    Ok(())
-}
-```
+| Format | Description |
+|--------|-------------|
+| Markdown | Headers, lists, code blocks, tables, page breaks |
+| Plain Text | Basic text extraction |
+| JSON | Metadata with type, confidence, page count, timing |
+| Positioned Items | Low-level text with coordinates and font info |
 
 ## CLI Tools
 
-### pdf2md
+| Tool | Description |
+|------|-------------|
+| `pdf2md` | Convert PDF to Markdown (supports `--json` output) |
+| `detect-pdf` | Detect PDF type without conversion (supports `--json` output) |
 
-Convert a PDF to Markdown:
+## API Overview
 
-```bash
-# Output to stdout
-pdf2md document.pdf
+### Functions
 
-# Output to file
-pdf2md document.pdf output.md
+| Function | Description |
+|----------|-------------|
+| `process_pdf` / `process_pdf_mem` | Detect, extract, and convert to markdown |
+| `detect_pdf_type` / `detect_pdf_type_mem` | Fast type detection only |
+| `extract_text` / `extract_text_mem` | Plain text extraction |
+| `extract_text_with_positions` | Text with coordinates |
+| `to_markdown` | Convert text to markdown |
 
-# JSON output with metadata
-pdf2md document.pdf --json
-```
+### Types
 
-### detect-pdf
-
-Detect PDF type without conversion:
-
-```bash
-# Human-readable output
-detect-pdf document.pdf
-
-# JSON output
-detect-pdf document.pdf --json
-```
+| Type | Description |
+|------|-------------|
+| `PdfType` | `TextBased`, `Scanned`, `ImageBased`, `Mixed` |
+| `PdfProcessResult` | Full result with text, markdown, and metadata |
+| `PdfTypeResult` | Detection result with type, confidence, page count |
+| `TextItem` | Text with position, font info, and page number |
+| `TextLine` | Grouped items on the same line |
+| `MarkdownOptions` | Configuration for markdown conversion |
+| `DetectionConfig` | Configuration for PDF type detection |
+| `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure` |
 
 ## How Detection Works
-
-Instead of loading the entire PDF, we:
 
 1. Load only metadata (xref table, trailer, page count)
 2. Sample first ~5 pages' content streams
@@ -223,34 +80,6 @@ Instead of loading the entire PDF, we:
 4. Classify based on text operator presence
 
 This allows detecting 300+ page PDFs in milliseconds.
-
-## API Reference
-
-### Types
-
-| Type | Description |
-|------|-------------|
-| `PdfType` | Enum: `TextBased`, `Scanned`, `ImageBased`, `Mixed` |
-| `PdfProcessResult` | Full processing result with text, markdown, and metadata |
-| `PdfTypeResult` | Detection result with type, confidence, and page count |
-| `TextItem` | Text with position (x, y), font info, and page number |
-| `TextLine` | Group of `TextItem`s on the same line |
-| `MarkdownOptions` | Configuration for markdown conversion |
-| `DetectionConfig` | Configuration for PDF type detection |
-| `PdfError` | Error type: `Io`, `Parse`, `Encrypted`, `InvalidStructure` |
-
-### Functions
-
-| Function | Description |
-|----------|-------------|
-| `process_pdf(path)` | High-level: detect, extract, and convert |
-| `process_pdf_mem(buffer)` | Same as above, from memory |
-| `detect_pdf_type(path)` | Fast type detection |
-| `detect_pdf_type_mem(buffer)` | Type detection from memory |
-| `extract_text(path)` | Extract plain text |
-| `extract_text_mem(buffer)` | Extract text from memory |
-| `extract_text_with_positions(path)` | Extract text with coordinates |
-| `to_markdown(text, options)` | Convert text to markdown |
 
 ## License
 
