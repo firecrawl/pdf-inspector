@@ -18,6 +18,8 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         font: "Helvetica".to_string(),
         font_size,
         page,
+        is_bold: false,
+        is_italic: false,
     }
 }
 
@@ -29,6 +31,7 @@ fn make_text_item_with_font(
     font: &str,
     page: u32,
 ) -> TextItem {
+    use pdf_inspector::extractor::{is_bold_font, is_italic_font};
     TextItem {
         text: text.to_string(),
         x,
@@ -38,6 +41,8 @@ fn make_text_item_with_font(
         font: font.to_string(),
         font_size,
         page,
+        is_bold: is_bold_font(font),
+        is_italic: is_italic_font(font),
     }
 }
 
@@ -253,6 +258,8 @@ fn test_markdown_options_custom() {
         remove_page_numbers: false,
         format_urls: false,
         fix_hyphenation: false,
+        detect_bold: false,
+        detect_italic: false,
     };
     assert!(!opts.detect_headers);
     assert!(opts.detect_lists);
@@ -261,6 +268,8 @@ fn test_markdown_options_custom() {
     assert!(!opts.remove_page_numbers);
     assert!(!opts.format_urls);
     assert!(!opts.fix_hyphenation);
+    assert!(!opts.detect_bold);
+    assert!(!opts.detect_italic);
 }
 
 // ============================================================================

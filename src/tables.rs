@@ -222,6 +222,12 @@ fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
         return None;
     }
 
+    // Validation 8: Check for Table of Contents pattern
+    // TOCs have dots (leader lines) and page numbers, not real table data
+    if is_table_of_contents(&cells) {
+        return None;
+    }
+
     Some(Table {
         columns,
         rows,
@@ -305,9 +311,9 @@ fn has_consistent_columns(cells: &[Vec<String>]) -> bool {
     consistent_rows as f32 / cells.len() as f32 > 0.4
 }
 
-/// Check if the content looks like table data (numbers, short values)
+/// Check if the content looks like table data (numbers, short values, specs)
 fn has_table_like_content(cells: &[Vec<String>]) -> bool {
-    let mut numeric_cells = 0;
+    let mut data_like_cells = 0;
     let mut total_cells = 0;
 
     for row in cells.iter().skip(1) {
@@ -316,9 +322,9 @@ fn has_table_like_content(cells: &[Vec<String>]) -> bool {
             let trimmed = cell.trim();
             if !trimmed.is_empty() {
                 total_cells += 1;
-                // Check if it looks like a number (including decimals)
-                if looks_like_number(trimmed) {
-                    numeric_cells += 1;
+                // Check if it looks like table data
+                if looks_like_table_data(trimmed) {
+                    data_like_cells += 1;
                 }
             }
         }
@@ -328,12 +334,65 @@ fn has_table_like_content(cells: &[Vec<String>]) -> bool {
         return false;
     }
 
-    // At least 20% numeric content suggests a data table
+    // At least 20% data-like content suggests a data table
     // OR the table has many columns (structural table)
-    let pct_numeric = numeric_cells as f32 / total_cells as f32;
+    let pct_data = data_like_cells as f32 / total_cells as f32;
     let num_cols = cells.first().map(|r| r.len()).unwrap_or(0);
 
-    pct_numeric > 0.2 || num_cols >= 5
+    pct_data > 0.2 || num_cols >= 5
+}
+
+/// Check if a cell value looks like table data
+/// Includes: numbers, part numbers, specifications with units, codes
+fn looks_like_table_data(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+
+    // Pure numbers
+    if looks_like_number(s) {
+        return true;
+    }
+
+    // Part numbers / model codes (alphanumeric, typically short)
+    // e.g., "NA555", "NE555", "LM358"
+    if s.len() <= 10
+        && s.chars().all(|c| c.is_alphanumeric())
+        && s.chars().any(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+
+    // Specifications with units (contains numbers and unit symbols)
+    // e.g., "–40°C to +105°C", "5V", "200mA", "8-pin"
+    let has_number = s.chars().any(|c| c.is_ascii_digit());
+    let has_unit = s.contains('°')
+        || s.contains('V')
+        || s.contains('A')
+        || s.contains("Hz")
+        || s.contains("mA")
+        || s.contains("µ")
+        || s.contains("pin")
+        || s.contains("MHz")
+        || s.contains("kHz");
+    if has_number && has_unit {
+        return true;
+    }
+
+    // Package designations with parentheses
+    // e.g., "D (SOIC, 8)", "P (PDIP, 8)"
+    if s.contains('(') && s.contains(')') && s.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+
+    // Temperature ranges
+    // e.g., "TA = –40°C to +105°C"
+    if (s.contains("°C") || s.contains("°F")) && s.contains("to") {
+        return true;
+    }
+
+    false
 }
 
 /// Check if a string looks like a number
@@ -347,6 +406,56 @@ fn looks_like_number(s: &str) -> bool {
     s.chars()
         .all(|c| c.is_ascii_digit() || c == '.' || c == ',' || c == '-' || c == '+')
         && s.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Check if this looks like a Table of Contents
+/// TOCs have characteristic patterns: leader dots, page numbers, section names
+fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
+    if cells.is_empty() {
+        return false;
+    }
+
+    let mut dot_cells = 0;
+    let mut page_number_cells = 0;
+    let mut total_cells = 0;
+
+    for row in cells {
+        for cell in row {
+            let trimmed = cell.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            total_cells += 1;
+
+            // Check for leader dots (sequences of periods)
+            // TOCs often have "........" or ". . . ." patterns
+            let dot_count = trimmed.chars().filter(|&c| c == '.').count();
+            let is_mostly_dots = dot_count > trimmed.len() / 2 && dot_count >= 3;
+            if is_mostly_dots {
+                dot_cells += 1;
+            }
+
+            // Check for standalone page numbers (1-4 digits, possibly with spaces)
+            let digits_only: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+            if digits_only.len() <= 4
+                && !digits_only.is_empty()
+                && digits_only.chars().all(|c| c.is_ascii_digit())
+            {
+                page_number_cells += 1;
+            }
+        }
+    }
+
+    if total_cells == 0 {
+        return false;
+    }
+
+    // If a significant portion of cells are dots or page numbers, it's likely a TOC
+    let dot_ratio = dot_cells as f32 / total_cells as f32;
+    let page_num_ratio = page_number_cells as f32 / total_cells as f32;
+
+    // TOC typically has >15% dot cells and >10% page number cells
+    dot_ratio > 0.15 || (dot_ratio > 0.05 && page_num_ratio > 0.15)
 }
 
 /// Check what fraction of items align to detected columns
@@ -817,6 +926,8 @@ mod tests {
             font: "F1".into(),
             font_size,
             page: 1,
+            is_bold: false,
+            is_italic: false,
         }
     }
 

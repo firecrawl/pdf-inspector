@@ -28,6 +28,10 @@ pub struct MarkdownOptions {
     pub format_urls: bool,
     /// Fix hyphenation (broken words across lines)
     pub fix_hyphenation: bool,
+    /// Detect and format bold text from font names
+    pub detect_bold: bool,
+    /// Detect and format italic text from font names
+    pub detect_italic: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -40,6 +44,8 @@ impl Default for MarkdownOptions {
             remove_page_numbers: true,
             format_urls: true,
             fix_hyphenation: true,
+            detect_bold: true,
+            detect_italic: true,
         }
     }
 }
@@ -214,6 +220,7 @@ fn to_markdown_from_lines_with_tables(
     let mut prev_y = f32::MAX;
     let mut in_list = false;
     let mut in_paragraph = false;
+    let mut last_list_x: Option<f32> = None;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
 
     for line in lines {
@@ -265,19 +272,21 @@ fn to_markdown_from_lines_with_tables(
         // Paragraph break (large Y gap)
         let y_gap = prev_y - line.y;
         let is_para_break = y_gap > base_size * 1.8; // Slightly lower threshold
-        if is_para_break {
-            if in_paragraph {
-                output.push_str("\n\n");
-                in_paragraph = false;
-            }
-            if in_list {
-                in_list = false;
-            }
+        if is_para_break && in_paragraph {
+            output.push_str("\n\n");
+            in_paragraph = false;
         }
+        // Don't immediately end list on paragraph break
+        // Let the continuation check below decide if we're still in a list
         prev_y = line.y;
 
-        let text = line.text();
+        // Get text with optional bold/italic formatting
+        let text = line.text_with_formatting(options.detect_bold, options.detect_italic);
         let trimmed = text.trim();
+
+        // Also get plain text for pattern matching (list detection, captions, etc.)
+        let plain_text = line.text();
+        let plain_trimmed = plain_text.trim();
 
         if trimmed.is_empty() {
             continue;
@@ -285,7 +294,7 @@ fn to_markdown_from_lines_with_tables(
 
         // Detect figure/table captions and source citations
         // These should be on their own line followed by a paragraph break
-        if is_caption_line(trimmed) {
+        if is_caption_line(plain_trimmed) {
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
@@ -296,7 +305,8 @@ fn to_markdown_from_lines_with_tables(
         }
 
         // Detect headers by font size
-        if options.detect_headers && trimmed.len() > 3 {
+        // Note: Headers typically shouldn't have bold markers since they're already emphasized
+        if options.detect_headers && plain_trimmed.len() > 3 {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) = detect_header_level(line_font_size, base_size) {
                 if in_paragraph {
@@ -304,14 +314,15 @@ fn to_markdown_from_lines_with_tables(
                     in_paragraph = false;
                 }
                 let prefix = "#".repeat(header_level);
-                output.push_str(&format!("{} {}\n\n", prefix, trimmed));
+                // Use plain text for headers to avoid redundant formatting
+                output.push_str(&format!("{} {}\n\n", prefix, plain_trimmed));
                 in_list = false;
                 continue;
             }
         }
 
         // Detect list items
-        if options.detect_lists && is_list_item(trimmed) {
+        if options.detect_lists && is_list_item(plain_trimmed) {
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
@@ -320,9 +331,37 @@ fn to_markdown_from_lines_with_tables(
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
+            last_list_x = line.items.first().map(|i| i.x);
             continue;
-        } else if in_list && !trimmed.starts_with(char::is_whitespace) {
-            in_list = false;
+        } else if in_list {
+            // Check if this line is a continuation of the previous list item
+            // Continuations have similar X position and reasonable Y gap
+            let line_x = line.items.first().map(|i| i.x);
+            let is_continuation = if let (Some(list_x), Some(curr_x)) = (last_list_x, line_x) {
+                // Continuation criteria:
+                // 1. X is at or past the list text position
+                // 2. Y gap is not too large (max ~5 line heights)
+                // 3. Not a new list item
+                let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
+                let y_ok = y_gap < base_size * 7.0;
+                x_ok && y_ok && !is_list_item(plain_trimmed)
+            } else {
+                false
+            };
+
+            if is_continuation {
+                // Append to previous list item with a space
+                if output.ends_with('\n') {
+                    output.pop();
+                    output.push(' ');
+                }
+                output.push_str(trimmed);
+                output.push('\n');
+                continue;
+            } else {
+                in_list = false;
+                last_list_x = None;
+            }
         }
 
         // Detect code blocks by font
@@ -333,7 +372,8 @@ fn to_markdown_from_lines_with_tables(
                     output.push_str("\n\n");
                     in_paragraph = false;
                 }
-                output.push_str(&format!("```\n{}\n```\n", trimmed));
+                // Use plain text for code blocks
+                output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
                 continue;
             }
         }
@@ -390,6 +430,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut prev_y = f32::MAX;
     let mut in_list = false;
     let mut in_paragraph = false;
+    let mut last_list_x: Option<f32> = None;
 
     for line in lines {
         // Page break
@@ -403,24 +444,28 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
             current_page = line.page;
             prev_y = f32::MAX;
+            in_list = false;
+            last_list_x = None;
         }
 
         // Paragraph break (large Y gap)
         let y_gap = prev_y - line.y;
         let is_para_break = y_gap > base_size * 1.8; // Slightly lower threshold
-        if is_para_break {
-            if in_paragraph {
-                output.push_str("\n\n");
-                in_paragraph = false;
-            }
-            if in_list {
-                in_list = false;
-            }
+        if is_para_break && in_paragraph {
+            output.push_str("\n\n");
+            in_paragraph = false;
         }
+        // Don't immediately end list on paragraph break
+        // Let the continuation check below decide if we're still in a list
         prev_y = line.y;
 
-        let text = line.text();
+        // Get text with optional bold/italic formatting
+        let text = line.text_with_formatting(options.detect_bold, options.detect_italic);
         let trimmed = text.trim();
+
+        // Also get plain text for pattern matching
+        let plain_text = line.text();
+        let plain_trimmed = plain_text.trim();
 
         if trimmed.is_empty() {
             continue;
@@ -428,7 +473,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
         // Detect figure/table captions and source citations
         // These should be on their own line followed by a paragraph break
-        if is_caption_line(trimmed) {
+        if is_caption_line(plain_trimmed) {
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
@@ -440,7 +485,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
         // Detect headers by font size
         // Skip very short text (likely drop caps or labels)
-        if options.detect_headers && trimmed.len() > 3 {
+        if options.detect_headers && plain_trimmed.len() > 3 {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) = detect_header_level(line_font_size, base_size) {
                 if in_paragraph {
@@ -448,14 +493,15 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     in_paragraph = false;
                 }
                 let prefix = "#".repeat(header_level);
-                output.push_str(&format!("{} {}\n\n", prefix, trimmed));
+                // Use plain text for headers to avoid redundant formatting
+                output.push_str(&format!("{} {}\n\n", prefix, plain_trimmed));
                 in_list = false;
                 continue;
             }
         }
 
         // Detect list items
-        if options.detect_lists && is_list_item(trimmed) {
+        if options.detect_lists && is_list_item(plain_trimmed) {
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
@@ -464,11 +510,35 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
+            last_list_x = line.items.first().map(|i| i.x);
             continue;
         } else if in_list {
-            // Check if continuing list or ending
-            if !trimmed.starts_with(char::is_whitespace) {
+            // Check if this line is a continuation of the previous list item
+            let line_x = line.items.first().map(|i| i.x);
+            let is_continuation = if let (Some(list_x), Some(curr_x)) = (last_list_x, line_x) {
+                // Continuation criteria:
+                // 1. X is at or past the list text position
+                // 2. Y gap is not too large (max ~5 line heights)
+                // 3. Not a new list item
+                let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
+                let y_ok = y_gap < base_size * 7.0;
+                x_ok && y_ok && !is_list_item(plain_trimmed)
+            } else {
+                false
+            };
+
+            if is_continuation {
+                // Append to previous list item with a space
+                if output.ends_with('\n') {
+                    output.pop();
+                    output.push(' ');
+                }
+                output.push_str(trimmed);
+                output.push('\n');
+                continue;
+            } else {
                 in_list = false;
+                last_list_x = None;
             }
         }
 
@@ -480,7 +550,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     output.push_str("\n\n");
                     in_paragraph = false;
                 }
-                output.push_str(&format!("```\n{}\n```\n", trimmed));
+                // Use plain text for code blocks
+                output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
                 continue;
             }
         }
@@ -949,7 +1020,7 @@ fn is_page_number_line(trimmed: &str) -> bool {
     }
 
     // Pattern 4: "- X -" centered page number
-    if trimmed.starts_with('-') && trimmed.ends_with('-') {
+    if trimmed.len() >= 3 && trimmed.starts_with('-') && trimmed.ends_with('-') {
         let inner = trimmed[1..trimmed.len() - 1].trim();
         if inner.chars().all(|c| c.is_ascii_digit()) && !inner.is_empty() {
             return true;

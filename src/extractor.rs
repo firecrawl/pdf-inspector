@@ -26,6 +26,10 @@ pub struct TextItem {
     pub font_size: f32,
     /// Page number (1-indexed)
     pub page: u32,
+    /// Whether the font is bold
+    pub is_bold: bool,
+    /// Whether the font is italic
+    pub is_italic: bool,
 }
 
 /// A line of text (grouped text items)
@@ -38,6 +42,81 @@ pub struct TextLine {
 
 impl TextLine {
     pub fn text(&self) -> String {
+        self.text_with_formatting(false, false)
+    }
+
+    /// Get text with optional bold/italic markdown formatting
+    pub fn text_with_formatting(&self, format_bold: bool, format_italic: bool) -> String {
+        if !format_bold && !format_italic {
+            return self.text_plain();
+        }
+
+        let mut result = String::new();
+        let mut current_bold = false;
+        let mut current_italic = false;
+
+        for (i, item) in self.items.iter().enumerate() {
+            let text = item.text.as_str();
+            let text_trimmed = text.trim();
+
+            // Skip empty items
+            if text_trimmed.is_empty() {
+                continue;
+            }
+
+            // Determine spacing
+            let needs_space = if i == 0 || result.is_empty() {
+                false
+            } else {
+                let prev_item = &self.items[i - 1];
+                self.needs_space_between(prev_item, item, &result)
+            };
+
+            // Check for style changes
+            let item_bold = format_bold && item.is_bold;
+            let item_italic = format_italic && item.is_italic;
+
+            // Close previous styles if they change
+            if current_italic && !item_italic {
+                result.push('*');
+                current_italic = false;
+            }
+            if current_bold && !item_bold {
+                result.push_str("**");
+                current_bold = false;
+            }
+
+            // Add space after closing markers if needed
+            if needs_space {
+                result.push(' ');
+            }
+
+            // Open new styles
+            if item_bold && !current_bold {
+                result.push_str("**");
+                current_bold = true;
+            }
+            if item_italic && !current_italic {
+                result.push('*');
+                current_italic = true;
+            }
+
+            result.push_str(text_trimmed);
+        }
+
+        // Close any remaining open styles
+        if current_italic {
+            result.push('*');
+        }
+        if current_bold {
+            result.push_str("**");
+        }
+
+        result
+    }
+
+    /// Get plain text without formatting
+    fn text_plain(&self) -> String {
         let mut result = String::new();
         for (i, item) in self.items.iter().enumerate() {
             let text = item.text.as_str();
@@ -45,52 +124,48 @@ impl TextLine {
                 result.push_str(text);
             } else {
                 let prev_item = &self.items[i - 1];
-
-                // Don't add space before/after hyphens for hyphenated words
-                let prev_ends_with_hyphen = result.ends_with('-');
-                let curr_is_hyphen = text.trim() == "-";
-                let curr_starts_with_hyphen = text.starts_with('-');
-
-                // Detect subscript/superscript: smaller font size and/or Y offset
-                // Subscripts/superscripts are typically 60-80% of normal font size
-                // and have a vertical offset of 1-3 points
-                let font_ratio = item.font_size / prev_item.font_size;
-                let reverse_font_ratio = prev_item.font_size / item.font_size;
-                let y_diff = (item.y - prev_item.y).abs();
-
-                // Current item is subscript/superscript (smaller than previous)
-                let is_sub_super = font_ratio < 0.85 && y_diff > 1.0;
-                // Previous item was subscript/superscript (returning to normal size)
-                let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
-
-                // Use position-based spacing detection
-                // This is more reliable than character-case heuristics for determining
-                // whether text fragments should be joined (e.g., "CONST" + "ANCIA" → "CONSTANCIA")
-                let should_join = should_join_items(prev_item, item);
-
-                // Check if space already exists to avoid double spaces
-                let prev_ends_with_space = result.ends_with(' ');
-                let curr_starts_with_space = text.starts_with(' ');
-                let space_already_exists = prev_ends_with_space || curr_starts_with_space;
-
-                if prev_ends_with_hyphen
-                    || curr_is_hyphen
-                    || curr_starts_with_hyphen
-                    || is_sub_super
-                    || was_sub_super
-                    || should_join
-                    || space_already_exists
-                {
-                    // No space for hyphenated words, subscript/superscript, closely positioned items,
-                    // or when space already exists
-                    result.push_str(text);
-                } else {
+                if self.needs_space_between(prev_item, item, &result) {
                     result.push(' ');
-                    result.push_str(text);
                 }
+                result.push_str(text);
             }
         }
         result
+    }
+
+    /// Determine if a space is needed between two items
+    fn needs_space_between(&self, prev_item: &TextItem, item: &TextItem, result: &str) -> bool {
+        let text = item.text.as_str();
+
+        // Don't add space before/after hyphens for hyphenated words
+        let prev_ends_with_hyphen = result.ends_with('-');
+        let curr_is_hyphen = text.trim() == "-";
+        let curr_starts_with_hyphen = text.starts_with('-');
+
+        // Detect subscript/superscript: smaller font size and/or Y offset
+        let font_ratio = item.font_size / prev_item.font_size;
+        let reverse_font_ratio = prev_item.font_size / item.font_size;
+        let y_diff = (item.y - prev_item.y).abs();
+
+        let is_sub_super = font_ratio < 0.85 && y_diff > 1.0;
+        let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
+
+        // Use position-based spacing detection
+        let should_join = should_join_items(prev_item, item);
+
+        // Check if space already exists
+        let prev_ends_with_space = result.ends_with(' ');
+        let curr_starts_with_space = text.starts_with(' ');
+        let space_already_exists = prev_ends_with_space || curr_starts_with_space;
+
+        // Add space unless one of these conditions applies
+        !(prev_ends_with_hyphen
+            || curr_is_hyphen
+            || curr_starts_with_hyphen
+            || is_sub_super
+            || was_sub_super
+            || should_join
+            || space_already_exists)
     }
 }
 
@@ -388,6 +463,11 @@ fn extract_page_text_items(
                             // Transform position through CTM
                             let combined = multiply_matrices(&text_matrix, &ctm);
                             let (x, y) = (combined[4], combined[5]);
+                            // Detect bold/italic from font name
+                            let base_font = font_base_names
+                                .get(&current_font)
+                                .map(|s| s.as_str())
+                                .unwrap_or(&current_font);
                             items.push(TextItem {
                                 text,
                                 x,
@@ -397,6 +477,8 @@ fn extract_page_text_items(
                                 font: current_font.clone(),
                                 font_size: rendered_size,
                                 page: page_num,
+                                is_bold: is_bold_font(base_font),
+                                is_italic: is_italic_font(base_font),
                             });
                         }
                     }
@@ -426,6 +508,11 @@ fn extract_page_text_items(
                             // Transform position through CTM
                             let combined = multiply_matrices(&text_matrix, &ctm);
                             let (x, y) = (combined[4], combined[5]);
+                            // Detect bold/italic from font name
+                            let base_font = font_base_names
+                                .get(&current_font)
+                                .map(|s| s.as_str())
+                                .unwrap_or(&current_font);
                             items.push(TextItem {
                                 text: combined_text,
                                 x,
@@ -435,6 +522,8 @@ fn extract_page_text_items(
                                 font: current_font.clone(),
                                 font_size: rendered_size,
                                 page: page_num,
+                                is_bold: is_bold_font(base_font),
+                                is_italic: is_italic_font(base_font),
                             });
                         }
                     }
@@ -460,6 +549,11 @@ fn extract_page_text_items(
                             // Transform position through CTM
                             let combined = multiply_matrices(&text_matrix, &ctm);
                             let (x, y) = (combined[4], combined[5]);
+                            // Detect bold/italic from font name
+                            let base_font = font_base_names
+                                .get(&current_font)
+                                .map(|s| s.as_str())
+                                .unwrap_or(&current_font);
                             items.push(TextItem {
                                 text,
                                 x,
@@ -469,6 +563,8 @@ fn extract_page_text_items(
                                 font: current_font.clone(),
                                 font_size: rendered_size,
                                 page: page_num,
+                                is_bold: is_bold_font(base_font),
+                                is_italic: is_italic_font(base_font),
                             });
                         }
                     }
@@ -501,6 +597,42 @@ fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32 {
     // Use the larger of the two scales (usually they're equal for non-rotated text)
     let scale = scale_x.max(scale_y);
     base_size * scale
+}
+
+/// Detect if a font name indicates bold style
+/// Common patterns: "Bold", "Bd", "Black", "Heavy", "Demi", "Semi" (semi-bold)
+pub fn is_bold_font(font_name: &str) -> bool {
+    let lower = font_name.to_lowercase();
+
+    // Check for common bold indicators
+    // Note: Need to be careful with "Oblique" not matching "Obl" + false positive for bold
+    lower.contains("bold")
+        || lower.contains("-bd")
+        || lower.contains("_bd")
+        || lower.contains("black")
+        || lower.contains("heavy")
+        || lower.contains("demibold")
+        || lower.contains("semibold")
+        || lower.contains("demi-bold")
+        || lower.contains("semi-bold")
+        || lower.contains("extrabold")
+        || lower.contains("ultrabold")
+        || lower.contains("medium") && !lower.contains("mediumitalic") // Some fonts use Medium for semi-bold
+}
+
+/// Detect if a font name indicates italic/oblique style
+/// Common patterns: "Italic", "It", "Oblique", "Obl", "Slant", "Inclined"
+pub fn is_italic_font(font_name: &str) -> bool {
+    let lower = font_name.to_lowercase();
+
+    // Check for common italic indicators
+    lower.contains("italic")
+        || lower.contains("oblique")
+        || lower.contains("-it")
+        || lower.contains("_it")
+        || lower.contains("slant")
+        || lower.contains("inclined")
+        || lower.contains("kursiv") // German for italic
 }
 
 /// Extract text from a text operand, handling encoding
@@ -881,6 +1013,8 @@ mod tests {
                 font: "F1".into(),
                 font_size: 12.0,
                 page: 1,
+                is_bold: false,
+                is_italic: false,
             },
             TextItem {
                 text: "World".into(),
@@ -891,6 +1025,8 @@ mod tests {
                 font: "F1".into(),
                 font_size: 12.0,
                 page: 1,
+                is_bold: false,
+                is_italic: false,
             },
             TextItem {
                 text: "Next line".into(),
@@ -901,6 +1037,8 @@ mod tests {
                 font: "F1".into(),
                 font_size: 12.0,
                 page: 1,
+                is_bold: false,
+                is_italic: false,
             },
         ];
 
@@ -908,5 +1046,33 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text(), "Hello World");
         assert_eq!(lines[1].text(), "Next line");
+    }
+
+    #[test]
+    fn test_bold_italic_detection() {
+        // Test bold detection
+        assert!(is_bold_font("Arial-Bold"));
+        assert!(is_bold_font("TimesNewRoman-Bold"));
+        assert!(is_bold_font("Helvetica-BoldOblique"));
+        assert!(is_bold_font("ABCDEF+ArialMT-Bold"));
+        assert!(is_bold_font("NotoSans-Black"));
+        assert!(is_bold_font("Roboto-SemiBold"));
+        assert!(!is_bold_font("Arial"));
+        assert!(!is_bold_font("TimesNewRoman-Italic"));
+
+        // Test italic detection
+        assert!(is_italic_font("Arial-Italic"));
+        assert!(is_italic_font("TimesNewRoman-Italic"));
+        assert!(is_italic_font("Helvetica-Oblique"));
+        assert!(is_italic_font("ABCDEF+ArialMT-Italic"));
+        assert!(is_italic_font("Helvetica-BoldOblique"));
+        assert!(!is_italic_font("Arial"));
+        assert!(!is_italic_font("TimesNewRoman-Bold"));
+
+        // Test bold-italic detection
+        assert!(is_bold_font("Arial-BoldItalic"));
+        assert!(is_italic_font("Arial-BoldItalic"));
+        assert!(is_bold_font("Helvetica-BoldOblique"));
+        assert!(is_italic_font("Helvetica-BoldOblique"));
     }
 }
