@@ -15,6 +15,369 @@ type FontEncodingMap = HashMap<u8, char>;
 /// All font encodings for a page
 type PageFontEncodings = HashMap<String, FontEncodingMap>;
 
+/// Font width information extracted from PDF font dictionaries
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct FontWidthInfo {
+    /// Glyph widths: maps character code to width in font units
+    widths: HashMap<u16, u16>,
+    /// Default width for glyphs not in the widths table
+    default_width: u16,
+    /// Width of the space character (code 32) if known
+    space_width: u16,
+    /// Whether this is a CID font (2-byte character codes)
+    is_cid: bool,
+    /// Scale factor to convert font units to text space units.
+    /// For Type1/TrueType: 0.001 (widths in 1000ths of em)
+    /// For Type3: FontMatrix[0] (e.g., 0.00048828125 for 2048-unit grid)
+    units_scale: f32,
+}
+
+/// All font width info for a page, keyed by font resource name
+type PageFontWidths = HashMap<String, FontWidthInfo>;
+
+/// Resolve a PDF object reference to an array
+fn resolve_array<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Vec<Object>> {
+    match obj {
+        Object::Array(arr) => Some(arr),
+        Object::Reference(r) => {
+            if let Ok(Object::Array(arr)) = doc.get_object(*r) {
+                Some(arr)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a PDF object reference to a dictionary
+fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a lopdf::Dictionary> {
+    match obj {
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(r) => doc.get_dictionary(*r).ok(),
+        _ => None,
+    }
+}
+
+/// Build font width info for all fonts on a page
+fn build_font_widths(
+    doc: &Document,
+    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+) -> PageFontWidths {
+    let mut widths = PageFontWidths::new();
+
+    for (font_name, font_dict) in fonts {
+        let resource_name = String::from_utf8_lossy(font_name).to_string();
+        if let Some(info) = parse_font_widths(doc, font_dict) {
+            widths.insert(resource_name, info);
+        }
+    }
+
+    widths
+}
+
+/// Parse font widths from a font dictionary, dispatching by Subtype
+fn parse_font_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<FontWidthInfo> {
+    // Get the font subtype
+    let subtype = font_dict.get(b"Subtype").ok()?;
+    let subtype_name = subtype.as_name().ok()?;
+
+    match subtype_name {
+        b"Type0" => parse_type0_widths(doc, font_dict),
+        b"Type1" | b"TrueType" | b"MMType1" | b"Type3" => parse_simple_font_widths(doc, font_dict),
+        _ => None,
+    }
+}
+
+/// Parse widths for simple fonts (Type1, TrueType, MMType1, Type3)
+/// Reads FirstChar, LastChar, and Widths array.
+/// For Type3 fonts, reads FontMatrix to determine the correct units_scale.
+fn parse_simple_font_widths(
+    doc: &Document,
+    font_dict: &lopdf::Dictionary,
+) -> Option<FontWidthInfo> {
+    let first_char = font_dict.get(b"FirstChar").ok().and_then(|o| match o {
+        Object::Integer(n) => Some(*n as u16),
+        Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| {
+            if let Object::Integer(n) = o {
+                Some(*n as u16)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    })?;
+
+    let last_char = font_dict.get(b"LastChar").ok().and_then(|o| match o {
+        Object::Integer(n) => Some(*n as u16),
+        Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| {
+            if let Object::Integer(n) = o {
+                Some(*n as u16)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    })?;
+
+    let widths_obj = font_dict.get(b"Widths").ok()?;
+    let widths_array = resolve_array(doc, widths_obj)?;
+
+    let mut widths = HashMap::new();
+    let mut space_width: u16 = 0;
+
+    for (i, w_obj) in widths_array.iter().enumerate() {
+        let code = first_char + i as u16;
+        if code > last_char {
+            break;
+        }
+        let w = match w_obj {
+            Object::Integer(n) => *n as u16,
+            Object::Real(n) => *n as u16,
+            Object::Reference(r) => {
+                if let Ok(obj) = doc.get_object(*r) {
+                    match obj {
+                        Object::Integer(n) => *n as u16,
+                        Object::Real(n) => *n as u16,
+                        _ => continue,
+                    }
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        if code == 32 {
+            space_width = w;
+        }
+        widths.insert(code, w);
+    }
+
+    // If space width wasn't found in the table, use a reasonable default
+    if space_width == 0 {
+        space_width = 250;
+    }
+
+    // Determine units_scale: for Type3 fonts, use FontMatrix[0]; for others, use 1/1000
+    let units_scale = if let Ok(fm) = font_dict.get(b"FontMatrix") {
+        if let Some(arr) = resolve_array(doc, fm) {
+            if !arr.is_empty() {
+                match &arr[0] {
+                    Object::Real(r) => r.abs(),
+                    Object::Integer(i) => (*i as f32).abs(),
+                    _ => 0.001,
+                }
+            } else {
+                0.001
+            }
+        } else {
+            0.001
+        }
+    } else {
+        0.001 // Standard 1000-unit system
+    };
+
+    Some(FontWidthInfo {
+        widths,
+        default_width: 0,
+        space_width,
+        is_cid: false,
+        units_scale,
+    })
+}
+
+/// Parse widths for Type0 (composite/CID) fonts
+/// Reads DescendantFonts → CIDFont → W array and DW value
+fn parse_type0_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<FontWidthInfo> {
+    let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
+    let desc_fonts = resolve_array(doc, desc_fonts_obj)?;
+
+    if desc_fonts.is_empty() {
+        return None;
+    }
+
+    // Get the first descendant font dictionary
+    let cid_font_dict = resolve_dict(doc, &desc_fonts[0])?;
+
+    // Get DW (default width)
+    let default_width = cid_font_dict
+        .get(b"DW")
+        .ok()
+        .and_then(|o| match o {
+            Object::Integer(n) => Some(*n as u16),
+            Object::Real(n) => Some(*n as u16),
+            _ => None,
+        })
+        .unwrap_or(1000);
+
+    let mut widths = HashMap::new();
+
+    // Parse W array if present
+    if let Ok(w_obj) = cid_font_dict.get(b"W") {
+        if let Some(w_array) = resolve_array(doc, w_obj) {
+            parse_cid_w_array(doc, w_array, &mut widths);
+        }
+    }
+
+    // Try to determine space width (CID 32 or CID 3 are common for space)
+    let space_width = widths
+        .get(&32)
+        .or_else(|| widths.get(&3))
+        .copied()
+        .unwrap_or(if default_width > 0 {
+            default_width / 4
+        } else {
+            250
+        });
+
+    Some(FontWidthInfo {
+        widths,
+        default_width,
+        space_width,
+        is_cid: true,
+        units_scale: 0.001, // CID fonts use standard 1000-unit system
+    })
+}
+
+/// Parse a CID W array into widths map
+/// Format: [c [w1 w2 ...]] (consecutive from c) or [c_first c_last w] (range with same width)
+fn parse_cid_w_array(doc: &Document, w_array: &[Object], widths: &mut HashMap<u16, u16>) {
+    let mut i = 0;
+    while i < w_array.len() {
+        let start_cid = match &w_array[i] {
+            Object::Integer(n) => *n as u16,
+            Object::Real(n) => *n as u16,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        i += 1;
+        if i >= w_array.len() {
+            break;
+        }
+
+        // Check if next element is an array (consecutive widths) or integer (range)
+        match &w_array[i] {
+            Object::Array(arr) => {
+                // [c [w1 w2 ...]] — consecutive widths starting at c
+                for (j, w_obj) in arr.iter().enumerate() {
+                    let w = match w_obj {
+                        Object::Integer(n) => *n as u16,
+                        Object::Real(n) => *n as u16,
+                        _ => continue,
+                    };
+                    widths.insert(start_cid + j as u16, w);
+                }
+                i += 1;
+            }
+            Object::Reference(r) => {
+                // Could be a reference to an array
+                if let Ok(Object::Array(arr)) = doc.get_object(*r) {
+                    for (j, w_obj) in arr.iter().enumerate() {
+                        let w = match w_obj {
+                            Object::Integer(n) => *n as u16,
+                            Object::Real(n) => *n as u16,
+                            _ => continue,
+                        };
+                        widths.insert(start_cid + j as u16, w);
+                    }
+                    i += 1;
+                } else {
+                    // Treat as c_first c_last w
+                    i += 1; // skip this
+                }
+            }
+            Object::Integer(end_cid) => {
+                // [c_first c_last w] — range with uniform width
+                let end = *end_cid as u16;
+                i += 1;
+                if i >= w_array.len() {
+                    break;
+                }
+                let w = match &w_array[i] {
+                    Object::Integer(n) => *n as u16,
+                    Object::Real(n) => *n as u16,
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                for cid in start_cid..=end {
+                    widths.insert(cid, w);
+                }
+                i += 1;
+            }
+            Object::Real(end_cid) => {
+                let end = *end_cid as u16;
+                i += 1;
+                if i >= w_array.len() {
+                    break;
+                }
+                let w = match &w_array[i] {
+                    Object::Integer(n) => *n as u16,
+                    Object::Real(n) => *n as u16,
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                for cid in start_cid..=end {
+                    widths.insert(cid, w);
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Compute the width of a string in text space units,
+/// given raw bytes and font width info.
+/// Returns width in text space units (font_units * units_scale * font_size).
+fn compute_string_width_ts(bytes: &[u8], font_info: &FontWidthInfo, font_size: f32) -> f32 {
+    let mut total: f32 = 0.0;
+    if font_info.is_cid {
+        // 2-byte (big-endian) character codes
+        let mut j = 0;
+        while j + 1 < bytes.len() {
+            let cid = u16::from_be_bytes([bytes[j], bytes[j + 1]]);
+            let w = font_info
+                .widths
+                .get(&cid)
+                .copied()
+                .unwrap_or(font_info.default_width);
+            total += w as f32;
+            j += 2;
+        }
+    } else {
+        // 1-byte character codes
+        for &b in bytes {
+            let code = b as u16;
+            let w = font_info
+                .widths
+                .get(&code)
+                .copied()
+                .unwrap_or(font_info.default_width);
+            total += w as f32;
+        }
+    }
+    // Convert from font units to text space using the font's scale factor
+    total * font_info.units_scale * font_size
+}
+
+/// Extract raw bytes from a PDF operand (String object)
+fn get_operand_bytes(obj: &Object) -> Option<&[u8]> {
+    if let Object::String(bytes, _) = obj {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
 /// Build encoding maps for all fonts on a page
 fn build_font_encodings(
     doc: &Document,
@@ -310,17 +673,21 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
         }
     }
 
-    // Estimate the average character width from font size
-    // Use a conservative estimate (0.45) since fonts vary
+    // When we have accurate width from font metrics, use a tight threshold
+    if prev_item.width > 0.0 {
+        let prev_end_x = prev_item.x + prev_item.width;
+        let gap = curr_item.x - prev_end_x;
+        let font_size = prev_item.font_size;
+        // With accurate widths, a gap < 15% of font size means glyphs are
+        // adjacent (same word). Anything larger is a deliberate space.
+        return gap < font_size * 0.15;
+    }
+
+    // Fallback: estimate width from font size heuristics
     let char_width = prev_item.font_size * 0.45;
 
-    // Estimate the width of the previous text
     let prev_text_len = prev_item.text.chars().count() as f32;
-    let estimated_prev_width = if prev_item.width > 0.0 {
-        prev_item.width // Use actual width if available
-    } else {
-        prev_text_len * char_width
-    };
+    let estimated_prev_width = prev_text_len * char_width;
 
     // Calculate expected end position of previous item
     let prev_end_x = prev_item.x + estimated_prev_width;
@@ -450,6 +817,9 @@ fn extract_page_text_items(
 
     // Build font encoding maps from Differences arrays
     let font_encodings = build_font_encodings(doc, &fonts);
+
+    // Build font width info for accurate text positioning
+    let font_widths = build_font_widths(doc, &fonts);
 
     // Build maps of font resource names to their base font names and ToUnicode object refs
     let mut font_base_names: std::collections::HashMap<String, String> =
@@ -586,6 +956,26 @@ fn extract_page_text_items(
                             // Transform position through CTM
                             let combined = multiply_matrices(&text_matrix, &ctm);
                             let (x, y) = (combined[4], combined[5]);
+                            // Compute width from font widths if available
+                            let width = if let Some(font_info) = font_widths.get(&current_font) {
+                                if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
+                                    let w_ts = compute_string_width_ts(
+                                        raw_bytes,
+                                        font_info,
+                                        current_font_size,
+                                    );
+                                    // Advance text matrix by string width
+                                    text_matrix[4] += w_ts * text_matrix[0];
+                                    text_matrix[5] += w_ts * text_matrix[1];
+                                    // Transform width through text matrix and CTM
+                                    (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2]))
+                                        .abs()
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                0.0
+                            };
                             // Detect bold/italic from font name
                             let base_font = font_base_names
                                 .get(&current_font)
@@ -595,7 +985,7 @@ fn extract_page_text_items(
                                 text,
                                 x,
                                 y,
-                                width: 0.0, // Would need glyph widths
+                                width,
                                 height: rendered_size,
                                 font: current_font.clone(),
                                 font_size: rendered_size,
@@ -612,31 +1002,56 @@ fn extract_page_text_items(
                 // Show text with positioning
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
+                        let font_info = font_widths.get(&current_font);
+
+                        // Compute space threshold based on font metrics when available
+                        let space_threshold = if let Some(font_info) = font_info {
+                            // Use 40% of the font's space width (in thousandths of text space)
+                            let space_em = font_info.space_width as f32 * font_info.units_scale;
+                            let threshold = space_em * 1000.0 * 0.4;
+                            // Clamp to reasonable range: at least 80, at most 200
+                            threshold.clamp(80.0, 200.0)
+                        } else {
+                            120.0 // fallback threshold
+                        };
+
                         let mut combined_text = String::new();
-                        for item in array {
-                            // Check for spacing values - large negative values indicate word spaces
-                            // In PDF, TJ arrays contain: strings and positioning adjustments
-                            // Negative values move right (create space), positive move left (tighten)
-                            // Values are in thousandths of an em unit
-                            match item {
+                        let mut total_width_ts: f32 = 0.0;
+                        for element in array {
+                            match element {
                                 Object::Integer(n) => {
-                                    // Threshold: -200 or more negative typically indicates a word space
-                                    // (roughly 1/5 of an em or more)
-                                    if *n < -200 && !combined_text.ends_with(' ') {
+                                    let n_val = *n as f32;
+                                    // Track displacement for total width
+                                    total_width_ts += -n_val / 1000.0 * current_font_size;
+                                    if n_val < -space_threshold
+                                        && !combined_text.is_empty()
+                                        && !combined_text.ends_with(' ')
+                                    {
                                         combined_text.push(' ');
                                     }
                                     continue;
                                 }
                                 Object::Real(n) => {
-                                    if *n < -200.0 && !combined_text.ends_with(' ') {
+                                    total_width_ts += -(*n) / 1000.0 * current_font_size;
+                                    if *n < -space_threshold
+                                        && !combined_text.is_empty()
+                                        && !combined_text.ends_with(' ')
+                                    {
                                         combined_text.push(' ');
                                     }
                                     continue;
                                 }
                                 _ => {}
                             }
+                            // Compute string width for total
+                            if let Some(fi) = font_info {
+                                if let Some(raw_bytes) = get_operand_bytes(element) {
+                                    total_width_ts +=
+                                        compute_string_width_ts(raw_bytes, fi, current_font_size);
+                                }
+                            }
                             if let Some(text) = extract_text_from_operand(
-                                item,
+                                element,
                                 doc,
                                 &fonts,
                                 &current_font,
@@ -651,10 +1066,16 @@ fn extract_page_text_items(
                         if !combined_text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
-                            // Transform position through CTM
                             let combined = multiply_matrices(&text_matrix, &ctm);
                             let (x, y) = (combined[4], combined[5]);
-                            // Detect bold/italic from font name
+                            // Compute accurate width if font widths available
+                            let width = if font_info.is_some() {
+                                (total_width_ts
+                                    * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2]))
+                                    .abs()
+                            } else {
+                                0.0
+                            };
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -663,7 +1084,7 @@ fn extract_page_text_items(
                                 text: combined_text,
                                 x,
                                 y,
-                                width: 0.0,
+                                width,
                                 height: rendered_size,
                                 font: current_font.clone(),
                                 font_size: rendered_size,
@@ -672,6 +1093,11 @@ fn extract_page_text_items(
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
                             });
+                            // Advance text matrix by total width
+                            if font_info.is_some() {
+                                text_matrix[4] += total_width_ts * text_matrix[0];
+                                text_matrix[5] += total_width_ts * text_matrix[1];
+                            }
                         }
                     }
                 }
@@ -872,6 +1298,9 @@ fn extract_form_xobject_text(
     let form_fonts = get_form_fonts(doc, &stream.dict);
     let font_encodings = build_font_encodings(doc, &form_fonts);
 
+    // Build font width info for the form
+    let font_widths = build_font_widths(doc, &form_fonts);
+
     // Build font base names and ToUnicode refs for the form
     let mut font_base_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -893,7 +1322,7 @@ fn extract_form_xobject_text(
         }
     }
 
-    // Process the content stream (simplified version)
+    // Process the content stream
     let mut current_font = String::new();
     let mut current_font_size: f32 = 12.0;
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -947,9 +1376,28 @@ fn extract_form_xobject_text(
                         if !text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
-                            // Transform position through parent CTM
                             let combined = multiply_matrices(&text_matrix, parent_ctm);
                             let (x, y) = (combined[4], combined[5]);
+                            // Compute width from font widths if available
+                            let width = if let Some(font_info) = font_widths.get(&current_font) {
+                                if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
+                                    let w_ts = compute_string_width_ts(
+                                        raw_bytes,
+                                        font_info,
+                                        current_font_size,
+                                    );
+                                    text_matrix[4] += w_ts * text_matrix[0];
+                                    text_matrix[5] += w_ts * text_matrix[1];
+                                    (w_ts
+                                        * (text_matrix[0] * parent_ctm[0]
+                                            + text_matrix[1] * parent_ctm[2]))
+                                        .abs()
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                0.0
+                            };
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -958,7 +1406,7 @@ fn extract_form_xobject_text(
                                 text,
                                 x,
                                 y,
-                                width: 0.0,
+                                width,
                                 height: rendered_size,
                                 font: current_font.clone(),
                                 font_size: rendered_size,
@@ -974,26 +1422,52 @@ fn extract_form_xobject_text(
             "TJ" => {
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
+                        let font_info = font_widths.get(&current_font);
+
+                        // Compute space threshold based on font metrics when available
+                        let space_threshold = if let Some(fi) = font_info {
+                            let space_em = fi.space_width as f32 * fi.units_scale;
+                            let threshold = space_em * 1000.0 * 0.4;
+                            threshold.clamp(80.0, 200.0)
+                        } else {
+                            120.0
+                        };
+
                         let mut combined_text = String::new();
-                        for item in array {
-                            // Check for spacing values
-                            match item {
+                        let mut total_width_ts: f32 = 0.0;
+                        for element in array {
+                            match element {
                                 Object::Integer(n) => {
-                                    if *n < -200 && !combined_text.ends_with(' ') {
+                                    let n_val = *n as f32;
+                                    total_width_ts += -n_val / 1000.0 * current_font_size;
+                                    if n_val < -space_threshold
+                                        && !combined_text.is_empty()
+                                        && !combined_text.ends_with(' ')
+                                    {
                                         combined_text.push(' ');
                                     }
                                     continue;
                                 }
                                 Object::Real(n) => {
-                                    if *n < -200.0 && !combined_text.ends_with(' ') {
+                                    total_width_ts += -(*n) / 1000.0 * current_font_size;
+                                    if *n < -space_threshold
+                                        && !combined_text.is_empty()
+                                        && !combined_text.ends_with(' ')
+                                    {
                                         combined_text.push(' ');
                                     }
                                     continue;
                                 }
                                 _ => {}
                             }
+                            if let Some(fi) = font_info {
+                                if let Some(raw_bytes) = get_operand_bytes(element) {
+                                    total_width_ts +=
+                                        compute_string_width_ts(raw_bytes, fi, current_font_size);
+                                }
+                            }
                             if let Some(text) = extract_text_from_operand(
-                                item,
+                                element,
                                 doc,
                                 &form_fonts,
                                 &current_font,
@@ -1005,21 +1479,19 @@ fn extract_form_xobject_text(
                                 combined_text.push_str(&text);
                             }
                         }
-                        // Add trailing space if the text ends with a letter
-                        // This helps with Form XObjects where text_matrix doesn't advance between TJs
-                        if !combined_text.is_empty() {
-                            let last_char = combined_text.chars().last();
-                            if let Some(c) = last_char {
-                                if c.is_alphabetic() && !combined_text.ends_with(' ') {
-                                    combined_text.push(' ');
-                                }
-                            }
-                        }
                         if !combined_text.trim().is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
-                            let combined = multiply_matrices(&text_matrix, parent_ctm);
-                            let (x, y) = (combined[4], combined[5]);
+                            let combined_mat = multiply_matrices(&text_matrix, parent_ctm);
+                            let (x, y) = (combined_mat[4], combined_mat[5]);
+                            let width = if font_info.is_some() {
+                                (total_width_ts
+                                    * (text_matrix[0] * parent_ctm[0]
+                                        + text_matrix[1] * parent_ctm[2]))
+                                    .abs()
+                            } else {
+                                0.0
+                            };
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -1028,7 +1500,7 @@ fn extract_form_xobject_text(
                                 text: combined_text,
                                 x,
                                 y,
-                                width: 0.0,
+                                width,
                                 height: rendered_size,
                                 font: current_font.clone(),
                                 font_size: rendered_size,
@@ -1037,6 +1509,10 @@ fn extract_form_xobject_text(
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
                             });
+                            if font_info.is_some() {
+                                text_matrix[4] += total_width_ts * text_matrix[0];
+                                text_matrix[5] += total_width_ts * text_matrix[1];
+                            }
                         }
                     }
                 }

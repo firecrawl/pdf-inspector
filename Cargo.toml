@@ -40,3 +40,4 @@ path = "src/bin/pdf2md.rs"
 [[bin]]
 name = "detect-pdf"
 path = "src/bin/detect_pdf.rs"
+
