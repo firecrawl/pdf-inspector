@@ -13,6 +13,8 @@ pub struct ToUnicodeCMap {
     pub char_map: HashMap<u16, String>,
     /// Range mappings (start_cid, end_cid) -> base_unicode
     pub ranges: Vec<(u16, u16, u32)>,
+    /// Byte width of source codes (1 or 2), determined from codespace and CMap entries
+    pub code_byte_length: u8,
 }
 
 impl ToUnicodeCMap {
@@ -25,6 +27,33 @@ impl ToUnicodeCMap {
     pub fn parse(content: &[u8]) -> Option<Self> {
         let text = String::from_utf8_lossy(content);
         let mut cmap = ToUnicodeCMap::new();
+        let mut src_hex_lengths: Vec<usize> = Vec::new();
+
+        // Parse begincodespacerange ... endcodespacerange to determine byte width
+        let mut codespace_byte_len: Option<u8> = None;
+        if let Some(cs_start) = text.find("begincodespacerange") {
+            let section_start = cs_start + "begincodespacerange".len();
+            if let Some(cs_end) = text[section_start..].find("endcodespacerange") {
+                let section = &text[section_start..section_start + cs_end];
+                // Parse hex values to determine byte length
+                let mut in_hex = false;
+                let mut hex_len = 0;
+                for c in section.chars() {
+                    if c == '<' {
+                        in_hex = true;
+                        hex_len = 0;
+                    } else if c == '>' {
+                        if in_hex && hex_len > 0 {
+                            let byte_len = (hex_len + 1) / 2; // 2 hex digits = 1 byte
+                            codespace_byte_len = Some(byte_len as u8);
+                        }
+                        in_hex = false;
+                    } else if in_hex && c.is_ascii_hexdigit() {
+                        hex_len += 1;
+                    }
+                }
+            }
+        }
 
         // Parse beginbfchar ... endbfchar sections
         let mut pos = 0;
@@ -32,7 +61,7 @@ impl ToUnicodeCMap {
             let section_start = pos + start + "beginbfchar".len();
             if let Some(end) = text[section_start..].find("endbfchar") {
                 let section = &text[section_start..section_start + end];
-                cmap.parse_bfchar_section(section);
+                cmap.parse_bfchar_section(section, &mut src_hex_lengths);
                 pos = section_start + end;
             } else {
                 break;
@@ -45,7 +74,7 @@ impl ToUnicodeCMap {
             let section_start = pos + start + "beginbfrange".len();
             if let Some(end) = text[section_start..].find("endbfrange") {
                 let section = &text[section_start..section_start + end];
-                cmap.parse_bfrange_section(section);
+                cmap.parse_bfrange_section(section, &mut src_hex_lengths);
                 pos = section_start + end;
             } else {
                 break;
@@ -53,14 +82,37 @@ impl ToUnicodeCMap {
         }
 
         if cmap.char_map.is_empty() && cmap.ranges.is_empty() {
-            None
-        } else {
-            Some(cmap)
+            return None;
         }
+
+        // Determine byte width: use codespace if available, otherwise infer from entries
+        cmap.code_byte_length = if let Some(cs_len) = codespace_byte_len {
+            // If codespace says 2-byte but ALL entries use 1-byte source codes
+            // (hex length <= 2), treat as 1-byte. This handles the common case where
+            // codespace is <0000><FFFF> but entries are <20>, <41>, etc.
+            if cs_len == 2 && !src_hex_lengths.is_empty() && src_hex_lengths.iter().all(|&l| l <= 2)
+            {
+                1
+            } else {
+                cs_len
+            }
+        } else if !src_hex_lengths.is_empty() {
+            // No codespace declaration: infer from entry hex lengths
+            let max_hex_len = src_hex_lengths.iter().max().copied().unwrap_or(4);
+            if max_hex_len <= 2 {
+                1
+            } else {
+                2
+            }
+        } else {
+            2 // Default to 2-byte
+        };
+
+        Some(cmap)
     }
 
     /// Parse a bfchar section: <src> <dst> pairs
-    fn parse_bfchar_section(&mut self, section: &str) {
+    fn parse_bfchar_section(&mut self, section: &str, src_hex_lengths: &mut Vec<usize>) {
         // Match pairs of hex values: <XXXX> <YYYY>
         let mut chars = section.chars().peekable();
 
@@ -84,6 +136,12 @@ impl ToUnicodeCMap {
                 }
             }
             chars.next(); // consume >
+
+            // Track source hex length for byte width detection
+            let trimmed_src = src_hex.trim();
+            if !trimmed_src.is_empty() {
+                src_hex_lengths.push(trimmed_src.len());
+            }
 
             // Skip whitespace
             while chars.peek().is_some_and(|c| c.is_whitespace()) {
@@ -114,8 +172,8 @@ impl ToUnicodeCMap {
         }
     }
 
-    /// Parse a bfrange section: <start> <end> <base> triplets
-    fn parse_bfrange_section(&mut self, section: &str) {
+    /// Parse a bfrange section: <start> <end> <base> or <start> <end> [<u1> <u2> ...] triplets
+    fn parse_bfrange_section(&mut self, section: &str, src_hex_lengths: &mut Vec<usize>) {
         let mut chars = section.chars().peekable();
 
         loop {
@@ -138,6 +196,12 @@ impl ToUnicodeCMap {
                 }
             }
             chars.next(); // consume >
+
+            // Track source hex length
+            let trimmed_start = start_hex.trim();
+            if !trimmed_start.is_empty() {
+                src_hex_lengths.push(trimmed_start.len());
+            }
 
             // Skip whitespace
             while chars.peek().is_some_and(|c| c.is_whitespace()) {
@@ -182,11 +246,57 @@ impl ToUnicodeCMap {
                     self.ranges.push((start, end, base));
                 }
             } else if chars.peek() == Some(&'[') {
-                // Array format - skip for now (less common)
-                while chars.peek().is_some_and(|&c| c != ']') {
-                    chars.next();
+                // Array format: [<unicode1> <unicode2> ...]
+                // Each entry maps to start_cid + index
+                chars.next(); // consume [
+                if let (Some(start), Some(end)) =
+                    (parse_hex_u16(&start_hex), parse_hex_u16(&end_hex))
+                {
+                    let mut cid = start;
+                    loop {
+                        // Skip whitespace
+                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                            chars.next();
+                        }
+                        if chars.peek() == Some(&']') {
+                            chars.next();
+                            break;
+                        }
+                        if chars.peek() != Some(&'<') {
+                            break;
+                        }
+                        chars.next(); // consume <
+                        let mut hex = String::new();
+                        while chars.peek().is_some_and(|&c| c != '>') {
+                            if let Some(c) = chars.next() {
+                                hex.push(c);
+                            }
+                        }
+                        chars.next(); // consume >
+                        if let Some(unicode_str) = hex_to_unicode_string(&hex) {
+                            self.char_map.insert(cid, unicode_str);
+                        }
+                        if cid >= end {
+                            // Skip remaining entries and closing bracket
+                            while chars.peek().is_some_and(|&c| c != ']') {
+                                chars.next();
+                            }
+                            if chars.peek() == Some(&']') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        cid = cid.saturating_add(1);
+                    }
+                } else {
+                    // Couldn't parse start/end, skip the array
+                    while chars.peek().is_some_and(|&c| c != ']') {
+                        chars.next();
+                    }
+                    if chars.peek() == Some(&']') {
+                        chars.next();
+                    }
                 }
-                chars.next();
             }
         }
     }
@@ -212,23 +322,52 @@ impl ToUnicodeCMap {
         None
     }
 
-    /// Decode a byte slice of CIDs (2 bytes each) to a Unicode string
+    /// Decode a byte slice to a Unicode string, respecting the CMap's code byte width
     pub fn decode_cids(&self, bytes: &[u8]) -> String {
         let mut result = String::new();
+        let mut unmapped_count = 0usize;
 
-        // CIDs are 2 bytes each (big-endian)
-        for chunk in bytes.chunks(2) {
-            if chunk.len() == 2 {
-                let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
-                if let Some(s) = self.lookup(cid) {
+        if self.code_byte_length == 1 {
+            // Single-byte codes: each byte is a code
+            for &b in bytes {
+                let code = b as u16;
+                if let Some(s) = self.lookup(code) {
                     result.push_str(&s);
                 } else {
-                    // Fallback: try as direct Unicode
-                    if let Some(c) = char::from_u32(cid as u32) {
-                        result.push(c);
+                    // For single-byte unmapped codes, try as Latin-1
+                    // (the byte IS the character code in most legacy encodings)
+                    if b >= 0x20 {
+                        result.push(b as char);
+                    }
+                    unmapped_count += 1;
+                }
+            }
+        } else {
+            // Two-byte codes: CIDs are 2 bytes each (big-endian)
+            for chunk in bytes.chunks(2) {
+                if chunk.len() == 2 {
+                    let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
+                    if let Some(s) = self.lookup(cid) {
+                        result.push_str(&s);
+                    } else {
+                        // Do NOT blindly interpret CIDs as Unicode codepoints.
+                        // CIDs are font-internal indices, not Unicode values.
+                        // Unmapped 2-byte CIDs are skipped to avoid CJK garbage.
+                        unmapped_count += 1;
                     }
                 }
             }
+        }
+
+        // If too many codes were unmapped, signal failure by returning empty
+        // so the caller can fall through to other decoding methods
+        let total = if self.code_byte_length == 1 {
+            bytes.len()
+        } else {
+            bytes.len() / 2
+        };
+        if total > 0 && unmapped_count > total / 2 {
+            return String::new();
         }
 
         result
@@ -453,10 +592,14 @@ impl FontCMaps {
         }
 
         // Try without leading 'F' if present (resource names sometimes differ)
+        // but only if the stripped name is long enough to avoid false matches
+        // (e.g., "F1" → "1" would match too many things)
         let stripped = font_name.strip_prefix('F').unwrap_or(font_name);
-        for (name, cmap) in &self.by_name {
-            if name.contains(stripped) || stripped.contains(name.as_str()) {
-                return Some(cmap);
+        if stripped.len() >= 4 {
+            for (name, cmap) in &self.by_name {
+                if name.contains(stripped) || stripped.contains(name.as_str()) {
+                    return Some(cmap);
+                }
             }
         }
 
@@ -544,7 +687,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_bfchar() {
+    fn test_parse_bfchar_2byte() {
         let cmap_content = r#"
 /CIDInit /ProcSet findresource begin
 12 dict begin
@@ -561,14 +704,40 @@ endcmap
 "#;
         let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
 
+        assert_eq!(cmap.code_byte_length, 2);
         assert_eq!(cmap.lookup(0x0003), Some(" ".to_string()));
         assert_eq!(cmap.lookup(0x0024), Some("A".to_string()));
         assert_eq!(cmap.lookup(0x0025), Some("B".to_string()));
     }
 
     #[test]
-    fn test_decode_cids() {
+    fn test_parse_bfchar_1byte() {
+        // This is the pattern that caused the CJK bug: codespace is <0000><FFFF>
+        // but all source codes are 1-byte hex (e.g., <20>, <41>)
         let cmap_content = r#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+3 beginbfchar
+<20> <0020>
+<41> <0041>
+<42> <0042>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        // Should detect as 1-byte because all source codes are 1-byte hex
+        assert_eq!(cmap.code_byte_length, 1);
+        assert_eq!(cmap.lookup(0x0020), Some(" ".to_string()));
+        assert_eq!(cmap.lookup(0x0041), Some("A".to_string()));
+    }
+
+    #[test]
+    fn test_decode_cids_2byte() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
 3 beginbfchar
 <0003> <0020>
 <0024> <0041>
@@ -577,8 +746,76 @@ endbfchar
 "#;
         let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
 
-        // "AB " in CID encoding
+        // "AB " in 2-byte CID encoding
         let cids = [0x00, 0x24, 0x00, 0x25, 0x00, 0x03];
         assert_eq!(cmap.decode_cids(&cids), "AB ");
+    }
+
+    #[test]
+    fn test_decode_cids_1byte_no_cjk_garbage() {
+        // Simulates the bug: CMap with 1-byte source codes
+        let cmap_content = r#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+5 beginbfchar
+<20> <0020>
+<42> <0042>
+<79> <0079>
+<50> <0050>
+<52> <0052>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert_eq!(cmap.code_byte_length, 1);
+
+        // "By" should decode to "By", NOT to CJK character 䉹
+        let bytes = [0x42, 0x79];
+        let result = cmap.decode_cids(&bytes);
+        assert_eq!(result, "By");
+        assert!(!result.contains('䉹'), "Should not produce CJK garbage");
+
+        // "PR" should decode to "PR"
+        let bytes2 = [0x50, 0x52];
+        assert_eq!(cmap.decode_cids(&bytes2), "PR");
+    }
+
+    #[test]
+    fn test_bfrange_array_format() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+1 beginbfrange
+<0003> <0005> [<0041> <0042> <0043>]
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        assert_eq!(cmap.lookup(0x0003), Some("A".to_string()));
+        assert_eq!(cmap.lookup(0x0004), Some("B".to_string()));
+        assert_eq!(cmap.lookup(0x0005), Some("C".to_string()));
+    }
+
+    #[test]
+    fn test_unmapped_2byte_cids_skipped() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfchar
+<0041> <0041>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert_eq!(cmap.code_byte_length, 2);
+
+        // CID 0x4279 is unmapped - should NOT produce CJK character
+        let bytes = [0x42, 0x79];
+        let result = cmap.decode_cids(&bytes);
+        assert!(
+            !result.contains('䉹'),
+            "Unmapped 2-byte CIDs should not produce CJK"
+        );
     }
 }

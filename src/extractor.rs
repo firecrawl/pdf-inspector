@@ -39,7 +39,7 @@ fn parse_font_encoding(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<
 
     // Encoding can be a name or a dictionary
     match encoding_obj {
-        Object::Name(name) => {
+        Object::Name(_name) => {
             // Standard encoding name (e.g., MacRomanEncoding, WinAnsiEncoding)
             // For standard encodings, we can use the standard tables
             // But we still need to check for Differences
@@ -975,8 +975,6 @@ fn extract_form_xobject_text(
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let mut combined_text = String::new();
-                        // Track if the last item was a large spacing (potential word boundary)
-                        let mut last_was_large_space = false;
                         for item in array {
                             // Check for spacing values
                             match item {
@@ -984,19 +982,15 @@ fn extract_form_xobject_text(
                                     if *n < -200 && !combined_text.ends_with(' ') {
                                         combined_text.push(' ');
                                     }
-                                    last_was_large_space = *n < -200;
                                     continue;
                                 }
                                 Object::Real(n) => {
                                     if *n < -200.0 && !combined_text.ends_with(' ') {
                                         combined_text.push(' ');
                                     }
-                                    last_was_large_space = *n < -200.0;
                                     continue;
                                 }
-                                _ => {
-                                    last_was_large_space = false;
-                                }
+                                _ => {}
                             }
                             if let Some(text) = extract_text_from_operand(
                                 item,
@@ -1262,6 +1256,7 @@ pub fn is_italic_font(font_name: &str) -> bool {
 }
 
 /// Extract text from a text operand, handling encoding
+#[allow(clippy::too_many_arguments)]
 fn extract_text_from_operand(
     obj: &Object,
     doc: &Document,

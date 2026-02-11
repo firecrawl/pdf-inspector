@@ -27,3 +27,6 @@ Thumbs.db
 # Local samples and scripts
 samples/
 scripts/
+
+# Test output
+test_output/
