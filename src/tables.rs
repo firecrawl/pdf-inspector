@@ -928,6 +928,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            item_type: crate::extractor::ItemType::Text,
         }
     }
 

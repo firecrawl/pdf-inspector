@@ -32,6 +32,10 @@ pub struct MarkdownOptions {
     pub detect_bold: bool,
     /// Detect and format italic text from font names
     pub detect_italic: bool,
+    /// Include image placeholders in output
+    pub include_images: bool,
+    /// Include extracted hyperlinks
+    pub include_links: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -46,6 +50,8 @@ impl Default for MarkdownOptions {
             fix_hyphenation: true,
             detect_bold: true,
             detect_italic: true,
+            include_images: true,
+            include_links: true,
         }
     }
 }
@@ -108,6 +114,7 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
 
 /// Convert positioned text items to markdown with structure detection
 pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) -> String {
+    use crate::extractor::ItemType;
     use crate::tables::{detect_tables, table_to_markdown};
     use std::collections::HashSet;
 
@@ -115,8 +122,31 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
         return String::new();
     }
 
+    // Separate images and links from text items
+    let mut images: Vec<TextItem> = Vec::new();
+    let mut links: Vec<TextItem> = Vec::new();
+    let mut text_items: Vec<TextItem> = Vec::new();
+
+    for item in items {
+        match &item.item_type {
+            ItemType::Image => {
+                if options.include_images {
+                    images.push(item);
+                }
+            }
+            ItemType::Link(_) => {
+                if options.include_links {
+                    links.push(item);
+                }
+            }
+            ItemType::Text => {
+                text_items.push(item);
+            }
+        }
+    }
+
     // Calculate base font size for table detection
-    let font_stats = calculate_font_stats_from_items(&items);
+    let font_stats = calculate_font_stats_from_items(&text_items);
     let base_size = options
         .base_font_size
         .unwrap_or(font_stats.most_common_size);
@@ -126,13 +156,35 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
     let mut page_tables: std::collections::HashMap<u32, Vec<(f32, String)>> =
         std::collections::HashMap::new();
 
+    // Store images by page and Y position for insertion
+    let mut page_images: std::collections::HashMap<u32, Vec<(f32, String)>> =
+        std::collections::HashMap::new();
+
+    for img in &images {
+        // Extract image name from "[Image: Im0]" format
+        let img_name = img
+            .text
+            .strip_prefix("[Image: ")
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(&img.text);
+        let img_md = format!("![Image: {}](image)\n", img_name);
+        page_images
+            .entry(img.page)
+            .or_default()
+            .push((img.y, img_md));
+    }
+
     // Group items by page for table detection
-    let mut pages: Vec<u32> = items.iter().map(|i| i.page).collect();
+    let mut pages: Vec<u32> = text_items.iter().map(|i| i.page).collect();
     pages.sort();
     pages.dedup();
 
     for page in pages {
-        let page_items: Vec<TextItem> = items.iter().filter(|i| i.page == page).cloned().collect();
+        let page_items: Vec<TextItem> = text_items
+            .iter()
+            .filter(|i| i.page == page)
+            .cloned()
+            .collect();
 
         let tables = detect_tables(&page_items, base_size);
 
@@ -140,7 +192,7 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
             // Mark items as belonging to a table
             for &idx in &table.item_indices {
                 // Find the global index
-                let global_idx = items
+                let global_idx = text_items
                     .iter()
                     .enumerate()
                     .filter(|(_, i)| i.page == page)
@@ -163,7 +215,7 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
     }
 
     // Filter out table items and process the rest
-    let non_table_items: Vec<TextItem> = items
+    let non_table_items: Vec<TextItem> = text_items
         .into_iter()
         .enumerate()
         .filter(|(idx, _)| !table_items.contains(idx))
@@ -172,8 +224,8 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
 
     let lines = group_into_lines(non_table_items);
 
-    // Convert to markdown, inserting tables at appropriate positions
-    to_markdown_from_lines_with_tables(lines, options, page_tables)
+    // Convert to markdown, inserting tables and images at appropriate positions
+    to_markdown_from_lines_with_tables_and_images(lines, options, page_tables, page_images)
 }
 
 /// Calculate font stats directly from items (before grouping into lines)
@@ -196,13 +248,14 @@ fn calculate_font_stats_from_items(items: &[TextItem]) -> FontStats {
     FontStats { most_common_size }
 }
 
-/// Convert text lines to markdown, inserting tables at appropriate Y positions
-fn to_markdown_from_lines_with_tables(
+/// Convert text lines to markdown, inserting tables and images at appropriate Y positions
+fn to_markdown_from_lines_with_tables_and_images(
     lines: Vec<TextLine>,
     options: MarkdownOptions,
     page_tables: std::collections::HashMap<u32, Vec<(f32, String)>>,
+    page_images: std::collections::HashMap<u32, Vec<(f32, String)>>,
 ) -> String {
-    if lines.is_empty() && page_tables.is_empty() {
+    if lines.is_empty() && page_tables.is_empty() && page_images.is_empty() {
         return String::new();
     }
 
@@ -222,11 +275,12 @@ fn to_markdown_from_lines_with_tables(
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
+    let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
 
     for line in lines {
         // Page break
         if line.page != current_page {
-            // Before leaving the current page, insert any remaining tables for that page
+            // Before leaving the current page, insert any remaining tables and images
             if current_page > 0 {
                 if let Some(tables) = page_tables.get(&current_page) {
                     for (idx, (_, table_md)) in tables.iter().enumerate() {
@@ -239,6 +293,20 @@ fn to_markdown_from_lines_with_tables(
                             output.push_str(table_md);
                             output.push('\n');
                             inserted_tables.insert((current_page, idx));
+                        }
+                    }
+                }
+                if let Some(images) = page_images.get(&current_page) {
+                    for (idx, (_, image_md)) in images.iter().enumerate() {
+                        if !inserted_images.contains(&(current_page, idx)) {
+                            if in_paragraph {
+                                output.push_str("\n\n");
+                                in_paragraph = false;
+                            }
+                            output.push('\n');
+                            output.push_str(image_md);
+                            output.push('\n');
+                            inserted_images.insert((current_page, idx));
                         }
                     }
                 }
@@ -265,6 +333,23 @@ fn to_markdown_from_lines_with_tables(
                     output.push_str(table_md);
                     output.push('\n');
                     inserted_tables.insert((current_page, idx));
+                }
+            }
+        }
+
+        // Check if we should insert an image before this line
+        if let Some(images) = page_images.get(&current_page) {
+            for (idx, (image_y, image_md)) in images.iter().enumerate() {
+                // Insert image when we pass its Y position
+                if *image_y > line.y && !inserted_images.contains(&(current_page, idx)) {
+                    if in_paragraph {
+                        output.push_str("\n\n");
+                        in_paragraph = false;
+                    }
+                    output.push('\n');
+                    output.push_str(image_md);
+                    output.push('\n');
+                    inserted_images.insert((current_page, idx));
                 }
             }
         }
@@ -396,6 +481,21 @@ fn to_markdown_from_lines_with_tables(
                 }
                 output.push('\n');
                 output.push_str(table_md);
+                output.push('\n');
+            }
+        }
+    }
+
+    // Insert any remaining images for the last page
+    if let Some(images) = page_images.get(&current_page) {
+        for (idx, (_, image_md)) in images.iter().enumerate() {
+            if !inserted_images.contains(&(current_page, idx)) {
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                output.push('\n');
+                output.push_str(image_md);
                 output.push('\n');
             }
         }

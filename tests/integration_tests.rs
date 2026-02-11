@@ -9,6 +9,7 @@ use pdf_inspector::{
 
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
+    use pdf_inspector::extractor::ItemType;
     TextItem {
         text: text.to_string(),
         x,
@@ -20,6 +21,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         page,
         is_bold: false,
         is_italic: false,
+        item_type: ItemType::Text,
     }
 }
 
@@ -31,7 +33,7 @@ fn make_text_item_with_font(
     font: &str,
     page: u32,
 ) -> TextItem {
-    use pdf_inspector::extractor::{is_bold_font, is_italic_font};
+    use pdf_inspector::extractor::{is_bold_font, is_italic_font, ItemType};
     TextItem {
         text: text.to_string(),
         x,
@@ -43,6 +45,7 @@ fn make_text_item_with_font(
         page,
         is_bold: is_bold_font(font),
         is_italic: is_italic_font(font),
+        item_type: ItemType::Text,
     }
 }
 
@@ -260,6 +263,8 @@ fn test_markdown_options_custom() {
         fix_hyphenation: false,
         detect_bold: false,
         detect_italic: false,
+        include_images: false,
+        include_links: false,
     };
     assert!(!opts.detect_headers);
     assert!(opts.detect_lists);
@@ -270,6 +275,8 @@ fn test_markdown_options_custom() {
     assert!(!opts.fix_hyphenation);
     assert!(!opts.detect_bold);
     assert!(!opts.detect_italic);
+    assert!(!opts.include_images);
+    assert!(!opts.include_links);
 }
 
 // ============================================================================

@@ -7,6 +7,18 @@ use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
 use std::path::Path;
 
+/// Type of content item
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ItemType {
+    /// Regular text content
+    #[default]
+    Text,
+    /// Image placeholder
+    Image,
+    /// Hyperlink (with URL)
+    Link(String),
+}
+
 /// A text item with position information
 #[derive(Debug, Clone)]
 pub struct TextItem {
@@ -30,6 +42,8 @@ pub struct TextItem {
     pub is_bold: bool,
     /// Whether the font is italic
     pub is_italic: bool,
+    /// Type of item (text, image, link)
+    pub item_type: ItemType,
 }
 
 /// A line of text (grouped text items)
@@ -297,6 +311,10 @@ fn extract_positioned_text_from_doc(
     for (page_num, &page_id) in pages.iter() {
         let items = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
         all_items.extend(items);
+
+        // Extract hyperlinks from page annotations
+        let links = extract_page_links(doc, page_id, *page_num);
+        all_items.extend(links);
     }
 
     Ok(all_items)
@@ -352,6 +370,9 @@ fn extract_page_text_items(
             }
         }
     }
+
+    // Get XObjects (images) from page resources
+    let xobjects = get_page_xobjects(doc, page_id);
 
     // Get content
     let content_data = doc
@@ -479,6 +500,7 @@ fn extract_page_text_items(
                                 page: page_num,
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
+                                item_type: ItemType::Text,
                             });
                         }
                     }
@@ -524,6 +546,7 @@ fn extract_page_text_items(
                                 page: page_num,
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
+                                item_type: ItemType::Text,
                             });
                         }
                     }
@@ -565,6 +588,37 @@ fn extract_page_text_items(
                                 page: page_num,
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
+                                item_type: ItemType::Text,
+                            });
+                        }
+                    }
+                }
+            }
+            "Do" => {
+                // XObject invocation - could be an image
+                if !op.operands.is_empty() {
+                    if let Ok(name) = op.operands[0].as_name() {
+                        let xobj_name = String::from_utf8_lossy(name).to_string();
+                        // Check if this XObject is an image
+                        if xobjects.contains(&xobj_name) {
+                            // Get position from CTM
+                            let (x, y) = (ctm[4], ctm[5]);
+                            // Get dimensions from CTM scale factors
+                            let width = ctm[0].abs();
+                            let height = ctm[3].abs();
+
+                            items.push(TextItem {
+                                text: format!("[Image: {}]", xobj_name),
+                                x,
+                                y,
+                                width,
+                                height,
+                                font: String::new(),
+                                font_size: 0.0,
+                                page: page_num,
+                                is_bold: false,
+                                is_italic: false,
+                                item_type: ItemType::Image,
                             });
                         }
                     }
@@ -584,6 +638,167 @@ fn get_number(obj: &Object) -> Option<f32> {
         Object::Real(r) => Some(*r),
         _ => None,
     }
+}
+
+/// Get XObject names that are images from page resources
+fn get_page_xobjects(doc: &Document, page_id: ObjectId) -> std::collections::HashSet<String> {
+    let mut image_names = std::collections::HashSet::new();
+
+    // Try to get the page dictionary
+    if let Ok(page_dict) = doc.get_dictionary(page_id) {
+        // Get Resources dictionary
+        let resources = if let Ok(res_ref) = page_dict.get(b"Resources") {
+            if let Ok(obj_ref) = res_ref.as_reference() {
+                doc.get_dictionary(obj_ref).ok()
+            } else {
+                res_ref.as_dict().ok()
+            }
+        } else {
+            None
+        };
+
+        if let Some(resources) = resources {
+            // Get XObject dictionary from Resources
+            if let Ok(xobjects_ref) = resources.get(b"XObject") {
+                let xobjects = if let Ok(obj_ref) = xobjects_ref.as_reference() {
+                    doc.get_dictionary(obj_ref).ok()
+                } else {
+                    xobjects_ref.as_dict().ok()
+                };
+
+                if let Some(xobjects) = xobjects {
+                    for (name, value) in xobjects.iter() {
+                        let name_str = String::from_utf8_lossy(name).to_string();
+
+                        // Check if this XObject is an Image
+                        // XObjects are typically Stream objects, not Dictionary
+                        if let Ok(obj_ref) = value.as_reference() {
+                            if let Ok(Object::Stream(stream)) = doc.get_object(obj_ref) {
+                                if let Ok(subtype) = stream.dict.get(b"Subtype") {
+                                    if let Ok(subtype_name) = subtype.as_name() {
+                                        if subtype_name == b"Image" {
+                                            image_names.insert(name_str);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    image_names
+}
+
+/// Extract hyperlinks from page annotations
+pub fn extract_page_links(doc: &Document, page_id: ObjectId, page_num: u32) -> Vec<TextItem> {
+    let mut links = Vec::new();
+
+    // Try to get the page dictionary
+    if let Ok(page_dict) = doc.get_dictionary(page_id) {
+        // Get Annots array
+        let annots = if let Ok(annots_ref) = page_dict.get(b"Annots") {
+            if let Ok(obj_ref) = annots_ref.as_reference() {
+                doc.get_object(obj_ref)
+                    .ok()
+                    .and_then(|o| o.as_array().ok().cloned())
+            } else {
+                annots_ref.as_array().ok().cloned()
+            }
+        } else {
+            None
+        };
+
+        if let Some(annots) = annots {
+            for annot_ref in annots {
+                // Get annotation dictionary
+                let annot_dict = if let Ok(obj_ref) = annot_ref.as_reference() {
+                    doc.get_dictionary(obj_ref).ok()
+                } else {
+                    annot_ref.as_dict().ok()
+                };
+
+                if let Some(annot_dict) = annot_dict {
+                    // Check if this is a Link annotation
+                    if let Ok(subtype) = annot_dict.get(b"Subtype") {
+                        if let Ok(subtype_name) = subtype.as_name() {
+                            if subtype_name != b"Link" {
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Get the Rect (position)
+                    let rect = if let Ok(rect_obj) = annot_dict.get(b"Rect") {
+                        if let Ok(rect_array) = rect_obj.as_array() {
+                            if rect_array.len() >= 4 {
+                                let x1 = get_number(&rect_array[0]).unwrap_or(0.0);
+                                let y1 = get_number(&rect_array[1]).unwrap_or(0.0);
+                                let x2 = get_number(&rect_array[2]).unwrap_or(0.0);
+                                let y2 = get_number(&rect_array[3]).unwrap_or(0.0);
+                                Some((x1, y1, x2 - x1, y2 - y1))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Get the action (A dictionary) or Dest
+                    let uri = extract_link_uri(doc, annot_dict);
+
+                    if let (Some((x, y, width, height)), Some(url)) = (rect, uri) {
+                        links.push(TextItem {
+                            text: url.clone(),
+                            x,
+                            y,
+                            width,
+                            height,
+                            font: String::new(),
+                            font_size: 0.0,
+                            page: page_num,
+                            is_bold: false,
+                            is_italic: false,
+                            item_type: ItemType::Link(url),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    links
+}
+
+/// Extract URI from a link annotation
+fn extract_link_uri(doc: &Document, annot_dict: &lopdf::Dictionary) -> Option<String> {
+    // Try to get the A (Action) dictionary
+    if let Ok(action_ref) = annot_dict.get(b"A") {
+        let action_dict = if let Ok(obj_ref) = action_ref.as_reference() {
+            doc.get_dictionary(obj_ref).ok()
+        } else {
+            action_ref.as_dict().ok()
+        };
+
+        if let Some(action_dict) = action_dict {
+            // Check for URI action
+            if let Ok(uri_obj) = action_dict.get(b"URI") {
+                if let Ok(uri_str) = uri_obj.as_str() {
+                    return Some(String::from_utf8_lossy(uri_str).to_string());
+                }
+            }
+        }
+    }
+
+    // Try Dest (named destination) - less common for external links
+    // We'll skip this for now as it requires looking up named destinations
+
+    None
 }
 
 /// Compute effective font size from base size and text matrix
@@ -970,7 +1185,34 @@ fn group_single_column(items: Vec<TextItem>) -> Vec<TextLine> {
     for item in items {
         // Only check the most recent line for merging
         let should_merge = lines.last().is_some_and(|last_line| {
-            last_line.page == item.page && (last_line.y - item.y).abs() < y_tolerance
+            if last_line.page != item.page {
+                return false;
+            }
+            let y_diff = (last_line.y - item.y).abs();
+            if y_diff >= y_tolerance {
+                return false;
+            }
+            // Check if this looks like a new line despite similar Y:
+            // If items are at the same X position (left margin) but different Y,
+            // they're vertically stacked lines, not the same line
+            let has_y_change = y_diff > 0.5;
+            if has_y_change {
+                if let Some(first_item) = last_line.items.first() {
+                    let at_same_x = (item.x - first_item.x).abs() < 5.0;
+                    // If at same X (left margin) with Y change, it's likely a new line
+                    if at_same_x {
+                        return false;
+                    }
+                    // If new item starts significantly to the left with Y change,
+                    // it's a new line (not just out-of-order items on same line)
+                    if let Some(last_item) = last_line.items.last() {
+                        if item.x < last_item.x - 10.0 {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
         });
 
         if should_merge {
@@ -1015,6 +1257,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                item_type: ItemType::Text,
             },
             TextItem {
                 text: "World".into(),
@@ -1027,6 +1270,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                item_type: ItemType::Text,
             },
             TextItem {
                 text: "Next line".into(),
@@ -1039,6 +1283,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                item_type: ItemType::Text,
             },
         ];
 
