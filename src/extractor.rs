@@ -1822,6 +1822,15 @@ fn extract_text_from_operand(
     }
 }
 
+/// Estimate the width of a text item, falling back to a character-count heuristic when width is 0.
+fn effective_width(item: &TextItem) -> f32 {
+    if item.width > 0.0 {
+        item.width
+    } else {
+        item.text.chars().count() as f32 * item.font_size * 0.5
+    }
+}
+
 /// Represents a column region on a page
 #[derive(Debug, Clone)]
 struct ColumnRegion {
@@ -1829,8 +1838,18 @@ struct ColumnRegion {
     x_max: f32,
 }
 
-/// Detect column boundaries on a page based on X-position gaps
+/// Detect column boundaries on a page using a horizontal projection profile.
+///
+/// Builds an occupancy histogram across the page width and finds empty valleys
+/// (gutters) where no text exists. Validates valleys with vertical consistency
+/// checks to avoid false positives.
 fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion> {
+    const BIN_WIDTH: f32 = 2.0;
+    const MIN_GUTTER_WIDTH: f32 = 8.0;
+    const MIN_VERTICAL_SPAN_RATIO: f32 = 0.30;
+    const MIN_ITEMS_PER_COLUMN: usize = 10;
+    const NOISE_FRACTION: f32 = 0.05;
+
     // Get items for this page
     let page_items: Vec<&TextItem> = items.iter().filter(|i| i.page == page).collect();
 
@@ -1842,110 +1861,180 @@ fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion> {
     let x_min = page_items.iter().map(|i| i.x).fold(f32::INFINITY, f32::min);
     let x_max = page_items
         .iter()
-        .map(|i| i.x + i.width.max(50.0)) // Estimate right edge
+        .map(|i| i.x + effective_width(i))
         .fold(f32::NEG_INFINITY, f32::max);
 
     let page_width = x_max - x_min;
     if page_width < 200.0 {
-        // Page too narrow for multi-column, single column
         return vec![ColumnRegion { x_min, x_max }];
     }
 
-    // Need enough items to reliably detect columns
     if page_items.len() < 20 {
         return vec![ColumnRegion { x_min, x_max }];
     }
 
-    // Collect all X positions (left edge of each text item)
-    let mut x_positions: Vec<f32> = page_items.iter().map(|i| i.x).collect();
-    x_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Build occupancy histogram
+    let num_bins = ((page_width / BIN_WIDTH).ceil() as usize).max(1);
+    let mut histogram = vec![0u32; num_bins];
 
-    // Find gaps in X positions
-    // A gap > 30% of page width suggests column boundary
-    // (increased from 20% to reduce false positives from text with varying indentation)
-    let gap_threshold = page_width * 0.30;
-    let mut column_boundaries = vec![x_min];
-
-    for window in x_positions.windows(2) {
-        let gap = window[1] - window[0];
-        if gap > gap_threshold {
-            // Found a column boundary - use midpoint of gap
-            let boundary = (window[0] + window[1]) / 2.0;
-            column_boundaries.push(boundary);
-        }
-    }
-    column_boundaries.push(x_max + 1.0);
-
-    // Convert boundaries to column regions
-    let mut columns = Vec::new();
-    for i in 0..column_boundaries.len() - 1 {
-        columns.push(ColumnRegion {
-            x_min: column_boundaries[i],
-            x_max: column_boundaries[i + 1],
-        });
-    }
-
-    // Only use multi-column if we have exactly 2 columns
-    // (most common case; 3+ columns are rare and error-prone)
-    if columns.len() == 2 {
-        // Verify both columns have substantial content
-        let col_counts: Vec<usize> = columns
-            .iter()
-            .map(|col| {
-                page_items
-                    .iter()
-                    .filter(|i| i.x >= col.x_min && i.x < col.x_max)
-                    .count()
-            })
-            .collect();
-
-        // Each column should have at least 20% of the content
-        let total: usize = col_counts.iter().sum();
-        let min_threshold = total / 5;
-        if col_counts.iter().all(|&c| c >= min_threshold) {
-            return columns;
+    for item in &page_items {
+        let w = effective_width(item);
+        let left = ((item.x - x_min) / BIN_WIDTH).floor() as usize;
+        let right = (((item.x + w) - x_min) / BIN_WIDTH).ceil() as usize;
+        let left = left.min(num_bins);
+        let right = right.min(num_bins);
+        for count in histogram.iter_mut().take(right).skip(left) {
+            *count += 1;
         }
     }
 
-    // For 3+ detected columns, try merging adjacent small columns
-    if columns.len() > 2 {
-        let col_counts: Vec<usize> = columns
+    // Find the noise threshold: bins with count <= max_count * NOISE_FRACTION are "empty"
+    let max_count = *histogram.iter().max().unwrap_or(&0);
+    let noise_threshold = (max_count as f32 * NOISE_FRACTION) as u32;
+
+    // Find empty valleys (consecutive runs of low-count bins)
+    // Each valley is stored as (start_bin, end_bin)
+    let mut valleys: Vec<(usize, usize)> = Vec::new();
+    let mut valley_start: Option<usize> = None;
+
+    for (i, &count) in histogram.iter().enumerate() {
+        if count <= noise_threshold {
+            if valley_start.is_none() {
+                valley_start = Some(i);
+            }
+        } else if let Some(start) = valley_start {
+            valleys.push((start, i));
+            valley_start = None;
+        }
+    }
+    // Close any valley that extends to the end
+    if let Some(start) = valley_start {
+        valleys.push((start, num_bins));
+    }
+
+    // Filter valleys: must be wide enough and not at page margins
+    let margin_threshold = page_width * 0.05;
+    let valleys: Vec<(usize, usize)> = valleys
+        .into_iter()
+        .filter(|&(start, end)| {
+            let width_pts = (end - start) as f32 * BIN_WIDTH;
+            if width_pts < MIN_GUTTER_WIDTH {
+                return false;
+            }
+            // Valley center must not be within 5% of page edges
+            let center_pts = ((start + end) as f32 / 2.0) * BIN_WIDTH;
+            center_pts > margin_threshold && center_pts < (page_width - margin_threshold)
+        })
+        .collect();
+
+    if valleys.is_empty() {
+        return vec![ColumnRegion { x_min, x_max }];
+    }
+
+    // Compute Y range of the page
+    let y_min = page_items.iter().map(|i| i.y).fold(f32::INFINITY, f32::min);
+    let y_max = page_items
+        .iter()
+        .map(|i| i.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let y_range = y_max - y_min;
+
+    // Validate each valley with vertical consistency
+    let mut valid_valleys: Vec<(usize, usize)> = Vec::new();
+    for &(start, end) in &valleys {
+        let gutter_left = x_min + start as f32 * BIN_WIDTH;
+        let gutter_right = x_min + end as f32 * BIN_WIDTH;
+        let gutter_center = (gutter_left + gutter_right) / 2.0;
+
+        // Collect items on each side of the gutter
+        let left_items: Vec<&&TextItem> = page_items
             .iter()
-            .map(|col| {
-                page_items
-                    .iter()
-                    .filter(|i| i.x >= col.x_min && i.x < col.x_max)
-                    .count()
-            })
+            .filter(|i| i.x + effective_width(i) <= gutter_center)
             .collect();
+        let right_items: Vec<&&TextItem> =
+            page_items.iter().filter(|i| i.x >= gutter_center).collect();
 
-        // Find the largest gap between columns that have substantial content
-        let total: usize = col_counts.iter().sum();
-        let min_items = total / 5; // 20% minimum
+        if left_items.len() < MIN_ITEMS_PER_COLUMN || right_items.len() < MIN_ITEMS_PER_COLUMN {
+            continue;
+        }
 
-        // Find first and last columns with enough content
-        let first_substantial = col_counts.iter().position(|&c| c >= min_items);
-        let last_substantial = col_counts.iter().rposition(|&c| c >= min_items);
+        // Check vertical overlap
+        if y_range > 0.0 {
+            let left_y_min = left_items.iter().map(|i| i.y).fold(f32::INFINITY, f32::min);
+            let left_y_max = left_items
+                .iter()
+                .map(|i| i.y)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let right_y_min = right_items
+                .iter()
+                .map(|i| i.y)
+                .fold(f32::INFINITY, f32::min);
+            let right_y_max = right_items
+                .iter()
+                .map(|i| i.y)
+                .fold(f32::NEG_INFINITY, f32::max);
 
-        if let (Some(first), Some(last)) = (first_substantial, last_substantial) {
-            if first != last {
-                // Create two columns: merge everything before the gap and after
-                return vec![
-                    ColumnRegion {
-                        x_min: columns[0].x_min,
-                        x_max: columns[first].x_max,
-                    },
-                    ColumnRegion {
-                        x_min: columns[last].x_min,
-                        x_max: columns[columns.len() - 1].x_max,
-                    },
-                ];
+            let overlap_min = left_y_min.max(right_y_min);
+            let overlap_max = left_y_max.min(right_y_max);
+            let overlap = (overlap_max - overlap_min).max(0.0);
+
+            if overlap / y_range < MIN_VERTICAL_SPAN_RATIO {
+                continue;
             }
         }
+
+        valid_valleys.push((start, end));
     }
 
-    // Default to single column
-    vec![ColumnRegion { x_min, x_max }]
+    if valid_valleys.is_empty() {
+        return vec![ColumnRegion { x_min, x_max }];
+    }
+
+    // Limit to at most 3 gutters (4 columns) — keep the widest if more found
+    if valid_valleys.len() > 3 {
+        valid_valleys.sort_by(|a, b| {
+            let wa = (a.1 - a.0) as f32;
+            let wb = (b.1 - b.0) as f32;
+            wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        valid_valleys.truncate(3);
+        // Re-sort by position (left to right)
+        valid_valleys.sort_by_key(|v| v.0);
+    }
+
+    // Build column regions from gutter boundaries
+    let mut columns = Vec::new();
+    let mut col_start = x_min;
+    for &(start, end) in &valid_valleys {
+        let gutter_center = x_min + ((start + end) as f32 / 2.0) * BIN_WIDTH;
+        columns.push(ColumnRegion {
+            x_min: col_start,
+            x_max: gutter_center,
+        });
+        col_start = gutter_center;
+    }
+    columns.push(ColumnRegion {
+        x_min: col_start,
+        x_max,
+    });
+
+    columns
+}
+
+/// Determines if a text item spans across multiple column regions (e.g. full-width headers/titles).
+fn spans_multiple_columns(item: &TextItem, columns: &[ColumnRegion]) -> bool {
+    let w = effective_width(item);
+    let item_right = item.x + w;
+    let overlap_count = columns
+        .iter()
+        .filter(|col| {
+            let overlap_start = item.x.max(col.x_min);
+            let overlap_end = item_right.min(col.x_max);
+            let overlap = (overlap_end - overlap_start).max(0.0);
+            overlap > (col.x_max - col.x_min) * 0.10 || overlap > 20.0
+        })
+        .count();
+    overlap_count >= 2
 }
 
 /// Check if a text item is likely a page number
@@ -1995,17 +2084,67 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
             let lines = group_single_column(page_items);
             all_lines.extend(lines);
         } else {
-            // Multi-column - process each column separately, then concatenate
+            // Multi-column - separate spanning items from column items
+            let mut spanning_items: Vec<TextItem> = Vec::new();
+            let mut column_items: Vec<TextItem> = Vec::new();
+
+            for item in &page_items {
+                if spans_multiple_columns(item, &columns) {
+                    spanning_items.push(item.clone());
+                } else {
+                    column_items.push(item.clone());
+                }
+            }
+
+            // Process each column's items independently
+            let mut column_lines: Vec<TextLine> = Vec::new();
             for column in &columns {
-                let col_items: Vec<TextItem> = page_items
+                let col_items: Vec<TextItem> = column_items
                     .iter()
-                    .filter(|i| i.x >= column.x_min && i.x < column.x_max)
+                    .filter(|i| {
+                        let center = i.x + effective_width(i) / 2.0;
+                        center >= column.x_min && center < column.x_max
+                    })
                     .cloned()
                     .collect();
 
                 let lines = group_single_column(col_items);
-                all_lines.extend(lines);
+                column_lines.extend(lines);
             }
+
+            // Process spanning items as their own group
+            let spanning_lines = group_single_column(spanning_items);
+
+            // Merge: interleave spanning lines by Y position among column lines
+            let mut merged: Vec<TextLine> = Vec::new();
+            let mut span_idx = 0;
+            let mut col_idx = 0;
+
+            // Sort spanning lines by Y descending (top-first in PDF coords)
+            let mut spanning_lines = spanning_lines;
+            spanning_lines
+                .sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+
+            while span_idx < spanning_lines.len() && col_idx < column_lines.len() {
+                // Higher Y = higher on page = comes first in reading order
+                if spanning_lines[span_idx].y >= column_lines[col_idx].y {
+                    merged.push(spanning_lines[span_idx].clone());
+                    span_idx += 1;
+                } else {
+                    merged.push(column_lines[col_idx].clone());
+                    col_idx += 1;
+                }
+            }
+            while span_idx < spanning_lines.len() {
+                merged.push(spanning_lines[span_idx].clone());
+                span_idx += 1;
+            }
+            while col_idx < column_lines.len() {
+                merged.push(column_lines[col_idx].clone());
+                col_idx += 1;
+            }
+
+            all_lines.extend(merged);
         }
     }
 
