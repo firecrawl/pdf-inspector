@@ -1146,33 +1146,95 @@ fn format_urls(text: &str) -> String {
         let url = mat.as_str();
 
         // Check if this URL is already in a markdown link by looking at preceding chars
-        let before = if start >= 2 {
-            &text[start - 2..start]
-        } else {
-            ""
+        // Use safe character boundary checking for multi-byte UTF-8
+        let before = {
+            let mut check_start = start.saturating_sub(2);
+            // Find a valid character boundary
+            while check_start > 0 && !text.is_char_boundary(check_start) {
+                check_start -= 1;
+            }
+            if check_start < start && text.is_char_boundary(start) {
+                &text[check_start..start]
+            } else {
+                ""
+            }
         };
         let already_linked = before.ends_with("](") || before.ends_with("](");
 
         // Also check if it's inside square brackets (link text)
-        let prefix = &text[..start];
+        // Ensure we're slicing at a valid char boundary
+        let prefix = if text.is_char_boundary(start) {
+            &text[..start]
+        } else {
+            // Find the nearest valid boundary before start
+            let mut safe_start = start;
+            while safe_start > 0 && !text.is_char_boundary(safe_start) {
+                safe_start -= 1;
+            }
+            &text[..safe_start]
+        };
         let open_brackets = prefix.matches('[').count();
         let close_brackets = prefix.matches(']').count();
         let inside_link_text = open_brackets > close_brackets;
 
+        // Ensure mat boundaries are valid char boundaries
+        let safe_last_end = if text.is_char_boundary(last_end) {
+            last_end
+        } else {
+            let mut pos = last_end;
+            while pos < text.len() && !text.is_char_boundary(pos) {
+                pos += 1;
+            }
+            pos
+        };
+        let safe_start = if text.is_char_boundary(start) {
+            start
+        } else {
+            let mut pos = start;
+            while pos < text.len() && !text.is_char_boundary(pos) {
+                pos += 1;
+            }
+            pos
+        };
+        let safe_end = if text.is_char_boundary(mat.end()) {
+            mat.end()
+        } else {
+            let mut pos = mat.end();
+            while pos < text.len() && !text.is_char_boundary(pos) {
+                pos += 1;
+            }
+            pos
+        };
+
         if already_linked || inside_link_text {
             // Already formatted, keep as-is
-            result.push_str(&text[last_end..mat.end()]);
+            if safe_last_end <= safe_end {
+                result.push_str(&text[safe_last_end..safe_end]);
+            }
         } else {
             // Add text before this URL
-            result.push_str(&text[last_end..start]);
+            if safe_last_end <= safe_start {
+                result.push_str(&text[safe_last_end..safe_start]);
+            }
             // Format as markdown link
             result.push_str(&format!("[{}]({})", url, url));
         }
-        last_end = mat.end();
+        last_end = safe_end;
     }
 
-    // Add remaining text
-    result.push_str(&text[last_end..]);
+    // Add remaining text (ensure valid char boundary)
+    let safe_last_end = if text.is_char_boundary(last_end) {
+        last_end
+    } else {
+        let mut pos = last_end;
+        while pos < text.len() && !text.is_char_boundary(pos) {
+            pos += 1;
+        }
+        pos
+    };
+    if safe_last_end < text.len() {
+        result.push_str(&text[safe_last_end..]);
+    }
     result
 }
 

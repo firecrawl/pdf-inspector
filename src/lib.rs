@@ -7,6 +7,7 @@
 
 pub mod detector;
 pub mod extractor;
+pub mod glyph_names;
 pub mod markdown;
 pub mod tables;
 pub mod tounicode;

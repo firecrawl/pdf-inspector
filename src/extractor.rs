@@ -2,10 +2,108 @@
 //!
 //! This module extracts text with position information for structure detection.
 
+use crate::glyph_names::glyph_to_char;
 use crate::tounicode::FontCMaps;
 use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Font encoding map: maps byte codes to Unicode characters
+type FontEncodingMap = HashMap<u8, char>;
+
+/// All font encodings for a page
+type PageFontEncodings = HashMap<String, FontEncodingMap>;
+
+/// Build encoding maps for all fonts on a page
+fn build_font_encodings(
+    doc: &Document,
+    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+) -> PageFontEncodings {
+    let mut encodings = PageFontEncodings::new();
+
+    for (font_name, font_dict) in fonts {
+        let resource_name = String::from_utf8_lossy(font_name).to_string();
+
+        if let Some(encoding_map) = parse_font_encoding(doc, font_dict) {
+            encodings.insert(resource_name, encoding_map);
+        }
+    }
+
+    encodings
+}
+
+/// Parse font encoding from a font dictionary
+fn parse_font_encoding(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<FontEncodingMap> {
+    let encoding_obj = font_dict.get(b"Encoding").ok()?;
+
+    // Encoding can be a name or a dictionary
+    match encoding_obj {
+        Object::Name(name) => {
+            // Standard encoding name (e.g., MacRomanEncoding, WinAnsiEncoding)
+            // For standard encodings, we can use the standard tables
+            // But we still need to check for Differences
+            None // Let lopdf handle standard encodings
+        }
+        Object::Reference(obj_ref) => {
+            // Reference to encoding dictionary
+            if let Ok(enc_dict) = doc.get_dictionary(*obj_ref) {
+                parse_encoding_dictionary(doc, enc_dict)
+            } else {
+                None
+            }
+        }
+        Object::Dictionary(enc_dict) => parse_encoding_dictionary(doc, enc_dict),
+        _ => None,
+    }
+}
+
+/// Parse an encoding dictionary with Differences array
+fn parse_encoding_dictionary(
+    doc: &Document,
+    enc_dict: &lopdf::Dictionary,
+) -> Option<FontEncodingMap> {
+    let differences = enc_dict.get(b"Differences").ok()?;
+
+    let diff_array = match differences {
+        Object::Array(arr) => arr.clone(),
+        Object::Reference(obj_ref) => {
+            if let Ok(Object::Array(arr)) = doc.get_object(*obj_ref) {
+                arr.clone()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    let mut encoding_map = FontEncodingMap::new();
+    let mut current_code: u8 = 0;
+
+    for item in diff_array {
+        match item {
+            Object::Integer(n) => {
+                // This sets the starting code for subsequent glyph names
+                current_code = n as u8;
+            }
+            Object::Name(name) => {
+                // Map current code to glyph name -> Unicode
+                let glyph_name = String::from_utf8_lossy(&name).to_string();
+                if let Some(ch) = glyph_to_char(&glyph_name) {
+                    encoding_map.insert(current_code, ch);
+                }
+                current_code = current_code.wrapping_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    if encoding_map.is_empty() {
+        None
+    } else {
+        Some(encoding_map)
+    }
+}
 
 /// Type of content item
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -350,6 +448,9 @@ fn extract_page_text_items(
     // Get fonts for encoding
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
 
+    // Build font encoding maps from Differences arrays
+    let font_encodings = build_font_encodings(doc, &fonts);
+
     // Build maps of font resource names to their base font names and ToUnicode object refs
     let mut font_base_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -477,6 +578,7 @@ fn extract_page_text_items(
                         font_cmaps,
                         &font_base_names,
                         &font_tounicode_refs,
+                        &font_encodings,
                     ) {
                         if !text.trim().is_empty() {
                             let rendered_size =
@@ -512,6 +614,27 @@ fn extract_page_text_items(
                     if let Ok(array) = op.operands[0].as_array() {
                         let mut combined_text = String::new();
                         for item in array {
+                            // Check for spacing values - large negative values indicate word spaces
+                            // In PDF, TJ arrays contain: strings and positioning adjustments
+                            // Negative values move right (create space), positive move left (tighten)
+                            // Values are in thousandths of an em unit
+                            match item {
+                                Object::Integer(n) => {
+                                    // Threshold: -200 or more negative typically indicates a word space
+                                    // (roughly 1/5 of an em or more)
+                                    if *n < -200 && !combined_text.ends_with(' ') {
+                                        combined_text.push(' ');
+                                    }
+                                    continue;
+                                }
+                                Object::Real(n) => {
+                                    if *n < -200.0 && !combined_text.ends_with(' ') {
+                                        combined_text.push(' ');
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
                             if let Some(text) = extract_text_from_operand(
                                 item,
                                 doc,
@@ -520,6 +643,7 @@ fn extract_page_text_items(
                                 font_cmaps,
                                 &font_base_names,
                                 &font_tounicode_refs,
+                                &font_encodings,
                             ) {
                                 combined_text.push_str(&text);
                             }
@@ -565,6 +689,7 @@ fn extract_page_text_items(
                         font_cmaps,
                         &font_base_names,
                         &font_tounicode_refs,
+                        &font_encodings,
                     ) {
                         if !text.trim().is_empty() {
                             let rendered_size =
@@ -595,31 +720,42 @@ fn extract_page_text_items(
                 }
             }
             "Do" => {
-                // XObject invocation - could be an image
+                // XObject invocation - could be an image or form
                 if !op.operands.is_empty() {
                     if let Ok(name) = op.operands[0].as_name() {
                         let xobj_name = String::from_utf8_lossy(name).to_string();
-                        // Check if this XObject is an image
-                        if xobjects.contains(&xobj_name) {
-                            // Get position from CTM
-                            let (x, y) = (ctm[4], ctm[5]);
-                            // Get dimensions from CTM scale factors
-                            let width = ctm[0].abs();
-                            let height = ctm[3].abs();
 
-                            items.push(TextItem {
-                                text: format!("[Image: {}]", xobj_name),
-                                x,
-                                y,
-                                width,
-                                height,
-                                font: String::new(),
-                                font_size: 0.0,
-                                page: page_num,
-                                is_bold: false,
-                                is_italic: false,
-                                item_type: ItemType::Image,
-                            });
+                        if let Some(xobj_type) = xobjects.get(&xobj_name) {
+                            match xobj_type {
+                                XObjectType::Image => {
+                                    // Get position from CTM
+                                    let (x, y) = (ctm[4], ctm[5]);
+                                    // Get dimensions from CTM scale factors
+                                    let width = ctm[0].abs();
+                                    let height = ctm[3].abs();
+
+                                    items.push(TextItem {
+                                        text: format!("[Image: {}]", xobj_name),
+                                        x,
+                                        y,
+                                        width,
+                                        height,
+                                        font: String::new(),
+                                        font_size: 0.0,
+                                        page: page_num,
+                                        is_bold: false,
+                                        is_italic: false,
+                                        item_type: ItemType::Image,
+                                    });
+                                }
+                                XObjectType::Form(form_id) => {
+                                    // Extract text from Form XObject
+                                    let form_items = extract_form_xobject_text(
+                                        doc, *form_id, page_num, font_cmaps, &ctm,
+                                    );
+                                    items.extend(form_items);
+                                }
+                            }
                         }
                     }
                 }
@@ -641,8 +777,19 @@ fn get_number(obj: &Object) -> Option<f32> {
 }
 
 /// Get XObject names that are images from page resources
-fn get_page_xobjects(doc: &Document, page_id: ObjectId) -> std::collections::HashSet<String> {
-    let mut image_names = std::collections::HashSet::new();
+/// XObject info - either Image or Form
+#[derive(Debug)]
+enum XObjectType {
+    Image,
+    Form(ObjectId),
+}
+
+/// Get XObjects from page resources, categorized by type
+fn get_page_xobjects(
+    doc: &Document,
+    page_id: ObjectId,
+) -> std::collections::HashMap<String, XObjectType> {
+    let mut xobject_types = std::collections::HashMap::new();
 
     // Try to get the page dictionary
     if let Ok(page_dict) = doc.get_dictionary(page_id) {
@@ -670,14 +817,16 @@ fn get_page_xobjects(doc: &Document, page_id: ObjectId) -> std::collections::Has
                     for (name, value) in xobjects.iter() {
                         let name_str = String::from_utf8_lossy(name).to_string();
 
-                        // Check if this XObject is an Image
-                        // XObjects are typically Stream objects, not Dictionary
+                        // Check XObject subtype
                         if let Ok(obj_ref) = value.as_reference() {
                             if let Ok(Object::Stream(stream)) = doc.get_object(obj_ref) {
                                 if let Ok(subtype) = stream.dict.get(b"Subtype") {
                                     if let Ok(subtype_name) = subtype.as_name() {
                                         if subtype_name == b"Image" {
-                                            image_names.insert(name_str);
+                                            xobject_types.insert(name_str, XObjectType::Image);
+                                        } else if subtype_name == b"Form" {
+                                            xobject_types
+                                                .insert(name_str, XObjectType::Form(obj_ref));
                                         }
                                     }
                                 }
@@ -689,7 +838,269 @@ fn get_page_xobjects(doc: &Document, page_id: ObjectId) -> std::collections::Has
         }
     }
 
-    image_names
+    xobject_types
+}
+
+/// Extract text items from a Form XObject
+fn extract_form_xobject_text(
+    doc: &Document,
+    form_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    parent_ctm: &[f32; 6],
+) -> Vec<TextItem> {
+    use lopdf::content::Content;
+
+    let mut items = Vec::new();
+
+    // Get the Form XObject stream
+    let Ok(Object::Stream(stream)) = doc.get_object(form_id) else {
+        return items;
+    };
+
+    // Decompress the content stream
+    let Ok(content_data) = stream.decompressed_content() else {
+        return items;
+    };
+
+    // Decode the content stream
+    let Ok(content) = Content::decode(&content_data) else {
+        return items;
+    };
+
+    // Get fonts from the Form's Resources
+    let form_fonts = get_form_fonts(doc, &stream.dict);
+    let font_encodings = build_font_encodings(doc, &form_fonts);
+
+    // Build font base names and ToUnicode refs for the form
+    let mut font_base_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut font_tounicode_refs: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+
+    for (font_name, font_dict) in &form_fonts {
+        let resource_name = String::from_utf8_lossy(font_name).to_string();
+        if let Ok(base_font) = font_dict.get(b"BaseFont") {
+            if let Ok(name) = base_font.as_name() {
+                let base_name = String::from_utf8_lossy(name).to_string();
+                font_base_names.insert(resource_name.clone(), base_name);
+            }
+        }
+        if let Ok(tounicode) = font_dict.get(b"ToUnicode") {
+            if let Ok(obj_ref) = tounicode.as_reference() {
+                font_tounicode_refs.insert(resource_name, obj_ref.0);
+            }
+        }
+    }
+
+    // Process the content stream (simplified version)
+    let mut current_font = String::new();
+    let mut current_font_size: f32 = 12.0;
+    let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut in_text_block = false;
+
+    for op in &content.operations {
+        match op.operator.as_str() {
+            "BT" => {
+                in_text_block = true;
+                text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+            }
+            "ET" => {
+                in_text_block = false;
+            }
+            "Tf" => {
+                if op.operands.len() >= 2 {
+                    if let Ok(name) = op.operands[0].as_name() {
+                        current_font = String::from_utf8_lossy(name).to_string();
+                    }
+                    current_font_size = get_number(&op.operands[1]).unwrap_or(12.0);
+                }
+            }
+            "Td" | "TD" => {
+                if op.operands.len() >= 2 {
+                    let tx = get_number(&op.operands[0]).unwrap_or(0.0);
+                    let ty = get_number(&op.operands[1]).unwrap_or(0.0);
+                    text_matrix[4] += tx;
+                    text_matrix[5] += ty;
+                }
+            }
+            "Tm" => {
+                if op.operands.len() >= 6 {
+                    for (i, operand) in op.operands.iter().take(6).enumerate() {
+                        text_matrix[i] =
+                            get_number(operand).unwrap_or(if i == 0 || i == 3 { 1.0 } else { 0.0 });
+                    }
+                }
+            }
+            "Tj" => {
+                if in_text_block && !op.operands.is_empty() {
+                    if let Some(text) = extract_text_from_operand(
+                        &op.operands[0],
+                        doc,
+                        &form_fonts,
+                        &current_font,
+                        font_cmaps,
+                        &font_base_names,
+                        &font_tounicode_refs,
+                        &font_encodings,
+                    ) {
+                        if !text.trim().is_empty() {
+                            let rendered_size =
+                                effective_font_size(current_font_size, &text_matrix);
+                            // Transform position through parent CTM
+                            let combined = multiply_matrices(&text_matrix, parent_ctm);
+                            let (x, y) = (combined[4], combined[5]);
+                            let base_font = font_base_names
+                                .get(&current_font)
+                                .map(|s| s.as_str())
+                                .unwrap_or(&current_font);
+                            items.push(TextItem {
+                                text,
+                                x,
+                                y,
+                                width: 0.0,
+                                height: rendered_size,
+                                font: current_font.clone(),
+                                font_size: rendered_size,
+                                page: page_num,
+                                is_bold: is_bold_font(base_font),
+                                is_italic: is_italic_font(base_font),
+                                item_type: ItemType::Text,
+                            });
+                        }
+                    }
+                }
+            }
+            "TJ" => {
+                if in_text_block && !op.operands.is_empty() {
+                    if let Ok(array) = op.operands[0].as_array() {
+                        let mut combined_text = String::new();
+                        // Track if the last item was a large spacing (potential word boundary)
+                        let mut last_was_large_space = false;
+                        for item in array {
+                            // Check for spacing values
+                            match item {
+                                Object::Integer(n) => {
+                                    if *n < -200 && !combined_text.ends_with(' ') {
+                                        combined_text.push(' ');
+                                    }
+                                    last_was_large_space = *n < -200;
+                                    continue;
+                                }
+                                Object::Real(n) => {
+                                    if *n < -200.0 && !combined_text.ends_with(' ') {
+                                        combined_text.push(' ');
+                                    }
+                                    last_was_large_space = *n < -200.0;
+                                    continue;
+                                }
+                                _ => {
+                                    last_was_large_space = false;
+                                }
+                            }
+                            if let Some(text) = extract_text_from_operand(
+                                item,
+                                doc,
+                                &form_fonts,
+                                &current_font,
+                                font_cmaps,
+                                &font_base_names,
+                                &font_tounicode_refs,
+                                &font_encodings,
+                            ) {
+                                combined_text.push_str(&text);
+                            }
+                        }
+                        // Add trailing space if the text ends with a letter
+                        // This helps with Form XObjects where text_matrix doesn't advance between TJs
+                        if !combined_text.is_empty() {
+                            let last_char = combined_text.chars().last();
+                            if let Some(c) = last_char {
+                                if c.is_alphabetic() && !combined_text.ends_with(' ') {
+                                    combined_text.push(' ');
+                                }
+                            }
+                        }
+                        if !combined_text.trim().is_empty() {
+                            let rendered_size =
+                                effective_font_size(current_font_size, &text_matrix);
+                            let combined = multiply_matrices(&text_matrix, parent_ctm);
+                            let (x, y) = (combined[4], combined[5]);
+                            let base_font = font_base_names
+                                .get(&current_font)
+                                .map(|s| s.as_str())
+                                .unwrap_or(&current_font);
+                            items.push(TextItem {
+                                text: combined_text,
+                                x,
+                                y,
+                                width: 0.0,
+                                height: rendered_size,
+                                font: current_font.clone(),
+                                font_size: rendered_size,
+                                page: page_num,
+                                is_bold: is_bold_font(base_font),
+                                is_italic: is_italic_font(base_font),
+                                item_type: ItemType::Text,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    items
+}
+
+/// Get fonts from a Form XObject's Resources
+fn get_form_fonts<'a>(
+    doc: &'a Document,
+    form_dict: &lopdf::Dictionary,
+) -> std::collections::BTreeMap<Vec<u8>, &'a lopdf::Dictionary> {
+    let mut fonts = std::collections::BTreeMap::new();
+
+    // Get Resources from Form dictionary
+    let resources = if let Ok(res_ref) = form_dict.get(b"Resources") {
+        if let Ok(obj_ref) = res_ref.as_reference() {
+            doc.get_dictionary(obj_ref).ok()
+        } else {
+            res_ref.as_dict().ok()
+        }
+    } else {
+        return fonts;
+    };
+
+    let Some(resources) = resources else {
+        return fonts;
+    };
+
+    // Get Font dictionary
+    let font_dict = if let Ok(font_ref) = resources.get(b"Font") {
+        if let Ok(obj_ref) = font_ref.as_reference() {
+            doc.get_dictionary(obj_ref).ok()
+        } else {
+            font_ref.as_dict().ok()
+        }
+    } else {
+        return fonts;
+    };
+
+    let Some(font_dict) = font_dict else {
+        return fonts;
+    };
+
+    // Collect fonts
+    for (name, value) in font_dict.iter() {
+        if let Ok(obj_ref) = value.as_reference() {
+            if let Ok(dict) = doc.get_dictionary(obj_ref) {
+                fonts.insert(name.clone(), dict);
+            }
+        }
+    }
+
+    fonts
 }
 
 /// Extract hyperlinks from page annotations
@@ -859,6 +1270,7 @@ fn extract_text_from_operand(
     font_cmaps: &FontCMaps,
     font_base_names: &std::collections::HashMap<String, String>,
     font_tounicode_refs: &std::collections::HashMap<String, u32>,
+    font_encodings: &PageFontEncodings,
 ) -> Option<String> {
     if let Object::String(bytes, _) = obj {
         // First, try to look up CMap by ToUnicode object reference (most reliable)
@@ -898,6 +1310,17 @@ fn extract_text_from_operand(
         // Also try looking up by resource name directly
         if let Some(cmap) = font_cmaps.get(current_font) {
             let decoded = cmap.decode_cids(bytes);
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+
+        // Try our custom encoding map from Differences arrays
+        if let Some(encoding_map) = font_encodings.get(current_font) {
+            let decoded: String = bytes
+                .iter()
+                .filter_map(|&b| encoding_map.get(&b).copied())
+                .collect();
             if !decoded.is_empty() {
                 return Some(decoded);
             }
