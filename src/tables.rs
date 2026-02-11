@@ -4,6 +4,15 @@
 
 use crate::extractor::TextItem;
 
+/// Detection mode controls thresholds for table validation
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TableDetectionMode {
+    /// Existing behavior: items with font size smaller than body text
+    SmallFont,
+    /// New: body-font items with stricter structural criteria
+    BodyFont,
+}
+
 /// A detected table
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -23,39 +32,76 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32) -> Vec<Table> {
         return vec![];
     }
 
-    // Tables typically use smaller font than body text
+    let mut tables = Vec::new();
+    let mut claimed_indices = std::collections::HashSet::new();
+
+    // === Pass 1: Small-font tables (existing behavior) ===
     let table_font_threshold = base_font_size * 0.90;
 
-    // Find items that might be table content (smaller font)
     let table_candidates: Vec<(usize, &TextItem)> = items
         .iter()
         .enumerate()
         .filter(|(_, item)| item.font_size <= table_font_threshold && item.font_size >= 6.0)
         .collect();
 
-    if table_candidates.len() < 6 {
-        return vec![];
+    if table_candidates.len() >= 6 {
+        let regions = find_table_regions(&table_candidates);
+
+        for (y_min, y_max) in regions {
+            let region_items: Vec<(usize, &TextItem)> = table_candidates
+                .iter()
+                .filter(|(_, item)| item.y >= y_min && item.y <= y_max)
+                .cloned()
+                .collect();
+
+            if region_items.len() < 6 {
+                continue;
+            }
+
+            if let Some(table) =
+                detect_table_in_region(&region_items, TableDetectionMode::SmallFont)
+            {
+                for &idx in &table.item_indices {
+                    claimed_indices.insert(idx);
+                }
+                tables.push(table);
+            }
+        }
     }
 
-    // Find table regions - contiguous Y ranges with dense content
-    let regions = find_table_regions(&table_candidates);
+    // === Pass 2: Body-font tables (stricter criteria) ===
+    let body_font_low = base_font_size * 0.85;
+    let body_font_high = base_font_size * 1.05;
 
-    let mut tables = Vec::new();
-    for (y_min, y_max) in regions {
-        // Get items in this region
-        let region_items: Vec<(usize, &TextItem)> = table_candidates
-            .iter()
-            .filter(|(_, item)| item.y >= y_min && item.y <= y_max)
-            .cloned()
-            .collect();
+    let body_candidates: Vec<(usize, &TextItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(idx, item)| {
+            !claimed_indices.contains(idx)
+                && item.font_size >= body_font_low
+                && item.font_size <= body_font_high
+                && item.font_size >= 6.0
+        })
+        .collect();
 
-        if region_items.len() < 6 {
-            continue;
-        }
+    if body_candidates.len() >= 9 {
+        let regions = find_table_regions_strict(&body_candidates);
 
-        // Detect column structure for this region
-        if let Some(table) = detect_table_in_region(&region_items) {
-            tables.push(table);
+        for (y_min, y_max) in regions {
+            let region_items: Vec<(usize, &TextItem)> = body_candidates
+                .iter()
+                .filter(|(_, item)| item.y >= y_min && item.y <= y_max)
+                .cloned()
+                .collect();
+
+            if region_items.len() < 9 {
+                continue;
+            }
+
+            if let Some(table) = detect_table_in_region(&region_items, TableDetectionMode::BodyFont)
+            {
+                tables.push(table);
+            }
         }
     }
 
@@ -102,24 +148,115 @@ fn find_table_regions(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
     regions
 }
 
+/// Find Y-regions for body-font table candidates using strict structural criteria.
+/// Requires rows with 3+ distinct X-position clusters to qualify.
+fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
+    if items.is_empty() {
+        return vec![];
+    }
+
+    // Step 1: Group items by Y position (8pt tolerance for same row)
+    let mut row_groups: Vec<(f32, Vec<f32>)> = Vec::new();
+    for (_, item) in items {
+        let mut found = false;
+        for (center, x_positions) in row_groups.iter_mut() {
+            if (item.y - *center).abs() < 8.0 {
+                x_positions.push(item.x);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            row_groups.push((item.y, vec![item.x]));
+        }
+    }
+
+    // Step 2: Filter to rows with 3+ distinct X-position clusters (20pt tolerance)
+    let mut qualifying_ys: Vec<f32> = Vec::new();
+    for (y, x_positions) in &row_groups {
+        let mut sorted_xs = x_positions.clone();
+        sorted_xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        if sorted_xs.is_empty() {
+            continue;
+        }
+
+        let mut clusters = 1;
+        let mut last_x = sorted_xs[0];
+        for &x in &sorted_xs[1..] {
+            if x - last_x > 20.0 {
+                clusters += 1;
+                last_x = x;
+            }
+        }
+        if clusters >= 3 {
+            qualifying_ys.push(*y);
+        }
+    }
+
+    if qualifying_ys.len() < 3 {
+        return vec![];
+    }
+
+    // Step 3: Find contiguous runs of qualifying rows (25pt max Y-gap)
+    qualifying_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut regions = Vec::new();
+    let mut region_start = qualifying_ys[0];
+    let mut region_end = qualifying_ys[0];
+    let mut region_count = 1;
+
+    for &y in &qualifying_ys[1..] {
+        if y - region_end > 25.0 {
+            if region_count >= 3 {
+                regions.push((region_start - 5.0, region_end + 5.0));
+            }
+            region_start = y;
+            region_end = y;
+            region_count = 1;
+        } else {
+            region_end = y;
+            region_count += 1;
+        }
+    }
+
+    // Don't forget last region
+    if region_count >= 3 {
+        regions.push((region_start - 5.0, region_end + 5.0));
+    }
+
+    regions
+}
+
 /// Detect a table within a specific region
-fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
+fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode) -> Option<Table> {
     // Find column boundaries
-    let columns = find_column_boundaries(items);
-    if columns.len() < 2 || columns.len() > 15 {
+    let columns = find_column_boundaries(items, mode);
+    let min_cols = match mode {
+        TableDetectionMode::SmallFont => 2,
+        TableDetectionMode::BodyFont => 3,
+    };
+    if columns.len() < min_cols || columns.len() > 15 {
         return None;
     }
 
     // Find row boundaries
     let rows = find_row_boundaries(items);
-    if rows.len() < 2 {
+    let min_rows = match mode {
+        TableDetectionMode::SmallFont => 2,
+        TableDetectionMode::BodyFont => 3,
+    };
+    if rows.len() < min_rows {
         return None;
     }
 
     // Verify this looks like a table: multiple items should align to columns
-    let col_alignment = check_column_alignment(items, &columns);
-    if col_alignment < 0.5 {
-        // Less than 50% of items align to detected columns
+    let col_alignment = check_column_alignment(items, &columns, mode);
+    let min_alignment = match mode {
+        TableDetectionMode::SmallFont => 0.5,
+        TableDetectionMode::BodyFont => 0.7,
+    };
+    if col_alignment < min_alignment {
         return None;
     }
 
@@ -179,17 +316,24 @@ fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
     }
 
     // Validation 2: real tables have content in MULTIPLE columns, not just first
-    // At least 30% of rows should have content in 2+ columns
     let rows_with_multi_cols = cells
         .iter()
         .filter(|row| row.iter().filter(|c| !c.is_empty()).count() >= 2)
         .count();
-    if rows_with_multi_cols < rows.len() / 3 {
+    let multi_col_threshold = match mode {
+        TableDetectionMode::SmallFont => (rows.len() / 3).max(1), // 33%
+        TableDetectionMode::BodyFont => (rows.len() / 2).max(1),  // 50%
+    };
+    if rows_with_multi_cols < multi_col_threshold {
         return None;
     }
 
     // Validation 3: tables shouldn't have too many rows (likely misdetected text)
-    if rows.len() > 30 {
+    let max_rows = match mode {
+        TableDetectionMode::SmallFont => 50,
+        TableDetectionMode::BodyFont => 100,
+    };
+    if rows.len() > max_rows {
         return None;
     }
 
@@ -199,8 +343,11 @@ fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
         .map(|row| row.iter().filter(|c| !c.is_empty()).count())
         .sum();
     let avg_cells_per_row = total_filled as f32 / rows.len() as f32;
-    if avg_cells_per_row < 1.5 {
-        // Less than 1.5 cells per row on average - probably not a table
+    let min_avg_cells = match mode {
+        TableDetectionMode::SmallFont => 1.5,
+        TableDetectionMode::BodyFont => 2.5,
+    };
+    if avg_cells_per_row < min_avg_cells {
         return None;
     }
 
@@ -218,7 +365,7 @@ fn detect_table_in_region(items: &[(usize, &TextItem)]) -> Option<Table> {
 
     // Validation 7: Tables should have some numeric/data content
     // (not just text labels)
-    if !has_table_like_content(&cells) {
+    if !has_table_like_content(&cells, mode) {
         return None;
     }
 
@@ -312,7 +459,7 @@ fn has_consistent_columns(cells: &[Vec<String>]) -> bool {
 }
 
 /// Check if the content looks like table data (numbers, short values, specs)
-fn has_table_like_content(cells: &[Vec<String>]) -> bool {
+fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bool {
     let mut data_like_cells = 0;
     let mut total_cells = 0;
 
@@ -334,12 +481,16 @@ fn has_table_like_content(cells: &[Vec<String>]) -> bool {
         return false;
     }
 
-    // At least 20% data-like content suggests a data table
-    // OR the table has many columns (structural table)
+    // Data-like content threshold depends on detection mode
     let pct_data = data_like_cells as f32 / total_cells as f32;
     let num_cols = cells.first().map(|r| r.len()).unwrap_or(0);
 
-    pct_data > 0.2 || num_cols >= 5
+    let min_pct = match mode {
+        TableDetectionMode::SmallFont => 0.2,
+        TableDetectionMode::BodyFont => 0.3,
+    };
+
+    pct_data > min_pct || num_cols >= 5
 }
 
 /// Check if a cell value looks like table data
@@ -459,8 +610,15 @@ fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
 }
 
 /// Check what fraction of items align to detected columns
-fn check_column_alignment(items: &[(usize, &TextItem)], columns: &[f32]) -> f32 {
-    let tolerance = 40.0;
+fn check_column_alignment(
+    items: &[(usize, &TextItem)],
+    columns: &[f32],
+    mode: TableDetectionMode,
+) -> f32 {
+    let tolerance = match mode {
+        TableDetectionMode::SmallFont => 40.0,
+        TableDetectionMode::BodyFont => 30.0,
+    };
     let aligned = items
         .iter()
         .filter(|(_, item)| columns.iter().any(|&col| (item.x - col).abs() < tolerance))
@@ -470,7 +628,7 @@ fn check_column_alignment(items: &[(usize, &TextItem)], columns: &[f32]) -> f32 
 }
 
 /// Find column boundaries by clustering X positions
-fn find_column_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
+fn find_column_boundaries(items: &[(usize, &TextItem)], mode: TableDetectionMode) -> Vec<f32> {
     let mut x_positions: Vec<f32> = items.iter().map(|(_, i)| i.x).collect();
     x_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -512,7 +670,7 @@ fn find_column_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
 
     // Filter columns - each should have multiple items
     let min_items_per_col = (items.len() / columns.len().max(1) / 4).max(2);
-    columns
+    let columns: Vec<f32> = columns
         .into_iter()
         .filter(|&col_x| {
             items
@@ -521,7 +679,25 @@ fn find_column_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
                 .count()
                 >= min_items_per_col
         })
-        .collect()
+        .collect();
+
+    // Anti-paragraph safeguard for BodyFont mode:
+    // Paragraphs concentrate items at the left margin; tables distribute evenly.
+    // Reject if any single column has >60% of all items.
+    if mode == TableDetectionMode::BodyFont {
+        let total_items = items.len();
+        for &col_x in &columns {
+            let count = items
+                .iter()
+                .filter(|(_, i)| (i.x - col_x).abs() < cluster_threshold)
+                .count();
+            if count as f32 / total_items as f32 > 0.60 {
+                return vec![];
+            }
+        }
+    }
+
+    columns
 }
 
 /// Find row boundaries by clustering Y positions
@@ -980,5 +1156,159 @@ mod tests {
         assert!(md.contains("| Header 1"));
         assert!(md.contains("| ---"));
         assert!(md.contains("| Cell 1"));
+    }
+
+    #[test]
+    fn test_body_font_table_detected() {
+        // 4-column, 4-row table at font_size == base_font_size
+        // Pass 1 rejects (not small font), Pass 2 should detect
+        let items = vec![
+            // Header row
+            make_item("Name", 100.0, 500.0, 10.0),
+            make_item("Price", 200.0, 500.0, 10.0),
+            make_item("Qty", 300.0, 500.0, 10.0),
+            make_item("Total", 400.0, 500.0, 10.0),
+            // Data row 1
+            make_item("Widget", 100.0, 480.0, 10.0),
+            make_item("5.00", 200.0, 480.0, 10.0),
+            make_item("10", 300.0, 480.0, 10.0),
+            make_item("50.00", 400.0, 480.0, 10.0),
+            // Data row 2
+            make_item("Gadget", 100.0, 460.0, 10.0),
+            make_item("12.50", 200.0, 460.0, 10.0),
+            make_item("4", 300.0, 460.0, 10.0),
+            make_item("50.00", 400.0, 460.0, 10.0),
+            // Data row 3
+            make_item("Gizmo", 100.0, 440.0, 10.0),
+            make_item("3.25", 200.0, 440.0, 10.0),
+            make_item("20", 300.0, 440.0, 10.0),
+            make_item("65.00", 400.0, 440.0, 10.0),
+        ];
+
+        let tables = detect_tables(&items, 10.0);
+        assert_eq!(
+            tables.len(),
+            1,
+            "Body-font table should be detected by Pass 2"
+        );
+        assert_eq!(tables[0].columns.len(), 4);
+        assert!(tables[0].rows.len() >= 3);
+    }
+
+    #[test]
+    fn test_paragraph_not_falsely_detected() {
+        // Body-font single-column paragraph text — must return 0 tables
+        let items = vec![
+            make_item(
+                "This is a paragraph of text that spans the full width",
+                72.0,
+                500.0,
+                10.0,
+            ),
+            make_item(
+                "of the page and should not be detected as a table.",
+                72.0,
+                485.0,
+                10.0,
+            ),
+            make_item(
+                "It continues for several lines with normal body text",
+                72.0,
+                470.0,
+                10.0,
+            ),
+            make_item(
+                "that is left-aligned and has no columnar structure.",
+                72.0,
+                455.0,
+                10.0,
+            ),
+            make_item(
+                "The paragraph keeps going with more content here.",
+                72.0,
+                440.0,
+                10.0,
+            ),
+            make_item(
+                "And it has even more text on this line as well.",
+                72.0,
+                425.0,
+                10.0,
+            ),
+            make_item(
+                "Finally the paragraph concludes with this last line.",
+                72.0,
+                410.0,
+                10.0,
+            ),
+            make_item(
+                "One more line to have enough items for detection.",
+                72.0,
+                395.0,
+                10.0,
+            ),
+            make_item(
+                "And another line of plain paragraph text content.",
+                72.0,
+                380.0,
+                10.0,
+            ),
+            make_item(
+                "Last line of the paragraph ends here for the test.",
+                72.0,
+                365.0,
+                10.0,
+            ),
+        ];
+
+        let tables = detect_tables(&items, 10.0);
+        assert_eq!(
+            tables.len(),
+            0,
+            "Single-column paragraph must not be detected as table"
+        );
+    }
+
+    #[test]
+    fn test_large_data_table_not_rejected() {
+        // 50-row table at small font — must not be rejected by row limit
+        let mut items = Vec::new();
+        // Header row
+        items.push(make_item("Temp", 100.0, 800.0, 8.0));
+        items.push(make_item("Pressure", 200.0, 800.0, 8.0));
+        items.push(make_item("Volume", 300.0, 800.0, 8.0));
+        items.push(make_item("Enthalpy", 400.0, 800.0, 8.0));
+
+        // 49 data rows
+        for i in 1..50 {
+            let y = 800.0 - (i as f32 * 12.0);
+            items.push(make_item(&format!("{}", -40 + i * 2), 100.0, y, 8.0));
+            items.push(make_item(
+                &format!("{:.1}", 100.0 + i as f32 * 5.0),
+                200.0,
+                y,
+                8.0,
+            ));
+            items.push(make_item(
+                &format!("{:.3}", 0.05 + i as f32 * 0.01),
+                300.0,
+                y,
+                8.0,
+            ));
+            items.push(make_item(
+                &format!("{:.1}", 150.0 + i as f32 * 2.5),
+                400.0,
+                y,
+                8.0,
+            ));
+        }
+
+        let tables = detect_tables(&items, 10.0);
+        assert_eq!(tables.len(), 1, "Large data table should not be rejected");
+        assert!(
+            tables[0].rows.len() >= 40,
+            "Large table should preserve most rows, got {}",
+            tables[0].rows.len()
+        );
     }
 }
