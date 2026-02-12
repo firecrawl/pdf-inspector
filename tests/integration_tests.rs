@@ -408,9 +408,10 @@ fn test_markdown_from_items_header_detection() {
 #[test]
 fn test_markdown_from_items_h2_detection() {
     use pdf_inspector::markdown::to_markdown_from_items;
-    // Need multiple body items to establish base font size
+    // Two heading tiers: 24.0 → H1, 18.0 → H2
     let items = vec![
-        make_text_item("Subtitle", 100.0, 750.0, 18.0, 1), // 1.5x = H2
+        make_text_item("Title", 100.0, 800.0, 24.0, 1),
+        make_text_item("Subtitle", 100.0, 750.0, 18.0, 1),
         make_text_item("Body text one", 100.0, 700.0, 12.0, 1),
         make_text_item("Body text two", 100.0, 680.0, 12.0, 1),
         make_text_item("Body text three", 100.0, 660.0, 12.0, 1),
@@ -643,26 +644,42 @@ fn test_header_level_h1() {
 }
 
 #[test]
+fn test_single_heading_tier_becomes_h1() {
+    use pdf_inspector::markdown::to_markdown_from_items;
+    // Single heading tier: 18.0pt on 12.0pt base → H1 (not H2)
+    let items = vec![
+        make_text_item("Section Title", 100.0, 700.0, 18.0, 1),
+        make_text_item("body text one", 100.0, 650.0, 12.0, 1),
+        make_text_item("body text two", 100.0, 630.0, 12.0, 1),
+        make_text_item("body text three", 100.0, 610.0, 12.0, 1),
+    ];
+    let md = to_markdown_from_items(items, MarkdownOptions::default());
+    assert!(md.contains("# Section Title"));
+}
+
+#[test]
 fn test_header_level_h2() {
     use pdf_inspector::markdown::to_markdown_from_items;
-    // 18.0 / 12.0 = 1.5x = H2
-    // Need multiple body items to establish base font size
+    // Two heading tiers: 24.0 → H1, 18.0 → H2
     let items = vec![
+        make_text_item("H1 Title", 100.0, 750.0, 24.0, 1),
         make_text_item("H2 Title", 100.0, 700.0, 18.0, 1),
         make_text_item("body text one", 100.0, 650.0, 12.0, 1),
         make_text_item("body text two", 100.0, 630.0, 12.0, 1),
         make_text_item("body text three", 100.0, 610.0, 12.0, 1),
     ];
     let md = to_markdown_from_items(items, MarkdownOptions::default());
+    assert!(md.contains("# H1 Title"));
     assert!(md.contains("## H2 Title"));
 }
 
 #[test]
 fn test_header_level_h3() {
     use pdf_inspector::markdown::to_markdown_from_items;
-    // 15.0 / 12.0 = 1.25x = H3
-    // Need multiple body items to establish base font size
+    // Three heading tiers: 24.0 → H1, 18.0 → H2, 15.0 → H3
     let items = vec![
+        make_text_item("H1 Title", 100.0, 800.0, 24.0, 1),
+        make_text_item("H2 Title", 100.0, 750.0, 18.0, 1),
         make_text_item("H3 Title", 100.0, 700.0, 15.0, 1),
         make_text_item("body text one", 100.0, 650.0, 12.0, 1),
         make_text_item("body text two", 100.0, 630.0, 12.0, 1),
@@ -675,9 +692,11 @@ fn test_header_level_h3() {
 #[test]
 fn test_header_level_h4() {
     use pdf_inspector::markdown::to_markdown_from_items;
-    // 13.5 / 12.0 = 1.125x = H4 (>= 1.1)
-    // Need multiple body items to establish base font size
+    // Four heading tiers: 24.0 → H1, 18.0 → H2, 15.0 → H3, 13.5 → H4
     let items = vec![
+        make_text_item("H1 Title", 100.0, 850.0, 24.0, 1),
+        make_text_item("H2 Title", 100.0, 800.0, 18.0, 1),
+        make_text_item("H3 Title", 100.0, 750.0, 15.0, 1),
         make_text_item("H4 Title", 100.0, 700.0, 13.5, 1),
         make_text_item("body text one", 100.0, 650.0, 12.0, 1),
         make_text_item("body text two", 100.0, 630.0, 12.0, 1),

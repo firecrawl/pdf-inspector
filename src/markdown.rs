@@ -268,6 +268,9 @@ fn to_markdown_from_lines_with_tables_and_images(
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
 
+    // Discover heading tiers for this document
+    let heading_tiers = compute_heading_tiers(&lines, base_size);
+
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
@@ -393,7 +396,9 @@ fn to_markdown_from_lines_with_tables_and_images(
         // Note: Headers typically shouldn't have bold markers since they're already emphasized
         if options.detect_headers && plain_trimmed.len() > 3 {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-            if let Some(header_level) = detect_header_level(line_font_size, base_size) {
+            if let Some(header_level) =
+                detect_header_level(line_font_size, base_size, &heading_tiers)
+            {
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;
@@ -525,6 +530,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
 
+    // Discover heading tiers for this document
+    let heading_tiers = compute_heading_tiers(&lines, base_size);
+
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
@@ -587,7 +595,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // Skip very short text (likely drop caps or labels)
         if options.detect_headers && plain_trimmed.len() > 3 {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-            if let Some(header_level) = detect_header_level(line_font_size, base_size) {
+            if let Some(header_level) =
+                detect_header_level(line_font_size, base_size, &heading_tiers)
+            {
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;
@@ -764,11 +774,11 @@ fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
     let mut size_counts: HashMap<i32, usize> = HashMap::new();
 
     for line in lines {
-        for item in &line.items {
-            // Only count fonts >= 9pt as potential body text
-            // Smaller fonts are typically table cells, footnotes, or captions
-            if item.font_size >= 9.0 {
-                let size_key = (item.font_size * 10.0) as i32; // Round to 0.1
+        // Count once per line (first item) to give each line equal weight
+        // Prevents small captions/footnotes from skewing the base
+        if let Some(first) = line.items.first() {
+            if first.font_size >= 9.0 {
+                let size_key = (first.font_size * 10.0) as i32;
                 *size_counts.entry(size_key).or_insert(0) += 1;
             }
         }
@@ -783,20 +793,72 @@ fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
     FontStats { most_common_size }
 }
 
-/// Detect header level from font size
-fn detect_header_level(font_size: f32, base_size: f32) -> Option<usize> {
+/// Discover distinct heading font-size tiers in the document.
+/// Returns tiers sorted largest-first (tier 0 = H1, tier 1 = H2, …).
+/// Sizes within 0.5pt are clustered into the same tier. Capped at 4 tiers.
+fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f32> {
+    let mut heading_sizes: Vec<f32> = Vec::new();
+
+    for line in lines {
+        if let Some(first) = line.items.first() {
+            if first.font_size / base_size >= 1.1 {
+                heading_sizes.push(first.font_size);
+            }
+        }
+    }
+
+    // Sort descending
+    heading_sizes.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Cluster sizes within 0.5pt into same tier (use first value as representative)
+    let mut tiers: Vec<f32> = Vec::new();
+    for size in heading_sizes {
+        let already_in_tier = tiers.iter().any(|&t| (t - size).abs() < 0.5);
+        if !already_in_tier {
+            tiers.push(size);
+        }
+    }
+
+    // Cap at 4 tiers
+    tiers.truncate(4);
+    tiers
+}
+
+/// Detect header level from font size using document-specific heading tiers.
+/// When tiers are available, maps tier 0→H1, tier 1→H2, etc.
+/// Falls back to ratio-based thresholds when no tiers exist.
+fn detect_header_level(font_size: f32, base_size: f32, heading_tiers: &[f32]) -> Option<usize> {
     let ratio = font_size / base_size;
 
+    if ratio < 1.1 {
+        return None; // Regular text
+    }
+
+    if !heading_tiers.is_empty() {
+        // Match font_size to a tier (within 0.5pt tolerance)
+        for (i, &tier_size) in heading_tiers.iter().enumerate() {
+            if (font_size - tier_size).abs() < 0.5 {
+                return Some(i + 1); // tier 0 → H1, tier 1 → H2, etc.
+            }
+        }
+        // No tier match but large ratio — assign level after last tier
+        if ratio >= 1.5 {
+            let level = (heading_tiers.len() + 1).min(4);
+            return Some(level);
+        }
+        // No tier match and small ratio — not a heading
+        return None;
+    }
+
+    // Fallback: original ratio-based thresholds (no tiers discovered)
     if ratio >= 2.0 {
-        Some(1) // H1
+        Some(1)
     } else if ratio >= 1.5 {
-        Some(2) // H2
+        Some(2)
     } else if ratio >= 1.25 {
-        Some(3) // H3
-    } else if ratio >= 1.1 {
-        Some(4) // H4
+        Some(3)
     } else {
-        None // Regular text
+        Some(4)
     }
 }
 
@@ -1270,10 +1332,29 @@ mod tests {
 
     #[test]
     fn test_detect_header_level() {
-        assert_eq!(detect_header_level(24.0, 12.0), Some(1));
-        assert_eq!(detect_header_level(18.0, 12.0), Some(2));
-        assert_eq!(detect_header_level(15.0, 12.0), Some(3));
-        assert_eq!(detect_header_level(12.0, 12.0), None);
+        // With three tiers: 24→H1, 18→H2, 15→H3, 12→None
+        let tiers = vec![24.0, 18.0, 15.0];
+        assert_eq!(detect_header_level(24.0, 12.0, &tiers), Some(1));
+        assert_eq!(detect_header_level(18.0, 12.0, &tiers), Some(2));
+        assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(3));
+        assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
+
+        // Single tier: 14→H1, 12→None
+        let tiers = vec![14.0];
+        assert_eq!(detect_header_level(14.0, 12.0, &tiers), Some(1));
+        assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
+
+        // No tiers (empty): falls back to ratio thresholds
+        let tiers: Vec<f32> = vec![];
+        assert_eq!(detect_header_level(24.0, 12.0, &tiers), Some(1));
+        assert_eq!(detect_header_level(18.0, 12.0, &tiers), Some(2));
+        assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(3));
+        assert_eq!(detect_header_level(13.5, 12.0, &tiers), Some(4));
+        assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
+
+        // Body text excluded when tiers exist: 13pt (ratio 1.08) → None
+        let tiers = vec![20.0];
+        assert_eq!(detect_header_level(13.0, 12.0, &tiers), None);
     }
 
     #[test]
