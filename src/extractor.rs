@@ -982,7 +982,7 @@ fn extract_page_text_items(
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
                             items.push(TextItem {
-                                text,
+                                text: expand_ligatures(&text),
                                 x,
                                 y,
                                 width,
@@ -1081,7 +1081,7 @@ fn extract_page_text_items(
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
                             items.push(TextItem {
-                                text: combined_text,
+                                text: expand_ligatures(&combined_text),
                                 x,
                                 y,
                                 width,
@@ -1129,7 +1129,7 @@ fn extract_page_text_items(
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
                             items.push(TextItem {
-                                text,
+                                text: expand_ligatures(&text),
                                 x,
                                 y,
                                 width: 0.0,
@@ -1403,7 +1403,7 @@ fn extract_form_xobject_text(
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
                             items.push(TextItem {
-                                text,
+                                text: expand_ligatures(&text),
                                 x,
                                 y,
                                 width,
@@ -1497,7 +1497,7 @@ fn extract_form_xobject_text(
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
                             items.push(TextItem {
-                                text: combined_text,
+                                text: expand_ligatures(&combined_text),
                                 x,
                                 y,
                                 width,
@@ -1786,14 +1786,30 @@ fn extract_text_from_operand(
             }
         }
 
-        // Try our custom encoding map from Differences arrays
+        // Try our custom encoding map from Differences arrays.
+        // The Differences array overrides specific codes in a base encoding (typically
+        // WinAnsiEncoding). We must combine Differences entries with the base encoding
+        // rather than using filter_map which silently drops unmapped bytes.
         if let Some(encoding_map) = font_encodings.get(current_font) {
-            let decoded: String = bytes
-                .iter()
-                .filter_map(|&b| encoding_map.get(&b).copied())
-                .collect();
-            if !decoded.is_empty() {
-                return Some(decoded);
+            let has_diff_match = bytes.iter().any(|b| encoding_map.contains_key(b));
+            if has_diff_match {
+                let decoded: String = bytes
+                    .iter()
+                    .filter_map(|&b| {
+                        if let Some(&ch) = encoding_map.get(&b) {
+                            Some(ch)
+                        } else if b >= 0x20 {
+                            // Base encoding fallback for printable bytes.
+                            // For codes 0x20-0x7E this matches all standard PDF encodings.
+                            Some(b as char)
+                        } else {
+                            None // Skip unmapped control characters
+                        }
+                    })
+                    .collect();
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
             }
         }
 
@@ -1820,6 +1836,24 @@ fn extract_text_from_operand(
     } else {
         None
     }
+}
+
+/// Expand Unicode ligature characters to their component characters.
+/// This makes extracted text more searchable and semantically correct.
+fn expand_ligatures(text: &str) -> String {
+    if !text.contains('\u{FB00}')
+        && !text.contains('\u{FB01}')
+        && !text.contains('\u{FB02}')
+        && !text.contains('\u{FB03}')
+        && !text.contains('\u{FB04}')
+    {
+        return text.to_string();
+    }
+    text.replace('\u{FB00}', "ff")
+        .replace('\u{FB01}', "fi")
+        .replace('\u{FB02}', "fl")
+        .replace('\u{FB03}', "ffi")
+        .replace('\u{FB04}', "ffl")
 }
 
 /// Estimate the width of a text item, falling back to a character-count heuristic when width is 0.

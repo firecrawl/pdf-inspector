@@ -219,6 +219,12 @@ pub static GLYPH_TO_UNICODE: LazyLock<HashMap<&'static str, char>> = LazyLock::n
     m.insert("ff", '\u{FB00}'); // ﬀ
     m.insert("ffi", '\u{FB03}'); // ﬃ
     m.insert("ffl", '\u{FB04}'); // ﬄ
+                                 // Alternative naming with underscores (used by some PDF producers)
+    m.insert("f_i", '\u{FB01}'); // ﬁ
+    m.insert("f_l", '\u{FB02}'); // ﬂ
+    m.insert("f_f", '\u{FB00}'); // ﬀ
+    m.insert("f_f_i", '\u{FB03}'); // ﬃ
+    m.insert("f_f_l", '\u{FB04}'); // ﬄ
 
     // Quotes and dashes
     m.insert("endash", '–');
