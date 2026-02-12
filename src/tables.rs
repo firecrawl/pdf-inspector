@@ -149,7 +149,9 @@ fn find_table_regions(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
 }
 
 /// Find Y-regions for body-font table candidates using strict structural criteria.
-/// Requires rows with 3+ distinct X-position clusters to qualify.
+/// Requires rows with 3+ distinct X-position clusters to qualify, and verifies
+/// that column positions are consistent across rows (tables have fixed columns,
+/// paragraph text has varying word positions).
 fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
     if items.is_empty() {
         return vec![];
@@ -172,7 +174,8 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
     }
 
     // Step 2: Filter to rows with 3+ distinct X-position clusters (20pt tolerance)
-    let mut qualifying_ys: Vec<f32> = Vec::new();
+    // Collect cluster start positions for cross-row alignment analysis
+    let mut qualifying_rows: Vec<(f32, Vec<f32>)> = Vec::new(); // (y, cluster_starts)
     for (y, x_positions) in &row_groups {
         let mut sorted_xs = x_positions.clone();
         sorted_xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -181,48 +184,87 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
             continue;
         }
 
-        let mut clusters = 1;
+        let mut cluster_starts: Vec<f32> = vec![sorted_xs[0]];
         let mut last_x = sorted_xs[0];
         for &x in &sorted_xs[1..] {
             if x - last_x > 20.0 {
-                clusters += 1;
+                cluster_starts.push(x);
                 last_x = x;
             }
         }
-        if clusters >= 3 {
-            qualifying_ys.push(*y);
+
+        if cluster_starts.len() >= 3 {
+            qualifying_rows.push((*y, cluster_starts));
         }
     }
 
-    if qualifying_ys.len() < 3 {
+    if qualifying_rows.len() < 3 {
         return vec![];
     }
 
     // Step 3: Find contiguous runs of qualifying rows (25pt max Y-gap)
-    qualifying_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    qualifying_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut regions = Vec::new();
-    let mut region_start = qualifying_ys[0];
-    let mut region_end = qualifying_ys[0];
-    let mut region_count = 1;
+    let mut candidate_regions: Vec<Vec<&(f32, Vec<f32>)>> = Vec::new();
+    let mut current_region: Vec<&(f32, Vec<f32>)> = vec![&qualifying_rows[0]];
 
-    for &y in &qualifying_ys[1..] {
-        if y - region_end > 25.0 {
-            if region_count >= 3 {
-                regions.push((region_start - 5.0, region_end + 5.0));
+    for row in qualifying_rows.iter().skip(1) {
+        let prev_y = current_region.last().unwrap().0;
+        if row.0 - prev_y > 25.0 {
+            if current_region.len() >= 3 {
+                candidate_regions.push(current_region);
             }
-            region_start = y;
-            region_end = y;
-            region_count = 1;
+            current_region = vec![row];
         } else {
-            region_end = y;
-            region_count += 1;
+            current_region.push(row);
         }
     }
+    if current_region.len() >= 3 {
+        candidate_regions.push(current_region);
+    }
 
-    // Don't forget last region
-    if region_count >= 3 {
-        regions.push((region_start - 5.0, region_end + 5.0));
+    // Step 4: Cross-row column alignment check per region
+    // Real tables have consistent column X positions across rows (high pairwise score).
+    // Paragraph text has varying word positions line-to-line (low pairwise score).
+    let mut regions = Vec::new();
+    for region_rows in &candidate_regions {
+        let num_rows = region_rows.len();
+        let mut total_score = 0.0f32;
+        let mut pair_count = 0u32;
+        let tolerance = 10.0f32;
+
+        for i in 0..num_rows {
+            for j in (i + 1)..num_rows {
+                let centers_a = &region_rows[i].1;
+                let centers_b = &region_rows[j].1;
+
+                let matches_a = centers_a
+                    .iter()
+                    .filter(|&&a| centers_b.iter().any(|&b| (a - b).abs() < tolerance))
+                    .count();
+                let matches_b = centers_b
+                    .iter()
+                    .filter(|&&b| centers_a.iter().any(|&a| (a - b).abs() < tolerance))
+                    .count();
+
+                let max_len = centers_a.len().max(centers_b.len());
+                if max_len > 0 {
+                    total_score += (matches_a + matches_b) as f32 / (2 * max_len) as f32;
+                    pair_count += 1;
+                }
+            }
+        }
+
+        let avg_score = if pair_count > 0 {
+            total_score / pair_count as f32
+        } else {
+            0.0
+        };
+        if avg_score >= 0.5 {
+            let y_min = region_rows.first().unwrap().0;
+            let y_max = region_rows.last().unwrap().0;
+            regions.push((y_min - 5.0, y_max + 5.0));
+        }
     }
 
     regions
@@ -490,7 +532,9 @@ fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bo
         TableDetectionMode::BodyFont => 0.3,
     };
 
-    pct_data > min_pct || num_cols >= 5
+    // For SmallFont, bypass content check for wide tables (5+ columns may have text headers).
+    // For BodyFont, always require data-like content to prevent paragraph false positives.
+    pct_data > min_pct || (mode == TableDetectionMode::SmallFont && num_cols >= 5)
 }
 
 /// Check if a cell value looks like table data
@@ -1266,6 +1310,52 @@ mod tests {
             tables.len(),
             0,
             "Single-column paragraph must not be detected as table"
+        );
+    }
+
+    #[test]
+    fn test_word_level_paragraph_not_detected_as_table() {
+        // Paragraph text with per-word TextItems (as produced by some PDFs).
+        // Word X positions vary from line to line — NOT a table.
+        let items = vec![
+            // Line 1
+            make_item("We", 72.0, 500.0, 10.0),
+            make_item("would", 95.0, 500.0, 10.0),
+            make_item("like", 145.0, 500.0, 10.0),
+            make_item("to", 180.0, 500.0, 10.0),
+            make_item("thank", 200.0, 500.0, 10.0),
+            make_item("all", 250.0, 500.0, 10.0),
+            make_item("the", 278.0, 500.0, 10.0),
+            make_item("practitioners", 305.0, 500.0, 10.0),
+            // Line 2
+            make_item("and", 72.0, 485.0, 10.0),
+            make_item("researchers", 105.0, 485.0, 10.0),
+            make_item("across", 185.0, 485.0, 10.0),
+            make_item("the", 232.0, 485.0, 10.0),
+            make_item("University", 260.0, 485.0, 10.0),
+            make_item("of", 335.0, 485.0, 10.0),
+            make_item("Leeds", 355.0, 485.0, 10.0),
+            // Line 3
+            make_item("Libraries", 72.0, 470.0, 10.0),
+            make_item("whose", 142.0, 470.0, 10.0),
+            make_item("contributions", 190.0, 470.0, 10.0),
+            make_item("made", 290.0, 470.0, 10.0),
+            make_item("this", 328.0, 470.0, 10.0),
+            make_item("report", 360.0, 470.0, 10.0),
+            // Line 4
+            make_item("possible", 72.0, 455.0, 10.0),
+            make_item("Both", 140.0, 455.0, 10.0),
+            make_item("constituent", 178.0, 455.0, 10.0),
+            make_item("studies", 262.0, 455.0, 10.0),
+            make_item("were", 315.0, 455.0, 10.0),
+            make_item("approved", 350.0, 455.0, 10.0),
+        ];
+
+        let tables = detect_tables(&items, 10.0);
+        assert_eq!(
+            tables.len(),
+            0,
+            "Word-level paragraph text must not be detected as table"
         );
     }
 

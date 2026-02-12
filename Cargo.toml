@@ -41,3 +41,7 @@ path = "src/bin/pdf2md.rs"
 name = "detect-pdf"
 path = "src/bin/detect_pdf.rs"
 
+
+[[bin]]
+name = "debug_ygaps"
+path = "src/bin/debug_ygaps.rs"
