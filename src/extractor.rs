@@ -678,6 +678,16 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
         let prev_end_x = prev_item.x + prev_item.width;
         let gap = curr_item.x - prev_end_x;
         let font_size = prev_item.font_size;
+
+        // When items perfectly touch (gap ≈ 0) and both are multi-character,
+        // they are likely separate words from different text operators.
+        // Single-character items (per-glyph positioning) should still be joined.
+        let prev_chars = prev_item.text.trim().chars().count();
+        let curr_chars = curr_item.text.trim().chars().count();
+        if gap >= 0.0 && gap < font_size * 0.05 && prev_chars >= 3 && curr_chars >= 2 {
+            return false; // Don't join — separate words
+        }
+
         // With accurate widths, a gap < 15% of font size means glyphs are
         // adjacent (same word). Anything larger is a deliberate space.
         return gap < font_size * 0.15;
@@ -1841,13 +1851,25 @@ fn extract_text_from_operand(
 /// Expand Unicode ligature characters to their component characters.
 /// This makes extracted text more searchable and semantically correct.
 fn expand_ligatures(text: &str) -> String {
+    // Strip null bytes and other control characters (except newline/tab)
+    let text = if text
+        .bytes()
+        .any(|b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t')
+    {
+        text.chars()
+            .filter(|&c| c >= ' ' || c == '\n' || c == '\r' || c == '\t')
+            .collect::<String>()
+    } else {
+        text.to_string()
+    };
+
     if !text.contains('\u{FB00}')
         && !text.contains('\u{FB01}')
         && !text.contains('\u{FB02}')
         && !text.contains('\u{FB03}')
         && !text.contains('\u{FB04}')
     {
-        return text.to_string();
+        return text;
     }
     text.replace('\u{FB00}', "ff")
         .replace('\u{FB01}', "fi")
@@ -2386,5 +2408,105 @@ mod tests {
         assert!(is_italic_font("Arial-BoldItalic"));
         assert!(is_bold_font("Helvetica-BoldOblique"));
         assert!(is_italic_font("Helvetica-BoldOblique"));
+    }
+
+    #[test]
+    fn test_word_level_items_get_spaces() {
+        // Simulate CID font per-word items touching with gap=0
+        let items = vec![
+            TextItem {
+                text: "the".into(),
+                x: 100.0,
+                y: 500.0,
+                width: 19.5,
+                height: 12.0,
+                font: "C2_0".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+            TextItem {
+                text: "Prague".into(),
+                x: 119.5,
+                y: 500.0,
+                width: 42.0,
+                height: 12.0,
+                font: "C2_0".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+            TextItem {
+                text: "Rules".into(),
+                x: 161.5,
+                y: 500.0,
+                width: 35.0,
+                height: 12.0,
+                font: "C2_0".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+        ];
+
+        let lines = group_into_lines(items);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "the Prague Rules");
+    }
+
+    #[test]
+    fn test_single_char_items_still_join() {
+        // Per-glyph positioning: single chars should join into words
+        let items = vec![
+            TextItem {
+                text: "N".into(),
+                x: 100.0,
+                y: 500.0,
+                width: 8.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+            TextItem {
+                text: "A".into(),
+                x: 108.0,
+                y: 500.0,
+                width: 8.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+            TextItem {
+                text: "V".into(),
+                x: 116.0,
+                y: 500.0,
+                width: 8.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+        ];
+
+        let lines = group_into_lines(items);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "NAV");
     }
 }
