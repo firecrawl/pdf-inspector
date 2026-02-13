@@ -755,6 +755,13 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
     // Calculate gap between items
     let gap = curr_item.x - prev_end_x;
 
+    // CJK text: always join adjacent items — CJK languages don't use spaces between words.
+    // The Latin case-based heuristics below would incorrectly insert spaces within CJK words.
+    let is_cjk = prev_last.is_some_and(is_cjk_char) || curr_first.is_some_and(is_cjk_char);
+    if is_cjk {
+        return gap < char_width * 0.8;
+    }
+
     // Use different thresholds based on character case
     // Same-case sequences (ALL CAPS or all lowercase) are more likely to be
     // word fragments that got split. Mixed case suggests word boundaries.
