@@ -695,12 +695,12 @@ fn test_header_level_h3() {
 #[test]
 fn test_header_level_h4() {
     use pdf_inspector::markdown::to_markdown_from_items;
-    // Four heading tiers: 24.0 → H1, 18.0 → H2, 15.0 → H3, 13.5 → H4
+    // Four heading tiers: 24.0 → H1, 18.0 → H2, 15.0 → H3, 14.5 → H4
     let items = vec![
         make_text_item("H1 Title", 100.0, 850.0, 24.0, 1),
         make_text_item("H2 Title", 100.0, 800.0, 18.0, 1),
         make_text_item("H3 Title", 100.0, 750.0, 15.0, 1),
-        make_text_item("H4 Title", 100.0, 700.0, 13.5, 1),
+        make_text_item("H4 Title", 100.0, 700.0, 14.5, 1),
         make_text_item("body text one", 100.0, 650.0, 12.0, 1),
         make_text_item("body text two", 100.0, 630.0, 12.0, 1),
         make_text_item("body text three", 100.0, 610.0, 12.0, 1),

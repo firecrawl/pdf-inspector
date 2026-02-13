@@ -271,6 +271,9 @@ fn to_markdown_from_lines_with_tables_and_images(
     // Discover heading tiers for this document
     let heading_tiers = compute_heading_tiers(&lines, base_size);
 
+    // Merge consecutive heading lines at the same level (e.g., wrapped titles)
+    let lines = merge_heading_lines(lines, base_size, &heading_tiers);
+
     // Compute the typical line spacing for paragraph break detection.
     // For double-spaced documents (like legal/government PDFs), the normal
     // line spacing can be 2.3x base_size, which would exceed a fixed 1.8x
@@ -400,7 +403,11 @@ fn to_markdown_from_lines_with_tables_and_images(
 
         // Detect headers by font size
         // Note: Headers typically shouldn't have bold markers since they're already emphasized
-        if options.detect_headers && plain_trimmed.len() > 3 {
+        // Skip very short text (drop caps/labels) and very long text (body paragraphs)
+        if options.detect_headers
+            && plain_trimmed.len() > 3
+            && plain_trimmed.split_whitespace().count() <= 15
+        {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) =
                 detect_header_level(line_font_size, base_size, &heading_tiers)
@@ -539,6 +546,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     // Discover heading tiers for this document
     let heading_tiers = compute_heading_tiers(&lines, base_size);
 
+    // Merge consecutive heading lines at the same level (e.g., wrapped titles)
+    let lines = merge_heading_lines(lines, base_size, &heading_tiers);
+
     // Compute the typical line spacing for paragraph break detection
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
 
@@ -601,8 +611,11 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         }
 
         // Detect headers by font size
-        // Skip very short text (likely drop caps or labels)
-        if options.detect_headers && plain_trimmed.len() > 3 {
+        // Skip very short text (drop caps/labels) and very long text (body paragraphs)
+        if options.detect_headers
+            && plain_trimmed.len() > 3
+            && plain_trimmed.split_whitespace().count() <= 15
+        {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) =
                 detect_header_level(line_font_size, base_size, &heading_tiers)
@@ -695,6 +708,61 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 /// Merge drop caps with the appropriate line
 /// A drop cap is a single large letter at the start of a paragraph
 /// Due to PDF coordinate sorting, the drop cap may appear AFTER the line it belongs to
+/// Merge consecutive heading lines at the same level into a single line.
+///
+/// When a heading wraps across multiple text lines (e.g., "About Glenair, the Mission-Critical"
+/// and "Interconnect Company"), each fragment becomes a separate `# Header` in the output.
+/// This function detects consecutive lines at the same heading tier on the same page
+/// with a small Y gap and merges them into one line.
+fn merge_heading_lines(
+    lines: Vec<TextLine>,
+    base_size: f32,
+    heading_tiers: &[f32],
+) -> Vec<TextLine> {
+    if lines.is_empty() {
+        return lines;
+    }
+
+    let mut result: Vec<TextLine> = Vec::with_capacity(lines.len());
+
+    for line in lines {
+        let line_font = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
+        let line_level = detect_header_level(line_font, base_size, heading_tiers);
+
+        // Check if the previous line is a heading at the same level on the same page
+        let should_merge = if let (Some(prev), Some(curr_level)) = (result.last(), line_level) {
+            let prev_font = prev.items.first().map(|i| i.font_size).unwrap_or(base_size);
+            let prev_level = detect_header_level(prev_font, base_size, heading_tiers);
+            let same_page = prev.page == line.page;
+            let same_level = prev_level == Some(curr_level);
+            let y_gap = prev.y - line.y;
+            // Merge if gap is within ~2x the font size (normal line wrap spacing)
+            let close_enough = y_gap > 0.0 && y_gap < line_font * 2.0;
+            same_page && same_level && close_enough
+        } else {
+            false
+        };
+
+        if should_merge {
+            // Append this line's items to the previous line
+            let prev = result.last_mut().unwrap();
+            // Add a space-bearing TextItem to separate the merged text
+            if let Some(first_item) = line.items.first() {
+                let mut space_item = first_item.clone();
+                space_item.text = format!(" {}", space_item.text.trim_start());
+                prev.items.push(space_item);
+            }
+            for item in line.items.into_iter().skip(1) {
+                prev.items.push(item);
+            }
+        } else {
+            result.push(line);
+        }
+    }
+
+    result
+}
+
 fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextLine> {
     let mut result: Vec<TextLine> = Vec::with_capacity(lines.len());
 
@@ -856,7 +924,7 @@ fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f32> {
 
     for line in lines {
         if let Some(first) = line.items.first() {
-            if first.font_size / base_size >= 1.1 {
+            if first.font_size / base_size >= 1.2 {
                 heading_sizes.push(first.font_size);
             }
         }
@@ -885,7 +953,7 @@ fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f32> {
 fn detect_header_level(font_size: f32, base_size: f32, heading_tiers: &[f32]) -> Option<usize> {
     let ratio = font_size / base_size;
 
-    if ratio < 1.1 {
+    if ratio < 1.2 {
         return None; // Regular text
     }
 
@@ -1394,9 +1462,10 @@ mod tests {
         assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(3));
         assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
 
-        // Single tier: 14→H1, 12→None
-        let tiers = vec![14.0];
-        assert_eq!(detect_header_level(14.0, 12.0, &tiers), Some(1));
+        // Single tier: 15→H1 (ratio 1.25 ≥ 1.2), 14→None (ratio 1.17 < 1.2)
+        let tiers = vec![15.0];
+        assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(1));
+        assert_eq!(detect_header_level(14.0, 12.0, &tiers), None);
         assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
 
         // No tiers (empty): falls back to ratio thresholds
@@ -1404,7 +1473,8 @@ mod tests {
         assert_eq!(detect_header_level(24.0, 12.0, &tiers), Some(1));
         assert_eq!(detect_header_level(18.0, 12.0, &tiers), Some(2));
         assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(3));
-        assert_eq!(detect_header_level(13.5, 12.0, &tiers), Some(4));
+        assert_eq!(detect_header_level(14.5, 12.0, &tiers), Some(4));
+        assert_eq!(detect_header_level(14.0, 12.0, &tiers), None);
         assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
 
         // Body text excluded when tiers exist: 13pt (ratio 1.08) → None
