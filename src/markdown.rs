@@ -271,6 +271,12 @@ fn to_markdown_from_lines_with_tables_and_images(
     // Discover heading tiers for this document
     let heading_tiers = compute_heading_tiers(&lines, base_size);
 
+    // Compute the typical line spacing for paragraph break detection.
+    // For double-spaced documents (like legal/government PDFs), the normal
+    // line spacing can be 2.3x base_size, which would exceed a fixed 1.8x
+    // threshold and cause every line to be treated as a paragraph break.
+    let para_threshold = compute_paragraph_threshold(&lines, base_size);
+
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
@@ -317,7 +323,7 @@ fn to_markdown_from_lines_with_tables_and_images(
                     output.push_str("\n\n");
                     in_paragraph = false;
                 }
-                output.push_str("---\n\n");
+                output.push_str("\n\n");
             }
             current_page = line.page;
             prev_y = f32::MAX;
@@ -357,9 +363,9 @@ fn to_markdown_from_lines_with_tables_and_images(
             }
         }
 
-        // Paragraph break (large Y gap)
+        // Paragraph break (large Y gap relative to document's typical line spacing)
         let y_gap = prev_y - line.y;
-        let is_para_break = y_gap > base_size * 1.8; // Slightly lower threshold
+        let is_para_break = y_gap > para_threshold;
         if is_para_break && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
@@ -533,6 +539,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     // Discover heading tiers for this document
     let heading_tiers = compute_heading_tiers(&lines, base_size);
 
+    // Compute the typical line spacing for paragraph break detection
+    let para_threshold = compute_paragraph_threshold(&lines, base_size);
+
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
@@ -548,7 +557,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     output.push_str("\n\n");
                     in_paragraph = false;
                 }
-                output.push_str("---\n\n");
+                output.push_str("\n\n");
             }
             current_page = line.page;
             prev_y = f32::MAX;
@@ -556,9 +565,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             last_list_x = None;
         }
 
-        // Paragraph break (large Y gap)
+        // Paragraph break (large Y gap relative to document's typical line spacing)
         let y_gap = prev_y - line.y;
-        let is_para_break = y_gap > base_size * 1.8; // Slightly lower threshold
+        let is_para_break = y_gap > para_threshold;
         if is_para_break && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
@@ -791,6 +800,52 @@ fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
         .unwrap_or(12.0);
 
     FontStats { most_common_size }
+}
+
+/// Compute the Y-gap threshold for paragraph break detection.
+///
+/// Instead of using a fixed multiple of base_size (which fails for double-spaced
+/// documents), we compute the document's typical (median) line spacing and use
+/// a multiplier on that. A gap significantly larger than typical indicates a
+/// paragraph break.
+///
+/// Fallback: if we can't compute typical spacing, use base_size * 1.8.
+fn compute_paragraph_threshold(lines: &[TextLine], base_size: f32) -> f32 {
+    let fallback = base_size * 1.8;
+
+    // Collect Y gaps between consecutive lines on the same page
+    let mut gaps: Vec<f32> = Vec::new();
+    let mut prev_y: Option<(u32, f32)> = None;
+
+    for line in lines {
+        if let Some((prev_page, py)) = prev_y {
+            if line.page == prev_page {
+                let gap = py - line.y;
+                // Only consider positive gaps within a reasonable range
+                // (skip huge gaps from page headers/footers)
+                if gap > 0.0 && gap < base_size * 10.0 {
+                    gaps.push(gap);
+                }
+            }
+        }
+        prev_y = Some((line.page, line.y));
+    }
+
+    if gaps.len() < 5 {
+        return fallback;
+    }
+
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let median = gaps[gaps.len() / 2];
+
+    // The paragraph threshold should be larger than the typical line spacing.
+    // Use 1.3x the median gap. This means:
+    // - Single-spaced (median ~14pt for 12pt font): threshold = 18.2pt
+    // - Double-spaced (median ~28pt for 12pt font): threshold = 36.4pt
+    // Also ensure it's at least base_size * 1.5 to avoid false paragraph breaks
+    // in tightly-spaced documents.
+    (median * 1.3).max(base_size * 1.5)
 }
 
 /// Discover distinct heading font-size tiers in the document.

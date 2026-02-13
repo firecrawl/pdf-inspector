@@ -440,11 +440,14 @@ fn test_markdown_from_items_monospace_code() {
 fn test_markdown_from_items_page_breaks() {
     use pdf_inspector::markdown::to_markdown_from_items;
     let items = vec![
-        make_text_item("Page 1", 100.0, 700.0, 12.0, 1),
-        make_text_item("Page 2", 100.0, 700.0, 12.0, 2),
+        make_text_item("Content on first page", 100.0, 700.0, 12.0, 1),
+        make_text_item("Content on second page", 100.0, 700.0, 12.0, 2),
     ];
     let md = to_markdown_from_items(items, MarkdownOptions::default());
-    assert!(md.contains("---")); // Page break marker
+    // Pages should be separated by blank lines (no --- markers)
+    assert!(!md.contains("---"));
+    assert!(md.contains("Content on first page"));
+    assert!(md.contains("Content on second page"));
 }
 
 // ============================================================================
