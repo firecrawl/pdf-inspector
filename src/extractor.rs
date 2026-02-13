@@ -2217,8 +2217,8 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
                 }
             }
 
-            // Process each column's items independently
-            let mut column_lines: Vec<TextLine> = Vec::new();
+            // Process each column's items independently, preserving column identity
+            let mut per_column_lines: Vec<Vec<TextLine>> = Vec::new();
             for column in &columns {
                 let col_items: Vec<TextItem> = column_items
                     .iter()
@@ -2230,39 +2230,42 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
                     .collect();
 
                 let lines = group_single_column(col_items);
-                column_lines.extend(lines);
+                per_column_lines.push(lines);
             }
 
             // Process spanning items as their own group
-            let spanning_lines = group_single_column(spanning_items);
-
-            // Merge: interleave spanning lines by Y position among column lines
-            let mut merged: Vec<TextLine> = Vec::new();
-            let mut span_idx = 0;
-            let mut col_idx = 0;
+            let mut spanning_lines = group_single_column(spanning_items);
 
             // Sort spanning lines by Y descending (top-first in PDF coords)
-            let mut spanning_lines = spanning_lines;
             spanning_lines
                 .sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
 
-            while span_idx < spanning_lines.len() && col_idx < column_lines.len() {
-                // Higher Y = higher on page = comes first in reading order
-                if spanning_lines[span_idx].y >= column_lines[col_idx].y {
-                    merged.push(spanning_lines[span_idx].clone());
-                    span_idx += 1;
-                } else {
-                    merged.push(column_lines[col_idx].clone());
-                    col_idx += 1;
+            // Section-based merge: spanning items define vertical sections.
+            // Within each section, emit all column lines (left-to-right, top-to-bottom)
+            // before emitting the spanning line.
+            let mut merged: Vec<TextLine> = Vec::new();
+            let mut col_cursors: Vec<usize> = vec![0; per_column_lines.len()];
+
+            for span_line in &spanning_lines {
+                let span_y = span_line.y;
+                // Emit all column lines above this spanning line, column by column
+                for (ci, col_lines) in per_column_lines.iter().enumerate() {
+                    while col_cursors[ci] < col_lines.len()
+                        && col_lines[col_cursors[ci]].y >= span_y
+                    {
+                        merged.push(col_lines[col_cursors[ci]].clone());
+                        col_cursors[ci] += 1;
+                    }
                 }
+                merged.push(span_line.clone());
             }
-            while span_idx < spanning_lines.len() {
-                merged.push(spanning_lines[span_idx].clone());
-                span_idx += 1;
-            }
-            while col_idx < column_lines.len() {
-                merged.push(column_lines[col_idx].clone());
-                col_idx += 1;
+
+            // Emit remaining column lines below all spanning items, column by column
+            for (ci, col_lines) in per_column_lines.iter().enumerate() {
+                while col_cursors[ci] < col_lines.len() {
+                    merged.push(col_lines[col_cursors[ci]].clone());
+                    col_cursors[ci] += 1;
+                }
             }
 
             all_lines.extend(merged);
