@@ -682,9 +682,14 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
         // When items perfectly touch (gap ≈ 0) and both are multi-character,
         // they are likely separate words from different text operators.
         // Single-character items (per-glyph positioning) should still be joined.
+        // Skip for CJK text — CJK languages don't use spaces between words.
         let prev_chars = prev_item.text.trim().chars().count();
         let curr_chars = curr_item.text.trim().chars().count();
-        if gap >= 0.0 && gap < font_size * 0.05 && prev_chars >= 3 && curr_chars >= 2 {
+        let prev_last_char = prev_item.text.trim().chars().last();
+        let curr_first_char = curr_item.text.trim().chars().next();
+        let is_cjk =
+            prev_last_char.map_or(false, is_cjk_char) || curr_first_char.map_or(false, is_cjk_char);
+        if !is_cjk && gap >= 0.0 && gap < font_size * 0.05 && prev_chars >= 3 && curr_chars >= 2 {
             return false; // Don't join — separate words
         }
 
@@ -1705,6 +1710,20 @@ fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32 {
     base_size * scale
 }
 
+/// Check if a character is CJK (Chinese, Japanese, Korean).
+/// CJK languages don't use spaces between words, so word-boundary
+/// heuristics should not apply when CJK characters are involved.
+fn is_cjk_char(c: char) -> bool {
+    matches!(c,
+        '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
+        | '\u{3040}'..='\u{309F}' // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        | '\u{FF00}'..='\u{FFEF}' // Halfwidth and Fullwidth Forms
+    )
+}
+
 /// Detect if a font name indicates bold style
 /// Common patterns: "Bold", "Bd", "Black", "Heavy", "Demi", "Semi" (semi-bold)
 pub fn is_bold_font(font_name: &str) -> bool {
@@ -2508,5 +2527,55 @@ mod tests {
         let lines = group_into_lines(items);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text(), "NAV");
+    }
+
+    #[test]
+    fn test_cjk_items_join_without_spaces() {
+        // Japanese text items touching at gap=0 should join without spaces
+        let items = vec![
+            TextItem {
+                text: "である".into(),
+                x: 100.0,
+                y: 500.0,
+                width: 24.0,
+                height: 12.0,
+                font: "C2_0".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+            TextItem {
+                text: "履行義務".into(),
+                x: 124.0,
+                y: 500.0,
+                width: 32.0,
+                height: 12.0,
+                font: "C2_0".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+            TextItem {
+                text: "を識別す".into(),
+                x: 156.0,
+                y: 500.0,
+                width: 32.0,
+                height: 12.0,
+                font: "C2_0".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+        ];
+
+        let lines = group_into_lines(items);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "である履行義務を識別す");
     }
 }
