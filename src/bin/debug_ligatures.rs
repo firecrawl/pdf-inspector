@@ -56,14 +56,12 @@ fn main() {
 
                 if let Some(enc_dict) = enc_dict {
                     // Check BaseEncoding
-                    if let Ok(base) = enc_dict.get(b"BaseEncoding") {
-                        if let lopdf::Object::Name(name) = base {
-                            println!(
-                                "  font={}: BaseEncoding={}",
-                                font_name,
-                                String::from_utf8_lossy(name)
-                            );
-                        }
+                    if let Ok(lopdf::Object::Name(name)) = enc_dict.get(b"BaseEncoding") {
+                        println!(
+                            "  font={}: BaseEncoding={}",
+                            font_name,
+                            String::from_utf8_lossy(name)
+                        );
                     }
 
                     // Dump Differences

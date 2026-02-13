@@ -80,8 +80,8 @@ fn main() {
 
         println!("===== PAGE {} ({} lines) =====", page, page_lines.len());
         println!(
-            "{:>8} {:>8} {:>8} {:>6} {:>5}  {}",
-            "Y", "Gap", "GapRatio", "Font", "Bold", "Text (first 80 chars)"
+            "{:>8} {:>8} {:>8} {:>6} {:>5}  Text (first 80 chars)",
+            "Y", "Gap", "GapRatio", "Font", "Bold"
         );
         println!("{}", "-".repeat(120));
 
