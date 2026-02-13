@@ -738,6 +738,29 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
             }
         }
 
+        // Numeric continuity: digits, commas, periods, and percent signs that
+        // are positioned close together are almost always a single number.
+        // e.g., "34,20" + "8" → "34,208", "+13." + "0" + "%" → "+13.0%"
+        // Use a generous threshold since word spaces in numbers are rare.
+        if let (Some(p), Some(c)) = (prev_last, curr_first) {
+            let prev_is_numeric = p.is_ascii_digit() || p == ',' || p == '.';
+            let curr_is_numeric = c.is_ascii_digit() || c == '%' || c == '.';
+            if prev_is_numeric && curr_is_numeric {
+                return gap < font_size * 0.3;
+            }
+            // Sign characters (+/-) followed by digits
+            if (p == '+' || p == '-') && c.is_ascii_digit() {
+                return gap < font_size * 0.3;
+            }
+        }
+
+        // Single-character fragments from per-glyph positioning are almost never
+        // standalone words. Use a more generous threshold to rejoin split words
+        // like "b" + "illion", "C" + "ultural", "togeth" + "er".
+        if prev_chars == 1 || curr_chars == 1 {
+            return gap < font_size * 0.25;
+        }
+
         // With accurate widths, a gap < 15% of font size means glyphs are
         // adjacent (same word). Anything larger is a deliberate space.
         return gap < font_size * 0.15;
