@@ -372,7 +372,7 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
 
     // Validation 3: tables shouldn't have too many rows (likely misdetected text)
     let max_rows = match mode {
-        TableDetectionMode::SmallFont => 50,
+        TableDetectionMode::SmallFont => 200,
         TableDetectionMode::BodyFont => 100,
     };
     if rows.len() > max_rows {
@@ -753,15 +753,22 @@ fn find_row_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
         return vec![];
     }
 
-    // Cluster Y positions - items within 10px are same row
-    let cluster_threshold = 10.0;
+    // Cluster Y positions - items within a fraction of the median font size are same row.
+    // Using 0.8× median font keeps the threshold between intra-row gaps (~0pt) and
+    // inter-row gaps (≥1× font size), preventing row merging in uniform-spaced PDFs.
+    let cluster_threshold = {
+        let mut font_sizes: Vec<f32> = items.iter().map(|(_, i)| i.font_size).collect();
+        font_sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_font = font_sizes[font_sizes.len() / 2];
+        (median_font * 0.8).max(4.0)
+    };
     let mut rows = Vec::new();
     let mut cluster_items: Vec<f32> = vec![y_positions[0]];
 
     for &y in &y_positions[1..] {
         let cluster_center = cluster_items.iter().sum::<f32>() / cluster_items.len() as f32;
 
-        if cluster_center - y > cluster_threshold {
+        if cluster_center - y >= cluster_threshold {
             // End current cluster (note: Y is descending)
             rows.push(cluster_center);
             cluster_items = vec![y];
@@ -1398,6 +1405,48 @@ mod tests {
         assert!(
             tables[0].rows.len() >= 40,
             "Large table should preserve most rows, got {}",
+            tables[0].rows.len()
+        );
+    }
+
+    #[test]
+    fn test_uniform_spacing_rows_not_merged() {
+        // Reproduces the 210603_ROOFING_BIDRESP bug: 8pt font, 10pt line spacing.
+        // With the old fixed 10.0pt threshold and strict `>`, adjacent rows at exactly
+        // 10pt apart were merged in pairs, producing garbled output like
+        // "1 1SC Priority LLC" (two company names joined).
+        let companies = [
+            "SC Priority LLC",
+            "Craft Roofing Co",
+            "Alpha Roofing Inc",
+            "Beta Construction",
+            "Gamma Builders",
+            "Delta Roofing",
+            "Epsilon Contractors",
+        ];
+
+        let mut items = Vec::new();
+
+        // Header row at y=800
+        items.push(make_item("No.", 50.0, 800.0, 8.0));
+        items.push(make_item("Company", 120.0, 800.0, 8.0));
+        items.push(make_item("Bid Amount", 350.0, 800.0, 8.0));
+
+        // 7 data rows, each 10pt apart (exactly the old threshold)
+        for (i, company) in companies.iter().enumerate() {
+            let y = 790.0 - (i as f32 * 10.0); // 10pt uniform spacing
+            items.push(make_item(&format!("{}", i + 1), 50.0, y, 8.0));
+            items.push(make_item(company, 120.0, y, 8.0));
+            items.push(make_item(&format!("${},000", 100 + i * 10), 350.0, y, 8.0));
+        }
+
+        let tables = detect_tables(&items, 12.0);
+        assert_eq!(tables.len(), 1, "Should detect one table");
+        // 1 header + 7 data = 8 rows total; must NOT merge into 4
+        assert_eq!(
+            tables[0].rows.len(),
+            8,
+            "Each company must be on its own row, got {} rows instead of 8",
             tables[0].rows.len()
         );
     }
