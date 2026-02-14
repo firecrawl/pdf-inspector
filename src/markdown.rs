@@ -214,6 +214,11 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
         }
     }
 
+    // Merge continuation tables across page breaks
+    // When consecutive pages each have exactly one table with the same column count,
+    // treat them as a single table spanning multiple pages.
+    merge_continuation_tables(&mut page_tables);
+
     // Filter out table items and process the rest
     let non_table_items: Vec<TextItem> = text_items
         .into_iter()
@@ -246,6 +251,113 @@ fn calculate_font_stats_from_items(items: &[TextItem]) -> FontStats {
         .unwrap_or(12.0);
 
     FontStats { most_common_size }
+}
+
+/// Merge continuation tables that span across page breaks.
+///
+/// When consecutive pages each have exactly one table with the same number of columns,
+/// the later pages are continuations. We strip their header+separator rows and append
+/// their data rows to the first page's table, then remove them from later pages.
+fn merge_continuation_tables(page_tables: &mut std::collections::HashMap<u32, Vec<(f32, String)>>) {
+    let mut sorted_pages: Vec<u32> = page_tables.keys().copied().collect();
+    sorted_pages.sort();
+
+    if sorted_pages.len() < 2 {
+        return;
+    }
+
+    // Find runs of consecutive pages that each have exactly one table with matching columns
+    let mut i = 0;
+    while i < sorted_pages.len() {
+        let first_page = sorted_pages[i];
+        let first_tables = match page_tables.get(&first_page) {
+            Some(t) if t.len() == 1 => t,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let first_col_count = count_table_columns(&first_tables[0].1);
+        if first_col_count == 0 {
+            i += 1;
+            continue;
+        }
+
+        // Collect continuation pages
+        let mut continuation_pages = Vec::new();
+        let mut j = i + 1;
+        while j < sorted_pages.len() {
+            let next_page = sorted_pages[j];
+            // Must be consecutive page numbers
+            let prev_page = if continuation_pages.is_empty() {
+                first_page
+            } else {
+                *continuation_pages.last().unwrap()
+            };
+            if next_page != prev_page + 1 {
+                break;
+            }
+
+            let next_tables = match page_tables.get(&next_page) {
+                Some(t) if t.len() == 1 => t,
+                _ => break,
+            };
+
+            let next_col_count = count_table_columns(&next_tables[0].1);
+            if next_col_count != first_col_count {
+                break;
+            }
+
+            continuation_pages.push(next_page);
+            j += 1;
+        }
+
+        if !continuation_pages.is_empty() {
+            // Collect data rows from continuation pages
+            let mut extra_rows = String::new();
+            for &cont_page in &continuation_pages {
+                if let Some(tables) = page_tables.get(&cont_page) {
+                    let table_md = &tables[0].1;
+                    // Skip header row (line 1) and separator row (line 2), keep the rest
+                    for (line_idx, line) in table_md.lines().enumerate() {
+                        if line_idx >= 2 {
+                            extra_rows.push_str(line);
+                            extra_rows.push('\n');
+                        }
+                    }
+                }
+            }
+
+            // Append continuation rows to the first page's table
+            if let Some(tables) = page_tables.get_mut(&first_page) {
+                tables[0].1.push_str(&extra_rows);
+            }
+
+            // Remove continuation pages from the map
+            for &cont_page in &continuation_pages {
+                page_tables.remove(&cont_page);
+            }
+
+            // Skip past the merged pages
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Count the number of columns in a markdown table by counting `|` in the separator row.
+fn count_table_columns(table_md: &str) -> usize {
+    // The separator row is the second line, containing "| --- | --- |"
+    if let Some(sep_line) = table_md.lines().nth(1) {
+        if sep_line.contains("---") {
+            // Count cells: number of | minus 1 (leading |), but handle edge cases
+            let pipes = sep_line.chars().filter(|&c| c == '|').count();
+            return if pipes >= 2 { pipes - 1 } else { 0 };
+        }
+    }
+    0
 }
 
 /// Convert text lines to markdown, inserting tables and images at appropriate Y positions
