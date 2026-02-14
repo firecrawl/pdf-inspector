@@ -489,32 +489,43 @@ fn to_markdown_from_lines_with_tables_and_images(
         in_paragraph = true;
     }
 
-    // Insert any remaining tables for the last page
-    if let Some(tables) = page_tables.get(&current_page) {
-        for (idx, (_, table_md)) in tables.iter().enumerate() {
-            if !inserted_tables.contains(&(current_page, idx)) {
-                if in_paragraph {
-                    output.push_str("\n\n");
-                    in_paragraph = false;
+    // Insert any remaining tables and images for all pages
+    // (handles the case where all text was consumed by tables, leaving no lines to iterate)
+    let mut remaining_pages: Vec<u32> = page_tables
+        .keys()
+        .chain(page_images.keys())
+        .copied()
+        .collect();
+    remaining_pages.sort();
+    remaining_pages.dedup();
+
+    for page in remaining_pages {
+        if let Some(tables) = page_tables.get(&page) {
+            for (idx, (_, table_md)) in tables.iter().enumerate() {
+                if !inserted_tables.contains(&(page, idx)) {
+                    if in_paragraph {
+                        output.push_str("\n\n");
+                        in_paragraph = false;
+                    }
+                    output.push('\n');
+                    output.push_str(table_md);
+                    output.push('\n');
+                    inserted_tables.insert((page, idx));
                 }
-                output.push('\n');
-                output.push_str(table_md);
-                output.push('\n');
             }
         }
-    }
-
-    // Insert any remaining images for the last page
-    if let Some(images) = page_images.get(&current_page) {
-        for (idx, (_, image_md)) in images.iter().enumerate() {
-            if !inserted_images.contains(&(current_page, idx)) {
-                if in_paragraph {
-                    output.push_str("\n\n");
-                    in_paragraph = false;
+        if let Some(images) = page_images.get(&page) {
+            for (idx, (_, image_md)) in images.iter().enumerate() {
+                if !inserted_images.contains(&(page, idx)) {
+                    if in_paragraph {
+                        output.push_str("\n\n");
+                        in_paragraph = false;
+                    }
+                    output.push('\n');
+                    output.push_str(image_md);
+                    output.push('\n');
+                    inserted_images.insert((page, idx));
                 }
-                output.push('\n');
-                output.push_str(image_md);
-                output.push('\n');
             }
         }
     }

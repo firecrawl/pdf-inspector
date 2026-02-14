@@ -373,7 +373,7 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     // Validation 3: tables shouldn't have too many rows (likely misdetected text)
     let max_rows = match mode {
         TableDetectionMode::SmallFont => 200,
-        TableDetectionMode::BodyFont => 100,
+        TableDetectionMode::BodyFont => 200,
     };
     if rows.len() > max_rows {
         return None;
@@ -547,6 +547,16 @@ fn looks_like_table_data(s: &str) -> bool {
 
     // Pure numbers
     if looks_like_number(s) {
+        return true;
+    }
+
+    // Dates: MM/DD/YYYY, DD/MM/YYYY, YYYY-MM-DD, etc.
+    if s.len() <= 10
+        && s.chars().filter(|c| c.is_ascii_digit()).count() >= 4
+        && (s.contains('/') || s.contains('-'))
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || c == '/' || c == '-')
+    {
         return true;
     }
 
