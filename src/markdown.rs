@@ -174,32 +174,29 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
             .push((img.y, img_md));
     }
 
-    // Group items by page for table detection
-    let mut pages: Vec<u32> = text_items.iter().map(|i| i.page).collect();
+    // Pre-group items by page with their global indices (O(n) instead of O(pages*n))
+    let mut page_groups: HashMap<u32, Vec<(usize, &TextItem)>> = HashMap::new();
+    for (global_idx, item) in text_items.iter().enumerate() {
+        page_groups
+            .entry(item.page)
+            .or_default()
+            .push((global_idx, item));
+    }
+
+    let mut pages: Vec<u32> = page_groups.keys().copied().collect();
     pages.sort();
-    pages.dedup();
 
     for page in pages {
-        let page_items: Vec<TextItem> = text_items
-            .iter()
-            .filter(|i| i.page == page)
-            .cloned()
-            .collect();
+        let group = page_groups.get(&page).unwrap();
+        let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
 
         let tables = detect_tables(&page_items, base_size);
 
         for table in tables {
-            // Mark items as belonging to a table
+            // Mark items as belonging to a table using pre-computed global indices
             for &idx in &table.item_indices {
-                // Find the global index
-                let global_idx = text_items
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, i)| i.page == page)
-                    .nth(idx)
-                    .map(|(i, _)| i);
-                if let Some(gi) = global_idx {
-                    table_items.insert(gi);
+                if let Some(&(global_idx, _)) = group.get(idx) {
+                    table_items.insert(global_idx);
                 }
             }
 
@@ -214,11 +211,6 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
         }
     }
 
-    // Merge continuation tables across page breaks
-    // When consecutive pages each have exactly one table with the same column count,
-    // treat them as a single table spanning multiple pages.
-    merge_continuation_tables(&mut page_tables);
-
     // Filter out table items and process the rest
     let non_table_items: Vec<TextItem> = text_items
         .into_iter()
@@ -226,6 +218,19 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
         .filter(|(idx, _)| !table_items.contains(idx))
         .map(|(_, item)| item)
         .collect();
+
+    // Find pages that are table-only (no remaining non-table text)
+    let table_only_pages: HashSet<u32> = {
+        let pages_with_text: HashSet<u32> = non_table_items.iter().map(|i| i.page).collect();
+        page_tables
+            .keys()
+            .filter(|p| !pages_with_text.contains(p))
+            .copied()
+            .collect()
+    };
+
+    // Merge continuation tables across page breaks, but only for table-only pages
+    merge_continuation_tables(&mut page_tables, &table_only_pages);
 
     let lines = group_into_lines(non_table_items);
 
@@ -255,10 +260,14 @@ fn calculate_font_stats_from_items(items: &[TextItem]) -> FontStats {
 
 /// Merge continuation tables that span across page breaks.
 ///
-/// When consecutive pages each have exactly one table with the same number of columns,
-/// the later pages are continuations. We strip their header+separator rows and append
-/// their data rows to the first page's table, then remove them from later pages.
-fn merge_continuation_tables(page_tables: &mut std::collections::HashMap<u32, Vec<(f32, String)>>) {
+/// When consecutive pages each have exactly one table with the same number of columns
+/// AND both pages are table-only (no non-table text), treat them as a single table.
+/// We strip their header+separator rows and append their data rows to the first page's
+/// table, then remove them from later pages.
+fn merge_continuation_tables(
+    page_tables: &mut std::collections::HashMap<u32, Vec<(f32, String)>>,
+    table_only_pages: &HashSet<u32>,
+) {
     let mut sorted_pages: Vec<u32> = page_tables.keys().copied().collect();
     sorted_pages.sort();
 
@@ -278,13 +287,19 @@ fn merge_continuation_tables(page_tables: &mut std::collections::HashMap<u32, Ve
             }
         };
 
+        // First page must be table-only to start a merge chain
+        if !table_only_pages.contains(&first_page) {
+            i += 1;
+            continue;
+        }
+
         let first_col_count = count_table_columns(&first_tables[0].1);
         if first_col_count == 0 {
             i += 1;
             continue;
         }
 
-        // Collect continuation pages
+        // Collect continuation pages (must also be table-only)
         let mut continuation_pages = Vec::new();
         let mut j = i + 1;
         while j < sorted_pages.len() {
@@ -296,6 +311,11 @@ fn merge_continuation_tables(page_tables: &mut std::collections::HashMap<u32, Ve
                 *continuation_pages.last().unwrap()
             };
             if next_page != prev_page + 1 {
+                break;
+            }
+
+            // Continuation page must be table-only
+            if !table_only_pages.contains(&next_page) {
                 break;
             }
 
