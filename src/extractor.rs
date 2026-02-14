@@ -754,11 +754,25 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
             }
         }
 
-        // Single-character fragments from per-glyph positioning are almost never
-        // standalone words. Use a more generous threshold to rejoin split words
-        // like "b" + "illion", "C" + "ultural", "togeth" + "er".
-        if prev_chars == 1 || curr_chars == 1 {
+        // Single-character fragment joined to a multi-character item: use a
+        // more generous threshold to rejoin split words like "b" + "illion"
+        // or "C" + "ultural".
+        if (prev_chars == 1) != (curr_chars == 1) {
             return gap < font_size * 0.25;
+        }
+
+        // Both single-char: per-glyph positioning. For numeric characters
+        // (digits within "100,000"), use generous threshold. For alphabetic
+        // per-glyph text ("E"+"f"+"f"...), use normal threshold to preserve
+        // word spaces between letters like "e" (end of word) + "D" (start).
+        if prev_chars == 1 && curr_chars == 1 {
+            if let (Some(p), Some(c)) = (prev_last, curr_first) {
+                let p_numeric = p.is_ascii_digit() || matches!(p, ',' | '.' | '%' | '+' | '-');
+                let c_numeric = c.is_ascii_digit() || matches!(c, ',' | '.' | '%');
+                if p_numeric && c_numeric {
+                    return gap < font_size * 0.25;
+                }
+            }
         }
 
         // With accurate widths, a gap < 15% of font size means glyphs are
