@@ -380,6 +380,46 @@ fn count_table_columns(table_md: &str) -> usize {
     0
 }
 
+/// Flush any remaining tables and images for a given page
+fn flush_page_tables_and_images(
+    page: u32,
+    page_tables: &std::collections::HashMap<u32, Vec<(f32, String)>>,
+    page_images: &std::collections::HashMap<u32, Vec<(f32, String)>>,
+    inserted_tables: &mut HashSet<(u32, usize)>,
+    inserted_images: &mut HashSet<(u32, usize)>,
+    output: &mut String,
+    in_paragraph: &mut bool,
+) {
+    if let Some(tables) = page_tables.get(&page) {
+        for (idx, (_, table_md)) in tables.iter().enumerate() {
+            if !inserted_tables.contains(&(page, idx)) {
+                if *in_paragraph {
+                    output.push_str("\n\n");
+                    *in_paragraph = false;
+                }
+                output.push('\n');
+                output.push_str(table_md);
+                output.push('\n');
+                inserted_tables.insert((page, idx));
+            }
+        }
+    }
+    if let Some(images) = page_images.get(&page) {
+        for (idx, (_, image_md)) in images.iter().enumerate() {
+            if !inserted_images.contains(&(page, idx)) {
+                if *in_paragraph {
+                    output.push_str("\n\n");
+                    *in_paragraph = false;
+                }
+                output.push('\n');
+                output.push_str(image_md);
+                output.push('\n');
+                inserted_images.insert((page, idx));
+            }
+        }
+    }
+}
+
 /// Convert text lines to markdown, inserting tables and images at appropriate Y positions
 fn to_markdown_from_lines_with_tables_and_images(
     lines: Vec<TextLine>,
@@ -421,45 +461,61 @@ fn to_markdown_from_lines_with_tables_and_images(
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
     let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
 
+    // Collect all pages that have tables or images (including image-only pages)
+    let mut all_content_pages: Vec<u32> = page_tables
+        .keys()
+        .chain(page_images.keys())
+        .copied()
+        .collect();
+    all_content_pages.sort();
+    all_content_pages.dedup();
+
     for line in lines {
         // Page break
         if line.page != current_page {
-            // Before leaving the current page, insert any remaining tables and images
+            // Flush current page's remaining tables and images
             if current_page > 0 {
-                if let Some(tables) = page_tables.get(&current_page) {
-                    for (idx, (_, table_md)) in tables.iter().enumerate() {
-                        if !inserted_tables.contains(&(current_page, idx)) {
-                            if in_paragraph {
-                                output.push_str("\n\n");
-                                in_paragraph = false;
-                            }
-                            output.push('\n');
-                            output.push_str(table_md);
-                            output.push('\n');
-                            inserted_tables.insert((current_page, idx));
-                        }
-                    }
-                }
-                if let Some(images) = page_images.get(&current_page) {
-                    for (idx, (_, image_md)) in images.iter().enumerate() {
-                        if !inserted_images.contains(&(current_page, idx)) {
-                            if in_paragraph {
-                                output.push_str("\n\n");
-                                in_paragraph = false;
-                            }
-                            output.push('\n');
-                            output.push_str(image_md);
-                            output.push('\n');
-                            inserted_images.insert((current_page, idx));
-                        }
-                    }
-                }
+                flush_page_tables_and_images(
+                    current_page,
+                    &page_tables,
+                    &page_images,
+                    &mut inserted_tables,
+                    &mut inserted_images,
+                    &mut output,
+                    &mut in_paragraph,
+                );
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;
                 }
                 output.push_str("\n\n");
             }
+
+            // Flush any intermediate pages (image-only or table-only) between
+            // current_page and line.page that have no text lines
+            for &p in &all_content_pages {
+                if p <= current_page {
+                    continue;
+                }
+                if p >= line.page {
+                    break;
+                }
+                flush_page_tables_and_images(
+                    p,
+                    &page_tables,
+                    &page_images,
+                    &mut inserted_tables,
+                    &mut inserted_images,
+                    &mut output,
+                    &mut in_paragraph,
+                );
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                output.push_str("\n\n");
+            }
+
             current_page = line.page;
             prev_y = f32::MAX;
         }
@@ -621,45 +677,30 @@ fn to_markdown_from_lines_with_tables_and_images(
         in_paragraph = true;
     }
 
-    // Insert any remaining tables and images for all pages
-    // (handles the case where all text was consumed by tables, leaving no lines to iterate)
-    let mut remaining_pages: Vec<u32> = page_tables
-        .keys()
-        .chain(page_images.keys())
-        .copied()
-        .collect();
-    remaining_pages.sort();
-    remaining_pages.dedup();
-
-    for page in remaining_pages {
-        if let Some(tables) = page_tables.get(&page) {
-            for (idx, (_, table_md)) in tables.iter().enumerate() {
-                if !inserted_tables.contains(&(page, idx)) {
-                    if in_paragraph {
-                        output.push_str("\n\n");
-                        in_paragraph = false;
-                    }
-                    output.push('\n');
-                    output.push_str(table_md);
-                    output.push('\n');
-                    inserted_tables.insert((page, idx));
-                }
-            }
+    // Flush current page and any remaining pages with tables/images
+    // (handles table-only pages after the last text line, and trailing image-only pages)
+    flush_page_tables_and_images(
+        current_page,
+        &page_tables,
+        &page_images,
+        &mut inserted_tables,
+        &mut inserted_images,
+        &mut output,
+        &mut in_paragraph,
+    );
+    for &p in &all_content_pages {
+        if p <= current_page {
+            continue;
         }
-        if let Some(images) = page_images.get(&page) {
-            for (idx, (_, image_md)) in images.iter().enumerate() {
-                if !inserted_images.contains(&(page, idx)) {
-                    if in_paragraph {
-                        output.push_str("\n\n");
-                        in_paragraph = false;
-                    }
-                    output.push('\n');
-                    output.push_str(image_md);
-                    output.push('\n');
-                    inserted_images.insert((page, idx));
-                }
-            }
-        }
+        flush_page_tables_and_images(
+            p,
+            &page_tables,
+            &page_images,
+            &mut inserted_tables,
+            &mut inserted_images,
+            &mut output,
+            &mut in_paragraph,
+        );
     }
 
     // Close final paragraph
@@ -1310,6 +1351,9 @@ fn is_monospace_font(font_name: &str) -> bool {
 
 /// Clean up markdown output with post-processing
 fn clean_markdown(mut text: String, options: &MarkdownOptions) -> String {
+    // Collapse dot leaders (e.g. TOC entries: "Introduction...............................1")
+    text = collapse_dot_leaders(&text);
+
     // Fix hyphenation first (before other processing)
     if options.fix_hyphenation {
         text = fix_hyphenation(&text);
@@ -1335,6 +1379,15 @@ fn clean_markdown(mut text: String, options: &MarkdownOptions) -> String {
     text.push('\n');
 
     text
+}
+
+/// Collapse dot leaders (runs of 4+ dots) into " ... "
+/// Common in tables of contents: "Introduction...............................1" -> "Introduction ... 1"
+fn collapse_dot_leaders(text: &str) -> String {
+    use once_cell::sync::Lazy;
+    static DOT_LEADER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.{4,}").unwrap());
+
+    DOT_LEADER_RE.replace_all(text, " ... ").to_string()
 }
 
 /// Fix words broken across lines with spaces before the continuation
