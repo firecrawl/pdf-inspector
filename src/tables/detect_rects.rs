@@ -8,10 +8,11 @@ use crate::types::{PdfRect, TextItem};
 
 use super::Table;
 
-/// Disjoint-set (union-find) for clustering indices.
+/// Disjoint-set (union-find) with component sizes for clustering indices.
 struct UnionFind {
     parent: Vec<usize>,
     rank: Vec<usize>,
+    size: Vec<usize>,
 }
 
 impl UnionFind {
@@ -19,6 +20,7 @@ impl UnionFind {
         Self {
             parent: (0..n).collect(),
             rank: vec![0; n],
+            size: vec![1; n],
         }
     }
 
@@ -35,14 +37,23 @@ impl UnionFind {
         if ra == rb {
             return;
         }
+        let new_size = self.size[ra] + self.size[rb];
         if self.rank[ra] < self.rank[rb] {
             self.parent[ra] = rb;
+            self.size[rb] = new_size;
         } else if self.rank[ra] > self.rank[rb] {
             self.parent[rb] = ra;
+            self.size[ra] = new_size;
         } else {
             self.parent[rb] = ra;
+            self.size[ra] = new_size;
             self.rank[ra] += 1;
         }
+    }
+
+    fn component_size(&mut self, x: usize) -> usize {
+        let root = self.find(x);
+        self.size[root]
     }
 }
 
@@ -64,8 +75,19 @@ pub(crate) fn rects_overlap(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), 
     !(a_right < b_left || b_right < a_left || a_top < b_bottom || b_top < a_bottom)
 }
 
+/// Maximum component size for rect clustering.  No real table has thousands
+/// of cell rects — once a component exceeds this, it is a vector drawing or
+/// page-spanning clipping path.  We skip overlap checks for rects already in
+/// an oversized component, keeping the original O(n²) loop but making it
+/// effectively O(n) for pathological pages.
+const MAX_CLUSTER_RECTS: usize = 2000;
+
 /// Cluster rects by spatial overlap using union-find.
 /// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
+///
+/// Skips overlap checks for rects whose component has already exceeded
+/// [`MAX_CLUSTER_RECTS`], so pages with tens of thousands of vector-drawing
+/// rects complete in milliseconds instead of minutes.
 pub(crate) fn cluster_rects(
     rects: &[(f32, f32, f32, f32)],
     tolerance: f32,
@@ -75,9 +97,20 @@ pub(crate) fn cluster_rects(
     let mut uf = UnionFind::new(n);
 
     for i in 0..n {
+        // If rect i is already in an oversized component, no point comparing
+        // it against further rects — the component won't be used for table
+        // detection anyway.
+        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+            continue;
+        }
         for j in (i + 1)..n {
             if rects_overlap(&rects[i], &rects[j], tolerance) {
                 uf.union(i, j);
+                // Check if the merged component just exceeded the cap —
+                // if so, no need to test more pairs for rect i.
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    break;
+                }
             }
         }
     }
@@ -253,26 +286,31 @@ pub fn detect_tables_from_rects(
         // Only remove when the container is a similarly-sized cell (height
         // ratio < 4×), NOT when the container is a table-wide background
         // that dwarfs the sub-rect.
-        let before = page_rects.len();
-        let snapshot = page_rects.clone();
-        page_rects.retain(|&(ax, ay, aw, ah)| {
-            let tol = 2.0;
-            !snapshot.iter().any(|&(bx, by, bw, bh)| {
-                // b must strictly contain a (b is larger in area)
-                bw * bh > aw * ah * 1.2
-                    && bh < ah * 4.0 // container must be similarly sized, not a table background
-                    && bx <= ax + tol
-                    && (bx + bw) >= (ax + aw) - tol
-                    && by <= ay + tol
-                    && (by + bh) >= (ay + ah) - tol
-            })
-        });
-        if page_rects.len() < before {
-            debug!(
-                "page {}: removed {} contained sub-rects",
-                page,
-                before - page_rects.len(),
-            );
+        //
+        // Skip this O(n²) dedup when there are too many rects — pages with
+        // thousands of vector-drawing rects won't benefit from cell dedup.
+        if page_rects.len() < MAX_CLUSTER_RECTS {
+            let before = page_rects.len();
+            let snapshot = page_rects.clone();
+            page_rects.retain(|&(ax, ay, aw, ah)| {
+                let tol = 2.0;
+                !snapshot.iter().any(|&(bx, by, bw, bh)| {
+                    // b must strictly contain a (b is larger in area)
+                    bw * bh > aw * ah * 1.2
+                        && bh < ah * 4.0 // container must be similarly sized, not a table background
+                        && bx <= ax + tol
+                        && (bx + bw) >= (ax + aw) - tol
+                        && by <= ay + tol
+                        && (by + bh) >= (ay + ah) - tol
+                })
+            });
+            if page_rects.len() < before {
+                debug!(
+                    "page {}: removed {} contained sub-rects",
+                    page,
+                    before - page_rects.len(),
+                );
+            }
         }
     }
 
