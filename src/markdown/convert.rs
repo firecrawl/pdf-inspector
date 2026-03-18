@@ -263,6 +263,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
+    let mut in_code_block = false;
     let mut prev_had_dot_leaders = false;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
     let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
@@ -281,6 +282,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         if line.page != current_page {
             // Flush current page's remaining tables and images
             if current_page > 0 {
+                if in_code_block {
+                    output.push_str("```\n");
+                    in_code_block = false;
+                }
                 flush_page_tables_and_images(
                     current_page,
                     &page_tables,
@@ -402,6 +407,18 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         // These should be on their own line followed by a paragraph break
         let struct_role = struct_roles.and_then(|roles| resolve_line_struct_role(&line, roles));
 
+        // Determine if this line is code (struct-tree or font-based) for block accumulation
+        let is_code_line = struct_role
+            .as_ref()
+            .is_some_and(|r| matches!(r, StructRole::Code))
+            || (options.detect_code && line.items.iter().any(|i| is_monospace_font(&i.font)));
+
+        // Close code block when transitioning to non-code
+        if in_code_block && !is_code_line {
+            output.push_str("```\n");
+            in_code_block = false;
+        }
+
         if struct_role
             .as_ref()
             .is_some_and(|r| matches!(r, StructRole::Caption))
@@ -516,31 +533,19 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             continue;
         }
 
-        // Structure-tree code block
-        if struct_role
-            .as_ref()
-            .is_some_and(|r| matches!(r, StructRole::Code))
-        {
+        // Code block accumulation (struct-tree Code role or monospace font)
+        if is_code_line {
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
             }
-            output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
-            continue;
-        }
-
-        // Detect code blocks by font
-        if options.detect_code {
-            let is_mono = line.items.iter().any(|i| is_monospace_font(&i.font));
-            if is_mono {
-                if in_paragraph {
-                    output.push_str("\n\n");
-                    in_paragraph = false;
-                }
-                // Use plain text for code blocks
-                output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
-                continue;
+            if !in_code_block {
+                output.push_str("```\n");
+                in_code_block = true;
             }
+            output.push_str(plain_trimmed);
+            output.push('\n');
+            continue;
         }
 
         // Regular text - join lines within same paragraph with space
@@ -555,6 +560,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         output.push_str(trimmed);
         in_paragraph = true;
         prev_had_dot_leaders = cur_dot_leaders;
+    }
+
+    // Close any trailing code block
+    if in_code_block {
+        output.push_str("```\n");
     }
 
     // Flush current page and any remaining pages with tables/images
@@ -1003,6 +1013,49 @@ mod tests {
         assert!(
             md.contains("```\nfn main() {}\n```"),
             "Should format as code block: {md}"
+        );
+    }
+
+    #[test]
+    fn test_struct_role_code_multiline_accumulation() {
+        let mut line1 = make_item("fn main() {", 1, Some(0));
+        line1.y = 700.0;
+        let mut line2 = make_item("    println!(\"hello\");", 1, Some(1));
+        line2.y = 688.0;
+        let mut line3 = make_item("}", 1, Some(2));
+        line3.y = 676.0;
+
+        let lines = vec![
+            make_line(vec![line1]),
+            make_line(vec![line2]),
+            make_line(vec![line3]),
+        ];
+
+        let mut page_roles = HashMap::new();
+        page_roles.insert(0i64, StructRole::Code);
+        page_roles.insert(1i64, StructRole::Code);
+        page_roles.insert(2i64, StructRole::Code);
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            Some(&roles),
+        );
+
+        // Should produce a single fenced block, not three separate ones
+        assert!(
+            md.contains("```\nfn main() {\nprintln!(\"hello\");\n}\n```"),
+            "Should accumulate consecutive code lines into one block: {md}"
+        );
+        // Should NOT have adjacent fences
+        assert!(
+            !md.contains("```\n```"),
+            "Should not have adjacent close/open fences: {md}"
         );
     }
 }
