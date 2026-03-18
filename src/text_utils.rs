@@ -879,6 +879,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             item_type: ItemType::Text,
+            mcid: None,
         }
     }
 
@@ -997,6 +998,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             });
             // Alternate between letter-gap and word-gap to create bimodal distribution
             x += w + if wi % 3 == 2 { word_gap } else { letter_gap };
@@ -1072,6 +1074,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             item_type: ItemType::Text,
+            mcid: None,
         }
     }
 

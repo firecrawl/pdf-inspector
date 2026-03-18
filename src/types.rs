@@ -117,6 +117,9 @@ pub struct TextItem {
     pub is_italic: bool,
     /// Type of item (text, image, link)
     pub item_type: ItemType,
+    /// Marked Content ID from the content stream's BDC/BMC operator.
+    /// Used to link this item to the PDF structure tree for tagged PDFs.
+    pub mcid: Option<i64>,
 }
 
 /// A line of text (grouped text items)

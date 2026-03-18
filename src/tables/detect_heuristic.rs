@@ -105,6 +105,7 @@ pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Ve
                 is_bold: first_item.is_bold,
                 is_italic: first_item.is_italic,
                 item_type: first_item.item_type.clone(),
+                mcid: first_item.mcid,
             });
             index_map.push(indices);
 

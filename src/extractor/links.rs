@@ -79,6 +79,7 @@ pub fn extract_page_links(doc: &Document, page_id: ObjectId, page_num: u32) -> V
                             is_bold: false,
                             is_italic: false,
                             item_type: ItemType::Link(url),
+                            mcid: None,
                         });
                     }
                 }
@@ -316,5 +317,6 @@ pub(crate) fn walk_form_fields(
         is_bold: false,
         is_italic: false,
         item_type: ItemType::FormField,
+        mcid: None,
     });
 }

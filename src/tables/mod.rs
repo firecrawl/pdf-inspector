@@ -231,6 +231,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_bold: item.is_bold,
             is_italic: item.is_italic,
             item_type: item.item_type.clone(),
+            mcid: item.mcid,
         });
     }
 
@@ -250,6 +251,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_bold: item.is_bold,
             is_italic: item.is_italic,
             item_type: item.item_type.clone(),
+            mcid: item.mcid,
         });
     }
 
@@ -296,6 +298,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             item_type: ItemType::Text,
+            mcid: None,
         }
     }
 
@@ -312,6 +315,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             item_type: ItemType::Text,
+            mcid: None,
         }
     }
 

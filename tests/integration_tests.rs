@@ -23,6 +23,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         is_bold: false,
         is_italic: false,
         item_type: ItemType::Text,
+        mcid: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn make_text_item_with_font(
         is_bold: is_bold_font(font),
         is_italic: is_italic_font(font),
         item_type: ItemType::Text,
+        mcid: None,
     }
 }
 

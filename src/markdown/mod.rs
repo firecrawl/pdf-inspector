@@ -452,7 +452,7 @@ pub fn to_markdown_from_items_with_rects(
     options: MarkdownOptions,
     rects: &[crate::types::PdfRect],
 ) -> String {
-    to_markdown_from_items_with_rects_and_lines(items, options, rects, &[], &HashMap::new())
+    to_markdown_from_items_with_rects_and_lines(items, options, rects, &[], &HashMap::new(), None)
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -465,6 +465,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     rects: &[crate::types::PdfRect],
     pdf_lines: &[crate::types::PdfLine],
     page_thresholds: &HashMap<u32, f32>,
+    struct_roles: Option<&HashMap<u32, HashMap<i64, crate::structure_tree::StructRole>>>,
 ) -> String {
     use crate::tables::{
         detect_tables, detect_tables_from_lines, detect_tables_from_rects, table_to_markdown,
@@ -757,6 +758,40 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         }
     }
 
+    // Check structure tree coverage on ALL text items (before table filtering)
+    // to decide whether to use structure-aware markdown generation.
+    let struct_roles_coverage_ok = struct_roles.is_some_and(|roles| {
+        let total = text_items.len();
+        if total == 0 {
+            return false;
+        }
+        let tagged = text_items
+            .iter()
+            .filter(|item| {
+                item.mcid
+                    .and_then(|mcid| {
+                        roles
+                            .get(&item.page)
+                            .and_then(|page_roles| page_roles.get(&mcid))
+                    })
+                    .is_some()
+            })
+            .count();
+        let coverage = tagged as f32 / total as f32;
+        log::debug!(
+            "structure tree coverage: {}/{} items ({:.0}%)",
+            tagged,
+            total,
+            coverage * 100.0
+        );
+        coverage >= 0.5
+    });
+    let effective_struct_roles = if struct_roles_coverage_ok {
+        struct_roles
+    } else {
+        None
+    };
+
     // Filter out table items and process the rest
     let non_table_items: Vec<TextItem> = text_items
         .into_iter()
@@ -841,6 +876,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         page_tables,
         page_images,
         &band_split_page_set,
+        effective_struct_roles,
     )
 }
 
@@ -926,6 +962,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             item_type: crate::types::ItemType::Text,
+            mcid: None,
         }
     }
 

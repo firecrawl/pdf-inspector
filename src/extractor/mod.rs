@@ -319,6 +319,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 is_bold: first.is_bold,
                 is_italic: first.is_italic,
                 item_type: first.item_type.clone(),
+                mcid: first.mcid,
             });
 
             i = j;
@@ -359,6 +360,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "World".into(),
@@ -372,6 +374,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "Next line".into(),
@@ -385,6 +388,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
         ];
 
@@ -438,6 +442,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "Prague".into(),
@@ -451,6 +456,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "Rules".into(),
@@ -464,6 +470,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
         ];
 
@@ -488,6 +495,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "A".into(),
@@ -501,6 +509,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "V".into(),
@@ -514,6 +523,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
         ];
 
@@ -540,6 +550,7 @@ mod tests {
                 is_bold: true,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             }
         }
 
@@ -573,6 +584,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             }
         }
 
@@ -607,6 +619,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "履行義務".into(),
@@ -620,6 +633,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "を識別す".into(),
@@ -633,6 +647,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
         ];
 
@@ -654,6 +669,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             item_type: ItemType::Text,
+            mcid: None,
         }
     }
 
@@ -765,6 +781,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "\u{05D1}".into(), // bet at x=200 (rightmost)
@@ -778,6 +795,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
         ];
         sort_line_items(&mut items);
@@ -801,6 +819,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
             TextItem {
                 text: "World".into(),
@@ -814,6 +833,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             },
         ];
         sort_line_items(&mut items);
@@ -853,6 +873,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             }],
         };
 
@@ -896,6 +917,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             }],
         };
 
@@ -939,6 +961,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 item_type: ItemType::Text,
+                mcid: None,
             }],
         };
 

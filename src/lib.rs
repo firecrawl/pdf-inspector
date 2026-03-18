@@ -28,6 +28,7 @@ pub mod extractor;
 pub mod glyph_names;
 pub mod markdown;
 pub mod process_mode;
+pub mod structure_tree;
 pub mod tables;
 pub mod text_utils;
 pub mod tounicode;
@@ -350,6 +351,22 @@ fn process_document(
         Some(extracted?)
     };
 
+    // Parse structure tree for tagged PDFs (reuses the loaded document)
+    let struct_roles = structure_tree::StructTree::from_doc(&doc).and_then(|tree| {
+        let page_ids = doc.get_pages();
+        let roles = tree.mcid_to_roles(&page_ids);
+        if roles.is_empty() {
+            None
+        } else {
+            log::debug!(
+                "structure tree: {} pages with MCID roles, {} total MCIDs",
+                roles.len(),
+                tree.mcid_count()
+            );
+            Some(roles)
+        }
+    });
+
     let (markdown, layout, has_encoding_issues) = match extracted {
         Some(((items, rects, lines), page_thresholds)) => {
             let layout = compute_layout_complexity(&items, &rects, &lines);
@@ -363,6 +380,7 @@ fn process_document(
                     &rects,
                     &lines,
                     &page_thresholds,
+                    struct_roles.as_ref(),
                 ))
             };
 

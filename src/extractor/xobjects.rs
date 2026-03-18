@@ -408,6 +408,7 @@ fn extract_form_xobject_text_inner(
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
+                                mcid: None,
                             });
                         }
                     }
@@ -549,6 +550,7 @@ fn extract_form_xobject_text_inner(
                                     is_bold: is_bold_font(base_font),
                                     is_italic: is_italic_font(base_font),
                                     item_type: ItemType::Text,
+                                    mcid: None,
                                 });
                             }
                         }

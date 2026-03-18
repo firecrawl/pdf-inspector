@@ -124,10 +124,18 @@ pub(crate) fn extract_page_text_items(
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
 
-    // Marked content (ActualText) tracking
-    let mut marked_content_stack: Vec<Option<String>> = Vec::new();
+    // Marked content tracking: (ActualText, MCID) per nesting level
+    struct MarkedContentEntry {
+        actual_text: Option<String>,
+        mcid: Option<i64>,
+    }
+    let mut marked_content_stack: Vec<MarkedContentEntry> = Vec::new();
     let mut suppress_glyph_extraction = false;
     let mut actual_text_start_tm: Option<[f32; 6]> = None; // text matrix at BDC entry
+    /// Get the innermost MCID from the marked content stack.
+    fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
+        stack.iter().rev().find_map(|e| e.mcid)
+    }
 
     for op in &content.operations {
         trace!("{} {:?}", op.operator, op.operands);
@@ -292,6 +300,7 @@ pub(crate) fn extract_page_text_items(
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
+                                mcid: current_mcid(&marked_content_stack),
                             });
                         }
                     }
@@ -440,6 +449,7 @@ pub(crate) fn extract_page_text_items(
                                     is_bold: is_bold_font(base_font),
                                     is_italic: is_italic_font(base_font),
                                     item_type: ItemType::Text,
+                                    mcid: current_mcid(&marked_content_stack),
                                 });
                             }
                         }
@@ -496,6 +506,7 @@ pub(crate) fn extract_page_text_items(
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
+                                mcid: current_mcid(&marked_content_stack),
                             });
                         }
                     }
@@ -531,11 +542,15 @@ pub(crate) fn extract_page_text_items(
             }
             "BMC" => {
                 // Begin Marked Content (no properties)
-                marked_content_stack.push(None);
+                marked_content_stack.push(MarkedContentEntry {
+                    actual_text: None,
+                    mcid: None,
+                });
             }
             "BDC" => {
-                // Begin Marked Content with properties — extract ActualText
+                // Begin Marked Content with properties — extract ActualText and MCID
                 let mut actual_text: Option<String> = None;
+                let mut mcid: Option<i64> = None;
                 if op.operands.len() >= 2 {
                     let dict = match &op.operands[1] {
                         Object::Dictionary(d) => Some(d.clone()),
@@ -549,47 +564,56 @@ pub(crate) fn extract_page_text_items(
                                 _ => None,
                             };
                         }
+                        if let Ok(Object::Integer(id)) = d.get(b"MCID") {
+                            mcid = Some(*id);
+                        }
                     }
                 }
                 if actual_text.is_some() {
                     suppress_glyph_extraction = true;
                     actual_text_start_tm = Some(text_matrix);
                 }
-                marked_content_stack.push(actual_text);
+                marked_content_stack.push(MarkedContentEntry { actual_text, mcid });
             }
             "EMC" => {
                 // End Marked Content — emit ActualText item with correct width
-                if let Some(Some(at)) = marked_content_stack.pop() {
-                    // Compute width from text matrix advancement during BDC..EMC
-                    if let Some(start_tm) = actual_text_start_tm.take() {
-                        let combined = multiply_matrices(&start_tm, &ctm);
-                        let rendered_size = effective_font_size(current_font_size, &combined);
-                        let (x, y) = (combined[4], combined[5]);
-                        // Width in device space from text matrix delta
-                        let delta_ts = text_matrix[4] - start_tm[4];
-                        let scale_x = start_tm[0] * ctm[0] + start_tm[1] * ctm[2];
-                        let width = (delta_ts * scale_x).abs();
-                        if !at.trim().is_empty() {
-                            let base_font = font_base_names
-                                .get(&current_font)
-                                .map(|s| s.as_str())
-                                .unwrap_or(&current_font);
-                            items.push(TextItem {
-                                text: expand_ligatures(&at),
-                                x,
-                                y,
-                                width,
-                                height: rendered_size,
-                                font: current_font.clone(),
-                                font_size: rendered_size,
-                                page: page_num,
-                                is_bold: is_bold_font(base_font),
-                                is_italic: is_italic_font(base_font),
-                                item_type: ItemType::Text,
-                            });
+                if let Some(entry) = marked_content_stack.pop() {
+                    if let Some(at) = entry.actual_text {
+                        // Compute width from text matrix advancement during BDC..EMC
+                        if let Some(start_tm) = actual_text_start_tm.take() {
+                            let combined = multiply_matrices(&start_tm, &ctm);
+                            let rendered_size = effective_font_size(current_font_size, &combined);
+                            let (x, y) = (combined[4], combined[5]);
+                            // Width in device space from text matrix delta
+                            let delta_ts = text_matrix[4] - start_tm[4];
+                            let scale_x = start_tm[0] * ctm[0] + start_tm[1] * ctm[2];
+                            let width = (delta_ts * scale_x).abs();
+                            if !at.trim().is_empty() {
+                                let base_font = font_base_names
+                                    .get(&current_font)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(&current_font);
+                                items.push(TextItem {
+                                    text: expand_ligatures(&at),
+                                    x,
+                                    y,
+                                    width,
+                                    height: rendered_size,
+                                    font: current_font.clone(),
+                                    font_size: rendered_size,
+                                    page: page_num,
+                                    is_bold: is_bold_font(base_font),
+                                    is_italic: is_italic_font(base_font),
+                                    item_type: ItemType::Text,
+                                    mcid: entry
+                                        .mcid
+                                        .or_else(|| current_mcid(&marked_content_stack)),
+                                });
+                            }
                         }
+                        suppress_glyph_extraction =
+                            marked_content_stack.iter().any(|e| e.actual_text.is_some());
                     }
-                    suppress_glyph_extraction = marked_content_stack.iter().any(|a| a.is_some());
                 }
             }
             "re" => {
