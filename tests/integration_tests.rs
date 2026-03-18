@@ -1001,3 +1001,39 @@ startxref
         );
     }
 }
+
+#[test]
+fn test_firecrawl_tagged_pdf_struct_tree() {
+    use lopdf::Document;
+    use pdf_inspector::structure_tree::{StructRole, StructTree};
+
+    let doc = Document::load("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let tree = StructTree::from_doc(&doc).expect("Should have a structure tree");
+
+    // Verify structure tree contains expected roles
+    let page_ids = doc.get_pages();
+    let roles = tree.mcid_to_roles(&page_ids);
+    assert!(!roles.is_empty(), "Should have MCID roles across pages");
+
+    let flat = tree.flatten();
+    let has_code = flat.iter().any(|e| matches!(e.role, StructRole::Code));
+    let has_h1 = flat.iter().any(|e| matches!(e.role, StructRole::H1));
+    let has_li = flat.iter().any(|e| matches!(e.role, StructRole::LI));
+    let has_caption = flat.iter().any(|e| matches!(e.role, StructRole::Caption));
+    assert!(has_code, "Should have Code elements");
+    assert!(has_h1, "Should have H1 elements");
+    assert!(has_li, "Should have LI elements");
+    assert!(has_caption, "Should have Caption elements");
+
+    // Full conversion: code fences should be generated from Code struct elements
+    let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
+    let md = result.markdown.unwrap();
+    let fence_count = md.matches("```").count();
+    assert!(
+        fence_count > 0,
+        "Should produce code fences from tagged Code elements"
+    );
+    // Fences come in open/close pairs
+    assert_eq!(fence_count % 2, 0, "Code fences should be balanced");
+}
