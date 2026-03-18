@@ -10,7 +10,7 @@ repository = "https://github.com/firecrawl/pdf-inspector"
 
 [dependencies]
 # PDF parsing
-lopdf = { git = "https://github.com/firecrawl/lopdf", branch = "firecrawl/zlib-checksum-encrypted", features = ["rayon"] }
+lopdf = { git = "https://github.com/firecrawl/lopdf", branch = "main", features = ["rayon"] }
 
 # Error handling
 thiserror = "2.0"
