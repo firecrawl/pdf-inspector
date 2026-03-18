@@ -8,6 +8,7 @@
 
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 // ─── Standard structure types ────────────────────────────────────────
@@ -605,6 +606,147 @@ fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a lopdf::Dic
     }
 }
 
+// ─── PDF byte pre-processing ────────────────────────────────────────
+
+/// Fix malformed structure element `/S` entries in raw PDF bytes.
+///
+/// Some PDF generators (notably fpdf2) write bare names like `/S Code`
+/// instead of the correct `/S /Code`. lopdf cannot parse dictionaries
+/// containing bare tokens, so the entire object is silently dropped.
+///
+/// This function scans for the pattern `/S <bare_word>` inside struct
+/// element dictionaries and prepends `/` to make them valid PDF names.
+/// Returns `Cow::Borrowed` if no fixes were needed.
+pub fn fix_bare_struct_names(buf: &[u8]) -> Cow<'_, [u8]> {
+    // Quick check: if no StructTreeRoot, nothing to fix
+    if !contains_bytes(buf, b"/StructTreeRoot") {
+        return Cow::Borrowed(buf);
+    }
+
+    // Known struct type names that may appear as bare tokens.
+    // We only fix names that are valid PDF structure types to avoid
+    // false positives on arbitrary dictionary values.
+    const KNOWN_NAMES: &[&[u8]] = &[
+        b"Document",
+        b"Part",
+        b"Art",
+        b"Sect",
+        b"Div",
+        b"BlockQuote",
+        b"Caption",
+        b"TOC",
+        b"TOCI",
+        b"Index",
+        b"NonStruct",
+        b"Private",
+        b"H",
+        b"H1",
+        b"H2",
+        b"H3",
+        b"H4",
+        b"H5",
+        b"H6",
+        b"P",
+        b"L",
+        b"LI",
+        b"Lbl",
+        b"LBody",
+        b"Table",
+        b"TR",
+        b"TH",
+        b"TD",
+        b"THead",
+        b"TBody",
+        b"TFoot",
+        b"Span",
+        b"Quote",
+        b"Note",
+        b"Reference",
+        b"BibEntry",
+        b"Code",
+        b"Link",
+        b"Annot",
+        b"Figure",
+        b"Formula",
+        b"Form",
+        b"Ruby",
+        b"RB",
+        b"RT",
+        b"RP",
+        b"Warichu",
+        b"WT",
+        b"WP",
+    ];
+
+    let pattern = b"/S ";
+    let mut result: Option<Vec<u8>> = None;
+    let mut pos = 0;
+
+    while pos + pattern.len() < buf.len() {
+        let Some(idx) = find_bytes(&buf[pos..], pattern).map(|i| i + pos) else {
+            break;
+        };
+
+        let after = idx + pattern.len();
+        // Check if the next char is already '/' (correct name) or not
+        if after < buf.len() && buf[after] == b'/' {
+            pos = after;
+            continue;
+        }
+
+        // Try to match a known bare struct name at this position
+        let mut matched = false;
+        for name in KNOWN_NAMES {
+            let end = after + name.len();
+            if end <= buf.len()
+                && &buf[after..end] == *name
+                // Must be followed by a delimiter (whitespace, newline, /, >)
+                && (end >= buf.len() || matches!(buf[end], b'\n' | b'\r' | b' ' | b'/' | b'>'))
+            {
+                // Found a bare name — lazily allocate output buffer
+                let out = result.get_or_insert_with(|| buf[..after].to_vec());
+                // Append everything from last position up to the bare name
+                if out.len() < after {
+                    out.extend_from_slice(&buf[out.len()..after]);
+                }
+                out.push(b'/');
+                out.extend_from_slice(name);
+                pos = end;
+                matched = true;
+                debug!(
+                    "fix_bare_struct_names: patched /S {} → /S /{}",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(name)
+                );
+                break;
+            }
+        }
+
+        if !matched {
+            pos = after;
+        }
+    }
+
+    match result {
+        Some(mut out) => {
+            // Append remaining bytes
+            if out.len() < buf.len() {
+                out.extend_from_slice(&buf[out.len()..]);
+            }
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(buf),
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    find_bytes(haystack, needle).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,6 +939,70 @@ mod tests {
         let page1 = roles.get(&1).unwrap();
         assert_eq!(page1.get(&0), Some(&StructRole::H1));
         assert_eq!(page1.get(&1), Some(&StructRole::P));
+    }
+
+    #[test]
+    fn test_fix_bare_struct_names() {
+        // Verify the byte-level pre-processor fixes bare names.
+        // All inputs include /StructTreeRoot to pass the early-return guard.
+        let input = b"/StructTreeRoot /S Code\n/Type /StructElem";
+        let fixed = fix_bare_struct_names(input);
+        assert!(
+            fixed.windows(b"/S /Code".len()).any(|w| w == b"/S /Code"),
+            "Should fix bare Code: {:?}",
+            String::from_utf8_lossy(&fixed)
+        );
+
+        // Already correct — should return borrowed
+        let input = b"/StructTreeRoot /S /Code\n/Type /StructElem";
+        let fixed = fix_bare_struct_names(input);
+        assert!(matches!(fixed, std::borrow::Cow::Borrowed(_)));
+
+        // Multiple bare names
+        let input = b"/StructTreeRoot /S H1\n/foo\n/S P\n/bar";
+        let fixed = fix_bare_struct_names(input);
+        let s = String::from_utf8_lossy(&fixed);
+        assert!(s.contains("/S /H1"), "Should fix H1: {s}");
+        assert!(s.contains("/S /P"), "Should fix P: {s}");
+
+        // Unknown name should not be touched
+        let input = b"/StructTreeRoot /S FooBar\n";
+        let fixed = fix_bare_struct_names(input);
+        let s = String::from_utf8_lossy(&fixed);
+        assert!(s.contains("/S FooBar"), "Should not fix unknown: {s}");
+
+        // No StructTreeRoot — skip entirely
+        let input = b"/S Code\nno struct tree";
+        let fixed = fix_bare_struct_names(input);
+        assert!(matches!(fixed, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_bare_name_struct_types() {
+        // Some PDF generators (e.g. fpdf2) write /S Code instead of /S /Code.
+        // lopdf silently drops objects with invalid tokens. Our pre-processor
+        // fixes these before loading.
+        let raw = std::fs::read("tests/fixtures/bare_name_struct.pdf").unwrap();
+        let fixed = fix_bare_struct_names(&raw);
+        let doc = Document::load_mem(fixed.as_ref()).unwrap();
+
+        let tree = StructTree::from_doc(&doc);
+        assert!(tree.is_some(), "Should parse bare-name struct tree");
+        let tree = tree.unwrap();
+
+        let flat = tree.flatten();
+        let roles: Vec<&StructRole> = flat.iter().map(|e| &e.role).collect();
+
+        assert!(
+            roles.iter().any(|r| matches!(r, StructRole::H1)),
+            "Should find H1 from bare name: {:?}",
+            roles
+        );
+        assert!(
+            roles.iter().any(|r| matches!(r, StructRole::Code)),
+            "Should find Code from bare name: {:?}",
+            roles
+        );
     }
 
     #[test]
