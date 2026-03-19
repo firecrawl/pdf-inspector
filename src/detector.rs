@@ -197,12 +197,12 @@ pub(crate) fn detect_from_document(
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={}",
+                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={}",
                 page_num, analysis.text_operator_count, analysis.has_images,
                 analysis.image_count, analysis.has_template_image,
                 analysis.unique_text_chars, analysis.unique_alphanum_chars,
                 analysis.path_op_count, analysis.has_vector_text,
-                analysis.total_image_area
+                analysis.total_image_area, analysis.has_identity_h_no_tounicode
             );
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
@@ -292,7 +292,7 @@ pub(crate) fn detect_from_document(
     };
 
     // Phase 2: Build per-page OCR list
-    let pages_needing_ocr = match pdf_type {
+    let mut pages_needing_ocr = match pdf_type {
         PdfType::TextBased => Vec::new(),
         PdfType::Scanned | PdfType::ImageBased => (1..=total_pages).collect(),
         PdfType::Mixed => {
@@ -318,6 +318,29 @@ pub(crate) fn detect_from_document(
             ocr_pages
         }
     };
+
+    // Phase 3: Flag pages with Identity-H/V fonts lacking ToUnicode for OCR.
+    // These fonts produce garbage text (raw CID values) for non-Latin scripts.
+    for (&page_num, analysis) in &analysis_cache {
+        if analysis.has_identity_h_no_tounicode && !pages_needing_ocr.contains(&page_num) {
+            pages_needing_ocr.push(page_num);
+        }
+    }
+    // Check uncached pages too (when not all pages were sampled)
+    if pages_needing_ocr.len() < total_pages as usize {
+        for page_num in 1..=total_pages {
+            if analysis_cache.contains_key(&page_num) || pages_needing_ocr.contains(&page_num) {
+                continue;
+            }
+            if let Some(&page_id) = pages.get(&page_num) {
+                if page_has_identity_h_no_tounicode(doc, page_id) {
+                    pages_needing_ocr.push(page_num);
+                }
+            }
+        }
+    }
+    pages_needing_ocr.sort();
+    pages_needing_ocr.dedup();
 
     // Try to get title from metadata
     let title = get_document_title(doc);
@@ -390,6 +413,9 @@ struct PageAnalysis {
     path_op_count: u32,
     /// Whether the page has vector-outlined text (massive path ops, minimal text ops)
     has_vector_text: bool,
+    /// Whether the page has Type0 fonts with Identity-H/V encoding but no ToUnicode CMap.
+    /// These fonts produce garbage text because CID values can't be mapped to Unicode.
+    has_identity_h_no_tounicode: bool,
 }
 
 /// Analyze a page's content stream for text operators and images
@@ -461,6 +487,10 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         .filter(|b| b.is_ascii_alphanumeric())
         .count() as u32;
 
+    // Check for Identity-H/V fonts without ToUnicode — these produce garbage text
+    let has_identity_h_no_tounicode =
+        text_ops > 0 && page_has_identity_h_no_tounicode(doc, page_id);
+
     PageAnalysis {
         text_operator_count: text_ops,
         has_images,
@@ -471,7 +501,50 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         unique_alphanum_chars,
         path_op_count: path_ops,
         has_vector_text,
+        has_identity_h_no_tounicode,
     }
+}
+
+/// Check if a page has Type0 fonts with Identity-H/V encoding and no ToUnicode CMap.
+/// These fonts encode text as raw CID values that can't be mapped to Unicode without
+/// a ToUnicode CMap, producing garbage output for non-Latin scripts (e.g. Cyrillic).
+fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
+    let fonts = match doc.get_page_fonts(page_id) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    for font_dict in fonts.values() {
+        let subtype = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        if subtype != Some(b"Type0") {
+            continue;
+        }
+        let encoding = font_dict
+            .get(b"Encoding")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        let is_identity = matches!(encoding, Some(b"Identity-H") | Some(b"Identity-V"));
+        if !is_identity {
+            continue;
+        }
+        // Has ToUnicode? Then the font is decodable.
+        if font_dict.get(b"ToUnicode").is_ok() {
+            continue;
+        }
+        // Identity-H/V without ToUnicode — flag it
+        log::debug!(
+            "page has Identity-H/V font without ToUnicode: {:?}",
+            font_dict
+                .get(b"BaseFont")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .map(|n| String::from_utf8_lossy(n).to_string())
+        );
+        return true;
+    }
+    false
 }
 
 fn scan_xobjects_in_resources(
@@ -1130,5 +1203,37 @@ mod tests {
             result.pages_needing_ocr
         );
         assert!(result.ocr_recommended);
+    }
+
+    #[test]
+    fn test_identity_h_no_tounicode_flags_ocr() {
+        // Integration test: Cyrillic PDF with Identity-H fonts and no ToUnicode
+        // should flag all pages for OCR even though it's classified as TextBased.
+        let path = std::path::PathBuf::from("../pdf-evals/pdfs/7cd13114475d.pdf");
+        if !path.exists() {
+            // PDF not available, skip test
+            return;
+        }
+
+        let config = DetectionConfig {
+            strategy: ScanStrategy::Full,
+            ..DetectionConfig::default()
+        };
+        let result = detect_pdf_type_with_config(&path, config).unwrap();
+        assert_eq!(
+            result.pdf_type,
+            PdfType::TextBased,
+            "PDF has text operators, so it's TextBased"
+        );
+        assert!(
+            result.pages_needing_ocr.contains(&1),
+            "Page 1 should need OCR (Identity-H without ToUnicode), got: {:?}",
+            result.pages_needing_ocr
+        );
+        assert!(
+            result.pages_needing_ocr.contains(&2),
+            "Page 2 should need OCR (Identity-H without ToUnicode), got: {:?}",
+            result.pages_needing_ocr
+        );
     }
 }

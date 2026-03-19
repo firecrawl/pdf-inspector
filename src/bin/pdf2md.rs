@@ -268,6 +268,9 @@ fn main() {
                         eprintln!("Pages: {}", result.page_count);
                         eprintln!("Processing time: {}ms", result.processing_time_ms);
                         print_layout_info(&result.layout);
+                        if !result.pages_needing_ocr.is_empty() {
+                            eprintln!("Pages needing OCR: {:?}", result.pages_needing_ocr);
+                        }
 
                         if let Some(markdown) = &result.markdown {
                             if let Some(output) = output_file {
