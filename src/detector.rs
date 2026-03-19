@@ -1206,34 +1206,81 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_h_no_tounicode_flags_ocr() {
-        // Integration test: Cyrillic PDF with Identity-H fonts and no ToUnicode
-        // should flag all pages for OCR even though it's classified as TextBased.
-        let path = std::path::PathBuf::from("../pdf-evals/pdfs/7cd13114475d.pdf");
-        if !path.exists() {
-            // PDF not available, skip test
-            return;
-        }
-
-        let config = DetectionConfig {
-            strategy: ScanStrategy::Full,
-            ..DetectionConfig::default()
+    fn test_page_has_identity_h_no_tounicode_positive() {
+        // Build a minimal PDF with a Type0 Identity-H font and no ToUnicode.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+ArialMT".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(font_id),
+            },
         };
-        let result = detect_pdf_type_with_config(&path, config).unwrap();
-        assert_eq!(
-            result.pdf_type,
-            PdfType::TextBased,
-            "PDF has text operators, so it's TextBased"
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
         );
-        assert!(
-            result.pages_needing_ocr.contains(&1),
-            "Page 1 should need OCR (Identity-H without ToUnicode), got: {:?}",
-            result.pages_needing_ocr
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
         );
-        assert!(
-            result.pages_needing_ocr.contains(&2),
-            "Page 2 should need OCR (Identity-H without ToUnicode), got: {:?}",
-            result.pages_needing_ocr
+        assert!(page_has_identity_h_no_tounicode(&doc, page_id));
+    }
+
+    #[test]
+    fn test_page_has_identity_h_with_tounicode_negative() {
+        // Type0 Identity-H font WITH ToUnicode — should NOT flag.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let cmap_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            b"fake cmap".to_vec(),
+        )));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+ArialMT".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "ToUnicode" => Object::Reference(cmap_id),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(font_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
         );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        assert!(!page_has_identity_h_no_tounicode(&doc, page_id));
     }
 }

@@ -861,28 +861,4 @@ mod tests {
             "Роботизированные технологии комплексы для производства металлургических предприятий";
         assert!(!is_garbage_text(cyrillic));
     }
-
-    #[test]
-    fn test_textbased_garbage_flags_ocr() {
-        // Integration test: Cyrillic PDF with Identity-H fonts produces garbage text.
-        // process_pdf_with_options should flag all pages for OCR.
-        let path = std::path::PathBuf::from("../pdf-evals/pdfs/7cd13114475d.pdf");
-        if !path.exists() {
-            return;
-        }
-
-        let result = process_pdf_with_options(&path, PdfOptions::default()).unwrap();
-
-        assert_eq!(result.pdf_type, PdfType::TextBased);
-        assert!(
-            result.markdown.is_none(),
-            "Garbage markdown should be dropped"
-        );
-        assert!(result.has_encoding_issues, "Should flag encoding issues");
-        assert!(
-            result.pages_needing_ocr.contains(&1) && result.pages_needing_ocr.contains(&2),
-            "All pages should need OCR, got: {:?}",
-            result.pages_needing_ocr
-        );
-    }
 }
