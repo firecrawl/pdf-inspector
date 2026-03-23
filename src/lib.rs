@@ -401,6 +401,54 @@ fn process_document(
 
     let (markdown, layout, has_encoding_issues, gid_pages) = match extracted {
         Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
+            // For TextBased PDFs with pages flagged for OCR (Identity-H or
+            // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
+            // passthrough actually produced readable text.  If a page's text
+            // is garbage, strip its items so we don't emit mojibake.
+            // Only applies to TextBased — for Mixed PDFs, OCR flags come from
+            // template images rather than font encoding issues.
+            let (items, rects, lines) =
+                if pages_needing_ocr.is_empty() || pdf_type != PdfType::TextBased {
+                    (items, rects, lines)
+                } else {
+                    let ocr_set: std::collections::HashSet<u32> =
+                        pages_needing_ocr.iter().copied().collect();
+                    // Collect text per OCR-flagged page and check quality
+                    let mut garbage_pages: std::collections::HashSet<u32> =
+                        std::collections::HashSet::new();
+                    for &pg in &ocr_set {
+                        let page_text: String = items
+                            .iter()
+                            .filter(|i| i.page == pg)
+                            .map(|i| i.text.as_str())
+                            .collect();
+                        if is_cid_garbage(&page_text) {
+                            garbage_pages.insert(pg);
+                        }
+                    }
+                    if garbage_pages.is_empty() {
+                        (items, rects, lines)
+                    } else {
+                        log::debug!(
+                            "suppressing garbage text from OCR-flagged pages: {:?}",
+                            garbage_pages
+                        );
+                        let items: Vec<_> = items
+                            .into_iter()
+                            .filter(|i| !garbage_pages.contains(&i.page))
+                            .collect();
+                        let rects: Vec<_> = rects
+                            .into_iter()
+                            .filter(|r| !garbage_pages.contains(&r.page))
+                            .collect();
+                        let lines: Vec<_> = lines
+                            .into_iter()
+                            .filter(|l| !garbage_pages.contains(&l.page))
+                            .collect();
+                        (items, rects, lines)
+                    }
+                };
+
             let layout = compute_layout_complexity(&items, &rects, &lines);
 
             let md = if options.mode == ProcessMode::Analyze {
@@ -553,6 +601,33 @@ fn is_garbage_text(markdown: &str) -> bool {
     }
     let total = alphanum + non_alphanum;
     total >= 50 && alphanum * 2 < total
+}
+
+/// Detect garbage from failed CID-to-Unicode mapping on Identity-H fonts.
+///
+/// When CID values don't correspond to Unicode codepoints, the raw bytes often
+/// produce characters in the C1 control range (U+0080–U+009F) or Private Use
+/// Area, mixed with random Latin Extended characters.  Valid text in any
+/// language almost never contains C1 controls.  We also fall back to the
+/// general `is_garbage_text` check for non-alphanumeric-heavy patterns.
+fn is_cid_garbage(text: &str) -> bool {
+    if is_garbage_text(text) {
+        return true;
+    }
+    let mut total = 0usize;
+    let mut c1_control = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        // C1 control characters (U+0080–U+009F) — almost never in real text
+        if ('\u{0080}'..='\u{009F}').contains(&ch) {
+            c1_control += 1;
+        }
+    }
+    // If ≥5% of non-whitespace chars are C1 controls, it's garbage
+    total >= 20 && c1_control * 20 >= total
 }
 
 /// Analyse extracted items and rects for layout complexity.
@@ -872,5 +947,31 @@ mod tests {
         let cyrillic =
             "Роботизированные технологии комплексы для производства металлургических предприятий";
         assert!(!is_garbage_text(cyrillic));
+    }
+
+    #[test]
+    fn test_cid_garbage_detection() {
+        // Simulates CID garbage from Identity-H fonts: Latin Extended chars
+        // mixed with C1 control characters (U+0080–U+009F).
+        let cid_garbage = "Ë>íÓ\tý\r\u{0088}æ&Ït\u{0094}äí;\ný;wAL¢©èåD\rü£\
+                           qq\u{0096}¶Í Æ\réá; Ô 7G\u{008B}ý;èÕç¢ £ ý;C";
+        assert!(
+            is_cid_garbage(cid_garbage),
+            "CID garbage with C1 controls should be detected"
+        );
+
+        // Valid Korean text (CID-as-Unicode passthrough) should NOT be garbage
+        let korean = "본 가격표는 국내 거주 중인 외국인을 위한 한국어 가격표의 비공식 번역본입니다";
+        assert!(
+            !is_cid_garbage(korean),
+            "Valid Korean text should not be flagged as garbage"
+        );
+
+        // Valid Japanese text should NOT be garbage
+        let japanese = "羽田空港新飛行経路に係る航空機騒音の測定結果";
+        assert!(
+            !is_cid_garbage(japanese),
+            "Valid Japanese text should not be flagged as garbage"
+        );
     }
 }

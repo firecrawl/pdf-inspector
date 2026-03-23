@@ -1037,3 +1037,27 @@ fn test_firecrawl_tagged_pdf_struct_tree() {
     // Fences come in open/close pairs
     assert_eq!(fence_count % 2, 0, "Code fences should be balanced");
 }
+
+#[test]
+fn test_identity_h_no_tounicode_suppresses_garbage() {
+    // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no
+    // ToUnicode CMap.  The raw CID values look like random Latin characters.
+    // We should suppress the garbage and flag the page for OCR.
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
+
+    // Page 1 should be flagged for OCR
+    assert!(
+        result.pages_needing_ocr.contains(&1),
+        "Page with Identity-H font without ToUnicode should be flagged for OCR"
+    );
+
+    // Markdown should be empty (garbage suppressed)
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.trim().is_empty(),
+        "Garbage CID text should be suppressed, got {} chars: {:?}",
+        md.len(),
+        &md[..md.len().min(100)]
+    );
+}
