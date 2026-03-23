@@ -118,12 +118,14 @@ pub(crate) fn extract_page_text_items(
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
-    let mut gstate_stack: Vec<([f32; 6], i32)> = Vec::new();
+    let mut gstate_stack: Vec<([f32; 6], i32, f32, f32)> = Vec::new();
 
     // Text state tracking
     let mut current_font = String::new();
     let mut current_font_size: f32 = 12.0;
     let mut text_leading: f32 = 0.0; // TL parameter (in text-space units)
+    let mut char_spacing: f32 = 0.0; // Tc parameter (extra spacing per character, unscaled)
+    let mut word_spacing: f32 = 0.0; // Tw parameter (extra spacing per space char, unscaled)
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
@@ -154,13 +156,15 @@ pub(crate) fn extract_page_text_items(
         match op.operator.as_str() {
             "q" => {
                 // Save graphics state
-                gstate_stack.push((ctm, text_rendering_mode));
+                gstate_stack.push((ctm, text_rendering_mode, char_spacing, word_spacing));
             }
             "Q" => {
                 // Restore graphics state
-                if let Some((saved_ctm, saved_tr)) = gstate_stack.pop() {
+                if let Some((saved_ctm, saved_tr, saved_tc, saved_tw)) = gstate_stack.pop() {
                     ctm = saved_ctm;
                     text_rendering_mode = saved_tr;
+                    char_spacing = saved_tc;
+                    word_spacing = saved_tw;
                 }
             }
             "cm" => {
@@ -213,6 +217,18 @@ pub(crate) fn extract_page_text_items(
                     text_rendering_mode = mode as i32;
                 }
             }
+            "Tc" => {
+                // Set character spacing (extra space added after each character)
+                if let Some(tc) = op.operands.first().and_then(get_number) {
+                    char_spacing = tc;
+                }
+            }
+            "Tw" => {
+                // Set word spacing (extra space added for each space character)
+                if let Some(tw) = op.operands.first().and_then(get_number) {
+                    word_spacing = tw;
+                }
+            }
             "Td" | "TD" => {
                 // Move text position: TLM = T(tx,ty) × TLM; Tm = TLM
                 // tx,ty are in text space — must be scaled by the text line matrix
@@ -253,8 +269,15 @@ pub(crate) fn extract_page_text_items(
                 if in_text_block && !op.operands.is_empty() {
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
-                        get_operand_bytes(&op.operands[0])
-                            .map(|raw| compute_string_width_ts(raw, fi, current_font_size))
+                        get_operand_bytes(&op.operands[0]).map(|raw| {
+                            compute_string_width_ts(
+                                raw,
+                                fi,
+                                current_font_size,
+                                char_spacing,
+                                word_spacing,
+                            )
+                        })
                     });
                     // ActualText: suppress glyph extraction, just advance text matrix
                     if suppress_glyph_extraction {
@@ -408,8 +431,13 @@ pub(crate) fn extract_page_text_items(
                             }
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
-                                    total_width_ts +=
-                                        compute_string_width_ts(raw_bytes, fi, current_font_size);
+                                    total_width_ts += compute_string_width_ts(
+                                        raw_bytes,
+                                        fi,
+                                        current_font_size,
+                                        char_spacing,
+                                        word_spacing,
+                                    );
                                 }
                             }
                             if !is_invisible {

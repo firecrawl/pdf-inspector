@@ -354,6 +354,8 @@ fn extract_form_xobject_text_inner(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
+                                    0.0,
+                                    0.0,
                                 );
                                 text_matrix[4] += w_ts * text_matrix[0];
                                 text_matrix[5] += w_ts * text_matrix[1];
@@ -381,6 +383,8 @@ fn extract_form_xobject_text_inner(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
+                                    0.0,
+                                    0.0,
                                 );
                                 text_matrix[4] += w_ts * text_matrix[0];
                                 text_matrix[5] += w_ts * text_matrix[1];
@@ -493,8 +497,13 @@ fn extract_form_xobject_text_inner(
                             }
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
-                                    total_width_ts +=
-                                        compute_string_width_ts(raw_bytes, fi, current_font_size);
+                                    total_width_ts += compute_string_width_ts(
+                                        raw_bytes,
+                                        fi,
+                                        current_font_size,
+                                        0.0,
+                                        0.0,
+                                    );
                                 }
                             }
                             if !fill_is_white {

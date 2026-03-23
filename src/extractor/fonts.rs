@@ -429,15 +429,23 @@ pub(crate) fn parse_cid_w_array(
 /// Compute the width of a string in text space units,
 /// given raw bytes and font width info.
 /// Returns width in text space units (font_units * units_scale * font_size).
+///
+/// `char_spacing` (Tc) is added per character and `word_spacing` (Tw) is added
+/// per space character (byte 0x20), both in unscaled text-space units.
+/// Per the PDF spec: tx = (w0 × Tfs + Tc + Tw_if_space) per glyph.
 pub(crate) fn compute_string_width_ts(
     bytes: &[u8],
     font_info: &FontWidthInfo,
     font_size: f32,
+    char_spacing: f32,
+    word_spacing: f32,
 ) -> f32 {
     let mut total: f32 = 0.0;
-    if font_info.is_cid {
+    let mut num_spaces: usize = 0;
+    let num_chars = if font_info.is_cid {
         // 2-byte (big-endian) character codes
         let mut j = 0;
+        let mut count = 0usize;
         while j + 1 < bytes.len() {
             let cid = u16::from_be_bytes([bytes[j], bytes[j + 1]]);
             let w = font_info
@@ -446,8 +454,14 @@ pub(crate) fn compute_string_width_ts(
                 .copied()
                 .unwrap_or(font_info.default_width);
             total += w as f32;
+            // CID 32 = space in most CID fonts
+            if cid == 32 {
+                num_spaces += 1;
+            }
+            count += 1;
             j += 2;
         }
+        count
     } else {
         // 1-byte character codes
         for &b in bytes {
@@ -458,10 +472,17 @@ pub(crate) fn compute_string_width_ts(
                 .copied()
                 .unwrap_or(font_info.default_width);
             total += w as f32;
+            if b == 0x20 {
+                num_spaces += 1;
+            }
         }
-    }
+        bytes.len()
+    };
     // Convert from font units to text space using the font's scale factor
+    // Then add Tc per character and Tw per space character
     total * font_info.units_scale * font_size
+        + num_chars as f32 * char_spacing
+        + num_spaces as f32 * word_spacing
 }
 
 /// Extract raw bytes from a PDF operand (String object)
@@ -1069,6 +1090,82 @@ fn score_text(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_font_info(widths: &[(u16, u16)], default_width: u16, is_cid: bool) -> FontWidthInfo {
+        FontWidthInfo {
+            widths: widths.iter().copied().collect(),
+            default_width,
+            space_width: widths
+                .iter()
+                .find(|(k, _)| *k == 32)
+                .map(|(_, v)| *v)
+                .unwrap_or(default_width),
+            is_cid,
+            units_scale: 0.001,
+            wmode: 0,
+        }
+    }
+
+    #[test]
+    fn compute_string_width_ts_no_tc_tw() {
+        // Without Tc/Tw (both 0), width = glyph widths only
+        let fi = make_font_info(&[(72, 500), (101, 400), (108, 300)], 600, false);
+        let bytes = b"Hello"; // H=500, e=400, l=300, l=300, o=600(default)
+        let w = compute_string_width_ts(bytes, &fi, 10.0, 0.0, 0.0);
+        // (500+400+300+300+600) * 0.001 * 10 = 21.0
+        assert!((w - 21.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_string_width_ts_with_positive_tc() {
+        // Positive Tc adds char_spacing per character
+        let fi = make_font_info(&[], 500, false);
+        let bytes = b"ab"; // 2 chars, each 500 default
+        let w = compute_string_width_ts(bytes, &fi, 10.0, 0.5, 0.0);
+        // glyph: (500+500)*0.001*10 = 10.0, Tc: 2*0.5 = 1.0, total = 11.0
+        assert!((w - 11.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_string_width_ts_with_negative_tc() {
+        // Negative Tc (tight tracking) reduces width
+        let fi = make_font_info(&[], 500, false);
+        let bytes = b"ab";
+        let w = compute_string_width_ts(bytes, &fi, 10.0, -0.3, 0.0);
+        // glyph: 10.0, Tc: 2*(-0.3) = -0.6, total = 9.4
+        assert!((w - 9.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_string_width_ts_with_tw() {
+        // Tw applies only to space characters (byte 0x20)
+        let fi = make_font_info(&[(32, 250)], 500, false);
+        let bytes = b"a b"; // 'a'=500, ' '=250, 'b'=500
+        let w = compute_string_width_ts(bytes, &fi, 10.0, 0.0, 0.8);
+        // glyph: (500+250+500)*0.001*10 = 12.5, Tw: 1*0.8 = 0.8, total = 13.3
+        assert!((w - 13.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_string_width_ts_with_tc_and_tw() {
+        // Both Tc and Tw
+        let fi = make_font_info(&[(32, 250)], 500, false);
+        let bytes = b"a b"; // 3 chars, 1 space
+        let w = compute_string_width_ts(bytes, &fi, 10.0, 0.1, 0.5);
+        // glyph: 12.5, Tc: 3*0.1 = 0.3, Tw: 1*0.5 = 0.5, total = 13.3
+        assert!((w - 13.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_string_width_ts_cid_font() {
+        // CID font: 2-byte codes, space is CID 32
+        let fi = make_font_info(&[(65, 500), (32, 250)], 600, true);
+        // "A " in CID: [0,65, 0,32]
+        let bytes = &[0u8, 65, 0, 32];
+        let w = compute_string_width_ts(bytes, &fi, 12.0, 0.2, 0.3);
+        // glyph: (500+250)*0.001*12 = 9.0, Tc: 2*0.2 = 0.4, Tw: 1*0.3 = 0.3
+        assert!((w - 9.7).abs() < 0.01);
+    }
 
     #[test]
     fn score_text_cjk() {

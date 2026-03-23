@@ -332,8 +332,26 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 if gap < -first.font_size * 0.5 {
                     break;
                 }
-                // Insert space at word boundaries
-                if gap > first.font_size * 0.08 {
+                // Insert space at word boundaries.
+                // Base threshold 0.08; raised to 0.13 for lowercase→lowercase
+                // junctions to accommodate Tc/Tw character-spacing adjustments
+                // that shift advance widths relative to Td positioning.
+                let threshold = {
+                    let prev_last = text.trim_end().chars().last();
+                    let next_first = next.text.trim_start().chars().next();
+                    // Never insert space before joining punctuation
+                    if next_first.is_some_and(|c| matches!(c, '.' | ',' | ';' | ')' | ']' | '}')) {
+                        first.font_size * 0.25
+                    } else if prev_last.is_some_and(|c| c.is_lowercase())
+                        && next_first.is_some_and(|c| c.is_lowercase())
+                    {
+                        // Lowercase→lowercase: likely mid-word, use wider threshold
+                        first.font_size * 0.13
+                    } else {
+                        first.font_size * 0.08
+                    }
+                };
+                if gap > threshold {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
@@ -464,6 +482,61 @@ mod tests {
     use crate::text_utils::{is_cjk_char, is_rtl_char, is_rtl_text, sort_line_items};
     use crate::types::{ItemType, TextLine};
     use layout::{detect_columns, is_newspaper_layout, ColumnRegion};
+
+    fn make_merge_item(text: &str, x: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.into(),
+            x,
+            y: 700.0,
+            width,
+            height: 12.0,
+            font: "F1".into(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn merge_items_no_space_before_period() {
+        // Simulate Tc/Tw-adjusted width: "date" width is smaller than the gap
+        // to "." due to negative Tc, but period should still join without space.
+        let items = vec![
+            make_merge_item("date", 227.25, 89.25), // end = 316.50
+            make_merge_item(".", 318.00, 3.0),      // gap = 1.50 (0.125 × fs)
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "date.");
+    }
+
+    #[test]
+    fn merge_items_lowercase_join_with_tc() {
+        // Lowercase→lowercase junction: "deve" + "lopers" with Tc-affected gap
+        // Gap of 0.12 × font_size should merge without space
+        let items = vec![
+            make_merge_item("deve", 100.0, 30.0),    // end = 130.0
+            make_merge_item("lopers", 131.44, 40.0), // gap = 1.44 (0.12 × 12)
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "developers");
+    }
+
+    #[test]
+    fn merge_items_space_at_word_boundary() {
+        // Word boundary gap (> 0.13 × font_size) should insert space
+        let items = vec![
+            make_merge_item("hello", 100.0, 30.0),
+            make_merge_item("world", 132.0, 30.0), // gap = 2.0 (0.167 × 12)
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "hello world");
+    }
 
     #[test]
     fn test_group_into_lines() {
