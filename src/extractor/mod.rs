@@ -420,8 +420,16 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 // Only merge purely numeric text to avoid false positives with small
                 // bullets, ordinal indicators, or letter-based labels.
                 if let Some(parent) = merged.last_mut() {
-                    // Only merge into a parent that is normal-sized, not another subscript
-                    if parent.font_size >= sub_threshold {
+                    // Only merge into a parent that is normal-sized, not another subscript,
+                    // and whose text ends with a letter. This prevents merging into numbers
+                    // (e.g. "33" + "1" in "33 1/3%") or punctuation, while preserving
+                    // chemical formulas (NH + "3") and footnote refs (word + "2").
+                    let ends_with_letter = parent
+                        .text
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphabetic());
+                    if parent.font_size >= sub_threshold && ends_with_letter {
                         let parent_right = parent.x + parent.width;
                         let gap = item.x - parent_right;
                         // Subscripts must be tightly adjacent (within ~1pt)
@@ -1188,5 +1196,29 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].text, "∆");
         assert_eq!(merged[1].text, "sol");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_parent_ends_with_digit() {
+        // "33" + "1" in "33 1/3%" — parent ends with digit, should NOT merge
+        let items = vec![
+            make_item_fs("33", 78.0, 499.0, 10.0, 8.0),
+            make_item_fs("1", 88.0, 496.0, 2.3, 4.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "33");
+        assert_eq!(merged[1].text, "1");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_parent_ends_with_space() {
+        // "Health " + "1" — parent ends with space (table credit), should NOT merge
+        let items = vec![
+            make_item_fs("Health ", 78.0, 499.0, 30.0, 8.0),
+            make_item_fs("1", 108.0, 496.0, 2.3, 4.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
     }
 }
