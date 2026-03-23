@@ -115,6 +115,17 @@ pub(crate) fn extract_page_text_items(
 
     let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
 
+    const MAX_OPERATIONS: usize = 1_000_000;
+    if content.operations.len() > MAX_OPERATIONS {
+        log::warn!(
+            "page {}: skipping extraction — {} operations exceeds limit ({})",
+            page_num,
+            content.operations.len(),
+            MAX_OPERATIONS
+        );
+        return Ok(((Vec::new(), Vec::new(), Vec::new()), false));
+    }
+
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
