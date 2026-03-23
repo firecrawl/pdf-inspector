@@ -128,6 +128,14 @@ pub(crate) fn extract_page_text_items(
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
 
+    // Track text direction votes: (horizontal_count, rotated_count).
+    // For each text item, if |combined[0]| > |combined[1]| the text runs
+    // horizontally (normal); otherwise it's rotated ~90°.
+    let mut rotation_votes = RotationVotes {
+        horizontal: 0,
+        rotated: 0,
+    };
+
     // Marked content tracking: (ActualText, MCID) per nesting level
     struct MarkedContentEntry {
         actual_text: Option<String>,
@@ -280,6 +288,11 @@ pub(crate) fn extract_page_text_items(
                         let combined = multiply_matrices(&text_matrix, &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined);
                         let (x, y) = (combined[4], combined[5]);
+                        if combined[0].abs() >= combined[1].abs() {
+                            rotation_votes.horizontal += 1;
+                        } else {
+                            rotation_votes.rotated += 1;
+                        }
                         let width = if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -422,6 +435,11 @@ pub(crate) fn extract_page_text_items(
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
+                            if combined[0].abs() >= combined[1].abs() {
+                                rotation_votes.horizontal += 1;
+                            } else {
+                                rotation_votes.rotated += 1;
+                            }
                             let rendered_size = effective_font_size(current_font_size, &combined);
                             let base_font = font_base_names
                                 .get(&current_font)
@@ -495,6 +513,11 @@ pub(crate) fn extract_page_text_items(
                     ) {
                         if !text.trim().is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
+                            if combined[0].abs() >= combined[1].abs() {
+                                rotation_votes.horizontal += 1;
+                            } else {
+                                rotation_votes.rotated += 1;
+                            }
                             let rendered_size = effective_font_size(current_font_size, &combined);
                             let (x, y) = (combined[4], combined[5]);
                             let base_font = font_base_names
@@ -589,6 +612,11 @@ pub(crate) fn extract_page_text_items(
                         // Compute width from text matrix advancement during BDC..EMC
                         if let Some(start_tm) = actual_text_start_tm.take() {
                             let combined = multiply_matrices(&start_tm, &ctm);
+                            if combined[0].abs() >= combined[1].abs() {
+                                rotation_votes.horizontal += 1;
+                            } else {
+                                rotation_votes.rotated += 1;
+                            }
                             let rendered_size = effective_font_size(current_font_size, &combined);
                             let (x, y) = (combined[4], combined[5]);
                             // Width in device space from text matrix delta
@@ -879,9 +907,94 @@ pub(crate) fn extract_page_text_items(
         }
     }
 
+    // Detect dominant text rotation and transform coordinates if needed.
+    // Some PDFs embed landscape content in portrait pages using a rotated text
+    // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
+    // assumes x=horizontal, y=vertical — so we swap coordinates to match.
+    let (items, rects, lines) = correct_rotated_page(items, rects, lines, &rotation_votes);
+
     let items = super::merge_text_items(items);
     let items = super::merge_subscript_items(items);
     Ok(((items, rects, lines), has_gid_fonts))
+}
+
+/// Counts of text operators with horizontal vs rotated combined matrices.
+struct RotationVotes {
+    horizontal: u32,
+    rotated: u32,
+}
+
+/// Detect if most text items on a page are rotated 90° or 270°, and if so,
+/// swap x↔y coordinates (plus widths/heights) so the layout engine sees
+/// them as horizontal text on a landscape page.
+fn correct_rotated_page(
+    mut items: Vec<TextItem>,
+    mut rects: Vec<PdfRect>,
+    mut lines: Vec<PdfLine>,
+    votes: &RotationVotes,
+) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>) {
+    if items.len() < 2 {
+        return (items, rects, lines);
+    }
+
+    // Use the combined-matrix direction votes collected during extraction.
+    // For normal text, combined[0] (the x-component of the text x-axis) is
+    // large; for 90° rotated text, combined[1] dominates instead.
+    let total_votes = votes.horizontal + votes.rotated;
+    if total_votes == 0 || votes.rotated * 3 < total_votes * 2 {
+        // Less than ~67% of text operators are rotated → not a rotated page
+        return (items, rects, lines);
+    }
+
+    log::debug!(
+        "detected rotated page text: {}/{} text ops are rotated — swapping coordinates",
+        votes.rotated,
+        total_votes
+    );
+
+    // For 90° CCW rotation (the common case: Tm = [0, b, -b, 0, tx, ty]):
+    //   device x increases = visual "down"   → negate when mapping to y
+    //   device y increases = visual "right"   → use directly as x
+    // The layout engine sorts by y descending (highest = top of page), so
+    // we negate old_x so that visual-top (low device x) gets high new_y.
+    for item in &mut items {
+        let new_x = item.y;
+        let new_y = -item.x;
+        item.x = new_x;
+        item.y = new_y;
+        // For rotated text, the "width" along the reading direction was
+        // lost (computed as 0 due to scale_x ≈ 0).  Estimate from text
+        // length × approximate char width.  font_size is the rendered
+        // height in device space, which for 90° rotation corresponds to
+        // the horizontal extent of one em.
+        if item.width < 0.5 {
+            let char_count = item.text.chars().count() as f32;
+            item.width = char_count * item.font_size * 0.5;
+        }
+    }
+
+    // Transform rectangles
+    for rect in &mut rects {
+        let new_x = rect.y;
+        let new_y = -(rect.x + rect.width.abs());
+        rect.x = new_x;
+        rect.y = new_y;
+        std::mem::swap(&mut rect.width, &mut rect.height);
+    }
+
+    // Transform lines
+    for line in &mut lines {
+        let new_x1 = line.y1;
+        let new_y1 = -line.x1;
+        let new_x2 = line.y2;
+        let new_y2 = -line.x2;
+        line.x1 = new_x1;
+        line.y1 = new_y1;
+        line.x2 = new_x2;
+        line.y2 = new_y2;
+    }
+
+    (items, rects, lines)
 }
 
 /// Remove near-duplicate rects (same coordinates within 0.5 pt tolerance).

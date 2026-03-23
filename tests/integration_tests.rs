@@ -4,8 +4,8 @@ use pdf_inspector::detector::{DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
-    detect_pdf_type, extract_text, extract_text_with_positions, to_markdown, MarkdownOptions,
-    PdfError, PdfType, TextItem,
+    detect_pdf_type, extract_text, extract_text_with_positions, process_pdf_with_options,
+    to_markdown, MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
 };
 
 // Helper to create test TextItems
@@ -1059,5 +1059,51 @@ fn test_identity_h_no_tounicode_suppresses_garbage() {
         "Garbage CID text should be suppressed, got {} chars: {:?}",
         md.len(),
         &md[..md.len().min(100)]
+    );
+}
+
+#[test]
+fn test_rotated_table_layout_correction() {
+    // tnagriculture_06_12.pdf has landscape content in a portrait page via
+    // a 90° CCW text matrix [0, b, -b, 0, tx, ty].  Without rotation
+    // correction, the table is read sideways (jumbled numbers).
+    let result =
+        process_pdf_with_options("tests/fixtures/tnagriculture_06_12.pdf", PdfOptions::new())
+            .unwrap();
+    let md = result.markdown.unwrap_or_default();
+
+    // Title should appear near the top
+    assert!(
+        md.contains("DISTRICT WISE PRODUCTION OF SPICES AND CONDIMENTS"),
+        "Should extract the table title"
+    );
+
+    // District names should be readable (not jumbled with numbers)
+    assert!(
+        md.contains("Ariyalur"),
+        "Should extract district name Ariyalur"
+    );
+    assert!(
+        md.contains("Coimbatore"),
+        "Should extract district name Coimbatore"
+    );
+
+    // Spice column headers should appear
+    assert!(
+        md.contains("CARDAMOM"),
+        "Should extract spice header CARDAMOM"
+    );
+    assert!(
+        md.contains("RED CHILLIES"),
+        "Should extract spice header RED CHILLIES"
+    );
+
+    // Table should be formatted as markdown table (has pipe delimiters)
+    let has_table_row = md
+        .lines()
+        .any(|l: &str| l.contains('|') && l.contains("Ariyalur"));
+    assert!(
+        has_table_row,
+        "District data should be in a markdown table row"
     );
 }
