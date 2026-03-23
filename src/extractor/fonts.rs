@@ -1168,6 +1168,16 @@ mod tests {
     }
 
     #[test]
+    fn compute_string_width_ts_large_tc() {
+        // Large Tc (character-spreading) is applied in full
+        let fi = make_font_info(&[], 500, false);
+        let bytes = b"abc"; // 3 chars
+        let w = compute_string_width_ts(bytes, &fi, 10.0, 5.0, 0.0);
+        // glyph: (500*3)*0.001*10 = 15.0, Tc: 3*5.0 = 15.0, total = 30.0
+        assert!((w - 30.0).abs() < 0.01);
+    }
+
+    #[test]
     fn score_text_cjk() {
         // Correct Japanese text should score well
         let japanese = "2026年9月期 1Q 業績報告";
