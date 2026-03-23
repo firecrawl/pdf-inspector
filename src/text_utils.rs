@@ -579,8 +579,10 @@ pub(crate) fn should_join_items(
         };
         let font_size = prev_item.font_size;
 
-        // Never join across column-scale gaps
-        if gap > font_size * 3.0 {
+        // Never join across column-scale gaps or large overlaps.
+        // Large negative gaps arise when Tc/Tw inflate item widths past
+        // where adjacent items actually start.
+        if gap > font_size * 3.0 || gap < -font_size {
             return false;
         }
 
@@ -612,15 +614,18 @@ pub(crate) fn should_join_items(
         // are positioned close together are almost always a single number.
         // e.g., "34,20" + "8" → "34,208", "+13." + "0" + "%" → "+13.0%"
         // Use a generous threshold since word spaces in numbers are rare.
+        // The lower bound (-font_size) rejects large overlaps caused by
+        // Tc/Tw–inflated item widths that make adjacent items appear to
+        // occupy the same space.
         if let (Some(p), Some(c)) = (prev_last, curr_first) {
             let prev_is_numeric = p.is_ascii_digit() || p == ',' || p == '.';
             let curr_is_numeric = c.is_ascii_digit() || c == '%' || c == '.';
             if prev_is_numeric && curr_is_numeric {
-                return gap < font_size * 0.3;
+                return gap > -font_size && gap < font_size * 0.3;
             }
             // Sign characters (+/-) followed by digits
             if (p == '+' || p == '-') && c.is_ascii_digit() {
-                return gap < font_size * 0.3;
+                return gap > -font_size && gap < font_size * 0.3;
             }
         }
 

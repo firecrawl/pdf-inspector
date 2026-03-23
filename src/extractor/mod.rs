@@ -272,6 +272,44 @@ pub(crate) fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
 /// Groups items by (page, Y-position) with a 5pt tolerance, sorts within each
 /// group by X, then merges consecutive items that share a similar font size
 /// and are close horizontally.
+/// Cap item width for merge-gap computation to guard against Tw inflation.
+///
+/// When PDF word-spacing (Tw) is large (used for text justification), the
+/// advance width of strings containing spaces extends far past the visible
+/// glyph extent.  This inflated width collapses inter-column gaps, making
+/// `merge_text_items` incorrectly merge items from different table columns.
+///
+/// Only applies to non-CJK items whose text contains spaces (where Tw
+/// contributes) and whose average width-per-character is abnormally high.
+fn effective_merge_width(item: &TextItem) -> f32 {
+    use crate::text_utils::is_cjk_char;
+
+    if item.width <= 0.0 || item.font_size <= 0.0 {
+        return item.width;
+    }
+    // Tw only inflates strings that contain space characters.
+    if !item.text.contains(' ') {
+        return item.width;
+    }
+    // CJK characters are naturally ~1.0× font_size wide; skip the cap.
+    if item.text.chars().any(is_cjk_char) {
+        return item.width;
+    }
+    let char_count = item.text.chars().count();
+    if char_count == 0 {
+        return item.width;
+    }
+    let avg = item.width / char_count as f32;
+    // Normal proportional text: ~0.5× font_size per char.
+    // Monospace: ~0.6×.  Threshold at 0.85× catches Tw inflation.
+    if avg > item.font_size * 0.85 {
+        let capped = char_count as f32 * item.font_size * 0.6;
+        capped.min(item.width)
+    } else {
+        item.width
+    }
+}
+
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
@@ -315,7 +353,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         while i < group.len() {
             let first = group[i];
             let mut text = first.text.clone();
-            let mut end_x = first.x + first.width;
+            let mut end_x = first.x + effective_merge_width(first);
             let x_gap_max = first.font_size * 0.5;
 
             let mut j = i + 1;
@@ -355,7 +393,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
-                end_x = next.x + next.width;
+                end_x = next.x + effective_merge_width(next);
                 j += 1;
             }
 
