@@ -880,6 +880,7 @@ pub(crate) fn extract_page_text_items(
     }
 
     let items = super::merge_text_items(items);
+    let items = super::merge_subscript_items(items);
     Ok(((items, rects, lines), has_gid_fonts))
 }
 

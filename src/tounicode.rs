@@ -18,6 +18,9 @@ pub struct ToUnicodeCMap {
     pub ranges: Vec<(u16, u16, u32)>,
     /// Byte width of source codes (1 or 2), determined from codespace and CMap entries
     pub code_byte_length: u8,
+    /// When true, unmapped CIDs are interpreted as Unicode codepoints directly.
+    /// Used as a last resort for Identity-H fonts without ToUnicode/cmap/glyph names.
+    pub cid_passthrough: bool,
 }
 
 pub(crate) fn build_cmap_entry_from_stream(
@@ -467,10 +470,24 @@ impl ToUnicodeCMap {
                     match self.lookup(cid) {
                         Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
                         _ => {
-                            // Do NOT blindly interpret CIDs as Unicode codepoints.
-                            // CIDs are font-internal indices, not Unicode values.
-                            // Unmapped 2-byte CIDs are skipped to avoid CJK garbage.
-                            unmapped_count += 1;
+                            if self.cid_passthrough {
+                                // Last-resort: treat CID as Unicode codepoint.
+                                // Valid for Identity-H fonts where the PDF generator
+                                // used Unicode values as CIDs but stripped the cmap.
+                                if let Some(ch) = char::from_u32(cid as u32) {
+                                    if !ch.is_control() || ch == '\t' || ch == '\n' {
+                                        result.push(ch);
+                                    } else {
+                                        unmapped_count += 1;
+                                    }
+                                } else {
+                                    unmapped_count += 1;
+                                }
+                            } else {
+                                // CIDs are font-internal indices, not Unicode values.
+                                // Unmapped 2-byte CIDs are skipped to avoid CJK garbage.
+                                unmapped_count += 1;
+                            }
                         }
                     }
                 }
@@ -1628,6 +1645,68 @@ fn merge_cmaps(mut base: ToUnicodeCMap, overlay: ToUnicodeCMap) -> ToUnicodeCMap
     base
 }
 
+/// Check if a CIDFont's /W (widths) array contains CID values that look like
+/// Unicode codepoints rather than low-value GIDs.
+///
+/// Returns true if the median CID is >= 0x41 (letter 'A'), indicating
+/// the PDF generator likely used Unicode codepoints as CIDs.
+fn cid_values_look_like_unicode(cid_font_dict: &lopdf::Dictionary) -> bool {
+    let w_arr = match cid_font_dict.get(b"W").ok() {
+        Some(Object::Array(arr)) => arr,
+        _ => return false,
+    };
+
+    // The /W array format: [cid [w1 w2 ...]] or [cid_start cid_end w]
+    // We extract all CID values (the first element of each group).
+    let mut cids: Vec<u16> = Vec::new();
+    let mut i = 0;
+    while i < w_arr.len() {
+        if let Ok(cid) = w_arr[i].as_i64() {
+            cids.push(cid as u16);
+            // Skip the width data
+            if i + 1 < w_arr.len() {
+                match &w_arr[i + 1] {
+                    Object::Array(widths) => {
+                        // [cid [w1 w2 ...]] — CIDs are cid, cid+1, ..., cid+len-1
+                        for j in 1..widths.len() {
+                            cids.push((cid as u16).wrapping_add(j as u16));
+                        }
+                        i += 2;
+                    }
+                    _ => {
+                        // [cid_start cid_end w] — range of CIDs
+                        if i + 2 < w_arr.len() {
+                            if let Ok(cid_end) = w_arr[i + 1].as_i64() {
+                                for c in (cid as u16)..=(cid_end as u16) {
+                                    cids.push(c);
+                                }
+                            }
+                            i += 3;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    if cids.is_empty() {
+        return false;
+    }
+
+    cids.sort_unstable();
+    let median = cids[cids.len() / 2];
+    // Unicode text CIDs are typically >= 0x20 (space) with letters at 0x41+.
+    // GID-based subsets typically start at low values (0-based).
+    // Use median >= 0x41 as a heuristic for Unicode CIDs.
+    median >= 0x41
+}
+
 /// Build a ToUnicodeCMap from predefined CID→Unicode mapping based on CIDSystemInfo.
 ///
 /// Supports Adobe-Korea1 (Korean) character collection. Can be extended for
@@ -1874,23 +1953,25 @@ impl FontCMaps {
             // Try parsing embedded TrueType/OpenType cmap
             if let Some(ff_ref) = font_file_ref {
                 if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                    if let Ok(data) = stream.decompressed_content() {
-                        if let Some(cmap) = build_cmap_from_truetype(&data) {
-                            debug!(
-                                "TrueType CMap obj={:<6} (embedded font) char_map={}",
-                                lookup_key,
-                                cmap.char_map.len()
-                            );
-                            by_obj_num.insert(
-                                lookup_key,
-                                CMapEntry {
-                                    primary: cmap,
-                                    remapped: None,
-                                    fallback: None,
-                                },
-                            );
-                            resolved = true;
-                        }
+                    let data = match stream.decompressed_content() {
+                        Ok(d) => d,
+                        Err(_) => stream.content.clone(),
+                    };
+                    if let Some(cmap) = build_cmap_from_truetype(&data) {
+                        debug!(
+                            "TrueType CMap obj={:<6} (embedded font) char_map={}",
+                            lookup_key,
+                            cmap.char_map.len()
+                        );
+                        by_obj_num.insert(
+                            lookup_key,
+                            CMapEntry {
+                                primary: cmap,
+                                remapped: None,
+                                fallback: None,
+                            },
+                        );
+                        resolved = true;
                     }
                 }
             }
@@ -1910,6 +1991,38 @@ impl FontCMaps {
                             remapped: None,
                             fallback: None,
                         },
+                    );
+                    resolved = true;
+                }
+            }
+
+            // Last resort: CID-as-Unicode passthrough.
+            // Many PDF generators (Chromium, wkhtmltopdf) use Identity-H encoding where
+            // CID values ARE Unicode codepoints, but strip the cmap table and omit
+            // ToUnicode. We detect this by checking the /W (widths) array: if CID values
+            // fall in typical Unicode letter/digit ranges (0x41+), CIDs are likely Unicode.
+            // If CIDs are low values (< 0x41), they're GIDs in a subset font.
+            if !resolved {
+                if cid_values_look_like_unicode(cid_font_dict) {
+                    debug!(
+                        "Identity-H font obj={}: W array CIDs look like Unicode — using passthrough",
+                        lookup_key
+                    );
+                    let mut cmap = ToUnicodeCMap::new();
+                    cmap.code_byte_length = 2;
+                    cmap.cid_passthrough = true;
+                    by_obj_num.insert(
+                        lookup_key,
+                        CMapEntry {
+                            primary: cmap,
+                            remapped: None,
+                            fallback: None,
+                        },
+                    );
+                } else {
+                    debug!(
+                        "Identity-H font obj={}: no decoding possible (stripped cmap, GID-based CIDs)",
+                        lookup_key
                     );
                 }
             }
