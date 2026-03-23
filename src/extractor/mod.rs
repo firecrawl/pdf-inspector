@@ -411,9 +411,14 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
         // Walk through items and merge subscripts into their preceding parent
         let mut merged: Vec<TextItem> = Vec::new();
         for item in group {
-            if item.font_size < sub_threshold && item.font_size > 0.0 && item.text.len() <= 4 {
-                // This is a candidate subscript/superscript (short text, small font).
-                // Merge into the preceding normal-sized item if tightly adjacent.
+            if item.font_size < sub_threshold
+                && item.font_size > 0.0
+                && item.text.len() <= 4
+                && item.text.chars().all(|c| c.is_ascii_digit())
+            {
+                // This is a candidate numeric subscript/superscript (e.g. "2" in H₂O).
+                // Only merge purely numeric text to avoid false positives with small
+                // bullets, ordinal indicators, or letter-based labels.
                 if let Some(parent) = merged.last_mut() {
                     // Only merge into a parent that is normal-sized, not another subscript
                     if parent.font_size >= sub_threshold {
@@ -1170,5 +1175,18 @@ mod tests {
         ];
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_non_numeric() {
+        // Non-numeric subscript text (e.g. "sol", "º", "vf") should NOT merge
+        let items = vec![
+            make_item_fs("∆", 200.0, 639.0, 5.5, 8.0),
+            make_item_fs("sol", 205.8, 636.9, 5.7, 4.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "∆");
+        assert_eq!(merged[1].text, "sol");
     }
 }
