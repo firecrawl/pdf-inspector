@@ -1276,6 +1276,23 @@ fn detect_row_stripe_table(
         return None;
     }
 
+    // Reject if any cell has excessive text — layout background rects (sidebar,
+    // header, section bands) produce "cells" that contain paragraphs of body text.
+    // Real alternating-row-stripe data tables have short cell content.
+    let max_cell_len = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|c| c.len())
+        .max()
+        .unwrap_or(0);
+    if max_cell_len > 500 {
+        debug!(
+            "  row-stripe rejected: max cell length {} > 500 (layout background)",
+            max_cell_len
+        );
+        return None;
+    }
+
     // No empty columns
     for col in 0..num_cols {
         let col_has_content = cells
@@ -1440,6 +1457,22 @@ fn detect_merged_cluster_table(
         debug!(
             "  merged-cluster rejected: content ratio {:.2} < 0.40",
             content_ratio
+        );
+        return None;
+    }
+
+    // Reject if any cell has excessive text — layout background rects produce
+    // "cells" containing paragraphs, not short data-table values.
+    let max_cell_len = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|c| c.len())
+        .max()
+        .unwrap_or(0);
+    if max_cell_len > 500 {
+        debug!(
+            "  merged-cluster rejected: max cell length {} > 500 (layout background)",
+            max_cell_len
         );
         return None;
     }
@@ -1850,6 +1883,28 @@ mod tests {
         ];
         // 3/4 = 0.75 — NOT > 0.75, so false
         assert!(!is_row_stripe_pattern(&rects));
+    }
+
+    #[test]
+    fn test_row_stripe_rejects_layout_background_long_cells() {
+        // Simulate a newsletter page with wide background rects (sidebar, header, body)
+        // that look like row stripes but contain paragraphs of body text.
+        let rects = vec![
+            (10.0, 700.0, 550.0, 50.0),  // header band
+            (10.0, 640.0, 550.0, 50.0),  // nav band
+            (10.0, 200.0, 550.0, 430.0), // body background
+        ];
+        let items = vec![
+            make_item("General News", 20.0, 650.0, 10.0),
+            make_item("People News", 20.0, 710.0, 10.0),
+            // Simulate a long body text (>500 chars) in the main content area
+            make_item(&"A".repeat(600), 200.0, 650.0, 10.0),
+        ];
+        let result = detect_row_stripe_table(&items, &rects, 1);
+        assert!(
+            result.is_none(),
+            "layout background rects should not be detected as a table"
+        );
     }
 
     // --- propagate_merged_cells ---
