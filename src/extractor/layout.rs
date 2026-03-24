@@ -177,7 +177,8 @@ fn find_relative_valleys(
 ) -> Vec<(usize, usize)> {
     const MIN_GUTTER_BINS: usize = 2; // minimum 4pt gutter
     const CONTRAST_THRESHOLD: f32 = 0.60; // valley must be < 60% of surrounding peaks
-    const PEAK_WINDOW: usize = 40; // look 80pt on each side for peaks
+    const PEAK_WINDOW: usize = 25; // look 50pt on each side for peaks
+    const MIN_PEAK_HEIGHT: f32 = 20.0; // peaks must be ≥20 (dense text columns)
 
     if num_bins < 10 {
         return vec![];
@@ -221,7 +222,7 @@ fn find_relative_valleys(
             .cloned()
             .fold(0.0f32, f32::max);
 
-        if left_peak < 5.0 || right_peak < 5.0 {
+        if left_peak < MIN_PEAK_HEIGHT || right_peak < MIN_PEAK_HEIGHT {
             continue;
         }
 
