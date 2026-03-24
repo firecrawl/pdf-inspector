@@ -144,12 +144,23 @@ pub(crate) fn detect_columns(
                 true, // center-based assignment for relative valleys
             );
             if result.len() > 1 {
-                debug!(
-                    "page {}: relative valley detection found {} columns",
-                    page,
-                    result.len()
-                );
-                return result;
+                // Validate that both sides contain paragraph-like content.
+                // Tables, forms, and checklists have short scattered items
+                // that create false gutter signals. Only commit to relative
+                // valley columns when both sides look like flowing prose.
+                if columns_have_prose(&result, &page_items) {
+                    debug!(
+                        "page {}: relative valley detection found {} columns",
+                        page,
+                        result.len()
+                    );
+                    return result;
+                } else {
+                    debug!(
+                        "page {}: relative valley rejected — columns lack prose density",
+                        page,
+                    );
+                }
             }
         }
         return vec![ColumnRegion { x_min, x_max }];
@@ -166,6 +177,126 @@ pub(crate) fn detect_columns(
         page,
         false, // edge-based assignment for absolute valleys
     );
+}
+
+/// Check whether each proposed column contains paragraph-like content.
+///
+/// Groups items per column into rough lines by Y-proximity, then measures
+/// what fraction of those lines span a significant portion of the column
+/// width. Two-column prose (justified or ragged-right) produces lines that
+/// fill most of the column width. Tables, forms, and checklists produce
+/// short scattered items that don't.
+///
+/// Returns true only when *every* column passes a minimum prose density.
+fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
+    const Y_TOL: f32 = 3.0; // y-proximity to group items into the same line
+    const LINE_FILL_THRESHOLD: f32 = 0.45; // line must span ≥45% of column width
+    const MIN_PROSE_RATIO: f32 = 0.40; // ≥40% of lines must be "full"
+    const MIN_LINES: usize = 8; // need enough lines to judge
+    const MIN_COL_WIDTH: f32 = 120.0; // columns must be ≥120pt (not narrow sidebars/fragments)
+    const MAX_AVG_ITEMS_PER_LINE: f32 = 3.5; // prose has 1-3 items/line; tables/forms have 4+
+
+    for col in columns {
+        let col_width = col.x_max - col.x_min;
+        if col_width < MIN_COL_WIDTH {
+            return false;
+        }
+
+        // Collect items whose center falls within this column
+        let col_items: Vec<&TextItem> = items
+            .iter()
+            .filter(|i| {
+                let center = i.x + effective_width(i) / 2.0;
+                center >= col.x_min && center <= col.x_max
+            })
+            .copied()
+            .collect();
+
+        if col_items.len() < MIN_LINES {
+            return false;
+        }
+
+        // Sort by Y descending (top of page = higher Y in PDF coords)
+        let mut sorted: Vec<&TextItem> = col_items;
+        sorted.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Group into lines by Y-proximity and measure fill + item count
+        let mut full_lines = 0usize;
+        let mut total_lines = 0usize;
+        let mut total_items_in_lines = 0usize;
+        let mut line_items: Vec<&TextItem> = Vec::new();
+        let mut line_y = f32::NAN;
+
+        let flush_line = |line_items: &[&TextItem],
+                          full: &mut usize,
+                          total: &mut usize,
+                          total_items: &mut usize| {
+            if line_items.is_empty() {
+                return;
+            }
+            *total += 1;
+            *total_items += line_items.len();
+            // Compute the span of text on this line within the column
+            let left = line_items
+                .iter()
+                .map(|i| i.x.max(col.x_min))
+                .fold(f32::INFINITY, f32::min);
+            let right = line_items
+                .iter()
+                .map(|i| (i.x + effective_width(i)).min(col.x_max))
+                .fold(f32::NEG_INFINITY, f32::max);
+            let span = (right - left).max(0.0);
+            if span >= col_width * LINE_FILL_THRESHOLD {
+                *full += 1;
+            }
+        };
+
+        for item in &sorted {
+            if line_items.is_empty() || (line_y - item.y).abs() < Y_TOL {
+                if line_items.is_empty() {
+                    line_y = item.y;
+                }
+                line_items.push(item);
+            } else {
+                flush_line(
+                    &line_items,
+                    &mut full_lines,
+                    &mut total_lines,
+                    &mut total_items_in_lines,
+                );
+                line_items.clear();
+                line_y = item.y;
+                line_items.push(item);
+            }
+        }
+        flush_line(
+            &line_items,
+            &mut full_lines,
+            &mut total_lines,
+            &mut total_items_in_lines,
+        );
+
+        if total_lines < MIN_LINES {
+            return false;
+        }
+
+        let ratio = full_lines as f32 / total_lines as f32;
+        let avg_items = total_items_in_lines as f32 / total_lines as f32;
+        debug!(
+            "columns_have_prose: col [{:.0}..{:.0}] lines={} full={} ratio={:.2} avg_items={:.1}",
+            col.x_min, col.x_max, total_lines, full_lines, ratio, avg_items
+        );
+        if ratio < MIN_PROSE_RATIO {
+            return false;
+        }
+        // Tables and forms tend to have many small items per line (one per cell),
+        // while prose has few items per line (one per word-run or phrase).
+        if avg_items > MAX_AVG_ITEMS_PER_LINE {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Find relative valleys (local minima) in the histogram.
@@ -769,9 +900,6 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
 /// Group text items into lines, using pre-computed per-page adaptive thresholds
 /// from Canva-style letter-spacing detection. Falls back to computing the
 /// threshold from item gaps when no pre-computed value is available.
-///
-/// `table_pages` is the set of pages that have detected tables — relative valley
-/// detection is skipped on those pages to avoid splitting table column gaps.
 pub(crate) fn group_into_lines_with_thresholds(
     items: Vec<TextItem>,
     page_thresholds: &HashMap<u32, f32>,
