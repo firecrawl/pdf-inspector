@@ -1,6 +1,6 @@
 //! Column detection, line grouping, and reading-order layout.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::text_utils::{effective_width, sort_line_items};
 use crate::types::{TextItem, TextLine};
@@ -18,7 +18,11 @@ pub(crate) struct ColumnRegion {
 /// Builds an occupancy histogram across the page width and finds empty valleys
 /// (gutters) where no text exists. Validates valleys with vertical consistency
 /// checks to avoid false positives.
-pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion> {
+pub(crate) fn detect_columns(
+    items: &[TextItem],
+    page: u32,
+    page_has_table: bool,
+) -> Vec<ColumnRegion> {
     const BIN_WIDTH: f32 = 2.0;
     const MIN_GUTTER_WIDTH: f32 = 8.0;
     const MIN_VERTICAL_SPAN_RATIO: f32 = 0.30;
@@ -116,7 +120,9 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
     // than the peaks on either side.
     // Only attempt this for dense pages (>=100 items) — sparse pages with shallow
     // histogram dips are likely not multi-column.
-    if valleys.is_empty() && page_items.len() >= 100 {
+    // Skip on pages with detected tables — table column gaps look like gutters
+    // in the histogram but the table pipeline already handles reading order.
+    if valleys.is_empty() && page_items.len() >= 100 && !page_has_table {
         let rel_valleys = find_relative_valleys(
             &histogram,
             num_bins,
@@ -757,15 +763,19 @@ fn split_column_stragglers(lines: Vec<TextLine>) -> (Vec<TextLine>, Vec<TextLine
 }
 
 pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
-    group_into_lines_with_thresholds(items, &HashMap::new())
+    group_into_lines_with_thresholds(items, &HashMap::new(), &HashSet::new())
 }
 
 /// Group text items into lines, using pre-computed per-page adaptive thresholds
 /// from Canva-style letter-spacing detection. Falls back to computing the
 /// threshold from item gaps when no pre-computed value is available.
+///
+/// `table_pages` is the set of pages that have detected tables — relative valley
+/// detection is skipped on those pages to avoid splitting table column gaps.
 pub(crate) fn group_into_lines_with_thresholds(
     items: Vec<TextItem>,
     page_thresholds: &HashMap<u32, f32>,
+    table_pages: &HashSet<u32>,
 ) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
@@ -793,7 +803,7 @@ pub(crate) fn group_into_lines_with_thresholds(
         let adaptive_threshold = page_thresholds.get(&page).copied().unwrap_or(0.10);
 
         // Detect columns for this page
-        let columns = detect_columns(&page_items, page);
+        let columns = detect_columns(&page_items, page, table_pages.contains(&page));
 
         if columns.len() <= 1 {
             // Single column - use simple sorting
@@ -1171,7 +1181,7 @@ mod tests {
         items.extend(fill_zone(1, 345.0, 660.0, 750.0, 50.0));
         items.extend(fill_zone(1, 675.0, 800.0, 750.0, 50.0));
 
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert_eq!(cols.len(), 3, "Expected 3 columns, got {}", cols.len());
 
         // Gutter 1 should be in the gap between left and middle zones
@@ -1196,7 +1206,7 @@ mod tests {
         items.extend(fill_zone(1, 30.0, 280.0, 750.0, 50.0));
         items.extend(fill_zone(1, 320.0, 570.0, 750.0, 50.0));
 
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert_eq!(cols.len(), 2, "Expected 2 columns, got {}", cols.len());
 
         let gutter = cols[0].x_max;
@@ -1227,7 +1237,7 @@ mod tests {
             ));
         }
 
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         // Should detect the gutters between the 3 dense zones, not the wide gap
         // before the sparse zone
         assert!(
@@ -1288,7 +1298,7 @@ mod tests {
         // Right column: x=300..550, items extend to ~557
         items.extend(fill_zone_justified(1, 300.0, 550.0, 7.0, 750.0, 50.0));
 
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert_eq!(
             cols.len(),
             2,
@@ -1309,7 +1319,7 @@ mod tests {
         // detected as a column gutter.
         let items = fill_zone_justified(1, 40.0, 350.0, 0.0, 750.0, 50.0);
 
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert_eq!(
             cols.len(),
             1,

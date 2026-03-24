@@ -712,7 +712,7 @@ fn compute_layout_complexity(
 
     let mut pages_with_columns: Vec<u32> = Vec::new();
     for page in seen_pages {
-        let cols = extractor::detect_columns(items, page);
+        let cols = extractor::detect_columns(items, page, pages_with_tables.contains(&page));
         if cols.len() >= 2 {
             pages_with_columns.push(page);
         }

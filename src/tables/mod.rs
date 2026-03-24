@@ -281,7 +281,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
     };
     use std::collections::HashMap;
 
-    let mut columns = detect_columns(items, page);
+    let mut columns = detect_columns(items, page, false);
     if columns.len() < 4 {
         return None;
     }
@@ -384,7 +384,13 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
     let thresholds = HashMap::new();
     let per_column_lines: Vec<Vec<crate::types::TextLine>> = col_buckets
         .iter()
-        .map(|bucket| group_into_lines_with_thresholds(bucket.clone(), &thresholds))
+        .map(|bucket| {
+            group_into_lines_with_thresholds(
+                bucket.clone(),
+                &thresholds,
+                &std::collections::HashSet::new(),
+            )
+        })
         .collect();
 
     // Must be tabular (not newspaper) layout

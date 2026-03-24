@@ -887,11 +887,15 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // Merge continuation tables across page breaks, but only for table-only pages
     merge_continuation_tables(&mut page_tables, &table_only_pages);
 
+    // Collect pages that have detected tables — used to suppress relative valley
+    // column detection on pages where table column gaps would be misidentified.
+    let table_page_set: HashSet<u32> = page_tables.keys().copied().collect();
+
     // Split non-table items by band boundaries before line grouping so that
     // items from different side-by-side zones (e.g. left/right month columns
     // in a calendar) don't merge into the same line.
     let lines = if page_band_splits.is_empty() {
-        group_into_lines_with_thresholds(non_table_items, page_thresholds)
+        group_into_lines_with_thresholds(non_table_items, page_thresholds, &table_page_set)
     } else {
         // Separate items into band-split pages and non-split pages
         let mut split_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
@@ -904,7 +908,8 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             }
         }
         // Process unsplit pages normally
-        let mut all_lines = group_into_lines_with_thresholds(unsplit_items, page_thresholds);
+        let mut all_lines =
+            group_into_lines_with_thresholds(unsplit_items, page_thresholds, &table_page_set);
         // Process each split page's bands independently, then interleave
         // by Y position so paired zones (e.g. left/right months) appear together.
         let mut split_pages: Vec<u32> = split_page_items.keys().copied().collect();
@@ -924,6 +929,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     page_lines.extend(group_into_lines_with_thresholds(
                         band_items,
                         page_thresholds,
+                        &table_page_set,
                     ));
                 }
             }

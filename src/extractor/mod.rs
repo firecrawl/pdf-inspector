@@ -913,7 +913,7 @@ mod tests {
             items.push(make_item("Left text here", 72.0, y, 200.0));
             items.push(make_item("Right text here", 350.0, y, 200.0));
         }
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert_eq!(cols.len(), 2, "Expected 2 columns, got {:?}", cols);
         assert!(cols[0].x_min < cols[1].x_min);
     }
@@ -928,7 +928,7 @@ mod tests {
             items.push(make_item("Col two", 220.0, y, 140.0));
             items.push(make_item("Col three", 390.0, y, 140.0));
         }
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert_eq!(cols.len(), 3, "Expected 3 columns, got {:?}", cols);
     }
 
@@ -946,7 +946,7 @@ mod tests {
             let y = 700.0 - (i as f32) * 14.0;
             items.push(make_item("wide", 72.0, y, 320.0));
         }
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert!(
             cols.len() >= 2,
             "Width bleed should not prevent column detection, got {:?}",
@@ -967,7 +967,7 @@ mod tests {
                 468.0,
             ));
         }
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert!(
             cols.len() <= 1,
             "Full-width text should not be split into columns, got {:?}",
