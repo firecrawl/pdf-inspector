@@ -803,12 +803,18 @@ fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
         return false;
     }
 
+    let num_cols = cells[0].len();
     let mut dot_cells = 0;
     let mut page_number_cells = 0;
     let mut total_cells = 0;
+    // Track which columns contain dots vs numbers to distinguish
+    // TOC (dots span middle, page number at end) from data tables
+    // (dots only in label column, many number columns).
+    let mut dot_cols = vec![0u32; num_cols];
+    let mut numeric_cols = vec![0u32; num_cols];
 
     for row in cells {
-        for cell in row {
+        for (ci, cell) in row.iter().enumerate() {
             let trimmed = cell.trim();
             if trimmed.is_empty() {
                 continue;
@@ -821,6 +827,9 @@ fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
             let is_mostly_dots = dot_count > trimmed.len() / 2 && dot_count >= 3;
             if is_mostly_dots {
                 dot_cells += 1;
+                if ci < num_cols {
+                    dot_cols[ci] += 1;
+                }
             }
 
             // Check for standalone page numbers (1-4 digits, possibly with spaces)
@@ -830,11 +839,25 @@ fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
                 && digits_only.chars().all(|c| c.is_ascii_digit())
             {
                 page_number_cells += 1;
+                if ci < num_cols {
+                    numeric_cols[ci] += 1;
+                }
             }
         }
     }
 
     if total_cells == 0 {
+        return false;
+    }
+
+    // Data tables with dot leaders (e.g. "1973....") have dots concentrated
+    // in one column (the label column) while many other columns contain numbers.
+    // True TOCs have dots spanning the middle and one page-number column at the end.
+    // If dots are confined to ≤1 column AND there are ≥3 columns with numbers,
+    // this is a data table, not a TOC.
+    let cols_with_dots = dot_cols.iter().filter(|&&c| c >= 2).count();
+    let cols_with_numbers = numeric_cols.iter().filter(|&&c| c >= 2).count();
+    if cols_with_dots <= 1 && cols_with_numbers >= 3 {
         return false;
     }
 
@@ -1187,5 +1210,90 @@ fn try_add_label_column(
         for (idx, _) in row_labels {
             table.item_indices.push(*idx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_table_of_contents_rejects_toc() {
+        // TOC with separate dot-leader cells and page number cells
+        let cells = vec![
+            vec![
+                "Chapter 1".to_string(),
+                "....................".to_string(),
+                "1".to_string(),
+            ],
+            vec![
+                "Chapter 2".to_string(),
+                "....................".to_string(),
+                "15".to_string(),
+            ],
+            vec![
+                "Chapter 3".to_string(),
+                "....................".to_string(),
+                "42".to_string(),
+            ],
+            vec![
+                "Appendix".to_string(),
+                "....................".to_string(),
+                "100".to_string(),
+            ],
+        ];
+        assert!(is_table_of_contents(&cells));
+    }
+
+    #[test]
+    fn is_table_of_contents_allows_data_table_with_dot_leaders() {
+        // Simulates ERP appendix tables where the first column has year + dots
+        // (e.g. "1973..........") and other columns have numeric data.
+        let cells = vec![
+            vec![
+                "1973..........".to_string(),
+                "0.80".to_string(),
+                "1.08".to_string(),
+                "1.05".to_string(),
+                "0.02".to_string(),
+                "-0.28".to_string(),
+                "-0.33".to_string(),
+                "5.16".to_string(),
+            ],
+            vec![
+                "1974..........".to_string(),
+                "73".to_string(),
+                "56".to_string(),
+                "49".to_string(),
+                "08".to_string(),
+                "17".to_string(),
+                "17".to_string(),
+                "-.28".to_string(),
+            ],
+            vec![
+                "1975..........".to_string(),
+                "86".to_string(),
+                "-.05".to_string(),
+                "-.14".to_string(),
+                "09".to_string(),
+                "91".to_string(),
+                "85".to_string(),
+                "1.03".to_string(),
+            ],
+            vec![
+                "1976..........".to_string(),
+                "-1.05".to_string(),
+                "36".to_string(),
+                "34".to_string(),
+                "02".to_string(),
+                "-1.41".to_string(),
+                "-1.31".to_string(),
+                "4.01".to_string(),
+            ],
+        ];
+        assert!(
+            !is_table_of_contents(&cells),
+            "data table with dot-leader labels should not be rejected as TOC"
+        );
     }
 }
