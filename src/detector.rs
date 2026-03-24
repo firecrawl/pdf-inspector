@@ -197,13 +197,13 @@ pub(crate) fn detect_from_document(
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={}",
+                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={}",
                 page_num, analysis.text_operator_count, analysis.has_images,
                 analysis.image_count, analysis.has_template_image,
                 analysis.unique_text_chars, analysis.unique_alphanum_chars,
                 analysis.path_op_count, analysis.has_vector_text,
                 analysis.total_image_area, analysis.has_identity_h_no_tounicode,
-                analysis.has_only_type3_fonts
+                analysis.has_only_type3_fonts, analysis.font_change_count
             );
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
@@ -291,6 +291,49 @@ pub(crate) fn detect_from_document(
     } else {
         ocr_recommended = false;
         (PdfType::TextBased, text_ratio.max(0.5))
+    };
+
+    // Phase 1b: Newspaper-style layout detection.
+    // Dense multi-column newspapers (WSJ, NYT) have extractable text but produce
+    // poor output due to complex interleaved article layouts. Detect via consistently
+    // high text density combined with moderate font switches and a low Tf/Tj ratio.
+    //
+    // The Tf/Tj ratio distinguishes newspapers from styled legal/business documents:
+    // - Newspapers: ratio 0.02-0.06 (dense prose with occasional font switches)
+    // - Rich-styled docs (DPA, contracts): ratio 0.25-0.35 (per-character styling)
+    //
+    // Thresholds calibrated against:
+    // - WSJ 50-page newspaper: text_ops 1500-3800, font_changes 50-194, ratio 0.02-0.06
+    // - DPA/contracts: text_ops 1300-2260, font_changes 327-630, ratio 0.25-0.32
+    // - SEC filings: text_ops 1-1800, font_changes 1-65 (only 1-2 dense pages)
+    // - Normal docs: text_ops < 700, font_changes < 55
+    let ocr_recommended = if pdf_type == PdfType::TextBased && pages_sampled >= 3 {
+        let mut newspaper_pages = 0u32;
+        for analysis in analysis_cache.values() {
+            let ratio = if analysis.text_operator_count > 0 {
+                analysis.font_change_count as f32 / analysis.text_operator_count as f32
+            } else {
+                1.0
+            };
+            if analysis.text_operator_count >= 1500
+                && analysis.font_change_count >= 50
+                && ratio < 0.15
+            {
+                newspaper_pages += 1;
+            }
+        }
+        let newspaper_ratio = newspaper_pages as f32 / pages_sampled as f32;
+        if newspaper_ratio >= 0.5 {
+            log::debug!(
+                "newspaper layout detected: {}/{} pages with high text_ops + font_changes → OCR recommended",
+                newspaper_pages, pages_sampled
+            );
+            true
+        } else {
+            ocr_recommended
+        }
+    } else {
+        ocr_recommended
     };
 
     // Phase 2: Build per-page OCR list
@@ -427,6 +470,8 @@ struct PageAnalysis {
     /// Type3 fonts render each glyph as a custom drawing/bitmap — without a
     /// ToUnicode CMap, the character codes can't be mapped to Unicode.
     has_only_type3_fonts: bool,
+    /// Number of Tf (set font) operators — high count indicates many font switches
+    font_change_count: u32,
 }
 
 /// Analyze a page's content stream for text operators and images
@@ -435,6 +480,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut has_images = false;
     let mut image_count = 0u32;
     let mut path_ops = 0u32;
+    let mut font_changes = 0u32;
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
 
     // Get content streams for this page
@@ -448,12 +494,13 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 Err(_) => stream.content.clone(),
             };
 
-            // Scan for text operators (Tj, TJ), image operators (Do), and path ops
-            let (ops, imgs, paths) =
+            // Scan for text operators (Tj, TJ), font changes (Tf), image operators (Do), and path ops
+            let (ops, imgs, paths, fonts) =
                 scan_content_for_text_operators(&content, &mut all_unique_chars);
             text_ops += ops;
             image_count += imgs;
             path_ops += paths;
+            font_changes += fonts;
             has_images = has_images || imgs > 0;
         }
     }
@@ -462,20 +509,22 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     if let Ok((resource_dict, resource_ids)) = doc.get_page_resources(page_id) {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
-            let (ops, imgs, paths) =
+            let (ops, imgs, paths, fonts) =
                 scan_xobjects_in_resources(doc, resources, &mut visited, &mut all_unique_chars);
             text_ops += ops;
             image_count += imgs;
             path_ops += paths;
+            font_changes += fonts;
             has_images = has_images || imgs > 0;
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                let (ops, imgs, paths) =
+                let (ops, imgs, paths, fonts) =
                     scan_xobjects_in_resources(doc, resources, &mut visited, &mut all_unique_chars);
                 text_ops += ops;
                 image_count += imgs;
                 path_ops += paths;
+                font_changes += fonts;
                 has_images = has_images || imgs > 0;
             }
         }
@@ -517,6 +566,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_vector_text,
         has_identity_h_no_tounicode,
         has_only_type3_fonts,
+        font_change_count: font_changes,
     }
 }
 
@@ -601,10 +651,11 @@ fn scan_xobjects_in_resources(
     resources: &lopdf::Dictionary,
     visited: &mut HashSet<ObjectId>,
     unique_chars: &mut HashSet<u8>,
-) -> (u32, u32, u32) {
+) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
     let mut path_ops = 0u32;
+    let mut font_changes = 0u32;
 
     let xobjects = match resources.get(b"XObject").ok() {
         Some(Object::Dictionary(d)) => Some(d.clone()),
@@ -633,22 +684,24 @@ fn scan_xobjects_in_resources(
                     let content = stream
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
-                    let (ops, imgs, paths) =
+                    let (ops, imgs, paths, fonts) =
                         scan_content_for_text_operators(&content, unique_chars);
                     text_ops += ops;
                     image_count += imgs;
                     path_ops += paths;
+                    font_changes += fonts;
                     if let Some(res) = stream
                         .dict
                         .get(b"Resources")
                         .ok()
                         .and_then(|o| o.as_dict().ok())
                     {
-                        let (ops2, imgs2, paths2) =
+                        let (ops2, imgs2, paths2, fonts2) =
                             scan_xobjects_in_resources(doc, res, visited, unique_chars);
                         text_ops += ops2;
                         image_count += imgs2;
                         path_ops += paths2;
+                        font_changes += fonts2;
                     }
                 }
                 Some(b"Image") => {
@@ -659,7 +712,7 @@ fn scan_xobjects_in_resources(
         }
     }
 
-    (text_ops, image_count, path_ops)
+    (text_ops, image_count, path_ops, font_changes)
 }
 
 /// Fast scan of content stream bytes for text operators
@@ -670,15 +723,16 @@ fn scan_xobjects_in_resources(
 /// - "'" - move to next line and show text
 /// - "\"" - set word/char spacing, move to next line, show text
 ///
-/// Returns (text_op_count, image_count, path_op_count).
+/// Returns (text_op_count, image_count, path_op_count, font_change_count).
 /// Unique non-whitespace text characters are collected into `unique_chars`.
 fn scan_content_for_text_operators(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
-) -> (u32, u32, u32) {
+) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
     let mut path_ops = 0u32;
+    let mut font_changes = 0u32;
 
     // Helper: check if position is a word boundary (start of content or preceded by whitespace)
     let is_word_start = |pos: usize| -> bool { pos == 0 || content[pos - 1].is_ascii_whitespace() };
@@ -691,7 +745,7 @@ fn scan_content_for_text_operators(
     while i < content.len() {
         let b = content[i];
 
-        // Look for 'T' followed by 'j' or 'J'
+        // Look for 'T' followed by 'j', 'J', or 'f'
         if b == b'T' && i + 1 < content.len() {
             let next = content[i + 1];
             if next == b'j' || next == b'J' {
@@ -704,6 +758,15 @@ fn scan_content_for_text_operators(
                     text_ops += 1;
                     // Scan backward for text string operand to collect unique chars
                     collect_text_chars_before(content, i, unique_chars);
+                }
+            } else if next == b'f' {
+                // Tf = set font operator
+                if i + 2 >= content.len()
+                    || content[i + 2].is_ascii_whitespace()
+                    || content[i + 2] == b'\n'
+                    || content[i + 2] == b'\r'
+                {
+                    font_changes += 1;
                 }
             }
         }
@@ -749,7 +812,7 @@ fn scan_content_for_text_operators(
         i += 1;
     }
 
-    (text_ops, image_count, path_ops)
+    (text_ops, image_count, path_ops, font_changes)
 }
 
 /// Scan backward from a Tj/TJ operator to find the preceding string operand
@@ -1108,7 +1171,7 @@ mod tests {
 
         // Sample PDF content stream with text operators
         let content = b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET";
-        let (ops, imgs, _) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, imgs, _, _) = scan_content_for_text_operators(content, &mut uchars);
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0);
         // "Hello World" without space: H, e, l, o, W, r, d = 7 unique
@@ -1117,7 +1180,7 @@ mod tests {
         // Content with TJ array
         uchars.clear();
         let content2 = b"BT /F1 12 Tf 100 700 Td [(H) 10 (ello)] TJ ET";
-        let (ops2, _, _) = scan_content_for_text_operators(content2, &mut uchars);
+        let (ops2, _, _, _) = scan_content_for_text_operators(content2, &mut uchars);
         assert_eq!(ops2, 1);
         // H, e, l, o = 4 unique
         assert!(uchars.len() >= 4);
@@ -1125,7 +1188,7 @@ mod tests {
         // Content with Do (image)
         uchars.clear();
         let content3 = b"q 100 0 0 100 50 700 cm /Img1 Do Q";
-        let (ops3, imgs3, _) = scan_content_for_text_operators(content3, &mut uchars);
+        let (ops3, imgs3, _, _) = scan_content_for_text_operators(content3, &mut uchars);
         assert_eq!(ops3, 0);
         assert_eq!(imgs3, 1);
     }
@@ -1144,7 +1207,7 @@ mod tests {
         content.extend_from_slice(b"BT (x) Tj ET\n");
 
         let mut uchars = HashSet::new();
-        let (ops, imgs, _) = scan_content_for_text_operators(&content, &mut uchars);
+        let (ops, imgs, _, _) = scan_content_for_text_operators(&content, &mut uchars);
         assert_eq!(ops, 3);
         assert_eq!(imgs, 50);
         // Only 'x' unique char
@@ -1162,7 +1225,7 @@ mod tests {
         let content = b"BT /F1 12 Tf (The quick brown fox jumps over the lazy dog) Tj ET\n\
                          /Img1 Do\n/Img2 Do\n";
         let mut uchars = HashSet::new();
-        let (ops, imgs, _) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, imgs, _, _) = scan_content_for_text_operators(content, &mut uchars);
         assert_eq!(ops, 1);
         assert_eq!(imgs, 2);
         // Many unique chars from the sentence
@@ -1185,7 +1248,7 @@ mod tests {
         content.extend_from_slice(b"f\n");
 
         let mut uchars = HashSet::new();
-        let (text, imgs, paths) = scan_content_for_text_operators(&content, &mut uchars);
+        let (text, imgs, paths, _) = scan_content_for_text_operators(&content, &mut uchars);
         assert_eq!(text, 1);
         assert_eq!(imgs, 0);
         // 500 * (m + l + c + h) + 1 f = 2001
@@ -1210,7 +1273,7 @@ mod tests {
         }
 
         let mut uchars = HashSet::new();
-        let (text, _, paths) = scan_content_for_text_operators(&content, &mut uchars);
+        let (text, _, paths, _) = scan_content_for_text_operators(&content, &mut uchars);
         assert_eq!(text, 20);
         assert!(paths >= 40, "expected >= 40 path ops, got {paths}");
 
@@ -1331,5 +1394,38 @@ mod tests {
             }),
         );
         assert!(!page_has_identity_h_no_tounicode(&doc, page_id));
+    }
+
+    #[test]
+    fn test_scan_content_counts_tf_operators() {
+        let mut uchars = HashSet::new();
+        let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
+        let (ops, _, _, fonts) = scan_content_for_text_operators(content, &mut uchars);
+        assert_eq!(ops, 2);
+        assert_eq!(fonts, 2);
+    }
+
+    #[test]
+    fn test_newspaper_heuristic_thresholds() {
+        // Newspaper page: high text ops, moderate font changes, low ratio
+        let text_ops = 3500u32;
+        let font_changes = 150u32;
+        let ratio = font_changes as f32 / text_ops as f32;
+        assert!(text_ops >= 1500);
+        assert!(font_changes >= 50);
+        assert!(ratio < 0.15); // 0.043
+
+        // Dense styled doc (DPA/contract): high text ops, very high font changes, high ratio
+        let text_ops = 1800u32;
+        let font_changes = 540u32;
+        let ratio = font_changes as f32 / text_ops as f32;
+        assert!(text_ops >= 1500);
+        assert!(font_changes >= 50);
+        assert!(ratio >= 0.15); // 0.30 — should NOT trigger newspaper heuristic
+
+        // Normal doc: low text ops — doesn't qualify at all
+        let text_ops = 300u32;
+        let font_changes = 50u32;
+        assert!(text_ops < 1500);
     }
 }
