@@ -212,17 +212,34 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             })
             .collect();
 
+        log::debug!(
+            "body-font pass: {} candidates (base={:.1}, range={:.1}..{:.1})",
+            body_candidates.len(),
+            base_font_size,
+            body_font_low,
+            body_font_high,
+        );
         if body_candidates.len() >= 9 {
             let regions = find_table_regions_strict(&body_candidates);
+            log::debug!("body-font: {} strict regions found", regions.len());
 
-            for (y_min, y_max, x_min, x_max) in regions {
+            for (y_min, y_max, _x_min, _x_max) in &regions {
+                // Use full X range for region items — the strict X bounds from
+                // qualifying rows can exclude continuation lines in wrapped cells.
+                // Y bounds from the region are sufficient to scope the table area.
                 let region_items: Vec<(usize, &TextItem)> = body_candidates
                     .iter()
-                    .filter(|(_, item)| {
-                        item.y >= y_min && item.y <= y_max && item.x >= x_min && item.x <= x_max
-                    })
+                    .filter(|(_, item)| item.y >= *y_min && item.y <= *y_max)
                     .cloned()
                     .collect();
+
+                log::debug!(
+                    "  region y={:.0}..{:.0}: {} items of {} candidates",
+                    y_min,
+                    y_max,
+                    region_items.len(),
+                    body_candidates.len()
+                );
 
                 if region_items.len() < 9 {
                     continue;
@@ -344,19 +361,38 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
         }
     }
 
+    log::debug!(
+        "find_table_regions_strict: {} row groups, {} qualifying (3+ X-clusters)",
+        row_groups.len(),
+        qualifying_rows.len()
+    );
     if qualifying_rows.len() < 3 {
         return vec![];
     }
 
-    // Step 3: Find contiguous runs of qualifying rows (25pt max Y-gap)
+    // Step 3: Find contiguous runs of qualifying rows.
+    // Use adaptive gap: median spacing × 3 (handles wrapped cells where
+    // qualifying rows are spaced further apart), with a floor of 25pt.
     qualifying_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let max_gap = if qualifying_rows.len() >= 3 {
+        let mut gaps: Vec<f32> = qualifying_rows
+            .windows(2)
+            .map(|w| (w[1].0 - w[0].0).abs())
+            .collect();
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_gap = gaps[gaps.len() / 2];
+        (median_gap * 3.0).max(25.0)
+    } else {
+        25.0
+    };
 
     let mut candidate_regions: Vec<Vec<&(f32, Vec<f32>)>> = Vec::new();
     let mut current_region: Vec<&(f32, Vec<f32>)> = vec![&qualifying_rows[0]];
 
     for row in qualifying_rows.iter().skip(1) {
         let prev_y = current_region.last().unwrap().0;
-        if row.0 - prev_y > 25.0 {
+        if row.0 - prev_y > max_gap {
             if current_region.len() >= 3 {
                 candidate_regions.push(current_region);
             }
@@ -436,6 +472,11 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         TableDetectionMode::BodyFont => 3,
     };
     if columns.len() < min_cols || columns.len() > 25 {
+        log::debug!(
+            "  detect_table_in_region: rejected {} cols (need {}..25)",
+            columns.len(),
+            min_cols
+        );
         return None;
     }
 
@@ -446,6 +487,11 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         TableDetectionMode::BodyFont => 3,
     };
     if rows.len() < min_rows {
+        log::debug!(
+            "  detect_table_in_region: rejected {} rows (need {}+)",
+            rows.len(),
+            min_rows
+        );
         return None;
     }
 
@@ -456,6 +502,13 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         TableDetectionMode::BodyFont => 0.7,
     };
     if col_alignment < min_alignment {
+        log::debug!(
+            "  detect_table_in_region: rejected alignment {:.2} < {:.2} ({} cols, {} rows)",
+            col_alignment,
+            min_alignment,
+            columns.len(),
+            rows.len()
+        );
         return None;
     }
 

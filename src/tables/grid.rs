@@ -116,6 +116,13 @@ pub(crate) fn find_column_boundaries(
         })
         .collect();
 
+    log::debug!(
+        "  find_column_boundaries: {} columns before filter, threshold={:.1}, {} items",
+        columns.len(),
+        cluster_threshold,
+        items.len()
+    );
+
     // Anti-paragraph safeguard for BodyFont mode:
     // Paragraphs concentrate items at the left margin; tables distribute evenly.
     // Reject if any single column has >60% of all items.

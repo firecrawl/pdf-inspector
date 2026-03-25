@@ -649,6 +649,33 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 .collect()
         };
 
+        // When the page is split into bands but no band produces a table,
+        // retry with all items merged as a single band.  This handles
+        // borderless tables whose column alignment is misclassified as
+        // page-layout columns by split_side_by_side.
+        let was_split = band_specs.len() > 1;
+        log::debug!(
+            "page {}: {} bands (was_split={})",
+            page,
+            band_specs.len(),
+            was_split
+        );
+        let merged_band: BandSpec = if was_split {
+            let identity: Vec<usize> = (0..page_items.len()).collect();
+            (
+                page_items.clone(),
+                identity,
+                rects.iter().filter(|r| r.page == page).cloned().collect(),
+                pdf_lines
+                    .iter()
+                    .filter(|l| l.page == page)
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+
         for (band_items, band_index_map, band_rects, band_lines) in &band_specs {
             if band_items.is_empty() {
                 continue;
@@ -873,6 +900,36 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         .or_default()
                         .push((table_y, table_md));
                 }
+            }
+        }
+
+        // Merged-band retry: if we split into bands but found no tables in
+        // any band, retry heuristic detection with all items as a single band.
+        // This catches borderless tables whose text-column alignment was
+        // misclassified as page-layout columns.
+        if was_split && !page_tables.contains_key(&page) && !merged_band.0.is_empty() {
+            let (ref band_items, ref band_index_map, _, _) = merged_band;
+            log::debug!(
+                "page {}: merged-band retry ({} items, was_split={})",
+                page,
+                band_items.len(),
+                was_split
+            );
+            let heuristic_tables = detect_tables(band_items, base_size, false);
+            for table in &heuristic_tables {
+                for &idx in &table.item_indices {
+                    if let Some(&page_idx) = band_index_map.get(idx) {
+                        if let Some(&(global_idx, _)) = group.get(page_idx) {
+                            table_items.insert(global_idx);
+                        }
+                    }
+                }
+                let table_y = table.rows.first().copied().unwrap_or(0.0);
+                let table_md = table_to_markdown(table);
+                page_tables
+                    .entry(page)
+                    .or_default()
+                    .push((table_y, table_md));
             }
         }
     }
