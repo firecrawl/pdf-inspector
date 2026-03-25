@@ -430,6 +430,22 @@ pub fn detect_tables_from_rects(
             }
         }
 
+        // Cell-rect fallback: when per-cluster attempts all fail, try using
+        // rect Y-edges for rows + text X-positions for columns on each failed
+        // cluster.  Handles tables with cell-background rects that don't form
+        // a clean grid (variable column widths, decoration fills).
+        if tables.is_empty() {
+            for fc_rects in &failed_clusters {
+                if fc_rects.len() >= 20 {
+                    if let Some(table) =
+                        detect_row_stripe_table_from_cell_rects(items, fc_rects, page)
+                    {
+                        tables.push(table);
+                    }
+                }
+            }
+        }
+
         // Row-stripe fallback: when clustering produces no large clusters
         // (row stripes don't overlap so each is its own cluster of 1),
         // try all page rects directly as a row-stripe table.
@@ -526,8 +542,11 @@ pub fn detect_tables_from_rects(
                     .count();
                 let w = x_right - x_left;
                 // Require reasonable dimensions: height ≥100pt (≈5+ rows),
-                // width ≤500pt (not page-spanning), height ≤600pt (not full page)
-                if (100.0..=600.0).contains(&h) && w <= 500.0 && items_inside >= 6 {
+                // height ≤600pt (not full page).
+                // Width check: ≤500pt normally, but allow wider for large
+                // clusters (≥30 rects) that are clearly structured.
+                let max_w = if fc_rects.len() >= 30 { 800.0 } else { 500.0 };
+                if (100.0..=600.0).contains(&h) && w <= max_w && items_inside >= 6 {
                     debug!(
                         "page {}: failed-cluster hint from {} rects ({} items): x={:.1}..{:.1} y={:.1}..{:.1} ({:.0}×{:.0})",
                         page, fc_rects.len(), items_inside, x_left, x_right, y_bottom, y_top,
@@ -1387,6 +1406,154 @@ fn detect_row_stripe_table(
         num_rows,
         num_cols,
         content_ratio * 100.0
+    );
+
+    Some(Table {
+        columns: column_centers,
+        rows: row_centers,
+        cells,
+        item_indices,
+    })
+}
+
+/// Detect a table from cell-background rects that failed grid detection.
+///
+/// Uses rect Y-edges for row boundaries and text X-position clustering for
+/// columns.  Handles tables with cell backgrounds that don't form a clean
+/// X-edge grid (variable column widths, decorative fills).
+fn detect_row_stripe_table_from_cell_rects(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
+    if group_rects.len() < 20 {
+        return None;
+    }
+
+    // Extract Y-edges from rects
+    let mut y_edges: Vec<f32> = Vec::new();
+    for &(_, y, _, h) in group_rects {
+        y_edges.push(y);
+        y_edges.push(y + h);
+    }
+    let y_edges = snap_edges(&y_edges, 6.0);
+
+    if y_edges.len() < 4 {
+        return None;
+    }
+
+    let mut row_edges = y_edges;
+    row_edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Compute bounding box from non-full-page rects
+    let median_h = {
+        let mut heights: Vec<f32> = group_rects.iter().map(|&(_, _, _, h)| h).collect();
+        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        heights[heights.len() / 2]
+    };
+    let content_rects: Vec<_> = group_rects
+        .iter()
+        .filter(|&&(_, _, _, h)| h < median_h * 10.0)
+        .collect();
+    if content_rects.is_empty() {
+        return None;
+    }
+
+    let x_left = content_rects
+        .iter()
+        .map(|&&(x, _, _, _)| x)
+        .reduce(f32::min)?;
+    let x_right = content_rects
+        .iter()
+        .map(|&&(x, _, w, _)| x + w)
+        .reduce(f32::max)?;
+    let y_top = row_edges[0];
+    let y_bottom = *row_edges.last()?;
+
+    // Gather items within the rect region
+    let page_items: Vec<(usize, &TextItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.page == page
+                && item.y >= y_bottom - 2.0
+                && item.y <= y_top + 2.0
+                && item.x >= x_left - 5.0
+                && item.x + item.width <= x_right + 5.0
+        })
+        .collect();
+
+    if page_items.is_empty() {
+        return None;
+    }
+
+    // Derive columns from text X-position clustering
+    let columns = cluster_x_positions(&page_items, 15.0);
+    if columns.len() < 2 {
+        return None;
+    }
+
+    // Build column edges
+    let mut col_edges: Vec<f32> = Vec::with_capacity(columns.len() + 1);
+    let min_x = page_items.iter().map(|(_, i)| i.x).reduce(f32::min)?;
+    col_edges.push(min_x - 5.0);
+    for pair in columns.windows(2) {
+        col_edges.push((pair[0] + pair[1]) / 2.0);
+    }
+    let max_x_right = page_items
+        .iter()
+        .map(|(_, i)| i.x + i.width)
+        .reduce(f32::max)?;
+    col_edges.push(max_x_right + 5.0);
+
+    let num_cols = col_edges.len() - 1;
+    let num_rows = row_edges.len() - 1;
+
+    debug!(
+        "  cell-rect table: {}x{} from {} rects, {} items",
+        num_rows,
+        num_cols,
+        group_rects.len(),
+        page_items.len()
+    );
+
+    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+
+    if item_indices.is_empty() {
+        return None;
+    }
+
+    // Validate: >=2 non-empty rows, >=25% density
+    let non_empty_rows = cells
+        .iter()
+        .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
+        .count();
+    if non_empty_rows < 2 {
+        return None;
+    }
+
+    let total_cells = (num_cols * num_rows) as f32;
+    let non_empty_cells = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    if total_cells > 0.0 && (non_empty_cells as f32 / total_cells) < 0.25 {
+        return None;
+    }
+
+    let column_centers: Vec<f32> = (0..num_cols)
+        .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
+        .collect();
+    let row_centers: Vec<f32> = (0..num_rows)
+        .map(|r| (row_edges[r] + row_edges[r + 1]) / 2.0)
+        .collect();
+
+    debug!(
+        "  cell-rect table accepted: {}x{}, {:.0}% density",
+        num_rows,
+        num_cols,
+        non_empty_cells as f32 / total_cells * 100.0
     );
 
     Some(Table {
