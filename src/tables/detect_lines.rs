@@ -144,17 +144,23 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
         return Vec::new();
     }
 
-    // Validate vertical lines: at least 2 should span >30% of table height.
-    // Real table columns extend most of the table height.
+    // Validate vertical lines: at least 2 should span a meaningful height.
+    // Full spanning (>30%) is ideal, but accept many shorter lines (>10%)
+    // for tables with partial column separators.
     let spanning_v = verticals
         .iter()
         .filter(|(_, y_min, y_max)| (y_max - y_min) > table_height * 0.3)
         .count();
-    if spanning_v < 2 {
+    let partial_v = verticals
+        .iter()
+        .filter(|(_, y_min, y_max)| (y_max - y_min) > table_height * 0.10)
+        .count();
+    if spanning_v < 2 && partial_v < 4 {
         log::debug!(
-            "detect_lines p{}: rejected — only {} spanning V lines (need 2)",
+            "detect_lines p{}: rejected — {} spanning + {} partial V lines",
             page,
-            spanning_v
+            spanning_v,
+            partial_v
         );
         return Vec::new();
     }
