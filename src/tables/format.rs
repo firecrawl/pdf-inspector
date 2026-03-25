@@ -107,11 +107,33 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let looks_like_data_row = non_first_cells.len() >= 2
             && avg_cell_len <= 10.0
             && numeric_cells > non_first_cells.len() / 2;
-        let is_continuation = first_cell.is_empty()
+        // Classic continuation: first cell empty, content in other cells
+        let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
             && !is_short_subheader
             && !looks_like_data_row
-            && cleaned.len() > 1; // Don't merge into the first row (header)
+            && cleaned.len() > 1;
+
+        // Wrapped-cell continuation: row has fewer filled cells than the header
+        // row, suggesting it's overflow text from the previous row's cells.
+        // Only trigger when the previous row has significantly more filled cells.
+        let num_cols = row.len();
+        let filled_cells = row.iter().filter(|c| !c.trim().is_empty()).count();
+        let prev_filled = cleaned
+            .last()
+            .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
+            .unwrap_or(0);
+        let header_filled = cleaned
+            .first()
+            .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
+            .unwrap_or(num_cols);
+        let is_wrapped_continuation = cleaned.len() > 1
+            && filled_cells < header_filled
+            && prev_filled > filled_cells
+            && !looks_like_data_row
+            && !is_short_subheader;
+
+        let is_continuation = is_classic_continuation || is_wrapped_continuation;
 
         if is_continuation {
             // Merge with previous row
