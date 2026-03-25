@@ -966,16 +966,52 @@ fn try_build_grid(
         }
     }
 
-    // Reject tables with any completely empty column — indicates a bad grid.
-    for col in 0..num_cols {
+    // Trim empty outer columns (rect edges beyond text), reject if any
+    // interior column is empty — that indicates a bad grid.
+    let first_non_empty = (0..num_cols).find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    let last_non_empty = (0..num_cols).rev().find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    let (first_col, last_col) = match (first_non_empty, last_non_empty) {
+        (Some(f), Some(l)) if l > f => (f, l),
+        _ => {
+            debug!("  rejected: no content columns");
+            return GridResult::Failed;
+        }
+    };
+    // Check interior columns
+    for col in first_col..=last_col {
         let col_has_content = cells
             .iter()
             .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
         if !col_has_content {
-            debug!("  rejected: column {} is completely empty", col);
+            debug!("  rejected: interior column {} is completely empty", col);
             return GridResult::Failed;
         }
     }
+    // Trim outer empty columns
+    let (columns, cells) = if first_col > 0 || last_col < num_cols - 1 {
+        let trimmed_cols: Vec<f32> = columns[first_col..=last_col].to_vec();
+        let trimmed_cells: Vec<Vec<String>> = cells
+            .iter()
+            .map(|row| row[first_col..=last_col].to_vec())
+            .collect();
+        debug!(
+            "  trimmed {} empty outer columns ({}..={})",
+            (num_cols - 1 - last_col + first_col),
+            first_col,
+            last_col
+        );
+        (trimmed_cols, trimmed_cells)
+    } else {
+        (columns, cells)
+    };
 
     GridResult::Ok(Table {
         columns,

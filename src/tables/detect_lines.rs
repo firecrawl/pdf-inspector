@@ -72,6 +72,13 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
     let v_xs: Vec<f32> = verticals.iter().map(|(x, _, _)| *x).collect();
     let col_edges = snap_edges(&v_xs, 3.0);
 
+    log::debug!(
+        "detect_lines p{}: {} row edges, {} col edges after snap",
+        page,
+        row_edges.len(),
+        col_edges.len()
+    );
+
     // Require at least 2 columns (3 col edges) and 2 rows (3 row edges).
     // A single column of horizontal lines is just separator rules, not a table.
     if row_edges.len() < 3 || col_edges.len() < 3 {
@@ -80,6 +87,12 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
 
     // Cap grid size: >20 columns is almost certainly a diagram, not a table
     if col_edges.len() > 21 || row_edges.len() > 80 {
+        log::debug!(
+            "detect_lines p{}: rejected — too many edges ({}x{})",
+            page,
+            row_edges.len(),
+            col_edges.len()
+        );
         return Vec::new();
     }
 
@@ -101,16 +114,33 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
     // dimension in both axes, it's a border frame, not a table.
     // Standard pages are ~595×842 (A4) or ~612×792 (Letter).
     if table_width > 500.0 && table_height > 700.0 {
+        log::debug!(
+            "detect_lines p{}: rejected — page-spanning frame ({:.0}×{:.0})",
+            page,
+            table_width,
+            table_height
+        );
         return Vec::new();
     }
 
-    // Validate horizontal lines: at least 3 should span >50% of table width.
-    // This filters out short segments that accidentally align.
+    // Validate horizontal lines: at least 3 should span a meaningful width.
+    // Full-width spanning (>50%) is ideal, but tables with partial horizontal
+    // rules (column-level separators) are also valid if there are enough.
     let spanning_h = horizontals
         .iter()
         .filter(|(_, x_min, x_max)| (x_max - x_min) > table_width * 0.5)
         .count();
-    if spanning_h < 3 {
+    let partial_h = horizontals
+        .iter()
+        .filter(|(_, x_min, x_max)| (x_max - x_min) > table_width * 0.15)
+        .count();
+    if spanning_h < 3 && partial_h < 6 {
+        log::debug!(
+            "detect_lines p{}: rejected — {} spanning + {} partial H lines",
+            page,
+            spanning_h,
+            partial_h
+        );
         return Vec::new();
     }
 
@@ -121,6 +151,11 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
         .filter(|(_, y_min, y_max)| (y_max - y_min) > table_height * 0.3)
         .count();
     if spanning_v < 2 {
+        log::debug!(
+            "detect_lines p{}: rejected — only {} spanning V lines (need 2)",
+            page,
+            spanning_v
+        );
         return Vec::new();
     }
 
