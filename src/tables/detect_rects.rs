@@ -1523,12 +1523,16 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
-    // Validate: >=2 non-empty rows, >=25% density
+    // Validate: >=2 non-empty rows, >=15% density
     let non_empty_rows = cells
         .iter()
         .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
         .count();
     if non_empty_rows < 2 {
+        debug!(
+            "  cell-rect rejected: only {} non-empty rows",
+            non_empty_rows
+        );
         return None;
     }
 
@@ -1538,7 +1542,16 @@ fn detect_row_stripe_table_from_cell_rects(
         .flat_map(|row| row.iter())
         .filter(|c| !c.trim().is_empty())
         .count();
-    if total_cells > 0.0 && (non_empty_cells as f32 / total_cells) < 0.25 {
+    let density = if total_cells > 0.0 {
+        non_empty_cells as f32 / total_cells
+    } else {
+        0.0
+    };
+    if density < 0.15 {
+        debug!(
+            "  cell-rect rejected: density {:.0}% < 15%",
+            density * 100.0
+        );
         return None;
     }
 

@@ -266,6 +266,12 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             .collect();
         table.item_indices = original_indices.into_iter().collect();
         table.item_indices.sort_unstable();
+        log::debug!(
+            "  heuristic table: {}x{}, {} item indices",
+            table.rows.len(),
+            table.columns.len(),
+            table.item_indices.len()
+        );
     }
 
     tables
@@ -495,6 +501,13 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         return None;
     }
 
+    log::debug!(
+        "  detect_table_in_region: {} cols, {} rows, {} items",
+        columns.len(),
+        rows.len(),
+        items.len()
+    );
+
     // Verify this looks like a table: multiple items should align to columns
     let col_alignment = check_column_alignment(items, &columns, mode);
     let min_alignment = match mode {
@@ -634,21 +647,25 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
 
     // Validation 6: Check column count consistency
     if !has_consistent_columns(&cells) {
+        log::debug!("  validation 6 fail: inconsistent columns");
         return None;
     }
 
     // Validation 7: Tables should have some numeric/data content
     if !has_table_like_content(&cells, mode) {
+        log::debug!("  validation 7 fail: no table-like content");
         return None;
     }
 
     // Validation 8: Check for Table of Contents pattern
     if is_table_of_contents(&cells) {
+        log::debug!("  validation 8 fail: table of contents");
         return None;
     }
 
     // Validation 9: Reject paragraph-like content falsely detected as tables
     if is_paragraph_content(&cells) {
+        log::debug!("  validation 9 fail: paragraph content");
         return None;
     }
 
