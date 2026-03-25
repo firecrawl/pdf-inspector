@@ -580,9 +580,11 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         cells.push(row_cells);
     }
 
-    // Validation 1: most rows should have content in first column
+    // Validation 1: some rows should have content in first column.
+    // Use a lower threshold (25%) for tables with wrapped cells where
+    // continuation lines leave the first column empty.
     let rows_with_first_col = cells.iter().filter(|row| !row[0].is_empty()).count();
-    if rows_with_first_col < rows.len() / 2 {
+    if rows_with_first_col < rows.len() / 4 {
         log::debug!(
             "  validation 1 fail: {}/{} rows have first col",
             rows_with_first_col,

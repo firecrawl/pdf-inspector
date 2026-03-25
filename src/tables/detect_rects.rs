@@ -435,8 +435,13 @@ pub fn detect_tables_from_rects(
         // cluster.  Handles tables with cell-background rects that don't form
         // a clean grid (variable column widths, decoration fills).
         if tables.is_empty() {
+            debug!(
+                "page {}: cell-rect fallback: {} failed clusters",
+                page,
+                failed_clusters.len()
+            );
             for fc_rects in &failed_clusters {
-                if fc_rects.len() >= 20 {
+                if fc_rects.len() >= 6 {
                     if let Some(table) =
                         detect_row_stripe_table_from_cell_rects(items, fc_rects, page)
                     {
@@ -1455,7 +1460,7 @@ fn detect_row_stripe_table_from_cell_rects(
     group_rects: &[(f32, f32, f32, f32)],
     page: u32,
 ) -> Option<Table> {
-    if group_rects.len() < 20 {
+    if group_rects.len() < 6 {
         return None;
     }
 
@@ -1467,12 +1472,76 @@ fn detect_row_stripe_table_from_cell_rects(
     }
     let y_edges = snap_edges(&y_edges, 6.0);
 
-    if y_edges.len() < 4 {
-        return None;
-    }
-
-    let mut row_edges = y_edges;
-    row_edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    // If rect Y-edges are insufficient for row structure, use the rect
+    // bounding box to scope items and derive rows from text Y-positions.
+    let row_edges = if y_edges.len() >= 4 {
+        let mut edges = y_edges;
+        edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        edges
+    } else {
+        // Fall back: gather items in the rect region and cluster by Y
+        let y_min = y_edges.first().copied().unwrap_or(0.0);
+        let y_max = y_edges.last().copied().unwrap_or(0.0);
+        let x_min = group_rects
+            .iter()
+            .map(|r| r.0)
+            .reduce(f32::min)
+            .unwrap_or(0.0);
+        let x_max = group_rects
+            .iter()
+            .map(|r| r.0 + r.2)
+            .reduce(f32::max)
+            .unwrap_or(0.0);
+        let region_items: Vec<&TextItem> = items
+            .iter()
+            .filter(|i| {
+                i.page == page
+                    && i.y >= y_min - 5.0
+                    && i.y <= y_max + 5.0
+                    && i.x >= x_min - 5.0
+                    && i.x <= x_max + 5.0
+            })
+            .collect();
+        if region_items.len() < 4 {
+            return None;
+        }
+        // Cluster Y positions using median font height as threshold
+        let median_h = {
+            let mut hs: Vec<f32> = region_items.iter().map(|i| i.height).collect();
+            hs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            hs[hs.len() / 2]
+        };
+        let mut ys: Vec<f32> = region_items.iter().map(|i| i.y).collect();
+        ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let mut edges = Vec::new();
+        let threshold = median_h * 0.8;
+        let mut cluster_start = ys[0];
+        let mut cluster_sum = ys[0];
+        let mut cluster_count = 1.0f32;
+        for &y in &ys[1..] {
+            if (cluster_sum / cluster_count - y).abs() > threshold {
+                let center = cluster_sum / cluster_count;
+                edges.push(center + median_h * 0.5);
+                edges.push(center - median_h * 0.5);
+                cluster_start = y;
+                cluster_sum = y;
+                cluster_count = 1.0;
+            } else {
+                cluster_sum += y;
+                cluster_count += 1.0;
+            }
+        }
+        let center = cluster_sum / cluster_count;
+        edges.push(center + median_h * 0.5);
+        edges.push(center - median_h * 0.5);
+        let _ = cluster_start; // suppress unused warning
+        edges = snap_edges(&edges, 3.0);
+        edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        if edges.len() < 4 {
+            return None;
+        }
+        edges
+    };
 
     // Compute bounding box from non-full-page rects
     let median_h = {
