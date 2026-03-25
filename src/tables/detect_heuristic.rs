@@ -571,6 +571,11 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     // Validation 1: most rows should have content in first column
     let rows_with_first_col = cells.iter().filter(|row| !row[0].is_empty()).count();
     if rows_with_first_col < rows.len() / 2 {
+        log::debug!(
+            "  validation 1 fail: {}/{} rows have first col",
+            rows_with_first_col,
+            rows.len()
+        );
         return None;
     }
 
@@ -584,6 +589,12 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         TableDetectionMode::BodyFont => (rows.len() / 2).max(1),  // 50%
     };
     if rows_with_multi_cols < multi_col_threshold {
+        log::debug!(
+            "  validation 2 fail: {}/{} rows multi-col (need {})",
+            rows_with_multi_cols,
+            rows.len(),
+            multi_col_threshold
+        );
         return None;
     }
 
@@ -604,14 +615,20 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     let avg_cells_per_row = total_filled as f32 / rows.len() as f32;
     let min_avg_cells = match mode {
         TableDetectionMode::SmallFont => 1.5,
-        TableDetectionMode::BodyFont => 2.5,
+        TableDetectionMode::BodyFont => 2.0,
     };
     if avg_cells_per_row < min_avg_cells {
+        log::debug!(
+            "  validation 4 fail: avg_cells={:.1} < {:.1}",
+            avg_cells_per_row,
+            min_avg_cells
+        );
         return None;
     }
 
     // Validation 5: Check for key-value pair layout (NOT a table)
     if is_key_value_layout(&cells) {
+        log::debug!("  validation 5 fail: key-value layout");
         return None;
     }
 

@@ -66,13 +66,19 @@ pub(crate) fn find_column_boundaries(
         let threshold = (consec_gaps[best_split]
             + consec_gaps[(best_split + 1).min(consec_gaps.len() - 1)])
             / 2.0;
-        // Only override for genuinely dense tables: many items packed into
-        // a wide range (e.g. 1200+ items for a 24-column train schedule).
-        // Smaller item counts (< 500) with a bimodal gap pattern are usually
-        // normal tables where center-based clustering works correctly.
+        // Override for tables with a clear bimodal gap pattern:
+        // - Dense tables (500+ items, e.g. 24-column train schedule): use
+        //   edge-based clustering with the detected threshold.
+        // - Smaller tables with a strong bimodal signal (jump > 10pt):
+        //   lower the threshold but keep center-based clustering to avoid
+        //   over-splitting.
         if threshold < 15.0 && best_jump > 2.0 && x_positions.len() > 500 {
             cluster_threshold = threshold.clamp(8.0, 25.0);
             use_edge_clustering = true;
+        } else if best_jump > 10.0 && threshold < cluster_threshold {
+            // Strong bimodal signal even with fewer items — the gap between
+            // within-column jitter and between-column spacing is unambiguous.
+            cluster_threshold = threshold.max(8.0);
         }
     }
 
