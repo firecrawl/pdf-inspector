@@ -478,10 +478,7 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
 fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode) -> Option<Table> {
     // Find column boundaries
     let columns = find_column_boundaries(items, mode);
-    let min_cols = match mode {
-        TableDetectionMode::SmallFont => 2,
-        TableDetectionMode::BodyFont => 3,
-    };
+    let min_cols = 2;
     if columns.len() < min_cols || columns.len() > 25 {
         log::debug!(
             "  detect_table_in_region: rejected {} cols (need {}..25)",
@@ -493,10 +490,7 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
 
     // Find row boundaries
     let rows = find_row_boundaries(items);
-    let min_rows = match mode {
-        TableDetectionMode::SmallFont => 2,
-        TableDetectionMode::BodyFont => 3,
-    };
+    let min_rows = 2;
     if rows.len() < min_rows {
         log::debug!(
             "  detect_table_in_region: rejected {} rows (need {}+)",
@@ -631,10 +625,7 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         .map(|row| row.iter().filter(|c| !c.is_empty()).count())
         .sum();
     let avg_cells_per_row = total_filled as f32 / rows.len() as f32;
-    let min_avg_cells = match mode {
-        TableDetectionMode::SmallFont => 1.5,
-        TableDetectionMode::BodyFont => 2.0,
-    };
+    let min_avg_cells = 1.5;
     if avg_cells_per_row < min_avg_cells {
         log::debug!(
             "  validation 4 fail: avg_cells={:.1} < {:.1}",
