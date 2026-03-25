@@ -127,8 +127,18 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             .first()
             .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
             .unwrap_or(num_cols);
+        // Merge when the row has significantly fewer filled cells than header.
+        // For wide tables (5+ cols), require ≤50% of header cells.
+        // For narrow tables (2-4 cols), require fewer than header cells.
+        // This prevents merging normal data rows in wide tables (6_KE_Chart)
+        // while allowing continuation merging in narrow tables (178).
+        let max_filled_for_merge = if header_filled >= 5 {
+            header_filled / 2
+        } else {
+            header_filled.saturating_sub(1)
+        };
         let is_wrapped_continuation = cleaned.len() > 1
-            && filled_cells < header_filled
+            && filled_cells <= max_filled_for_merge
             && prev_filled > filled_cells
             && !looks_like_data_row
             && !is_short_subheader;

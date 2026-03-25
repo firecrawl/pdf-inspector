@@ -1621,7 +1621,7 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
-    // Validate: >=2 non-empty rows, >=15% density
+    // Validate: >=2 non-empty rows, >=25% density
     let non_empty_rows = cells
         .iter()
         .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
@@ -1645,10 +1645,34 @@ fn detect_row_stripe_table_from_cell_rects(
     } else {
         0.0
     };
-    if density < 0.15 {
+    if density < 0.25 {
         debug!(
-            "  cell-rect rejected: density {:.0}% < 15%",
+            "  cell-rect rejected: density {:.0}% < 25%",
             density * 100.0
+        );
+        return None;
+    }
+
+    // Reject tables with paragraph-length cells (layout backgrounds, not tables)
+    let max_cell_len = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|c| c.len())
+        .max()
+        .unwrap_or(0);
+    if max_cell_len > 500 {
+        debug!(
+            "  cell-rect rejected: max cell length {} > 500",
+            max_cell_len
+        );
+        return None;
+    }
+
+    // Reject wildly disproportionate grids (e.g. 68x6 from decorative rects)
+    if num_rows > 20 && num_cols < 4 {
+        debug!(
+            "  cell-rect rejected: disproportionate grid {}x{}",
+            num_rows, num_cols
         );
         return None;
     }
