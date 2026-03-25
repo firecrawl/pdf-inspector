@@ -362,13 +362,13 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
             }
         }
 
-        if cluster_starts.len() >= 3 {
+        if cluster_starts.len() >= 2 {
             qualifying_rows.push((*y, cluster_starts));
         }
     }
 
     log::debug!(
-        "find_table_regions_strict: {} row groups, {} qualifying (3+ X-clusters)",
+        "find_table_regions_strict: {} row groups, {} qualifying (2+ X-clusters)",
         row_groups.len(),
         qualifying_rows.len()
     );
@@ -448,6 +448,11 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
         } else {
             0.0
         };
+        log::debug!(
+            "  candidate region: {} rows, avg alignment score={:.2}",
+            num_rows,
+            avg_score
+        );
         if avg_score >= 0.5 {
             let y_min = region_rows.first().unwrap().0;
             let y_max = region_rows.last().unwrap().0;
@@ -802,9 +807,10 @@ fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bo
         TableDetectionMode::BodyFont => 0.3,
     };
 
-    // For SmallFont, bypass content check for wide tables (5+ columns may have text headers).
-    // For BodyFont, always require data-like content to prevent paragraph false positives.
-    pct_data > min_pct || (mode == TableDetectionMode::SmallFont && num_cols >= 5)
+    // Bypass content check for wide tables (3+ columns) — text-only tables
+    // (category lists, program descriptions) are legitimate if they passed
+    // all structural validations (alignment, consistency, not key-value).
+    pct_data > min_pct || num_cols >= 3
 }
 
 /// Check if a cell value looks like table data

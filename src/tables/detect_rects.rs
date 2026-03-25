@@ -1375,24 +1375,53 @@ fn detect_row_stripe_table(
         .map(|c| c.len())
         .max()
         .unwrap_or(0);
-    if max_cell_len > 500 {
+    // Allow longer cells for multi-column tables (descriptions in one column
+    // are common).  Single-column or 2-column "tables" with giant cells are
+    // almost always layout backgrounds.
+    let max_allowed = if num_cols >= 3 { 2000 } else { 500 };
+    if max_cell_len > max_allowed {
         debug!(
-            "  row-stripe rejected: max cell length {} > 500 (layout background)",
-            max_cell_len
+            "  row-stripe rejected: max cell length {} > {} (layout background)",
+            max_cell_len, max_allowed
         );
         return None;
     }
 
-    // No empty columns
-    for col in 0..num_cols {
+    // Trim empty outer columns, reject if interior columns are empty
+    let first_col = (0..num_cols).find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    let last_col = (0..num_cols).rev().find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    let (first_col, last_col) = match (first_col, last_col) {
+        (Some(f), Some(l)) if l > f => (f, l),
+        _ => return None,
+    };
+    for col in first_col..=last_col {
         let col_has_content = cells
             .iter()
             .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
         if !col_has_content {
-            debug!("  row-stripe rejected: column {} is empty", col);
+            debug!("  row-stripe rejected: interior column {} is empty", col);
             return None;
         }
     }
+    let (col_edges, cells) = if first_col > 0 || last_col < num_cols - 1 {
+        let new_edges: Vec<f32> = col_edges[first_col..=last_col + 1].to_vec();
+        let new_cells: Vec<Vec<String>> = cells
+            .iter()
+            .map(|row| row[first_col..=last_col].to_vec())
+            .collect();
+        (new_edges, new_cells)
+    } else {
+        (col_edges, cells)
+    };
+    let num_cols = col_edges.len() - 1;
 
     let column_centers: Vec<f32> = (0..num_cols)
         .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
