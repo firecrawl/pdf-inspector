@@ -520,6 +520,22 @@ fn process_document(
         pages_needing_ocr.sort_unstable();
     }
 
+    // Detect sparse extraction: when a TEXT-BASED PDF produces very few
+    // characters per page, the text is likely embedded in images/forms
+    // that need OCR.  Flag all pages for OCR in this case.
+    if pdf_type == PdfType::TextBased && page_count > 0 && pages_needing_ocr.is_empty() {
+        let md_len = markdown.as_ref().map_or(0, |m| m.len());
+        let chars_per_page = md_len as f32 / page_count as f32;
+        if chars_per_page < 50.0 && md_len < 500 {
+            log::debug!(
+                "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
+                chars_per_page,
+                page_count
+            );
+            pages_needing_ocr = (1..=page_count).collect();
+        }
+    }
+
     let markdown = if all_gid {
         log::debug!(
             "all {} pages have gid-encoded fonts — suppressing markdown output",
