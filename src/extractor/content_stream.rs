@@ -20,6 +20,60 @@ use super::fonts::{
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
 use super::{get_number, multiply_matrices};
 
+/// Strip PDF comments (% to end of line) from content stream bytes.
+///
+/// Some PDF generators (e.g. PD4ML) embed comments in content streams that
+/// confuse lopdf's `Content::decode` parser.  Comments inside string literals
+/// (parentheses) are NOT stripped — only top-level comments.
+fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
+    // Quick check: if no '%' present, return as-is (common case)
+    if !data.contains(&b'%') {
+        return data.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+    let mut in_string = 0i32; // parenthesis nesting depth
+    let mut in_hex_string = false;
+
+    while i < data.len() {
+        let b = data[i];
+        match b {
+            b'(' if !in_hex_string => {
+                in_string += 1;
+                result.push(b);
+            }
+            b')' if !in_hex_string && in_string > 0 => {
+                in_string -= 1;
+                result.push(b);
+            }
+            b'<' if in_string == 0 && !in_hex_string => {
+                in_hex_string = true;
+                result.push(b);
+            }
+            b'>' if in_hex_string => {
+                in_hex_string = false;
+                result.push(b);
+            }
+            b'%' if in_string == 0 && !in_hex_string => {
+                // Skip until end of line
+                while i < data.len() && data[i] != b'\n' && data[i] != b'\r' {
+                    i += 1;
+                }
+                // Replace comment with a space to preserve token separation
+                result.push(b' ');
+                continue; // Don't increment i again
+            }
+            _ => {
+                result.push(b);
+            }
+        }
+        i += 1;
+    }
+
+    result
+}
+
 /// Returns `(page_extraction, has_gid_fonts)` where `has_gid_fonts` indicates
 /// the page uses fonts with unresolvable gid-encoded glyphs.
 pub(crate) fn extract_page_text_items(
@@ -112,6 +166,11 @@ pub(crate) fn extract_page_text_items(
     let content_data = doc
         .get_page_content(page_id)
         .map_err(|e| PdfError::Parse(e.to_string()))?;
+
+    // Strip PDF comments (% to end of line) from the content stream.
+    // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's
+    // Content::decode parser, causing it to skip operators like ET and Q.
+    let content_data = strip_pdf_comments(&content_data);
 
     let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
 
@@ -1173,5 +1232,37 @@ mod tests {
         assert!(items.is_empty());
         assert!(rects.is_empty());
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_strip_pdf_comments() {
+        // Basic comment stripping
+        let input = b"BT\n% comment\nTj\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"BT\n \nTj\nET\n");
+
+        // No comments = unchanged
+        let input = b"BT\nTj\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, input.to_vec());
+
+        // Don't strip inside string literals
+        let input = b"(text with % not a comment)\n% real comment\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"(text with % not a comment)\n \n");
+
+        // Don't strip inside hex strings
+        let input = b"<0033% not a comment>\n% real comment\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"<0033% not a comment>\n \n");
+
+        // PD4ML style: comment between Tj and ET
+        let input = b"<0033> Tj\n\t% Mission Statement\n\tET\n";
+        let output = strip_pdf_comments(input);
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("ET"),
+            "ET should be preserved after comment stripping"
+        );
     }
 }
