@@ -638,6 +638,7 @@ fn is_cid_garbage(text: &str) -> bool {
     }
     let mut total = 0usize;
     let mut c1_control = 0usize;
+    let mut high_latin = 0usize;
     for ch in text.chars() {
         if ch.is_whitespace() {
             continue;
@@ -647,9 +648,25 @@ fn is_cid_garbage(text: &str) -> bool {
         if ('\u{0080}'..='\u{009F}').contains(&ch) {
             c1_control += 1;
         }
+        // High Latin-1 (U+00A0–U+00FF) — legitimate in Western European text
+        // but when combined with ASCII in CID passthrough, indicates mojibake
+        // from CID values being misinterpreted as Latin-1 characters.
+        if ('\u{00A0}'..='\u{00FF}').contains(&ch) {
+            high_latin += 1;
+        }
+    }
+    if total < 5 {
+        return false;
     }
     // If ≥5% of non-whitespace chars are C1 controls, it's garbage
-    total >= 20 && c1_control * 20 >= total
+    if c1_control * 20 >= total {
+        return true;
+    }
+    // If ≥40% of non-whitespace chars are high Latin-1 AND the text has few
+    // ASCII letters, it's likely CID-as-Latin-1 mojibake (Japanese/CJK PDFs
+    // where CID values 0x80-0xFF become accented Latin characters).
+    let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    high_latin * 5 >= total * 2 && ascii_letters * 3 < total
 }
 
 /// Analyse extracted items and rects for layout complexity.
