@@ -523,7 +523,12 @@ fn process_document(
     // Detect sparse extraction: when a TEXT-BASED PDF produces very few
     // characters per page, the text is likely embedded in images/forms
     // that need OCR.  Flag all pages for OCR in this case.
-    if pdf_type == PdfType::TextBased && page_count > 0 && pages_needing_ocr.is_empty() {
+    // Only check when markdown was actually generated (not in Analyze mode).
+    if pdf_type == PdfType::TextBased
+        && page_count > 0
+        && pages_needing_ocr.is_empty()
+        && markdown.is_some()
+    {
         let md_len = markdown.as_ref().map_or(0, |m| m.len());
         let chars_per_page = md_len as f32 / page_count as f32;
         if chars_per_page < 50.0 && md_len < 500 {
