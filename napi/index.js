@@ -577,4 +577,8 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding
 module.exports.classifyPdf = nativeBinding.classifyPdf
+module.exports.detectPdf = nativeBinding.detectPdf
+module.exports.extractText = nativeBinding.extractText
 module.exports.extractTextInRegions = nativeBinding.extractTextInRegions
+module.exports.extractTextWithPositions = nativeBinding.extractTextWithPositions
+module.exports.processPdf = nativeBinding.processPdf

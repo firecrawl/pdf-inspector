@@ -1100,16 +1100,13 @@ pub(crate) fn group_into_lines_with_thresholds(
 
                 // Sort by Y descending (top-first), then by X for same-Y lines
                 all_page_lines.sort_by(|a, b| {
-                    b.y.partial_cmp(&a.y)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(
-                            a.items
-                                .first()
-                                .map(|i| i.x)
-                                .unwrap_or(0.0)
-                                .partial_cmp(&b.items.first().map(|i| i.x).unwrap_or(0.0))
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
+                    b.y.total_cmp(&a.y).then(
+                        a.items
+                            .first()
+                            .map(|i| i.x)
+                            .unwrap_or(0.0)
+                            .total_cmp(&b.items.first().map(|i| i.x).unwrap_or(0.0)),
+                    )
                 });
 
                 // Merge lines at the same Y (within tolerance) into single lines
@@ -1184,11 +1181,7 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
     let items = if use_y_sorting {
         // Sort by Y descending (top to bottom in PDF coords)
         let mut sorted = items;
-        sorted.sort_by(|a, b| {
-            b.y.partial_cmp(&a.y)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.x.total_cmp(&b.x))
-        });
+        sorted.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
         sorted
     } else {
         items
