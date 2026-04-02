@@ -121,7 +121,7 @@ pub(crate) fn compute_paragraph_threshold(lines: &[TextLine], base_size: f32) ->
         return fallback;
     }
 
-    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    gaps.sort_by(|a, b| a.total_cmp(b));
 
     let median = gaps[gaps.len() / 2];
 
@@ -221,7 +221,7 @@ pub(crate) fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f
     }
 
     // Sort descending
-    heading_sizes.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    heading_sizes.sort_by(|a, b| b.total_cmp(a));
 
     // Cluster sizes within 0.5pt into same tier (use first value as representative)
     let mut tiers: Vec<f32> = Vec::new();

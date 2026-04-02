@@ -33,7 +33,7 @@ pub(crate) fn try_build_rect_guided_table(
 
     // 1. Derive column boundaries from rect X positions (snapped to 2pt tolerance)
     let mut x_lefts: Vec<f32> = cluster_rects.iter().map(|&(x, _, _, _)| x).collect();
-    x_lefts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x_lefts.sort_by(|a, b| a.total_cmp(b));
     // Snap: deduplicate within 2pt tolerance
     let mut col_boundaries: Vec<f32> = Vec::new();
     for x in &x_lefts {
@@ -54,7 +54,7 @@ pub(crate) fn try_build_rect_guided_table(
     // boundaries so every day gets a column.
     if col_boundaries.len() >= 2 {
         let mut spacings: Vec<f32> = col_boundaries.windows(2).map(|w| w[1] - w[0]).collect();
-        spacings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        spacings.sort_by(|a, b| a.total_cmp(b));
         let median_spacing = spacings[spacings.len() / 2];
         let threshold = median_spacing * 1.5;
 
@@ -87,7 +87,7 @@ pub(crate) fn try_build_rect_guided_table(
 
     // 3. Derive row boundaries from item Y positions (5pt tolerance)
     let mut y_values: Vec<f32> = expanded_items.iter().map(|(item, _)| item.y).collect();
-    y_values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // descending
+    y_values.sort_by(|a, b| b.total_cmp(a)); // descending
     let mut row_boundaries: Vec<f32> = Vec::new();
     for y in &y_values {
         if row_boundaries
@@ -296,7 +296,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
 
     // Find the top-most row with items in multiple columns (likely the header)
     let mut ys: Vec<f32> = page_items.iter().map(|i| i.y).collect();
-    ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    ys.sort_by(|a, b| b.total_cmp(a));
     ys.dedup_by(|a, b| (*a - *b).abs() < y_tol);
 
     for &header_y in ys.iter().take(5) {
@@ -318,7 +318,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
             if col_items.len() >= 2 {
                 // Sort by X and find the split point
                 let mut sorted: Vec<f32> = col_items.iter().map(|i| i.x).collect();
-                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                sorted.sort_by(|a, b| a.total_cmp(b));
                 // Split at the midpoint between the two items
                 let split_x = (sorted[0]
                     + col_items.iter().find(|i| i.x == sorted[0]).unwrap().width
@@ -411,7 +411,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
             }
         }
     }
-    row_ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    row_ys.sort_by(|a, b| b.total_cmp(a));
 
     if row_ys.len() < 3 || row_ys.len() > 40 {
         return None;

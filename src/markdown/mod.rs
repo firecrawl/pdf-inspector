@@ -42,7 +42,7 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
 
     // Sort items by left edge
     let mut xs: Vec<f32> = items.iter().map(|i| i.x).collect();
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    xs.sort_by(|a, b| a.total_cmp(b));
 
     // Find all candidate gaps: ≥30pt, in the middle 60% of the X range,
     // with ≥20 items on each side.
@@ -118,7 +118,7 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
         })
         .copied()
         .collect();
-    balanced_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    balanced_positions.sort_by(|a, b| a.total_cmp(b));
     balanced_positions.dedup_by(|a, b| (*a - *b).abs() < 50.0);
     if balanced_positions.len() > 1 {
         return vec![];
@@ -209,7 +209,7 @@ fn split_from_hint_regions(items: &[TextItem], rects: &[PdfRect], page: u32) -> 
 
     // Width outlier filter (same as detect_tables_from_rects)
     let mut widths: Vec<f32> = page_rects.iter().map(|&(_, _, w, _)| w).collect();
-    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    widths.sort_by(|a, b| a.total_cmp(b));
     let median_width = widths[widths.len() / 2];
     page_rects.retain(|&(_, _, w, _)| w <= median_width * 10.0);
 
@@ -1037,7 +1037,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             }
             // Sort by Y descending (top to bottom) so left and right
             // band lines interleave in visual reading order.
-            page_lines.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+            page_lines.sort_by(|a, b| b.y.total_cmp(&a.y));
             all_lines.extend(page_lines);
         }
         all_lines

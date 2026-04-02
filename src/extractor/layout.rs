@@ -218,7 +218,7 @@ fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
 
         // Sort by Y descending (top of page = higher Y in PDF coords)
         let mut sorted: Vec<&TextItem> = col_items;
-        sorted.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| b.y.total_cmp(&a.y));
 
         // Group into lines by Y-proximity and measure fill + item count
         let mut full_lines = 0usize;
@@ -616,7 +616,7 @@ fn identify_spanning_lines(items: &[TextItem], columns: &[ColumnRegion]) -> Vec<
     // Build (original_index, y) pairs sorted by Y descending for grouping
     let mut indexed: Vec<(usize, f32)> =
         items.iter().enumerate().map(|(i, it)| (i, it.y)).collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
 
     // Group by Y-proximity into rough lines (as index sets)
     let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -778,7 +778,7 @@ pub(crate) fn is_newspaper_layout(
                             return 0.0;
                         }
                         let mut ys: Vec<f32> = lines.iter().map(|l| l.y).collect();
-                        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        ys.sort_by(|a, b| a.total_cmp(b));
                         let span = ys.last().unwrap() - ys.first().unwrap();
                         span / (lines.len() as f32 - 1.0)
                     };
@@ -845,7 +845,7 @@ fn split_column_stragglers(lines: Vec<TextLine>) -> (Vec<TextLine>, Vec<TextLine
 
     // Median gap = typical line spacing
     let mut sorted_gaps = gaps.clone();
-    sorted_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_gaps.sort_by(|a, b| a.total_cmp(b));
     let median_gap = sorted_gaps[sorted_gaps.len() / 2];
 
     // A gap > 3× median (min 30pt) indicates a break between content clusters
@@ -1078,9 +1078,8 @@ pub(crate) fn group_into_lines_with_thresholds(
                     }
                 }
 
-                above.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
-                below_spanning
-                    .sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+                above.sort_by(|a, b| b.y.total_cmp(&a.y));
+                below_spanning.sort_by(|a, b| b.y.total_cmp(&a.y));
 
                 all_lines.extend(above);
                 for col in core_columns {
@@ -1188,7 +1187,7 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
         sorted.sort_by(|a, b| {
             b.y.partial_cmp(&a.y)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+                .then(a.x.total_cmp(&b.x))
         });
         sorted
     } else {

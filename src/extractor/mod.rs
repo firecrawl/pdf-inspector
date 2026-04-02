@@ -334,17 +334,14 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     for (_, _, group) in &mut line_groups {
         let rtl = is_rtl_text(group.iter().map(|i| &i.text));
         if rtl {
-            group.sort_by(|a, b| b.x.partial_cmp(&a.x).unwrap_or(std::cmp::Ordering::Equal));
+            group.sort_by(|a, b| b.x.total_cmp(&a.x));
         } else {
-            group.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            group.sort_by(|a, b| a.x.total_cmp(&b.x));
         }
     }
 
     // Sort groups by page then Y descending (top of page first)
-    line_groups.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-    });
+    line_groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
 
     let mut merged = Vec::new();
 
@@ -452,7 +449,7 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
     for (_, _, mut group) in line_groups {
         // Sort by X position
-        group.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        group.sort_by(|a, b| a.x.total_cmp(&b.x));
 
         // Find the dominant (most common) font size in this group
         let max_fs = group.iter().map(|i| i.font_size).fold(0.0_f32, f32::max);

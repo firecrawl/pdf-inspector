@@ -144,7 +144,7 @@ fn split_wide_cluster(
 
     // Build sorted list of X-intervals (x_left, x_right) from each rect
     let mut intervals: Vec<(f32, f32)> = rects.iter().map(|&(x, _, w, _)| (x, x + w)).collect();
-    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     // Merge overlapping intervals to find contiguous X-bands
     let mut merged: Vec<(f32, f32)> = Vec::new();
@@ -262,7 +262,7 @@ pub fn detect_tables_from_rects(
     // background fills stand out clearly.
     if page_rects.len() >= 6 {
         let mut widths: Vec<f32> = page_rects.iter().map(|&(_, _, w, _)| w).collect();
-        widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        widths.sort_by(|a, b| a.total_cmp(b));
         let median_width = widths[widths.len() / 2];
         let width_threshold = median_width * 10.0;
         let before = page_rects.len();
@@ -333,7 +333,7 @@ pub fn detect_tables_from_rects(
         // cluster they overlap, so grid detection still has their edges.
         let is_page_bg = {
             let mut heights: Vec<f32> = page_rects.iter().map(|&(_, _, _, h)| h).collect();
-            heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            heights.sort_by(|a, b| a.total_cmp(b));
             let median_height = heights[heights.len() / 2];
             let height_threshold = median_height * 20.0;
             let flags: Vec<bool> = page_rects
@@ -621,7 +621,7 @@ fn merge_overlapping_hints(mut hints: Vec<RectHintRegion>) -> Vec<RectHintRegion
         return hints;
     }
     loop {
-        hints.sort_by(|a, b| a.x_left.partial_cmp(&b.x_left).unwrap());
+        hints.sort_by(|a, b| a.x_left.total_cmp(&b.x_left));
         let mut merged: Vec<RectHintRegion> = Vec::new();
         let mut any_merged = false;
         for hint in &hints {
@@ -685,7 +685,7 @@ fn extract_hint_region(group_rects: &[(f32, f32, f32, f32)]) -> Option<RectHintR
 
     // Compute median height to identify cell-sized rects
     let mut heights: Vec<f32> = group_rects.iter().map(|&(_, _, _, h)| h).collect();
-    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    heights.sort_by(|a, b| a.total_cmp(b));
     let median_h = heights[heights.len() / 2];
 
     // Keep only cell-sized rects (height ≤ 4× median)
@@ -857,9 +857,9 @@ fn try_build_grid(
 
     // Sort column edges left-to-right, row edges top-to-bottom (highest Y first for PDF)
     let mut col_edges = x_edges;
-    col_edges.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    col_edges.sort_by(|a, b| a.total_cmp(b));
     let mut row_edges = y_edges;
-    row_edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    row_edges.sort_by(|a, b| b.total_cmp(a));
 
     let num_cols = col_edges.len() - 1;
     let num_rows = row_edges.len() - 1;
@@ -1048,7 +1048,7 @@ fn try_build_grid(
 /// Deduplicate nearby edge values within a tolerance, returning sorted unique edges.
 pub(crate) fn snap_edges(values: &[f32], tolerance: f32) -> Vec<f32> {
     let mut sorted: Vec<f32> = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
 
     let mut snapped: Vec<f32> = Vec::new();
     for &v in &sorted {
@@ -1204,7 +1204,7 @@ fn is_row_stripe_pattern(rects: &[(f32, f32, f32, f32)]) -> bool {
     }
 
     let mut widths: Vec<f32> = rects.iter().map(|&(_, _, w, _)| w).collect();
-    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    widths.sort_by(|a, b| a.total_cmp(b));
     let median_width = widths[widths.len() / 2];
 
     // Must be page-spanning (>200pt)
@@ -1252,7 +1252,7 @@ fn detect_row_stripe_table(
 
     // Sort row edges top-to-bottom (highest Y first for PDF)
     let mut row_edges = y_edges;
-    row_edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    row_edges.sort_by(|a, b| b.total_cmp(a));
 
     // Compute the bounding box of the stripe region for filtering items
     let y_top = row_edges[0];
@@ -1476,7 +1476,7 @@ fn detect_row_stripe_table_from_cell_rects(
     // bounding box to scope items and derive rows from text Y-positions.
     let row_edges = if y_edges.len() >= 4 {
         let mut edges = y_edges;
-        edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        edges.sort_by(|a, b| b.total_cmp(a));
         edges
     } else {
         // Fall back: gather items in the rect region and cluster by Y
@@ -1508,11 +1508,11 @@ fn detect_row_stripe_table_from_cell_rects(
         // Cluster Y positions using median font height as threshold
         let median_h = {
             let mut hs: Vec<f32> = region_items.iter().map(|i| i.height).collect();
-            hs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            hs.sort_by(|a, b| a.total_cmp(b));
             hs[hs.len() / 2]
         };
         let mut ys: Vec<f32> = region_items.iter().map(|i| i.y).collect();
-        ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        ys.sort_by(|a, b| b.total_cmp(a));
         let mut edges = Vec::new();
         let threshold = median_h * 0.8;
         let mut cluster_start = ys[0];
@@ -1536,7 +1536,7 @@ fn detect_row_stripe_table_from_cell_rects(
         edges.push(center - median_h * 0.5);
         let _ = cluster_start; // suppress unused warning
         edges = snap_edges(&edges, 3.0);
-        edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        edges.sort_by(|a, b| b.total_cmp(a));
         if edges.len() < 4 {
             return None;
         }
@@ -1546,7 +1546,7 @@ fn detect_row_stripe_table_from_cell_rects(
     // Compute bounding box from non-full-page rects
     let median_h = {
         let mut heights: Vec<f32> = group_rects.iter().map(|&(_, _, _, h)| h).collect();
-        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        heights.sort_by(|a, b| a.total_cmp(b));
         heights[heights.len() / 2]
     };
     let content_rects: Vec<_> = group_rects
@@ -1724,7 +1724,7 @@ fn detect_merged_cluster_table(
     }
 
     let mut row_edges = y_edges;
-    row_edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    row_edges.sort_by(|a, b| b.total_cmp(a));
 
     // Bounding box of all rects
     let y_top = row_edges[0];
@@ -1890,7 +1890,7 @@ fn detect_merged_cluster_table(
 /// (no need for anti-paragraph safeguards).
 fn cluster_x_positions(items: &[(usize, &TextItem)], min_threshold: f32) -> Vec<f32> {
     let mut x_positions: Vec<f32> = items.iter().map(|(_, i)| i.x).collect();
-    x_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x_positions.sort_by(|a, b| a.total_cmp(b));
 
     if x_positions.is_empty() {
         return vec![];

@@ -9,7 +9,7 @@ pub(crate) fn find_column_boundaries(
     mode: TableDetectionMode,
 ) -> Vec<f32> {
     let mut x_positions: Vec<f32> = items.iter().map(|(_, i)| i.x).collect();
-    x_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x_positions.sort_by(|a, b| a.total_cmp(b));
 
     if x_positions.is_empty() {
         return vec![];
@@ -43,7 +43,7 @@ pub(crate) fn find_column_boundaries(
         .collect();
 
     if consec_gaps.len() > 2 {
-        consec_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        consec_gaps.sort_by(|a, b| a.total_cmp(b));
         // Find the biggest jump in the sorted gap sequence — natural break
         // between within-column jitter and between-column spacing.
         // Require at least 3 values on each side to avoid outlier-dominated
@@ -151,7 +151,7 @@ pub(crate) fn find_column_boundaries(
 /// Find row boundaries by clustering Y positions
 pub(crate) fn find_row_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
     let mut y_positions: Vec<f32> = items.iter().map(|(_, i)| i.y).collect();
-    y_positions.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // Descending
+    y_positions.sort_by(|a, b| b.total_cmp(a)); // Descending
 
     if y_positions.is_empty() {
         return vec![];
@@ -162,7 +162,7 @@ pub(crate) fn find_row_boundaries(items: &[(usize, &TextItem)]) -> Vec<f32> {
     // inter-row gaps (≥1× font size), preventing row merging in uniform-spaced PDFs.
     let cluster_threshold = {
         let mut font_sizes: Vec<f32> = items.iter().map(|(_, i)| i.font_size).collect();
-        font_sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        font_sizes.sort_by(|a, b| a.total_cmp(b));
         let median_font = font_sizes[font_sizes.len() / 2];
         (median_font * 0.8).max(4.0)
     };

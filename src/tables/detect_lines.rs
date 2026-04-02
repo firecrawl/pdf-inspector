@@ -167,7 +167,7 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
 
     // Row edges need to be in descending order (top of page = higher Y first)
     let mut row_edges_desc = row_edges;
-    row_edges_desc.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    row_edges_desc.sort_by(|a, b| b.total_cmp(a));
 
     log::debug!(
         "detect_lines p{}: {} row_edges, {} col_edges, table=({:.0},{:.0})-({:.0},{:.0}), spanning_h={}, spanning_v={}",

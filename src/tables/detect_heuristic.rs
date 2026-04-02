@@ -48,7 +48,7 @@ pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Ve
     }
 
     // Sort groups by Y descending (top of page first)
-    line_groups.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    line_groups.sort_by(|a, b| b.0.total_cmp(&a.0));
 
     let mut merged_items = Vec::new();
     let mut index_map: Vec<Vec<usize>> = Vec::new();
@@ -284,7 +284,7 @@ fn find_table_regions(items: &[(usize, &TextItem)]) -> Vec<(f32, f32)> {
     }
 
     let mut y_positions: Vec<f32> = items.iter().map(|(_, i)| i.y).collect();
-    y_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    y_positions.sort_by(|a, b| a.total_cmp(b));
 
     // Find clusters of Y positions (table regions)
     let mut regions = Vec::new();
@@ -347,7 +347,7 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
     let mut qualifying_rows: Vec<(f32, Vec<f32>)> = Vec::new(); // (y, cluster_starts)
     for (y, x_positions) in &row_groups {
         let mut sorted_xs = x_positions.clone();
-        sorted_xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_xs.sort_by(|a, b| a.total_cmp(b));
 
         if sorted_xs.is_empty() {
             continue;
@@ -379,14 +379,14 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
     // Step 3: Find contiguous runs of qualifying rows.
     // Use adaptive gap: median spacing × 3 (handles wrapped cells where
     // qualifying rows are spaced further apart), with a floor of 25pt.
-    qualifying_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    qualifying_rows.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let max_gap = if qualifying_rows.len() >= 3 {
         let mut gaps: Vec<f32> = qualifying_rows
             .windows(2)
             .map(|w| (w[1].0 - w[0].0).abs())
             .collect();
-        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        gaps.sort_by(|a, b| a.total_cmp(b));
         let median_gap = gaps[gaps.len() / 2];
         (median_gap * 3.0).max(25.0)
     } else {
@@ -566,11 +566,9 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
             // Sort by X position (direction-aware)
             let rtl = is_rtl_text(col_items.iter().map(|i| &i.text));
             if rtl {
-                col_items
-                    .sort_by(|a, b| b.x.partial_cmp(&a.x).unwrap_or(std::cmp::Ordering::Equal));
+                col_items.sort_by(|a, b| b.x.total_cmp(&a.x));
             } else {
-                col_items
-                    .sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+                col_items.sort_by(|a, b| a.x.total_cmp(&b.x));
             }
 
             // Join items with subscript-aware spacing

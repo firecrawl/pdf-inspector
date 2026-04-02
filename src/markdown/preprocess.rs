@@ -275,7 +275,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         page_sorted_ys.entry(line.page).or_default().push(line.y);
     }
     for ys in page_sorted_ys.values_mut() {
-        ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ys.sort_by(|a, b| a.total_cmp(b));
         ys.dedup();
     }
 

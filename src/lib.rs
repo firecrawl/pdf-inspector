@@ -477,16 +477,29 @@ fn collect_text_in_region(
         return String::new();
     }
 
-    // Sort top→bottom (descending Y in bottom-left coords), then left→right
+    // Sort top→bottom (descending Y in bottom-left coords), then left→right.
+    // Uses total_cmp to avoid panics on NaN values from bogus font metrics.
     matched.sort_by(|a, b| {
-        let line_threshold = a.font_size.max(b.font_size) * 0.5;
-        let y_diff = b.y - a.y; // descending Y = top to bottom
-        if y_diff.abs() < line_threshold {
-            a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)
+        let fs_a = if a.font_size.is_finite() {
+            a.font_size
         } else {
-            y_diff
-                .partial_cmp(&0.0_f32)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            0.0
+        };
+        let fs_b = if b.font_size.is_finite() {
+            b.font_size
+        } else {
+            0.0
+        };
+        let line_threshold = fs_a.max(fs_b) * 0.5;
+        let ay = if a.y.is_finite() { a.y } else { 0.0 };
+        let by = if b.y.is_finite() { b.y } else { 0.0 };
+        let y_diff = by - ay; // descending Y = top to bottom
+        if y_diff.abs() < line_threshold {
+            let ax = if a.x.is_finite() { a.x } else { 0.0 };
+            let bx = if b.x.is_finite() { b.x } else { 0.0 };
+            ax.total_cmp(&bx)
+        } else {
+            by.total_cmp(&ay)
         }
     });
 

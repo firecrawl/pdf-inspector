@@ -68,9 +68,9 @@ where
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
     if rtl {
-        items.sort_by(|a, b| b.x.partial_cmp(&a.x).unwrap_or(std::cmp::Ordering::Equal));
+        items.sort_by(|a, b| b.x.total_cmp(&a.x));
     } else {
-        items.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        items.sort_by(|a, b| a.x.total_cmp(&b.x));
     }
 }
 
@@ -376,7 +376,7 @@ fn compute_canva_join_threshold(items: &[TextItem]) -> f32 {
     }
 
     let mut sorted: Vec<f32> = ratios;
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
 
     if sorted[sorted.len() - 1] < 0.40 || sorted[0] < 0.40 {
         return DEFAULT;
@@ -478,7 +478,7 @@ fn compute_single_char_join_threshold(items: &[TextItem]) -> f32 {
         return DEFAULT;
     }
 
-    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ratios.sort_by(|a, b| a.total_cmp(b));
 
     // If all gaps are tight (max < 0.40), use default — normal PDF
     let max_ratio = ratios[ratios.len() - 1];
