@@ -1232,6 +1232,55 @@ fn test_extract_regions_mem_not_a_pdf() {
     assert!(result.is_err(), "Non-PDF input should return an error");
 }
 
+#[test]
+fn test_extract_regions_mem_rotated_page_not_false_empty() {
+    let buf = std::fs::read("tests/fixtures/tnagriculture_06_12.pdf").unwrap();
+    let regions =
+        extract_text_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].regions.len(), 1);
+    let region = &regions[0].regions[0];
+    assert!(
+        !region.text.trim().is_empty(),
+        "Rotated page full-region extraction should not be empty"
+    );
+    assert!(
+        !region.needs_ocr,
+        "Rotated page with native text should not be flagged for OCR fallback"
+    );
+    assert!(
+        region
+            .text
+            .contains("DISTRICT WISE PRODUCTION OF SPICES AND CONDIMENTS"),
+        "Expected known title from rotated fixture in extracted region text"
+    );
+}
+
+#[test]
+fn test_collect_text_in_region_keeps_partial_overlap_items() {
+    let item = make_text_item("EdgeWord", 100.0, 700.0, 12.0, 1);
+    // Region intersects only the left edge of the item. Center x=124 falls
+    // outside x=[95,120], so center-only containment would drop it.
+    let text = pdf_inspector::collect_text_in_region(&[item], 95.0, 80.0, 120.0, 110.0, 800.0);
+    assert!(
+        text.contains("EdgeWord"),
+        "Partially overlapping items should be retained in region extraction"
+    );
+}
+
+#[test]
+fn test_collect_text_in_region_uses_rtl_sorting() {
+    let items = vec![
+        make_text_item("بكم", 240.0, 700.0, 12.0, 1),
+        make_text_item("مرحبا", 300.0, 700.0, 12.0, 1),
+    ];
+    let text = pdf_inspector::collect_text_in_region(&items, 0.0, 0.0, 600.0, 800.0, 800.0);
+    assert_eq!(
+        text, "مرحبا بكم",
+        "Region path should reuse RTL-aware line sorting"
+    );
+}
+
 // =========================================================================
 // Fast vs normal extraction comparison
 // =========================================================================

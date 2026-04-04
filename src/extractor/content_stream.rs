@@ -82,7 +82,7 @@ pub(crate) fn extract_page_text_items(
     page_num: u32,
     font_cmaps: &FontCMaps,
     include_invisible: bool,
-) -> Result<(PageExtraction, bool), PdfError> {
+) -> Result<(PageExtraction, bool, bool), PdfError> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
@@ -182,7 +182,7 @@ pub(crate) fn extract_page_text_items(
             content.operations.len(),
             MAX_OPERATIONS
         );
-        return Ok(((Vec::new(), Vec::new(), Vec::new()), false));
+        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false));
     }
 
     // Graphics state tracking
@@ -1009,11 +1009,12 @@ pub(crate) fn extract_page_text_items(
     // Some PDFs embed landscape content in portrait pages using a rotated text
     // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
     // assumes x=horizontal, y=vertical — so we swap coordinates to match.
-    let (items, rects, lines) = correct_rotated_page(items, rects, lines, &rotation_votes);
+    let (items, rects, lines, coords_rotated) =
+        correct_rotated_page(items, rects, lines, &rotation_votes);
 
     let items = super::merge_text_items(items);
     let items = super::merge_subscript_items(items);
-    Ok(((items, rects, lines), has_gid_fonts))
+    Ok(((items, rects, lines), has_gid_fonts, coords_rotated))
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.
@@ -1030,9 +1031,9 @@ fn correct_rotated_page(
     mut rects: Vec<PdfRect>,
     mut lines: Vec<PdfLine>,
     votes: &RotationVotes,
-) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>) {
+) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>, bool) {
     if items.len() < 2 {
-        return (items, rects, lines);
+        return (items, rects, lines, false);
     }
 
     // Use the combined-matrix direction votes collected during extraction.
@@ -1041,7 +1042,7 @@ fn correct_rotated_page(
     let total_votes = votes.horizontal + votes.rotated;
     if total_votes == 0 || votes.rotated * 3 < total_votes * 2 {
         // Less than ~67% of text operators are rotated → not a rotated page
-        return (items, rects, lines);
+        return (items, rects, lines, false);
     }
 
     log::debug!(
@@ -1092,7 +1093,7 @@ fn correct_rotated_page(
         line.y2 = new_y2;
     }
 
-    (items, rects, lines)
+    (items, rects, lines, true)
 }
 
 /// Remove near-duplicate rects (same coordinates within 0.5 pt tolerance).
@@ -1228,7 +1229,7 @@ mod tests {
 
         let font_cmaps = FontCMaps::from_doc(&doc);
         let result = extract_page_text_items(&doc, page_id, 1, &font_cmaps, false).unwrap();
-        let ((items, rects, lines), _has_gid) = result;
+        let ((items, rects, lines), _has_gid, _coords_rotated) = result;
         assert!(items.is_empty());
         assert!(rects.is_empty());
         assert!(lines.is_empty());

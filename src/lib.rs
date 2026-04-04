@@ -358,6 +358,8 @@ pub fn extract_text_in_regions_mem(
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut gid_pages: HashSet<u32> = HashSet::new();
+    let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
+    let mut rotated_pages: HashSet<u32> = HashSet::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -369,7 +371,7 @@ pub fn extract_text_in_regions_mem(
         page_heights.insert(*page_num, height);
 
         // Extract text items for this page
-        let ((mut items, _rects, _lines), has_gid) =
+        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -377,9 +379,15 @@ pub fn extract_text_in_regions_mem(
                 &font_cmaps,
                 false,
             )?;
-        text_utils::fix_letterspaced_items(&mut items);
+        let threshold = text_utils::fix_letterspaced_items(&mut items);
+        if threshold > 0.10 {
+            page_thresholds.insert(*page_num, threshold);
+        }
         if has_gid {
             gid_pages.insert(*page_num);
+        }
+        if coords_rotated {
+            rotated_pages.insert(*page_num);
         }
         items_by_page.insert(*page_num, items);
     }
@@ -392,6 +400,12 @@ pub fn extract_text_in_regions_mem(
         let items = items_by_page.get(&page_1idx);
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let page_has_gid = gid_pages.contains(&page_1idx);
+        let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
+        let coords = if rotated_pages.contains(&page_1idx) {
+            RegionCoordSpace::Rotated90Ccw
+        } else {
+            RegionCoordSpace::Standard
+        };
 
         let mut page_results = Vec::with_capacity(regions.len());
 
@@ -399,7 +413,16 @@ pub fn extract_text_in_regions_mem(
             let [rx1, ry1, rx2, ry2] = *rect;
 
             let text = match items {
-                Some(items) => collect_text_in_region(items, rx1, ry1, rx2, ry2, page_h),
+                Some(items) => collect_text_in_region_with_options(
+                    items,
+                    rx1,
+                    ry1,
+                    rx2,
+                    ry2,
+                    page_h,
+                    coords,
+                    adaptive_threshold,
+                ),
                 None => String::new(),
             };
 
@@ -454,6 +477,20 @@ fn obj_to_f32(obj: &lopdf::Object) -> Option<f32> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RegionCoordSpace {
+    Standard,
+    Rotated90Ccw,
+}
+
+#[derive(Clone, Copy)]
+struct RegionBounds {
+    x_min: f32,
+    y_min: f32,
+    x_max: f32,
+    y_max: f32,
+}
+
 /// Collect text items that fall within a region bbox (top-left origin, PDF points)
 /// and return them as a single string in reading order.
 pub fn collect_text_in_region(
@@ -464,65 +501,108 @@ pub fn collect_text_in_region(
     ry2: f32,
     page_height: f32,
 ) -> String {
-    // Convert region from top-left to bottom-left origin
-    let by1 = page_height - ry2; // top-left y2 → bottom-left y1
-    let by2 = page_height - ry1; // top-left y1 → bottom-left y2
+    collect_text_in_region_with_options(
+        items,
+        rx1,
+        ry1,
+        rx2,
+        ry2,
+        page_height,
+        infer_region_coord_space(items),
+        0.10,
+    )
+}
 
-    // Collect items whose center falls within the region
-    let mut matched: Vec<&TextItem> = items
+fn collect_text_in_region_with_options(
+    items: &[TextItem],
+    rx1: f32,
+    ry1: f32,
+    rx2: f32,
+    ry2: f32,
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+    adaptive_threshold: f32,
+) -> String {
+    let bounds = region_bounds(rx1, ry1, rx2, ry2, page_height, coord_space);
+    let Some(page) = items.first().map(|item| item.page) else {
+        return String::new();
+    };
+    let matched: Vec<TextItem> = items
         .iter()
-        .filter(|item| {
-            let cx = item.x + item.width / 2.0;
-            let cy = item.y + item.height / 2.0;
-            cx >= rx1 && cx <= rx2 && cy >= by1 && cy <= by2
-        })
+        .filter(|item| region_overlaps_item(item, bounds))
+        .cloned()
         .collect();
-
     if matched.is_empty() {
         return String::new();
     }
-
-    // Sort top→bottom (descending Y in bottom-left coords), then left→right.
-    // Uses strict total_cmp ordering to guarantee transitivity (required by
-    // Rust's sort). The line-grouping phase below handles fuzzy Y matching.
-    matched.sort_by(|a, b| {
-        b.y.total_cmp(&a.y) // descending Y = top to bottom
-            .then(a.x.total_cmp(&b.x)) // ascending X = left to right
-    });
-
-    // Group into lines and join
-    let mut lines: Vec<String> = Vec::new();
-    let mut current_line = String::new();
-    let mut last_y = f32::NAN;
-    let mut last_x_end = 0.0_f32;
-
-    for item in &matched {
-        let line_threshold = item.font_size * 0.5;
-        let same_line = (item.y - last_y).abs() < line_threshold;
-
-        if !same_line && !current_line.is_empty() {
-            lines.push(current_line.clone());
-            current_line.clear();
-        }
-
-        if !current_line.is_empty() {
-            // Insert space if there's a gap between items on the same line
-            let gap = item.x - last_x_end;
-            if gap > item.font_size * 0.15 {
-                current_line.push(' ');
-            }
-        }
-
-        current_line.push_str(&item.text);
-        last_y = item.y;
-        last_x_end = item.x + item.width;
+    let mut thresholds = HashMap::new();
+    if adaptive_threshold > 0.10 {
+        thresholds.insert(page, adaptive_threshold);
     }
+    let lines = extractor::group_into_lines_with_thresholds(matched, &thresholds, &HashSet::new());
+    lines
+        .into_iter()
+        .map(|line| line.text())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    if !current_line.is_empty() {
-        lines.push(current_line);
+fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
+    // Rotated-page normalization currently maps y = -old_x, so most text items
+    // land at negative Y. Use this to keep `collect_text_in_region` behavior
+    // compatible for direct callers that do not have extractor metadata.
+    let negative_y = items.iter().filter(|item| item.y < 0.0).count();
+    if !items.is_empty() && negative_y * 2 >= items.len() {
+        RegionCoordSpace::Rotated90Ccw
+    } else {
+        RegionCoordSpace::Standard
     }
+}
 
-    lines.join("\n")
+fn region_bounds(
+    rx1: f32,
+    ry1: f32,
+    rx2: f32,
+    ry2: f32,
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+) -> RegionBounds {
+    let tx_min = rx1.min(rx2);
+    let tx_max = rx1.max(rx2);
+    let ty_min = ry1.min(ry2);
+    let ty_max = ry1.max(ry2);
+    let by_min = page_height - ty_max;
+    let by_max = page_height - ty_min;
+    match coord_space {
+        RegionCoordSpace::Standard => RegionBounds {
+            x_min: tx_min,
+            y_min: by_min,
+            x_max: tx_max,
+            y_max: by_max,
+        },
+        RegionCoordSpace::Rotated90Ccw => RegionBounds {
+            x_min: by_min,
+            x_max: by_max,
+            y_min: -tx_max,
+            y_max: -tx_min,
+        },
+    }
+}
+
+fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
+    const REGION_MARGIN: f32 = 1.5;
+    let item_x_min = item.x;
+    let item_x_max = item.x + text_utils::effective_width(item);
+    let item_y_min = item.y;
+    let item_y_max = item.y + item.height;
+
+    let x_overlap = (item_x_max.min(bounds.x_max + REGION_MARGIN)
+        - item_x_min.max(bounds.x_min - REGION_MARGIN))
+    .max(0.0);
+    let y_overlap = (item_y_max.min(bounds.y_max + REGION_MARGIN)
+        - item_y_min.max(bounds.y_min - REGION_MARGIN))
+    .max(0.0);
+    x_overlap > 0.0 && y_overlap > 0.0
 }
 
 // =========================================================================

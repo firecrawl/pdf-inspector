@@ -188,7 +188,7 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let ((mut items, rects, lines), has_gid_fonts) =
+        let ((mut items, rects, lines), has_gid_fonts, _coords_rotated) =
             extract_page_text_items(doc, page_id, *page_num, font_cmaps, include_invisible)?;
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);

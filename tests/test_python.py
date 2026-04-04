@@ -262,6 +262,13 @@ class TestExtractTextInRegions:
         assert results[0].page == 0
         assert results[1].page == 1
 
+    def test_malformed_region_raises_value_error(self):
+        with pytest.raises(ValueError, match="Invalid region"):
+            pdf_inspector.extract_text_in_regions(
+                fixture_path("thermo-freon12.pdf"),
+                [(0, [[0.0, 0.0, 600.0]])],
+            )
+
 
 # ---------------------------------------------------------------------------
 # Error handling

@@ -248,21 +248,34 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
         .collect()
 }
 
-fn parse_page_regions(page_regions: Vec<(u32, Vec<Vec<f64>>)>) -> Vec<(u32, Vec<[f32; 4]>)> {
+fn parse_page_regions(
+    page_regions: Vec<(u32, Vec<Vec<f64>>)>,
+) -> PyResult<Vec<(u32, Vec<[f32; 4]>)>> {
     page_regions
         .into_iter()
         .map(|(page, regions)| {
-            let bboxes: Vec<[f32; 4]> = regions
-                .iter()
-                .map(|r| {
-                    if r.len() != 4 {
-                        [0.0, 0.0, 0.0, 0.0]
-                    } else {
-                        [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32]
-                    }
-                })
-                .collect();
-            (page, bboxes)
+            let mut bboxes: Vec<[f32; 4]> = Vec::with_capacity(regions.len());
+            for (idx, region) in regions.into_iter().enumerate() {
+                if region.len() != 4 {
+                    return Err(PyValueError::new_err(format!(
+                        "Invalid region at page {page}, index {idx}: expected [x1, y1, x2, y2], got {} values",
+                        region.len()
+                    )));
+                }
+                let [x1, y1, x2, y2] = [region[0], region[1], region[2], region[3]];
+                if !(x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite()) {
+                    return Err(PyValueError::new_err(format!(
+                        "Invalid region at page {page}, index {idx}: coordinates must be finite numbers"
+                    )));
+                }
+                if x2 < x1 || y2 < y1 {
+                    return Err(PyValueError::new_err(format!(
+                        "Invalid region at page {page}, index {idx}: expected x2>=x1 and y2>=y1, got [{x1}, {y1}, {x2}, {y2}]"
+                    )));
+                }
+                bboxes.push([x1 as f32, y1 as f32, x2 as f32, y2 as f32]);
+            }
+            Ok((page, bboxes))
         })
         .collect()
 }
@@ -424,7 +437,7 @@ fn extract_text_in_regions_bytes(
     data: &[u8],
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
-    let regions = parse_page_regions(page_regions);
+    let regions = parse_page_regions(page_regions)?;
     let results = crate::extract_text_in_regions_mem(data, &regions).map_err(to_py_err)?;
     Ok(convert_region_results(results))
 }
