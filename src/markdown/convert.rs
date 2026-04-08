@@ -555,8 +555,14 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     + if standalone { 0.2 } else { 0.0 }
                     + if isolated { 0.3 } else { 0.0 };
 
-                // Require standalone + at least one other signal (bold, rare, or isolated)
-                if score >= 0.5 && standalone && word_count >= 2 {
+                // Require standalone + at least one strong signal.
+                // Non-bold, non-isolated lines need very high rarity (≥0.97)
+                // to avoid classifying ordinary body text as headings in
+                // multi-column layouts where column switches break
+                // paragraph continuity and minor font-size variation
+                // inflates rarity scores.
+                let has_strong_signal = all_bold || isolated || (rarity >= 0.97 && word_count <= 8);
+                if score >= 0.5 && standalone && word_count >= 2 && has_strong_signal {
                     Some(bold_heading_level(&heading_tiers))
                 } else {
                     None
@@ -1153,6 +1159,62 @@ mod tests {
         assert!(
             md.contains("```\nfn main() {}\n```"),
             "Should format as code block: {md}"
+        );
+    }
+
+    #[test]
+    fn test_rarity_heading_requires_strong_signal() {
+        // Simulate a two-column academic paper where body text lines become
+        // "standalone" due to column switches.  Body text at the same font
+        // size as most of the document should NOT be classified as headings
+        // just because of moderate rarity + standalone.
+        //
+        // Regression: previously, lines with rarity ~0.62 and standalone=true
+        // scored 0.51 (>=0.5 threshold), producing hundreds of false ## headings.
+
+        // Create many body-text lines at font_size=10.9 (most common)
+        let mut lines = Vec::new();
+        for i in 0..20 {
+            let mut item = make_item("This is ordinary body text in a paragraph.", 1, None);
+            item.font_size = 10.9;
+            item.y = 700.0 - i as f32 * 14.0;
+            lines.push(make_line(vec![item]));
+        }
+        // A few lines at a slightly different size (simulating column B text)
+        for i in 0..10 {
+            let mut item = make_item("Another body text line from the second column.", 1, None);
+            item.font_size = 11.0; // slightly different → non-zero rarity
+            item.y = 700.0 - i as f32 * 14.0;
+            item.x = 320.0; // right column
+            lines.push(make_line(vec![item]));
+        }
+        // One genuine bold heading
+        let mut heading_item = make_item("3 Philosophical Perspectives", 1, None);
+        heading_item.font_size = 10.9;
+        heading_item.is_bold = true;
+        heading_item.y = 200.0;
+        lines.push(make_line(vec![heading_item]));
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        // The bold heading should be detected
+        assert!(
+            md.contains("## 3 Philosophical Perspectives"),
+            "Bold heading should be detected: {md}"
+        );
+
+        // Body text lines should NOT be headings
+        let heading_count = md.lines().filter(|l| l.starts_with("##")).count();
+        assert!(
+            heading_count <= 2,
+            "Expected at most 2 headings but found {heading_count} in:\n{md}"
         );
     }
 
