@@ -730,7 +730,7 @@ fn scan_content_for_text_operators(
     unique_chars: &mut HashSet<u8>,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
-    let mut image_count = 0u32;
+    let image_count = 0u32;
     let mut path_ops = 0u32;
     let mut font_changes = 0u32;
 
@@ -771,14 +771,10 @@ fn scan_content_for_text_operators(
             }
         }
 
-        // Look for 'Do' operator (XObject/image placement)
-        if b == b'D'
-            && i + 1 < content.len()
-            && content[i + 1] == b'o'
-            && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace())
-        {
-            image_count += 1;
-        }
+        // Note: We do NOT count 'Do' operators here because Do invokes any
+        // XObject — including Form XObjects that contain text.  Actual image
+        // detection is handled by scan_xobjects_in_resources (checks Subtype)
+        // and analyze_page_images (measures pixel area).
 
         // Count path construction/painting operators.
         // Single-byte: m (moveto), l (lineto), c (curveto), h (closepath),
@@ -1185,23 +1181,24 @@ mod tests {
         // H, e, l, o = 4 unique
         assert!(uchars.len() >= 4);
 
-        // Content with Do (image)
+        // Content with Do (XObject invocation — not counted as image here;
+        // actual image detection is handled by scan_xobjects_in_resources)
         uchars.clear();
         let content3 = b"q 100 0 0 100 50 700 cm /Img1 Do Q";
         let (ops3, imgs3, _, _) = scan_content_for_text_operators(content3, &mut uchars);
         assert_eq!(ops3, 0);
-        assert_eq!(imgs3, 1);
+        assert_eq!(imgs3, 0);
     }
 
     #[test]
     fn test_image_dominated_detection() {
-        // Simulate a page with many Do operators and minimal text
+        // Do operators are no longer counted as images by scan_content_for_text_operators.
+        // Image-dominated detection now relies on scan_xobjects_in_resources which
+        // checks XObject Subtype. Here we verify that Do operators don't inflate image_count.
         let mut content = Vec::new();
-        // Add 50 Do operators (image-heavy)
         for i in 0..50 {
             content.extend_from_slice(format!("/Im{i} Do\n").as_bytes());
         }
-        // Add a few text operators with only a bullet char
         content.extend_from_slice(b"BT (x) Tj ET\n");
         content.extend_from_slice(b"BT (x) Tj ET\n");
         content.extend_from_slice(b"BT (x) Tj ET\n");
@@ -1209,15 +1206,8 @@ mod tests {
         let mut uchars = HashSet::new();
         let (ops, imgs, _, _) = scan_content_for_text_operators(&content, &mut uchars);
         assert_eq!(ops, 3);
-        assert_eq!(imgs, 50);
-        // Only 'x' unique char
+        assert_eq!(imgs, 0); // Do operators are not counted here
         assert_eq!(uchars.len(), 1);
-
-        // This should be image-dominated: 50 > 10 && 50 > 3*3=9
-        let is_image_dominated = imgs > 10 && imgs > ops * 3;
-        assert!(is_image_dominated);
-        // And fails unique char threshold
-        assert!(uchars.len() < 5);
     }
 
     #[test]
@@ -1227,12 +1217,9 @@ mod tests {
         let mut uchars = HashSet::new();
         let (ops, imgs, _, _) = scan_content_for_text_operators(content, &mut uchars);
         assert_eq!(ops, 1);
-        assert_eq!(imgs, 2);
-        // Many unique chars from the sentence
+        assert_eq!(imgs, 0); // Do operators not counted here
+                             // Many unique chars from the sentence
         assert!(uchars.len() >= 5);
-        // Not image-dominated: 2 > 10 fails
-        let is_image_dominated = imgs > 10 && imgs > ops * 3;
-        assert!(!is_image_dominated);
     }
 
     #[test]
