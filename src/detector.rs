@@ -598,7 +598,15 @@ fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
         if font_dict.get(b"ToUnicode").is_ok() {
             continue;
         }
-        // Identity-H/V without ToUnicode — flag it
+
+        // Check if fallback decoding paths can handle this font.
+        // The extraction pipeline tries: TrueType cmap → CIDSystemInfo → passthrough.
+        // If any of these would succeed, the font is decodable — don't flag it.
+        if identity_h_font_has_fallback(font_dict, doc) {
+            continue;
+        }
+
+        // Identity-H/V without ToUnicode and no fallback — flag it
         log::debug!(
             "page has Identity-H/V font without ToUnicode: {:?}",
             font_dict
@@ -608,6 +616,102 @@ fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
                 .map(|n| String::from_utf8_lossy(n).to_string())
         );
         return true;
+    }
+    false
+}
+
+/// Check whether an Identity-H font without ToUnicode can still be decoded
+/// via one of the extraction pipeline's fallback paths.
+fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -> bool {
+    let desc_fonts_obj = match font_dict.get(b"DescendantFonts").ok() {
+        Some(obj) => obj,
+        None => return false,
+    };
+    let desc_fonts = match desc_fonts_obj {
+        Object::Array(arr) => arr,
+        Object::Reference(r) => match doc.get_object(*r) {
+            Ok(Object::Array(arr)) => arr,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    if desc_fonts.is_empty() {
+        return false;
+    }
+    let cid_font_dict = match &desc_fonts[0] {
+        Object::Reference(r) => match doc.get_dictionary(*r) {
+            Ok(d) => d,
+            _ => return false,
+        },
+        Object::Dictionary(d) => d,
+        _ => return false,
+    };
+
+    // Fallback 1: W array CIDs look like Unicode codepoints → passthrough works.
+    // Many PDF generators (Chromium, wkhtmltopdf) use Identity-H where CID = Unicode.
+    if crate::tounicode::cid_values_look_like_unicode(cid_font_dict) {
+        return true;
+    }
+
+    // Fallback 2: Embedded TrueType/OpenType font has a usable cmap table.
+    if let Some(font_descriptor) = cid_font_dict
+        .get(b"FontDescriptor")
+        .ok()
+        .and_then(|o| match o {
+            Object::Reference(r) => doc.get_dictionary(*r).ok(),
+            Object::Dictionary(d) => Some(d),
+            _ => None,
+        })
+    {
+        let font_file_ref = font_descriptor
+            .get(b"FontFile2")
+            .ok()
+            .and_then(|o| o.as_reference().ok())
+            .or_else(|| {
+                font_descriptor
+                    .get(b"FontFile3")
+                    .ok()
+                    .and_then(|o| o.as_reference().ok())
+            });
+        if let Some(ff_ref) = font_file_ref {
+            if embedded_font_has_cmap(doc, ff_ref) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Quick check whether an embedded TrueType/OpenType font has a cmap table
+/// that can map GIDs to Unicode codepoints.
+fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
+    let stream = match doc.get_object(font_ref).and_then(Object::as_stream) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let data = match stream.decompressed_content() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let face = match ttf_parser::Face::parse(&data, 0) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Check that the font has a cmap table with at least some Unicode mappings
+    if let Some(cmap) = face.tables().cmap {
+        for subtable in cmap.subtables {
+            if subtable.is_unicode()
+                || (subtable.platform_id == ttf_parser::PlatformId::Windows
+                    && subtable.encoding_id == 0)
+            {
+                let mut count = 0u32;
+                subtable.codepoints(|_| count += 1);
+                if count > 0 {
+                    return true;
+                }
+            }
+        }
     }
     false
 }
@@ -1381,6 +1485,123 @@ mod tests {
             }),
         );
         assert!(!page_has_identity_h_no_tounicode(&doc, page_id));
+    }
+
+    #[test]
+    fn test_identity_h_with_unicode_cids_not_flagged() {
+        // Type0 Identity-H font without ToUnicode but with W array CIDs
+        // that look like Unicode codepoints (e.g. from Chromium/wkhtmltopdf).
+        // The CID-as-Unicode passthrough can decode these — don't flag.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        // CIDFont with W array containing Unicode-range CIDs (>= 0x41)
+        let cid_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"CIDFontType2".to_vec()),
+            "W" => Object::Array(vec![
+                Object::Integer(0x41),  // CID 65 = 'A'
+                Object::Array(vec![
+                    Object::Integer(600), Object::Integer(600), Object::Integer(600),
+                ]),
+                Object::Integer(0x61),  // CID 97 = 'a'
+                Object::Array(vec![
+                    Object::Integer(500), Object::Integer(500), Object::Integer(500),
+                ]),
+            ]),
+        });
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+ArialMT".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "DescendantFonts" => Object::Array(vec![Object::Reference(cid_font_id)]),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(font_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        assert!(
+            !page_has_identity_h_no_tounicode(&doc, page_id),
+            "Should NOT flag: W array CIDs look like Unicode, passthrough works"
+        );
+    }
+
+    #[test]
+    fn test_identity_h_with_low_gid_cids_still_flagged() {
+        // Type0 Identity-H font without ToUnicode and W array CIDs
+        // that are low GID values (subset font, no cmap). These can't
+        // be decoded — should still be flagged.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        // CIDFont with W array containing low GID values (< 0x41)
+        let cid_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"CIDFontType2".to_vec()),
+            "W" => Object::Array(vec![
+                Object::Integer(3),  // Low GID
+                Object::Array(vec![
+                    Object::Integer(600), Object::Integer(600), Object::Integer(600),
+                    Object::Integer(600), Object::Integer(600),
+                ]),
+                Object::Integer(10),  // Still low
+                Object::Array(vec![
+                    Object::Integer(500), Object::Integer(500), Object::Integer(500),
+                ]),
+            ]),
+        });
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"GPBCHP+TimesNewRoman".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "DescendantFonts" => Object::Array(vec![Object::Reference(cid_font_id)]),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(font_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        assert!(
+            page_has_identity_h_no_tounicode(&doc, page_id),
+            "Should flag: low GID CIDs, no cmap, no passthrough"
+        );
     }
 
     #[test]

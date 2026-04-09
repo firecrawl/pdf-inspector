@@ -1650,7 +1650,7 @@ fn merge_cmaps(mut base: ToUnicodeCMap, overlay: ToUnicodeCMap) -> ToUnicodeCMap
 ///
 /// Returns true if the median CID is >= 0x41 (letter 'A'), indicating
 /// the PDF generator likely used Unicode codepoints as CIDs.
-fn cid_values_look_like_unicode(cid_font_dict: &lopdf::Dictionary) -> bool {
+pub(crate) fn cid_values_look_like_unicode(cid_font_dict: &lopdf::Dictionary) -> bool {
     let w_arr = match cid_font_dict.get(b"W").ok() {
         Some(Object::Array(arr)) => arr,
         _ => return false,
