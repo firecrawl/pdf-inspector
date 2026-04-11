@@ -444,6 +444,155 @@ pub fn extract_text_in_regions_mem(
     Ok(results)
 }
 
+/// Extract tables within bounding-box regions from a PDF in memory.
+///
+/// Similar to [`extract_text_in_regions_mem`] but runs table detection on items
+/// within each region and returns markdown pipe-tables instead of flat text.
+///
+/// When table structure is detected, `text` contains a markdown pipe-table and
+/// `needs_ocr` is `false`. When no table is found (too few items, poor alignment,
+/// GID fonts, etc.), `text` is empty and `needs_ocr` is `true` so the caller can
+/// fall back to GPU OCR.
+pub fn extract_tables_in_regions_mem(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let pages = doc.get_pages();
+
+    let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
+    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
+
+    let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    let mut page_heights: HashMap<u32, f32> = HashMap::new();
+    let mut gid_pages: HashSet<u32> = HashSet::new();
+    let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
+    let mut rotated_pages: HashSet<u32> = HashSet::new();
+
+    for (page_num, &page_id) in pages.iter() {
+        if !needed_pages.contains(page_num) {
+            continue;
+        }
+        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
+        page_heights.insert(*page_num, height);
+
+        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
+            extractor::content_stream::extract_page_text_items(
+                &doc,
+                page_id,
+                *page_num,
+                &font_cmaps,
+                false,
+            )?;
+        let threshold = text_utils::fix_letterspaced_items(&mut items);
+        if threshold > 0.10 {
+            page_thresholds.insert(*page_num, threshold);
+        }
+        if has_gid {
+            gid_pages.insert(*page_num);
+        }
+        if coords_rotated {
+            rotated_pages.insert(*page_num);
+        }
+        items_by_page.insert(*page_num, items);
+    }
+
+    let mut results = Vec::with_capacity(page_regions.len());
+
+    for (page_0idx, regions) in page_regions {
+        let page_1idx = page_0idx + 1;
+        let items = items_by_page.get(&page_1idx);
+        let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
+        let page_has_gid = gid_pages.contains(&page_1idx);
+        let coords = if rotated_pages.contains(&page_1idx) {
+            RegionCoordSpace::Rotated90Ccw
+        } else {
+            RegionCoordSpace::Standard
+        };
+
+        let mut page_results = Vec::with_capacity(regions.len());
+
+        for rect in regions {
+            let [rx1, ry1, rx2, ry2] = *rect;
+
+            // If page has GID font issues, bail early
+            if page_has_gid {
+                page_results.push(RegionText {
+                    text: String::new(),
+                    needs_ocr: true,
+                });
+                continue;
+            }
+
+            let matched: Vec<TextItem> = match items {
+                Some(items) => {
+                    let bounds = region_bounds(rx1, ry1, rx2, ry2, page_h, coords);
+                    items
+                        .iter()
+                        .filter(|item| region_overlaps_item(item, bounds))
+                        .cloned()
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+
+            if matched.is_empty() {
+                page_results.push(RegionText {
+                    text: String::new(),
+                    needs_ocr: true,
+                });
+                continue;
+            }
+
+            // Compute base_font_size as most common font size in the region
+            let base_font_size = {
+                let mut freq: HashMap<i32, usize> = HashMap::new();
+                for item in &matched {
+                    *freq.entry((item.font_size * 10.0) as i32).or_default() += 1;
+                }
+                freq.into_iter()
+                    .max_by_key(|(_, count)| *count)
+                    .map(|(size, _)| size as f32 / 10.0)
+                    .unwrap_or(12.0)
+            };
+
+            // Run heuristic table detection; skip_body_font = false since
+            // the layout model already identified this region as a table.
+            let detected = tables::detect_tables(&matched, base_font_size, false);
+
+            if let Some(table) = detected.into_iter().next() {
+                let md = tables::table_to_markdown(&table);
+                if md.trim().is_empty() {
+                    page_results.push(RegionText {
+                        text: String::new(),
+                        needs_ocr: true,
+                    });
+                } else {
+                    let needs_ocr =
+                        is_garbage_text(&md) || is_cid_garbage(&md) || detect_encoding_issues(&md);
+                    page_results.push(RegionText {
+                        text: md,
+                        needs_ocr,
+                    });
+                }
+            } else {
+                page_results.push(RegionText {
+                    text: String::new(),
+                    needs_ocr: true,
+                });
+            }
+        }
+
+        results.push(PageRegionResult {
+            page: *page_0idx,
+            regions: page_results,
+        });
+    }
+
+    Ok(results)
+}
+
 /// Get page height in points from MediaBox.
 fn get_page_height(doc: &Document, page_id: lopdf::ObjectId) -> Option<f32> {
     let page_dict = doc.get_dictionary(page_id).ok()?;

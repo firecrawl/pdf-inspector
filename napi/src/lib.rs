@@ -255,7 +255,42 @@ pub fn extract_text_in_regions(
     page_regions: Vec<PageRegions>,
 ) -> Result<Vec<PageRegionTexts>> {
     let bytes: Vec<u8> = buffer.to_vec();
-    let regions: Vec<(u32, Vec<[f32; 4]>)> = page_regions
+    let regions = parse_page_regions(&page_regions);
+
+    catch_panic("extract_text_in_regions", move || {
+        let results = pdf_inspector::extract_text_in_regions_mem(&bytes, &regions)
+            .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
+        Ok(to_page_region_texts(results))
+    })
+}
+
+/// Extract markdown tables within bounding-box regions from a PDF.
+///
+/// Like `extractTextInRegions` but runs table detection on items within each
+/// region and returns markdown pipe-tables instead of flat text.
+///
+/// When table structure is detected, `text` contains a markdown pipe-table and
+/// `needsOcr` is `false`. When no table is found, `text` is empty and
+/// `needsOcr` is `true` so the caller can fall back to GPU OCR.
+///
+/// Coordinates are PDF points with top-left origin.
+#[napi]
+pub fn extract_tables_in_regions(
+    buffer: Buffer,
+    page_regions: Vec<PageRegions>,
+) -> Result<Vec<PageRegionTexts>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let regions = parse_page_regions(&page_regions);
+
+    catch_panic("extract_tables_in_regions", move || {
+        let results = pdf_inspector::extract_tables_in_regions_mem(&bytes, &regions)
+            .map_err(|e| to_napi_err(e, "extract_tables_in_regions"))?;
+        Ok(to_page_region_texts(results))
+    })
+}
+
+fn parse_page_regions(page_regions: &[PageRegions]) -> Vec<(u32, Vec<[f32; 4]>)> {
+    page_regions
         .iter()
         .map(|pr| {
             let bboxes: Vec<[f32; 4]> = pr
@@ -271,25 +306,22 @@ pub fn extract_text_in_regions(
                 .collect();
             (pr.page, bboxes)
         })
-        .collect();
+        .collect()
+}
 
-    catch_panic("extract_text_in_regions", move || {
-        let results = pdf_inspector::extract_text_in_regions_mem(&bytes, &regions)
-            .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
-
-        Ok(results
-            .into_iter()
-            .map(|page_result| PageRegionTexts {
-                page: page_result.page,
-                regions: page_result
-                    .regions
-                    .into_iter()
-                    .map(|r| RegionText {
-                        text: r.text,
-                        needs_ocr: r.needs_ocr,
-                    })
-                    .collect(),
-            })
-            .collect())
-    })
+fn to_page_region_texts(results: Vec<pdf_inspector::PageRegionResult>) -> Vec<PageRegionTexts> {
+    results
+        .into_iter()
+        .map(|page_result| PageRegionTexts {
+            page: page_result.page,
+            regions: page_result
+                .regions
+                .into_iter()
+                .map(|r| RegionText {
+                    text: r.text,
+                    needs_ocr: r.needs_ocr,
+                })
+                .collect(),
+        })
+        .collect()
 }

@@ -4,9 +4,9 @@ use pdf_inspector::detector::{DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
-    detect_pdf_type, extract_text, extract_text_in_regions_mem, extract_text_with_positions,
-    process_pdf_mem, process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions,
-    PdfType, TextItem,
+    detect_pdf_type, extract_tables_in_regions_mem, extract_text, extract_text_in_regions_mem,
+    extract_text_with_positions, process_pdf_mem, process_pdf_with_options, to_markdown,
+    MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
 };
 use std::collections::HashSet;
 
@@ -1343,4 +1343,96 @@ fn test_extract_regions_fast_vs_normal_comparison() {
             }
         }
     }
+}
+
+// =========================================================================
+// extract_tables_in_regions_mem tests
+// =========================================================================
+
+#[test]
+fn test_extract_tables_in_regions_table_pdf() {
+    // tnagriculture has a clear table with district names and spice columns
+    let buf = std::fs::read("tests/fixtures/tnagriculture_06_12.pdf").unwrap();
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].regions.len(), 1);
+
+    let region = &results[0].regions[0];
+    // Should detect a table with pipe-delimited markdown
+    if !region.needs_ocr {
+        assert!(
+            region.text.contains('|'),
+            "Table output should contain pipe delimiters"
+        );
+        // Should have separator row
+        assert!(
+            region.text.lines().any(|l| l.contains("---")),
+            "Table output should contain separator row"
+        );
+    }
+}
+
+#[test]
+fn test_extract_tables_in_regions_non_table_region() {
+    // Use a small region that likely won't contain enough items for a table
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 50.0, 50.0]])]).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].regions.len(), 1);
+
+    let region = &results[0].regions[0];
+    // Small region with few items should fall back to needs_ocr
+    assert!(
+        region.needs_ocr,
+        "Non-table region should set needs_ocr = true"
+    );
+    assert!(
+        region.text.is_empty(),
+        "Non-table region should have empty text"
+    );
+}
+
+#[test]
+fn test_extract_tables_in_regions_empty_region() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let results = extract_tables_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 0.0, 0.0]])]).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let region = &results[0].regions[0];
+    assert!(region.needs_ocr);
+    assert!(region.text.is_empty());
+}
+
+#[test]
+fn test_extract_tables_in_regions_identity_h_needs_ocr() {
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let region = &results[0].regions[0];
+    assert!(region.needs_ocr, "Identity-H font should trigger needs_ocr");
+}
+
+#[test]
+fn test_extract_tables_in_regions_not_a_pdf() {
+    let result =
+        extract_tables_in_regions_mem(b"not a pdf", &[(0, vec![[0.0, 0.0, 100.0, 100.0]])]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_extract_tables_in_regions_nonexistent_page() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(9999, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let region = &results[0].regions[0];
+    assert!(region.needs_ocr);
+    assert!(region.text.is_empty());
 }
