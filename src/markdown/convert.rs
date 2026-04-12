@@ -14,6 +14,57 @@ use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
 use super::MarkdownOptions;
 
+/// Pre-scan struct heading tags to find levels that are overused — i.e., tagged on
+/// so many lines that they clearly represent body text, not real headings.
+/// Returns the set of heading levels (1–6) that should be suppressed.
+///
+/// Some PDFs (e.g. British Academy grant guidance) tag every numbered paragraph
+/// line as H2, producing hundreds of false headings. We detect this by checking
+/// if any heading level accounts for >25% of tagged lines.
+fn detect_overused_struct_heading_levels(
+    lines: &[TextLine],
+    struct_roles: Option<
+        &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
+    >,
+) -> HashSet<usize> {
+    let mut overused = HashSet::new();
+    let Some(roles) = struct_roles else {
+        return overused;
+    };
+
+    let mut level_counts: HashMap<usize, usize> = HashMap::new();
+    let mut total = 0usize;
+
+    for line in lines {
+        if let Some(role) = resolve_line_struct_role(line, roles) {
+            total += 1;
+            if let Some(level) = struct_role_heading_level(&role) {
+                *level_counts.entry(level).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if total < 20 {
+        return overused;
+    }
+
+    for (&level, &count) in &level_counts {
+        let ratio = count as f32 / total as f32;
+        if ratio > 0.15 {
+            log::debug!(
+                "struct heading H{} overused: {}/{} lines ({:.0}%), suppressing",
+                level,
+                count,
+                total,
+                ratio * 100.0
+            );
+            overused.insert(level);
+        }
+    }
+
+    overused
+}
+
 /// Pre-scan lines to find "isolated" ones: short lines with paragraph breaks both
 /// before and after.  These are heading candidates even at body font size — common
 /// in academic papers ("Acknowledgements", "B.3 Prompt Engineering").
@@ -345,6 +396,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // lookahead in HeadingProcessor (prevNode/nextNode context).
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
 
+    // Detect struct heading levels that are overused (body text mistagged as headings)
+    let overused_heading_levels = detect_overused_struct_heading_levels(&lines, struct_roles);
+
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
@@ -526,7 +580,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         // Structure roles ADD headings (e.g. same-size text tagged H2) but do NOT
         // suppress headings that the font heuristic would detect (some tagged PDFs
         // mark obvious headings as P or Span).
-        let struct_heading = struct_role.as_ref().and_then(struct_role_heading_level);
+        let struct_heading = struct_role
+            .as_ref()
+            .and_then(struct_role_heading_level)
+            .filter(|level| !overused_heading_levels.contains(level));
         let heuristic_heading = if options.detect_headers
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
@@ -1258,6 +1315,81 @@ mod tests {
         assert!(
             !md.contains("```\n```"),
             "Should not have adjacent close/open fences: {md}"
+        );
+    }
+
+    #[test]
+    fn test_overused_struct_heading_suppressed() {
+        // Simulate a PDF where H2 is mistagged on body text lines.
+        // 30 lines total: 5 tagged H1 (real headings), 20 tagged H2 (mistagged body),
+        // 5 tagged P.
+        let mut lines = Vec::new();
+        let mut page_roles = HashMap::new();
+        let mut mcid = 0i64;
+
+        for i in 0..30 {
+            let mut item = make_item(&format!("Line {i}"), 1, Some(mcid));
+            item.y = 700.0 - (i as f32 * 15.0);
+            lines.push(make_line(vec![item]));
+
+            let role = if i < 5 {
+                StructRole::H1
+            } else if i < 25 {
+                StructRole::H2
+            } else {
+                StructRole::P
+            };
+            page_roles.insert(mcid, role);
+            mcid += 1;
+        }
+
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let overused = detect_overused_struct_heading_levels(&lines, Some(&roles));
+        // H2 is on 20/30 = 67% of lines — should be suppressed
+        assert!(
+            overused.contains(&2),
+            "H2 should be detected as overused: {:?}",
+            overused
+        );
+        // H1 is on 5/30 = 17% — should also be suppressed at >15% threshold
+        assert!(
+            overused.contains(&1),
+            "H1 at 17% should also be suppressed: {:?}",
+            overused
+        );
+    }
+
+    #[test]
+    fn test_normal_struct_headings_not_suppressed() {
+        // Normal document: a few headings, mostly body text
+        let mut lines = Vec::new();
+        let mut page_roles = HashMap::new();
+        let mut mcid = 0i64;
+
+        for i in 0..50 {
+            let mut item = make_item(&format!("Line {i}"), 1, Some(mcid));
+            item.y = 700.0 - (i as f32 * 14.0);
+            lines.push(make_line(vec![item]));
+
+            let role = if i % 10 == 0 {
+                StructRole::H1 // 5 headings out of 50 = 10%
+            } else {
+                StructRole::P
+            };
+            page_roles.insert(mcid, role);
+            mcid += 1;
+        }
+
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let overused = detect_overused_struct_heading_levels(&lines, Some(&roles));
+        assert!(
+            overused.is_empty(),
+            "No heading level should be overused: {:?}",
+            overused
         );
     }
 }
