@@ -4,9 +4,10 @@ use pdf_inspector::detector::{DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
-    detect_pdf_type, extract_tables_in_regions_mem, extract_text, extract_text_in_regions_mem,
-    extract_text_with_positions, process_pdf_mem, process_pdf_with_options, to_markdown,
-    MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
+    detect_pdf_type, extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
+    extract_text_in_regions_mem, extract_text_with_positions, process_pdf_mem,
+    process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions, PdfType,
+    TextItem,
 };
 use std::collections::HashSet;
 
@@ -1435,4 +1436,114 @@ fn test_extract_tables_in_regions_nonexistent_page() {
     let region = &results[0].regions[0];
     assert!(region.needs_ocr);
     assert!(region.text.is_empty());
+}
+
+// =========================================================================
+// extract_pages_markdown_mem tests
+// =========================================================================
+
+#[test]
+fn test_extract_pages_markdown_basic() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let results = extract_pages_markdown_mem(&buf, &[0, 1]).unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].page, 0);
+    assert_eq!(results[1].page, 1);
+    // Text-based PDF should produce non-empty markdown
+    assert!(!results[0].markdown.is_empty());
+    assert!(!results[0].needs_ocr);
+}
+
+#[test]
+fn test_extract_pages_markdown_page_ordering() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    // Request pages in non-sequential order
+    let results = extract_pages_markdown_mem(&buf, &[1, 0]).unwrap();
+
+    assert_eq!(results.len(), 2);
+    // Results should match input order, not document order
+    assert_eq!(results[0].page, 1);
+    assert_eq!(results[1].page, 0);
+}
+
+#[test]
+fn test_extract_pages_markdown_out_of_range() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let results = extract_pages_markdown_mem(&buf, &[9999]).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].page, 9999);
+    assert!(results[0].markdown.is_empty());
+    assert!(results[0].needs_ocr);
+}
+
+#[test]
+fn test_extract_pages_markdown_empty_pages_list() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let results = extract_pages_markdown_mem(&buf, &[]).unwrap();
+    assert!(results.is_empty());
+}
+
+#[test]
+fn test_extract_pages_markdown_single_page() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let results = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].page, 0);
+    assert!(!results[0].markdown.is_empty());
+    assert!(!results[0].needs_ocr);
+}
+
+#[test]
+fn test_extract_pages_markdown_invalid_buffer() {
+    let result = extract_pages_markdown_mem(b"not a pdf", &[0]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_extract_pages_markdown_gid_pages_need_ocr() {
+    // shinagawa_identity_h.pdf has GID-encoded fonts
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let results = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].needs_ocr);
+}
+
+#[test]
+fn test_extract_pages_markdown_consistency_with_process_pdf() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+
+    // Get full process_pdf output
+    let full = process_pdf_mem(&buf).unwrap();
+    let full_md = full.markdown.unwrap_or_default();
+
+    // Get per-page output for all pages
+    let page_count = full.page_count;
+    let page_indices: Vec<u32> = (0..page_count).collect();
+    let per_page = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+
+    // Concatenated per-page markdown should contain substantial overlap with
+    // the full output (exact match not expected due to header/footer stripping
+    // and cross-page paragraph merging differences)
+    let concat: String = per_page
+        .iter()
+        .map(|p| p.markdown.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Both should be non-empty for a text-based PDF
+    assert!(!full_md.is_empty());
+    assert!(!concat.is_empty());
+
+    // The per-page version should contain at least 50% of the full content's
+    // length (accounting for header/footer stripping differences)
+    assert!(
+        concat.len() * 2 >= full_md.len(),
+        "per-page concat ({} chars) is too short vs full ({} chars)",
+        concat.len(),
+        full_md.len()
+    );
 }

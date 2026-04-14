@@ -317,6 +317,41 @@ pub fn extract_tables_in_regions(
     })
 }
 
+/// Per-page markdown extraction result.
+#[napi(object)]
+pub struct PageMarkdownResult {
+    /// 0-indexed page number.
+    pub page: u32,
+    /// Formatted markdown for this page.
+    pub markdown: String,
+    /// `true` when text on this page is unreliable.
+    pub needs_ocr: bool,
+}
+
+/// Extract formatted markdown for specific pages of a PDF.
+///
+/// Returns per-page markdown so callers can mix direct extraction
+/// (for simple text pages) with GPU OCR (for complex/scanned pages).
+///
+/// Font statistics are computed from the full document so header
+/// detection is consistent across pages.
+#[napi]
+pub fn extract_pages_markdown(buffer: Buffer, pages: Vec<u32>) -> Result<Vec<PageMarkdownResult>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_pages_markdown", move || {
+        let results = pdf_inspector::extract_pages_markdown_mem(&bytes, &pages)
+            .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
+        Ok(results
+            .into_iter()
+            .map(|r| PageMarkdownResult {
+                page: r.page,
+                markdown: r.markdown,
+                needs_ocr: r.needs_ocr,
+            })
+            .collect())
+    })
+}
+
 fn parse_page_regions(page_regions: &[PageRegions]) -> Vec<(u32, Vec<[f32; 4]>)> {
     page_regions
         .iter()

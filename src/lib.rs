@@ -299,6 +299,115 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     })
 }
 
+// =========================================================================
+// Per-page markdown extraction
+// =========================================================================
+
+/// Per-page markdown extraction result.
+#[derive(Debug)]
+pub struct PageMarkdown {
+    /// 0-indexed page number.
+    pub page: u32,
+    /// Formatted markdown for this page.
+    pub markdown: String,
+    /// `true` when text on this page is unreliable (GID-encoded fonts,
+    /// encoding issues, garbage text, or empty extraction).
+    pub needs_ocr: bool,
+}
+
+/// Extract formatted markdown for specific pages of a PDF.
+///
+/// Unlike [`process_pdf_mem`] which returns one concatenated markdown string,
+/// this returns per-page markdown so callers can mix direct extraction
+/// (for simple text pages) with GPU OCR (for complex/scanned pages).
+///
+/// Font statistics are computed from the full document so header
+/// detection thresholds are consistent regardless of which pages are
+/// requested. Per-page `needs_ocr` is set when the page has GID-encoded
+/// fonts, encoding issues, or garbage text.
+pub fn extract_pages_markdown_mem(
+    buffer: &[u8],
+    pages: &[u32],
+) -> Result<Vec<PageMarkdown>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+
+    // Extract ALL pages to get accurate, document-wide font stats.
+    let ((all_items, all_rects, _all_lines), page_thresholds, gid_pages) =
+        extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?;
+
+    // Compute font stats from full document (cross-page consistency).
+    let font_stats = markdown::analysis::calculate_font_stats_from_items(&all_items);
+
+    let mut results = Vec::with_capacity(pages.len());
+
+    for &page_0idx in pages {
+        // Out-of-range pages → empty + needs_ocr
+        if page_0idx >= page_count {
+            results.push(PageMarkdown {
+                page: page_0idx,
+                markdown: String::new(),
+                needs_ocr: true,
+            });
+            continue;
+        }
+
+        let page_1idx = page_0idx + 1;
+
+        // Filter items/rects for this page only
+        let page_items: Vec<TextItem> = all_items
+            .iter()
+            .filter(|i| i.page == page_1idx)
+            .cloned()
+            .collect();
+
+        let page_rects: Vec<PdfRect> = all_rects
+            .iter()
+            .filter(|r| r.page == page_1idx)
+            .cloned()
+            .collect();
+
+        let has_gid = gid_pages.contains(&page_1idx);
+
+        // Build markdown with document-wide font stats
+        let options = MarkdownOptions {
+            base_font_size: Some(font_stats.most_common_size),
+            include_page_numbers: false,
+            strip_headers_footers: false,
+            ..MarkdownOptions::default()
+        };
+
+        let md = markdown::to_markdown_from_items_with_rects_and_lines(
+            page_items,
+            options,
+            &page_rects,
+            &[],
+            &page_thresholds,
+            None,
+            &[],
+        );
+
+        let needs_ocr = md.trim().is_empty()
+            || has_gid
+            || is_garbage_text(&md)
+            || is_cid_garbage(&md)
+            || detect_encoding_issues(&md);
+
+        results.push(PageMarkdown {
+            page: page_0idx,
+            markdown: if needs_ocr { String::new() } else { md },
+            needs_ocr,
+        });
+    }
+
+    Ok(results)
+}
+
+// =========================================================================
+// Region-based text extraction (for hybrid OCR pipelines)
+// =========================================================================
+
 /// Result for a single region's text extraction.
 #[derive(Debug)]
 pub struct RegionText {
