@@ -6,13 +6,35 @@ use std::collections::HashSet;
 use std::panic;
 
 // ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+/// PDF document type classification.
+#[napi(string_enum)]
+pub enum PdfType {
+    TextBased,
+    Scanned,
+    ImageBased,
+    Mixed,
+}
+
+/// Type of a positioned text item.
+#[napi(string_enum)]
+pub enum ItemType {
+    Text,
+    Image,
+    Link,
+    FormField,
+}
+
+// ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
 
 /// Full PDF processing result with markdown and metadata.
 #[napi(object)]
 pub struct PdfResult {
-    pub pdf_type: String,
+    pub pdf_type: PdfType,
     pub markdown: Option<String>,
     pub page_count: u32,
     pub processing_time_ms: u32,
@@ -29,7 +51,7 @@ pub struct PdfResult {
 /// Lightweight PDF classification result.
 #[napi(object)]
 pub struct PdfClassification {
-    pub pdf_type: String,
+    pub pdf_type: PdfType,
     pub page_count: u32,
     /// 0-indexed page numbers that need OCR.
     pub pages_needing_ocr: Vec<u32>,
@@ -49,7 +71,9 @@ pub struct TextItem {
     pub page: u32,
     pub is_bold: bool,
     pub is_italic: bool,
-    pub item_type: String,
+    pub item_type: ItemType,
+    /// URL for link items, `None` for other types.
+    pub link_url: Option<String>,
 }
 
 /// A page's regions for text extraction: (page_index_0based, bboxes).
@@ -79,18 +103,18 @@ pub struct PageRegionTexts {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn pdf_type_string(t: pdf_inspector::PdfType) -> String {
+fn convert_pdf_type(t: pdf_inspector::PdfType) -> PdfType {
     match t {
-        pdf_inspector::PdfType::TextBased => "TextBased".to_string(),
-        pdf_inspector::PdfType::Scanned => "Scanned".to_string(),
-        pdf_inspector::PdfType::ImageBased => "ImageBased".to_string(),
-        pdf_inspector::PdfType::Mixed => "Mixed".to_string(),
+        pdf_inspector::PdfType::TextBased => PdfType::TextBased,
+        pdf_inspector::PdfType::Scanned => PdfType::Scanned,
+        pdf_inspector::PdfType::ImageBased => PdfType::ImageBased,
+        pdf_inspector::PdfType::Mixed => PdfType::Mixed,
     }
 }
 
 fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
     PdfResult {
-        pdf_type: pdf_type_string(r.pdf_type),
+        pdf_type: convert_pdf_type(r.pdf_type),
         markdown: r.markdown,
         page_count: r.page_count,
         processing_time_ms: r.processing_time_ms as u32,
@@ -104,12 +128,12 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
     }
 }
 
-fn item_type_string(t: &pdf_inspector::types::ItemType) -> String {
+fn convert_item_type(t: &pdf_inspector::types::ItemType) -> (ItemType, Option<String>) {
     match t {
-        pdf_inspector::types::ItemType::Text => "text".into(),
-        pdf_inspector::types::ItemType::Image => "image".into(),
-        pdf_inspector::types::ItemType::Link(url) => format!("link:{url}"),
-        pdf_inspector::types::ItemType::FormField => "form_field".into(),
+        pdf_inspector::types::ItemType::Text => (ItemType::Text, None),
+        pdf_inspector::types::ItemType::Image => (ItemType::Image, None),
+        pdf_inspector::types::ItemType::Link(url) => (ItemType::Link, Some(url.clone())),
+        pdf_inspector::types::ItemType::FormField => (ItemType::FormField, None),
     }
 }
 
@@ -181,7 +205,7 @@ pub fn classify_pdf(buffer: Buffer) -> Result<PdfClassification> {
         let result =
             pdf_inspector::classify_pdf_mem(&bytes).map_err(|e| to_napi_err(e, "classify_pdf"))?;
         Ok(PdfClassification {
-            pdf_type: pdf_type_string(result.pdf_type),
+            pdf_type: convert_pdf_type(result.pdf_type),
             page_count: result.page_count,
             pages_needing_ocr: result.pages_needing_ocr,
             confidence: result.confidence as f64,
@@ -222,18 +246,22 @@ pub fn extract_text_with_positions(
 
         Ok(items
             .into_iter()
-            .map(|item| TextItem {
-                text: item.text,
-                x: item.x as f64,
-                y: item.y as f64,
-                width: item.width as f64,
-                height: item.height as f64,
-                font: item.font,
-                font_size: item.font_size as f64,
-                page: item.page,
-                is_bold: item.is_bold,
-                is_italic: item.is_italic,
-                item_type: item_type_string(&item.item_type),
+            .map(|item| {
+                let (item_type, link_url) = convert_item_type(&item.item_type);
+                TextItem {
+                    text: item.text,
+                    x: item.x as f64,
+                    y: item.y as f64,
+                    width: item.width as f64,
+                    height: item.height as f64,
+                    font: item.font,
+                    font_size: item.font_size as f64,
+                    page: item.page,
+                    is_bold: item.is_bold,
+                    is_italic: item.is_italic,
+                    item_type,
+                    link_url,
+                }
             })
             .collect())
     })
