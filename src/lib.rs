@@ -28,6 +28,7 @@ pub mod python;
 pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
+pub mod formula_latex;
 pub mod glyph_names;
 pub mod markdown;
 pub mod process_mode;
@@ -788,6 +789,100 @@ pub fn extract_formulas_in_regions_mem(
         }
 
         results.push(PageRegionResult {
+            page: *page_0idx,
+            regions: page_results,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Extract formula text within bounding-box regions and reconstruct LaTeX.
+///
+/// For each formula bbox, this function:
+/// 1. Gets positioned text items inside the bbox
+/// 2. Analyzes font sizes and vertical positions to detect sub/superscripts
+/// 3. Detects simple fractions from vertically stacked text
+/// 4. Converts Unicode math symbols to LaTeX commands
+/// 5. Reconstructs structured LaTeX from the positioned items
+///
+/// Each result includes a `confidence` score (0.0–1.0) indicating how reliable
+/// the LaTeX reconstruction is. Low-confidence results should be sent to GPU OCR.
+///
+/// The `needs_ocr` flag is set only when extraction fails entirely (empty text,
+/// encoding garbage), NOT based on confidence — the caller decides the threshold.
+pub fn extract_formulas_in_regions_as_latex(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+) -> Result<Vec<formula_latex::PageFormulaResult>, PdfError> {
+    let data = prepare_region_extraction(buffer, page_regions)?;
+
+    let mut results = Vec::with_capacity(page_regions.len());
+
+    for (page_0idx, regions) in page_regions {
+        let page_1idx = page_0idx + 1;
+        let items = data.items_by_page.get(&page_1idx);
+        let (page_h, _adaptive_threshold, coords) = page_region_context(&data, page_1idx);
+
+        let mut page_results = Vec::with_capacity(regions.len());
+
+        for rect in regions {
+            let [rx1, ry1, rx2, ry2] = *rect;
+
+            let result = match items {
+                Some(items) => {
+                    // Convert the bbox from top-left origin to the item coordinate space
+                    let bounds = region_bounds(rx1, ry1, rx2, ry2, page_h, coords);
+
+                    // Filter items whose center falls inside the bbox
+                    let matched = formula_latex::filter_items_in_bbox(
+                        items,
+                        bounds.x_min,
+                        bounds.y_min,
+                        bounds.x_max,
+                        bounds.y_max,
+                    );
+
+                    if matched.is_empty() {
+                        formula_latex::FormulaResult {
+                            latex: String::new(),
+                            raw_text: String::new(),
+                            confidence: 0.0,
+                            needs_ocr: true,
+                            confidence_breakdown: Vec::new(),
+                        }
+                    } else {
+                        let (latex, raw_text, confidence, confidence_breakdown) =
+                            formula_latex::reconstruct_latex(&matched);
+
+                        // Same formula-specific quality checks as extract_formulas_in_regions_mem
+                        let needs_ocr = raw_text.trim().is_empty()
+                            || is_cid_garbage(&raw_text)
+                            || detect_encoding_issues(&raw_text)
+                            || is_formula_garbage(&raw_text);
+
+                        formula_latex::FormulaResult {
+                            latex,
+                            raw_text,
+                            confidence,
+                            needs_ocr,
+                            confidence_breakdown,
+                        }
+                    }
+                }
+                None => formula_latex::FormulaResult {
+                    latex: String::new(),
+                    raw_text: String::new(),
+                    confidence: 0.0,
+                    needs_ocr: true,
+                    confidence_breakdown: Vec::new(),
+                },
+            };
+
+            page_results.push(result);
+        }
+
+        results.push(formula_latex::PageFormulaResult {
             page: *page_0idx,
             regions: page_results,
         });

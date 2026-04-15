@@ -99,6 +99,26 @@ pub struct PageRegionTexts {
     pub regions: Vec<RegionText>,
 }
 
+/// LaTeX reconstruction result for a single formula region.
+#[napi(object)]
+pub struct FormulaLatexResult {
+    /// Reconstructed LaTeX string.
+    pub latex: String,
+    /// The linearized raw text (before LaTeX reconstruction).
+    pub raw_text: String,
+    /// Heuristic confidence in the LaTeX output (0.0–1.0).
+    pub confidence: f64,
+    /// `true` when extraction failed entirely and GPU OCR is needed.
+    pub needs_ocr: bool,
+}
+
+/// LaTeX reconstruction results for one page's formula regions.
+#[napi(object)]
+pub struct PageFormulaLatexResults {
+    pub page: u32,
+    pub regions: Vec<FormulaLatexResult>,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -337,6 +357,47 @@ pub fn extract_formulas_in_regions(
         let results = pdf_inspector::extract_formulas_in_regions_mem(&bytes, &regions)
             .map_err(|e| to_napi_err(e, "extract_formulas_in_regions"))?;
         Ok(to_page_region_texts(results))
+    })
+}
+
+/// Extract formula text within bounding-box regions and reconstruct LaTeX.
+///
+/// Like `extractFormulasInRegions` but additionally reconstructs LaTeX from
+/// the positioned text items. Each result includes the raw text, reconstructed
+/// LaTeX, a confidence score, and the `needsOcr` flag.
+///
+/// The confidence score (0.0–1.0) indicates how reliable the heuristic LaTeX
+/// reconstruction is. The caller should use this to decide whether to trust
+/// the LaTeX or fall back to GPU OCR.
+///
+/// Coordinates are PDF points with top-left origin.
+#[napi]
+pub fn extract_formulas_in_regions_as_latex(
+    buffer: Buffer,
+    page_regions: Vec<PageRegions>,
+) -> Result<Vec<PageFormulaLatexResults>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let regions = parse_page_regions(&page_regions);
+
+    catch_panic("extract_formulas_in_regions_as_latex", move || {
+        let results = pdf_inspector::extract_formulas_in_regions_as_latex(&bytes, &regions)
+            .map_err(|e| to_napi_err(e, "extract_formulas_in_regions_as_latex"))?;
+        Ok(results
+            .into_iter()
+            .map(|page_result| PageFormulaLatexResults {
+                page: page_result.page,
+                regions: page_result
+                    .regions
+                    .into_iter()
+                    .map(|r| FormulaLatexResult {
+                        latex: r.latex,
+                        raw_text: r.raw_text,
+                        confidence: r.confidence as f64,
+                        needs_ocr: r.needs_ocr,
+                    })
+                    .collect(),
+            })
+            .collect())
     })
 }
 
