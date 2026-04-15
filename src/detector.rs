@@ -229,8 +229,8 @@ pub(crate) fn detect_from_document(
             // text PDFs with figures have multiple smaller images alongside real text.
             if analysis.has_template_image
                 && (analysis.image_count <= 1
-                    || analysis.text_operator_count < 50
-                    || analysis.unique_alphanum_chars < 10)
+                    && analysis.text_operator_count < 50
+                    && analysis.unique_alphanum_chars < 10)
             {
                 pages_with_template_images += 1;
             }
@@ -361,8 +361,8 @@ pub(crate) fn detect_from_document(
                 // Template images only need OCR when it looks like a scan
                 // (single full-page image) rather than figures alongside text.
                 let looks_like_scan = analysis.image_count <= 1
-                    || analysis.text_operator_count < 50
-                    || analysis.unique_alphanum_chars < 10;
+                    && analysis.text_operator_count < 50
+                    && analysis.unique_alphanum_chars < 10;
                 if (analysis.has_template_image && looks_like_scan)
                     || analysis.has_vector_text
                     || (analysis.text_operator_count < config.min_text_ops_per_page
@@ -1688,5 +1688,59 @@ mod tests {
         let text_ops = 300u32;
         let font_changes = 50u32;
         assert!(text_ops < 1500);
+    }
+
+    #[test]
+    fn test_looks_like_scan_requires_all_conditions() {
+        // The looks_like_scan heuristic requires ALL three conditions (AND):
+        // 1. image_count <= 1
+        // 2. text_operator_count < 50
+        // 3. unique_alphanum_chars < 10
+
+        // A text page with one figure: has text ops and alphanum chars
+        // Should NOT look like a scan
+        let image_count = 1u32;
+        let text_operator_count = 135u32;
+        let unique_alphanum_chars = 58u32;
+        let looks_like_scan =
+            image_count <= 1 && text_operator_count < 50 && unique_alphanum_chars < 10;
+        assert!(
+            !looks_like_scan,
+            "text page with one figure should not be flagged as scan"
+        );
+
+        // A genuine scan: single image, no real text
+        let image_count = 1u32;
+        let text_operator_count = 3u32;
+        let unique_alphanum_chars = 2u32;
+        let looks_like_scan =
+            image_count <= 1 && text_operator_count < 50 && unique_alphanum_chars < 10;
+        assert!(
+            looks_like_scan,
+            "single image with no real text should be flagged as scan"
+        );
+
+        // OCR overlay page: single image but has OCR text operators and chars
+        // Should NOT look like a scan (OCR text is sufficient)
+        let image_count = 1u32;
+        let text_operator_count = 200u32;
+        let unique_alphanum_chars = 40u32;
+        let looks_like_scan =
+            image_count <= 1 && text_operator_count < 50 && unique_alphanum_chars < 10;
+        assert!(
+            !looks_like_scan,
+            "OCR overlay page should not be flagged as scan"
+        );
+
+        // Multiple images but low text: still not a scan (multiple figures page)
+        let image_count = 4u32;
+        let text_operator_count = 25u32;
+        let unique_alphanum_chars = 1u32;
+        let looks_like_scan =
+            image_count <= 1 && text_operator_count < 50 && unique_alphanum_chars < 10;
+        assert!(
+            !looks_like_scan,
+            "multiple images page should not match single-image scan pattern"
+        );
     }
 }

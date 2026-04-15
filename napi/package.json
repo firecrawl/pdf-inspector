@@ -1,6 +1,6 @@
 {
   "name": "firecrawl-pdf-inspector",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Fast PDF classification and text extraction. Detect text-based vs scanned PDFs, extract text by region with quality checks. Native Rust performance via napi-rs.",
   "main": "index.js",
   "types": "index.d.ts",
