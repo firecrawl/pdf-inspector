@@ -952,6 +952,7 @@ fn test_pages_needing_ocr_field_accessible() {
         title: None,
         ocr_recommended: false,
         pages_needing_ocr: Vec::new(),
+        pages_with_images: Vec::new(),
     };
     assert!(detection_result.pages_needing_ocr.is_empty());
 
@@ -961,6 +962,7 @@ fn test_pages_needing_ocr_field_accessible() {
         page_count: 1,
         processing_time_ms: 0,
         pages_needing_ocr: vec![1, 3],
+        pages_with_images: Vec::new(),
         title: None,
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
