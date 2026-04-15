@@ -60,11 +60,8 @@ pub struct PdfTypeResult {
     /// 1-indexed page numbers that need OCR (image-only or insufficient text).
     /// Empty for TextBased. All pages for Scanned/ImageBased. Specific pages for Mixed.
     pub pages_needing_ocr: Vec<u32>,
-    /// 1-indexed page numbers that contain at least one embedded raster/vector image
-    /// (Do XObject invocation with Subtype=Image, or inline image operators).
-    /// Computed for every page regardless of pdf_type, so callers can route
-    /// image-bearing pages to a downstream chart/VLM pipeline while still
-    /// fast-path'ing pure-text pages.
+    /// 1-indexed page numbers containing embedded images.
+    /// Includes image XObjects and inline images.
     pub pages_with_images: Vec<u32>,
 }
 
@@ -420,11 +417,7 @@ pub(crate) fn detect_from_document(
     pages_needing_ocr.sort();
     pages_needing_ocr.dedup();
 
-    // Phase 4: Build per-page image list. We need this for callers that want
-    // to route image-bearing pages to a chart/VLM pipeline while fast-path'ing
-    // pure-text pages. Reuse `analysis_cache` where available; analyze any
-    // remaining uncached pages on demand. Per-page analysis is ~0.2 ms so a
-    // full-document pass is negligible vs. any downstream OCR/VLM cost.
+    // Phase 4: Build per-page image list, reusing cached analyses when available.
     let mut pages_with_images: Vec<u32> = Vec::new();
     for page_num in 1..=total_pages {
         let has_images = if let Some(cached) = analysis_cache.get(&page_num) {

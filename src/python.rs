@@ -30,9 +30,7 @@ pub struct PyPdfResult {
     /// 1-indexed page numbers that need OCR.
     #[pyo3(get)]
     pub pages_needing_ocr: Vec<u32>,
-    /// 1-indexed page numbers containing at least one embedded image.
-    /// Populated for every page regardless of pdf_type — use this to route
-    /// image/chart pages to a VLM pipeline while fast-path'ing pure-text pages.
+    /// 1-indexed page numbers containing embedded images.
     #[pyo3(get)]
     pub pages_with_images: Vec<u32>,
     /// Title from PDF metadata.
@@ -82,7 +80,7 @@ pub struct PyPdfClassification {
     /// 0-indexed page numbers that need OCR.
     #[pyo3(get)]
     pub pages_needing_ocr: Vec<u32>,
-    /// 0-indexed page numbers containing at least one embedded image.
+    /// 0-indexed page numbers containing embedded images.
     #[pyo3(get)]
     pub pages_with_images: Vec<u32>,
     /// Detection confidence (0.0-1.0).

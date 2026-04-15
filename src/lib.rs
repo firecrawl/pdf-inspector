@@ -70,8 +70,7 @@ pub struct PdfProcessResult {
     pub processing_time_ms: u64,
     /// 1-indexed page numbers that need OCR.
     pub pages_needing_ocr: Vec<u32>,
-    /// 1-indexed page numbers that contain at least one embedded image
-    /// (XObject or inline). Populated for every page regardless of pdf_type.
+    /// 1-indexed page numbers containing embedded images.
     pub pages_with_images: Vec<u32>,
     /// Title from PDF metadata (if available).
     pub title: Option<String>,
@@ -283,8 +282,7 @@ pub struct PdfClassification {
     pub page_count: u32,
     /// 0-indexed page numbers that need OCR (scanned/image pages).
     pub pages_needing_ocr: Vec<u32>,
-    /// 0-indexed page numbers that contain at least one embedded image.
-    /// Populated for every page regardless of pdf_type.
+    /// 0-indexed page numbers containing embedded images.
     pub pages_with_images: Vec<u32>,
     /// Detection confidence score (0.0–1.0).
     pub confidence: f32,
