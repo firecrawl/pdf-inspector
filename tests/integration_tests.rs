@@ -972,6 +972,15 @@ fn test_pages_needing_ocr_field_accessible() {
 }
 
 #[test]
+fn test_pages_with_images_detected_for_fixture() {
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+    let result = process_pdf_mem(&buf).unwrap();
+
+    assert_eq!(result.pdf_type, PdfType::Mixed);
+    assert_eq!(result.pages_with_images, vec![31, 32, 116, 139, 430]);
+}
+
+#[test]
 fn test_text_pdf_process_result_empty_ocr_pages() {
     // A minimal valid PDF that is text-based should have empty pages_needing_ocr.
     // We use a minimal PDF buffer with a text content stream.

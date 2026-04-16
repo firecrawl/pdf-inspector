@@ -40,6 +40,8 @@ pub struct PdfResult {
     pub processing_time_ms: u32,
     /// 1-indexed page numbers that need OCR.
     pub pages_needing_ocr: Vec<u32>,
+    /// 1-indexed page numbers containing embedded images.
+    pub pages_with_images: Vec<u32>,
     pub title: Option<String>,
     pub confidence: f64,
     pub is_complex_layout: bool,
@@ -55,6 +57,8 @@ pub struct PdfClassification {
     pub page_count: u32,
     /// 0-indexed page numbers that need OCR.
     pub pages_needing_ocr: Vec<u32>,
+    /// 0-indexed page numbers containing embedded images.
+    pub pages_with_images: Vec<u32>,
     pub confidence: f64,
 }
 
@@ -119,6 +123,7 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         page_count: r.page_count,
         processing_time_ms: r.processing_time_ms as u32,
         pages_needing_ocr: r.pages_needing_ocr,
+        pages_with_images: r.pages_with_images,
         title: r.title,
         confidence: r.confidence as f64,
         is_complex_layout: r.layout.is_complex,
@@ -208,6 +213,7 @@ pub fn classify_pdf(buffer: Buffer) -> Result<PdfClassification> {
             pdf_type: convert_pdf_type(result.pdf_type),
             page_count: result.page_count,
             pages_needing_ocr: result.pages_needing_ocr,
+            pages_with_images: result.pages_with_images,
             confidence: result.confidence as f64,
         })
     })
@@ -350,10 +356,7 @@ pub struct PagesExtractionResult {
 /// OCR needs) from a single parse. Font statistics are computed from the
 /// full document so header detection is consistent across pages.
 #[napi]
-pub fn extract_pages_markdown(
-    buffer: Buffer,
-    pages: Vec<u32>,
-) -> Result<PagesExtractionResult> {
+pub fn extract_pages_markdown(buffer: Buffer, pages: Vec<u32>) -> Result<PagesExtractionResult> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("extract_pages_markdown", move || {
         let result = pdf_inspector::extract_pages_markdown_mem(&bytes, &pages)

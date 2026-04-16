@@ -165,6 +165,11 @@ fn main() {
                         .iter()
                         .map(|p| p.to_string())
                         .collect();
+                    let image_pages: Vec<String> = result
+                        .pages_with_images
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect();
                     let table_pages: Vec<String> = result
                         .layout
                         .pages_with_tables
@@ -178,11 +183,12 @@ fn main() {
                         .map(|p| p.to_string())
                         .collect();
                     println!(
-                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{}}}"#,
+                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"pages_with_images":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{}}}"#,
                         pdf_type_str,
                         result.page_count,
                         result.processing_time_ms,
                         ocr_pages.join(","),
+                        image_pages.join(","),
                         result.layout.is_complex,
                         table_pages.join(","),
                         col_pages.join(","),
@@ -194,6 +200,9 @@ fn main() {
                     eprintln!("Processing time: {}ms", result.processing_time_ms);
                     if !result.pages_needing_ocr.is_empty() {
                         eprintln!("Pages needing OCR: {:?}", result.pages_needing_ocr);
+                    }
+                    if !result.pages_with_images.is_empty() {
+                        eprintln!("Pages with images: {:?}", result.pages_with_images);
                     }
                     if analyze {
                         print_layout_info(&result.layout);
@@ -211,6 +220,11 @@ fn main() {
                     .iter()
                     .map(|p| p.to_string())
                     .collect();
+                let image_pages: Vec<String> = result
+                    .pages_with_images
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
                 let table_pages: Vec<String> = result
                     .layout
                     .pages_with_tables
@@ -224,7 +238,7 @@ fn main() {
                     .map(|p| p.to_string())
                     .collect();
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"markdown":"{}"}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"pages_with_images":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"markdown":"{}"}}"#,
                     match result.pdf_type {
                         PdfType::TextBased => "text_based",
                         PdfType::Scanned => "scanned",
@@ -236,6 +250,7 @@ fn main() {
                     result.processing_time_ms,
                     result.markdown.as_ref().map(|m| m.len()).unwrap_or(0),
                     ocr_pages.join(","),
+                    image_pages.join(","),
                     result.layout.is_complex,
                     table_pages.join(","),
                     col_pages.join(","),
@@ -271,6 +286,9 @@ fn main() {
                         if !result.pages_needing_ocr.is_empty() {
                             eprintln!("Pages needing OCR: {:?}", result.pages_needing_ocr);
                         }
+                        if !result.pages_with_images.is_empty() {
+                            eprintln!("Pages with images: {:?}", result.pages_with_images);
+                        }
 
                         if let Some(markdown) = &result.markdown {
                             if let Some(output) = output_file {
@@ -297,6 +315,9 @@ fn main() {
                         );
                         eprintln!("Pages: {}", result.page_count);
                         eprintln!("Processing time: {}ms", result.processing_time_ms);
+                        if !result.pages_with_images.is_empty() {
+                            eprintln!("Pages with images: {:?}", result.pages_with_images);
+                        }
                         eprintln!();
                         eprintln!("This PDF requires OCR for text extraction.");
                         eprintln!("Consider using MinerU or similar OCR tool.");
@@ -314,6 +335,9 @@ fn main() {
                                 eprintln!("Note: Some pages may contain images that require OCR.");
                             } else {
                                 eprintln!("Pages needing OCR: {:?}", result.pages_needing_ocr);
+                            }
+                            if !result.pages_with_images.is_empty() {
+                                eprintln!("Pages with images: {:?}", result.pages_with_images);
                             }
                             eprintln!();
 
