@@ -317,6 +317,29 @@ pub fn extract_tables_in_regions(
     })
 }
 
+/// Extract formula text within bounding-box regions from a PDF.
+///
+/// Like `extractTextInRegions` but uses formula-specific quality checks.
+/// Formula text is legitimately symbol-heavy (Greek letters, math operators)
+/// so the generic garbage-text check is relaxed. When the text decodes
+/// cleanly, `needsOcr` is `false` — the caller can skip GPU OCR.
+///
+/// Coordinates are PDF points with top-left origin.
+#[napi]
+pub fn extract_formulas_in_regions(
+    buffer: Buffer,
+    page_regions: Vec<PageRegions>,
+) -> Result<Vec<PageRegionTexts>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let regions = parse_page_regions(&page_regions);
+
+    catch_panic("extract_formulas_in_regions", move || {
+        let results = pdf_inspector::extract_formulas_in_regions_mem(&bytes, &regions)
+            .map_err(|e| to_napi_err(e, "extract_formulas_in_regions"))?;
+        Ok(to_page_region_texts(results))
+    })
+}
+
 /// Per-page markdown extraction result.
 #[napi(object)]
 pub struct PageMarkdownResult {

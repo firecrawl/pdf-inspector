@@ -496,6 +496,98 @@ pub struct PageRegionResult {
     pub regions: Vec<RegionText>,
 }
 
+/// Shared page extraction state for region-based extraction functions.
+struct RegionExtractionData {
+    items_by_page: HashMap<u32, Vec<TextItem>>,
+    page_heights: HashMap<u32, f32>,
+    #[allow(dead_code)]
+    gid_pages: HashSet<u32>,
+    page_thresholds: HashMap<u32, f32>,
+    rotated_pages: HashSet<u32>,
+}
+
+/// Extract text items, page heights, and metadata for the pages needed by region queries.
+///
+/// This is the shared boilerplate for `extract_text_in_regions_mem`,
+/// `extract_tables_in_regions_mem`, and `extract_formulas_in_regions_mem`.
+fn prepare_region_extraction(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+) -> Result<RegionExtractionData, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let pages = doc.get_pages();
+
+    let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
+
+    // Fast mode: skip expensive TrueType font fallback parsing.
+    // Fonts that can't be decoded from ToUnicode alone will produce empty/garbage
+    // text, triggering needs_ocr=true → GPU OCR fallback in the pipeline.
+    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
+
+    let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    let mut page_heights: HashMap<u32, f32> = HashMap::new();
+    let mut gid_pages: HashSet<u32> = HashSet::new();
+    let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
+    let mut rotated_pages: HashSet<u32> = HashSet::new();
+
+    for (page_num, &page_id) in pages.iter() {
+        if !needed_pages.contains(page_num) {
+            continue;
+        }
+
+        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
+        page_heights.insert(*page_num, height);
+
+        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
+            extractor::content_stream::extract_page_text_items(
+                &doc,
+                page_id,
+                *page_num,
+                &font_cmaps,
+                false,
+            )?;
+        let threshold = text_utils::fix_letterspaced_items(&mut items);
+        if threshold > 0.10 {
+            page_thresholds.insert(*page_num, threshold);
+        }
+        if has_gid {
+            gid_pages.insert(*page_num);
+        }
+        if coords_rotated {
+            rotated_pages.insert(*page_num);
+        }
+        items_by_page.insert(*page_num, items);
+    }
+
+    Ok(RegionExtractionData {
+        items_by_page,
+        page_heights,
+        gid_pages,
+        page_thresholds,
+        rotated_pages,
+    })
+}
+
+/// Resolve per-page coord space and adaptive threshold for a given page.
+fn page_region_context(
+    data: &RegionExtractionData,
+    page_1idx: u32,
+) -> (f32, f32, RegionCoordSpace) {
+    let page_h = data.page_heights.get(&page_1idx).copied().unwrap_or(792.0);
+    let adaptive_threshold = data
+        .page_thresholds
+        .get(&page_1idx)
+        .copied()
+        .unwrap_or(0.10);
+    let coords = if data.rotated_pages.contains(&page_1idx) {
+        RegionCoordSpace::Rotated90Ccw
+    } else {
+        RegionCoordSpace::Standard
+    };
+    (page_h, adaptive_threshold, coords)
+}
+
 /// Extract text within bounding-box regions from a PDF in memory.
 ///
 /// This is designed for hybrid OCR pipelines: a layout model detects regions
@@ -519,70 +611,14 @@ pub fn extract_text_in_regions_mem(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResult>, PdfError> {
-    validate_pdf_bytes(buffer)?;
-    let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let pages = doc.get_pages();
+    let data = prepare_region_extraction(buffer, page_regions)?;
 
-    // Build a set of pages we need to extract (1-indexed for lopdf)
-    let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
-
-    // Fast mode: skip expensive TrueType font fallback parsing.
-    // Fonts that can't be decoded from ToUnicode alone will produce empty/garbage
-    // text, triggering needs_ocr=true → GPU OCR fallback in the pipeline.
-    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
-
-    // Extract text items for needed pages only
-    let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
-    let mut page_heights: HashMap<u32, f32> = HashMap::new();
-    let mut gid_pages: HashSet<u32> = HashSet::new();
-    let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
-
-    for (page_num, &page_id) in pages.iter() {
-        if !needed_pages.contains(page_num) {
-            continue;
-        }
-
-        // Get page height from MediaBox for coordinate flip
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        // Extract text items for this page
-        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
-                *page_num,
-                &font_cmaps,
-                false,
-            )?;
-        let threshold = text_utils::fix_letterspaced_items(&mut items);
-        if threshold > 0.10 {
-            page_thresholds.insert(*page_num, threshold);
-        }
-        if has_gid {
-            gid_pages.insert(*page_num);
-        }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
-        }
-        items_by_page.insert(*page_num, items);
-    }
-
-    // For each page's regions, filter and assemble text
     let mut results = Vec::with_capacity(page_regions.len());
 
     for (page_0idx, regions) in page_regions {
         let page_1idx = page_0idx + 1;
-        let items = items_by_page.get(&page_1idx);
-        let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
-        let _page_has_gid = gid_pages.contains(&page_1idx);
-        let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let items = data.items_by_page.get(&page_1idx);
+        let (page_h, adaptive_threshold, coords) = page_region_context(&data, page_1idx);
 
         let mut page_results = Vec::with_capacity(regions.len());
 
@@ -636,73 +672,19 @@ pub fn extract_tables_in_regions_mem(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResult>, PdfError> {
-    validate_pdf_bytes(buffer)?;
-    let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let pages = doc.get_pages();
-
-    let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
-    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
-
-    let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
-    let mut page_heights: HashMap<u32, f32> = HashMap::new();
-    let mut gid_pages: HashSet<u32> = HashSet::new();
-    let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
-
-    for (page_num, &page_id) in pages.iter() {
-        if !needed_pages.contains(page_num) {
-            continue;
-        }
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
-                *page_num,
-                &font_cmaps,
-                false,
-            )?;
-        let threshold = text_utils::fix_letterspaced_items(&mut items);
-        if threshold > 0.10 {
-            page_thresholds.insert(*page_num, threshold);
-        }
-        if has_gid {
-            gid_pages.insert(*page_num);
-        }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
-        }
-        items_by_page.insert(*page_num, items);
-    }
+    let data = prepare_region_extraction(buffer, page_regions)?;
 
     let mut results = Vec::with_capacity(page_regions.len());
 
     for (page_0idx, regions) in page_regions {
         let page_1idx = page_0idx + 1;
-        let items = items_by_page.get(&page_1idx);
-        let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
-        let _page_has_gid = gid_pages.contains(&page_1idx);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let items = data.items_by_page.get(&page_1idx);
+        let (page_h, _adaptive_threshold, coords) = page_region_context(&data, page_1idx);
 
         let mut page_results = Vec::with_capacity(regions.len());
 
         for rect in regions {
             let [rx1, ry1, rx2, ry2] = *rect;
-
-            // Note: we intentionally DO NOT bail on page_has_gid here.
-            // The GID flag means some font on the page uses unresolvable
-            // glyph IDs, but that font may only appear in a logo or
-            // header — not in the table region. Instead we let the
-            // per-region text quality checks (is_garbage_text, is_cid_garbage,
-            // detect_encoding_issues) reject based on the actual extracted
-            // content. This avoids rejecting clean tables just because an
-            // unrelated decorative font on the same page is GID-encoded.
 
             let matched: Vec<TextItem> = match items {
                 Some(items) => {
@@ -773,6 +755,70 @@ pub fn extract_tables_in_regions_mem(
                     needs_ocr: true,
                 });
             }
+        }
+
+        results.push(PageRegionResult {
+            page: *page_0idx,
+            regions: page_results,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Extract formula text within bounding-box regions from a PDF in memory.
+///
+/// Similar to [`extract_text_in_regions_mem`] but uses formula-specific quality
+/// checks. Formula text is legitimately symbol-heavy (Greek letters, math
+/// operators, subscripts) so the generic `is_garbage_text` check — which rejects
+/// text with <50% alphanumeric characters — would false-positive on valid
+/// formula regions.
+///
+/// When the extracted text decodes cleanly, `needs_ocr` is `false` and the
+/// caller can skip GPU OCR. When extraction fails (empty, PUA-heavy, encoding
+/// issues), `needs_ocr` is `true` for OCR fallback.
+pub fn extract_formulas_in_regions_mem(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    let data = prepare_region_extraction(buffer, page_regions)?;
+
+    let mut results = Vec::with_capacity(page_regions.len());
+
+    for (page_0idx, regions) in page_regions {
+        let page_1idx = page_0idx + 1;
+        let items = data.items_by_page.get(&page_1idx);
+        let (page_h, adaptive_threshold, coords) = page_region_context(&data, page_1idx);
+
+        let mut page_results = Vec::with_capacity(regions.len());
+
+        for rect in regions {
+            let [rx1, ry1, rx2, ry2] = *rect;
+
+            let text = match items {
+                Some(items) => collect_text_in_region_with_options(
+                    items,
+                    rx1,
+                    ry1,
+                    rx2,
+                    ry2,
+                    page_h,
+                    coords,
+                    adaptive_threshold,
+                ),
+                None => String::new(),
+            };
+
+            // Formula-specific quality checks:
+            // - Skip is_garbage_text (formulas are legitimately symbol-heavy)
+            // - Keep CID/encoding checks (broken font decode is still broken)
+            // - Add PUA check (extensible delimiters that didn't decode)
+            let needs_ocr = text.trim().is_empty()
+                || is_cid_garbage(&text)
+                || detect_encoding_issues(&text)
+                || is_formula_garbage(&text);
+
+            page_results.push(RegionText { text, needs_ocr });
         }
 
         results.push(PageRegionResult {
@@ -1379,6 +1425,49 @@ fn is_cid_garbage(text: &str) -> bool {
     // where CID values 0x80-0xFF become accented Latin characters).
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
     high_latin * 5 >= total * 2 && ascii_letters * 3 < total
+}
+
+/// Detect formula text that is unlikely to be usable despite passing generic checks.
+///
+/// Formula text (Greek letters, math operators, variables) is legitimately
+/// symbol-heavy, so `is_garbage_text` would false-positive. This check instead
+/// catches:
+///
+/// 1. **Private Use Area (PUA) characters** — TeX extensible delimiter glyphs
+///    (large brackets from CMEX fonts) often map to PUA U+E000–F8FF when the
+///    ToUnicode CMap is missing. >10% PUA means significant undecoded content.
+///
+/// 2. **Control characters** — C0 controls (U+0000–001F excluding whitespace)
+///    indicate broken font encoding, not formula content. >30% is rejected.
+fn is_formula_garbage(text: &str) -> bool {
+    let mut total = 0usize;
+    let mut pua = 0usize;
+    let mut control = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        if ('\u{E000}'..='\u{F8FF}').contains(&ch) {
+            pua += 1;
+        }
+        let cp = ch as u32;
+        if cp < 0x20 {
+            control += 1;
+        }
+    }
+    if total < 3 {
+        return false;
+    }
+    // >10% PUA — significant undecoded extensible delimiters
+    if pua * 10 > total {
+        return true;
+    }
+    // >30% control chars — broken encoding
+    if control * 10 > total * 3 {
+        return true;
+    }
+    false
 }
 
 /// Detect markdown tables with suspicious structure that suggest the heuristic
@@ -2103,6 +2192,60 @@ mod tests {
         assert!(
             !is_cid_garbage(japanese),
             "Valid Japanese text should not be flagged as garbage"
+        );
+    }
+
+    #[test]
+    fn test_is_formula_garbage_accepts_math_text() {
+        // Greek letters, math operators, variables — typical formula text
+        let formula = "Φ(ν) = ∫ ∞ dze −it r1 − iνr2 sinh z";
+        assert!(
+            !is_formula_garbage(formula),
+            "Valid formula text should not be flagged as garbage"
+        );
+
+        // Dense operator text
+        let operators = "α + β − γ × δ ÷ ε ≤ ζ ≥ η ≈ θ ≠ ι ± κ";
+        assert!(
+            !is_formula_garbage(operators),
+            "Math operator text should not be flagged as garbage"
+        );
+
+        // Short formula (e.g. single equation variable)
+        let short = "αβ";
+        assert!(
+            !is_formula_garbage(short),
+            "Short formula text should not be flagged"
+        );
+    }
+
+    #[test]
+    fn test_is_formula_garbage_rejects_pua_heavy() {
+        // Simulates extensible delimiters from CMEX fonts mapping to PUA
+        let pua_heavy = "x \u{F8EB} \u{F8EC} \u{F8ED} \u{F8F6} \u{F8F7} \u{F8F8} y";
+        assert!(
+            is_formula_garbage(pua_heavy),
+            "PUA-heavy text should be flagged as formula garbage"
+        );
+    }
+
+    #[test]
+    fn test_is_formula_garbage_rejects_control_chars() {
+        // Control characters indicate broken encoding
+        let control_heavy = "a\x01b\x02c\x03d\x04e\x05f\x06g\x07h\x08i";
+        assert!(
+            is_formula_garbage(control_heavy),
+            "Control-char-heavy text should be flagged as formula garbage"
+        );
+    }
+
+    #[test]
+    fn test_is_formula_garbage_accepts_few_pua() {
+        // A few PUA chars among many valid chars is fine (<10% threshold)
+        let mostly_good = "Φ(ν) = ∫ dze r1 − iνr2 sinh z α β γ δ ε ζ η θ \u{F8EB}";
+        assert!(
+            !is_formula_garbage(mostly_good),
+            "Mostly-good text with rare PUA should pass"
         );
     }
 }
