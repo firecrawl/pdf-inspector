@@ -1037,12 +1037,7 @@ fn try_build_grid(
         (columns, cells)
     };
 
-    GridResult::Ok(Table {
-        columns,
-        rows,
-        cells,
-        item_indices,
-    })
+    GridResult::Ok(Table::new(columns, rows, cells, item_indices))
 }
 
 /// Deduplicate nearby edge values within a tolerance, returning sorted unique edges.
@@ -1161,11 +1156,23 @@ fn propagate_merged_cells(
                 continue;
             }
 
-            // Find first and last grid rows that the rect spans
-            let first_row = (0..num_rows)
-                .find(|&r| ry <= row_edges[r] + tol && (ry + rh) >= row_edges[r + 1] - tol);
-            let last_row = (0..num_rows)
-                .rfind(|&r| ry <= row_edges[r] + tol && (ry + rh) >= row_edges[r + 1] - tol);
+            // Find first and last grid rows that the rect spans.
+            //
+            // Require a rect to actually overlap the row by more than `tol`
+            // to count as a span. A "rect bottom ≤ row top + tol AND rect
+            // top ≥ row bottom − tol" check gives false positives at shared
+            // row boundaries — a rect whose top equals row N's bottom lies
+            // entirely below the row but still passes the tolerance-slack
+            // check, cascading body text from unrelated rows into one
+            // merged cell.
+            let spans = |r: usize| {
+                let row_top = row_edges[r];
+                let row_bot = row_edges[r + 1];
+                let overlap = (row_top.min(ry + rh) - row_bot.max(ry)).max(0.0);
+                overlap > tol
+            };
+            let first_row = (0..num_rows).find(|&r| spans(r));
+            let last_row = (0..num_rows).rfind(|&r| spans(r));
 
             let (first, last) = match (first_row, last_row) {
                 (Some(f), Some(l)) if l > f => (f, l),
@@ -1442,12 +1449,7 @@ fn detect_row_stripe_table(
         content_ratio * 100.0
     );
 
-    Some(Table {
-        columns: column_centers,
-        rows: row_centers,
-        cells,
-        item_indices,
-    })
+    Some(Table::new(column_centers, row_centers, cells, item_indices))
 }
 
 /// Detect a table from cell-background rects that failed grid detection.
@@ -1677,6 +1679,49 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
+    // Reject "tables" that are actually prose in a framed region.
+    // Columns here come from text X-position clustering; when prose wraps
+    // inside a bounding-box rect (e.g. chat-transcript figures) the
+    // word-boundary gaps cluster into many spurious columns, and the
+    // resulting cells hold sentence fragments riddled with common English
+    // function words. Count cells with any such word and reject when
+    // 20%+ of non-empty cells match — real tabular data (labels, units,
+    // numbers) rarely contains these words.
+    if num_cols >= 4 {
+        const PROSE_WORDS: &[&str] = &[
+            "a", "an", "the", "of", "to", "is", "was", "are", "were", "be", "been", "in", "on",
+            "at", "with", "for", "by", "as", "and", "or", "but", "this", "that", "these", "those",
+            "from", "into", "has", "have", "had", "not", "don't", "doesn't", "it's", "its", "it",
+            "i", "me", "my", "we", "our", "us", "you", "your", "they", "them", "their", "he",
+            "she", "his", "her",
+        ];
+        let mut prose_cells = 0usize;
+        let mut counted = 0usize;
+        for row in &cells {
+            for cell in row {
+                let t = cell.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                counted += 1;
+                let lower = t.to_ascii_lowercase();
+                let has_prose_word = lower
+                    .split(|c: char| !c.is_ascii_alphabetic() && c != '\'')
+                    .any(|w| PROSE_WORDS.contains(&w));
+                if has_prose_word {
+                    prose_cells += 1;
+                }
+            }
+        }
+        if counted > 0 && prose_cells * 5 >= counted {
+            debug!(
+                "  cell-rect rejected: {}/{} cells contain prose function words — likely prose",
+                prose_cells, counted
+            );
+            return None;
+        }
+    }
+
     let column_centers: Vec<f32> = (0..num_cols)
         .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
         .collect();
@@ -1691,12 +1736,7 @@ fn detect_row_stripe_table_from_cell_rects(
         non_empty_cells as f32 / total_cells * 100.0
     );
 
-    Some(Table {
-        columns: column_centers,
-        rows: row_centers,
-        cells,
-        item_indices,
-    })
+    Some(Table::new(column_centers, row_centers, cells, item_indices))
 }
 
 /// Detect a table by merging all cluster rects into one group.
@@ -1875,12 +1915,7 @@ fn detect_merged_cluster_table(
         content_ratio * 100.0
     );
 
-    Some(Table {
-        columns: column_centers,
-        rows: row_centers,
-        cells,
-        item_indices,
-    })
+    Some(Table::new(column_centers, row_centers, cells, item_indices))
 }
 
 /// Cluster text item X positions into column centers with a given minimum threshold.
@@ -2368,6 +2403,27 @@ mod tests {
         // Column 0 should be unchanged
         assert_eq!(cells[0][0], "A");
         assert_eq!(cells[1][0], "B");
+    }
+
+    #[test]
+    fn test_propagate_merged_cells_rect_tangent_to_row_boundary() {
+        // Regression: a rect whose top exactly equals a row's bottom lies
+        // entirely outside that row, so it must not be considered to span
+        // it. With the old overlap-based predicate this cascaded into body
+        // text from unrelated rows being merged into a single header cell
+        // (mythos system card CB task-based evaluations table).
+        //
+        // Layout: two rows 0..80 and 80..160 (bottom → top in PDF coords),
+        // rect occupies only the lower row (y=0..80). Its top equals the
+        // upper row's bottom; it must not span the upper row.
+        let col_edges = vec![0.0, 50.0];
+        let row_edges = vec![160.0, 80.0, 0.0]; // top → bot
+        let mut cells = vec![vec!["Upper".to_string()], vec!["Lower".to_string()]];
+        let group_rects = vec![(0.0, 0.0, 50.0, 80.0)]; // rect at y=0..80
+        let skip = vec![false];
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
+        assert_eq!(cells[0][0], "Upper", "upper row must not be merged");
+        assert_eq!(cells[1][0], "Lower", "lower row must not be touched");
     }
 
     #[test]

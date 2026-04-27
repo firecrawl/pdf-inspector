@@ -1,3 +1,9 @@
+// Rust 1.95 introduced collapsible_match for `if` inside match arms.
+// The content-stream parsers use this pattern extensively (match on operator
+// name, then check `in_text_block && !op.operands.is_empty()`). Collapsing
+// these into match guards would hurt readability. Allow crate-wide.
+#![allow(clippy::collapsible_match)]
+
 //! Smart PDF detection and text extraction using lopdf
 //!
 //! # Quick start
@@ -335,12 +341,16 @@ pub struct PagesExtractionResult {
     pub is_complex: bool,
 }
 
-/// Extract formatted markdown for specific pages of a PDF, with layout
+/// Extract formatted markdown for pages of a PDF, with layout
 /// classification metadata.
 ///
 /// Unlike [`process_pdf_mem`] which returns one concatenated markdown string,
 /// this returns per-page markdown so callers can mix direct extraction
 /// (for simple text pages) with GPU OCR (for complex/scanned pages).
+///
+/// When `pages` is `None`, every page (0-indexed, in document order) is
+/// returned. When `Some(&[...])`, only the listed 0-indexed pages are
+/// returned, in the caller's order.
 ///
 /// Font statistics are computed from the full document so header
 /// detection thresholds are consistent regardless of which pages are
@@ -351,7 +361,7 @@ pub struct PagesExtractionResult {
 /// at near-zero cost since the items/rects/lines are already in memory.
 pub fn extract_pages_markdown_mem(
     buffer: &[u8],
-    pages: &[u32],
+    pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem(buffer)?;
@@ -367,10 +377,20 @@ pub fn extract_pages_markdown_mem(
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&all_items);
 
-    let mut results = Vec::with_capacity(pages.len());
+    // When caller doesn't specify pages, return every page in document order.
+    let all_pages: Vec<u32>;
+    let pages_slice: &[u32] = match pages {
+        Some(p) => p,
+        None => {
+            all_pages = (0..page_count).collect();
+            &all_pages
+        }
+    };
+
+    let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
 
-    for &page_0idx in pages {
+    for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
         if page_0idx >= page_count {
             pages_needing_ocr.push(page_0idx + 1);
@@ -441,6 +461,20 @@ pub fn extract_pages_markdown_mem(
         pages_needing_ocr,
         is_complex: complexity.is_complex,
     })
+}
+
+/// Path-based wrapper for [`extract_pages_markdown_mem`].
+///
+/// Reads the PDF from disk and extracts per-page markdown. Pass `None` for
+/// `pages` to return every page in document order, or `Some(&[...])` to
+/// restrict to specific 0-indexed pages (in caller-supplied order).
+pub fn extract_pages_markdown<P: AsRef<Path>>(
+    path: P,
+    pages: Option<&[u32]>,
+) -> Result<PagesExtractionResult, PdfError> {
+    validate_pdf_file(&path)?;
+    let buffer = std::fs::read(path.as_ref())?;
+    extract_pages_markdown_mem(&buffer, pages)
 }
 
 // =========================================================================
@@ -755,6 +789,601 @@ pub fn extract_tables_in_regions_mem(
     Ok(results)
 }
 
+// =========================================================================
+// Region-based table extraction with external structure recovery (TSR)
+// =========================================================================
+
+/// Input for [`extract_tables_with_structure_mem`]: one cropped table region
+/// plus the raw structure-recovery output for it.
+///
+/// The structure tokens and bboxes are typically produced by an external
+/// table-structure recognition model (e.g. SLANet on PaddleOCR) running on
+/// a rendered crop of the page. pdf-inspector uses the structure to lay out
+/// the cells and pulls the cell text from the native PDF — no OCR involved.
+#[derive(Debug, Clone)]
+pub struct TsrTableInput {
+    /// 0-indexed page number where the crop was taken from.
+    pub page: u32,
+    /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
+    /// **top-left origin** (matches the layout model's coordinate space).
+    pub crop_pdf_pt_bbox: [f32; 4],
+    /// DPI the crop image was rendered at (e.g. `200.0`). Used to convert
+    /// cell bboxes from image-pixels back to PDF points.
+    pub render_dpi: f32,
+    /// Raw structure tokens emitted by the TSR model, in document order.
+    /// See [`tables::structured::parse_structure`] for the accepted grammar.
+    pub structure_tokens: Vec<String>,
+    /// One bbox per cell (in document order, parallel to the cell open-tags
+    /// in `structure_tokens`). May be 4-element `[x1,y1,x2,y2]` or
+    /// 8-element 4-corner polygon, in **crop image-pixel space**.
+    pub cell_bboxes: Vec<Vec<f32>>,
+}
+
+/// Extract structured cells using externally-supplied structure recovery.
+///
+/// For each input, this:
+/// 1. Pairs each cell open-tag in `structure_tokens` with the next bbox in
+///    `cell_bboxes` (document order), tracking row/col with rowspan/colspan
+///    awareness.
+/// 2. Converts each cell bbox from crop image-pixels into page PDF-points.
+/// 3. Pulls the cell's text by overlap-testing PDF text items inside that
+///    bbox — same primitives used by [`extract_text_in_regions_mem`].
+///
+/// Returns one `Vec<StructuredCell>` per input, in input order. Each cell
+/// carries its (row, col, rowspan, colspan, is_header) metadata, the
+/// extracted text, and its page-PDF-pt bbox so callers can do their own
+/// rendering, debug overlays, or per-cell post-processing.
+///
+/// Inputs whose page is out of range or whose tokens parse to zero cells
+/// produce an empty `Vec`.
+///
+/// See [`extract_tables_with_structure_mem`] if you just want the rendered
+/// markdown.
+pub fn extract_tables_with_structure_cells_mem(
+    buffer: &[u8],
+    inputs: &[TsrTableInput],
+) -> Result<Vec<Vec<tables::StructuredCell>>, PdfError> {
+    use tables::structured::{
+        cell_px_to_page_pt, normalize_cell_bands, parse_structure, polygon_to_aabb, StructuredCell,
+    };
+
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let pages = doc.get_pages();
+
+    let needed_pages: HashSet<u32> = inputs.iter().map(|t| t.page + 1).collect();
+    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
+
+    let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    let mut page_heights: HashMap<u32, f32> = HashMap::new();
+    let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
+    let mut rotated_pages: HashSet<u32> = HashSet::new();
+
+    for (page_num, &page_id) in pages.iter() {
+        if !needed_pages.contains(page_num) {
+            continue;
+        }
+        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
+        page_heights.insert(*page_num, height);
+
+        let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+            extractor::content_stream::extract_page_text_items(
+                &doc,
+                page_id,
+                *page_num,
+                &font_cmaps,
+                false,
+            )?;
+        let threshold = text_utils::fix_letterspaced_items(&mut items);
+        if threshold > 0.10 {
+            page_thresholds.insert(*page_num, threshold);
+        }
+        if coords_rotated {
+            rotated_pages.insert(*page_num);
+        }
+        items_by_page.insert(*page_num, items);
+    }
+
+    let mut results: Vec<Vec<StructuredCell>> = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        let page_1idx = input.page + 1;
+        let Some(items) = items_by_page.get(&page_1idx) else {
+            // Out-of-range page or page with no extractable text — emit empty.
+            results.push(Vec::new());
+            continue;
+        };
+        let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
+        let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
+        let coords = if rotated_pages.contains(&page_1idx) {
+            RegionCoordSpace::Rotated90Ccw
+        } else {
+            RegionCoordSpace::Standard
+        };
+
+        let crop_origin = [input.crop_pdf_pt_bbox[0], input.crop_pdf_pt_bbox[1]];
+
+        let slots = parse_structure(&input.structure_tokens);
+        if slots.is_empty() {
+            results.push(Vec::new());
+            continue;
+        }
+
+        let mut cells: Vec<StructuredCell> = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            let page_pt_bbox;
+
+            if let Some(coords_arr) = input.cell_bboxes.get(slot.bbox_idx) {
+                if let Some(aabb_px) = polygon_to_aabb(coords_arr) {
+                    page_pt_bbox = cell_px_to_page_pt(aabb_px, input.render_dpi, crop_origin);
+                } else {
+                    page_pt_bbox = [0.0, 0.0, 0.0, 0.0];
+                }
+            } else {
+                page_pt_bbox = [0.0, 0.0, 0.0, 0.0];
+            }
+
+            cells.push(StructuredCell {
+                row: slot.row,
+                col: slot.col,
+                rowspan: slot.rowspan,
+                colspan: slot.colspan,
+                is_header: slot.is_header,
+                text: String::new(),
+                page_pt_bbox,
+            });
+        }
+
+        normalize_cell_bands(&mut cells);
+
+        // Stage 1: exclusive per-item assignment. For each PDF text item,
+        // find the cell(s) whose (band-clamped) bbox satisfies the strict
+        // membership rule (`tsr_region_contains_item`: center inside OR
+        // >=60% overlap on both axes). If multiple cells qualify, assign
+        // the item to the cell whose center is geometrically closest. If
+        // exactly one qualifies, assign to that. If none, the item is an
+        // orphan and stage 2 below tries to recover it.
+        //
+        // The exclusivity (one item → one cell) prevents the cell-overlap
+        // bug where SLANet emits cells whose y-extents overlap between
+        // rows: under the previous "for each cell, gather items" approach,
+        // an item whose center fell in two cells' overlap got duplicated
+        // into both. Closest-center disambiguation routes it to the
+        // correct row.
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut item_to_cell: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+
+        // Pre-compute each cell's bounds + center (in PDF-pt-flipped space)
+        // so we don't redo the work per item.
+        let cell_meta: Vec<Option<(RegionBounds, f32, f32)>> = cells
+            .iter()
+            .map(|cell| {
+                let [x1, y1, x2, y2] = cell.page_pt_bbox;
+                if x1 >= x2 || y1 >= y2 {
+                    return None;
+                }
+                let bounds = region_bounds(x1, y1, x2, y2, page_h, coords);
+                let cx = (bounds.x_min + bounds.x_max) * 0.5;
+                let cy = (bounds.y_min + bounds.y_max) * 0.5;
+                Some((bounds, cx, cy))
+            })
+            .collect();
+
+        for (item_idx, item) in items.iter().enumerate() {
+            let item_w = text_utils::effective_width(item);
+            let item_cx = item.x + item_w * 0.5;
+            let item_cy = item.y + item.height * 0.5;
+            let mut best: Option<(usize, f32)> = None;
+            for (cell_idx, meta) in cell_meta.iter().enumerate() {
+                let Some((bounds, ccx, ccy)) = meta else {
+                    continue;
+                };
+                if !tsr_region_contains_item(item, *bounds) {
+                    continue;
+                }
+                let dx = item_cx - ccx;
+                let dy = item_cy - ccy;
+                let dist_sq = dx * dx + dy * dy;
+                if best.is_none_or(|(_, d)| dist_sq < d) {
+                    best = Some((cell_idx, dist_sq));
+                }
+            }
+            if let Some((ci, _)) = best {
+                claimed.insert(item_idx);
+                item_to_cell.insert(item_idx, ci);
+            }
+        }
+
+        // Build per-cell text from the assigned items. Markdown cells must
+        // be one line — collapse line breaks from the line-grouping pass.
+        let mut per_cell_items: Vec<Vec<TextItem>> = vec![Vec::new(); cells.len()];
+        for (&item_idx, &cell_idx) in &item_to_cell {
+            per_cell_items[cell_idx].push(items[item_idx].clone());
+        }
+        for (cell_idx, matched) in per_cell_items.into_iter().enumerate() {
+            cells[cell_idx].text = collect_text_from_matched_items(matched, adaptive_threshold)
+                .replace(['\n', '\r'], " ");
+        }
+
+        // Stage 2: orphan assignment — text items that didn't land in any
+        // cell during stage 1 get assigned to their nearest *empty* cell,
+        // clamped by a plausibility cap derived from cell geometry.
+        //
+        // This recovers two failure modes left by `normalize_cell_bands`:
+        //   (a) header text positioned to the LEFT of a column whose band
+        //       was derived from data cells centered farther right, so the
+        //       header text falls outside the clamped band; and
+        //   (b) local SLANet row drift where a cell's bbox sits slightly
+        //       above/below its target text item, so the strict rules miss.
+        // Empty-cell-only is the safety net: a cell already filled by stage 1
+        // is never overwritten or augmented, so the cell-bleed case PR #62
+        // closed cannot regress.
+        tsr_assign_orphan_items(items, &mut cells, &claimed, page_h, coords);
+
+        results.push(cells);
+    }
+
+    Ok(results)
+}
+
+/// Compute plausibility caps for the orphan-assignment pass. Returns
+/// `(cap_x, cap_y)` — the maximum x/y distance from a text item's center
+/// to a candidate empty cell's bbox before the candidate is rejected.
+///
+/// Caps are derived from cell geometry so they scale with the table:
+/// dense small-row tables get a tight cap, looser tables get more slack.
+/// Floor values guard against degenerate single-cell tables collapsing
+/// the cap to zero.
+fn tsr_assignment_caps(cells: &[tables::StructuredCell]) -> (f32, f32) {
+    let mut widths: Vec<f32> = Vec::with_capacity(cells.len());
+    let mut heights: Vec<f32> = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let [x1, y1, x2, y2] = cell.page_pt_bbox;
+        let w = (x2 - x1).abs();
+        let h = (y2 - y1).abs();
+        if w > 0.0 && h > 0.0 {
+            widths.push(w);
+            heights.push(h);
+        }
+    }
+    if widths.is_empty() {
+        return (0.0, 0.0);
+    }
+    widths.sort_by(|a, b| a.total_cmp(b));
+    heights.sort_by(|a, b| a.total_cmp(b));
+    let median_w = widths[widths.len() / 2];
+    let median_h = heights[heights.len() / 2];
+    // Floor values: even on a dense table, a 5pt floor handles small
+    // pixel-level bbox jitter without being so loose that we'd cross
+    // into a neighboring row/column. Symmetric in both axes.
+    let cap_x = median_w.max(5.0);
+    let cap_y = median_h.max(5.0);
+    (cap_x, cap_y)
+}
+
+/// For each text item that wasn't claimed by any cell during stage 1,
+/// find the nearest *empty* cell within `(cap_x, cap_y)` of the item's
+/// center and append the item's text to that cell. Cells that already
+/// have content are skipped — stage 2 only fills, never augments.
+///
+/// Distance is point-to-rect: 0 if the item center is inside the cell's
+/// bbox, else the axis-aligned gap to the nearest edge. Both x-gap and
+/// y-gap must be within their respective caps for a candidate to qualify;
+/// among qualifying candidates, the smallest combined euclidean distance
+/// wins.
+fn tsr_assign_orphan_items(
+    items: &[TextItem],
+    cells: &mut [tables::StructuredCell],
+    claimed: &std::collections::HashSet<usize>,
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+) {
+    if cells.is_empty() {
+        return;
+    }
+    let (cap_x, cap_y) = tsr_assignment_caps(cells);
+    if cap_x <= 0.0 || cap_y <= 0.0 {
+        return;
+    }
+    // Y-tolerance for "same line as a previous orphan" — multi-token branch
+    // names like "Blue Valley Parkway" are 3 separate text items and should
+    // all stack into the same cell. But two orphans on different rows of
+    // the PDF (different y values) targeting the same empty cell should
+    // NOT merge — that produces the "Mitchell Woonsocket" / "Shawnee Blue
+    // Valley Parkway" run-on cells. Half a row of slack is conservative.
+    let y_tolerance = (cap_y * 0.5).max(3.0);
+
+    // Pre-compute each empty cell's region bounds so we don't re-flip
+    // page coordinates per orphan-candidate pair.
+    let cell_bounds: Vec<Option<RegionBounds>> = cells
+        .iter()
+        .map(|cell| {
+            if !cell.text.is_empty() {
+                return None;
+            }
+            let [x1, y1, x2, y2] = cell.page_pt_bbox;
+            if x1 >= x2 || y1 >= y2 {
+                return None;
+            }
+            Some(region_bounds(x1, y1, x2, y2, page_height, coord_space))
+        })
+        .collect();
+
+    // Track the y-center of the FIRST orphan that landed in each cell so
+    // subsequent orphans only stack if they're on the same line.
+    let mut stage2_first_y: std::collections::HashMap<usize, f32> =
+        std::collections::HashMap::new();
+
+    for (i, item) in items.iter().enumerate() {
+        if claimed.contains(&i) {
+            continue;
+        }
+        let item_w = text_utils::effective_width(item);
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        let cx = item.x + item_w * 0.5;
+        let cy = item.y + item.height * 0.5;
+
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, bounds_opt) in cell_bounds.iter().enumerate() {
+            let Some(bounds) = bounds_opt else {
+                continue;
+            };
+            // If a previous orphan already landed in this cell, only let a
+            // new orphan join if it's on the same line. Cross-line orphans
+            // need to look elsewhere (next-nearest empty cell).
+            if let Some(&first_y) = stage2_first_y.get(&ci) {
+                if (first_y - cy).abs() > y_tolerance {
+                    continue;
+                }
+            }
+            let dx = (bounds.x_min - cx).max(0.0).max(cx - bounds.x_max);
+            let dy = (bounds.y_min - cy).max(0.0).max(cy - bounds.y_max);
+            if dx > cap_x || dy > cap_y {
+                continue;
+            }
+            let dist_sq = dx * dx + dy * dy;
+            if best.is_none_or(|(_, d)| dist_sq < d) {
+                best = Some((ci, dist_sq));
+            }
+        }
+
+        if let Some((ci, _)) = best {
+            // Append, preserving stage 1's content. Same-line orphans
+            // stack to support multi-token text (e.g. "Blue Valley
+            // Parkway"); cross-line orphans are filtered out above.
+            let trimmed = item.text.trim();
+            if cells[ci].text.is_empty() {
+                cells[ci].text = trimmed.to_string();
+            } else {
+                cells[ci].text.push(' ');
+                cells[ci].text.push_str(trimmed);
+            }
+            stage2_first_y.entry(ci).or_insert(cy);
+        }
+    }
+}
+
+/// Extract markdown tables using externally-supplied structure recovery.
+///
+/// Convenience wrapper around [`extract_tables_with_structure_cells_mem`]
+/// that renders each cell list to markdown via
+/// [`tables::cells_to_markdown`]. Returns one markdown string per input,
+/// in input order. Inputs whose page is out of range or whose tokens parse
+/// to zero cells produce an empty string.
+pub fn extract_tables_with_structure_mem(
+    buffer: &[u8],
+    inputs: &[TsrTableInput],
+) -> Result<Vec<String>, PdfError> {
+    let cells_lists = extract_tables_with_structure_cells_mem(buffer, inputs)?;
+    Ok(cells_lists
+        .into_iter()
+        .map(|cells| {
+            if cells.is_empty() {
+                String::new()
+            } else {
+                tables::cells_to_markdown(&cells)
+            }
+        })
+        .collect())
+}
+
+/// Markdown for one extracted table plus a diagnostic flag describing
+/// which path produced it.
+///
+/// `fallback_reason` is `None` when the TSR-hybrid path produced the
+/// markdown directly; `Some(<short identifier>)` when stage 1's quality
+/// check fired and the heuristic `extract_tables_in_regions_mem` was
+/// substituted instead. The reason string is stable enough to use as a
+/// metric label (e.g. `phantom_empty_row`, `multi_row_in_cell`).
+#[derive(Debug, Clone)]
+pub struct TableExtractionResult {
+    pub markdown: String,
+    pub fallback_reason: Option<String>,
+}
+
+/// Detect quality issues in the TSR-hybrid output for a single input.
+///
+/// Returns `Some(reason)` if the cells look like they reflect a known
+/// SLANet detection pathology that the heuristic table extractor would
+/// likely handle better. Reasons (also used as metric labels):
+///
+/// * `phantom_empty_row` — a row whose every cell is empty, surrounded
+///   above and below by rows with content. SLANet sometimes emits an
+///   extra row that doesn't correspond to any visible PDF row.
+/// * `multi_row_in_cell` — at least one cell's matched PDF text items
+///   span more than 1.3× either the smallest cell height or the tallest
+///   contained item's own height, meaning the cell has absorbed text
+///   from two adjacent visual rows. SLANet's row under-detection on
+///   tightly-packed tables produces this.
+fn detect_tsr_quality_issue(
+    buffer: &[u8],
+    input: &TsrTableInput,
+    cells: &[tables::StructuredCell],
+) -> Result<Option<String>, PdfError> {
+    if cells.is_empty() {
+        return Ok(None);
+    }
+
+    // Phantom row: cheap, computed from cell metadata alone.
+    let max_row = cells.iter().map(|c| c.row).max().unwrap_or(0);
+    if max_row >= 2 {
+        let mut row_has_content = vec![false; max_row + 1];
+        for cell in cells {
+            if !cell.text.trim().is_empty() {
+                row_has_content[cell.row] = true;
+            }
+        }
+        for r in 1..max_row {
+            if !row_has_content[r] && row_has_content[r - 1] && row_has_content[r + 1] {
+                return Ok(Some("phantom_empty_row".to_string()));
+            }
+        }
+    }
+
+    // Multi-row-in-cell: re-extract PDF text items in the page and check
+    // whether any non-empty cell's bbox encloses items whose y-centers
+    // span across multiple visual lines. This is the FNBO failure mode —
+    // a tall TSR cell catches text from two adjacent PDF rows.
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let pages = doc.get_pages();
+    let page_1idx = input.page + 1;
+    let Some(&page_id) = pages.get(&page_1idx) else {
+        return Ok(None);
+    };
+    let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
+    let mut needed: HashSet<u32> = HashSet::new();
+    needed.insert(page_1idx);
+    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
+    let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+        extractor::content_stream::extract_page_text_items(
+            &doc,
+            page_id,
+            page_1idx,
+            &font_cmaps,
+            false,
+        )?;
+    let _ = text_utils::fix_letterspaced_items(&mut items);
+    let coords = if coords_rotated {
+        RegionCoordSpace::Rotated90Ccw
+    } else {
+        RegionCoordSpace::Standard
+    };
+
+    // Use the minimum non-empty cell height as the typical-row baseline.
+    // The pathology is that some cells are abnormally tall (multi-row),
+    // so taking the median or mean would scale with the bad cells. The
+    // smallest cell is likely a tightly-bound single-row cell, which is
+    // a better proxy for a real row's height.
+    let mut heights: Vec<f32> = cells
+        .iter()
+        .map(|c| (c.page_pt_bbox[3] - c.page_pt_bbox[1]).abs())
+        .filter(|h| *h > 0.0)
+        .collect();
+    heights.sort_by(|a, b| a.total_cmp(b));
+    let typical_row_h = heights.first().copied().unwrap_or(15.0).max(5.0);
+
+    for cell in cells {
+        if cell.text.trim().is_empty() {
+            continue;
+        }
+        let [x1, y1, x2, y2] = cell.page_pt_bbox;
+        if x1 >= x2 || y1 >= y2 {
+            continue;
+        }
+        let bounds = region_bounds(x1, y1, x2, y2, page_h, coords);
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut max_item_h = 0f32;
+        let mut count = 0u32;
+        for item in &items {
+            if tsr_region_contains_item(item, bounds) {
+                let cy = item.y + item.height * 0.5;
+                min_y = min_y.min(cy);
+                max_y = max_y.max(cy);
+                max_item_h = max_item_h.max(item.height);
+                count += 1;
+            }
+        }
+        if count < 2 {
+            continue;
+        }
+        // Items on the same visual line have y-centers within ~one
+        // line-height. Flag a cell whose items span > 1.3× both the
+        // typical row height AND the largest item's own height —
+        // either signal alone is a strong indicator of multi-line text
+        // inside a cell that should be a single row.
+        let span = max_y - min_y;
+        let row_threshold = typical_row_h * 1.3;
+        let item_threshold = max_item_h.max(5.0) * 1.3;
+        if span > row_threshold || span > item_threshold {
+            return Ok(Some("multi_row_in_cell".to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Auto-fallback variant of [`extract_tables_with_structure_mem`]:
+/// runs the TSR-hybrid path, checks the resulting cells for known
+/// SLANet detection pathologies (phantom rows, multi-row-in-cell text),
+/// and falls back to the heuristic [`extract_tables_in_regions_mem`]
+/// for any input where the TSR path looks compromised.
+///
+/// On clean inputs this is identical to the markdown variant.
+/// On flagged inputs the heuristic markdown replaces the TSR markdown
+/// and the result's `fallback_reason` is set to the diagnostic label.
+///
+/// Use this from production callers that want self-healing output.
+/// Use [`extract_tables_with_structure_mem`] when you want raw TSR
+/// output regardless of quality (e.g. eval harnesses comparing the
+/// two paths).
+pub fn extract_tables_with_structure_auto_mem(
+    buffer: &[u8],
+    inputs: &[TsrTableInput],
+) -> Result<Vec<TableExtractionResult>, PdfError> {
+    let tsr_cells = extract_tables_with_structure_cells_mem(buffer, inputs)?;
+    let mut results = Vec::with_capacity(inputs.len());
+
+    for (i, input) in inputs.iter().enumerate() {
+        let cells = &tsr_cells[i];
+        let issue = detect_tsr_quality_issue(buffer, input, cells)?;
+
+        let result = match issue {
+            None => TableExtractionResult {
+                markdown: if cells.is_empty() {
+                    String::new()
+                } else {
+                    tables::cells_to_markdown(cells)
+                },
+                fallback_reason: None,
+            },
+            Some(reason) => {
+                // Fall back to heuristic on the input's table region.
+                // The crop's PDF-pt bbox IS the table region.
+                let heuristic = extract_tables_in_regions_mem(
+                    buffer,
+                    &[(input.page, vec![input.crop_pdf_pt_bbox])],
+                )?;
+                let md = heuristic
+                    .into_iter()
+                    .next()
+                    .and_then(|page_result| page_result.regions.into_iter().next().map(|r| r.text))
+                    .unwrap_or_default();
+                TableExtractionResult {
+                    markdown: md,
+                    fallback_reason: Some(reason),
+                }
+            }
+        };
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
 /// Get page height in points from MediaBox.
 fn get_page_height(doc: &Document, page_id: lopdf::ObjectId) -> Option<f32> {
     let page_dict = doc.get_dictionary(page_id).ok()?;
@@ -841,6 +1470,31 @@ fn collect_text_in_region_with_options(
         .filter(|item| region_overlaps_item(item, bounds))
         .cloned()
         .collect();
+    collect_text_from_matched_items(matched, adaptive_threshold)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn collect_text_in_tsr_cell(
+    items: &[TextItem],
+    rx1: f32,
+    ry1: f32,
+    rx2: f32,
+    ry2: f32,
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+    adaptive_threshold: f32,
+) -> String {
+    let bounds = region_bounds(rx1, ry1, rx2, ry2, page_height, coord_space);
+    let matched: Vec<TextItem> = items
+        .iter()
+        .filter(|item| tsr_region_contains_item(item, bounds))
+        .cloned()
+        .collect();
+    collect_text_from_matched_items(matched, adaptive_threshold)
+}
+
+fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f32) -> String {
     if matched.is_empty() {
         return String::new();
     }
@@ -942,6 +1596,30 @@ fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
     x_overlap > 0.0 && y_overlap > 0.0
 }
 
+fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {
+    let item_x_min = item.x;
+    let item_x_max = item.x + text_utils::effective_width(item);
+    let item_y_min = item.y;
+    let item_y_max = item.y + item.height;
+
+    let center_x = (item_x_min + item_x_max) * 0.5;
+    let center_y = (item_y_min + item_y_max) * 0.5;
+    if center_x >= bounds.x_min
+        && center_x <= bounds.x_max
+        && center_y >= bounds.y_min
+        && center_y <= bounds.y_max
+    {
+        return true;
+    }
+
+    let x_overlap = (item_x_max.min(bounds.x_max) - item_x_min.max(bounds.x_min)).max(0.0);
+    let y_overlap = (item_y_max.min(bounds.y_max) - item_y_min.max(bounds.y_min)).max(0.0);
+    let item_width = (item_x_max - item_x_min).max(0.1);
+    let item_height = (item_y_max - item_y_min).max(0.1);
+
+    x_overlap / item_width >= 0.6 && y_overlap / item_height >= 0.6
+}
+
 // =========================================================================
 // Internal: single-load document pipeline
 // =========================================================================
@@ -951,28 +1629,131 @@ fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
 /// `Document::load_metadata` for page count + `Document::load` for content
 /// are combined here, but lopdf loads the full doc in `load()` so we extract
 /// page count from it directly to avoid the metadata-only round-trip.
-fn load_document_from_path<P: AsRef<Path>>(path: P) -> Result<(Document, u32), PdfError> {
+pub(crate) fn load_document_from_path<P: AsRef<Path>>(
+    path: P,
+) -> Result<(Document, u32), PdfError> {
     let buffer = std::fs::read(&path)?;
     load_document_from_mem(&buffer)
 }
 
 /// Load a PDF from a memory buffer.
-fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
+pub(crate) fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
     // Fix malformed struct element names before parsing. Some PDF generators
     // write bare names (/S Code) instead of proper PDF names (/S /Code), which
     // causes lopdf to silently drop the entire object.
     let fixed = structure_tree::fix_bare_struct_names(buffer);
     let buf = fixed.as_ref();
 
-    let doc = match Document::load_mem(buf) {
-        Ok(d) => d,
-        Err(ref e) if is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))?
+    let doc = match load_document_bytes(buf) {
+        Ok(doc) => doc,
+        Err(first_err) => {
+            for repaired in repair_pdf_container_candidates(buf) {
+                match load_document_bytes(&repaired) {
+                    Ok(doc) => {
+                        log::debug!("loaded PDF after repairing malformed container bytes");
+                        let page_count = doc.get_pages().len() as u32;
+                        return Ok((doc, page_count));
+                    }
+                    Err(e) => {
+                        if is_encrypted_lopdf_error(&e) {
+                            return Err(e.into());
+                        }
+                    }
+                }
+            }
+            return Err(first_err.into());
         }
-        Err(e) => return Err(e.into()),
     };
     let page_count = doc.get_pages().len() as u32;
     Ok((doc, page_count))
+}
+
+fn load_document_bytes(buf: &[u8]) -> Result<Document, lopdf::Error> {
+    match Document::load_mem(buf) {
+        Ok(doc) => Ok(doc),
+        Err(ref e) if is_encrypted_lopdf_error(e) => {
+            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
+    let mut candidates = Vec::new();
+
+    add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
+
+    let stripped = strip_leading_pdf_container_bytes(buf);
+    if let Some(stripped_buf) = stripped.as_deref() {
+        add_repair_candidate(&mut candidates, Some(stripped_buf.to_vec()), buf);
+        add_repair_candidate(
+            &mut candidates,
+            append_missing_eof_marker(stripped_buf),
+            buf,
+        );
+    }
+
+    candidates
+}
+
+fn add_repair_candidate(
+    candidates: &mut Vec<Vec<u8>>,
+    candidate: Option<Vec<u8>>,
+    original: &[u8],
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if candidate.as_slice() == original {
+        return;
+    }
+    if candidates.iter().any(|existing| existing == &candidate) {
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn append_missing_eof_marker(buf: &[u8]) -> Option<Vec<u8>> {
+    if contains_recent_eof_marker(buf) {
+        return None;
+    }
+
+    let mut end = buf.len();
+    while end > 0 && buf[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+
+    if !buf[..end].ends_with(b"%%EO") {
+        return None;
+    }
+
+    let mut repaired = Vec::with_capacity(end + 2);
+    repaired.extend_from_slice(&buf[..end]);
+    repaired.extend_from_slice(b"F\n");
+    Some(repaired)
+}
+
+fn contains_recent_eof_marker(buf: &[u8]) -> bool {
+    let start = buf.len().saturating_sub(1024);
+    buf[start..].windows(b"%%EOF".len()).any(|w| w == b"%%EOF")
+}
+
+fn strip_leading_pdf_container_bytes(buf: &[u8]) -> Option<Vec<u8>> {
+    let mut start = if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    };
+
+    while start < buf.len() && buf[start].is_ascii_whitespace() {
+        start += 1;
+    }
+
+    if start > 0 && buf[start..].starts_with(b"%PDF-") {
+        Some(buf[start..].to_vec())
+    } else {
+        None
+    }
 }
 
 /// Core processing pipeline operating on a pre-loaded document.
@@ -1785,19 +2566,26 @@ fn compute_layout_complexity(
                 markdown::filter_lines_to_band(lines, page, x_lo, x_hi)
             };
 
+            // TOC pages route through the table detector but render as flat
+            // lists. They aren't tables in any user-facing sense, so don't
+            // count them toward LayoutComplexity (would also trip the
+            // table-page guard in column detection below).
+            let has_data_table =
+                |tables: &[tables::Table]| tables.iter().any(|t| t.kind == tables::TableKind::Data);
+
             let (rect_tables, _) = tables::detect_tables_from_rects(&band_items, &band_rects, page);
-            if !rect_tables.is_empty() {
+            if has_data_table(&rect_tables) {
                 found_table = true;
                 break;
             }
             let line_tables = tables::detect_tables_from_lines(&band_items, &band_lines, page);
-            if !line_tables.is_empty() {
+            if has_data_table(&line_tables) {
                 found_table = true;
                 break;
             }
             // Heuristic fallback for borderless tables
             let heuristic_tables = tables::detect_tables(&band_items, base_size, false);
-            if !heuristic_tables.is_empty() {
+            if has_data_table(&heuristic_tables) {
                 found_table = true;
                 break;
             }
@@ -1993,6 +2781,24 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ItemType;
+
+    fn test_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height,
+            font: "Helvetica".to_string(),
+            font_size: height,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
 
     #[test]
     fn test_detect_encoding_issues_fffd() {
@@ -2072,5 +2878,482 @@ mod tests {
             !is_cid_garbage(japanese),
             "Valid Japanese text should not be flagged as garbage"
         );
+    }
+
+    #[test]
+    fn tsr_text_fill_does_not_pull_neighboring_overlapping_rows() {
+        use crate::tables::structured::normalize_cell_bands;
+        use crate::tables::StructuredCell;
+
+        let items = vec![
+            test_item("Branch Name", 12.0, 88.0, 55.0, 8.0),
+            test_item("Deposits", 112.0, 88.0, 36.0, 8.0),
+            test_item("Oak Street", 12.0, 72.0, 48.0, 8.0),
+            test_item("100", 112.0, 72.0, 18.0, 8.0),
+            test_item("Boardwalk", 12.0, 55.2, 46.0, 8.0),
+            test_item("200", 112.0, 55.2, 18.0, 8.0),
+        ];
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: String::new(),
+                page_pt_bbox: [10.0, 100.0, 100.0, 125.0],
+            },
+            StructuredCell {
+                row: 0,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: String::new(),
+                page_pt_bbox: [100.0, 100.0, 170.0, 125.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 116.0, 100.0, 141.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [100.0, 116.0, 170.0, 141.0],
+            },
+            StructuredCell {
+                row: 2,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 132.8, 100.0, 157.8],
+            },
+            StructuredCell {
+                row: 2,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [100.0, 132.8, 170.0, 157.8],
+            },
+        ];
+
+        normalize_cell_bands(&mut cells);
+        for cell in &mut cells {
+            let [x1, y1, x2, y2] = cell.page_pt_bbox;
+            cell.text = collect_text_in_tsr_cell(
+                &items,
+                x1,
+                y1,
+                x2,
+                y2,
+                200.0,
+                RegionCoordSpace::Standard,
+                0.10,
+            );
+        }
+
+        assert_eq!(cells[0].text, "Branch Name");
+        assert_eq!(cells[2].text, "Oak Street");
+        assert_eq!(cells[4].text, "Boardwalk");
+        assert!(!cells[0].text.contains("Oak Street"));
+        assert!(!cells[2].text.contains("Branch Name"));
+        assert!(!cells[2].text.contains("Boardwalk"));
+    }
+
+    #[test]
+    fn tsr_assignment_caps_uses_median_geometry() {
+        use crate::tables::StructuredCell;
+        let cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [0.0, 0.0, 100.0, 20.0], // 100x20
+            },
+            StructuredCell {
+                row: 0,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [100.0, 0.0, 200.0, 20.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [0.0, 20.0, 100.0, 40.0],
+            },
+        ];
+        let (cap_x, cap_y) = tsr_assignment_caps(&cells);
+        assert_eq!(cap_x, 100.0);
+        assert_eq!(cap_y, 20.0);
+    }
+
+    #[test]
+    fn tsr_assignment_caps_floor_protects_degenerate_input() {
+        use crate::tables::StructuredCell;
+        let cells = vec![StructuredCell {
+            row: 0,
+            col: 0,
+            rowspan: 1,
+            colspan: 1,
+            is_header: false,
+            text: String::new(),
+            page_pt_bbox: [0.0, 0.0, 1.0, 1.0],
+        }];
+        let (cap_x, cap_y) = tsr_assignment_caps(&cells);
+        assert_eq!(cap_x, 5.0);
+        assert_eq!(cap_y, 5.0);
+    }
+
+    #[test]
+    fn stage2_recovers_left_aligned_header_text_outside_data_band() {
+        // Symptom A reproduction: the column band derived from data-cell
+        // centers ends up too far right, so header text positioned at the
+        // left of the column falls outside the band and stage 1's strict
+        // membership rejects it. Stage 2 should re-attach by proximity.
+        //
+        // Item coords are bottom-left native; cell page_pt_bbox is top-left.
+        // page_height=200 so a top-left bbox y=[88, 100] flips to native y
+        // bounds [100, 112]; an item at native y=104 (center 108) lands in.
+        use crate::tables::StructuredCell;
+        let items = vec![
+            // Header text — centered in row 0 (native y=104, center 108) but
+            // at the LEFT of the column (x=175, far left of the [410, 700]
+            // data-derived band).
+            test_item("Address", 175.0, 104.0, 50.0, 8.0),
+            // Data row 1 — fits its cell.
+            test_item("205 W Oak St", 420.0, 84.0, 100.0, 8.0),
+            // Data row 2 — fits its cell.
+            test_item("155 E Boardwalk Dr", 420.0, 64.0, 100.0, 8.0),
+        ];
+        // Cells AFTER normalize_cell_bands would have run — col 0 band
+        // shifted right by data-cell centers, header cell now excludes
+        // the "Address" text at center x=200.
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: String::new(),
+                page_pt_bbox: [410.0, 88.0, 700.0, 100.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [410.0, 108.0, 700.0, 116.0],
+            },
+            StructuredCell {
+                row: 2,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [410.0, 128.0, 700.0, 136.0],
+            },
+        ];
+        let page_h = 200.0;
+
+        // Stage 1 mimic — fill cells via the strict rule, track claimed.
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for cell in &mut cells {
+            let [x1, y1, x2, y2] = cell.page_pt_bbox;
+            let bounds = region_bounds(x1, y1, x2, y2, page_h, RegionCoordSpace::Standard);
+            let mut matched: Vec<TextItem> = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                if tsr_region_contains_item(item, bounds) {
+                    claimed.insert(i);
+                    matched.push(item.clone());
+                }
+            }
+            cell.text = collect_text_from_matched_items(matched, 0.10).replace(['\n', '\r'], " ");
+        }
+        // Header is empty after stage 1 (Address fell outside col 0 band).
+        assert_eq!(cells[0].text, "", "header should be empty after stage 1");
+        // Data rows already populated.
+        assert!(
+            cells[1].text.contains("Oak"),
+            "data row 1 should contain Oak: got {:?}",
+            cells[1].text
+        );
+        assert!(
+            cells[2].text.contains("Boardwalk"),
+            "data row 2 should contain Boardwalk: got {:?}",
+            cells[2].text
+        );
+
+        // Stage 2 should fill the orphan "Address" into the empty header.
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            page_h,
+            RegionCoordSpace::Standard,
+        );
+        assert_eq!(cells[0].text, "Address");
+        // Data rows must NOT have been augmented (already filled by stage 1).
+        assert!(!cells[1].text.contains("Address"));
+        assert!(!cells[2].text.contains("Address"));
+    }
+
+    #[test]
+    fn stage2_recovers_y_shifted_col0_in_consecutive_rows() {
+        // Symptom B reproduction: a stretch of rows where col 0 cell bboxes
+        // sit just above the actual branch-name text. After stage 1 those
+        // cells are empty; stage 2 should pull the orphan items in by
+        // y-proximity.
+        //
+        // page_height=800. Cells are 14pt tall in top-left; flipped native
+        // bounds are [240,254], [220,234], [200,214]. Items sit ~1pt below
+        // each cell's native y range (still within ~1pt of the edge), so
+        // both center-containment and 60% overlap fail in stage 1.
+        use crate::tables::StructuredCell;
+        let items = vec![
+            // Bellevue: native y=235, center 239 — just below row 0's
+            // cell native bottom (240). Closer to row 0 than row 1.
+            test_item("Bellevue", 30.0, 235.0, 45.0, 8.0),
+            // Glenwood: native y=215, center 219 — just below row 1.
+            test_item("Glenwood", 30.0, 215.0, 45.0, 8.0),
+            // Metro Crossing: native y=195, center 199 — just below row 2.
+            test_item("Metro Crossing", 30.0, 195.0, 70.0, 8.0),
+        ];
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 546.0, 200.0, 560.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 566.0, 200.0, 580.0],
+            },
+            StructuredCell {
+                row: 2,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 586.0, 200.0, 600.0],
+            },
+        ];
+        let page_h = 800.0;
+
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for cell in &mut cells {
+            let [x1, y1, x2, y2] = cell.page_pt_bbox;
+            let bounds = region_bounds(x1, y1, x2, y2, page_h, RegionCoordSpace::Standard);
+            let mut matched: Vec<TextItem> = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                if tsr_region_contains_item(item, bounds) {
+                    claimed.insert(i);
+                    matched.push(item.clone());
+                }
+            }
+            cell.text = collect_text_from_matched_items(matched, 0.10).replace(['\n', '\r'], " ");
+        }
+        // All three cells empty after stage 1 (text falls just below each).
+        for c in &cells {
+            assert!(
+                c.text.is_empty(),
+                "stage 1 should leave all cells empty: {:?}",
+                c
+            );
+        }
+
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            page_h,
+            RegionCoordSpace::Standard,
+        );
+        assert_eq!(cells[0].text, "Bellevue");
+        assert_eq!(cells[1].text, "Glenwood");
+        assert_eq!(cells[2].text, "Metro Crossing");
+    }
+
+    #[test]
+    fn stage2_rejects_cross_line_stacking_into_same_cell() {
+        // Two orphans on different rows of the PDF, both equidistant from
+        // the same empty cell. Without the same-line guard they'd both stack
+        // into that cell ("Shawnee Blue Valley Parkway" run-on); the guard
+        // keeps the first orphan and routes the second to the next-nearest
+        // empty cell on its own line.
+        use crate::tables::StructuredCell;
+        // page_h=200. Two empty cells:
+        //   cell X (row 0): top-left y=[100, 110], native [90, 100]
+        //   cell Y (row 1): top-left y=[112, 122], native [78, 88]
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 100.0, 100.0, 110.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 112.0, 100.0, 122.0],
+            },
+        ];
+        // Two orphans, different rows of the PDF (y differs by 14pt = a
+        // full row), both 2pt outside their target cell — both within
+        // cap_y, both equidistant-ish to cell X. Without the same-line
+        // guard they'd both land in X.
+        //   "Shawnee" should belong to cell X (row 0) — center y=98 is
+        //   2pt below X's native min=100.
+        //   "BlueValley" should belong to cell Y (row 1) — center y=84
+        //   is 4pt above Y's native max=88.
+        let items = vec![
+            // Shawnee orphan — closer to X (dy=2) than Y (dy=6 from native min=78).
+            test_item("Shawnee", 30.0, 94.0, 50.0, 8.0),
+            // BlueValley orphan — closer to Y (dy=4) than X (dy=8 from native max=100).
+            test_item("BlueValley", 30.0, 80.0, 60.0, 8.0),
+        ];
+        let claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            200.0,
+            RegionCoordSpace::Standard,
+        );
+        assert_eq!(cells[0].text, "Shawnee");
+        assert_eq!(cells[1].text, "BlueValley");
+        assert!(!cells[0].text.contains("BlueValley"));
+        assert!(!cells[1].text.contains("Shawnee"));
+    }
+
+    #[test]
+    fn stage2_allows_same_line_orphans_to_stack_into_one_cell() {
+        // Multi-token branch names like "Blue Valley Parkway" are 3 PDF
+        // text items at the SAME y-coordinate. They should all stack into
+        // the cell their row's branch-name belongs to, not get split
+        // across rows by the cross-line guard.
+        use crate::tables::StructuredCell;
+        let mut cells = vec![StructuredCell {
+            row: 0,
+            col: 0,
+            rowspan: 1,
+            colspan: 1,
+            is_header: false,
+            text: String::new(),
+            page_pt_bbox: [10.0, 100.0, 200.0, 110.0],
+        }];
+        // Three same-line items, all 2pt below the cell's native bottom.
+        let items = vec![
+            test_item("Blue", 30.0, 94.0, 25.0, 8.0),
+            test_item("Valley", 60.0, 94.0, 35.0, 8.0),
+            test_item("Parkway", 100.0, 94.0, 45.0, 8.0),
+        ];
+        let claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            200.0,
+            RegionCoordSpace::Standard,
+        );
+        // All three same-line orphans stacked into the single empty cell.
+        assert_eq!(cells[0].text, "Blue Valley Parkway");
+    }
+
+    #[test]
+    fn stage2_does_not_overwrite_filled_cells_or_admit_far_orphans() {
+        // Stage 2 must only fill EMPTY cells (preserves stage 1's strict
+        // behavior on bleed cases) and must reject orphans that fall far
+        // outside any cell (prevents pulling a figure title into a table).
+        use crate::tables::StructuredCell;
+        let items = vec![
+            test_item("Real", 50.0, 100.0, 30.0, 8.0),
+            // Far orphan — at native y=20 (page bottom edge) on a page where
+            // the table sits around native y=92..104 (top-left y=96..108).
+            // y-distance to nearest cell is ~70pt, far exceeding the ~12pt
+            // cap from median row height.
+            test_item("FigureTitle", 50.0, 20.0, 60.0, 8.0),
+        ];
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [40.0, 96.0, 100.0, 108.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: "Pre-filled".to_string(),
+                page_pt_bbox: [40.0, 116.0, 100.0, 128.0],
+            },
+        ];
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Pretend "Real" got claimed by a different cell (won't be re-assigned).
+        // Don't claim "FigureTitle" — it's the far orphan.
+        claimed.insert(0);
+
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            200.0,
+            RegionCoordSpace::Standard,
+        );
+        // Empty cell stayed empty (orphan was too far).
+        assert_eq!(cells[0].text, "");
+        // Pre-filled cell was not touched.
+        assert_eq!(cells[1].text, "Pre-filled");
     }
 }

@@ -152,6 +152,67 @@ impl PyPageRegionTexts {
 // Text item wrapper
 // ---------------------------------------------------------------------------
 
+/// Per-page markdown extraction result.
+#[pyclass(name = "PageMarkdown")]
+#[derive(Clone)]
+pub struct PyPageMarkdown {
+    /// 0-indexed page number.
+    #[pyo3(get)]
+    pub page: u32,
+    /// Formatted markdown for this page.
+    #[pyo3(get)]
+    pub markdown: String,
+    /// True when text on this page is unreliable (GID-encoded fonts,
+    /// encoding issues, garbage text, or empty extraction).
+    #[pyo3(get)]
+    pub needs_ocr: bool,
+}
+
+#[pymethods]
+impl PyPageMarkdown {
+    fn __repr__(&self) -> String {
+        format!(
+            "PageMarkdown(page={}, markdown='{}', needs_ocr={})",
+            self.page,
+            self.markdown.chars().take(40).collect::<String>(),
+            self.needs_ocr
+        )
+    }
+}
+
+/// Combined per-page markdown extraction and layout classification result.
+#[pyclass(name = "PagesExtractionResult")]
+#[derive(Clone)]
+pub struct PyPagesExtractionResult {
+    /// Per-page markdown results, in the order requested.
+    #[pyo3(get)]
+    pub pages: Vec<PyPageMarkdown>,
+    /// 1-indexed pages where tables were detected.
+    #[pyo3(get)]
+    pub pages_with_tables: Vec<u32>,
+    /// 1-indexed pages where multi-column layout was detected.
+    #[pyo3(get)]
+    pub pages_with_columns: Vec<u32>,
+    /// 1-indexed pages that need OCR (scanned/image-based or unreliable text).
+    #[pyo3(get)]
+    pub pages_needing_ocr: Vec<u32>,
+    /// True if any page has tables or columns.
+    #[pyo3(get)]
+    pub is_complex: bool,
+}
+
+#[pymethods]
+impl PyPagesExtractionResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "PagesExtractionResult(pages={}, pages_with_tables={:?}, is_complex={})",
+            self.pages.len(),
+            self.pages_with_tables,
+            self.is_complex
+        )
+    }
+}
+
 /// A positioned text item extracted from a PDF.
 #[pyclass(name = "TextItem")]
 #[derive(Clone)]
@@ -285,6 +346,24 @@ fn parse_page_regions(
             Ok((page, bboxes))
         })
         .collect()
+}
+
+fn to_py_pages_result(r: crate::PagesExtractionResult) -> PyPagesExtractionResult {
+    PyPagesExtractionResult {
+        pages: r
+            .pages
+            .into_iter()
+            .map(|p| PyPageMarkdown {
+                page: p.page,
+                markdown: p.markdown,
+                needs_ocr: p.needs_ocr,
+            })
+            .collect(),
+        pages_with_tables: r.pages_with_tables,
+        pages_with_columns: r.pages_with_columns,
+        pages_needing_ocr: r.pages_needing_ocr,
+        is_complex: r.is_complex,
+    }
 }
 
 fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRegionTexts> {
@@ -450,6 +529,44 @@ fn extract_text_in_regions_bytes(
     Ok(convert_region_results(results))
 }
 
+/// Extract formatted markdown for pages of a PDF file, with layout
+/// classification metadata.
+///
+/// Returns per-page markdown and classification data (tables, columns,
+/// OCR needs) from a single parse. Font statistics are computed from the
+/// full document so header detection is consistent across pages.
+///
+/// Args:
+///     path: Path to the PDF file.
+///     pages: Optional list of 0-indexed pages. When None (default), every
+///         page is returned in document order. When provided, output
+///         matches the caller-supplied order.
+///
+/// Returns:
+///     PagesExtractionResult with per-page markdown and classification data.
+#[pyfunction]
+#[pyo3(signature = (path, pages=None))]
+fn extract_pages_markdown(
+    path: &str,
+    pages: Option<Vec<u32>>,
+) -> PyResult<PyPagesExtractionResult> {
+    let result = crate::extract_pages_markdown(path, pages.as_deref()).map_err(to_py_err)?;
+    Ok(to_py_pages_result(result))
+}
+
+/// Extract formatted markdown for pages of a PDF from bytes.
+///
+/// See [`extract_pages_markdown`] for details.
+#[pyfunction]
+#[pyo3(signature = (data, pages=None))]
+fn extract_pages_markdown_bytes(
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+) -> PyResult<PyPagesExtractionResult> {
+    let result = crate::extract_pages_markdown_mem(data, pages.as_deref()).map_err(to_py_err)?;
+    Ok(to_py_pages_result(result))
+}
+
 /// Python module definition.
 #[pymodule]
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -458,6 +575,8 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTextItem>()?;
     m.add_class::<PyRegionText>()?;
     m.add_class::<PyPageRegionTexts>()?;
+    m.add_class::<PyPageMarkdown>()?;
+    m.add_class::<PyPagesExtractionResult>()?;
     m.add_function(wrap_pyfunction!(process_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(process_pdf_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(detect_pdf, m)?)?;
@@ -470,5 +589,7 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_with_positions_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_pages_markdown, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_pages_markdown_bytes, m)?)?;
     Ok(())
 }

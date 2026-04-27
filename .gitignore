@@ -35,3 +35,8 @@ scripts/
 # Test output
 test_output/
 
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+

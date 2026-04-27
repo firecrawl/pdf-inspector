@@ -626,6 +626,33 @@ fn find_relative_valleys(
     valleys
 }
 
+/// Detect whether a side of a gutter consists predominantly of list-marker
+/// glyphs (•, ●, ○, ◦, ▪, ▫, ◆, ◇). A column of bullets on the left margin
+/// creates a spurious histogram valley between the bullet and the content.
+/// Treating it as a real column splits each list item's text across two
+/// "columns," so we reject these candidates.
+fn is_list_marker_column(items: &[&&TextItem]) -> bool {
+    const LIST_MARKERS: &[char] = &['•', '●', '○', '◦', '▪', '▫', '◆', '◇', '■', '□'];
+    if items.is_empty() {
+        return false;
+    }
+    let marker_count = items
+        .iter()
+        .filter(|i| {
+            let t = i.text.trim();
+            let mut chars = t.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => LIST_MARKERS.contains(&c),
+                _ => false,
+            }
+        })
+        .count();
+    // Require ≥80% of items on this side to be standalone markers. A handful
+    // of non-marker items (stray page numbers, footnote refs) shouldn't
+    // defeat the check.
+    marker_count as f32 / items.len() as f32 >= 0.8
+}
+
 /// Validate valley candidates with vertical consistency checks and build column regions.
 ///
 /// When `center_assign` is true, items are assigned to columns based on their
@@ -691,6 +718,19 @@ fn validate_and_build_columns(
             (right_items.len(), left_items.len())
         };
         if larger < min_items || smaller < 3 {
+            continue;
+        }
+
+        // Reject valleys where the smaller side is just a column of list
+        // markers (bullets aligned at the left margin). This is a common
+        // pattern in PDFs where ● starts each list item: histogram detection
+        // sees the gap between bullet and content as a gutter.
+        let smaller_items: &[&&TextItem] = if left_items.len() <= right_items.len() {
+            &left_items
+        } else {
+            &right_items
+        };
+        if is_list_marker_column(smaller_items) {
             continue;
         }
 
@@ -1778,6 +1818,63 @@ mod tests {
             spanning_count, 0,
             "Column items with gap at gutter should NOT be pre-masked"
         );
+    }
+
+    #[test]
+    fn bullet_marker_column_not_detected_as_column() {
+        // Pattern: every line is `● <content>`, with ● at x=90 and content
+        // starting at x=104. Histogram detection sees a gutter between them
+        // and would split the page into a "bullet column" and "content column",
+        // scrambling every list item.
+        let mut items = Vec::new();
+        for i in 0..15 {
+            let y = 750.0 - i as f32 * 30.0;
+            items.push(make_item(1, 90.0, y, "●"));
+            items.push(make_item(
+                1,
+                104.0,
+                y,
+                "FullContentLineTextHere________________",
+            ));
+        }
+        // Pad with content to satisfy min item count for column detection.
+        for i in 0..15 {
+            let y = 300.0 - i as f32 * 14.0;
+            items.push(make_item(1, 72.0, y, "FootnoteText_____________________"));
+        }
+
+        let cols = detect_columns(&items, 1, false);
+        assert_eq!(
+            cols.len(),
+            1,
+            "Bullet markers aligned at left margin should not be treated as their own column"
+        );
+    }
+
+    #[test]
+    fn is_list_marker_column_detects_bullets() {
+        let items = vec![
+            make_item(1, 90.0, 100.0, "●"),
+            make_item(1, 90.0, 114.0, "●"),
+            make_item(1, 90.0, 128.0, "●"),
+            make_item(1, 90.0, 142.0, "●"),
+        ];
+        let refs: Vec<&TextItem> = items.iter().collect();
+        let wrapped: Vec<&&TextItem> = refs.iter().collect();
+        assert!(is_list_marker_column(&wrapped));
+    }
+
+    #[test]
+    fn is_list_marker_column_rejects_prose() {
+        let items = vec![
+            make_item(1, 30.0, 100.0, "Regular prose line"),
+            make_item(1, 30.0, 114.0, "Another sentence"),
+            make_item(1, 30.0, 128.0, "Third line"),
+            make_item(1, 30.0, 142.0, "Fourth line"),
+        ];
+        let refs: Vec<&TextItem> = items.iter().collect();
+        let wrapped: Vec<&&TextItem> = refs.iter().collect();
+        assert!(!is_list_marker_column(&wrapped));
     }
 
     #[test]

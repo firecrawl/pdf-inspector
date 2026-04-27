@@ -520,6 +520,18 @@ impl ToUnicodeCMap {
         }
     }
 
+    /// Get the maximum source CID across all mappings (char_map + ranges).
+    fn max_source_cid(&self) -> Option<u16> {
+        let char_max = self.char_map.keys().copied().max();
+        let range_max = self.ranges.iter().map(|&(_, end, _)| end).max();
+        match (char_max, range_max) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a @ Some(_), None) => a,
+            (None, b @ Some(_)) => b,
+            (None, None) => None,
+        }
+    }
+
     /// Remap a CMap that references pre-subsetting GIDs to sequential post-subsetting GIDs.
     /// Collects all source CIDs, sorts them, and reassigns to 1, 2, 3, ...
     pub fn remap_to_sequential(&self) -> ToUnicodeCMap {
@@ -657,6 +669,81 @@ fn get_w_array_start_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> O
     }
 }
 
+/// Return true if the CIDFont's W (widths) array explicitly covers the given CID.
+///
+/// The W array uses two formats (PDF 32000-1:2008, §9.7.4.3):
+///   1. `c [w1 w2 ... wn]` — widths for CIDs c, c+1, ..., c+n-1
+///   2. `c_first c_last w` — CIDs c_first..c_last all have width w
+fn w_array_covers_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document, target: u16) -> bool {
+    let Ok(w_obj) = cid_font_dict.get(b"W") else {
+        return false;
+    };
+    let arr = match w_obj {
+        Object::Array(arr) => arr,
+        Object::Reference(r) => match doc.get_object(*r) {
+            Ok(Object::Array(arr)) => arr,
+            _ => return false,
+        },
+        _ => return false,
+    };
+
+    let resolve_int = |o: &Object| -> Option<i64> {
+        match o {
+            Object::Integer(n) => Some(*n),
+            Object::Reference(r) => match doc.get_object(*r) {
+                Ok(Object::Integer(n)) => Some(*n),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+
+    let resolve_arr = |o: &Object| -> Option<Vec<Object>> {
+        match o {
+            Object::Array(a) => Some(a.clone()),
+            Object::Reference(r) => match doc.get_object(*r) {
+                Ok(Object::Array(a)) => Some(a.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+
+    let target = target as i64;
+    let mut i = 0usize;
+    while i < arr.len() {
+        let Some(first) = resolve_int(&arr[i]) else {
+            break;
+        };
+        i += 1;
+        if i >= arr.len() {
+            break;
+        }
+        // Peek at arr[i] to decide format.
+        if let Some(widths) = resolve_arr(&arr[i]) {
+            // Format 1: c [w1 ... wn]
+            let last = first + widths.len() as i64 - 1;
+            if target >= first && target <= last {
+                return true;
+            }
+            i += 1;
+        } else if let Some(last) = resolve_int(&arr[i]) {
+            // Format 2: c_first c_last w
+            i += 1;
+            if i < arr.len() {
+                i += 1; // skip the width value
+            }
+            if target >= first && target <= last {
+                return true;
+            }
+        } else {
+            // Unknown token — abort parsing safely
+            break;
+        }
+    }
+    false
+}
+
 /// Extract CIDToGIDMap as a vector of GIDs (u16) indexed by CID.
 fn get_cid_to_gid_map(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u16>> {
     let obj = cid_font_dict.get(b"CIDToGIDMap").ok()?;
@@ -751,6 +838,20 @@ fn try_remap_subset_cmap(
         Some(c) if c <= 2 => c,
         _ => return (cmap, None),
     };
+
+    // If the W array actually covers the CMap's max source CID, the CMap is
+    // aligned with the font — no sequential renumbering happened. A sparse W
+    // array starting at CID 0 (for .notdef) with additional high-CID entries
+    // matching the CMap is the normal subset layout, not a mismatch.
+    if let Some(max_cid) = cmap.max_source_cid() {
+        if w_array_covers_cid(cid_font_dict, doc, max_cid) {
+            debug!(
+                "Subset remap skipped for obj={}: W array covers CMap max CID {}",
+                obj_num, max_cid
+            );
+            return (cmap, None);
+        }
+    }
 
     debug!(
         "Subset GID mismatch detected for obj={}: W starts at CID {}, CMap min CID {}. Remapping to sequential.",
@@ -2716,5 +2817,188 @@ endbfchar
         // No swap: remapped should still have 50 entries
         assert_eq!(remapped.unwrap().char_map.len(), 50);
         assert_eq!(fallback.unwrap().char_map.len(), 10);
+    }
+
+    #[test]
+    fn test_max_source_cid() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+2 beginbfchar
+<0003> <0020>
+<0031> <004E>
+endbfchar
+1 beginbfrange
+<0208> <0227> <0430>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert_eq!(cmap.min_source_cid(), Some(0x0003));
+        assert_eq!(cmap.max_source_cid(), Some(0x0227));
+    }
+
+    /// Helper: build a minimal CIDFont dict with a W array and check coverage.
+    fn cid_font_dict_with_w(w_items: Vec<lopdf::Object>) -> lopdf::Dictionary {
+        let mut d = lopdf::Dictionary::new();
+        d.set("W", lopdf::Object::Array(w_items));
+        d
+    }
+
+    #[test]
+    fn test_w_array_covers_cid_format1() {
+        // Format 1: `c [w1 w2 ... wn]` — widths for CIDs c..c+n-1.
+        // Mimics the 16.pdf Tahoma W array: 0[1000] 3[313] 5[401] 11[383 383] 16[363 303 382]
+        let doc = Document::new();
+        let d = cid_font_dict_with_w(vec![
+            lopdf::Object::Integer(0),
+            lopdf::Object::Array(vec![lopdf::Object::Integer(1000)]),
+            lopdf::Object::Integer(3),
+            lopdf::Object::Array(vec![lopdf::Object::Integer(313)]),
+            lopdf::Object::Integer(5),
+            lopdf::Object::Array(vec![lopdf::Object::Integer(401)]),
+            lopdf::Object::Integer(11),
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(383),
+                lopdf::Object::Integer(383),
+            ]),
+            lopdf::Object::Integer(16),
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(363),
+                lopdf::Object::Integer(303),
+                lopdf::Object::Integer(382),
+            ]),
+            lopdf::Object::Integer(570),
+            lopdf::Object::Array(vec![lopdf::Object::Integer(667); 26]),
+        ]);
+
+        assert!(w_array_covers_cid(&d, &doc, 0));
+        assert!(w_array_covers_cid(&d, &doc, 3));
+        assert!(w_array_covers_cid(&d, &doc, 5));
+        assert!(w_array_covers_cid(&d, &doc, 11));
+        assert!(w_array_covers_cid(&d, &doc, 12));
+        assert!(w_array_covers_cid(&d, &doc, 16));
+        assert!(w_array_covers_cid(&d, &doc, 18));
+        assert!(w_array_covers_cid(&d, &doc, 570));
+        assert!(w_array_covers_cid(&d, &doc, 595));
+        // Gaps are NOT covered
+        assert!(!w_array_covers_cid(&d, &doc, 1));
+        assert!(!w_array_covers_cid(&d, &doc, 4));
+        assert!(!w_array_covers_cid(&d, &doc, 19));
+        assert!(!w_array_covers_cid(&d, &doc, 596));
+    }
+
+    #[test]
+    fn test_w_array_covers_cid_format2() {
+        // Format 2: `c_first c_last w` — CIDs c_first..c_last all have width w.
+        let doc = Document::new();
+        let d = cid_font_dict_with_w(vec![
+            lopdf::Object::Integer(100),
+            lopdf::Object::Integer(120),
+            lopdf::Object::Integer(500),
+        ]);
+
+        assert!(w_array_covers_cid(&d, &doc, 100));
+        assert!(w_array_covers_cid(&d, &doc, 110));
+        assert!(w_array_covers_cid(&d, &doc, 120));
+        assert!(!w_array_covers_cid(&d, &doc, 99));
+        assert!(!w_array_covers_cid(&d, &doc, 121));
+    }
+
+    #[test]
+    fn test_w_array_covers_cid_missing_w() {
+        let doc = Document::new();
+        let d = lopdf::Dictionary::new();
+        assert!(!w_array_covers_cid(&d, &doc, 3));
+    }
+
+    #[test]
+    fn test_try_remap_skipped_when_w_covers_cmap() {
+        // Simulates 16.pdf: CMap's max source CID (0x0279 = 633) is explicitly
+        // in the W array, so no subset-renumbering happened — remap must NOT fire.
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+2 beginbfchar
+<0003> <0020>
+<0031> <004E>
+endbfchar
+2 beginbfrange
+<023A> <0253> <0410>
+<0255> <0279> <042B>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        let mut doc = Document::new();
+        // Build a CIDFont dict with Identity CIDToGIDMap and a W array that
+        // covers CID 633 via `597 [widths...]`.
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("CIDToGIDMap", lopdf::Object::Name(b"Identity".to_vec()));
+        cid_font.set(
+            "W",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Array(vec![lopdf::Object::Integer(750)]),
+                lopdf::Object::Integer(597),
+                lopdf::Object::Array(vec![lopdf::Object::Integer(500); 37]), // 597..633
+            ]),
+        );
+        let cid_font_id = doc.add_object(cid_font);
+
+        // Build the Type0 font dict with Identity-H + DescendantFonts ref.
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set("Encoding", lopdf::Object::Name(b"Identity-H".to_vec()));
+        font_dict.set(
+            "DescendantFonts",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
+        );
+
+        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 123);
+        assert!(
+            remapped.is_none(),
+            "Remap must be skipped when W covers CMap max CID (this is 16.pdf)"
+        );
+        assert_eq!(primary.lookup(0x0003), Some(" ".to_string()));
+    }
+
+    #[test]
+    fn test_try_remap_fires_for_true_subset_mismatch() {
+        // True mismatch: CMap has high CIDs (512-544) but W only lists low sequential CIDs.
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfrange
+<0200> <0220> <0410>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        let mut doc = Document::new();
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("CIDToGIDMap", lopdf::Object::Name(b"Identity".to_vec()));
+        cid_font.set(
+            "W",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Array(vec![lopdf::Object::Integer(500); 34]), // 0..33
+            ]),
+        );
+        let cid_font_id = doc.add_object(cid_font);
+
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set("Encoding", lopdf::Object::Name(b"Identity-H".to_vec()));
+        font_dict.set(
+            "DescendantFonts",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
+        );
+
+        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 456);
+        assert!(
+            remapped.is_some(),
+            "Remap must fire when CMap's CIDs are outside W array coverage"
+        );
     }
 }

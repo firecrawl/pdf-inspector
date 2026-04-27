@@ -1,8 +1,12 @@
 //! CLI tool for detecting PDF type (text-based vs scanned)
 
-use pdf_inspector::{detect_pdf_type, process_pdf_with_options, PdfOptions, PdfType, ProcessMode};
+use pdf_inspector::{
+    detect_pdf_type, detector::estimate_page_count_from_bytes, process_pdf_with_options,
+    PdfOptions, PdfType, ProcessMode,
+};
 use std::env;
 use std::fmt::Write;
+use std::fs;
 use std::process;
 use std::time::Instant;
 
@@ -61,6 +65,32 @@ fn pdf_type_str(pdf_type: &PdfType) -> &'static str {
         PdfType::Scanned => "scanned",
         PdfType::ImageBased => "image_based",
         PdfType::Mixed => "mixed",
+    }
+}
+
+fn page_count_hint(pdf_path: &str) -> Option<u32> {
+    fs::read(pdf_path)
+        .ok()
+        .map(|bytes| estimate_page_count_from_bytes(&bytes))
+        .filter(|&count| count > 0)
+}
+
+fn print_error(e: &pdf_inspector::PdfError, pdf_path: &str, json_output: bool) {
+    if json_output {
+        if let Some(count) = page_count_hint(pdf_path) {
+            println!(
+                r#"{{"error":"{}","page_count_hint":{}}}"#,
+                json_escape(&e.to_string()),
+                count
+            );
+        } else {
+            println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));
+        }
+    } else {
+        eprintln!("Error: {}", e);
+        if let Some(count) = page_count_hint(pdf_path) {
+            eprintln!("Page count hint: {}", count);
+        }
     }
 }
 
@@ -144,11 +174,7 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
             }
         }
         Err(e) => {
-            if json_output {
-                println!(r#"{{"error":"{}"}}"#, e);
-            } else {
-                eprintln!("Error: {}", e);
-            }
+            print_error(&e, pdf_path, json_output);
             process::exit(1);
         }
     }
@@ -257,11 +283,7 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
             }
         }
         Err(e) => {
-            if json_output {
-                println!(r#"{{"error":"{}"}}"#, e);
-            } else {
-                eprintln!("Error: {}", e);
-            }
+            print_error(&e, pdf_path, json_output);
             process::exit(1);
         }
     }

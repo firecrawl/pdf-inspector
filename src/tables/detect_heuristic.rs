@@ -581,8 +581,14 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     // Validation 1: some rows should have content in first column.
     // Use a lower threshold (25%) for tables with wrapped cells where
     // continuation lines leave the first column empty.
+    // Skip when cells form a narrow TOC pattern: hierarchical entries indented
+    // across multiple X levels leave the leftmost column sparse (only top-level
+    // chapters land there) but the structure is still a valid TOC. Narrow only
+    // (<=5 cols) — wide multi-column TOCs (e.g. 2-up indices) would render
+    // poorly through format_toc_as_list, which assumes one entry per row.
     let rows_with_first_col = cells.iter().filter(|row| !row[0].is_empty()).count();
-    if rows_with_first_col < rows.len() / 4 {
+    let is_narrow_toc = columns.len() <= 5 && is_table_of_contents(&cells);
+    if rows_with_first_col < rows.len() / 4 && !is_narrow_toc {
         log::debug!(
             "  validation 1 fail: {}/{} rows have first col",
             rows_with_first_col,
@@ -653,15 +659,24 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         return None;
     }
 
-    // Validation 8: Check for Table of Contents pattern
-    if is_table_of_contents(&cells) {
-        log::debug!("  validation 8 fail: table of contents");
+    // Validation 8: Reject paragraph-like content falsely detected as tables.
+    // TOC pages with deep indentation (top-level chapters in col 0, subsections
+    // in cols 1-3, page numbers in last col) leave most cells empty and trip
+    // the paragraph heuristic; TOC shape is a safer signal here. Narrow only
+    // — see narrow-TOC rationale at validation 1.
+    if is_paragraph_content(&cells) && !is_narrow_toc {
+        log::debug!("  validation 9 fail: paragraph content");
         return None;
     }
 
-    // Validation 9: Reject paragraph-like content falsely detected as tables
-    if is_paragraph_content(&cells) {
-        log::debug!("  validation 9 fail: paragraph content");
+    // Validation 9: Reject wide "index" layouts where every cell carries a
+    // full "label ... page" fragment (back-of-book IRS-style indices).
+    // These render poorly in any structured form; text flow is the best
+    // fallback.  Narrow dot-leader TOCs (2-3 cols) are kept so format.rs
+    // can emit them as a per-row flat list with titles tab-joined to page
+    // numbers.
+    if is_inline_leader_index(&cells) {
+        log::debug!("  validation 9 fail: inline-leader index");
         return None;
     }
 
@@ -672,12 +687,7 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         item_indices.len()
     );
 
-    Some(Table {
-        columns,
-        rows,
-        cells,
-        item_indices,
-    })
+    Some(Table::new(columns, rows, cells, item_indices))
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
@@ -898,77 +908,247 @@ fn looks_like_number(s: &str) -> bool {
         && s.chars().any(|c| c.is_ascii_digit())
 }
 
-/// Check if this looks like a Table of Contents
-/// TOCs have characteristic patterns: leader dots, page numbers, section names
-fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
+/// Check if this looks like a Table of Contents (either style).
+///
+/// Used by format.rs to render TOCs as flat lists instead of markdown tables.
+pub fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
+    is_dot_leader_toc(cells) || is_tabular_toc(cells)
+}
+
+/// Dot-leader TOC: any "Chapter 1 ........ 42" style with explicit leader
+/// dots.  Covers both narrow 2-3 col TOCs (where the leader is a dedicated
+/// cell) and wide indices (where each cell encodes a full "label ... page"
+/// fragment).  Used by format.rs to render as a flat list.
+pub(super) fn is_dot_leader_toc(cells: &[Vec<String>]) -> bool {
+    has_structural_dot_leader(cells) || is_inline_leader_index(cells)
+}
+
+/// Rows with a dedicated dots-only cell flanked by label + number (2-3 col
+/// TOC layout).  Format.rs handles these well via per-row flat-list
+/// rendering; they should NOT be rejected at detect time.
+fn has_structural_dot_leader(cells: &[Vec<String>]) -> bool {
     if cells.is_empty() {
         return false;
     }
+    let structural_rows = cells.iter().filter(|row| row_has_dot_leader(row)).count();
+    structural_rows as f32 / cells.len() as f32 >= 0.3
+}
 
-    let num_cols = cells[0].len();
-    let mut dot_cells = 0;
-    let mut page_number_cells = 0;
-    let mut total_cells = 0;
-    // Track which columns contain dots vs numbers to distinguish
-    // TOC (dots span middle, page number at end) from data tables
-    // (dots only in label column, many number columns).
-    let mut dot_cols = vec![0u32; num_cols];
-    let mut numeric_cols = vec![0u32; num_cols];
-
+/// Wide index layout: each cell holds a full "label ... page" fragment
+/// because the column detector kept multi-column indices as single cells.
+/// These render poorly both as markdown tables (column boundaries are
+/// arbitrary) and as flat lists (each row holds 3+ separate index
+/// entries).  Reject these at detect time so they fall back to the page's
+/// normal text flow.
+pub(super) fn is_inline_leader_index(cells: &[Vec<String>]) -> bool {
+    let mut inline_cells = 0;
+    let mut total_nonempty = 0;
     for row in cells {
-        for (ci, cell) in row.iter().enumerate() {
+        for cell in row {
             let trimmed = cell.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            total_cells += 1;
-
-            // Check for leader dots (sequences of periods)
-            // TOCs often have "........" or ". . . ." patterns
-            let dot_count = trimmed.chars().filter(|&c| c == '.').count();
-            let is_mostly_dots = dot_count > trimmed.len() / 2 && dot_count >= 3;
-            if is_mostly_dots {
-                dot_cells += 1;
-                if ci < num_cols {
-                    dot_cols[ci] += 1;
-                }
-            }
-
-            // Check for standalone page numbers (1-4 digits, possibly with spaces)
-            let digits_only: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
-            if digits_only.len() <= 4
-                && !digits_only.is_empty()
-                && digits_only.chars().all(|c| c.is_ascii_digit())
-            {
-                page_number_cells += 1;
-                if ci < num_cols {
-                    numeric_cols[ci] += 1;
-                }
+            total_nonempty += 1;
+            if cell_is_inline_leader(trimmed) {
+                inline_cells += 1;
             }
         }
     }
+    total_nonempty >= 4 && inline_cells as f32 / total_nonempty as f32 >= 0.25
+}
 
-    if total_cells == 0 {
+/// A row with a dot-leader.  Accepts two layouts:
+///   1. A dedicated dots-only cell ("....") with a text label somewhere
+///      to its left and a page number somewhere to its right.
+///   2. A "title ... " cell (trailing leader dots glued to the title)
+///      with a page number elsewhere in the same row.
+fn row_has_dot_leader(row: &[String]) -> bool {
+    let has_page_number = row.iter().any(|c| row_cell_is_page_number(c));
+
+    for (ci, cell) in row.iter().enumerate() {
+        let trimmed = cell.trim();
+
+        // Pattern 1: dedicated dots-only cell.
+        let dot_count = trimmed.chars().filter(|&c| c == '.').count();
+        let is_mostly_dots = dot_count >= 3
+            && dot_count > trimmed.len() / 2
+            && trimmed.chars().all(|c| c == '.' || c.is_whitespace());
+        if is_mostly_dots {
+            let has_label_left = row[..ci].iter().any(|c| {
+                let t = c.trim();
+                !t.is_empty() && t.chars().any(|ch| ch.is_alphabetic())
+            });
+            if has_label_left && has_page_number {
+                return true;
+            }
+            continue;
+        }
+
+        // Pattern 2: cell ends with a trailing " ... " run after a label.
+        if has_page_number && cell_has_trailing_leader(trimmed) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Cell ends with a run of ≥3 dots preceded by alphabetic text and a
+/// space — the "Title ... " layout where the leader is glued to the name.
+/// Alphabetic (not alphanumeric) so that data-table row labels like
+/// "1973 ... " do not register as titles.
+fn cell_has_trailing_leader(cell: &str) -> bool {
+    let trimmed = cell.trim_end();
+    if !trimmed.ends_with('.') {
+        return false;
+    }
+    let without_dots = trimmed.trim_end_matches('.');
+    let dot_run = trimmed.len() - without_dots.len();
+    if dot_run < 3 {
+        return false;
+    }
+    // Require a space before the dot run (rules out "etc..." / "Mr...") and
+    // at least one alphabetic char (rules out "1973 ... " data-row labels).
+    without_dots.ends_with(' ') && without_dots.trim().chars().any(|c| c.is_alphabetic())
+}
+
+/// Page-number shape: single ≤4-digit integer, a ", "-separated list of
+/// ≤4-digit integers ("18, 36, 107"), or a dashed section-page ID
+/// ("A-1", "5-21").  Rejects decimal cells ("4. 0"), thousands-separated
+/// values ("189,164"), and other long numeric data that appears in
+/// statistical tables.
+fn row_cell_is_page_number(cell: &str) -> bool {
+    let t = cell.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if looks_like_section_page_id(t) {
+        return true;
+    }
+    // Page list: ", " separator (with space) distinguishes real page lists
+    // from thousands-separated numbers like "189,164".
+    let parts: Vec<&str> = t.split(", ").collect();
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.len() <= 4 && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// A cell shaped like an index leader fragment.  Accepts two forms:
+///   - "text ... number" — label + dots + page number in one cell
+///   - "... number"      — bare leader + number (row where the label
+///     landed in a separate column)
+///
+/// Both only count if followed by pure numeric content (optionally
+/// comma-separated page lists like "127, 213").
+fn cell_is_inline_leader(cell: &str) -> bool {
+    let cell = cell.trim();
+
+    // Find the first "..." run.  Surrounding-whitespace checks below
+    // reject intra-word ellipses ("etc...").
+    let idx = match cell.match_indices("...").next() {
+        Some((i, _)) => i,
+        None => return false,
+    };
+
+    let before = &cell[..idx];
+    let after_dots = &cell[idx + 3..];
+    // Allow extra dots (e.g. "....") by skipping any additional '.'
+    let after = after_dots.trim_start_matches('.');
+
+    // Require space (or start-of-cell) before the dots and space/digit
+    // after — blocks intra-word ellipses.
+    let before_ok = before.is_empty() || before.ends_with(' ');
+    let after_ok = after.starts_with(' ') || after.is_empty();
+    if !before_ok || !after_ok {
         return false;
     }
 
-    // Data tables with dot leaders (e.g. "1973....") have dots concentrated
-    // in one column (the label column) while many other columns contain numbers.
-    // True TOCs have dots spanning the middle and one page-number column at the end.
-    // If dots are confined to ≤1 column AND there are ≥3 columns with numbers,
-    // this is a data table, not a TOC.
-    let cols_with_dots = dot_cols.iter().filter(|&&c| c >= 2).count();
-    let cols_with_numbers = numeric_cols.iter().filter(|&&c| c >= 2).count();
-    if cols_with_dots <= 1 && cols_with_numbers >= 3 {
+    let after_trim = after.trim();
+    if after_trim.is_empty() {
+        return false;
+    }
+    // Tail must be purely numeric/page-list content.
+    let tail_numeric = after_trim
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, ',' | ' ' | '.' | '-' | '$'))
+        && after_trim.chars().any(|c| c.is_ascii_digit());
+    if !tail_numeric {
         return false;
     }
 
-    // If a significant portion of cells are dots or page numbers, it's likely a TOC
-    let dot_ratio = dot_cells as f32 / total_cells as f32;
-    let page_num_ratio = page_number_cells as f32 / total_cells as f32;
+    // Either we have a label before, or the leader is bare (starts the cell)
+    // — both are legitimate index fragments.
+    before.chars().any(|c| c.is_alphabetic()) || before.trim().is_empty()
+}
 
-    // TOC typically has >15% dot cells and >10% page number cells
-    dot_ratio > 0.15 || (dot_ratio > 0.05 && page_num_ratio > 0.15)
+/// Dot-less tabular TOC: tagged PDFs emit entries as rows where the first
+/// column starts with a dotted section number (e.g. "4.3.1 Something") and
+/// the last column is one or more page numbers.  These have no leader dots
+/// and benefit from flat-list formatting (page numbers aligned to titles).
+pub(super) fn is_tabular_toc(cells: &[Vec<String>]) -> bool {
+    if cells.is_empty() {
+        return false;
+    }
+    let num_cols = cells[0].len();
+    if num_cols < 2 || cells.len() < 4 {
+        return false;
+    }
+
+    let section_rows = cells
+        .iter()
+        .filter(|row| {
+            row.iter()
+                .find(|c| !c.trim().is_empty())
+                .is_some_and(|c| starts_with_section_number(c.trim()))
+        })
+        .count();
+
+    let last_col = num_cols - 1;
+    let (last_filled, last_page_num) = cells.iter().fold((0u32, 0u32), |(f, n), row| {
+        let cell = row.get(last_col).map(|s| s.trim()).unwrap_or("");
+        if cell.is_empty() {
+            return (f, n);
+        }
+        let is_page_nums = cell
+            .split_whitespace()
+            .all(|tok| !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit()));
+        (f + 1, n + if is_page_nums { 1 } else { 0 })
+    });
+
+    let section_ratio = section_rows as f32 / cells.len() as f32;
+    let page_num_last_ratio = if last_filled > 0 {
+        last_page_num as f32 / last_filled as f32
+    } else {
+        0.0
+    };
+
+    section_ratio >= 0.6 && last_filled >= 3 && page_num_last_ratio >= 0.7
+}
+
+/// Matches dashed section-page identifiers used in technical manuals:
+/// "5-21", "A-1", "B--3", "TC-2".  At least one ASCII digit is required.
+fn looks_like_section_page_id(s: &str) -> bool {
+    let ok = s
+        .chars()
+        .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase() || c == '-');
+    ok && s.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Returns true when the leading token looks like a dotted section number:
+/// "1", "1.2", "1.2.3", "4.3.1.2" — integer components joined by dots,
+/// with at least one dot (single-number prefixes are too ambiguous).
+fn starts_with_section_number(s: &str) -> bool {
+    let Some(first) = s.split_whitespace().next() else {
+        return false;
+    };
+    let first = first.trim_end_matches('.');
+    let parts: Vec<&str> = first.split('.').collect();
+    if parts.len() < 2 || parts.len() > 6 {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Check if detected "table" cells are actually paragraph text fragments.
@@ -1424,5 +1604,284 @@ mod tests {
             !is_table_of_contents(&cells),
             "data table with dot-leader labels should not be rejected as TOC"
         );
+    }
+
+    #[test]
+    fn is_table_of_contents_accepts_hierarchical_indented_toc() {
+        // Mythos system card pages 4-5: top-level chapters indent at col 0,
+        // subsections at cols 1-2, leaving col 0 mostly empty (only ~10% of
+        // rows). Validation 1 was rejecting these even though the structure
+        // is unambiguously a TOC.
+        let cells = vec![
+            vec!["Abstract".to_string(), String::new(), "3".to_string()],
+            vec![
+                "1 Introduction".to_string(),
+                String::new(),
+                "10".to_string(),
+            ],
+            vec![
+                String::new(),
+                "1.1 Model training".to_string(),
+                "11".to_string(),
+            ],
+            vec![
+                String::new(),
+                "1.1.1 Training data".to_string(),
+                "11".to_string(),
+            ],
+            vec![
+                String::new(),
+                "1.1.2 Crowd workers".to_string(),
+                "12".to_string(),
+            ],
+            vec![
+                String::new(),
+                "1.2 Release decision".to_string(),
+                "13".to_string(),
+            ],
+            vec![
+                "2 RSP evaluations".to_string(),
+                String::new(),
+                "16".to_string(),
+            ],
+            vec![
+                String::new(),
+                "2.1 RSP risk assessment".to_string(),
+                "16".to_string(),
+            ],
+            vec![String::new(), "2.1.1 Context".to_string(), "16".to_string()],
+            vec![
+                String::new(),
+                "2.2 CB evaluations".to_string(),
+                "20".to_string(),
+            ],
+        ];
+        assert!(
+            is_table_of_contents(&cells),
+            "hierarchical TOC with sparse col 0 should still be detected"
+        );
+    }
+
+    #[test]
+    fn is_table_of_contents_rejects_dotless_toc() {
+        // Tabular TOC without leader dots: first column starts with dotted
+        // section numbers, last column is page numbers.  Pattern from
+        // Mythos system card pages 6-8.
+        let cells = vec![
+            vec![
+                "4.3 Case studies and targeted evaluations".to_string(),
+                String::new(),
+                "86".to_string(),
+            ],
+            vec![
+                "4.3.1 Destructive or reckless actions".to_string(),
+                "4.3.1.1 Synthetic-backend evaluation".to_string(),
+                "86 86".to_string(),
+            ],
+            vec![
+                "4.3.2 Adherence to constitution".to_string(),
+                "4.3.2.1 Overview".to_string(),
+                "89 89".to_string(),
+            ],
+            vec![
+                "4.3.3 Honesty and hallucinations".to_string(),
+                "4.3.3.1 Factual hallucinations".to_string(),
+                "93 94".to_string(),
+            ],
+            vec![
+                "4.4 Capability evaluations".to_string(),
+                String::new(),
+                "101".to_string(),
+            ],
+        ];
+        assert!(
+            is_table_of_contents(&cells),
+            "dot-less TOC with section numbers + page numbers should be rejected"
+        );
+    }
+
+    #[test]
+    fn dot_leader_toc_accepts_short_inline_leaders() {
+        // Index-style cells where the full "label ... number" pattern is
+        // preserved in a single cell (IRS Publication 17 back-of-book index).
+        let cells = vec![
+            vec!["Child tax credit ... 235".to_string(), String::new()],
+            vec!["Church employee ... 252".to_string(), String::new()],
+            vec!["Citizens outside the U.S ... 6".to_string(), String::new()],
+            vec![
+                "Claim for refund ... 18, 36, 107".to_string(),
+                String::new(),
+            ],
+            vec!["Clergy ... 7, 52".to_string(), String::new()],
+        ];
+        assert!(is_dot_leader_toc(&cells));
+    }
+
+    #[test]
+    fn dot_leader_toc_allows_ellipsis_data_table() {
+        // Data tables using "..." as a row-omission marker must not be
+        // mistaken for dot-leader TOCs.  Based on MCF5235RM QSPI RAM layout.
+        let cells = vec![
+            vec![
+                "0x00".to_string(),
+                "QTR0".to_string(),
+                "Transmit RAM".to_string(),
+            ],
+            vec!["0x01".to_string(), "QTR1".to_string(), String::new()],
+            vec![
+                "...".to_string(),
+                "...".to_string(),
+                "16 bits wide".to_string(),
+            ],
+            vec!["0x0F".to_string(), "QTR15".to_string(), String::new()],
+            vec![
+                "0x10".to_string(),
+                "QRR0".to_string(),
+                "Receive RAM".to_string(),
+            ],
+            vec!["0x11".to_string(), "QRR1".to_string(), String::new()],
+            vec![
+                "...".to_string(),
+                "...".to_string(),
+                "16 bits wide".to_string(),
+            ],
+            vec!["0x1F".to_string(), "QRR15".to_string(), String::new()],
+        ];
+        assert!(
+            !is_dot_leader_toc(&cells),
+            "ellipsis markers in a data table should not match TOC detection"
+        );
+    }
+
+    #[test]
+    fn dot_leader_toc_rejects_year_row_data_table() {
+        // ERP-2025 economic data tables: year labels with trailing " ... ",
+        // a final " ... " column, and decimal-looking numeric cells.  The
+        // detection previously classified these as dot-leader TOCs and
+        // routed them through flat-list formatting, destroying the grid.
+        let cells = vec![
+            vec![
+                "1973 ... ".to_string(),
+                "4. 0".to_string(),
+                "1. 8".to_string(),
+                "0. 4".to_string(),
+                "3. 2".to_string(),
+                " ... ".to_string(),
+            ],
+            vec![
+                "1974 ... ".to_string(),
+                "–1. 9".to_string(),
+                "–1. 6".to_string(),
+                "–5. 6".to_string(),
+                "2. 4".to_string(),
+                " ... ".to_string(),
+            ],
+            vec![
+                "1975 ... ".to_string(),
+                "2. 6".to_string(),
+                "5. 1".to_string(),
+                "6. 1".to_string(),
+                "4. 1".to_string(),
+                " ... ".to_string(),
+            ],
+            vec![
+                "1976 ... ".to_string(),
+                "4. 3".to_string(),
+                "5. 4".to_string(),
+                "6. 4".to_string(),
+                "4. 5".to_string(),
+                " ... ".to_string(),
+            ],
+        ];
+        assert!(
+            !is_dot_leader_toc(&cells),
+            "year-indexed data tables with decimal cells must not match TOC detection"
+        );
+    }
+
+    #[test]
+    fn dot_leader_toc_rejects_monthly_data_table() {
+        // ERP-2025 Table B-22: monthly labor-force rows with "Jan ... ",
+        // "Feb ... " labels and thousands-separated cells ("189,164").
+        // Previously matched TOC detection because "Jan ..." has alphabetic
+        // text and "189,164" passed the page-number shape check.
+        let cells = vec![
+            vec![
+                "2023: Jan ... ".to_string(),
+                "265,962".to_string(),
+                "165,871".to_string(),
+                "160,152".to_string(),
+                "62. 4".to_string(),
+            ],
+            vec![
+                "Feb ... ".to_string(),
+                "266,112".to_string(),
+                "166,263".to_string(),
+                "160,301".to_string(),
+                "62. 5".to_string(),
+            ],
+            vec![
+                "Mar ... ".to_string(),
+                "266,272".to_string(),
+                "166,690".to_string(),
+                "160,824".to_string(),
+                "62. 6".to_string(),
+            ],
+            vec![
+                "Apr ... ".to_string(),
+                "266,443".to_string(),
+                "166,678".to_string(),
+                "160,962".to_string(),
+                "62. 6".to_string(),
+            ],
+        ];
+        assert!(
+            !is_dot_leader_toc(&cells),
+            "monthly labor-force rows with thousands-separated data must not match TOC detection"
+        );
+    }
+
+    #[test]
+    fn tabular_toc_requires_section_numbers_and_pages() {
+        // Dot-less tabular TOC matches is_tabular_toc but not dot-leader.
+        let cells = vec![
+            vec![
+                "4.3 Case studies".to_string(),
+                String::new(),
+                "86".to_string(),
+            ],
+            vec![
+                "4.3.1 Destructive actions".to_string(),
+                String::new(),
+                "86".to_string(),
+            ],
+            vec![
+                "4.3.2 Adherence".to_string(),
+                String::new(),
+                "89".to_string(),
+            ],
+            vec!["4.3.3 Honesty".to_string(), String::new(), "93".to_string()],
+        ];
+        assert!(is_tabular_toc(&cells));
+        assert!(!is_dot_leader_toc(&cells));
+    }
+
+    #[test]
+    fn starts_with_section_number_matches_dotted() {
+        assert!(starts_with_section_number("1.2"));
+        assert!(starts_with_section_number("4.3.1"));
+        assert!(starts_with_section_number("4.3.1.2"));
+        assert!(starts_with_section_number("4.3 Case studies"));
+        assert!(starts_with_section_number("2.2.5.1 Expert red teaming"));
+    }
+
+    #[test]
+    fn starts_with_section_number_rejects_non_sections() {
+        assert!(!starts_with_section_number("Chapter 1"));
+        assert!(!starts_with_section_number("1973"));
+        assert!(!starts_with_section_number("1.5M"));
+        assert!(!starts_with_section_number("10.0%"));
+        assert!(!starts_with_section_number(""));
+        assert!(!starts_with_section_number("Hello world"));
     }
 }

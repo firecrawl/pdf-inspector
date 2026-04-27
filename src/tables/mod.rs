@@ -9,13 +9,16 @@ mod detect_struct;
 mod financial;
 mod format;
 mod grid;
+pub mod structured;
 
 pub use detect_heuristic::detect_tables;
+pub(crate) use detect_heuristic::is_table_of_contents;
 pub use detect_lines::detect_tables_from_lines;
 pub(crate) use detect_rects::cluster_rects;
 pub use detect_rects::{detect_tables_from_rects, RectHintRegion};
 pub use detect_struct::detect_tables_from_struct_tree;
 pub use format::table_to_markdown;
+pub use structured::{cells_to_markdown, StructuredCell};
 
 use crate::types::TextItem;
 
@@ -166,12 +169,12 @@ pub(crate) fn try_build_rect_guided_table(
     used_indices.sort_unstable();
     used_indices.dedup();
 
-    Some(Table {
-        columns: col_boundaries,
-        rows: row_boundaries,
+    Some(Table::new(
+        col_boundaries,
+        row_boundaries,
         cells,
-        item_indices: used_indices,
-    })
+        used_indices,
+    ))
 }
 
 /// Split a TextItem whose text contains multiple whitespace-separated tokens
@@ -541,12 +544,22 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         multi_col_rows
     );
 
-    Some(Table {
-        columns: col_xs,
-        rows: row_ys,
-        cells,
-        item_indices,
-    })
+    Some(Table::new(col_xs, row_ys, cells, item_indices))
+}
+
+/// What kind of structure a detected `Table` represents. Classification is
+/// computed once at construction so consumers don't have to re-analyze the
+/// cells (and stay consistent across detection backends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableKind {
+    /// A real data table — renders as markdown table syntax.
+    #[default]
+    Data,
+    /// A table of contents — renders as a flat list with tab-aligned page
+    /// numbers via `format_toc_as_list`. Detected through the table pipeline
+    /// because TOCs share row/column structure with tables, but they are not
+    /// data tables and shouldn't appear in `pages_with_tables` etc.
+    Toc,
 }
 
 /// A detected table.
@@ -560,6 +573,31 @@ pub struct Table {
     pub cells: Vec<Vec<String>>,
     /// Items that belong to this table
     pub item_indices: Vec<usize>,
+    /// Data table vs TOC. Set by `Table::new` from `cells`.
+    pub kind: TableKind,
+}
+
+impl Table {
+    /// Build a table and classify it (data vs TOC) from its cells.
+    pub fn new(
+        columns: Vec<f32>,
+        rows: Vec<f32>,
+        cells: Vec<Vec<String>>,
+        item_indices: Vec<usize>,
+    ) -> Self {
+        let kind = if is_table_of_contents(&cells) {
+            TableKind::Toc
+        } else {
+            TableKind::Data
+        };
+        Self {
+            columns,
+            rows,
+            cells,
+            item_indices,
+            kind,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -642,6 +680,7 @@ mod tests {
                 vec!["Cell 1".into(), "Cell 2".into()],
             ],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
 
         let md = table_to_markdown(&table);
@@ -1002,6 +1041,7 @@ mod tests {
                 vec!["3".into(), "5/2".into(), "Item C".into(), "300".into()],
             ],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
 
         let md = table_to_markdown(&table);

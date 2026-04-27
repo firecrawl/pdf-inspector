@@ -271,6 +271,78 @@ class TestExtractTextInRegions:
 
 
 # ---------------------------------------------------------------------------
+# extract_pages_markdown / extract_pages_markdown_bytes
+# ---------------------------------------------------------------------------
+
+
+class TestExtractPagesMarkdown:
+    def test_default_returns_all_pages(self):
+        result = pdf_inspector.extract_pages_markdown(
+            fixture_path("thermo-freon12.pdf")
+        )
+        assert len(result.pages) == 3
+        assert [p.page for p in result.pages] == [0, 1, 2]
+        assert all(isinstance(p.markdown, str) for p in result.pages)
+
+    def test_bytes_default_returns_all_pages(self):
+        data = fixture_bytes("thermo-freon12.pdf")
+        result = pdf_inspector.extract_pages_markdown_bytes(data)
+        assert len(result.pages) == 3
+
+    def test_selected_pages_preserve_order(self):
+        result = pdf_inspector.extract_pages_markdown(
+            fixture_path("thermo-freon12.pdf"), pages=[2, 0]
+        )
+        assert [p.page for p in result.pages] == [2, 0]
+
+    def test_bytes_selected_pages_preserve_order(self):
+        data = fixture_bytes("thermo-freon12.pdf")
+        result = pdf_inspector.extract_pages_markdown_bytes(data, pages=[1])
+        assert len(result.pages) == 1
+        assert result.pages[0].page == 1
+
+    def test_page_fields(self):
+        result = pdf_inspector.extract_pages_markdown(
+            fixture_path("thermo-freon12.pdf"), pages=[0]
+        )
+        page = result.pages[0]
+        assert isinstance(page.page, int)
+        assert isinstance(page.markdown, str)
+        assert isinstance(page.needs_ocr, bool)
+        assert not page.needs_ocr  # text-based fixture
+        assert len(page.markdown) > 0
+
+    def test_result_fields(self):
+        result = pdf_inspector.extract_pages_markdown(
+            fixture_path("thermo-freon12.pdf")
+        )
+        assert isinstance(result.pages, list)
+        assert isinstance(result.pages_with_tables, list)
+        assert isinstance(result.pages_with_columns, list)
+        assert isinstance(result.pages_needing_ocr, list)
+        assert isinstance(result.is_complex, bool)
+
+    def test_out_of_range_page_marks_needs_ocr(self):
+        result = pdf_inspector.extract_pages_markdown(
+            fixture_path("thermo-freon12.pdf"), pages=[9999]
+        )
+        assert len(result.pages) == 1
+        assert result.pages[0].needs_ocr
+        assert result.pages[0].markdown == ""
+
+    def test_repr(self):
+        result = pdf_inspector.extract_pages_markdown(
+            fixture_path("thermo-freon12.pdf"), pages=[0]
+        )
+        assert "PagesExtractionResult" in repr(result)
+        assert "PageMarkdown" in repr(result.pages[0])
+
+    def test_not_a_pdf(self):
+        with pytest.raises(ValueError):
+            pdf_inspector.extract_pages_markdown_bytes(b"not a pdf")
+
+
+# ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 

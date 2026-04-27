@@ -9,7 +9,9 @@ use super::analysis::{
     bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
     detect_header_level, font_size_rarity, has_dot_leaders,
 };
-use super::classify::{format_list_item, is_caption_line, is_list_item, is_monospace_font};
+use super::classify::{
+    format_list_item, is_caption_line, is_list_item, is_monospace_font, starts_with_bullet_marker,
+};
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
 use super::MarkdownOptions;
@@ -584,9 +586,30 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             .as_ref()
             .and_then(struct_role_heading_level)
             .filter(|level| !overused_heading_levels.contains(level));
+
+        // Protect wrapped list items: when inside a list, a visually-continuing
+        // line (same indent, line-wrap spacing) must not be reclassified as a
+        // heading by the font heuristic — PDFs often bold the lead phrase of a
+        // list item across multiple wrap lines, and an all-bold middle line
+        // would otherwise split one item into a heading + stray body text.
+        // We gate on the document's paragraph threshold so genuine section
+        // headings that follow a numbered paragraph (y_gap > para_threshold)
+        // remain detectable.
+        let looks_like_list_continuation = in_list
+            && match (last_list_x, line.items.first().map(|i| i.x)) {
+                (Some(list_x), Some(curr_x)) => {
+                    let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
+                    let y_ok = y_gap >= 0.0 && y_gap <= para_threshold;
+                    x_ok && y_ok && !is_list_item(plain_trimmed)
+                }
+                _ => false,
+            };
+
         let heuristic_heading = if options.detect_headers
+            && !looks_like_list_continuation
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
+            && !starts_with_bullet_marker(plain_trimmed)
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
@@ -641,11 +664,16 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             continue;
         }
 
-        // Structure-tree list item (LI only — LBody is a continuation, not a new item)
+        // Structure-tree list item (LI only — LBody is a continuation, not a new item).
+        // Some tagged PDFs use a "flat" style where every wrapped line in a list item
+        // gets its own MCID tagged directly under LI. When we're already inside a list
+        // and the line has no visible bullet marker, treat it as a continuation (falls
+        // through to the continuation logic below) rather than a new list item.
         if struct_role
             .as_ref()
             .is_some_and(|r| matches!(r, StructRole::LI))
             && !is_list_item(plain_trimmed)
+            && !in_list
         {
             if in_paragraph {
                 output.push_str("\n\n");
@@ -1091,6 +1119,59 @@ mod tests {
     }
 
     #[test]
+    fn test_struct_role_li_flat_continuation_lines_merge() {
+        // Regression: some tagged PDFs put each wrapped visual line of a list
+        // item under its own MCID, all tagged directly as LI. Continuation
+        // lines (no bullet marker) must merge into the bulleted parent item,
+        // not each become their own list item.
+        let make = |text: &str, mcid: i64, x: f32, y: f32| {
+            let mut item = make_item(text, 1, Some(mcid));
+            item.x = x;
+            item.y = y;
+            item
+        };
+        let lines = vec![
+            make_line(vec![make("● First item that wraps onto", 0, 90.0, 322.0)]),
+            make_line(vec![make("a continuation line.", 1, 108.0, 306.0)]),
+            make_line(vec![make("● Second bullet also wraps", 2, 90.0, 290.0)]),
+            make_line(vec![make("to a second line here.", 3, 108.0, 274.0)]),
+        ];
+
+        let mut page_roles = HashMap::new();
+        for mcid in 0..4 {
+            page_roles.insert(mcid, StructRole::LI);
+        }
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            Some(&roles),
+        );
+
+        assert!(
+            md.contains("- First item that wraps onto a continuation line."),
+            "continuation should merge into first bullet: {md}"
+        );
+        assert!(
+            md.contains("- Second bullet also wraps to a second line here."),
+            "continuation should merge into second bullet: {md}"
+        );
+        assert!(
+            !md.contains("- a continuation line."),
+            "continuation line should not get its own bullet: {md}"
+        );
+        assert!(
+            !md.contains("- to a second line here."),
+            "continuation line should not get its own bullet: {md}"
+        );
+    }
+
+    #[test]
     fn test_struct_role_blockquote() {
         let lines = vec![make_line(vec![make_item("Quoted text", 1, Some(0))])];
 
@@ -1390,6 +1471,72 @@ mod tests {
             overused.is_empty(),
             "No heading level should be overused: {:?}",
             overused
+        );
+    }
+
+    #[test]
+    fn test_wrapped_bold_lead_in_list_item_not_heading() {
+        // Regression: numbered-list items whose bold "lead" phrase wraps onto
+        // a second line (e.g. definitions in system cards) must not have the
+        // wrapped line reclassified as a heading. The middle line is
+        // all_bold + standalone (in_paragraph=false while in_list), which
+        // previously tripped the rarity heuristic and emitted #### in the
+        // middle of the item, splitting the body into stray bullets.
+        let make = |text: &str, x: f32, y: f32, bold: bool| {
+            let mut item = make_item(text, 1, None);
+            item.x = x;
+            item.y = y;
+            item.is_bold = bold;
+            item
+        };
+
+        let lines = vec![
+            // "1. **bold lead phrase start**"
+            make_line(vec![
+                make("1. ", 72.0, 700.0, false),
+                make(
+                    "Chemical and biological weapons threat model 1 (CB-1): Non-novel",
+                    90.0,
+                    700.0,
+                    true,
+                ),
+            ]),
+            // wrapped continuation of the bold lead — all_bold, same indent
+            make_line(vec![make(
+                "chemical/biological weapons production capabilities: A model has CB-1",
+                90.0,
+                686.0,
+                true,
+            )]),
+            // body text of the same list item
+            make_line(vec![make(
+                "capabilities if it has the ability to significantly help individuals.",
+                90.0,
+                672.0,
+                false,
+            )]),
+        ];
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert!(
+            !md.contains("#### "),
+            "wrapped bold lead must not become a heading: {md}"
+        );
+        assert!(
+            md.lines().filter(|l| l.starts_with("- ")).count() == 0,
+            "continuation body must not become a stray bullet: {md}"
+        );
+        assert!(
+            md.contains("1. ") && md.contains("A model has CB-1"),
+            "numbered list item should remain intact: {md}"
         );
     }
 }

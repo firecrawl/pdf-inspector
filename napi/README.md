@@ -1,4 +1,4 @@
-# firecrawl-pdf-inspector
+# PDF Inspector
 
 Fast PDF classification and region-based text extraction for Node.js/Bun. Native Rust performance via [napi-rs](https://napi.rs).
 
@@ -7,9 +7,9 @@ Built by [Firecrawl](https://firecrawl.dev) for hybrid OCR pipelines — extract
 ## Install
 
 ```bash
-npm install firecrawl-pdf-inspector
+npm install @firecrawl/pdf-inspector
 # or
-bun add firecrawl-pdf-inspector
+bun add @firecrawl/pdf-inspector
 ```
 
 Prebuilt binaries included for **linux-x64** and **macOS ARM64**. No Rust toolchain needed.
@@ -21,7 +21,7 @@ Prebuilt binaries included for **linux-x64** and **macOS ARM64**. No Rust toolch
 Classify a PDF as TextBased, Scanned, Mixed, or ImageBased (~10-50ms). Returns which pages need OCR.
 
 ```typescript
-import { classifyPdf } from 'firecrawl-pdf-inspector'
+import { classifyPdf } from '@firecrawl/pdf-inspector'
 import { readFileSync } from 'fs'
 
 const pdf = readFileSync('document.pdf')
@@ -40,7 +40,7 @@ Extract text within bounding-box regions from a PDF. Designed for hybrid OCR pip
 Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues).
 
 ```typescript
-import { extractTextInRegions } from 'firecrawl-pdf-inspector'
+import { extractTextInRegions } from '@firecrawl/pdf-inspector'
 
 const result = extractTextInRegions(pdf, [
   {

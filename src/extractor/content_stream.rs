@@ -216,6 +216,7 @@ pub(crate) fn extract_page_text_items(
     let mut marked_content_stack: Vec<MarkedContentEntry> = Vec::new();
     let mut suppress_glyph_extraction = false;
     let mut actual_text_start_tm: Option<[f32; 6]> = None; // text matrix at BDC entry
+    let mut actual_text_glyph_tm: Option<[f32; 6]> = None; // text matrix at first glyph inside BDC
     /// Get the innermost MCID from the marked content stack.
     fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
         stack.iter().rev().find_map(|e| e.mcid)
@@ -349,8 +350,15 @@ pub(crate) fn extract_page_text_items(
                             )
                         })
                     });
-                    // ActualText: suppress glyph extraction, just advance text matrix
+                    // ActualText: suppress glyph extraction, just advance text matrix.
+                    // Capture the FIRST glyph's text matrix as the rendering position
+                    // for the ActualText item. Td ops between BDC and the first Tj
+                    // may have moved the position to the correct line — the BDC-entry
+                    // position (actual_text_start_tm) can be on the previous line.
                     if suppress_glyph_extraction {
+                        if actual_text_glyph_tm.is_none() {
+                            actual_text_glyph_tm = Some(text_matrix);
+                        }
                         if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -425,6 +433,10 @@ pub(crate) fn extract_page_text_items(
                         let font_info = font_widths.get(&current_font);
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
+                        // Capture first-glyph position for ActualText
+                        if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
+                            actual_text_glyph_tm = Some(text_matrix);
+                        }
 
                         // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(font_info) = font_info {
@@ -700,6 +712,7 @@ pub(crate) fn extract_page_text_items(
                 if actual_text.is_some() {
                     suppress_glyph_extraction = true;
                     actual_text_start_tm = Some(text_matrix);
+                    actual_text_glyph_tm = None; // reset — will be captured at first Tj/TJ
                 }
                 marked_content_stack.push(MarkedContentEntry { actual_text, mcid });
             }
@@ -707,8 +720,13 @@ pub(crate) fn extract_page_text_items(
                 // End Marked Content — emit ActualText item with correct width
                 if let Some(entry) = marked_content_stack.pop() {
                     if let Some(at) = entry.actual_text {
-                        // Compute width from text matrix advancement during BDC..EMC
-                        if let Some(start_tm) = actual_text_start_tm.take() {
+                        // Use the first-glyph position (if available) instead of the
+                        // BDC-entry position. Td operators between BDC and the first
+                        // Tj may have moved the text position to the correct line —
+                        // the BDC-entry position can be on the previous line.
+                        let glyph_tm = actual_text_glyph_tm.take();
+                        let entry_tm = actual_text_start_tm.take();
+                        if let Some(start_tm) = glyph_tm.or(entry_tm) {
                             let combined = multiply_matrices(&start_tm, &ctm);
                             if combined[0].abs() >= combined[1].abs() {
                                 rotation_votes.horizontal += 1;

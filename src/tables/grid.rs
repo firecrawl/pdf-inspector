@@ -499,6 +499,7 @@ pub(crate) fn recover_header_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tables::TableKind;
     use crate::types::ItemType;
 
     fn make_item(text: &str, x: f32, y: f32, font_size: f32) -> TextItem {
@@ -756,6 +757,7 @@ mod tests {
             rows: vec![500.0, 480.0],
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
+            kind: TableKind::Data,
         };
 
         recover_header_row(&mut table, &all_items, 9.0);
@@ -774,6 +776,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![0, 1],
+            kind: TableKind::Data,
         };
 
         let rows_before = table.rows.len();
@@ -794,6 +797,7 @@ mod tests {
             rows: vec![500.0, 480.0],
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
+            kind: TableKind::Data,
         };
 
         let rows_before = table.rows.len();
@@ -814,6 +818,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![1, 2],
+            kind: TableKind::Data,
         };
 
         let rows_before = table.rows.len();
@@ -829,6 +834,7 @@ mod tests {
             rows: vec![],
             cells: vec![],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
 
         recover_header_row(&mut table, &all_items, 9.0);

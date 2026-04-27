@@ -1,9 +1,12 @@
 {
-  "name": "firecrawl-pdf-inspector",
-  "version": "0.7.4",
+  "name": "@firecrawl/pdf-inspector",
+  "version": "1.7.1",
   "description": "Fast PDF classification and text extraction. Detect text-based vs scanned PDFs, extract text by region with quality checks. Native Rust performance via napi-rs.",
   "main": "index.js",
   "types": "index.d.ts",
+  "bin": {
+    "pdf-inspector": "bin/pdf-inspector.mjs"
+  },
   "license": "MIT",
   "keywords": [
     "pdf",
@@ -20,6 +23,7 @@
     "index.js",
     "index.d.ts",
     "*.node",
+    "bin/",
     "README.md"
   ],
   "repository": {
@@ -34,7 +38,8 @@
     "binaryName": "pdf-inspector",
     "targets": [
       "x86_64-unknown-linux-gnu",
-      "aarch64-apple-darwin"
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
     ],
     "package": {
       "name": "@firecrawl/pdf-inspector-js"

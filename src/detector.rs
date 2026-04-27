@@ -100,26 +100,9 @@ pub fn detect_pdf_type_with_config<P: AsRef<Path>>(
 ) -> Result<PdfTypeResult, PdfError> {
     crate::validate_pdf_file(&path)?;
 
-    // First, load metadata only (fast operation)
-    let metadata = match Document::load_metadata(&path) {
-        Ok(m) => m,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_metadata_with_password(&path, "")?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let (doc, page_count) = crate::load_document_from_path(&path)?;
 
-    // Then load the full document for content inspection
-    // We use filtered loading to skip heavy objects we don't need
-    let doc = match Document::load(&path) {
-        Ok(d) => d,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_with_password(&path, "")?
-        }
-        Err(e) => return Err(e.into()),
-    };
-
-    detect_from_document(&doc, metadata.page_count, &config)
+    detect_from_document(&doc, page_count, &config)
 }
 
 /// Detect PDF type from memory buffer
@@ -134,25 +117,64 @@ pub fn detect_pdf_type_mem_with_config(
 ) -> Result<PdfTypeResult, PdfError> {
     crate::validate_pdf_bytes(buffer)?;
 
-    // Load metadata first (fast)
-    let metadata = match Document::load_metadata_mem(buffer) {
-        Ok(m) => m,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_metadata_mem_with_password(buffer, "")?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let (doc, page_count) = crate::load_document_from_mem(buffer)?;
 
-    // Load document for inspection
-    let doc = match Document::load_mem(buffer) {
-        Ok(d) => d,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_options(buffer, lopdf::LoadOptions::with_password(""))?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    detect_from_document(&doc, page_count, &config)
+}
 
-    detect_from_document(&doc, metadata.page_count, &config)
+/// Heuristic page-count fallback for malformed PDFs that cannot be parsed.
+///
+/// This scans raw bytes for page dictionaries (`/Type /Page`) while excluding
+/// the page tree node (`/Type /Pages`). It is intended as a low-confidence hint
+/// for diagnostics; parsed page-tree counts remain authoritative.
+pub fn estimate_page_count_from_bytes(buffer: &[u8]) -> u32 {
+    let mut count = 0u32;
+    let mut pos = 0usize;
+
+    while let Some(rel_idx) = find_bytes(&buffer[pos..], b"/Type") {
+        let mut value_pos = pos + rel_idx + b"/Type".len();
+        value_pos = skip_pdf_whitespace(buffer, value_pos);
+
+        if buffer.get(value_pos) == Some(&b'/') {
+            let name_start = value_pos + 1;
+            let name_end = name_start + b"Page".len();
+            if name_end <= buffer.len()
+                && &buffer[name_start..name_end] == b"Page"
+                && buffer
+                    .get(name_end)
+                    .is_none_or(|b| is_pdf_name_delimiter(*b))
+            {
+                count += 1;
+            }
+        }
+
+        pos += rel_idx + b"/Type".len();
+    }
+
+    count
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn skip_pdf_whitespace(buffer: &[u8], mut pos: usize) -> usize {
+    while pos < buffer.len() && is_pdf_whitespace(buffer[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+fn is_pdf_whitespace(byte: u8) -> bool {
+    matches!(byte, b'\0' | b'\t' | b'\n' | 0x0C | b'\r' | b' ')
+}
+
+fn is_pdf_name_delimiter(byte: u8) -> bool {
+    is_pdf_whitespace(byte)
+        || matches!(
+            byte,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
 }
 
 /// Detection logic on a pre-loaded document.

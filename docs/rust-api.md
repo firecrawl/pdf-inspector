@@ -79,6 +79,27 @@ let bytes = std::fs::read("document.pdf")?;
 let result = process_pdf_mem(&bytes)?;
 ```
 
+Extract per-page Markdown (one string per page, plus document-wide layout
+metadata):
+
+```rust
+use pdf_inspector::extract_pages_markdown;
+
+// Pass `None` for every page in document order, or a slice of 0-indexed
+// pages to restrict the output (caller-supplied order is preserved).
+let result = extract_pages_markdown("document.pdf", None)?;
+
+for page in &result.pages {
+    if page.needs_ocr {
+        // Route this page to OCR
+    } else {
+        println!("Page {}: {}", page.page, page.markdown);
+    }
+}
+
+println!("Complex layout? {}", result.is_complex);
+```
+
 ## Processing modes
 
 | Mode | What it does | Returns |
@@ -102,6 +123,8 @@ let result = process_pdf_mem(&bytes)?;
 | `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |
 | `to_markdown_from_items_with_rects(items, options, rects)` | Markdown with rectangle-based table detection |
+| `extract_pages_markdown(path, pages)` | Per-page Markdown + layout metadata (file) |
+| `extract_pages_markdown_mem(bytes, pages)` | Per-page Markdown from bytes |
 
 Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
 
@@ -119,4 +142,6 @@ Low-level detection functions are also available via the `detector` module (`det
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
 | `TextItem` | Text with position, font info, and page number |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
+| `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
+| `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |

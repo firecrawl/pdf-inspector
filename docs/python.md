@@ -42,6 +42,14 @@ text = pdf_inspector.extract_text("document.pdf")
 items = pdf_inspector.extract_text_with_positions("document.pdf")
 for item in items[:5]:
     print(f"'{item.text}' at ({item.x:.0f}, {item.y:.0f}) size={item.font_size}")
+
+# Per-page markdown (one Markdown string per page, plus layout metadata)
+result = pdf_inspector.extract_pages_markdown("document.pdf")
+for page in result.pages:
+    print(f"Page {page.page}: {len(page.markdown)} chars, needs_ocr={page.needs_ocr}")
+
+# Restrict to specific 0-indexed pages (preserves caller order)
+result = pdf_inspector.extract_pages_markdown("document.pdf", pages=[0, 2])
 ```
 
 ## API reference
@@ -60,6 +68,8 @@ for item in items[:5]:
 | `extract_text_with_positions_bytes(data, pages=None)` | Text with positions from bytes |
 | `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions |
 | `extract_text_in_regions_bytes(data, page_regions)` | Region extraction from bytes |
+| `extract_pages_markdown(path, pages=None)` | Per-page Markdown + layout metadata (all pages by default) |
+| `extract_pages_markdown_bytes(data, pages=None)` | Per-page Markdown from bytes |
 
 ## Types
 
@@ -72,3 +82,7 @@ for item in items[:5]:
 **`RegionText` fields:** `text`, `needs_ocr`
 
 **`PageRegionTexts` fields:** `page` (0-indexed), `regions` (list of RegionText)
+
+**`PageMarkdown` fields:** `page` (0-indexed), `markdown`, `needs_ocr`
+
+**`PagesExtractionResult` fields:** `pages` (list of PageMarkdown), `pages_with_tables` (1-indexed), `pages_with_columns` (1-indexed), `pages_needing_ocr` (1-indexed), `is_complex`

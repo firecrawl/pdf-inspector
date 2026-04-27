@@ -1,15 +1,92 @@
 //! Integration tests for pdf-to-markdown library
 
-use pdf_inspector::detector::{DetectionConfig, ScanStrategy};
+use pdf_inspector::detector::{estimate_page_count_from_bytes, DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
-    detect_pdf_type, extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
-    extract_text_in_regions_mem, extract_text_with_positions, process_pdf_mem,
-    process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions, PdfType,
-    TextItem,
+    detect_pdf_type, extract_pages_markdown, extract_pages_markdown_mem,
+    extract_tables_in_regions_mem, extract_text, extract_text_in_regions_mem,
+    extract_text_with_positions, process_pdf_mem, process_pdf_with_options, to_markdown,
+    MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
 };
 use std::collections::HashSet;
+
+fn make_minimal_text_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    );
+
+    let content = "BT /F1 12 Tf 100 700 Td (Hello World) Tj 0 -14 Td (Second Line) Tj 0 -14 Td (Third Line) Tj ET";
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+fn truncate_eof_marker(mut pdf: Vec<u8>) -> Vec<u8> {
+    assert!(pdf.ends_with(b"%%EOF"));
+    pdf.pop();
+    pdf
+}
+
+fn add_leading_tab(mut pdf: Vec<u8>) -> Vec<u8> {
+    pdf.insert(0, b'\t');
+    pdf
+}
 
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
@@ -827,6 +904,73 @@ fn test_bom_prefixed_pdf_header_not_rejected() {
 }
 
 #[test]
+fn test_process_pdf_mem_repairs_truncated_eof_marker() {
+    let pdf = truncate_eof_marker(make_minimal_text_pdf());
+
+    let result = process_pdf_mem(&pdf).expect("truncated %%EO marker should be repaired");
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert_eq!(result.page_count, 1);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Hello World"),
+        "repaired PDF should still extract text"
+    );
+}
+
+#[test]
+fn test_process_pdf_mem_repairs_leading_tab_and_truncated_eof() {
+    let pdf = add_leading_tab(truncate_eof_marker(make_minimal_text_pdf()));
+
+    let result = process_pdf_mem(&pdf).expect("leading whitespace + %%EO should be repaired");
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert_eq!(result.page_count, 1);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Hello World"),
+        "repaired PDF should still extract text"
+    );
+}
+
+#[test]
+fn test_detect_pdf_type_repairs_container_from_path() {
+    let pdf = add_leading_tab(truncate_eof_marker(make_minimal_text_pdf()));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("broken-container.pdf");
+    std::fs::write(&path, pdf).unwrap();
+
+    let result = detect_pdf_type(&path).expect("detector should use shared repair loader");
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert_eq!(result.page_count, 1);
+    assert_eq!(result.pages_with_text, 1);
+}
+
+#[test]
+fn test_extract_text_mem_uses_container_repair() {
+    let pdf = truncate_eof_marker(make_minimal_text_pdf());
+
+    let text = pdf_inspector::extractor::extract_text_mem(&pdf)
+        .expect("plain text extraction should use shared repair loader");
+
+    assert!(text.contains("Hello World"));
+}
+
+#[test]
+fn test_estimate_page_count_from_bytes_excludes_pages_tree() {
+    let pdf = add_leading_tab(truncate_eof_marker(make_minimal_text_pdf()));
+
+    assert_eq!(estimate_page_count_from_bytes(&pdf), 1);
+}
+
+#[test]
 fn test_not_a_pdf_detect_pdf_type_mem() {
     // Verify detect_pdf_type_mem is also guarded
     let html = b"<html><head><title>Not a PDF</title></head></html>";
@@ -1486,13 +1630,585 @@ fn test_bits_pilani_page8_table_detection() {
 }
 
 // =========================================================================
+// extract_tables_with_structure_mem tests (TSR-aware path)
+// =========================================================================
+
+/// Build an 8-element 4-corner polygon `[x1,y1, x2,y1, x2,y2, x1,y2]` from
+/// an axis-aligned rect — matches the format SLANet emits for cell bboxes.
+fn poly(x1: f32, y1: f32, x2: f32, y2: f32) -> Vec<f32> {
+    vec![x1, y1, x2, y1, x2, y2, x1, y2]
+}
+
+fn synthetic_dense_table_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    let operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 10.into()]),
+        Operation::new("Td", vec![20.into(), 700.into()]),
+        Operation::new("Tj", vec![Object::string_literal("Branch Name")]),
+        Operation::new("Td", vec![100.into(), 0.into()]),
+        Operation::new("Tj", vec![Object::string_literal("Deposits")]),
+        Operation::new("Td", vec![Object::Integer(-100), Object::Real(-16.8)]),
+        Operation::new("Tj", vec![Object::string_literal("Oak Street")]),
+        Operation::new("Td", vec![100.into(), 0.into()]),
+        Operation::new("Tj", vec![Object::string_literal("100")]),
+        Operation::new("Td", vec![Object::Integer(-100), Object::Real(-16.8)]),
+        Operation::new("Tj", vec![Object::string_literal("Boardwalk")]),
+        Operation::new("Td", vec![100.into(), 0.into()]),
+        Operation::new("Tj", vec![Object::string_literal("200")]),
+        Operation::new("ET", vec![]),
+    ];
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 800.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_extract_tables_with_structure_real_pdf_bits_pilani() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+    // Hand-crafted TSR fixture targeting page 4 (0-indexed=3) of
+    // bits_pilani_feedback.pdf, which contains a clean tabular layout.
+    //
+    // We construct a 2×2 table:
+    //   row 0 (header): "Department"   "Core Courses"
+    //   row 1 (data):   "BIO"          "8.23"
+    //
+    // The PDF page is US Letter (792pt tall). We render at 72 dpi so
+    // image-px maps 1:1 to PDF-pt — that lets us write cell bboxes in
+    // the same units as our hand-measured page-pt coordinates.
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    // The PDF page is A4 in points (≈595.44 × 841.68). The table sits in
+    // the upper part of the page; we crop a window large enough to enclose
+    // both rows we care about.
+    //
+    // Crop bounds in PDF points (top-left origin):
+    //   x: 80..280, y: 170..240
+    let crop = [80.0_f32, 170.0, 280.0, 240.0];
+    let dpi = 72.0_f32;
+
+    // Cell bboxes in CROP image-pixel space (= crop-relative PDF-pt at
+    // 72 dpi). The y ranges are tightened against neighbouring rows
+    // ("First Degree" above the header at native y=666.7, "Feedback Score"
+    // between the header and data rows at native y=640.9, "CE" below the
+    // BIO row at native y=591.1) so each cell only overlaps its target
+    // text item.
+    let cell_bboxes = vec![
+        // Header row: y crop-relative (7, 18) → page-pt y (177, 188)
+        poly(10.0, 7.0, 100.0, 18.0), // "Department"   (item at page-pt x=107.1)
+        poly(110.0, 7.0, 200.0, 18.0), // "Core Courses" (item at page-pt x=199.0)
+        // Data row: y crop-relative (35, 60) → page-pt y (205, 230)
+        poly(10.0, 35.0, 100.0, 60.0), // "BIO"  (item at page-pt x=104.1)
+        poly(110.0, 35.0, 200.0, 60.0), // "8.23" (item at page-pt x=221.2)
+    ];
+
+    // Minimal SLANet-style token stream: a 2-row table with a thead and tbody.
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let inputs = vec![TsrTableInput {
+        page: 3,
+        crop_pdf_pt_bbox: crop,
+        render_dpi: dpi,
+        structure_tokens: tokens,
+        cell_bboxes,
+    }];
+
+    let mds = extract_tables_with_structure_mem(&buf, &inputs).unwrap();
+    assert_eq!(mds.len(), 1);
+    let md = &mds[0];
+
+    // Hand-written gold standard for the rendered markdown.
+    let expected = "|Department|Core Courses|\n|---|---|\n|BIO|8.23|\n";
+    assert_eq!(
+        md, expected,
+        "structured-table markdown should match the gold standard exactly\nactual: {md}"
+    );
+}
+
+#[test]
+fn test_extract_tables_with_structure_dense_overlapping_slanet_boxes() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+
+    let buf = synthetic_dense_table_pdf();
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    // Rows are spaced 16.8pt apart, while the SLANet-style boxes are 40pt
+    // tall and overlap adjacent rows. Text must still land in only one row.
+    let cell_bboxes = vec![
+        poly(10.0, 72.0, 100.0, 112.0),
+        poly(90.0, 72.0, 180.0, 112.0),
+        poly(10.0, 88.8, 100.0, 128.8),
+        poly(90.0, 88.8, 180.0, 128.8),
+        poly(10.0, 105.6, 100.0, 145.6),
+        poly(90.0, 105.6, 180.0, 145.6),
+    ];
+
+    let mds = extract_tables_with_structure_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 800.0],
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+
+    let expected = "|Branch Name|Deposits|\n|---|---|\n|Oak Street|100|\n|Boardwalk|200|\n";
+    assert_eq!(mds[0], expected);
+    assert!(!mds[0].contains("Branch Name Oak Street"));
+    assert!(!mds[0].contains("Oak Street Boardwalk"));
+}
+
+#[test]
+fn test_extract_tables_with_structure_input_order_preserved() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    // Two inputs; both target the same page but with different shapes.
+    // We just need to confirm we get 2 outputs in the same order.
+    let make_input = |toks: Vec<&str>, cells: Vec<Vec<f32>>| TsrTableInput {
+        page: 3,
+        crop_pdf_pt_bbox: [80.0, 170.0, 280.0, 240.0],
+        render_dpi: 72.0,
+        structure_tokens: toks.into_iter().map(String::from).collect(),
+        cell_bboxes: cells,
+    };
+
+    let inputs = vec![
+        make_input(
+            vec!["<table>", "<tr>", "<td></td>", "</tr>", "</table>"],
+            vec![poly(10.0, 35.0, 100.0, 60.0)],
+        ),
+        make_input(
+            vec!["<table>", "<tr>", "<td></td>", "</tr>", "</table>"],
+            vec![poly(110.0, 35.0, 200.0, 60.0)],
+        ),
+    ];
+
+    let mds = extract_tables_with_structure_mem(&buf, &inputs).unwrap();
+    assert_eq!(mds.len(), 2);
+    assert!(
+        mds[0].contains("BIO"),
+        "input 0 should pull 'BIO': {}",
+        mds[0]
+    );
+    assert!(
+        mds[1].contains("8.23"),
+        "input 1 should pull '8.23': {}",
+        mds[1]
+    );
+}
+
+#[test]
+fn test_extract_tables_with_structure_out_of_range_page() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    let inputs = vec![TsrTableInput {
+        page: 9999,
+        crop_pdf_pt_bbox: [0.0, 0.0, 100.0, 100.0],
+        render_dpi: 72.0,
+        structure_tokens: vec![
+            "<table>".into(),
+            "<tr>".into(),
+            "<td></td>".into(),
+            "</tr>".into(),
+            "</table>".into(),
+        ],
+        cell_bboxes: vec![poly(0.0, 0.0, 50.0, 50.0)],
+    }];
+
+    let mds = extract_tables_with_structure_mem(&buf, &inputs).unwrap();
+    assert_eq!(mds.len(), 1);
+    assert!(
+        mds[0].is_empty(),
+        "out-of-range page should yield empty string"
+    );
+}
+
+#[test]
+fn test_extract_tables_with_structure_not_a_pdf() {
+    use pdf_inspector::extract_tables_with_structure_mem;
+    let result = extract_tables_with_structure_mem(b"not a pdf", &[]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_extract_tables_with_structure_empty_inputs() {
+    use pdf_inspector::extract_tables_with_structure_mem;
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+    let mds = extract_tables_with_structure_mem(&buf, &[]).unwrap();
+    assert!(mds.is_empty());
+}
+
+#[test]
+fn test_extract_tables_with_structure_cells_real_pdf_bits_pilani() {
+    use pdf_inspector::{extract_tables_with_structure_cells_mem, TsrTableInput};
+    // Same fixture as test_extract_tables_with_structure_real_pdf_bits_pilani
+    // but exercising the cell-level API. Verifies that callers receive
+    // structured per-cell metadata (row/col/spans/is_header/page_pt_bbox)
+    // alongside the extracted text.
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    let crop = [80.0_f32, 170.0, 280.0, 240.0];
+    let dpi = 72.0_f32;
+    let cell_bboxes = vec![
+        poly(10.0, 7.0, 100.0, 18.0),
+        poly(110.0, 7.0, 200.0, 18.0),
+        poly(10.0, 35.0, 100.0, 60.0),
+        poly(110.0, 35.0, 200.0, 60.0),
+    ];
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let inputs = vec![TsrTableInput {
+        page: 3,
+        crop_pdf_pt_bbox: crop,
+        render_dpi: dpi,
+        structure_tokens: tokens,
+        cell_bboxes,
+    }];
+
+    let cells_lists = extract_tables_with_structure_cells_mem(&buf, &inputs).unwrap();
+    assert_eq!(cells_lists.len(), 1);
+    let cells = &cells_lists[0];
+    assert_eq!(cells.len(), 4);
+
+    // Header row: both cells flagged as headers (they were in <thead>/<th>).
+    assert!(cells[0].is_header);
+    assert!(cells[1].is_header);
+    assert_eq!((cells[0].row, cells[0].col), (0, 0));
+    assert_eq!((cells[1].row, cells[1].col), (0, 1));
+    assert_eq!(cells[0].text, "Department");
+    assert_eq!(cells[1].text, "Core Courses");
+
+    // Data row: not flagged as header.
+    assert!(!cells[2].is_header);
+    assert!(!cells[3].is_header);
+    assert_eq!((cells[2].row, cells[2].col), (1, 0));
+    assert_eq!((cells[3].row, cells[3].col), (1, 1));
+    assert_eq!(cells[2].text, "BIO");
+    assert_eq!(cells[3].text, "8.23");
+
+    // Every cell carries a non-degenerate page-pt bbox.
+    for c in cells {
+        let [x1, y1, x2, y2] = c.page_pt_bbox;
+        assert!(
+            x1 < x2 && y1 < y2,
+            "cell bbox should be non-empty: {:?}",
+            c.page_pt_bbox
+        );
+    }
+}
+
+#[test]
+fn test_extract_tables_with_structure_separator_after_thead() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+    // Re-run the same 2x2 fixture but assert exact markdown output: with
+    // <thead> + <th> headers, the separator should land after the header
+    // row (which is also row 0 here, so the gold-standard hasn't changed).
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    let crop = [80.0_f32, 170.0, 280.0, 240.0];
+    let dpi = 72.0_f32;
+    let cell_bboxes = vec![
+        poly(10.0, 7.0, 100.0, 18.0),
+        poly(110.0, 7.0, 200.0, 18.0),
+        poly(10.0, 35.0, 100.0, 60.0),
+        poly(110.0, 35.0, 200.0, 60.0),
+    ];
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let mds = extract_tables_with_structure_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 3,
+            crop_pdf_pt_bbox: crop,
+            render_dpi: dpi,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+    assert_eq!(mds.len(), 1);
+    assert_eq!(mds[0], "|Department|Core Courses|\n|---|---|\n|BIO|8.23|\n");
+}
+
+// =========================================================================
+// extract_tables_with_structure_auto_mem tests (TSR + heuristic fallback)
+// =========================================================================
+
+#[test]
+fn test_auto_passes_through_clean_tsr_output() {
+    use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
+
+    let buf = synthetic_dense_table_pdf();
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    // Cells fit each visible row cleanly. Same shape as the existing
+    // dense-overlap regression test — TSR should produce clean output
+    // and the auto wrapper should pass through with no fallback.
+    let cell_bboxes = vec![
+        poly(10.0, 72.0, 100.0, 112.0),
+        poly(90.0, 72.0, 180.0, 112.0),
+        poly(10.0, 88.8, 100.0, 128.8),
+        poly(90.0, 88.8, 180.0, 128.8),
+        poly(10.0, 105.6, 100.0, 145.6),
+        poly(90.0, 105.6, 180.0, 145.6),
+    ];
+
+    let results = extract_tables_with_structure_auto_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 800.0],
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].fallback_reason.is_none(),
+        "expected no fallback, got {:?}",
+        results[0].fallback_reason
+    );
+    assert!(results[0].markdown.contains("Oak Street"));
+    assert!(results[0].markdown.contains("Boardwalk"));
+    assert!(!results[0].markdown.contains("Oak Street Boardwalk"));
+}
+
+#[test]
+fn test_auto_falls_back_on_multi_row_in_cell() {
+    use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
+
+    let buf = synthetic_dense_table_pdf();
+    // TSR returns only 2 rows for what's actually 3 visible PDF rows.
+    // Row 1's cells are tall enough to encompass both Oak Street and
+    // Boardwalk text — the FNBO row-undercount pattern.
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    // Header row at top-left y=[88, 105] (covers "Branch Name"/"Deposits"
+    // at native y=700, top-left y≈92-103). The "data" row at top-left
+    // y=[105, 145] is intentionally tall — covers BOTH the Oak Street
+    // line (top-left y≈108-119) AND the Boardwalk line (y≈124-135).
+    let cell_bboxes = vec![
+        poly(10.0, 88.0, 100.0, 105.0),
+        poly(90.0, 88.0, 180.0, 105.0),
+        poly(10.0, 105.0, 100.0, 145.0),
+        poly(90.0, 105.0, 180.0, 145.0),
+    ];
+
+    let results = extract_tables_with_structure_auto_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 800.0],
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].fallback_reason.as_deref(),
+        Some("multi_row_in_cell"),
+        "expected multi_row_in_cell fallback, got {:?}",
+        results[0].fallback_reason
+    );
+    // The heuristic-fallback markdown should preserve all three PDF rows.
+    let md = &results[0].markdown;
+    assert!(md.contains("Oak Street"), "missing Oak Street: {md}");
+    assert!(md.contains("Boardwalk"), "missing Boardwalk: {md}");
+    assert!(md.contains("100"), "missing 100: {md}");
+    assert!(md.contains("200"), "missing 200: {md}");
+}
+
+#[test]
+fn test_auto_returns_empty_inputs() {
+    use pdf_inspector::extract_tables_with_structure_auto_mem;
+    let buf = synthetic_dense_table_pdf();
+    let results = extract_tables_with_structure_auto_mem(&buf, &[]).unwrap();
+    assert!(results.is_empty());
+}
+
+// =========================================================================
 // extract_pages_markdown_mem tests
 // =========================================================================
 
 #[test]
 fn test_extract_pages_markdown_basic() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[0, 1]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[0, 1])).unwrap();
 
     assert_eq!(result.pages.len(), 2);
     assert_eq!(result.pages[0].page, 0);
@@ -1506,7 +2222,7 @@ fn test_extract_pages_markdown_basic() {
 fn test_extract_pages_markdown_page_ordering() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
     // Request pages in non-sequential order
-    let result = extract_pages_markdown_mem(&buf, &[1, 0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[1, 0])).unwrap();
 
     assert_eq!(result.pages.len(), 2);
     // Results should match input order, not document order
@@ -1517,7 +2233,7 @@ fn test_extract_pages_markdown_page_ordering() {
 #[test]
 fn test_extract_pages_markdown_out_of_range() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[9999]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[9999])).unwrap();
 
     assert_eq!(result.pages.len(), 1);
     assert_eq!(result.pages[0].page, 9999);
@@ -1529,14 +2245,14 @@ fn test_extract_pages_markdown_out_of_range() {
 #[test]
 fn test_extract_pages_markdown_empty_pages_list() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[])).unwrap();
     assert!(result.pages.is_empty());
 }
 
 #[test]
 fn test_extract_pages_markdown_single_page() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
 
     assert_eq!(result.pages.len(), 1);
     assert_eq!(result.pages[0].page, 0);
@@ -1546,7 +2262,7 @@ fn test_extract_pages_markdown_single_page() {
 
 #[test]
 fn test_extract_pages_markdown_invalid_buffer() {
-    let result = extract_pages_markdown_mem(b"not a pdf", &[0]);
+    let result = extract_pages_markdown_mem(b"not a pdf", Some(&[0]));
     assert!(result.is_err());
 }
 
@@ -1554,7 +2270,7 @@ fn test_extract_pages_markdown_invalid_buffer() {
 fn test_extract_pages_markdown_gid_pages_need_ocr() {
     // shinagawa_identity_h.pdf has GID-encoded fonts
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
 
     assert_eq!(result.pages.len(), 1);
     assert!(result.pages[0].needs_ocr);
@@ -1567,7 +2283,7 @@ fn test_extract_pages_markdown_classification_with_tables() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
     let page_count = process_pdf_mem(&buf).unwrap().page_count;
     let page_indices: Vec<u32> = (0..page_count).collect();
-    let result = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&page_indices)).unwrap();
 
     assert!(
         !result.pages_with_tables.is_empty(),
@@ -1580,7 +2296,7 @@ fn test_extract_pages_markdown_classification_with_tables() {
 fn test_extract_pages_markdown_simple_pdf_no_complexity() {
     // bare_name_struct.pdf is a simple document with a heading and code block
     let buf = std::fs::read("tests/fixtures/bare_name_struct.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
 
     assert!(result.pages_with_tables.is_empty());
     assert!(result.pages_with_columns.is_empty());
@@ -1593,7 +2309,7 @@ fn test_extract_pages_markdown_classification_matches_process_pdf() {
     let full = process_pdf_mem(&buf).unwrap();
     let page_count = full.page_count;
     let page_indices: Vec<u32> = (0..page_count).collect();
-    let result = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&page_indices)).unwrap();
 
     assert_eq!(
         result.pages_with_tables, full.layout.pages_with_tables,
@@ -1616,7 +2332,7 @@ fn test_extract_pages_markdown_consistency_with_process_pdf() {
     // Get per-page output for all pages
     let page_count = full.page_count;
     let page_indices: Vec<u32> = (0..page_count).collect();
-    let result = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&page_indices)).unwrap();
 
     // Concatenated per-page markdown should contain substantial overlap with
     // the full output (exact match not expected due to header/footer stripping
@@ -1640,4 +2356,42 @@ fn test_extract_pages_markdown_consistency_with_process_pdf() {
         concat.len(),
         full_md.len()
     );
+}
+
+#[test]
+fn test_extract_pages_markdown_none_returns_all_pages() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let page_count = process_pdf_mem(&buf).unwrap().page_count;
+
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+
+    assert_eq!(result.pages.len() as u32, page_count);
+    for (i, page) in result.pages.iter().enumerate() {
+        assert_eq!(page.page, i as u32, "pages should be in document order");
+    }
+}
+
+#[test]
+fn test_extract_pages_markdown_path_api() {
+    let path = "tests/fixtures/nexo-price-en.pdf";
+    let buf = std::fs::read(path).unwrap();
+
+    let via_path = extract_pages_markdown(path, Some(&[0])).unwrap();
+    let via_mem = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
+
+    assert_eq!(via_path.pages.len(), via_mem.pages.len());
+    assert_eq!(via_path.pages[0].markdown, via_mem.pages[0].markdown);
+    assert_eq!(via_path.pages[0].needs_ocr, via_mem.pages[0].needs_ocr);
+    assert_eq!(via_path.is_complex, via_mem.is_complex);
+}
+
+#[test]
+fn test_extract_pages_markdown_path_none_returns_all_pages() {
+    let path = "tests/fixtures/nexo-price-en.pdf";
+    let page_count = process_pdf_mem(&std::fs::read(path).unwrap())
+        .unwrap()
+        .page_count;
+
+    let result = extract_pages_markdown(path, None).unwrap();
+    assert_eq!(result.pages.len() as u32, page_count);
 }

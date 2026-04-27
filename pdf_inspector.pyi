@@ -60,6 +60,28 @@ class PageRegionTexts:
     """0-indexed page number."""
     regions: list[RegionText]
 
+class PageMarkdown:
+    """Per-page markdown extraction result."""
+    page: int
+    """0-indexed page number."""
+    markdown: str
+    """Formatted markdown for this page (empty string when needs_ocr is True)."""
+    needs_ocr: bool
+    """True when text on this page is unreliable and OCR should be used instead."""
+
+class PagesExtractionResult:
+    """Per-page markdown output with document-wide layout classification."""
+    pages: list[PageMarkdown]
+    """Per-page markdown results, in the order requested."""
+    pages_with_tables: list[int]
+    """1-indexed pages where tables were detected."""
+    pages_with_columns: list[int]
+    """1-indexed pages where multi-column layout was detected."""
+    pages_needing_ocr: list[int]
+    """1-indexed pages that need OCR."""
+    is_complex: bool
+    """True if any page has tables or multi-column layout."""
+
 def process_pdf(path: str, pages: Optional[list[int]] = None) -> PdfResult:
     """Process a PDF: detect type, extract text, convert to Markdown."""
     ...
@@ -125,5 +147,33 @@ def extract_text_in_regions_bytes(
     Args:
         data: PDF file contents as bytes.
         page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
+    """
+    ...
+
+def extract_pages_markdown(
+    path: str,
+    pages: Optional[list[int]] = None,
+) -> PagesExtractionResult:
+    """Extract formatted markdown for pages of a PDF, with layout classification.
+
+    Args:
+        path: Path to the PDF file.
+        pages: Optional list of 0-indexed pages. When ``None`` (default), every
+            page is returned in document order. Otherwise, output matches the
+            caller-supplied order.
+
+    Returns:
+        PagesExtractionResult with per-page markdown and document-wide layout
+        classification (tables, columns, OCR needs).
+    """
+    ...
+
+def extract_pages_markdown_bytes(
+    data: bytes,
+    pages: Optional[list[int]] = None,
+) -> PagesExtractionResult:
+    """Extract formatted markdown for pages of a PDF from bytes.
+
+    See :func:`extract_pages_markdown` for details.
     """
     ...

@@ -64,6 +64,22 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
     false
 }
 
+/// Check if text starts with an unambiguous bullet marker (●, •, ○, ◦).
+///
+/// Narrower than [`is_list_item`]: it excludes numbered/lettered patterns
+/// like `1.` or `a)`, which legitimately appear as section headings in many
+/// documents. Used by the heading classifier to reject bullet lines without
+/// also demoting numbered headings.
+pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("• ")
+        || trimmed.starts_with("● ")
+        || trimmed.starts_with("○ ")
+        || trimmed.starts_with("◦ ")
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+}
+
 /// Check if text looks like a list item
 pub(crate) fn is_list_item(text: &str) -> bool {
     let trimmed = text.trim_start();
@@ -114,6 +130,16 @@ pub(crate) fn format_list_item(text: &str) -> String {
     for bullet in &['•', '○', '●', '◦'] {
         if let Some(rest) = trimmed.strip_prefix(*bullet) {
             return format!("- {}", rest.trim_start());
+        }
+        // Bullet inside a leading bold/italic run (e.g. "**● Label:** rest").
+        // The run wraps both the marker and the following label because both
+        // use a bold font in the PDF.
+        for wrapper in ["**", "*"] {
+            if let Some(after_open) = trimmed.strip_prefix(wrapper) {
+                if let Some(rest) = after_open.strip_prefix(*bullet) {
+                    return format!("- {}{}", wrapper, rest.trim_start());
+                }
+            }
         }
     }
 
@@ -197,4 +223,43 @@ pub(crate) fn is_monospace_font(font_name: &str) -> bool {
     ];
 
     patterns.iter().any(|p| lower.contains(p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_list_item_plain_bullet() {
+        assert_eq!(format_list_item("● Item"), "- Item");
+        assert_eq!(format_list_item("• Item"), "- Item");
+    }
+
+    #[test]
+    fn format_list_item_bullet_inside_bold() {
+        // PDF that uses bold font for both the marker and the label produces
+        // a single bold run like "**● Label:** rest"; the bullet must still
+        // be stripped and the bold wrapper preserved on the label.
+        assert_eq!(
+            format_list_item("**● Fraud: Willing cooperation;**"),
+            "- **Fraud: Willing cooperation;**"
+        );
+        assert_eq!(
+            format_list_item("**● Label:** rest of line"),
+            "- **Label:** rest of line"
+        );
+        assert_eq!(format_list_item("*● Italic:* rest"), "- *Italic:* rest");
+    }
+
+    #[test]
+    fn format_list_item_already_dash() {
+        assert_eq!(format_list_item("- existing"), "- existing");
+    }
+
+    #[test]
+    fn is_list_item_with_bullet_space() {
+        assert!(is_list_item("● Item"));
+        assert!(is_list_item("• Item"));
+        assert!(is_list_item("- Item"));
+    }
 }

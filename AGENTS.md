@@ -61,8 +61,7 @@ src/
 
 - **Unit tests**: inline `#[cfg(test)] mod tests` in each module with synthetic data.
 - **Integration tests**: `tests/integration_tests.rs` with fixture PDFs in `tests/fixtures/`.
-- **Regression suite**: sibling repo `pdf-evals` with 187+ snapshot PDFs. Run `cargo build --release` then `bench.py test` in that repo before committing.
-- **Semantic quality**: run `bench.py score` in `pdf-evals` for the semantic verdict (TEDS + MHS + reading order + char/word + list preservation, composited). Character-level diff alone misclassifies structural improvements (e.g., column-detection rewrites) as regressions — `score` is the tie-breaker. See `pdf-evals/CLAUDE.md` "Semantic scoring".
+- **Regression suite**: sibling repo `pdf-evals` with 179+ snapshot PDFs. Run `cargo build --release` then `bench.py test` in that repo before committing.
 
 ## Debugging
 

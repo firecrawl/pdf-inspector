@@ -36,26 +36,14 @@ pub(crate) use layout::ColumnRegion;
 /// Extract text from PDF file as plain string
 pub fn extract_text<P: AsRef<Path>>(path: P) -> Result<String, PdfError> {
     crate::validate_pdf_file(&path)?;
-    let doc = match Document::load(&path) {
-        Ok(d) => d,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_with_password(&path, "")?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let (doc, _) = crate::load_document_from_path(&path)?;
     extract_text_from_doc(&doc)
 }
 
 /// Extract text from PDF memory buffer
 pub fn extract_text_mem(buffer: &[u8]) -> Result<String, PdfError> {
     crate::validate_pdf_bytes(buffer)?;
-    let doc = match Document::load_mem(buffer) {
-        Ok(d) => d,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_options(buffer, lopdf::LoadOptions::with_password(""))?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let (doc, _) = crate::load_document_from_mem(buffer)?;
     extract_text_from_doc(&doc)
 }
 
@@ -91,13 +79,7 @@ pub(crate) fn extract_text_with_positions_and_rects<P: AsRef<Path>>(
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<PageExtraction, PdfError> {
     crate::validate_pdf_file(&path)?;
-    let doc = match Document::load(&path) {
-        Ok(d) => d,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_with_password(&path, "")?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let (doc, _) = crate::load_document_from_path(&path)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let (extraction, _thresholds, _gid_pages) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
@@ -124,13 +106,7 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<PageExtraction, PdfError> {
     crate::validate_pdf_bytes(buffer)?;
-    let doc = match Document::load_mem(buffer) {
-        Ok(d) => d,
-        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_options(buffer, lopdf::LoadOptions::with_password(""))?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let (extraction, _thresholds, _gid_pages) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;

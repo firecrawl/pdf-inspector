@@ -265,12 +265,12 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
         page, num_rows, num_cols, item_indices.len(), page_item_count, non_empty_rows, cols_with_content
     );
 
-    vec![Table {
-        columns: col_edges,
-        rows: row_edges_desc[..num_rows].to_vec(),
+    vec![Table::new(
+        col_edges,
+        row_edges_desc[..num_rows].to_vec(),
         cells,
         item_indices,
-    }]
+    )]
 }
 
 #[cfg(test)]
