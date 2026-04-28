@@ -16,14 +16,8 @@ crate-type = ["lib", "cdylib"]
 # Python bindings
 pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
 
-# PDF parsing
-lopdf = { git = "https://github.com/J-F-Liu/lopdf", rev = "7a05512d831415b1f2b1ce522391d6beab8a1284", features = ["rayon"] }
-
 # Error handling
 thiserror = "2.0"
-
-# Parallel processing
-rayon = "1.10"
 
 # Logging
 log = "0.4"
@@ -36,6 +30,20 @@ unicode-normalization = "0.1"
 
 # TrueType font parsing (for Identity-H CID font cmap extraction)
 ttf-parser = "0.25"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Parallel processing
+rayon = "1.10"
+# PDF parsing with threading
+lopdf = { git = "https://github.com/J-F-Liu/lopdf", rev = "7a05512d831415b1f2b1ce522391d6beab8a1284", features = ["rayon"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# PDF parsing without threading for WASM
+lopdf = { git = "https://github.com/J-F-Liu/lopdf", rev = "7a05512d831415b1f2b1ce522391d6beab8a1284" }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1.7"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+js-sys = "0.3"
 
 [dev-dependencies]
 tempfile = "3.3"

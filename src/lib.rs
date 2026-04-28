@@ -43,6 +43,9 @@ pub mod text_utils;
 pub mod tounicode;
 pub mod types;
 
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
@@ -85,6 +88,23 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type CompatInstant = std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+pub struct CompatInstant(f64);
+
+#[cfg(target_arch = "wasm32")]
+impl CompatInstant {
+    pub fn now() -> Self {
+        CompatInstant(js_sys::Date::now())
+    }
+    pub fn elapsed(&self) -> std::time::Duration {
+        std::time::Duration::from_millis((js_sys::Date::now() - self.0) as u64)
+    }
 }
 
 // =========================================================================
@@ -190,7 +210,7 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
     path: P,
     options: PdfOptions,
 ) -> Result<PdfProcessResult, PdfError> {
-    let start = std::time::Instant::now();
+    let start = CompatInstant::now();
     validate_pdf_file(&path)?;
 
     // Load the document once — shared by detection AND extraction.
@@ -216,7 +236,7 @@ pub fn process_pdf_mem_with_options(
     buffer: &[u8],
     options: PdfOptions,
 ) -> Result<PdfProcessResult, PdfError> {
-    let start = std::time::Instant::now();
+    let start = CompatInstant::now();
     validate_pdf_bytes(buffer)?;
 
     let (doc, page_count) = load_document_from_mem(buffer)?;
@@ -1818,7 +1838,7 @@ fn process_document(
     doc: Document,
     page_count: u32,
     options: PdfOptions,
-    start: std::time::Instant,
+    start: CompatInstant,
 ) -> Result<PdfProcessResult, PdfError> {
     // Step 1 — Detection (cheap: scans content streams for text operators)
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;

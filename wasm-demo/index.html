@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Inspector WebAssembly Demo</title>
+    <style>
+        :root {
+            --primary: #ff4f00;
+            --primary-hover: #e04500;
+            --bg-color: #fafafa;
+            --text-main: #111827;
+            --text-muted: #6b7280;
+            --border-color: #e5e7eb;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            padding: 0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .header {
+            background-color: #ffffff;
+            width: 100%;
+            padding: 1.5rem 0;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 1.75rem;
+            font-weight: 700;
+        }
+
+        .header span {
+            color: var(--primary);
+        }
+
+        .container {
+            width: 100%;
+            max-width: 900px;
+            padding: 0 1.5rem;
+            box-sizing: border-box;
+        }
+
+        p.description {
+            text-align: center;
+            color: var(--text-muted);
+            margin-bottom: 2.5rem;
+            font-size: 1.1rem;
+        }
+
+        a {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        .drop-zone {
+            border: 2px dashed #cbd5e1;
+            padding: 3rem 2rem;
+            text-align: center;
+            border-radius: 12px;
+            background: #ffffff;
+            cursor: pointer;
+            transition: all 0.2s ease-in-out;
+            margin-bottom: 24px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+        }
+
+        .drop-zone:hover {
+            background: #fff5f2;
+            border-color: var(--primary);
+        }
+
+        .drop-zone svg {
+            width: 48px;
+            height: 48px;
+            color: var(--primary);
+            opacity: 0.8;
+        }
+
+        .drop-zone .title {
+            font-weight: 600;
+            font-size: 1.25rem;
+            color: var(--text-main);
+        }
+
+        .drop-zone .subtitle {
+            font-size: 0.95rem;
+            color: var(--text-muted);
+        }
+
+        .output-container {
+            background: #1e1e2f;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            margin-bottom: 3rem;
+        }
+
+        .output-header {
+            background: #2a2a3f;
+            padding: 0.75rem 1.5rem;
+            color: #e2e8f0;
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        #output {
+            width: 100%;
+            height: 500px;
+            padding: 1.5rem;
+            border: none;
+            font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            color: #f8f8f2;
+            white-space: pre-wrap;
+            overflow-y: auto;
+            background-color: transparent;
+            box-sizing: border-box;
+        }
+
+        /* Custom scrollbar for dark theme */
+        #output::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        #output::-webkit-scrollbar-track {
+            background: #1e1e2f;
+        }
+
+        #output::-webkit-scrollbar-thumb {
+            background: #474761;
+            border-radius: 4px;
+        }
+
+        #output::-webkit-scrollbar-thumb:hover {
+            background: #626284;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <h1>📄 PDF Inspector <span>WASM</span></h1>
+    </div>
+
+    <div class="container">
+        <p class="description">
+            This runs the <a href="https://github.com/firecrawl/pdf-inspector" target="_blank">Firecrawl
+                pdf-inspector</a> Rust engine
+            <strong>directly inside your browser</strong>. <br>No backend servers, no OCR delays, pure Native WASM
+            speed.
+        </p>
+
+        <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round"
+                    d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+            </svg>
+            <div class="title">Click or drop a PDF here</div>
+            <div class="subtitle">Extracts text and complex tables to Markdown instantly</div>
+            <input type="file" id="fileInput" accept="application/pdf" style="display: none;"
+                onchange="handleFileSelect(event)">
+        </div>
+
+        <div class="output-container">
+            <div class="output-header">
+                <span>Markdown Output</span>
+                <span id="timing"></span>
+            </div>
+            <div id="output">Waiting for file...</div>
+        </div>
+    </div>
+
+    <!-- 
+      Once the package is published to NPM and CDNs, you will use something like:
+      import init, { process_pdf_bytes } from 'https://unpkg.com/firecrawl-pdf-inspector-web/pkg/pdf_inspector.js';
+      
+      For local tests after compiling with `wasm-pack build --target web`:
+    -->
+    <script type="module">
+        window.wasmParserReady = false;
+        let process_pdf_bytes_fn = null;
+
+        window.handleFileSelect = async function (event) {
+            if (!window.wasmParserReady) {
+                alert("WASM is not loaded or compiled yet! Make sure to run 'wasm-pack build --target web' first.");
+                return;
+            }
+
+            const file = event.target.files[0];
+            if (!file) return;
+
+            document.getElementById('timing').textContent = "";
+            document.getElementById('output').textContent = "Processing...";
+
+            const reader = new FileReader();
+            reader.onload = async function (e) {
+                const arrayBuffer = e.target.result;
+                const bytes = new Uint8Array(arrayBuffer);
+
+                const startTime = performance.now();
+
+                try {
+                    const markdown = process_pdf_bytes_fn(bytes);
+                    const endTime = performance.now();
+                    const duration = (endTime - startTime).toFixed(2);
+
+                    document.getElementById('timing').textContent = `Processed in ${duration}ms`;
+                    document.getElementById('output').textContent = markdown;
+
+                } catch (err) {
+                    document.getElementById('output').textContent = "Error parsing PDF:\n" + err;
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        };
+
+        async function setup() {
+            try {
+                document.getElementById('output').textContent = "Attempting to load WASM package...\n(If it fails, run 'wasm-pack build --target web' in the project root)";
+
+                const wasmModule = await import('../pkg/pdf_inspector.js');
+                await wasmModule.default();
+                process_pdf_bytes_fn = wasmModule.process_pdf_bytes;
+
+                window.wasmParserReady = true;
+                document.getElementById('output').textContent = "✅ WASM Loaded successfully!\n\nYou can drop a PDF above.";
+            } catch (err) {
+                console.error("Failed to initialize WASM", err);
+                document.getElementById('output').textContent = "❌ Error loading WASM component (check if the pkg/ folder exists).\nDetails: " + err;
+            }
+        }
+
+        setup();
+    </script>
+</body>
+
+</html>
