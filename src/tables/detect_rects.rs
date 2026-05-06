@@ -277,39 +277,6 @@ pub fn detect_tables_from_rects(
             );
         }
 
-        // Drop exact / near-exact duplicates first.  Many PDFs draw the
-        // same cell rectangle multiple times — once for the cell border,
-        // again for an inner padding fill, plus a per-text-run background
-        // wrapper.  Without this dedup, the contained-sub-rect pass below
-        // can't help (it requires container area to strictly exceed the
-        // sub-rect by 20%), and the duplicated edges over-segment the grid
-        // into spurious thin rows / columns that collapse content density.
-        //
-        // Preserve original order (no sort) — cluster output is keyed by
-        // first-seen index, and a sort here would shuffle the table-emission
-        // order on multi-table pages.
-        if page_rects.len() < MAX_CLUSTER_RECTS {
-            let before = page_rects.len();
-            let mut seen: std::collections::HashSet<(i32, i32, i32, i32)> =
-                std::collections::HashSet::new();
-            page_rects.retain(|&(x, y, w, h)| {
-                let key = (
-                    x.round() as i32,
-                    y.round() as i32,
-                    w.round() as i32,
-                    h.round() as i32,
-                );
-                seen.insert(key)
-            });
-            if page_rects.len() < before {
-                debug!(
-                    "page {}: removed {} duplicate rects",
-                    page,
-                    before - page_rects.len(),
-                );
-            }
-        }
-
         // Deduplicate sub-rects: when a rect is fully contained within a
         // slightly larger rect (same column, interior Y range), the smaller
         // one is a cell-internal decoration (e.g. content-area shading
