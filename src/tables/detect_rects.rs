@@ -1764,21 +1764,33 @@ fn detect_row_stripe_table_from_cell_rects(
 
     // Reject "tables" that are actually prose in a framed region.
     // Columns here come from text X-position clustering; when prose wraps
-    // inside a bounding-box rect (e.g. chat-transcript figures) the
-    // word-boundary gaps cluster into many spurious columns, and the
-    // resulting cells hold sentence fragments riddled with common English
-    // function words.
+    // inside a bounding-box rect (e.g. chat-transcript figures, two-column
+    // legal-text blocks in forms) the word-boundary gaps cluster into
+    // spurious columns, and the resulting cells hold sentence fragments
+    // riddled with common English function words.
     //
-    // The 20%-of-cells threshold catches both shapes — a prose paragraph
-    // chunked across cols where every cell carries prose, and a single
-    // prose column flanked by empty cols where the prose dominates the
-    // small population of non-empty cells. To avoid rejecting real data
-    // tables that happen to include one description column, relax only
-    // when content is well-distributed: at least 75% of columns must hold
-    // ≥2 non-empty cells. That excludes the prose-in-a-frame case (one
-    // filled col, the rest empty) while admitting "label / value /
-    // explanation / benefit"-style tables.
-    if num_cols >= 4 {
+    // Apply at any column count >= 2. The 2-col case is the bite — a
+    // paragraph wrapped into 2 justified columns produces the same
+    // surface signal as a real "label / value" table in the
+    // well-distributed-cols check (both cols populated), so we need a
+    // content-based signal to tell them apart.
+    //
+    // Two layered checks combine after the 20%-of-cells prose-word
+    // trigger fires:
+    //   (a) Long-cell content: prose-in-a-frame averages ~70-100 chars
+    //       per non-empty cell (sentence fragments); real data tables
+    //       are typically <30 chars, occasionally up to ~55 for
+    //       descriptive 4-col tables. The 65-char threshold cleanly
+    //       separates them on observed fixtures (accessory_building
+    //       prose=74 chars, upstage data=53, greencomp=20). This
+    //       overrides the well-distributed relaxation — long cells
+    //       are the strongest prose signal even when both cols are
+    //       populated.
+    //   (b) Well-distributed columns: ≥75% of cols hold ≥2 non-empty
+    //       cells. Catches the prose-paragraph-as-many-cols shape
+    //       while admitting real "label / value / description /
+    //       benefit"-style tables.
+    if num_cols >= 2 {
         const PROSE_WORDS: &[&str] = &[
             "a", "an", "the", "of", "to", "is", "was", "are", "were", "be", "been", "in", "on",
             "at", "with", "for", "by", "as", "and", "or", "but", "this", "that", "these", "those",
@@ -1788,6 +1800,7 @@ fn detect_row_stripe_table_from_cell_rects(
         ];
         let mut prose_cells = 0usize;
         let mut counted = 0usize;
+        let mut total_chars = 0usize;
         for row in &cells {
             for cell in row {
                 let t = cell.trim();
@@ -1795,6 +1808,7 @@ fn detect_row_stripe_table_from_cell_rects(
                     continue;
                 }
                 counted += 1;
+                total_chars += t.chars().count();
                 let lower = t.to_ascii_lowercase();
                 let has_prose_word = lower
                     .split(|c: char| !c.is_ascii_alphabetic() && c != '\'')
@@ -1805,6 +1819,22 @@ fn detect_row_stripe_table_from_cell_rects(
             }
         }
         if counted > 0 && prose_cells * 5 >= counted {
+            // (a) Long-cell content: overrides the well-distributed
+            // relaxation. The 2-col prose-in-a-frame case populates
+            // both cols (passes well-distributed) but every cell
+            // holds a sentence fragment, so mean cell length is the
+            // discriminator.
+            const PROSE_MEAN_CHAR_THRESHOLD: usize = 65;
+            let mean_chars = total_chars / counted;
+            if mean_chars > PROSE_MEAN_CHAR_THRESHOLD {
+                debug!(
+                    "  cell-rect rejected: prose-in-frame, mean non-empty cell {} chars > {} (prose words {}/{})",
+                    mean_chars, PROSE_MEAN_CHAR_THRESHOLD, prose_cells, counted
+                );
+                return None;
+            }
+
+            // (b) Well-distributed columns.
             let filled_cols = (0..num_cols)
                 .filter(|&c| {
                     cells
@@ -1823,14 +1853,14 @@ fn detect_row_stripe_table_from_cell_rects(
             let well_distributed = filled_cols * 4 >= num_cols * 3;
             if !well_distributed {
                 debug!(
-                    "  cell-rect rejected: {}/{} cells contain prose function words — likely prose ({}/{} cols filled)",
-                    prose_cells, counted, filled_cols, num_cols
+                    "  cell-rect rejected: {}/{} cells contain prose function words — likely prose ({}/{} cols filled, mean {} chars)",
+                    prose_cells, counted, filled_cols, num_cols, mean_chars
                 );
                 return None;
             }
             debug!(
-                "  cell-rect prose check relaxed: {}/{} cols filled — table-with-description-col",
-                filled_cols, num_cols
+                "  cell-rect prose check relaxed: {}/{} cols filled, mean {} chars — table-with-description-col",
+                filled_cols, num_cols, mean_chars
             );
         }
     }

@@ -1057,6 +1057,43 @@ mod vector_grid_tests {
         rect_tables
     }
 
+    /// Regression for the prose-in-a-frame failure mode introduced by the
+    /// shaded-header detection lift (PR #76). The accessory_building permit
+    /// form has a paragraph of legal text laid out in a 2-column justified
+    /// block; the new fill-priority + dedup changes start producing rects
+    /// for it, and the rect detector then admits a 10×2 fake table where
+    /// every cell holds a sentence fragment ("I agree to comply...", "I",
+    /// "It is the property owner's responsibility..."). This test asserts
+    /// the detector REJECTS that fake table — only the real 5×3 form data
+    /// table (TYPE / SIZE / SETBACKS) should survive. See pdf-evals PR #30
+    /// for the original score regression that surfaced this.
+    #[test]
+    fn accessory_building_rejects_prose_in_frame() {
+        let tables = detect_rect_tables_in_fixture(
+            "tests/fixtures/accessory_building_permit_prose_frame.pdf",
+        );
+        // Real form data table (TYPE / SIZE / SETBACKS) must still be detected.
+        let data_table = tables.iter().find(|t| t.columns.len() == 3);
+        assert!(
+            data_table.is_some(),
+            "expected to keep the 5×3 TYPE/SIZE/SETBACKS data table; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+        // Prose paragraph laid out in 2 cols must NOT be detected as a table.
+        // If the rejection regresses, the 10×2 fake table reappears and
+        // produces fragmented markdown like "I agree to comply..." | "I"
+        // that fragments mid-sentence.
+        let prose_table = tables.iter().find(|t| t.columns.len() == 2);
+        assert!(
+            prose_table.is_none(),
+            "expected the 10×2 prose-in-frame block to be rejected; got rows×cols = {:?}",
+            prose_table.map(|t| (t.rows.len(), t.columns.len()))
+        );
+    }
+
     /// Regression for `greencomp_competence.pdf` — a 2-column "Area / Competence"
     /// glossary with a green-shaded header row and plain (line-drawn) body cells.
     /// Mirrors the production failure cohort #1 (Contractions glossary) and #6
