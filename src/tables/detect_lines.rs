@@ -110,15 +110,21 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
         return Vec::new();
     }
 
-    // Reject page-spanning frames: if the grid covers >90% of a standard page
-    // dimension in both axes, it's a border frame, not a table.
+    // Reject page-spanning frames: a decorative outer border has just 4
+    // edges (top/bottom/left/right). Real full-page tables — common in
+    // governmental ledgers, financial reports, etc. — span the same A4 /
+    // Letter dimensions but have many internal row/column rules. Only
+    // reject when the line set looks like a bare frame, not a grid.
     // Standard pages are ~595×842 (A4) or ~612×792 (Letter).
-    if table_width > 500.0 && table_height > 700.0 {
+    if table_width > 500.0 && table_height > 700.0 && horizontals.len() <= 4 && verticals.len() <= 4
+    {
         log::debug!(
-            "detect_lines p{}: rejected — page-spanning frame ({:.0}×{:.0})",
+            "detect_lines p{}: rejected — page-spanning frame ({:.0}×{:.0}, {} h + {} v)",
             page,
             table_width,
-            table_height
+            table_height,
+            horizontals.len(),
+            verticals.len()
         );
         return Vec::new();
     }
@@ -408,6 +414,75 @@ mod tests {
 
         let tables = detect_tables_from_lines(&items, &lines, 1);
         assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_page_spanning_bare_frame_rejected() {
+        // Just an outer A4-sized rectangle: 2 horizontals + 2 verticals.
+        // No internal structure → decorative border, not a table.
+        let lines = vec![
+            make_hline(20.0, 20.0, 575.0, 1),  // top
+            make_hline(820.0, 20.0, 575.0, 1), // bottom
+            make_vline(20.0, 20.0, 820.0, 1),  // left
+            make_vline(575.0, 20.0, 820.0, 1), // right
+        ];
+        let items = vec![
+            make_item("title", 100.0, 100.0, 1),
+            make_item("body", 100.0, 200.0, 1),
+        ];
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert!(
+            tables.is_empty(),
+            "Page-sized 4-edge frame should be rejected as decoration"
+        );
+    }
+
+    #[test]
+    fn test_page_spanning_grid_with_internal_lines_accepted() {
+        // Full-page table (governmental-ledger pattern): A4-sized grid
+        // that previously hit the "page-spanning frame" early reject
+        // before downstream validation could even look at it.
+        // Verticals span the full table height so we isolate the
+        // frame-vs-grid decision under test.
+        let mut lines = Vec::new();
+        // 13 horizontal rules: header + 12 row separators
+        let h_ys = [
+            22.5, 37.9, 95.5, 144.5, 184.9, 233.9, 291.7, 340.7, 415.8, 499.6, 574.7, 623.7, 698.8,
+        ];
+        for &y in &h_ys {
+            lines.push(make_hline(y, 22.6, 566.6, 1));
+        }
+        // 7 column dividers spanning full table height.
+        let v_xs = [22.6, 66.3, 116.3, 186.6, 263.1, 493.5, 566.5];
+        for &x in &v_xs {
+            lines.push(make_vline(x, 22.5, 698.8, 1));
+        }
+        // Populate every cell so the capture-ratio + density checks pass.
+        let mut items = Vec::new();
+        for r in 0..(h_ys.len() - 1) {
+            let row_y = (h_ys[r] + h_ys[r + 1]) / 2.0;
+            for c in 0..(v_xs.len() - 1) {
+                let col_x = (v_xs[c] + v_xs[c + 1]) / 2.0;
+                items.push(make_item("x", col_x, row_y, 1));
+            }
+        }
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(
+            tables.len(),
+            1,
+            "Full-page table with internal grid should be accepted"
+        );
+        let t = &tables[0];
+        assert!(
+            t.cells.len() >= 6,
+            "expected ≥6 rows, got {}",
+            t.cells.len()
+        );
+        assert!(
+            t.cells[0].len() >= 3,
+            "expected ≥3 columns, got {}",
+            t.cells[0].len()
+        );
     }
 
     #[test]
