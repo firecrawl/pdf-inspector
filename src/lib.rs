@@ -1280,6 +1280,46 @@ mod vector_grid_tests {
         );
     }
 
+    /// Regression for `wired_header_data_misalign.pdf` — a single page from a
+    /// parts catalog with a 4-column wire-bordered table (`Item | EAN | Nombre
+    /// | Cant`). Column headers are centered/right-aligned inside their cells
+    /// while data is left-aligned, so cluster_x_positions merges or drops
+    /// columns and the cell-rect fallback used to assign text to the wrong
+    /// columns (lost a column, fragmented neighbor cells). The fix prefers
+    /// rect-border-derived column edges when they're well-distributed across
+    /// the actual text items. This test asserts the detector keeps all 4
+    /// columns and every column ends up populated.
+    #[test]
+    fn wired_header_data_misalign_keeps_all_columns() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/wired_header_data_misalign.pdf");
+        let table = tables
+            .iter()
+            .find(|t| t.columns.len() == 4 && t.rows.len() >= 5)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a 4-column ≥5-row table; got {:?}",
+                    tables
+                        .iter()
+                        .map(|t| (t.rows.len(), t.columns.len()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        for c in 0..4 {
+            let populated_rows = table
+                .cells
+                .iter()
+                .filter(|row| !row[c].trim().is_empty())
+                .count();
+            assert!(
+                populated_rows >= 2,
+                "column {} only populated in {} rows; cells: {:?}",
+                c,
+                populated_rows,
+                table.cells
+            );
+        }
+    }
+
     #[test]
     fn test_crop_px_bbox_is_plausible_bounds() {
         let crop = [10.0, 20.0, 110.0, 220.0];

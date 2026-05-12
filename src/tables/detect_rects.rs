@@ -1632,7 +1632,49 @@ fn detect_row_stripe_table_from_cell_rects(
         }
     };
 
+    // For wired-grid tables whose header text is centered/right-aligned but
+    // whose data is left-aligned, cluster_x_positions can drop the header-only
+    // x-cluster in its singleton-filter pass and merge adjacent data clusters
+    // when the gap is below threshold, losing a column. Rect borders are
+    // ground truth in that case — but only when each rect column actually
+    // holds text. Decorative or background rects (prose laid out in a frame,
+    // cell-fill rects with extra borders) can produce more rect-derived
+    // columns than the text supports; preferring rects there would split a
+    // logical column into spurious sub-columns.
+    let rect_cols_match_text = match (&rect_col_edges, &text_col_edges) {
+        (Some(rect_edges), _) if rect_edges.len() >= 4 => {
+            let num_rect_cols = rect_edges.len() - 1;
+            let mut col_item_counts = vec![0usize; num_rect_cols];
+            for (_, item) in &page_items {
+                let cx = item.x + item.width / 2.0;
+                for c in 0..num_rect_cols {
+                    if cx >= rect_edges[c] - 2.0 && cx <= rect_edges[c + 1] + 2.0 {
+                        col_item_counts[c] += 1;
+                        break;
+                    }
+                }
+            }
+            // Require every rect column to hold multiple text items. A rect
+            // column with no (or only one) item is decorative or the rect grid
+            // is detecting a spurious column the data does not need; in those
+            // cases the old text-cluster preference is the safer fallback.
+            col_item_counts.iter().all(|&n| n >= 2)
+        }
+        _ => false,
+    };
+
     let (col_edges, columns_from_text) = match (rect_col_edges, text_col_edges) {
+        (Some(rect_edges), text_edges_opt) if rect_cols_match_text => {
+            debug!(
+                "  cell-rect using {} rect-derived columns (text clusters: {}; rect cols well-distributed)",
+                rect_edges.len() - 1,
+                text_edges_opt
+                    .as_ref()
+                    .map(|e| (e.len() - 1) as i32)
+                    .unwrap_or(-1)
+            );
+            (rect_edges, false)
+        }
         (Some(rect_edges), Some(text_edges)) if rect_edges.len() <= text_edges.len() => {
             debug!(
                 "  cell-rect using {} rect-derived columns over {} text clusters",
@@ -3340,6 +3382,88 @@ mod tests {
         assert!(table.cells[1][1].contains("host-based firewall"));
         assert!(table.cells[1][1].contains("default-deny rule"));
         assert!(table.cells[2][1].contains("deny unauthorized"));
+    }
+
+    /// Wire-bordered 4-column table whose header text is centered/right-aligned
+    /// inside each cell while the data is left-aligned: cluster_x_positions
+    /// merges adjacent columns (data Item→EAN gap is below threshold) and
+    /// drops the header-only x-clusters in the filter pass, leaving only 3
+    /// text-derived columns. Rect borders are 4 columns of ground truth.
+    /// Before the fix the cell-rect path preferred text edges when they were
+    /// the smaller set — losing a column. After the fix, 3+ rect columns
+    /// always win.
+    #[test]
+    fn wired_header_data_misaligned_keeps_all_columns_from_rects() {
+        let page = 1;
+        // 4 cols: Item | EAN | Nombre | Cant
+        let col_xs = [380.0_f32, 410.0, 470.0, 660.0, 700.0];
+        // Header + 9 data rows at 15pt tall each (y descending).
+        let row_ys: Vec<f32> = (0..=10).map(|r| 400.0 - 15.0 * r as f32).collect();
+
+        let mut rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for r in 0..10 {
+            let y_top = row_ys[r];
+            let y_bot = row_ys[r + 1];
+            for c in 0..4 {
+                rects.push((col_xs[c], y_bot, col_xs[c + 1] - col_xs[c], y_top - y_bot));
+            }
+        }
+
+        let mut items: Vec<TextItem> = Vec::new();
+        // Header row (y ≈ 392.5): headers sit further to the right than data
+        // because they are centered/right-aligned in the cells.
+        items.push(make_item("Item", 389.0, 392.5, 9.0));
+        items.push(make_item("EAN", 432.0, 392.5, 9.0));
+        items.push(make_item("Nombre", 552.0, 392.5, 9.0));
+        items.push(make_item("Cant", 672.0, 392.5, 9.0));
+
+        let names = [
+            "Arnes Frontal",
+            "Arnes Motor",
+            "Arnes Piso",
+            "Arnes Techo",
+            "Arnes Puerta",
+            "Arnes Tablero",
+            "Arnes Trasero",
+            "Arnes Lateral",
+            "Arnes Sensor",
+        ];
+        for r in 0..9 {
+            let y = 377.5 - 15.0 * r as f32;
+            items.push(make_item(&(r + 1).to_string(), 396.0, y, 9.0));
+            items.push(make_item("7701023403016", 410.0, y, 9.0));
+            items.push(make_item(names[r], 480.0, y, 9.0));
+            items.push(make_item("1", 680.0, y, 9.0));
+        }
+
+        let table = detect_row_stripe_table_from_cell_rects(&items, &rects, page)
+            .expect("wired 4-column table with header/data x-misalignment must detect");
+        assert_eq!(
+            table.columns.len(),
+            4,
+            "expected 4 columns from rect borders; cells: {:?}",
+            table.cells
+        );
+        for c in 0..4 {
+            let any_populated = table.cells.iter().any(|row| !row[c].trim().is_empty());
+            assert!(
+                any_populated,
+                "column {} empty across all rows; cells: {:?}",
+                c, table.cells
+            );
+        }
+        // Header row populated in all 4 cells.
+        let header = &table.cells[0];
+        assert_eq!(header[0].trim(), "Item");
+        assert_eq!(header[1].trim(), "EAN");
+        assert_eq!(header[2].trim(), "Nombre");
+        assert_eq!(header[3].trim(), "Cant");
+        // First data row: Item="1", EAN, name, count="1" — no Item↔EAN merge.
+        let data1 = &table.cells[1];
+        assert_eq!(data1[0].trim(), "1");
+        assert_eq!(data1[1].trim(), "7701023403016");
+        assert!(data1[2].trim().contains("Arnes"));
+        assert_eq!(data1[3].trim(), "1");
     }
 
     #[test]
