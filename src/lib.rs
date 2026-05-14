@@ -775,57 +775,92 @@ pub fn extract_tables_in_regions_mem(
             // Total length of text the page extractor saw inside this
             // region, used by the captured-fragment guard below.
             let region_text_chars: usize = matched.iter().map(|i| i.text.chars().count()).sum();
+            let line_region_has_vertical_rules = has_vertical_rules(&region_lines);
 
-            let evaluate = |t: &tables::Table| -> Option<String> {
-                let md = tables::table_to_markdown(t);
-                let trimmed = md.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                if is_garbage_text(&md)
-                    || is_cid_garbage(&md)
-                    || detect_encoding_issues(&md)
-                    || looks_like_partial_table_ex(&md, true)
-                {
-                    return None;
-                }
-                // Reject extractions that only captured a small fraction
-                // of the text actually in the region. Two recurring
-                // failure shapes this catches:
-                //   - "header-only": detector found the column-header band
-                //     cleanly but missed every data row below (financial
-                //     statements with multi-line column headers + many
-                //     data rows are the dominant case).
-                //   - "sparse": detector returned a couple of fragmentary
-                //     cells even though the region has many lines of text.
-                // The region floor (200 chars) keeps short legitimate
-                // tables (timestamps, units, axis labels) from being
-                // rejected as partial.
-                if captured_only_a_fragment(&md, region_text_chars) {
-                    return None;
-                }
-                Some(md)
-            };
+            let evaluate =
+                |source: TableCandidateSource, t: &tables::Table| -> Option<TableCandidate> {
+                    let md = tables::table_to_markdown(t);
+                    let trimmed = md.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    if is_garbage_text(&md)
+                        || is_cid_garbage(&md)
+                        || detect_encoding_issues(&md)
+                        || looks_like_partial_table_ex(&md, true)
+                    {
+                        return None;
+                    }
+                    // Reject extractions that only captured a small fraction
+                    // of the text actually in the region. Two recurring
+                    // failure shapes this catches:
+                    //   - "header-only": detector found the column-header band
+                    //     cleanly but missed every data row below (financial
+                    //     statements with multi-line column headers + many
+                    //     data rows are the dominant case).
+                    //   - "sparse": detector returned a couple of fragmentary
+                    //     cells even though the region has many lines of text.
+                    // The region floor (200 chars) keeps short legitimate
+                    // tables (timestamps, units, axis labels) from being
+                    // rejected as partial.
+                    if captured_only_a_fragment(&md, region_text_chars) {
+                        return None;
+                    }
+                    let shape = markdown_table_shape(&md);
+                    let issue = if source == TableCandidateSource::Line
+                        && line_region_has_vertical_rules
+                        && line_table_collapses_text_rows(t, &matched, shape)
+                    {
+                        Some(TableCandidateIssue::LineRowUndercount)
+                    } else if wide_table_sparse_prefix_undercount(&md) {
+                        Some(TableCandidateIssue::SparseWideUndercount)
+                    } else if text_cluster_column_undercount(&matched, shape) {
+                        Some(TableCandidateIssue::TextColumnUndercount)
+                    } else if prose_grid_fragment_needs_ocr(&md) {
+                        Some(TableCandidateIssue::ProseGridFragment)
+                    } else {
+                        None
+                    };
+                    Some(TableCandidate {
+                        markdown: md,
+                        source,
+                        shape,
+                        issue,
+                    })
+                };
 
-            let mut accepted_md: Option<String> = None;
+            let mut candidates: Vec<TableCandidate> = Vec::new();
             if !region_rects.is_empty() {
                 let (rect_tables, _) =
                     tables::detect_tables_from_rects(&matched, &region_rects, page_1idx);
-                accepted_md = rect_tables.iter().find_map(&evaluate);
+                if let Some(candidate) = rect_tables
+                    .iter()
+                    .find_map(|t| evaluate(TableCandidateSource::Rect, t))
+                {
+                    candidates.push(candidate);
+                }
             }
-            if accepted_md.is_none() && !region_lines.is_empty() {
+            if !region_lines.is_empty() {
                 let line_tables =
                     tables::detect_tables_from_lines(&matched, &region_lines, page_1idx);
-                accepted_md = line_tables.iter().find_map(&evaluate);
+                if let Some(candidate) = line_tables
+                    .iter()
+                    .find_map(|t| evaluate(TableCandidateSource::Line, t))
+                {
+                    candidates.push(candidate);
+                }
             }
-            if accepted_md.is_none() {
-                let detected = tables::detect_tables(&matched, base_font_size, false);
-                accepted_md = detected.iter().find_map(&evaluate);
+            let detected = tables::detect_tables(&matched, base_font_size, false);
+            if let Some(candidate) = detected
+                .iter()
+                .find_map(|t| evaluate(TableCandidateSource::Heuristic, t))
+            {
+                candidates.push(candidate);
             }
 
-            match accepted_md {
-                Some(md) => page_results.push(RegionText {
-                    text: md,
+            match select_table_candidate(&candidates) {
+                Some(candidate) => page_results.push(RegionText {
+                    text: candidate.markdown.clone(),
                     needs_ocr: false,
                 }),
                 None => page_results.push(RegionText {
@@ -3648,6 +3683,436 @@ fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
     captured_text_chars * 4 < region_text_chars
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableCandidateSource {
+    Rect,
+    Line,
+    Heuristic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableCandidateIssue {
+    LineRowUndercount,
+    SparseWideUndercount,
+    TextColumnUndercount,
+    ProseGridFragment,
+}
+
+#[derive(Debug, Clone)]
+struct TableCandidate {
+    markdown: String,
+    source: TableCandidateSource,
+    shape: MarkdownTableShape,
+    issue: Option<TableCandidateIssue>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MarkdownTableShape {
+    rows: usize,
+    cols: usize,
+    raw_cols: usize,
+}
+
+fn select_table_candidate(candidates: &[TableCandidate]) -> Option<&TableCandidate> {
+    let first = candidates.first()?;
+
+    // A line grid that visibly collapses several captured text baselines
+    // into too few rows is structurally undercounted. Prefer a clearly
+    // wider clean heuristic if one exists; otherwise force OCR rather than
+    // serving a tidy-looking fragment.
+    if first.issue == Some(TableCandidateIssue::LineRowUndercount) {
+        return candidates.iter().find(|candidate| {
+            candidate.source == TableCandidateSource::Heuristic
+                && candidate.issue.is_none()
+                && candidate.shape.cols * 10 >= first.shape.cols * 13
+        });
+    }
+
+    let mut accepted = candidates
+        .iter()
+        .find(|candidate| candidate.issue.is_none())?;
+
+    // Keep the vector-first behavior from PR #85 unless the text heuristic
+    // is also clean and has substantially more structure. This catches
+    // vector grids that pass text quality checks while missing implicit rows
+    // or sparse columns, without swapping on small shape noise.
+    if matches!(
+        accepted.source,
+        TableCandidateSource::Rect | TableCandidateSource::Line
+    ) {
+        if let Some(heuristic) = candidates.iter().find(|candidate| {
+            candidate.source == TableCandidateSource::Heuristic
+                && candidate.issue.is_none()
+                && heuristic_substantially_better(candidate.shape, accepted.shape)
+        }) {
+            accepted = heuristic;
+        }
+    }
+
+    Some(accepted)
+}
+
+fn heuristic_substantially_better(
+    heuristic: MarkdownTableShape,
+    accepted: MarkdownTableShape,
+) -> bool {
+    (accepted.rows > 0 && heuristic.rows * 2 >= accepted.rows * 3)
+        || (accepted.cols > 0 && heuristic.cols * 10 >= accepted.cols * 13)
+}
+
+fn markdown_table_shape(markdown: &str) -> MarkdownTableShape {
+    let mut shape = MarkdownTableShape::default();
+    for cells in markdown_pipe_rows(markdown) {
+        shape.rows += 1;
+        shape.raw_cols = shape.raw_cols.max(cells.len());
+        shape.cols = shape
+            .cols
+            .max(cells.iter().filter(|cell| !cell.trim().is_empty()).count());
+    }
+    shape
+}
+
+fn markdown_pipe_rows(markdown: &str) -> Vec<Vec<&str>> {
+    markdown
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
+                return None;
+            }
+            if is_markdown_separator_row(trimmed) {
+                return None;
+            }
+            let parts: Vec<&str> = trimmed.split('|').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            Some(parts[1..parts.len() - 1].to_vec())
+        })
+        .collect()
+}
+
+fn is_markdown_separator_row(line: &str) -> bool {
+    let mut saw_dash = false;
+    for ch in line.chars() {
+        match ch {
+            '-' => saw_dash = true,
+            '|' | ':' | ' ' => {}
+            _ => return false,
+        }
+    }
+    saw_dash
+}
+
+fn line_table_collapses_text_rows(
+    table: &tables::Table,
+    items: &[TextItem],
+    shape: MarkdownTableShape,
+) -> bool {
+    let table_rows = shape.rows.max(
+        table
+            .cells
+            .iter()
+            .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+            .count(),
+    );
+    let table_cols = shape.raw_cols.max(shape.cols);
+    if !(2..=4).contains(&table_rows) || table_cols < 3 {
+        return false;
+    }
+
+    let captured_items: Vec<&TextItem> = table
+        .item_indices
+        .iter()
+        .filter_map(|&idx| items.get(idx))
+        .filter(|item| !item.text.trim().is_empty())
+        .collect();
+    let captured_chars: usize = captured_items
+        .iter()
+        .map(|item| item.text.chars().count())
+        .sum();
+    if captured_chars <= 200 {
+        return false;
+    }
+
+    let implicit_rows = y_cluster_count(&captured_items);
+    implicit_rows >= 4 && table_rows * 2 <= implicit_rows
+}
+
+fn y_cluster_count(items: &[&TextItem]) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    let mut ys: Vec<f32> = items.iter().map(|item| item.y).collect();
+    ys.sort_by(|a, b| a.total_cmp(b));
+
+    let mut clusters = 1;
+    let mut center = ys[0];
+    let mut count = 1usize;
+    for &y in &ys[1..] {
+        if (y - center).abs() > 3.0 {
+            clusters += 1;
+            center = y;
+            count = 1;
+        } else {
+            center = (center * count as f32 + y) / (count as f32 + 1.0);
+            count += 1;
+        }
+    }
+    clusters
+}
+
+fn has_vertical_rules(lines: &[PdfLine]) -> bool {
+    let angle_tolerance = 2.0_f32.to_radians().tan();
+    lines
+        .iter()
+        .filter(|line| {
+            let dx = (line.x2 - line.x1).abs();
+            let dy = (line.y2 - line.y1).abs();
+            let length = (dx * dx + dy * dy).sqrt();
+            length >= 20.0 && dy > 0.01 && dx / dy <= angle_tolerance
+        })
+        .count()
+        >= 2
+}
+
+fn wide_table_sparse_prefix_undercount(markdown: &str) -> bool {
+    let rows = markdown_pipe_rows(markdown);
+    if rows.len() < 4 {
+        return false;
+    }
+    let header = &rows[0];
+    let raw_cols = header.len();
+    if raw_cols < 8 {
+        return false;
+    }
+
+    let empty_headers: Vec<usize> = header
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, cell)| cell.trim().is_empty().then_some(idx))
+        .collect();
+    if empty_headers.len() != 1 {
+        return false;
+    }
+    let empty_header_idx = empty_headers[0];
+    if empty_header_idx == 0 || empty_header_idx >= raw_cols / 2 {
+        return false;
+    }
+
+    let prefix_end = (raw_cols / 2).max(empty_header_idx + 1).min(raw_cols);
+    if prefix_end <= 2 {
+        return false;
+    }
+
+    let mut data_rows = 0usize;
+    let mut sparse_prefix_rows = 0usize;
+    for row in rows.iter().skip(1) {
+        if row.iter().all(|cell| cell.trim().is_empty()) {
+            continue;
+        }
+        data_rows += 1;
+        let empty_prefix_cells = row
+            .iter()
+            .skip(1)
+            .take(prefix_end.saturating_sub(1))
+            .filter(|cell| cell.trim().is_empty())
+            .count();
+        if empty_prefix_cells >= 2 {
+            sparse_prefix_rows += 1;
+        }
+    }
+
+    data_rows >= 3 && sparse_prefix_rows * 2 >= data_rows
+}
+
+fn text_cluster_column_undercount(items: &[TextItem], shape: MarkdownTableShape) -> bool {
+    let table_cols = shape.raw_cols.max(shape.cols);
+    if table_cols < 6 || items.len() < table_cols * 2 {
+        return false;
+    }
+
+    let implicit_cols = x_cluster_count(items);
+    implicit_cols >= table_cols + 2 && implicit_cols * 10 >= table_cols * 12
+}
+
+fn x_cluster_count(items: &[TextItem]) -> usize {
+    let mut xs: Vec<f32> = items
+        .iter()
+        .filter(|item| !item.text.trim().is_empty())
+        .map(|item| item.x)
+        .collect();
+    if xs.is_empty() {
+        return 0;
+    }
+    xs.sort_by(|a, b| a.total_cmp(b));
+
+    let mut clusters = 1usize;
+    let mut center = xs[0];
+    let mut count = 1usize;
+    for &x in &xs[1..] {
+        if (x - center).abs() > 8.0 {
+            clusters += 1;
+            center = x;
+            count = 1;
+        } else {
+            center = (center * count as f32 + x) / (count as f32 + 1.0);
+            count += 1;
+        }
+    }
+    clusters
+}
+
+fn prose_grid_fragment_needs_ocr(markdown: &str) -> bool {
+    let rows = markdown_pipe_rows(markdown);
+    if rows.len() < 3 {
+        return false;
+    }
+    let raw_cols = rows[0].len();
+    if !(3..=4).contains(&raw_cols) {
+        return false;
+    }
+
+    let mut seen_by_col = vec![0usize; raw_cols];
+    let mut compact_by_col = vec![0usize; raw_cols];
+    let mut long_prose = 0usize;
+    let mut total = 0usize;
+
+    for row in rows.iter().skip(1) {
+        for (col, cell) in row.iter().take(raw_cols).enumerate() {
+            let trimmed = cell.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            total += 1;
+            seen_by_col[col] += 1;
+            if compact_identifier_cell(trimmed) {
+                compact_by_col[col] += 1;
+            }
+            if long_prose_cell(trimmed) {
+                long_prose += 1;
+            }
+        }
+    }
+
+    if total < raw_cols * 2 {
+        return false;
+    }
+    if long_prose * 3 < total * 2 {
+        return false;
+    }
+
+    !seen_by_col
+        .iter()
+        .zip(compact_by_col.iter())
+        .any(|(&seen, &compact)| seen >= 3 && compact * 2 >= seen)
+}
+
+fn compact_identifier_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let words = word_count(trimmed);
+    if words <= 3 && trimmed.chars().count() <= 40 {
+        return true;
+    }
+
+    let chars = trimmed.chars().filter(|c| !c.is_whitespace()).count();
+    if chars == 0 || chars > 48 {
+        return false;
+    }
+    let compact_marks = trimmed
+        .chars()
+        .filter(|c| {
+            c.is_ascii_digit()
+                || matches!(c, '.' | ',' | ':' | ';' | '/' | '-' | '(' | ')' | '[' | ']')
+        })
+        .count();
+    compact_marks * 2 >= chars
+}
+
+fn long_prose_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if compact_identifier_cell(trimmed) {
+        return false;
+    }
+    let words = word_count(trimmed);
+    let alpha = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+    words >= 4 && alpha >= 12
+}
+
+fn word_count(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|word| word.chars().any(|c| c.is_alphanumeric()))
+        .count()
+}
+
+fn starts_with_numbered_table_label(cell: &str) -> bool {
+    let trimmed = cell.trim_start();
+    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+
+    digit_count > 0
+        && digit_count <= 3
+        && trimmed
+            .chars()
+            .nth(digit_count)
+            .is_some_and(|c| matches!(c, '.' | ')' | '-' | ':'))
+}
+
+fn starts_with_uppercase_alpha(cell: &str) -> bool {
+    cell.chars()
+        .find(|c| c.is_alphabetic())
+        .is_some_and(|c| c.is_uppercase())
+}
+
+fn compact_title_like_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.len() < 3 || trimmed.len() > 80 || !starts_with_uppercase_alpha(trimmed) {
+        return false;
+    }
+    let words = trimmed
+        .split_whitespace()
+        .filter(|word| word.chars().any(|c| c.is_alphabetic()))
+        .count();
+    (1..=6).contains(&words)
+}
+
+fn numbered_rowspan_hierarchy_needs_ocr(markdown: &str) -> bool {
+    let rows = markdown_pipe_rows(markdown);
+    if rows.len() < 6 {
+        return false;
+    }
+
+    let n_cols = rows[0].len();
+    if !(3..=6).contains(&n_cols) {
+        return false;
+    }
+
+    let data_rows = &rows[1..];
+    let numbered_group_rows = data_rows
+        .iter()
+        .filter(|row| {
+            row.first()
+                .is_some_and(|cell| starts_with_numbered_table_label(cell))
+        })
+        .count();
+    let blank_first_subrows = data_rows
+        .iter()
+        .filter(|row| {
+            row.first().is_some_and(|cell| cell.trim().is_empty())
+                && row.get(1).is_some_and(|cell| compact_title_like_cell(cell))
+        })
+        .count();
+
+    // Native Markdown cannot express rowspans.  In numbered hierarchical
+    // tables, repeated blank first-column sub-rows are a strong signal that
+    // wrapped content from sibling rows can be assigned to the wrong row even
+    // after continuation merging is conservative.  Let OCR handle this shape
+    // instead of serving a tidy-looking but lossy native table.
+    numbered_group_rows >= 2 && blank_first_subrows >= 2
+}
+
 fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     let lines: Vec<&str> = markdown.lines().filter(|l| l.starts_with('|')).collect();
     if lines.len() < 2 {
@@ -3677,6 +4142,10 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
         // (caller can decide), but multi-column header checks below don't
         // apply.
         return false;
+    }
+
+    if layout_assisted && numbered_rowspan_hierarchy_needs_ocr(markdown) {
+        return true;
     }
 
     // Failure mode 1: header starts with a bare number (likely we missed
@@ -3849,6 +4318,189 @@ mod captured_only_a_fragment_tests {
         // Just under 25%: 249*4=996 < 1000 — flagged.
         let md_under = "x".repeat(249);
         assert!(captured_only_a_fragment(&md_under, 1000));
+    }
+}
+
+#[cfg(test)]
+mod table_candidate_selection_tests {
+    use super::{
+        line_table_collapses_text_rows, markdown_table_shape, prose_grid_fragment_needs_ocr,
+        select_table_candidate, text_cluster_column_undercount,
+        wide_table_sparse_prefix_undercount, MarkdownTableShape, TableCandidate,
+        TableCandidateIssue, TableCandidateSource,
+    };
+    use crate::tables::Table;
+    use crate::types::{ItemType, TextItem};
+
+    fn candidate(
+        source: TableCandidateSource,
+        rows: usize,
+        cols: usize,
+        issue: Option<TableCandidateIssue>,
+    ) -> TableCandidate {
+        TableCandidate {
+            markdown: format!("{source:?}-{rows}x{cols}"),
+            source,
+            shape: MarkdownTableShape {
+                rows,
+                cols,
+                raw_cols: cols,
+            },
+            issue,
+        }
+    }
+
+    fn item(text: &str, y: f32) -> TextItem {
+        item_at(text, 10.0, y)
+    }
+
+    fn item_at(text: &str, x: f32, y: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: 50.0,
+            height: 10.0,
+            font: "F1".to_string(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn markdown_shape_counts_rows_and_non_empty_columns() {
+        let md = "|A|B||D|\n|---|---|---|---|\n|one|two|three||";
+        let shape = markdown_table_shape(md);
+        assert_eq!(shape.rows, 2);
+        assert_eq!(shape.cols, 3);
+        assert_eq!(shape.raw_cols, 4);
+    }
+
+    #[test]
+    fn prefers_clean_heuristic_when_substantially_wider_than_vector() {
+        let candidates = vec![
+            candidate(TableCandidateSource::Rect, 5, 3, None),
+            candidate(TableCandidateSource::Heuristic, 5, 4, None),
+        ];
+        let selected = select_table_candidate(&candidates).unwrap();
+        assert_eq!(selected.source, TableCandidateSource::Heuristic);
+    }
+
+    #[test]
+    fn line_row_undercount_routes_to_ocr_without_wider_heuristic() {
+        let candidates = vec![
+            candidate(
+                TableCandidateSource::Line,
+                2,
+                3,
+                Some(TableCandidateIssue::LineRowUndercount),
+            ),
+            candidate(TableCandidateSource::Heuristic, 4, 3, None),
+        ];
+        assert!(select_table_candidate(&candidates).is_none());
+    }
+
+    #[test]
+    fn line_row_undercount_can_use_clearly_wider_heuristic() {
+        let candidates = vec![
+            candidate(
+                TableCandidateSource::Line,
+                2,
+                3,
+                Some(TableCandidateIssue::LineRowUndercount),
+            ),
+            candidate(TableCandidateSource::Heuristic, 2, 4, None),
+        ];
+        let selected = select_table_candidate(&candidates).unwrap();
+        assert_eq!(selected.source, TableCandidateSource::Heuristic);
+    }
+
+    #[test]
+    fn line_candidate_collapsing_captured_y_clusters_is_suspicious() {
+        let long = "value value value value value value value value value value value value";
+        let items = vec![
+            item(long, 100.0),
+            item(long, 112.0),
+            item(long, 124.0),
+            item(long, 136.0),
+        ];
+        let table = Table::new(
+            vec![0.0, 100.0, 200.0, 300.0],
+            vec![150.0, 120.0],
+            vec![
+                vec!["A".to_string(), "B".to_string(), "C".to_string()],
+                vec!["D".to_string(), "E".to_string(), "F".to_string()],
+            ],
+            vec![0, 1, 2, 3],
+        );
+        let shape = MarkdownTableShape {
+            rows: 2,
+            cols: 3,
+            raw_cols: 3,
+        };
+        assert!(line_table_collapses_text_rows(&table, &items, shape));
+    }
+
+    #[test]
+    fn wide_sparse_prefix_with_blank_header_is_suspicious() {
+        let md = "|Name|Flag A|Flag B||Metric A|Metric B|Metric C|Metric D|\n\
+                  |---|---|---|---|---|---|---|---|\n\
+                  |Row 1|Y|||1|2|3|4|\n\
+                  |Row 2|||N|5|6|7|8|\n\
+                  |Row 3||||9|10|11|12|";
+        assert!(wide_table_sparse_prefix_undercount(md));
+    }
+
+    #[test]
+    fn wide_blank_header_with_dense_body_is_allowed() {
+        let md = "|Name|Flag A|Flag B||Metric A|Metric B|Metric C|Metric D|\n\
+                  |---|---|---|---|---|---|---|---|\n\
+                  |Row 1|Y|N|Y|1|2|3|4|\n\
+                  |Row 2|N|Y|N|5|6|7|8|\n\
+                  |Row 3|Y|Y|N|9|10|11|12|";
+        assert!(!wide_table_sparse_prefix_undercount(md));
+    }
+
+    #[test]
+    fn x_clusters_can_signal_wide_column_undercount() {
+        let mut items = Vec::new();
+        for y in [100.0, 112.0, 124.0] {
+            for x in [
+                10.0, 45.0, 80.0, 115.0, 150.0, 185.0, 220.0, 255.0, 290.0, 325.0,
+            ] {
+                items.push(item_at("value", x, y));
+            }
+        }
+        let shape = MarkdownTableShape {
+            rows: 4,
+            cols: 8,
+            raw_cols: 8,
+        };
+        assert!(text_cluster_column_undercount(&items, shape));
+    }
+
+    #[test]
+    fn wrapped_prose_grid_fragment_is_suspicious() {
+        let md = "|A useful capability with several words|Another descriptive capability column|A final descriptive capability column|\n\
+                  |---|---|---|\n\
+                  |The group includes experienced specialists|received a strong neutral recommendation|system in a neutral evaluation setting|\n\
+                  |presented several papers in public venues|shown stronger performance than alternatives|ranked highly in a neutral benchmark|\n\
+                  |recognized by external reviewers|delivered useful results for operators|used in production style workflows|";
+        assert!(prose_grid_fragment_needs_ocr(md));
+    }
+
+    #[test]
+    fn compact_identifier_columns_are_not_prose_fragments() {
+        let md = "|Box 1, F-7|Description|Date|\n\
+                  |---|---|---|\n\
+                  |Box 1, F-8|Long neutral description with several words for one record|2020 Jan 1|\n\
+                  |Box 1, F-9|Another neutral description with several words for another record|2021 Feb 2|\n\
+                  |Box 1, F-10|Additional neutral description with several words for a record|n.d.|";
+        assert!(!prose_grid_fragment_needs_ocr(md));
     }
 }
 
@@ -4031,6 +4683,34 @@ mod looks_like_partial_table_tests {
         assert!(
             looks_like_partial_table_ex(md, true),
             "paragraph rejection stays strict"
+        );
+    }
+
+    #[test]
+    fn numbered_rowspan_hierarchy_rejected_when_layout_assisted() {
+        let md = "|Group|Task|Detail|Benefit|\n\
+                  |---|---|---|---|\n\
+                  |1. Group alpha|Task setup|Begin setup|Faster start|\n\
+                  |2. Group beta|Storage setup|Provides tools||\n\
+                  ||Label workspace|Creates review sets|Lets teams review|\n\
+                  ||Model training|Builds model|Supports rollout|\n\
+                  |3. Group gamma|Pipeline setup|Configures flow|Improves control|";
+        assert!(
+            looks_like_partial_table_ex(md, true),
+            "layout-assisted native extraction should fall back for numbered row-spanned hierarchies"
+        );
+    }
+
+    #[test]
+    fn plain_numbered_table_kept_when_layout_assisted() {
+        let md = "|Step|Task|Detail|Benefit|\n\
+                  |---|---|---|---|\n\
+                  |1. Group alpha|Task setup|Begin setup|Faster start|\n\
+                  |2. Group beta|Storage setup|Provides tools|Easier review|\n\
+                  |3. Group gamma|Pipeline setup|Configures flow|Improves control|";
+        assert!(
+            !looks_like_partial_table_ex(md, true),
+            "numbered rows alone are fine; the guard requires blank-first-column sub-rows"
         );
     }
 

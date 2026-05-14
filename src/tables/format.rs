@@ -160,6 +160,63 @@ fn starts_with_uppercase_word(cell: &str) -> bool {
         .is_some_and(|c| c.is_uppercase())
 }
 
+fn starts_with_uppercase_alpha(cell: &str) -> bool {
+    cell.chars()
+        .find(|c| c.is_alphabetic())
+        .is_some_and(|c| c.is_uppercase())
+}
+
+fn starts_with_lowercase_alpha(cell: &str) -> bool {
+    cell.chars()
+        .find(|c| c.is_alphabetic())
+        .is_some_and(|c| c.is_lowercase())
+}
+
+fn starts_with_numbered_label(cell: &str) -> bool {
+    let trimmed = cell.trim_start();
+    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+
+    digit_count > 0
+        && digit_count <= 3
+        && trimmed
+            .chars()
+            .nth(digit_count)
+            .is_some_and(|c| matches!(c, '.' | ')' | '-' | ':'))
+}
+
+fn alpha_word_count(cell: &str) -> usize {
+    cell.split_whitespace()
+        .filter(|word| word.chars().any(|c| c.is_alphabetic()))
+        .count()
+}
+
+fn looks_like_compact_entry_label(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.len() < 3 || trimmed.len() > 80 {
+        return false;
+    }
+
+    if !starts_with_uppercase_alpha(trimmed) && !starts_with_numbered_label(trimmed) {
+        return false;
+    }
+
+    if trimmed.ends_with(['.', ',', ';', ':']) {
+        return false;
+    }
+
+    let words = alpha_word_count(trimmed);
+    (1..=6).contains(&words)
+}
+
+fn ends_like_incomplete_phrase(cell: &str) -> bool {
+    let lower = cell.trim_end().to_ascii_lowercase();
+    lower.ends_with(" and")
+        || lower.ends_with(" or")
+        || lower.ends_with(',')
+        || lower.ends_with('-')
+        || lower.ends_with('/')
+}
+
 /// Clean up table cells: merge continuation rows, extract footnotes, remove empty rows
 fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
     let mut cleaned: Vec<Vec<String>> = Vec::new();
@@ -184,6 +241,9 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             footnotes.push(footnote_text);
             continue;
         }
+
+        let num_cols = row.len();
+        let filled_cells = row.iter().filter(|c| !c.trim().is_empty()).count();
 
         // Check if this is a continuation row (first column is empty but others have content).
         // A row with only 1 short non-empty cell (besides the first) is more likely a
@@ -222,23 +282,64 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             .iter()
             .filter(|cell| starts_with_uppercase_word(cell))
             .count();
+        let first_non_empty_col = row.iter().position(|c| !c.trim().is_empty());
+        let first_non_empty_cell = first_non_empty_col
+            .and_then(|idx| row.get(idx))
+            .map(|c| c.trim())
+            .unwrap_or("");
+        let title_like_later_cells = first_non_empty_col
+            .map(|idx| {
+                row.iter()
+                    .skip(idx + 1)
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty() && starts_with_uppercase_alpha(c))
+                    .count()
+            })
+            .unwrap_or(0);
+        let prev_first_cell_empty = cleaned
+            .last()
+            .and_then(|r| r.first())
+            .is_some_and(|c| c.trim().is_empty());
+        let prev_first_cell = cleaned
+            .last()
+            .and_then(|r| r.first())
+            .map(|c| c.trim())
+            .unwrap_or("");
         let looks_like_spanning_first_column_row = first_cell.is_empty()
             && row.len() >= 4
             && non_first_cells.len() == row.len().saturating_sub(1)
             && uppercase_leading_cells >= non_first_cells.len().saturating_sub(1);
+        // Hierarchical tables often use a row-spanned first column: sub-rows
+        // leave column 0 blank, then start a compact title-like label in
+        // column 1.  Wrapped continuations in the existing fixtures start
+        // mid-sentence/lowercase ("continued text here", "with 3.5%...") or
+        // carry lowercase fragments in the later cells, so keep those mergeable.
+        let looks_like_hierarchical_subrow = first_cell.is_empty()
+            && row.len() >= 3
+            && first_non_empty_col == Some(1)
+            && looks_like_compact_entry_label(first_non_empty_cell)
+            && ((non_first_cells.len() >= 2 && title_like_later_cells > 0)
+                || (non_first_cells.len() == 1
+                    && prev_first_cell_empty
+                    && alpha_word_count(first_non_empty_cell) >= 2));
+        let looks_like_new_first_column_entry = !first_cell.is_empty()
+            && (starts_with_numbered_label(first_cell) || starts_with_uppercase_alpha(first_cell))
+            && filled_cells >= 2
+            && non_first_cells
+                .iter()
+                .any(|cell| looks_like_compact_entry_label(cell));
         // Classic continuation: first cell empty, content in other cells
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
             && !is_short_subheader
             && !looks_like_data_row
             && !looks_like_spanning_first_column_row
+            && !looks_like_hierarchical_subrow
             && cleaned.len() > 1;
 
         // Wrapped-cell continuation: row has fewer filled cells than the header
         // row, suggesting it's overflow text from the previous row's cells.
         // Only trigger when the previous row has significantly more filled cells.
-        let num_cols = row.len();
-        let filled_cells = row.iter().filter(|c| !c.trim().is_empty()).count();
         let prev_filled = cleaned
             .last()
             .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
@@ -257,11 +358,17 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         } else {
             header_filled.saturating_sub(1)
         };
+        let continues_wrapped_first_column_label = !first_cell.is_empty()
+            && starts_with_lowercase_alpha(first_cell)
+            && ends_like_incomplete_phrase(prev_first_cell);
         let is_wrapped_continuation = cleaned.len() > 1
             && filled_cells <= max_filled_for_merge
-            && prev_filled > filled_cells
+            && (prev_filled > filled_cells
+                || (continues_wrapped_first_column_label && prev_filled >= filled_cells))
             && !looks_like_data_row
             && !looks_like_spanning_first_column_row
+            && !looks_like_hierarchical_subrow
+            && !looks_like_new_first_column_entry
             && !is_short_subheader;
 
         let is_continuation = is_classic_continuation || is_wrapped_continuation;
@@ -457,6 +564,100 @@ mod tests {
         assert_eq!(cleaned.len(), 3);
         assert_eq!(cleaned[2][0], "");
         assert_eq!(cleaned[2][1], "Uncertainty around other copies");
+    }
+
+    #[test]
+    fn test_clean_table_cells_numbered_hierarchy_rows_not_overmerged() {
+        let cells = vec![
+            vec![
+                "Group".into(),
+                "Task".into(),
+                "Detail".into(),
+                "Benefit".into(),
+            ],
+            vec![
+                "1. Group alpha".into(),
+                "Task setup and".into(),
+                "Begin setup".into(),
+                "Faster start".into(),
+            ],
+            vec![
+                "".into(),
+                "management".into(),
+                "recommended profile".into(),
+                "with saved defaults".into(),
+            ],
+            vec![
+                "2. Group beta and".into(),
+                "Storage setup".into(),
+                "Provides upload tools".into(),
+                "".into(),
+            ],
+            vec![
+                "fine-tuning".into(),
+                "".into(),
+                "for filtered inputs".into(),
+                "service".into(),
+            ],
+            vec![
+                "".into(),
+                "Label workspace".into(),
+                "Creates review sets".into(),
+                "Lets teams review".into(),
+            ],
+            vec![
+                "".into(),
+                "Model training".into(),
+                "".into(),
+                "Supports custom model".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 5);
+        assert_eq!(cleaned[1][0], "1. Group alpha");
+        assert_eq!(cleaned[1][1], "Task setup and management");
+        assert_eq!(cleaned[2][0], "2. Group beta and fine-tuning");
+        assert_eq!(cleaned[2][1], "Storage setup");
+        assert_eq!(cleaned[3][1], "Label workspace");
+        assert_eq!(cleaned[4][1], "Model training");
+    }
+
+    #[test]
+    fn test_clean_table_cells_partial_hierarchical_subrow_not_merged() {
+        let cells = vec![
+            vec![
+                "Group".into(),
+                "Task".into(),
+                "Detail".into(),
+                "Benefit".into(),
+            ],
+            vec![
+                "Group A".into(),
+                "Alpha task".into(),
+                "Initial detail".into(),
+                "Initial benefit".into(),
+            ],
+            vec![
+                "".into(),
+                "Beta task".into(),
+                "Parallel detail".into(),
+                "".into(),
+            ],
+            vec![
+                "".into(),
+                "second line".into(),
+                "additional detail".into(),
+                "".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 3);
+        assert_eq!(cleaned[1][1], "Alpha task");
+        assert_eq!(cleaned[2][0], "");
+        assert_eq!(cleaned[2][1], "Beta task second line");
+        assert_eq!(cleaned[2][2], "Parallel detail additional detail");
     }
 
     #[test]
