@@ -3965,11 +3965,11 @@ fn x_cluster_count(items: &[TextItem]) -> usize {
 
 fn prose_grid_fragment_needs_ocr(markdown: &str) -> bool {
     let rows = markdown_pipe_rows(markdown);
-    if rows.len() < 3 {
+    if rows.len() < 2 {
         return false;
     }
     let raw_cols = rows[0].len();
-    if !(3..=4).contains(&raw_cols) {
+    if !(2..=4).contains(&raw_cols) {
         return false;
     }
 
@@ -3995,7 +3995,8 @@ fn prose_grid_fragment_needs_ocr(markdown: &str) -> bool {
         }
     }
 
-    if total < raw_cols * 2 {
+    let min_total = if raw_cols == 2 { 2 } else { raw_cols * 2 };
+    if total < min_total {
         return false;
     }
     if long_prose * 3 < total * 2 {
@@ -4500,6 +4501,23 @@ mod table_candidate_selection_tests {
                   |Box 1, F-8|Long neutral description with several words for one record|2020 Jan 1|\n\
                   |Box 1, F-9|Another neutral description with several words for another record|2021 Feb 2|\n\
                   |Box 1, F-10|Additional neutral description with several words for a record|n.d.|";
+        assert!(!prose_grid_fragment_needs_ocr(md));
+    }
+
+    #[test]
+    fn two_column_all_prose_fragment_is_suspicious() {
+        let md = "|A long descriptive header fragment|Another long descriptive header fragment|\n\
+                  |---|---|\n\
+                  |Long wrapped prose content from one visual cell|More wrapped prose content from a neighboring visual cell|";
+        assert!(prose_grid_fragment_needs_ocr(md));
+    }
+
+    #[test]
+    fn two_column_key_value_table_is_allowed() {
+        let md = "|Field|Detail|\n\
+                  |---|---|\n\
+                  |Status|Long neutral explanation with several words for this value|\n\
+                  |Owner|Another neutral explanation with several words for this value|";
         assert!(!prose_grid_fragment_needs_ocr(md));
     }
 }
