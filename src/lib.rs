@@ -3985,31 +3985,60 @@ fn wide_table_sparse_prefix_undercount(markdown: &str) -> bool {
 
 fn text_cluster_column_undercount(items: &[TextItem], shape: MarkdownTableShape) -> bool {
     let table_cols = shape.raw_cols.max(shape.cols);
-    if table_cols < 6 || items.len() < table_cols * 2 {
+    if table_cols < 2 || items.len() < table_cols * 2 {
         return false;
     }
 
-    let implicit_cols = x_cluster_count(items);
-    implicit_cols >= table_cols + 2 && implicit_cols * 10 >= table_cols * 12
+    // Count "significant" x-clusters — clusters whose item count is at
+    // least 1/4 of the dominant cluster. Filters out within-cell text
+    // variation (wrapped continuations, bullet starts, indents) that
+    // produces many small x-clusters not corresponding to real columns.
+    let cluster_counts = x_cluster_item_counts(items);
+    let Some(&dominant) = cluster_counts.iter().max() else {
+        return false;
+    };
+    let min_cluster_size = (dominant / 4).max(2);
+    let significant_clusters: usize = cluster_counts
+        .iter()
+        .filter(|&&n| n >= min_cluster_size)
+        .count();
+
+    // Two regimes:
+    //   - Wide table undercount (e.g. 11-col dropped to 9): fire when the
+    //     clustering surfaces ≥2 extra columns AND ≥1.2× the markdown
+    //     column count. Inherits the old wide-table heuristic.
+    //   - Narrow table undercount (e.g. 4-col dropped to 2): fire when
+    //     the clustering surfaces ≥2× the markdown column count and at
+    //     least 3 real columns. Catches narrow numeric columns
+    //     (dates, amounts, IDs) collapsed into adjacent ones.
+    let wide_undercount = table_cols >= 6
+        && significant_clusters >= table_cols + 2
+        && significant_clusters * 10 >= table_cols * 12;
+    let narrow_undercount = significant_clusters >= 3 && significant_clusters >= table_cols * 2;
+    wide_undercount || narrow_undercount
 }
 
-fn x_cluster_count(items: &[TextItem]) -> usize {
+/// Cluster x-positions of non-empty text items with 8pt tolerance and
+/// return the item count of each cluster. Same clustering policy as
+/// `x_cluster_count`; the array form lets the caller weight clusters
+/// by population to filter out single-item outliers.
+fn x_cluster_item_counts(items: &[TextItem]) -> Vec<usize> {
     let mut xs: Vec<f32> = items
         .iter()
         .filter(|item| !item.text.trim().is_empty())
         .map(|item| item.x)
         .collect();
     if xs.is_empty() {
-        return 0;
+        return Vec::new();
     }
     xs.sort_by(|a, b| a.total_cmp(b));
 
-    let mut clusters = 1usize;
+    let mut counts: Vec<usize> = Vec::new();
     let mut center = xs[0];
     let mut count = 1usize;
     for &x in &xs[1..] {
         if (x - center).abs() > 8.0 {
-            clusters += 1;
+            counts.push(count);
             center = x;
             count = 1;
         } else {
@@ -4017,7 +4046,8 @@ fn x_cluster_count(items: &[TextItem]) -> usize {
             count += 1;
         }
     }
-    clusters
+    counts.push(count);
+    counts
 }
 
 fn prose_grid_fragment_needs_ocr(markdown: &str) -> bool {
@@ -4326,6 +4356,120 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
 #[cfg(test)]
 fn looks_like_partial_table(markdown: &str) -> bool {
     looks_like_partial_table_ex(markdown, false)
+}
+
+#[cfg(test)]
+mod text_cluster_column_undercount_tests {
+    use super::{text_cluster_column_undercount, MarkdownTableShape, TextItem};
+    use crate::types::ItemType;
+
+    fn item(x: f32, y: f32, text: &str) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: text.len() as f32 * 5.0,
+            height: 10.0,
+            font: "F".into(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    /// 22 rows × 4 columns of items, neutral synthetic content. Simulates
+    /// the "narrow numeric columns dropped" shape: heuristic detector
+    /// produced 2 markdown columns but the page geometry shows 4.
+    fn make_four_column_grid() -> Vec<TextItem> {
+        let xs = [60.0, 145.0, 330.0, 430.0];
+        let mut items = Vec::new();
+        for row in 0..22 {
+            let y = 700.0 - row as f32 * 20.0;
+            for &x in &xs {
+                items.push(item(x, y, "x"));
+            }
+        }
+        items
+    }
+
+    fn shape(cols: usize) -> MarkdownTableShape {
+        MarkdownTableShape {
+            rows: 22,
+            cols,
+            raw_cols: cols,
+        }
+    }
+
+    #[test]
+    fn narrow_undercount_2col_markdown_4col_geometry_fires() {
+        // The shape this PR targets: heuristic detector collapsed a
+        // 4-column page into 2 markdown columns because narrow numeric
+        // columns (e.g. dates, IDs) didn't survive x-position
+        // clustering. Significant clusters (4) >= markdown_cols (2) * 2.
+        let items = make_four_column_grid();
+        assert!(text_cluster_column_undercount(&items, shape(2)));
+    }
+
+    #[test]
+    fn matching_geometry_does_not_fire() {
+        // 4-col page with 4-col markdown — no undercount.
+        let items = make_four_column_grid();
+        assert!(!text_cluster_column_undercount(&items, shape(4)));
+    }
+
+    #[test]
+    fn single_column_skipped() {
+        // 1-col markdown is not a table — never flag.
+        let items = make_four_column_grid();
+        assert!(!text_cluster_column_undercount(&items, shape(1)));
+    }
+
+    #[test]
+    fn insufficient_items_skipped() {
+        // < 2*table_cols items — not enough signal to claim undercount.
+        let items = vec![
+            item(60.0, 700.0, "x"),
+            item(145.0, 700.0, "x"),
+            item(330.0, 700.0, "x"),
+        ];
+        assert!(!text_cluster_column_undercount(&items, shape(2)));
+    }
+
+    #[test]
+    fn outlier_singletons_filtered_out() {
+        // 2-col grid (22 items each col) plus a few stray outliers at
+        // other x positions. Significant clusters = 2; markdown=2;
+        // doesn't fire (significant >= cols*2 = 4 is false).
+        let mut items = Vec::new();
+        for row in 0..22 {
+            let y = 700.0 - row as f32 * 20.0;
+            items.push(item(60.0, y, "x"));
+            items.push(item(330.0, y, "x"));
+        }
+        // Add a handful of strays (continuation fragments, footnotes).
+        items.push(item(145.0, 100.0, "footnote"));
+        items.push(item(430.0, 50.0, "page#"));
+        assert!(!text_cluster_column_undercount(&items, shape(2)));
+    }
+
+    #[test]
+    fn wide_table_path_still_fires() {
+        // The original wide-table case: 6+ markdown cols with ≥2 extra
+        // significant clusters. Builds a 12-col geometry with 8-col
+        // markdown — the legacy wide-undercount path catches this.
+        let mut items = Vec::new();
+        let xs: Vec<f32> = (0..12).map(|i| 50.0 + i as f32 * 40.0).collect();
+        for row in 0..22 {
+            let y = 700.0 - row as f32 * 20.0;
+            for &x in &xs {
+                items.push(item(x, y, "x"));
+            }
+        }
+        assert!(text_cluster_column_undercount(&items, shape(8)));
+    }
 }
 
 #[cfg(test)]
