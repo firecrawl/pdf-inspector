@@ -188,7 +188,17 @@ pub(crate) fn extract_page_text_items(
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
-    let mut gstate_stack: Vec<([f32; 6], i32, f32, f32)> = Vec::new();
+    #[derive(Clone)]
+    struct SavedGraphicsState {
+        ctm: [f32; 6],
+        text_rendering_mode: i32,
+        char_spacing: f32,
+        word_spacing: f32,
+        text_leading: f32,
+        current_font: String,
+        current_font_size: f32,
+    }
+    let mut gstate_stack: Vec<SavedGraphicsState> = Vec::new();
 
     // Text state tracking
     let mut current_font = String::new();
@@ -227,15 +237,26 @@ pub(crate) fn extract_page_text_items(
         match op.operator.as_str() {
             "q" => {
                 // Save graphics state
-                gstate_stack.push((ctm, text_rendering_mode, char_spacing, word_spacing));
+                gstate_stack.push(SavedGraphicsState {
+                    ctm,
+                    text_rendering_mode,
+                    char_spacing,
+                    word_spacing,
+                    text_leading,
+                    current_font: current_font.clone(),
+                    current_font_size,
+                });
             }
             "Q" => {
                 // Restore graphics state
-                if let Some((saved_ctm, saved_tr, saved_tc, saved_tw)) = gstate_stack.pop() {
-                    ctm = saved_ctm;
-                    text_rendering_mode = saved_tr;
-                    char_spacing = saved_tc;
-                    word_spacing = saved_tw;
+                if let Some(saved) = gstate_stack.pop() {
+                    ctm = saved.ctm;
+                    text_rendering_mode = saved.text_rendering_mode;
+                    char_spacing = saved.char_spacing;
+                    word_spacing = saved.word_spacing;
+                    text_leading = saved.text_leading;
+                    current_font = saved.current_font;
+                    current_font_size = saved.current_font_size;
                 }
             }
             "cm" => {
@@ -1284,6 +1305,91 @@ mod tests {
         assert!(items.is_empty());
         assert!(rects.is_empty());
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_q_restores_current_font_for_text_decoding() {
+        use crate::tounicode::FontCMaps;
+        use lopdf::{dictionary, Object, Stream};
+
+        fn cmap_stream(dst_hex: &str) -> Stream {
+            let cmap = format!(
+                r#"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Test-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+1 beginbfchar
+<41> <{dst_hex}>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end"#
+            );
+            Stream::new(dictionary! {}, cmap.into_bytes())
+        }
+
+        let mut doc = lopdf::Document::new();
+        let f1_cmap = doc.add_object(Object::Stream(cmap_stream("0058"))); // X
+        let f2_cmap = doc.add_object(Object::Stream(cmap_stream("0059"))); // Y
+        let f1 = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "ToUnicode" => Object::Reference(f1_cmap),
+        });
+        let f2 = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "ToUnicode" => Object::Reference(f2_cmap),
+        });
+
+        let content = b"BT /F1 12 Tf 10 700 Tm <41> Tj ET
+q
+BT /F2 12 Tf 20 700 Tm <41> Tj ET
+Q
+BT 30 700 Tm <41> Tj ET";
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            content.to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => Object::Reference(f1),
+                    "F2" => Object::Reference(f2),
+                },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _) =
+            extract_page_text_items(&doc, page_id, 1, &font_cmaps, false).unwrap();
+        let text = items
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(text, "XYX");
     }
 
     #[test]

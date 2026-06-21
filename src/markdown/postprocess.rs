@@ -29,6 +29,7 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
     // text item, which combine with gap-based space insertion to produce
     // double spaces ("Vice  President" instead of "Vice President").
     collapse_consecutive_spaces(&mut text);
+    remove_spaces_before_closing_brackets(&mut text);
 
     // Remove excessive newlines (more than 2 in a row)
     while text.contains("\n\n\n") {
@@ -67,6 +68,20 @@ fn collapse_consecutive_spaces(text: &mut String) {
                 result.push(ch);
             }
         }
+    }
+    *text = result;
+}
+
+/// Remove spaces before closing square brackets.
+/// Unit markers and markdown links occasionally pick up a gap-inserted space
+/// before `]` (e.g. `[kg/m3 ]`), which is cosmetic padding.
+fn remove_spaces_before_closing_brackets(text: &mut String) {
+    let mut result = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == ']' && result.ends_with(' ') {
+            result.pop();
+        }
+        result.push(ch);
     }
     *text = result;
 }
@@ -340,6 +355,18 @@ mod tests {
         assert!(result.contains("Chapter 1 ... 10"));
         assert!(result.contains("Some text... ok"));
         assert!(result.contains("Chapter 2 ... 20"));
+    }
+
+    // --- remove_spaces_before_closing_brackets ---
+
+    #[test]
+    fn test_remove_spaces_before_closing_brackets() {
+        let mut input = "Density [kg/m3 ] and [linked text ](https://example.com)".to_string();
+        remove_spaces_before_closing_brackets(&mut input);
+        assert_eq!(
+            input,
+            "Density [kg/m3] and [linked text](https://example.com)"
+        );
     }
 
     // --- fix_hyphenation ---
