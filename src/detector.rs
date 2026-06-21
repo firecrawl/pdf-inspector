@@ -60,6 +60,9 @@ pub struct PdfTypeResult {
     /// 1-indexed page numbers that need OCR (image-only or insufficient text).
     /// Empty for TextBased. All pages for Scanned/ImageBased. Specific pages for Mixed.
     pub pages_needing_ocr: Vec<u32>,
+    /// 1-indexed page numbers containing embedded images.
+    /// Includes image XObjects and inline images.
+    pub pages_with_images: Vec<u32>,
 }
 
 /// Configuration for PDF type detection
@@ -382,7 +385,9 @@ pub(crate) fn detect_from_document(
                 let analysis = if let Some(cached) = analysis_cache.get(&page_num) {
                     cached.clone()
                 } else if let Some(&page_id) = pages.get(&page_num) {
-                    analyze_page_content(doc, page_id)
+                    let analysis = analyze_page_content(doc, page_id);
+                    analysis_cache.insert(page_num, analysis.clone());
+                    analysis
                 } else {
                     continue;
                 };
@@ -418,23 +423,33 @@ pub(crate) fn detect_from_document(
             pages_needing_ocr.push(page_num);
         }
     }
-    // Check uncached pages too (when not all pages were sampled).
+    // Check uncached pages too and populate the cache for later passes.
     // Use analyze_page_content to get usage-based font checks (P1 + P2 fix).
-    if pages_needing_ocr.len() < total_pages as usize {
-        for page_num in 1..=total_pages {
-            if analysis_cache.contains_key(&page_num) || pages_needing_ocr.contains(&page_num) {
-                continue;
-            }
-            if let Some(&page_id) = pages.get(&page_num) {
-                let analysis = analyze_page_content(doc, page_id);
-                if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
-                    pages_needing_ocr.push(page_num);
-                }
+    for page_num in 1..=total_pages {
+        if analysis_cache.contains_key(&page_num) {
+            continue;
+        }
+        if let Some(&page_id) = pages.get(&page_num) {
+            let analysis = analyze_page_content(doc, page_id);
+            let has_undecodable_fonts =
+                analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts;
+            analysis_cache.insert(page_num, analysis);
+            if has_undecodable_fonts && !pages_needing_ocr.contains(&page_num) {
+                pages_needing_ocr.push(page_num);
             }
         }
     }
     pages_needing_ocr.sort();
     pages_needing_ocr.dedup();
+
+    // Phase 4: Build per-page image list from cached analyses.
+    let pages_with_images: Vec<u32> = (1..=total_pages)
+        .filter(|page_num| {
+            analysis_cache
+                .get(page_num)
+                .is_some_and(|analysis| analysis.has_images)
+        })
+        .collect();
 
     // Try to get title from metadata
     let title = get_document_title(doc);
@@ -448,6 +463,7 @@ pub(crate) fn detect_from_document(
         title,
         ocr_recommended,
         pages_needing_ocr,
+        pages_with_images,
     })
 }
 

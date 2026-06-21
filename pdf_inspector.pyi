@@ -4,12 +4,14 @@ from typing import Optional
 
 class PdfResult:
     """Result of processing a PDF file."""
+
     pdf_type: str
     """'text_based', 'scanned', 'image_based', or 'mixed'."""
     markdown: Optional[str]
     page_count: int
     processing_time_ms: int
     pages_needing_ocr: list[int]
+    pages_with_images: list[int]
     title: Optional[str]
     confidence: float
     is_complex_layout: bool
@@ -19,15 +21,19 @@ class PdfResult:
 
 class PdfClassification:
     """Lightweight PDF classification result."""
+
     pdf_type: str
     """'text_based', 'scanned', 'image_based', or 'mixed'."""
     page_count: int
     pages_needing_ocr: list[int]
     """0-indexed page numbers that need OCR."""
+    pages_with_images: list[int]
+    """0-indexed page numbers containing embedded images."""
     confidence: float
 
 class TextItem:
     """A positioned text item extracted from a PDF."""
+
     text: str
     x: float
     y: float
@@ -42,12 +48,14 @@ class TextItem:
 
 class RegionText:
     """Extracted text for a single region."""
+
     text: str
     needs_ocr: bool
     """True when the text should not be trusted."""
 
 class PageRegionTexts:
     """Extracted text for one page's regions."""
+
     page: int
     """0-indexed page number."""
     regions: list[RegionText]
@@ -106,11 +114,15 @@ def extract_text_bytes(data: bytes) -> str:
     """Extract plain text from PDF bytes."""
     ...
 
-def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) -> list[TextItem]:
+def extract_text_with_positions(
+    path: str, pages: Optional[list[int]] = None
+) -> list[TextItem]:
     """Extract text with position information."""
     ...
 
-def extract_text_with_positions_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[TextItem]:
+def extract_text_with_positions_bytes(
+    data: bytes, pages: Optional[list[int]] = None
+) -> list[TextItem]:
     """Extract text with position information from bytes."""
     ...
 

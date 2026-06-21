@@ -1098,6 +1098,7 @@ fn test_pages_needing_ocr_field_accessible() {
         title: None,
         ocr_recommended: false,
         pages_needing_ocr: Vec::new(),
+        pages_with_images: Vec::new(),
     };
     assert!(detection_result.pages_needing_ocr.is_empty());
 
@@ -1107,12 +1108,22 @@ fn test_pages_needing_ocr_field_accessible() {
         page_count: 1,
         processing_time_ms: 0,
         pages_needing_ocr: vec![1, 3],
+        pages_with_images: Vec::new(),
         title: None,
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
         has_encoding_issues: false,
     };
     assert_eq!(process_result.pages_needing_ocr, vec![1, 3]);
+}
+
+#[test]
+fn test_pages_with_images_detected_for_fixture() {
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+    let result = process_pdf_mem(&buf).unwrap();
+
+    assert_eq!(result.pdf_type, PdfType::Mixed);
+    assert_eq!(result.pages_with_images, vec![31, 32, 116, 139, 430]);
 }
 
 #[test]

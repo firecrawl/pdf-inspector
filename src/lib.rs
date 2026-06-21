@@ -79,6 +79,8 @@ pub struct PdfProcessResult {
     pub processing_time_ms: u64,
     /// 1-indexed page numbers that need OCR.
     pub pages_needing_ocr: Vec<u32>,
+    /// 1-indexed page numbers containing embedded images.
+    pub pages_with_images: Vec<u32>,
     /// Title from PDF metadata (if available).
     pub title: Option<String>,
     /// Detection confidence score (0.0–1.0).
@@ -289,6 +291,8 @@ pub struct PdfClassification {
     pub page_count: u32,
     /// 0-indexed page numbers that need OCR (scanned/image pages).
     pub pages_needing_ocr: Vec<u32>,
+    /// 0-indexed page numbers containing embedded images.
+    pub pages_with_images: Vec<u32>,
     /// Detection confidence score (0.0–1.0).
     pub confidence: f32,
 }
@@ -304,6 +308,7 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
         page_count,
         // Convert from 1-indexed to 0-indexed for caller convenience
         pages_needing_ocr: detection.pages_needing_ocr.iter().map(|&p| p - 1).collect(),
+        pages_with_images: detection.pages_with_images.iter().map(|&p| p - 1).collect(),
         confidence: detection.confidence,
     })
 }
@@ -3305,6 +3310,7 @@ fn process_document(
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
     let pdf_type = detection.pdf_type;
     let pages_needing_ocr = detection.pages_needing_ocr;
+    let pages_with_images = detection.pages_with_images;
     let title = detection.title;
     let confidence = detection.confidence;
 
@@ -3316,6 +3322,7 @@ fn process_document(
             page_count,
             processing_time_ms: start.elapsed().as_millis() as u64,
             pages_needing_ocr,
+            pages_with_images,
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3331,6 +3338,7 @@ fn process_document(
             page_count,
             processing_time_ms: start.elapsed().as_millis() as u64,
             pages_needing_ocr,
+            pages_with_images,
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3554,6 +3562,7 @@ fn process_document(
         page_count,
         processing_time_ms: start.elapsed().as_millis() as u64,
         pages_needing_ocr,
+        pages_with_images,
         title,
         confidence,
         layout,

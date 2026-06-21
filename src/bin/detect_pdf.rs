@@ -105,6 +105,11 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
                     .iter()
                     .map(|p| p.to_string())
                     .collect();
+                let image_pages: Vec<String> = result
+                    .pages_with_images
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
                 let table_pages: Vec<String> = result
                     .layout
                     .pages_with_tables
@@ -118,10 +123,11 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
                     .map(|p| p.to_string())
                     .collect();
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"detection_time_ms":{}}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_needing_ocr":[{}],"pages_with_images":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"detection_time_ms":{}}}"#,
                     pdf_type_str(&result.pdf_type),
                     result.page_count,
                     ocr_pages.join(","),
+                    image_pages.join(","),
                     result.layout.is_complex,
                     table_pages.join(","),
                     col_pages.join(","),
@@ -144,6 +150,9 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
                 println!("Page count: {}", result.page_count);
                 if !result.pages_needing_ocr.is_empty() {
                     println!("Pages needing OCR: {:?}", result.pages_needing_ocr);
+                }
+                if !result.pages_with_images.is_empty() {
+                    println!("Pages with images: {:?}", result.pages_with_images);
                 }
                 println!();
                 if result.layout.is_complex {
@@ -184,8 +193,13 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                     .iter()
                     .map(|p| p.to_string())
                     .collect();
+                let image_pages: Vec<String> = result
+                    .pages_with_images
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},"title":{},"ocr_recommended":{},"pages_needing_ocr":[{}],"detection_time_ms":{}}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},"title":{},"ocr_recommended":{},"pages_needing_ocr":[{}],"pages_with_images":[{}],"detection_time_ms":{}}}"#,
                     pdf_type_str(&result.pdf_type),
                     result.page_count,
                     result.pages_sampled,
@@ -198,6 +212,7 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                         .unwrap_or_else(|| "null".to_string()),
                     result.ocr_recommended,
                     ocr_pages.join(","),
+                    image_pages.join(","),
                     elapsed.as_millis()
                 );
             } else {
@@ -232,6 +247,12 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                             result.pages_needing_ocr, result.page_count
                         );
                     }
+                }
+                if !result.pages_with_images.is_empty() {
+                    println!(
+                        "Pages with images: {:?} (of {})",
+                        result.pages_with_images, result.page_count
+                    );
                 }
                 if let Some(title) = &result.title {
                     println!("Title: {}", title);

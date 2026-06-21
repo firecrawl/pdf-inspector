@@ -30,6 +30,9 @@ pub struct PyPdfResult {
     /// 1-indexed page numbers that need OCR.
     #[pyo3(get)]
     pub pages_needing_ocr: Vec<u32>,
+    /// 1-indexed page numbers containing embedded images.
+    #[pyo3(get)]
+    pub pages_with_images: Vec<u32>,
     /// Title from PDF metadata.
     #[pyo3(get)]
     pub title: Option<String>,
@@ -77,6 +80,9 @@ pub struct PyPdfClassification {
     /// 0-indexed page numbers that need OCR.
     #[pyo3(get)]
     pub pages_needing_ocr: Vec<u32>,
+    /// 0-indexed page numbers containing embedded images.
+    #[pyo3(get)]
+    pub pages_with_images: Vec<u32>,
     /// Detection confidence (0.0-1.0).
     #[pyo3(get)]
     pub confidence: f32,
@@ -268,6 +274,7 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         page_count: r.page_count,
         processing_time_ms: r.processing_time_ms,
         pages_needing_ocr: r.pages_needing_ocr,
+        pages_with_images: r.pages_with_images,
         title: r.title,
         confidence: r.confidence,
         is_complex_layout: r.layout.is_complex,
@@ -436,6 +443,7 @@ fn classify_pdf_bytes(data: &[u8]) -> PyResult<PyPdfClassification> {
         pdf_type: pdf_type_str(result.pdf_type),
         page_count: result.page_count,
         pages_needing_ocr: result.pages_needing_ocr,
+        pages_with_images: result.pages_with_images,
         confidence: result.confidence,
     })
 }
