@@ -672,8 +672,9 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lopdf"
-version = "0.40.0"
-source = "git+https://github.com/J-F-Liu/lopdf?rev=7a05512d831415b1f2b1ce522391d6beab8a1284#7a05512d831415b1f2b1ce522391d6beab8a1284"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67513274c50a2b51e5f75d9e682fcf4ab064a8a9c9ae2c3c59309084882bb24d"
 dependencies = [
  "aes",
  "bitflags",
@@ -829,7 +830,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "pdf-inspector"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "env_logger",
  "log",
@@ -844,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-inspector-napi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "napi",
  "napi-build",
