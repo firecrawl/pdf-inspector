@@ -755,9 +755,9 @@ pub(crate) fn extract_text_from_operand(
                                     return Some(ch.to_string());
                                 }
                             }
-                            // 4. Printable ASCII/Latin-1 fallback
+                            // 4. Printable single-byte fallback
                             if b >= 0x20 {
-                                return Some((b as char).to_string());
+                                return Some(decode_single_byte_fallback_char(b).to_string());
                             }
                             None
                         })
@@ -880,8 +880,9 @@ pub(crate) fn extract_text_from_operand(
                                 Some(ch)
                             } else if b >= 0x20 {
                                 // Base encoding fallback for printable bytes.
-                                // For codes 0x20-0x7E this matches all standard PDF encodings.
-                                Some(b as char)
+                                // Most PDFs with simple fonts use WinAnsi/PDFDocEncoding
+                                // semantics, not ISO-8859-1 C1 controls.
+                                Some(decode_single_byte_fallback_char(b))
                             } else {
                                 None // Skip unmapped control characters
                             }
@@ -937,6 +938,11 @@ pub(crate) fn extract_text_from_operand(
             // Try to decode using cached font encoding from lopdf
             if let Some(encoding) = encoding_cache.get(current_font) {
                 if let Ok(text) = Document::decode_text(encoding, bytes) {
+                    let text = if is_type0_cid_font {
+                        text
+                    } else {
+                        normalize_cp1252_controls(text)
+                    };
                     if text.contains('\u{FFFD}') {
                         debug!(
                             "decode_text produced replacement for font={} bytes_len={}",
@@ -973,16 +979,82 @@ pub(crate) fn extract_text_from_operand(
                 return Some(symbol_text);
             }
 
-            // Pure ASCII bytes round-trip safely (Latin-1 == ASCII for
-            // 0x00..=0x7F), and non-CID (Type1 / TrueType / Type3) fonts
-            // use single-byte encodings where Latin-1 fallback is the
-            // canonical interpretation.
-            Some(bytes.iter().map(|&b| b as char).collect())
+            // Non-CID (Type1 / TrueType / Type3) fonts use single-byte
+            // encodings. In practice the fallback should follow WinAnsi for
+            // 0x80..=0x9F so bytes like 0x92 become smart punctuation instead
+            // of C1 controls that look like CID mojibake.
+            Some(decode_single_byte_fallback(bytes))
         } else {
             None
         }
     })();
-    result.map(clean_symbol_pua)
+    result.map(|text| {
+        let text = clean_symbol_pua(text);
+        if is_type0_cid_font {
+            text
+        } else {
+            normalize_cp1252_controls(text)
+        }
+    })
+}
+
+fn decode_single_byte_fallback(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| decode_single_byte_fallback_char(b))
+        .collect()
+}
+
+fn decode_single_byte_fallback_char(byte: u8) -> char {
+    match byte {
+        0x80 => '\u{20AC}',
+        0x82 => '\u{201A}',
+        0x83 => '\u{0192}',
+        0x84 => '\u{201E}',
+        0x85 => '\u{2026}',
+        0x86 => '\u{2020}',
+        0x87 => '\u{2021}',
+        0x88 => '\u{02C6}',
+        0x89 => '\u{2030}',
+        0x8A => '\u{0160}',
+        0x8B => '\u{2039}',
+        0x8C => '\u{0152}',
+        0x8E => '\u{017D}',
+        0x91 => '\u{2018}',
+        0x92 => '\u{2019}',
+        0x93 => '\u{201C}',
+        0x94 => '\u{201D}',
+        0x95 => '\u{2022}',
+        0x96 => '\u{2013}',
+        0x97 => '\u{2014}',
+        0x98 => '\u{02DC}',
+        0x99 => '\u{2122}',
+        0x9A => '\u{0161}',
+        0x9B => '\u{203A}',
+        0x9C => '\u{0153}',
+        0x9E => '\u{017E}',
+        0x9F => '\u{0178}',
+        _ => byte as char,
+    }
+}
+
+fn normalize_cp1252_controls(text: String) -> String {
+    if !text
+        .chars()
+        .any(|ch| ('\u{0080}'..='\u{009F}').contains(&ch))
+    {
+        return text;
+    }
+
+    text.chars()
+        .map(|ch| {
+            if ('\u{0080}'..='\u{009F}').contains(&ch) {
+                decode_single_byte_fallback_char(ch as u8)
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 /// Replace PUA characters in the F000-F0FF range with standard Unicode equivalents.
@@ -1279,15 +1351,15 @@ mod tests {
     }
 
     #[test]
-    fn simple_font_latin1_fallback_passes_high_bytes_through() {
+    fn simple_font_single_byte_fallback_passes_high_bytes_through() {
         // A Type1/TrueType simple font (is_cid=false) with a `/ToUnicode`
         // reference but no usable CMap and no `/Differences` map.
-        // Per-byte Latin-1 IS the canonical interpretation here — these
-        // bytes are character codes, not CIDs. The CID guard must NOT
-        // strip them. Reproduces the false positive that an earlier
-        // version of the guard introduced for fonts in PDFs like
-        // pdf-evals/Navigating-Artificial-Intelligence-..., where bytes
-        // like 0xB6 are legitimate Latin-1 character codes.
+        // Per-byte fallback is the canonical interpretation here — these
+        // bytes are character codes, not CIDs. The CID guard must NOT strip
+        // them. Reproduces the false positive that an earlier version of the
+        // guard introduced for fonts in PDFs like pdf-evals/Navigating-
+        // Artificial-Intelligence-..., where bytes like 0xB6 are legitimate
+        // single-byte character codes.
         let bytes = vec![0x24_u8, 0x47, 0xB6, 0x56]; // "$G¶V"
         let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
 
@@ -1319,5 +1391,41 @@ mod tests {
             !text.contains('\u{FFFD}'),
             "simple font fallback must not stamp FFFD over legitimate bytes: {text:?}"
         );
+    }
+
+    #[test]
+    fn simple_font_single_byte_fallback_maps_cp1252_punctuation() {
+        let bytes = vec![b'l', 0x92_u8, b'a', b'c', b'a', b'd'];
+        let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
+
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let inline_cmaps = HashMap::new();
+        let font_encodings: PageFontEncodings = HashMap::new();
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let font_widths: PageFontWidths = HashMap::new();
+
+        let text = extract_text_from_operand(
+            &obj,
+            "F1",
+            None,
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("simple font should decode CP1252 punctuation");
+
+        assert_eq!(text, "l’acad");
+    }
+
+    #[test]
+    fn cached_encoding_decode_normalizes_cp1252_controls() {
+        let text = normalize_cp1252_controls("d\u{92}un \u{96} test".to_string());
+        assert_eq!(text, "d’un – test");
     }
 }

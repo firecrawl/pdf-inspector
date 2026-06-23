@@ -3684,6 +3684,10 @@ fn detect_encoding_issues(markdown: &str) -> bool {
     }
 
     // Heuristic 2: dollar-as-space pattern
+    has_dollar_as_space_pattern(markdown)
+}
+
+fn has_dollar_as_space_pattern(markdown: &str) -> bool {
     let total_dollars = markdown.matches('$').count();
     if total_dollars > 10 {
         let bytes = markdown.as_bytes();
@@ -3784,10 +3788,29 @@ fn text_span_has_decoding_issue(text: &str) -> bool {
         return false;
     }
 
-    detect_encoding_issues(text)
+    has_replacement_text_run(text)
+        || has_dollar_as_space_pattern(text)
         || has_private_use_text_run(text)
         || is_cid_garbage(text)
         || has_cid_control_token(text)
+}
+
+fn has_replacement_text_run(text: &str) -> bool {
+    let mut replacement = 0usize;
+    let mut current_run = 0usize;
+    let mut longest_run = 0usize;
+
+    for ch in text.chars() {
+        if ch == '\u{FFFD}' {
+            replacement += 1;
+            current_run += 1;
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+
+    longest_run >= 2 || replacement >= 3
 }
 
 fn has_private_use_text_run(text: &str) -> bool {
@@ -3851,20 +3874,36 @@ fn is_private_use_char(ch: char) -> bool {
 fn is_garbage_text(markdown: &str) -> bool {
     let mut alphanum = 0usize;
     let mut non_alphanum = 0usize;
-    for ch in markdown.chars() {
-        if ch.is_whitespace() {
-            continue;
+
+    let chars: Vec<char> = markdown.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        let mut run_end = i + 1;
+        while run_end < chars.len() && chars[run_end] == ch {
+            run_end += 1;
         }
-        // Skip markdown syntax chars that we add (not from the PDF)
-        if matches!(ch, '#' | '*' | '|' | '-' | '\n') {
-            continue;
+
+        let is_decorative_leader = matches!(ch, '.' | '_') && run_end - i >= 3;
+        if !is_decorative_leader {
+            for &run_ch in &chars[i..run_end] {
+                if run_ch.is_whitespace() {
+                    continue;
+                }
+                // Skip markdown syntax chars that we add (not from the PDF)
+                if matches!(run_ch, '#' | '*' | '|' | '-' | '\n') {
+                    continue;
+                }
+                if run_ch.is_alphanumeric() {
+                    alphanum += 1;
+                } else {
+                    non_alphanum += 1;
+                }
+            }
         }
-        if ch.is_alphanumeric() {
-            alphanum += 1;
-        } else {
-            non_alphanum += 1;
-        }
+        i = run_end;
     }
+
     let total = alphanum + non_alphanum;
     total >= 50 && alphanum * 2 < total
 }
@@ -3908,9 +3947,11 @@ fn is_cid_garbage(text: &str) -> bool {
     }
     // If ≥40% of non-whitespace chars are high Latin-1 AND the text has few
     // ASCII letters, it's likely CID-as-Latin-1 mojibake (Japanese/CJK PDFs
-    // where CID values 0x80-0xFF become accented Latin characters).
+    // where CID values 0x80-0xFF become accented Latin characters).  Keep a
+    // minimum length so short math tokens like "2×()×" do not route a clean
+    // page to OCR.
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    high_latin * 5 >= total * 2 && ascii_letters * 3 < total
+    total >= 20 && high_latin * 5 >= total * 2 && ascii_letters * 3 < total
 }
 
 /// Detect markdown tables with suspicious structure that suggest the heuristic
@@ -5855,7 +5896,7 @@ mod tests {
     #[test]
     fn test_text_quality_flags_replacement_and_private_use_runs() {
         let items = vec![
-            test_text_item_on_page(1, "broken \u{FFFD} text"),
+            test_text_item_on_page(1, "broken \u{FFFD}\u{FFFD} text"),
             test_text_item_on_page(3, "\u{E000}\u{E001}\u{E002}"),
         ];
 
@@ -5885,6 +5926,37 @@ mod tests {
         assert!(!quality.has_encoding_issues);
         assert!(quality.pages_needing_ocr.is_empty());
         assert!(quality.reasons_by_page.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_toc_leaders_form_rules_and_short_math() {
+        let items = vec![
+            test_text_item_on_page(
+                1,
+                "Feature Overview ........................................................................................................ 1-5",
+            ),
+            test_text_item_on_page(1, "Signature __________________________________________"),
+            test_text_item_on_page(1, "__________________________________________________"),
+            test_text_item_on_page(1, "2×()×"),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_isolated_replacement_character() {
+        let items = vec![
+            test_text_item_on_page(1, "\u{FFFD}2026 FINRA"),
+            test_text_item_on_page(1, "A mostly clean page should not be sent to OCR."),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
     }
 
     #[test]
