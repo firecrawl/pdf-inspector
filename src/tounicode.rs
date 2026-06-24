@@ -616,9 +616,15 @@ fn hex_to_unicode_string(hex: &str) -> Option<String> {
 }
 
 fn normalize_tounicode_destination(text: String) -> String {
-    let is_multi_char = text.chars().count() > 1;
+    let is_multi_char = text.chars().nth(1).is_some();
 
-    if is_multi_char && text.chars().all(char::is_whitespace) {
+    // Some malformed producer CMaps put a list of alternative whitespace or
+    // hyphen codepoints into one destination. Keep ordinary multi-character
+    // mappings intact unless that malformed signature is present.
+    if is_multi_char
+        && text.chars().all(char::is_whitespace)
+        && text.chars().any(|ch| matches!(ch, '\t' | '\n' | '\r'))
+    {
         return if text.contains('\t') {
             "\t".to_string()
         } else {
@@ -627,6 +633,7 @@ fn normalize_tounicode_destination(text: String) -> String {
     }
 
     if is_multi_char
+        && text.contains('\u{00ad}')
         && text.chars().all(|ch| {
             matches!(
                 ch,
@@ -2722,6 +2729,27 @@ endbfchar
         assert_eq!(cmap.lookup(0x21), Some("\t".to_string()));
         assert_eq!(cmap.lookup(0x22), Some("-".to_string()));
         assert_eq!(cmap.lookup(0x23), Some("\u{00a0}".to_string()));
+    }
+
+    #[test]
+    fn test_parse_preserves_valid_multi_character_destinations() {
+        let cmap_content = r#"
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+4 beginbfchar
+<21> <002d002d>
+<22> <20132013>
+<23> <002000a0>
+<24> <00660069>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        assert_eq!(cmap.lookup(0x21), Some("--".to_string()));
+        assert_eq!(cmap.lookup(0x22), Some("––".to_string()));
+        assert_eq!(cmap.lookup(0x23), Some(" \u{00a0}".to_string()));
+        assert_eq!(cmap.lookup(0x24), Some("fi".to_string()));
     }
 
     #[test]
