@@ -329,7 +329,7 @@ impl ToUnicodeCMap {
                 if let (Some(start), Some(end), Some(base)) = (
                     parse_hex_u16(&start_hex),
                     parse_hex_u16(&end_hex),
-                    parse_hex_u32(&base_hex),
+                    hex_to_unicode_scalar(&base_hex),
                 ) {
                     self.ranges.push((start, end, base));
                 }
@@ -575,32 +575,79 @@ fn parse_hex_u16(hex: &str) -> Option<u16> {
     u16::from_str_radix(hex.trim(), 16).ok()
 }
 
-/// Parse a hex string to u32
-fn parse_hex_u32(hex: &str) -> Option<u32> {
-    u32::from_str_radix(hex.trim(), 16).ok()
-}
-
-/// Convert a hex string to a Unicode string
-/// Handles both 2-byte (BMP) and 4-byte (supplementary) codepoints
+/// Convert a ToUnicode destination hex string to Unicode.
+///
+/// PDF ToUnicode destinations are UTF-16BE strings. Supplementary-plane
+/// characters are encoded as surrogate pairs, so treating each 4-hex chunk as
+/// a scalar drops emoji like D83CDF1F.
 fn hex_to_unicode_string(hex: &str) -> Option<String> {
-    let hex = hex.trim();
-    let mut result = String::new();
-
-    // Process 4 hex digits at a time
-    let mut i = 0;
-    while i + 4 <= hex.len() {
-        if let Ok(cp) = u32::from_str_radix(&hex[i..i + 4], 16) {
-            if let Some(c) = char::from_u32(cp) {
-                result.push(c);
-            }
-        }
-        i += 4;
+    let hex: String = hex.chars().filter(|ch| !ch.is_ascii_whitespace()).collect();
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return None;
     }
 
-    if result.is_empty() {
-        None
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect();
+    let bytes = bytes?;
+
+    if bytes.len().is_multiple_of(2) {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        if let Ok(result) = String::from_utf16(&units) {
+            if !result.is_empty() {
+                return Some(normalize_tounicode_destination(result));
+            }
+        }
+    }
+
+    // Be permissive for non-standard one-byte destinations.
+    if bytes.len() == 1 {
+        let ch = bytes[0] as char;
+        if !ch.is_control() || ch == '\t' || ch == '\n' {
+            return Some(ch.to_string());
+        }
+    }
+
+    None
+}
+
+fn normalize_tounicode_destination(text: String) -> String {
+    let is_multi_char = text.chars().count() > 1;
+
+    if is_multi_char && text.chars().all(char::is_whitespace) {
+        return if text.contains('\t') {
+            "\t".to_string()
+        } else {
+            " ".to_string()
+        };
+    }
+
+    if is_multi_char
+        && text.chars().all(|ch| {
+            matches!(
+                ch,
+                '-' | '\u{00ad}' | '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2212}'
+            )
+        })
+    {
+        return "-".to_string();
+    }
+
+    text
+}
+
+fn hex_to_unicode_scalar(hex: &str) -> Option<u32> {
+    let text = hex_to_unicode_string(hex)?;
+    let mut chars = text.chars();
+    let ch = chars.next()?;
+    if chars.next().is_none() {
+        Some(ch as u32)
     } else {
-        Some(result)
+        None
     }
 }
 
@@ -2605,6 +2652,76 @@ endbfrange
         assert_eq!(cmap.lookup(0x0003), Some("A".to_string()));
         assert_eq!(cmap.lookup(0x0004), Some("B".to_string()));
         assert_eq!(cmap.lookup(0x0005), Some("C".to_string()));
+    }
+
+    #[test]
+    fn test_parse_bfchar_surrogate_pair_emoji() {
+        let cmap_content = r#"
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+2 beginbfchar
+<16> <D83CDF1F>
+<9D> <D83CDFAD>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        assert_eq!(cmap.code_byte_length, 1);
+        assert_eq!(cmap.lookup(0x16), Some("🌟".to_string()));
+        assert_eq!(cmap.lookup(0x9D), Some("🎭".to_string()));
+    }
+
+    #[test]
+    fn test_parse_bfrange_surrogate_pair_base() {
+        let cmap_content = r#"
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+1 beginbfrange
+<C8> <C9> <D83CDFD8>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        assert_eq!(cmap.code_byte_length, 1);
+        assert_eq!(cmap.lookup(0xC8), Some("🏘".to_string()));
+        assert_eq!(cmap.lookup(0xC9), Some("🏙".to_string()));
+    }
+
+    #[test]
+    fn test_parse_bfrange_preserves_single_hyphen_like_base() {
+        let cmap_content = r#"
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+1 beginbfrange
+<21> <22> <2013>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        assert_eq!(cmap.lookup(0x21), Some("–".to_string()));
+        assert_eq!(cmap.lookup(0x22), Some("—".to_string()));
+    }
+
+    #[test]
+    fn test_parse_spaced_destination_hex_without_control_noise() {
+        let cmap_content = r#"
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+3 beginbfchar
+<21> < 0009 000d 0020 00a0 >
+<22> < 002d 00ad 2010 >
+<23> <00a0>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        assert_eq!(cmap.lookup(0x21), Some("\t".to_string()));
+        assert_eq!(cmap.lookup(0x22), Some("-".to_string()));
+        assert_eq!(cmap.lookup(0x23), Some("\u{00a0}".to_string()));
     }
 
     #[test]
