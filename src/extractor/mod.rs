@@ -352,6 +352,133 @@ fn effective_merge_width(item: &TextItem) -> f32 {
     }
 }
 
+fn is_standalone_bullet_text(text: &str) -> bool {
+    matches!(text.trim(), "•" | "○" | "●" | "◦")
+}
+
+fn first_text_char(text: &str) -> Option<char> {
+    text.trim_start().chars().next()
+}
+
+fn is_short_alpha_fragment(text: &str) -> bool {
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    (1..=4).contains(&char_count) && trimmed.chars().all(char::is_alphabetic)
+}
+
+fn has_phrase_continuation_shape(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed
+        .chars()
+        .take(24)
+        .any(|ch| ch.is_whitespace() || matches!(ch, '-'))
+}
+
+fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
+    if group.len() < 3 {
+        return false;
+    }
+
+    let Some(first) = group.iter().find(|item| !item.text.trim().is_empty()) else {
+        return false;
+    };
+    if group.iter().all(|item| item.mcid.is_none()) {
+        return false;
+    }
+
+    let mut nonempty_count = 0;
+    let mut saw_backtrack = false;
+    let mut nonspace_chars = 0;
+    let mut math_symbol_chars = 0;
+    let mut max_font_size = first.font_size;
+
+    for item in group {
+        if !item.text.trim().is_empty() {
+            nonempty_count += 1;
+        }
+        if (item.font_size - first.font_size).abs() > first.font_size * 0.25 {
+            return false;
+        }
+        max_font_size = max_font_size.max(item.font_size);
+        for ch in item.text.chars().filter(|ch| !ch.is_whitespace()) {
+            nonspace_chars += 1;
+            if matches!(
+                ch,
+                '*' | 'ˆ' | '^' | '=' | '+' | '_' | '[' | ']' | '{' | '}' | '|' | '<' | '>'
+            ) {
+                math_symbol_chars += 1;
+            }
+        }
+    }
+
+    if nonempty_count < 2 {
+        return false;
+    }
+    if nonspace_chars > 0 && math_symbol_chars * 4 > nonspace_chars {
+        return false;
+    }
+
+    let mut sorted_by_x = group.to_vec();
+    sorted_by_x.sort_by(|a, b| a.x.total_cmp(&b.x));
+    let cluster_start = sorted_by_x[0].x;
+    let mut cluster_end = cluster_start + effective_merge_width(sorted_by_x[0]);
+    for item in sorted_by_x.iter().skip(1) {
+        let gap = item.x - cluster_end;
+        if gap > max_font_size * 2.5 {
+            return false;
+        }
+        cluster_end = cluster_end.max(item.x + effective_merge_width(item));
+    }
+    if cluster_end - cluster_start > max_font_size * 36.0 {
+        return false;
+    }
+
+    for index in 0..group.len() - 1 {
+        let previous = group[index];
+        let next = group[index + 1];
+        let font_size = previous.font_size.max(next.font_size);
+        let backtrack_threshold = font_size * 0.25;
+        let previous_start = previous.x;
+        let next_start = next.x;
+        let next_end = next.x + effective_merge_width(next);
+        if next_start < previous_start - backtrack_threshold
+            && next_end > previous_start + backtrack_threshold
+        {
+            let has_near_prefix = group[..=index].iter().rev().take(4).any(|item| {
+                is_short_alpha_fragment(&item.text)
+                    && item.x >= next_start - font_size * 0.5
+                    && item.x <= next_start + font_size * 4.0
+            });
+            let starts_lowercase = first_text_char(&next.text).is_some_and(char::is_lowercase);
+            let phrase_continuation = has_phrase_continuation_shape(&next.text);
+            let has_near_bullet = group[..=index]
+                .iter()
+                .position(|item| {
+                    is_standalone_bullet_text(&item.text) && next_start <= item.x + font_size * 3.0
+                })
+                .is_some_and(|bullet_index| {
+                    if bullet_index >= index {
+                        return false;
+                    }
+                    group[bullet_index + 1..=index]
+                        .iter()
+                        .rev()
+                        .find(|item| !item.text.trim().is_empty())
+                        .is_some_and(|item| {
+                            item.text.trim().chars().count() <= 8
+                                && has_phrase_continuation_shape(&next.text)
+                        })
+                });
+            if (has_near_prefix && starts_lowercase && phrase_continuation) || has_near_bullet {
+                saw_backtrack = true;
+                break;
+            }
+        }
+    }
+
+    saw_backtrack
+}
+
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
@@ -372,28 +499,32 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         }
     }
 
-    // Sort each group by X position (direction-aware)
-    for (_, _, group) in &mut line_groups {
+    let mut ordered_line_groups: Vec<(u32, f32, Vec<&TextItem>, bool)> = Vec::new();
+
+    // Sort each group by X position (direction-aware), except for lines whose
+    // content stream intentionally backtracks to overlay ActualText fragments.
+    for (page, y, mut group) in line_groups {
         let rtl = is_rtl_text(group.iter().map(|i| &i.text));
+        let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
             group.sort_by(|a, b| b.x.total_cmp(&a.x));
-        } else {
+        } else if !preserve_stream_order {
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
         }
+        ordered_line_groups.push((page, y, group, preserve_stream_order));
     }
 
     // Sort groups by page then Y descending (top of page first)
-    line_groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
+    ordered_line_groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
 
     let mut merged = Vec::new();
 
-    for (_, _, group) in &line_groups {
+    for (_, _, group, preserve_stream_order) in &ordered_line_groups {
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
-            let x_gap_max = first.font_size * 0.5;
 
             let mut j = i + 1;
             while j < group.len() {
@@ -403,10 +534,15 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     break;
                 }
                 let gap = next.x - end_x;
+                let x_gap_max = if *preserve_stream_order && is_standalone_bullet_text(&text) {
+                    first.font_size * 1.2
+                } else {
+                    first.font_size * 0.5
+                };
                 if gap > x_gap_max {
                     break;
                 }
-                if gap < -first.font_size * 0.5 {
+                if gap < -first.font_size * 0.5 && !preserve_stream_order {
                     break;
                 }
                 // Insert space at word boundaries.
@@ -428,11 +564,19 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                         first.font_size * 0.08
                     }
                 };
-                if gap > threshold {
+                let needs_bullet_space = *preserve_stream_order
+                    && is_standalone_bullet_text(&text)
+                    && !next.text.trim().is_empty();
+                if needs_bullet_space || gap > threshold {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
-                end_x = next.x + effective_merge_width(next);
+                let next_end = next.x + effective_merge_width(next);
+                end_x = if *preserve_stream_order {
+                    end_x.max(next_end)
+                } else {
+                    next_end
+                };
                 j += 1;
             }
 
@@ -577,6 +721,11 @@ mod tests {
         }
     }
 
+    fn with_mcid(mut item: TextItem) -> TextItem {
+        item.mcid = Some(1);
+        item
+    }
+
     #[test]
     fn trace_text_preview_truncates_on_char_boundary() {
         let text = format!("{}{}tail", "a".repeat(79), '\u{FFFD}');
@@ -623,6 +772,83 @@ mod tests {
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "hello world");
+    }
+
+    #[test]
+    fn merge_items_preserves_stream_order_for_backtracking_heading() {
+        // Some tagged PDFs emit first-letter ActualText fragments, then reset
+        // the text matrix and draw the rest of the word from the line start.
+        let items = vec![
+            with_mcid(make_merge_item("F", 79.4, 4.5)),
+            with_mcid(make_merge_item("r", 83.9, 3.3)),
+            with_mcid(make_merge_item("om tables to data-", 79.4, 89.7)),
+            with_mcid(make_merge_item("", 168.9, 33.9)),
+            with_mcid(make_merge_item("analytics-", 168.9, 75.5)),
+            with_mcid(make_merge_item("ready content", 210.5, 60.8)),
+        ];
+
+        let merged = merge_text_items(items);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].text,
+            "From tables to data-analytics-ready content"
+        );
+    }
+
+    #[test]
+    fn merge_items_preserves_stream_order_for_reset_word_prefix() {
+        let items = vec![
+            with_mcid(make_merge_item("N", 68.0, 7.0)),
+            with_mcid(make_merge_item("e", 75.1, 4.0)),
+            with_mcid(make_merge_item("w fields created", 68.0, 82.0)),
+        ];
+
+        let merged = merge_text_items(items);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "New fields created");
+    }
+
+    #[test]
+    fn merge_items_uses_x_order_for_untagged_backtracking_text() {
+        let items = vec![
+            make_merge_item("N", 68.0, 7.0),
+            make_merge_item("e", 75.1, 4.0),
+            make_merge_item("w fields created", 68.2, 82.0),
+        ];
+
+        let merged = merge_text_items(items);
+
+        let texts: Vec<_> = merged.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, vec!["N", "w fields created", "e"]);
+    }
+
+    #[test]
+    fn merge_items_preserves_bullet_stream_order_with_backtracking() {
+        let items = vec![
+            with_mcid(make_merge_item("•", 79.4, 5.0)),
+            with_mcid(make_merge_item("The MS", 91.0, 32.6)),
+            with_mcid(make_merge_item("A LoS project", 84.4, 70.0)),
+        ];
+
+        let merged = merge_text_items(items);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "• The MSA LoS project");
+    }
+
+    #[test]
+    fn merge_items_keeps_normal_bullet_gap_limit_without_stream_order() {
+        let items = vec![
+            make_merge_item("•", 79.4, 5.0),
+            make_merge_item("Distant item", 91.0, 60.0),
+        ];
+
+        let merged = merge_text_items(items);
+
+        let texts: Vec<_> = merged.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, vec!["•", "Distant item"]);
     }
 
     #[test]
