@@ -526,6 +526,11 @@ pub(crate) fn parse_font_encoding(
     font_dict: &lopdf::Dictionary,
 ) -> Option<EncodingResult> {
     let encoding_obj = font_dict.get(b"Encoding").ok()?;
+    let base_font_name = font_dict
+        .get(b"BaseFont")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .map(|n| String::from_utf8_lossy(n).to_string());
 
     // Encoding can be a name or a dictionary
     match encoding_obj {
@@ -538,12 +543,14 @@ pub(crate) fn parse_font_encoding(
         Object::Reference(obj_ref) => {
             // Reference to encoding dictionary
             if let Ok(enc_dict) = doc.get_dictionary(*obj_ref) {
-                parse_encoding_dictionary(doc, enc_dict)
+                parse_encoding_dictionary(doc, enc_dict, base_font_name.as_deref())
             } else {
                 None
             }
         }
-        Object::Dictionary(enc_dict) => parse_encoding_dictionary(doc, enc_dict),
+        Object::Dictionary(enc_dict) => {
+            parse_encoding_dictionary(doc, enc_dict, base_font_name.as_deref())
+        }
         _ => None,
     }
 }
@@ -562,6 +569,7 @@ pub(crate) struct EncodingResult {
 pub(crate) fn parse_encoding_dictionary(
     doc: &Document,
     enc_dict: &lopdf::Dictionary,
+    base_font_name: Option<&str>,
 ) -> Option<EncodingResult> {
     let differences = enc_dict.get(b"Differences").ok()?;
 
@@ -591,11 +599,9 @@ pub(crate) fn parse_encoding_dictionary(
             Object::Name(name) => {
                 // Map current code to glyph name -> Unicode
                 let glyph_name = String::from_utf8_lossy(&name).to_string();
-                if glyph_name == "fi"
-                    || glyph_name == "fl"
-                    || glyph_name == "ffi"
-                    || glyph_name == "ffl"
-                {
+                let mapped_char = glyph_to_char(&glyph_name)
+                    .or_else(|| private_glyph_to_char(&glyph_name, base_font_name));
+                if mapped_char.is_some_and(is_ligature_char) {
                     debug!(
                         "  Differences: code=0x{:02X} glyph={:?} (ligature)",
                         current_code, glyph_name
@@ -610,7 +616,7 @@ pub(crate) fn parse_encoding_dictionary(
                 {
                     gid_glyph_count += 1;
                 }
-                if let Some(ch) = glyph_to_char(&glyph_name) {
+                if let Some(ch) = mapped_char {
                     encoding_map.insert(current_code, ch);
                 } else {
                     debug!(
@@ -643,6 +649,31 @@ pub(crate) fn parse_encoding_dictionary(
         map: encoding_map,
         gid_glyph_count,
     })
+}
+
+fn private_glyph_to_char(glyph_name: &str, base_font_name: Option<&str>) -> Option<char> {
+    let base_font_name = strip_subset_prefix(base_font_name?);
+
+    // Aptos CFF subsets from Office PDFs can expose the ff ligature as /g431
+    // without a ToUnicode map. Keep this font-scoped because /gNNN names are private.
+    if base_font_name.eq_ignore_ascii_case("Aptos") && glyph_name == "g431" {
+        Some('\u{FB00}')
+    } else {
+        None
+    }
+}
+
+fn strip_subset_prefix(font_name: &str) -> &str {
+    font_name
+        .split_once('+')
+        .map_or(font_name, |(_, stripped)| stripped)
+}
+
+fn is_ligature_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{FB00}' | '\u{FB01}' | '\u{FB02}' | '\u{FB03}' | '\u{FB04}'
+    )
 }
 
 /// Get the CMap lookup key for an Identity-H/V CID font without ToUnicode.
@@ -1214,6 +1245,7 @@ fn score_text(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     fn make_font_info(widths: &[(u16, u16)], default_width: u16, is_cid: bool) -> FontWidthInfo {
         FontWidthInfo {
@@ -1336,6 +1368,51 @@ mod tests {
         let good = "the quick brown fox and the lazy dog";
         let bad = "###!!!@@@$$$";
         assert!(score_text(good) > score_text(bad));
+    }
+
+    fn doc_with_private_differences() -> (Document, lopdf::ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let encoding_id = doc.add_object(dictionary! {
+            "Differences" => Object::Array(vec![
+                Object::Integer(0x88),
+                Object::Name(b"g431".to_vec()),
+                Object::Name(b"fi".to_vec()),
+                Object::Integer(0xAD),
+                Object::Name(b"fl".to_vec()),
+            ]),
+        });
+
+        (doc, encoding_id)
+    }
+
+    #[test]
+    fn aptos_private_g431_maps_to_ff_ligature() {
+        let (doc, encoding_id) = doc_with_private_differences();
+        let font_dict = dictionary! {
+            "BaseFont" => Object::Name(b"NJEQOD+Aptos".to_vec()),
+            "Encoding" => Object::Reference(encoding_id),
+        };
+
+        let result = parse_font_encoding(&doc, &font_dict).expect("encoding should parse");
+
+        assert_eq!(result.map.get(&0x88u8), Some(&'\u{FB00}'));
+        assert_eq!(result.map.get(&0x89u8), Some(&'\u{FB01}'));
+        assert_eq!(result.map.get(&0xADu8), Some(&'\u{FB02}'));
+    }
+
+    #[test]
+    fn private_g431_does_not_map_for_unrelated_fonts() {
+        let (doc, encoding_id) = doc_with_private_differences();
+        let font_dict = dictionary! {
+            "BaseFont" => Object::Name(b"ABCDEF+OtherFont".to_vec()),
+            "Encoding" => Object::Reference(encoding_id),
+        };
+
+        let result = parse_font_encoding(&doc, &font_dict).expect("encoding should parse");
+
+        assert!(!result.map.contains_key(&0x88u8));
+        assert_eq!(result.map.get(&0x89u8), Some(&'\u{FB01}'));
+        assert_eq!(result.map.get(&0xADu8), Some(&'\u{FB02}'));
     }
 
     #[test]
