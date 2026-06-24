@@ -725,6 +725,8 @@ pub(crate) fn extract_text_from_operand(
     let is_type0_cid_font = font_widths
         .get(current_font)
         .is_some_and(|info| info.is_cid);
+    let use_cp1252_fallback =
+        should_use_cp1252_single_byte_fallback(base_font_name, is_type0_cid_font);
     let result = (|| -> Option<String> {
         if let Object::String(bytes, _) = obj {
             let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<String> {
@@ -757,7 +759,10 @@ pub(crate) fn extract_text_from_operand(
                             }
                             // 4. Printable single-byte fallback
                             if b >= 0x20 {
-                                return Some(decode_single_byte_fallback_char(b).to_string());
+                                return Some(
+                                    decode_single_byte_fallback_char(b, use_cp1252_fallback)
+                                        .to_string(),
+                                );
                             }
                             None
                         })
@@ -882,7 +887,7 @@ pub(crate) fn extract_text_from_operand(
                                 // Base encoding fallback for printable bytes.
                                 // Most PDFs with simple fonts use WinAnsi/PDFDocEncoding
                                 // semantics, not ISO-8859-1 C1 controls.
-                                Some(decode_single_byte_fallback_char(b))
+                                Some(decode_single_byte_fallback_char(b, use_cp1252_fallback))
                             } else {
                                 None // Skip unmapped control characters
                             }
@@ -938,11 +943,7 @@ pub(crate) fn extract_text_from_operand(
             // Try to decode using cached font encoding from lopdf
             if let Some(encoding) = encoding_cache.get(current_font) {
                 if let Ok(text) = Document::decode_text(encoding, bytes) {
-                    let text = if is_type0_cid_font {
-                        text
-                    } else {
-                        normalize_cp1252_controls(text)
-                    };
+                    let text = normalize_cp1252_controls(text, use_cp1252_fallback);
                     if text.contains('\u{FFFD}') {
                         debug!(
                             "decode_text produced replacement for font={} bytes_len={}",
@@ -983,29 +984,29 @@ pub(crate) fn extract_text_from_operand(
             // encodings. In practice the fallback should follow WinAnsi for
             // 0x80..=0x9F so bytes like 0x92 become smart punctuation instead
             // of C1 controls that look like CID mojibake.
-            Some(decode_single_byte_fallback(bytes))
+            Some(decode_single_byte_fallback(bytes, use_cp1252_fallback))
         } else {
             None
         }
     })();
     result.map(|text| {
         let text = clean_symbol_pua(text);
-        if is_type0_cid_font {
-            text
-        } else {
-            normalize_cp1252_controls(text)
-        }
+        normalize_cp1252_controls(text, use_cp1252_fallback)
     })
 }
 
-fn decode_single_byte_fallback(bytes: &[u8]) -> String {
+fn decode_single_byte_fallback(bytes: &[u8], use_cp1252_fallback: bool) -> String {
     bytes
         .iter()
-        .map(|&b| decode_single_byte_fallback_char(b))
+        .map(|&b| decode_single_byte_fallback_char(b, use_cp1252_fallback))
         .collect()
 }
 
-fn decode_single_byte_fallback_char(byte: u8) -> char {
+fn decode_single_byte_fallback_char(byte: u8, use_cp1252_fallback: bool) -> char {
+    if !use_cp1252_fallback {
+        return byte as char;
+    }
+
     match byte {
         0x80 => '\u{20AC}',
         0x82 => '\u{201A}',
@@ -1038,7 +1039,10 @@ fn decode_single_byte_fallback_char(byte: u8) -> char {
     }
 }
 
-fn normalize_cp1252_controls(text: String) -> String {
+fn normalize_cp1252_controls(text: String, use_cp1252_fallback: bool) -> String {
+    if !use_cp1252_fallback {
+        return text;
+    }
     if !text
         .chars()
         .any(|ch| ('\u{0080}'..='\u{009F}').contains(&ch))
@@ -1049,12 +1053,46 @@ fn normalize_cp1252_controls(text: String) -> String {
     text.chars()
         .map(|ch| {
             if ('\u{0080}'..='\u{009F}').contains(&ch) {
-                decode_single_byte_fallback_char(ch as u8)
+                decode_single_byte_fallback_char(ch as u8, true)
             } else {
                 ch
             }
         })
         .collect()
+}
+
+fn should_use_cp1252_single_byte_fallback(
+    base_font_name: Option<&str>,
+    is_type0_cid_font: bool,
+) -> bool {
+    if is_type0_cid_font {
+        return false;
+    }
+
+    let Some(base_font_name) = base_font_name else {
+        return true;
+    };
+    let font_name = base_font_name
+        .rsplit_once('+')
+        .map_or(base_font_name, |(_, stripped)| stripped)
+        .to_ascii_lowercase();
+
+    // TeX/Computer Modern and math/symbol fonts often place ligatures or
+    // symbols in the C1 byte range. Treating those bytes as Windows-1252 makes
+    // words like "deficiente" become "de…ciente" and "fluid" become "‡uid".
+    let non_cp1252_prefixes = [
+        "cmr", "cmb", "cmmi", "cmsy", "cmex", "cmtt", "cmss", "cmti", "ecrm", "ecbx", "ecti",
+        "tcrm", "tctt", "msam", "msbm", "ttdc",
+    ];
+    if non_cp1252_prefixes
+        .iter()
+        .any(|prefix| font_name.starts_with(prefix))
+    {
+        return false;
+    }
+
+    let non_cp1252_names = ["math", "symbol", "dingbat", "emoji"];
+    !non_cp1252_names.iter().any(|name| font_name.contains(name))
 }
 
 /// Replace PUA characters in the F000-F0FF range with standard Unicode equivalents.
@@ -1425,7 +1463,29 @@ mod tests {
 
     #[test]
     fn cached_encoding_decode_normalizes_cp1252_controls() {
-        let text = normalize_cp1252_controls("d\u{92}un \u{96} test".to_string());
+        let text = normalize_cp1252_controls("d\u{92}un \u{96} test".to_string(), true);
         assert_eq!(text, "d’un – test");
+    }
+
+    #[test]
+    fn tex_font_decode_keeps_c1_ligature_bytes_unmodified() {
+        let text = normalize_cp1252_controls("de\u{85}ciente \u{87}uid".to_string(), false);
+        assert_eq!(text, "de\u{85}ciente \u{87}uid");
+        assert!(!should_use_cp1252_single_byte_fallback(
+            Some("TTdcr10"),
+            false
+        ));
+        assert!(!should_use_cp1252_single_byte_fallback(
+            Some("cmr10"),
+            false
+        ));
+    }
+
+    #[test]
+    fn winansi_text_font_uses_cp1252_fallback() {
+        assert!(should_use_cp1252_single_byte_fallback(
+            Some("BJPQNQ+Times-Roman"),
+            false
+        ));
     }
 }
