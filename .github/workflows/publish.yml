@@ -3,7 +3,10 @@ name: Publish npm package
 on:
   push:
     branches: [main]
-    paths: ['napi/package.json']
+    paths:
+      - '.github/workflows/publish.yml'
+      - 'napi/package.json'
+      - 'napi/legacy/**'
 
 permissions:
   contents: read
@@ -14,29 +17,60 @@ jobs:
     name: Check version change
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.check.outputs.changed }}
-      version: ${{ steps.check.outputs.version }}
+      scoped_changed: ${{ steps.check.outputs.scoped_changed }}
+      scoped_version: ${{ steps.check.outputs.scoped_version }}
+      legacy_changed: ${{ steps.check.outputs.legacy_changed }}
+      legacy_version: ${{ steps.check.outputs.legacy_version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      - name: Check if version changed
+      - name: Check if versions changed
         id: check
         run: |
-          NEW_VERSION=$(node -p "require('./napi/package.json').version")
-          OLD_VERSION=$(git show HEAD~1:napi/package.json | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
-          echo "old=$OLD_VERSION new=$NEW_VERSION"
-          if [ "$NEW_VERSION" != "$OLD_VERSION" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          SCOPED_NEW=$(node -p "require('./napi/package.json').version")
+          if git show HEAD~1:napi/package.json >/tmp/scoped-package-old.json 2>/dev/null; then
+            SCOPED_OLD=$(node -p "JSON.parse(require('fs').readFileSync('/tmp/scoped-package-old.json','utf8')).version")
           else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+            SCOPED_OLD=""
+          fi
+
+          LEGACY_NEW=$(node -p "require('./napi/legacy/package.json').version")
+          if git show HEAD~1:napi/legacy/package.json >/tmp/legacy-package-old.json 2>/dev/null; then
+            LEGACY_OLD=$(node -p "JSON.parse(require('fs').readFileSync('/tmp/legacy-package-old.json','utf8')).version")
+          else
+            LEGACY_OLD=""
+          fi
+
+          echo "scoped old=$SCOPED_OLD new=$SCOPED_NEW"
+          echo "legacy old=$LEGACY_OLD new=$LEGACY_NEW"
+
+          if [ "$LEGACY_NEW" != "$SCOPED_NEW" ]; then
+            echo "Legacy package version ($LEGACY_NEW) must match scoped package version ($SCOPED_NEW)." >&2
+            exit 1
+          fi
+
+          echo "scoped_version=$SCOPED_NEW" >> "$GITHUB_OUTPUT"
+          echo "legacy_version=$LEGACY_NEW" >> "$GITHUB_OUTPUT"
+
+          if [ "$SCOPED_NEW" != "$SCOPED_OLD" ]; then
+            echo "scoped_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "scoped_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$LEGACY_NEW" != "$LEGACY_OLD" ]; then
+            echo "legacy_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "legacy_changed=false" >> "$GITHUB_OUTPUT"
           fi
 
   build:
     needs: check-version
-    if: needs.check-version.outputs.changed == 'true'
+    if: needs.check-version.outputs.scoped_changed == 'true'
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -99,6 +133,7 @@ jobs:
     name: Publish to npm
     needs: [check-version, build]
     runs-on: ubuntu-latest
+    if: ${{ always() && (needs.check-version.outputs.scoped_changed == 'true' || needs.check-version.outputs.legacy_changed == 'true') && (needs.check-version.outputs.scoped_changed != 'true' || needs.build.result == 'success') }}
     permissions:
       contents: read
       id-token: write
@@ -111,11 +146,13 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Download all artifacts
+        if: needs.check-version.outputs.scoped_changed == 'true'
         uses: actions/download-artifact@v4
         with:
           path: napi/artifacts
 
-      - name: Collect binaries and publish
+      - name: Collect binaries and publish scoped package
+        if: needs.check-version.outputs.scoped_changed == 'true'
         working-directory: napi
         run: |
           cp artifacts/bindings-*/*.node .
@@ -126,3 +163,20 @@ jobs:
           ls -la *.node index.js index.d.ts
 
           npm publish --provenance --access public
+
+      - name: Publish legacy package wrapper
+        if: needs.check-version.outputs.legacy_changed == 'true'
+        working-directory: napi/legacy
+        run: npm publish --provenance
+
+      - name: Deprecate legacy package
+        if: needs.check-version.outputs.legacy_changed == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is not configured; skipping npm deprecate."
+            exit 0
+          fi
+
+          npm deprecate firecrawl-pdf-inspector "Deprecated: this package has moved to @firecrawl/pdf-inspector. Please install @firecrawl/pdf-inspector instead."

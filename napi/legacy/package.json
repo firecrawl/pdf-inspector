@@ -1,0 +1,35 @@
+{
+  "name": "firecrawl-pdf-inspector",
+  "version": "1.9.8",
+  "description": "Deprecated compatibility wrapper for @firecrawl/pdf-inspector.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "pdf-inspector": "bin/pdf-inspector.mjs"
+  },
+  "license": "MIT",
+  "keywords": [
+    "pdf",
+    "pdf-extraction",
+    "pdf-parser",
+    "text-extraction",
+    "ocr",
+    "pdf-classification",
+    "firecrawl",
+    "deprecated"
+  ],
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "bin/",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/firecrawl/pdf-inspector"
+  },
+  "homepage": "https://github.com/firecrawl/pdf-inspector",
+  "dependencies": {
+    "@firecrawl/pdf-inspector": "1.9.8"
+  }
+}
