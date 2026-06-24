@@ -1234,11 +1234,7 @@ pub(crate) fn group_into_lines_with_thresholds(
                             ci,
                             item.x,
                             item.y,
-                            if item.text.len() > 60 {
-                                &item.text[..60]
-                            } else {
-                                &item.text
-                            }
+                            super::trace_text_preview(&item.text, 60)
                         );
                     }
                 }

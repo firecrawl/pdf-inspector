@@ -33,6 +33,13 @@ pub(crate) use layout::ColumnRegion;
 // Public API
 // ---------------------------------------------------------------------------
 
+pub(crate) fn trace_text_preview(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
 /// Extract text from PDF file as plain string
 pub fn extract_text<P: AsRef<Path>>(path: P) -> Result<String, PdfError> {
     crate::validate_pdf_file(&path)?;
@@ -195,11 +202,7 @@ fn extract_positioned_text_impl(
                     item.width,
                     item.font_size,
                     item.font,
-                    if item.text.len() > 80 {
-                        &item.text[..80]
-                    } else {
-                        &item.text
-                    }
+                    trace_text_preview(&item.text, 80)
                 );
             }
         }
@@ -572,6 +575,16 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    #[test]
+    fn trace_text_preview_truncates_on_char_boundary() {
+        let text = format!("{}{}tail", "a".repeat(79), '\u{FFFD}');
+        let preview = trace_text_preview(&text, 80);
+
+        assert_eq!(preview.chars().count(), 80);
+        assert!(text.is_char_boundary(preview.len()));
+        assert!(preview.ends_with('\u{FFFD}'));
     }
 
     #[test]
