@@ -14,6 +14,10 @@ permissions:
 jobs:
   check-version:
     name: Check version change
+    # Guard manual dispatches too: PyPI trusted publishing matches
+    # repo+workflow+environment but NOT branch, so without this a
+    # workflow_dispatch from any branch could publish unmerged code.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.check.outputs.changed }}
@@ -31,20 +35,26 @@ jobs:
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "manual dispatch: publishing v$NEW_VERSION if not already on PyPI"
+            # Manual dispatch always rebuilds and publishes. Combined with
+            # skip-existing on the publish step, this repairs partial releases
+            # (PyPI's version endpoint returns 200 even when only some of the
+            # expected wheels were uploaded).
+            echo "manual dispatch: publishing v$NEW_VERSION (skip-existing handles uploaded files)"
             echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            OLD_VERSION=$(git show HEAD~1:Cargo.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
-            echo "old=$OLD_VERSION new=$NEW_VERSION"
-
-            if [ "$NEW_VERSION" = "$OLD_VERSION" ]; then
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              echo "published=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          OLD_VERSION=$(git show HEAD~1:Cargo.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
+          echo "old=$OLD_VERSION new=$NEW_VERSION"
+
+          if [ "$NEW_VERSION" = "$OLD_VERSION" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
 
           HTTP_STATUS=$(curl --silent --show-error --output /tmp/pypi-version.json --write-out "%{http_code}" \
             "https://pypi.org/pypi/pdf-inspector/$NEW_VERSION/json")
@@ -146,3 +156,6 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          # Tolerate already-uploaded files so a manual re-run can complete
+          # a release that previously failed partway through.
+          skip-existing: true
