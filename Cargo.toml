@@ -1,6 +1,6 @@
 [package]
 name = "pdf-inspector"
-version = "0.1.4"
+version = "0.2.1"
 edition = "2021"
 autobins = false
 authors = ["Firecrawl Team"]
@@ -14,7 +14,7 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 # Python bindings
-pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py38"], optional = true }
 
 # PDF parsing
 lopdf = { version = "0.41.0", features = ["rayon"] }

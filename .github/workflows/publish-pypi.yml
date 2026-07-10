@@ -1,0 +1,148 @@
+name: Publish Python package
+
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.toml']
+  # Manual fallback: re-publish the current version without a version bump
+  # (e.g. first run after PyPI trusted publishing is configured).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    name: Check version change
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      published: ${{ steps.check.outputs.published }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if version changed
+        id: check
+        run: |
+          NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch: publishing v$NEW_VERSION if not already on PyPI"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            OLD_VERSION=$(git show HEAD~1:Cargo.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
+            echo "old=$OLD_VERSION new=$NEW_VERSION"
+
+            if [ "$NEW_VERSION" = "$OLD_VERSION" ]; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          HTTP_STATUS=$(curl --silent --show-error --output /tmp/pypi-version.json --write-out "%{http_code}" \
+            "https://pypi.org/pypi/pdf-inspector/$NEW_VERSION/json")
+
+          case "$HTTP_STATUS" in
+            200)
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "pdf-inspector v$NEW_VERSION is already published to PyPI"
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              cat /tmp/pypi-version.json
+              echo "Unexpected PyPI response: $HTTP_STATUS" >&2
+              exit 1
+              ;;
+          esac
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true' && needs.check-version.outputs.published == 'false'
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true' && needs.check-version.outputs.published == 'false'
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: [check-version, build, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
