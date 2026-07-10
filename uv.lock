@@ -1,0 +1,8 @@
+version = 1
+revision = 3
+requires-python = ">=3.8"
+
+[[package]]
+name = "pdf-inspector"
+version = "0.2.1"
+source = { editable = "." }

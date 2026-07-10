@@ -3,7 +3,7 @@ name: Publish Python package
 on:
   push:
     branches: [main]
-    paths: ['Cargo.toml']
+    paths: ['pyproject.toml']
   # Manual fallback: re-publish the current version without a version bump
   # (e.g. first run after PyPI trusted publishing is configured).
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
       - name: Check if version changed
         id: check
         run: |
-          NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')
+          NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -45,7 +45,7 @@ jobs:
             exit 0
           fi
 
-          OLD_VERSION=$(git show HEAD~1:Cargo.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
+          OLD_VERSION=$(git show HEAD~1:pyproject.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')
           echo "old=$OLD_VERSION new=$NEW_VERSION"
 
           if [ "$NEW_VERSION" = "$OLD_VERSION" ]; then

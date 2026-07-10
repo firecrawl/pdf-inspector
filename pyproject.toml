@@ -4,9 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "pdf-inspector"
-# Version is sourced from Cargo.toml [package] version by maturin so the Python
-# artifact always tracks the crate release instead of drifting on its own.
-dynamic = ["version"]
+# Bump this to publish to PyPI — CI publishes automatically when the version
+# changes on main (same flow as napi/package.json for npm).
+version = "0.2.1"
 description = "Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection"
 license = { text = "MIT" }
 requires-python = ">=3.8"
