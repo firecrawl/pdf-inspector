@@ -139,7 +139,7 @@ fn is_page_number_cell(cell: &str) -> bool {
         if all_digits {
             return t.len() <= 4;
         }
-        if is_canonical_roman(t) {
+        if super::canonical_roman_value(t).is_some() {
             return true;
         }
         // Section-page form: uppercase letters, digits, dashes; at least
@@ -147,37 +147,6 @@ fn is_page_number_cell(cell: &str) -> bool {
         t.chars()
             .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase() || c == '-')
             && t.chars().any(|c| c.is_ascii_digit())
-    })
-}
-
-/// True when `token` is a canonical lowercase/uppercase roman numeral in the
-/// i/v/x/l/c range (rejects ordinary words like "civil" or "mix").
-fn is_canonical_roman(token: &str) -> bool {
-    let lower = token.to_ascii_lowercase();
-    if lower.is_empty() || !lower.chars().all(|c| "ivxlc".contains(c)) {
-        return false;
-    }
-    const TABLE: [(u32, &str); 9] = [
-        (100, "c"),
-        (90, "xc"),
-        (50, "l"),
-        (40, "xl"),
-        (10, "x"),
-        (9, "ix"),
-        (5, "v"),
-        (4, "iv"),
-        (1, "i"),
-    ];
-    // Re-encode 1..=399 and check for an exact match.
-    (1..400u32).any(|mut n| {
-        let mut out = String::new();
-        for (val, sym) in TABLE {
-            while n >= val {
-                out.push_str(sym);
-                n -= val;
-            }
-        }
-        out == lower
     })
 }
 

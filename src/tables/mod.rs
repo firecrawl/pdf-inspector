@@ -177,6 +177,60 @@ pub(crate) fn try_build_rect_guided_table(
     ))
 }
 
+/// Canonical lowercase roman numeral for `n` (the i/v/x/l/c range).
+pub(super) fn to_roman_lower(mut n: u32) -> String {
+    const TABLE: [(u32, &str); 9] = [
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut out = String::new();
+    for (val, sym) in TABLE {
+        while n >= val {
+            out.push_str(sym);
+            n -= val;
+        }
+    }
+    out
+}
+
+/// Parse a *canonical* roman numeral (i/v/x/l/c range, ≤8 chars) to its value.
+/// Returns `None` for non-canonical strings, so ordinary words made of those
+/// letters — "civil", "mix", "ill" — are not mistaken for numbers. Shared by
+/// the TOC detector and the TOC formatter so the two stay in sync.
+pub(super) fn canonical_roman_value(token: &str) -> Option<u32> {
+    let lower = token.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.len() > 8 || !lower.chars().all(|c| "ivxlc".contains(c)) {
+        return None;
+    }
+    let mut total = 0i32;
+    let mut prev = 0i32;
+    for c in lower.chars().rev() {
+        let v = match c {
+            'i' => 1,
+            'v' => 5,
+            'x' => 10,
+            'l' => 50,
+            'c' => 100,
+            _ => return None,
+        };
+        if v < prev {
+            total -= v;
+        } else {
+            total += v;
+            prev = v;
+        }
+    }
+    let value = u32::try_from(total).ok().filter(|&n| n > 0)?;
+    (to_roman_lower(value) == lower).then_some(value)
+}
+
 /// Split a TextItem whose text contains multiple whitespace-separated tokens
 /// (like "10 11 12 ... 31") into individual TextItems, each assigned to the
 /// nearest column boundary.

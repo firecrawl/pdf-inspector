@@ -917,31 +917,10 @@ pub fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
     is_dot_leader_toc(cells) || is_tabular_toc(cells) || is_page_number_toc(cells)
 }
 
-/// Canonical lowercase roman numeral for `n` (covers the i/v/x/l/c range).
-fn to_roman_lower(mut n: u32) -> String {
-    const TABLE: [(u32, &str); 9] = [
-        (100, "c"),
-        (90, "xc"),
-        (50, "l"),
-        (40, "xl"),
-        (10, "x"),
-        (9, "ix"),
-        (5, "v"),
-        (4, "iv"),
-        (1, "i"),
-    ];
-    let mut out = String::new();
-    for (val, sym) in TABLE {
-        while n >= val {
-            out.push_str(sym);
-            n -= val;
-        }
-    }
-    out
-}
-
 /// Parse a page-number-like token: a short arabic integer (≤4 digits) or a
-/// lowercase/uppercase roman numeral (front-matter pages: i, ii, …, xii).
+/// canonical roman numeral (front-matter pages: i, ii, …, xxxviii). Roman
+/// parsing is shared with the formatter via `super::canonical_roman_value` so
+/// the two stay in sync.
 fn page_number_value(token: &str) -> Option<u32> {
     let t = token.trim();
     if t.is_empty() {
@@ -950,33 +929,7 @@ fn page_number_value(token: &str) -> Option<u32> {
     if t.chars().all(|c| c.is_ascii_digit()) && t.len() <= 4 {
         return t.parse().ok();
     }
-    // Roman numeral: accept only *canonical* forms so ordinary words made of
-    // {i,v,x,l,c} — "civil", "ill", "mix" — aren't mistaken for page numbers.
-    // Parse subtractively, then require the value to re-encode to the input.
-    let lower = t.to_ascii_lowercase();
-    if !lower.is_empty() && lower.len() <= 6 && lower.chars().all(|c| "ivxlc".contains(c)) {
-        let mut total = 0i32;
-        let mut prev = 0i32;
-        for c in lower.chars().rev() {
-            let v = match c {
-                'i' => 1,
-                'v' => 5,
-                'x' => 10,
-                'l' => 50,
-                'c' => 100,
-                _ => return None,
-            };
-            if v < prev {
-                total -= v;
-            } else {
-                total += v;
-                prev = v;
-            }
-        }
-        let value = u32::try_from(total).ok().filter(|&n| n > 0)?;
-        return (to_roman_lower(value) == lower).then_some(value);
-    }
-    None
+    super::canonical_roman_value(t)
 }
 
 /// Page-number-column TOC: title-based contents with no dot leaders and no
@@ -1039,7 +992,18 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
         return false;
     }
     let non_decreasing = page_vals.windows(2).filter(|w| w[1] >= w[0]).count();
-    (non_decreasing as f32) >= 0.7 * (page_vals.len() - 1) as f32
+    if (non_decreasing as f32) < 0.7 * (page_vals.len() - 1) as f32 {
+        return false;
+    }
+
+    // Stronger TOC signal: real page numbers SPAN the document — they skip
+    // (3, 6, 13, 24, …) so their range far exceeds the entry count. A dense
+    // ordinal / rank / ID column (1, 2, 3, …) has a range close to its length.
+    // Require the span to exceed the number of entries, which rejects those
+    // consecutive-sequence data tables that monotonicity alone would pass.
+    let min = *page_vals.iter().min().unwrap();
+    let max = *page_vals.iter().max().unwrap();
+    max.saturating_sub(min) > page_vals.len() as u32
 }
 
 /// Dot-leader TOC: any "Chapter 1 ........ 42" style with explicit leader
@@ -2024,6 +1988,22 @@ mod tests {
         assert_eq!(page_number_value("ix"), Some(9));
         assert_eq!(page_number_value("xii"), Some(12));
         assert_eq!(page_number_value("42"), Some(42));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_dense_ordinal_column() {
+        // Headerless title | rank table: values are a consecutive 1..n
+        // sequence (monotonic, no header, text first column) but their range
+        // ~= the row count, so it is data, not a table of contents.
+        let cells: Vec<Vec<String>> = vec![
+            vec!["Alice".into(), "1".into()],
+            vec!["Bob".into(), "2".into()],
+            vec!["Carol".into(), "3".into()],
+            vec!["Dave".into(), "4".into()],
+            vec!["Erin".into(), "5".into()],
+            vec!["Frank".into(), "6".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
     }
 
     #[test]
