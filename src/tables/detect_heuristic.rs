@@ -996,14 +996,44 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
         return false;
     }
 
-    // Stronger TOC signal: real page numbers SPAN the document — they skip
-    // (3, 6, 13, 24, …) so their range far exceeds the entry count. A dense
-    // ordinal / rank / ID column (1, 2, 3, …) has a range close to its length.
-    // Require the span to exceed the number of entries, which rejects those
-    // consecutive-sequence data tables that monotonicity alone would pass.
+    // Stronger TOC signal. Real page numbers SPAN the document — entries skip
+    // (3, 6, 13, 24, …) so their range exceeds the entry count. A rank / ID /
+    // ordinal column is instead a *perfectly dense* consecutive run (1,2,3,… or
+    // 100,101,102,…). Accept anything with page gaps; for a dense run — which a
+    // one-page-per-entry TOC can also produce — fall back to a title signal:
+    // real contents entries are multi-word headings, rank labels are short.
     let min = *page_vals.iter().min().unwrap();
     let max = *page_vals.iter().max().unwrap();
-    max.saturating_sub(min) > page_vals.len() as u32
+    let span = max.saturating_sub(min);
+    if span > page_vals.len() as u32 {
+        return true;
+    }
+    let dense_consecutive = (span as usize) + 1 == page_vals.len() && {
+        let mut sorted = page_vals.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted.len() == page_vals.len()
+    };
+    if !dense_consecutive {
+        // Narrow range but with a gap or repeat — still contents-like.
+        return true;
+    }
+    // Dense counter: only a TOC if the titles read like headings, not the
+    // short single-word labels typical of rank/leaderboard/ID tables.
+    let (total_words, titled_rows) = cells
+        .iter()
+        .filter_map(|row| row.first())
+        .filter(|c| c.chars().any(|ch| ch.is_alphabetic()))
+        .fold((0usize, 0usize), |(w, n), c| {
+            (
+                w + c
+                    .split_whitespace()
+                    .filter(|t| t.chars().any(|ch| ch.is_alphabetic()))
+                    .count(),
+                n + 1,
+            )
+        });
+    titled_rows > 0 && (total_words as f32) / titled_rows as f32 >= 1.8
 }
 
 /// Dot-leader TOC: any "Chapter 1 ........ 42" style with explicit leader
@@ -1988,6 +2018,21 @@ mod tests {
         assert_eq!(page_number_value("ix"), Some(9));
         assert_eq!(page_number_value("xii"), Some(12));
         assert_eq!(page_number_value("42"), Some(42));
+    }
+
+    #[test]
+    fn page_number_toc_matches_consecutive_pages_with_titles() {
+        // A short chapter-per-page contents: pages are a dense 1..n run, but
+        // the multi-word titles mark it as a real TOC (recovered by the title
+        // signal rather than rejected for lacking page gaps).
+        let cells: Vec<Vec<String>> = vec![
+            vec!["Introduction to the Study".into(), "1".into()],
+            vec!["Materials and Methods".into(), "2".into()],
+            vec!["Results and Discussion".into(), "3".into()],
+            vec!["Summary of Findings".into(), "4".into()],
+            vec!["References and Notes".into(), "5".into()],
+        ];
+        assert!(is_page_number_toc(&cells));
     }
 
     #[test]
