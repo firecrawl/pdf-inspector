@@ -208,6 +208,157 @@ fn normalize_for_comparison(s: &str) -> String {
     trimmed.to_string()
 }
 
+/// Compact a comparison key for fuzzy matching of damaged running headers.
+///
+/// Some tagged PDFs emit running footer text with overlapping fragments, so one
+/// page may read "F rom ..." while later pages read "F om r ...". Exact
+/// normalized text still drives candidate discovery; this compact form is only
+/// used when deciding whether a one-off edge line is close enough to an already
+/// repeated candidate.
+fn compact_comparison_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn bounded_levenshtein(a: &str, b: &str, max_distance: usize) -> Option<usize> {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+
+    if a_chars.len().abs_diff(b_chars.len()) > max_distance {
+        return None;
+    }
+
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0; b_chars.len() + 1];
+
+    for (i, a_ch) in a_chars.iter().enumerate() {
+        curr[0] = i + 1;
+        let mut row_min = curr[0];
+
+        for (j, b_ch) in b_chars.iter().enumerate() {
+            let cost = usize::from(a_ch != b_ch);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+            row_min = row_min.min(curr[j + 1]);
+        }
+
+        if row_min > max_distance {
+            return None;
+        }
+
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    let distance = prev[b_chars.len()];
+    (distance <= max_distance).then_some(distance)
+}
+
+fn matches_candidate(
+    normalized: &str,
+    candidates: &HashSet<String>,
+    compact_candidates: &[String],
+) -> bool {
+    if candidates.contains(normalized) {
+        return true;
+    }
+
+    if !has_broken_word_spacing(normalized) {
+        return false;
+    }
+
+    let compact = compact_comparison_key(normalized);
+    if compact.len() < 20 {
+        return false;
+    }
+
+    compact_candidates.iter().any(|candidate| {
+        candidate.len().abs_diff(compact.len()) <= 2
+            && bounded_levenshtein(&compact, candidate, 2).is_some()
+    })
+}
+
+fn ends_with_hyphen(raw: &str) -> bool {
+    matches!(
+        raw.chars().last(),
+        Some('-' | '\u{00ad}' | '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}')
+    )
+}
+
+fn suspicious_short_token(raw: &str, alpha: &str, contains_equals: bool) -> bool {
+    let len = alpha.chars().count();
+    if len == 0 || len > 2 || ends_with_hyphen(raw) {
+        return false;
+    }
+
+    if contains_equals {
+        let raw_alpha: String = raw.chars().filter(|c| c.is_alphabetic()).collect();
+        if raw_alpha.chars().all(|c| c.is_uppercase()) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_uppercase_heavy(text: &str) -> bool {
+    let mut alpha = 0usize;
+    let mut uppercase = 0usize;
+    let mut lowercase = 0usize;
+
+    for ch in text.chars().filter(|ch| ch.is_alphabetic()) {
+        alpha += 1;
+        if ch.is_uppercase() {
+            uppercase += 1;
+        } else if ch.is_lowercase() {
+            lowercase += 1;
+        }
+    }
+
+    alpha >= 12 && lowercase == 0 && uppercase * 100 / alpha >= 80
+}
+
+fn has_broken_word_spacing(text: &str) -> bool {
+    if is_uppercase_heavy(text) {
+        return false;
+    }
+
+    let contains_equals = text.contains('=');
+    let tokens: Vec<(usize, bool)> = text
+        .split_whitespace()
+        .filter_map(|raw| {
+            let alpha: String = raw
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .flat_map(|c| c.to_lowercase())
+                .collect();
+            let len = alpha.chars().count();
+            (len > 0).then(|| (len, suspicious_short_token(raw, &alpha, contains_equals)))
+        })
+        .collect();
+
+    if tokens.len() < 4 {
+        return false;
+    }
+
+    let suspicious_tokens = tokens.iter().filter(|(_, suspicious)| *suspicious).count();
+    if suspicious_tokens < 3 {
+        return false;
+    }
+
+    let split_word_windows = tokens
+        .windows(3)
+        .filter(|window| window[0].0 >= 3 && window[1].1 && window[2].0 >= 3)
+        .count();
+    let adjacent_fragments = tokens
+        .windows(2)
+        .filter(|window| window[0].1 && window[1].1)
+        .count();
+
+    suspicious_tokens as f32 / tokens.len() as f32 >= 0.35
+        && (split_word_windows > 0 || adjacent_fragments > 0)
+}
+
 /// Returns true if the line looks like a list item or heading (should not be stripped).
 fn is_structural_line(text: &str) -> bool {
     let t = text.trim_start();
@@ -236,7 +387,9 @@ fn is_decorative_separator(text: &str) -> bool {
 /// Strip lines that repeat on many distinct pages (running headers/footers).
 ///
 /// A line is considered a repeated header/footer if:
-/// 1. Its normalized text appears on `>= max(3, page_count * 30%)` distinct pages
+/// 1. Its normalized text appears on enough distinct pages. The normal threshold
+///    is document-wide; visibly broken/letter-spaced running text can use a
+///    capped chapter-level threshold in long books.
 /// 2. It is at least 10 characters long
 /// 3. It doesn't look like a structural element (heading, list item)
 /// 4. It consistently appears in the top or bottom N distinct Y positions
@@ -253,13 +406,27 @@ fn is_decorative_separator(text: &str) -> bool {
 /// Page numbers are stripped from line text before comparison, so headers like
 /// "Chapter 3 — Page 5" and "Chapter 3 — Page 6" are treated as the same text.
 pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
-    if lines.is_empty() || page_count < 3 {
+    let removal_set = find_repeated_line_indices(&lines, page_count);
+    if removal_set.is_empty() {
         return lines;
+    }
+
+    lines
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| !removal_set.contains(idx))
+        .map(|(_, line)| line)
+        .collect()
+}
+
+fn find_repeated_line_indices(lines: &[TextLine], page_count: u32) -> HashSet<usize> {
+    if lines.is_empty() || page_count < 3 {
+        return HashSet::new();
     }
 
     // Compute Y range per page (min_y, max_y)
     let mut page_y_range: HashMap<u32, (f32, f32)> = HashMap::new();
-    for line in &lines {
+    for line in lines {
         let entry = page_y_range.entry(line.page).or_insert((line.y, line.y));
         if line.y < entry.0 {
             entry.0 = line.y;
@@ -271,7 +438,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
 
     // Build sorted Y values per page, so we can check line rank (position from edge)
     let mut page_sorted_ys: HashMap<u32, Vec<f32>> = HashMap::new();
-    for line in &lines {
+    for line in lines {
         page_sorted_ys.entry(line.page).or_default().push(line.y);
     }
     for ys in page_sorted_ys.values_mut() {
@@ -287,23 +454,39 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     // page margin.
     const EDGE_LINE_COUNT: usize = 5;
 
+    fn y_position_rank(
+        y: f32,
+        page: u32,
+        page_sorted_ys: &HashMap<u32, Vec<f32>>,
+    ) -> Option<(usize, usize)> {
+        let ys = page_sorted_ys.get(&page)?;
+        let pos = ys.iter().position(|&py| (py - y).abs() < 0.1)?;
+        Some((pos, ys.len()))
+    }
+
     /// Returns true if the given Y position is among the first or last N distinct
     /// Y positions on the specified page.
     fn is_y_at_edge(y: f32, page: u32, page_sorted_ys: &HashMap<u32, Vec<f32>>, n: usize) -> bool {
-        let ys = match page_sorted_ys.get(&page) {
-            Some(ys) => ys,
-            None => return false,
+        let Some((pos, len)) = y_position_rank(y, page, page_sorted_ys) else {
+            return false;
         };
-        if ys.len() <= n * 2 {
+        if len <= n * 2 {
             // Page has very few lines — everything is near the edge
             return true;
         }
-        // Check if this Y is among the first or last N
-        let pos = match ys.iter().position(|&py| (py - y).abs() < 0.1) {
-            Some(p) => p,
-            None => return false,
+        pos < n || pos >= len - n
+    }
+
+    fn is_y_at_strict_lower_edge(
+        y: f32,
+        page: u32,
+        page_sorted_ys: &HashMap<u32, Vec<f32>>,
+        n: usize,
+    ) -> bool {
+        let Some((pos, len)) = y_position_rank(y, page, page_sorted_ys) else {
+            return false;
         };
-        pos < n || pos >= ys.len() - n
+        len > n * 2 && pos < n
     }
 
     // Average page span for normalizing Y variance
@@ -327,8 +510,9 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     // Build frequency maps using normalize_for_comparison.
     // Individual line text -> distinct pages
     let mut freq: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut bottom_freq: HashMap<String, HashSet<u32>> = HashMap::new();
     let mut y_positions: HashMap<String, Vec<f32>> = HashMap::new();
-    for line in &lines {
+    for line in lines {
         if !is_y_at_edge(line.y, line.page, &page_sorted_ys, EDGE_LINE_COUNT) {
             continue;
         }
@@ -340,6 +524,12 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         freq.entry(normalized.clone())
             .or_default()
             .insert(line.page);
+        if is_y_at_strict_lower_edge(line.y, line.page, &page_sorted_ys, EDGE_LINE_COUNT) {
+            bottom_freq
+                .entry(normalized.clone())
+                .or_default()
+                .insert(line.page);
+        }
         y_positions.entry(normalized).or_default().push(line.y);
     }
 
@@ -347,6 +537,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     // This catches split column headers where individual fragments don't meet
     // the frequency threshold but the combined row does.
     let mut band_freq: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut band_bottom_freq: HashMap<String, HashSet<u32>> = HashMap::new();
     let mut band_y_positions: HashMap<String, Vec<f32>> = HashMap::new();
     for (&(page, _), indices) in &y_bands {
         if indices.len() < 2 {
@@ -371,11 +562,36 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
             .entry(normalized.clone())
             .or_default()
             .insert(page);
+        if is_y_at_strict_lower_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
+            band_bottom_freq
+                .entry(normalized.clone())
+                .or_default()
+                .insert(page);
+        }
         band_y_positions.entry(normalized).or_default().push(band_y);
     }
 
-    // Compute threshold
-    let threshold = 3u32.max(page_count * 30 / 100);
+    // Compute thresholds. Keep the conservative document-wide threshold for
+    // clean text, and allow a lower cap only for visibly broken/letter-spaced
+    // running headers in books where each chapter has its own footer/header.
+    let document_threshold = 3u32.max(page_count * 30 / 100);
+    let garbled_chapter_threshold = 3u32.max((page_count * 30 / 100).min(8));
+    let remove_all_bottom_threshold = document_threshold.min(garbled_chapter_threshold);
+    let meets_frequency_threshold =
+        |text: &str, pages: &HashSet<u32>, bottom_pages: &HashMap<String, HashSet<u32>>| -> bool {
+            pages.len() as u32 >= document_threshold
+                || (has_broken_word_spacing(text)
+                    && bottom_pages
+                        .get(text)
+                        .is_some_and(|pages| pages.len() as u32 >= garbled_chapter_threshold))
+        };
+    let should_remove_all_occurrences =
+        |text: &str, bottom_pages: &HashMap<String, HashSet<u32>>| -> bool {
+            has_broken_word_spacing(text)
+                && bottom_pages
+                    .get(text)
+                    .is_some_and(|pages| pages.len() as u32 >= remove_all_bottom_threshold)
+        };
 
     // Check Y-position consistency: headers/footers appear at the same position
     // on every page, table content varies. Require normalized stddev < 5% of
@@ -393,29 +609,61 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     };
 
     // Identify candidates from individual frequency map
-    let candidates: HashSet<String> = freq
-        .into_iter()
-        .filter(|(text, pages)| {
-            pages.len() as u32 >= threshold
-                && !is_structural_line(text)
-                && has_consistent_y(text, &y_positions)
-        })
-        .map(|(text, _)| text)
+    let mut remove_all_candidates: HashSet<String> = HashSet::new();
+    let mut candidates: HashSet<String> = HashSet::new();
+    for (text, pages) in freq {
+        if meets_frequency_threshold(&text, &pages, &bottom_freq)
+            && !is_structural_line(&text)
+            && has_consistent_y(&text, &y_positions)
+        {
+            if should_remove_all_occurrences(&text, &bottom_freq) {
+                remove_all_candidates.insert(text.clone());
+            }
+            candidates.insert(text);
+        }
+    }
+    let compact_candidates: Vec<String> = candidates
+        .iter()
+        .filter(|text| has_broken_word_spacing(text))
+        .map(|text| compact_comparison_key(text))
+        .filter(|text| text.len() >= 20)
+        .collect();
+    let compact_remove_all_candidates: Vec<String> = remove_all_candidates
+        .iter()
+        .filter(|text| has_broken_word_spacing(text))
+        .map(|text| compact_comparison_key(text))
+        .filter(|text| text.len() >= 20)
         .collect();
 
     // Identify candidates from coalesced band frequency map
-    let band_candidates: HashSet<String> = band_freq
-        .into_iter()
-        .filter(|(text, pages)| {
-            pages.len() as u32 >= threshold
-                && !is_structural_line(text)
-                && has_consistent_y(text, &band_y_positions)
-        })
-        .map(|(text, _)| text)
+    let mut remove_all_band_candidates: HashSet<String> = HashSet::new();
+    let mut band_candidates: HashSet<String> = HashSet::new();
+    for (text, pages) in band_freq {
+        if meets_frequency_threshold(&text, &pages, &band_bottom_freq)
+            && !is_structural_line(&text)
+            && has_consistent_y(&text, &band_y_positions)
+        {
+            if should_remove_all_occurrences(&text, &band_bottom_freq) {
+                remove_all_band_candidates.insert(text.clone());
+            }
+            band_candidates.insert(text);
+        }
+    }
+    let compact_band_candidates: Vec<String> = band_candidates
+        .iter()
+        .filter(|text| has_broken_word_spacing(text))
+        .map(|text| compact_comparison_key(text))
+        .filter(|text| text.len() >= 20)
+        .collect();
+    let compact_remove_all_band_candidates: Vec<String> = remove_all_band_candidates
+        .iter()
+        .filter(|text| has_broken_word_spacing(text))
+        .map(|text| compact_comparison_key(text))
+        .filter(|text| text.len() >= 20)
         .collect();
 
     if candidates.is_empty() && band_candidates.is_empty() {
-        return lines;
+        return HashSet::new();
     }
 
     // Build removal set.
@@ -424,8 +672,10 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     //   (b) its Y-band's coalesced text matches a band candidate, OR
     //   (c) any sibling in its Y-band was removed (propagation).
     //
-    // The first occurrence (lowest page number) of each repeated header/footer
-    // is kept so that document titles, column headers, etc. appear once.
+    // The first occurrence (lowest page number) of each repeated line is kept
+    // so that document titles, column headers, etc. appear once. Visibly broken
+    // footers proven by repeated lower-edge placement are removed from every
+    // matching edge occurrence, including sparse first pages.
     let mut removal_set: HashSet<usize> = HashSet::new();
 
     // Track which page first shows each candidate (to preserve first occurrence)
@@ -436,7 +686,15 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         }
         let text = line.text();
         let normalized = normalize_for_comparison(&text);
-        if candidates.contains(&normalized) {
+        if matches_candidate(&normalized, &candidates, &compact_candidates) {
+            if matches_candidate(
+                &normalized,
+                &remove_all_candidates,
+                &compact_remove_all_candidates,
+            ) {
+                removal_set.insert(idx);
+                continue;
+            }
             let first = first_page_individual.entry(normalized).or_insert(line.page);
             if line.page > *first {
                 removal_set.insert(idx);
@@ -465,7 +723,7 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
             .collect::<Vec<_>>()
             .join(" ");
         let normalized = normalize_for_comparison(&coalesced);
-        if band_candidates.contains(&normalized) {
+        if matches_candidate(&normalized, &band_candidates, &compact_band_candidates) {
             let first = first_page_band.entry(normalized).or_insert(page);
             if page < *first {
                 *first = page;
@@ -489,7 +747,17 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
             .collect::<Vec<_>>()
             .join(" ");
         let normalized = normalize_for_comparison(&coalesced);
-        if band_candidates.contains(&normalized) {
+        if matches_candidate(&normalized, &band_candidates, &compact_band_candidates) {
+            if matches_candidate(
+                &normalized,
+                &remove_all_band_candidates,
+                &compact_remove_all_band_candidates,
+            ) {
+                for &idx in &sorted_indices {
+                    removal_set.insert(idx);
+                }
+                continue;
+            }
             let first = first_page_band.get(&normalized).copied().unwrap_or(0);
             if page > first {
                 for &idx in &sorted_indices {
@@ -514,15 +782,10 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     }
 
     if removal_set.is_empty() {
-        return lines;
+        return HashSet::new();
     }
 
-    lines
-        .into_iter()
-        .enumerate()
-        .filter(|(idx, _)| !removal_set.contains(idx))
-        .map(|(_, line)| line)
-        .collect()
+    removal_set
 }
 
 #[cfg(test)]
@@ -556,6 +819,29 @@ mod tests {
             page,
             adaptive_threshold: 0.10,
         }
+    }
+
+    #[test]
+    fn test_has_broken_word_spacing_detects_split_words() {
+        assert!(has_broken_word_spacing(
+            "F rom p rese rva tion to access a nd be yond"
+        ));
+        assert!(has_broken_word_spacing("Conve rs ing w ith the pas t"));
+        assert!(has_broken_word_spacing("The Na tional Arch ives (U K)"));
+    }
+
+    #[test]
+    fn test_has_broken_word_spacing_ignores_normal_short_words() {
+        assert!(!has_broken_word_spacing(
+            "Reunir talento e empresas é um dos fatores po- sitivos para comunidades de sucesso"
+        ));
+        assert!(!has_broken_word_spacing("Witnessed on behalf of"));
+        assert!(!has_broken_word_spacing(
+            "V = Volume in m3/kg H = Enthalpy in kJ/kg S = Entropy in kJ/kg.K"
+        ));
+        assert!(!has_broken_word_spacing(
+            "TITULAR DEL PODER EJECUTIVO FEDERAL, A TRAVÉS DE LA SECRETARÍA DE ECONOMÍA, A HACER VALER EL PRINCIPIO DE"
+        ));
     }
 
     #[test]
@@ -684,5 +970,223 @@ mod tests {
             .find(|l| l.text().contains("VOICE OF SOUTH MARION"))
             .unwrap();
         assert_eq!(first_header.page, 1, "first occurrence should be on page 1");
+    }
+
+    #[test]
+    fn test_strip_repeated_clean_bottom_footers_kept_below_document_threshold() {
+        let mut lines = Vec::new();
+        for page in 1..=8u32 {
+            for row in 0..12u32 {
+                lines.push(make_line(
+                    &format!("unique body content page {page} row {row}"),
+                    9.5,
+                    page,
+                    600.0 - row as f32 * 20.0,
+                    None,
+                ));
+            }
+            lines.push(make_line(
+                &format!("Chapter running footer {}", 90 + page),
+                7.5,
+                page,
+                39.5,
+                None,
+            ));
+        }
+
+        let result = strip_repeated_lines(lines, 200);
+
+        let footer_count = result
+            .iter()
+            .filter(|line| line.text().contains("Chapter running footer"))
+            .count();
+        assert_eq!(
+            footer_count, 8,
+            "clean repeated footer should not use the lower garbled-text threshold"
+        );
+    }
+
+    #[test]
+    fn test_strip_repeated_garbled_bottom_footers_removes_all_occurrences_in_long_doc() {
+        let mut lines = Vec::new();
+        for page in 1..=8u32 {
+            for row in 0..12u32 {
+                lines.push(make_line(
+                    &format!("unique body content page {page} row {row}"),
+                    9.5,
+                    page,
+                    600.0 - row as f32 * 20.0,
+                    None,
+                ));
+            }
+            lines.push(make_line(
+                &format!("M L a t the Na tional Libra ry of N orwa y {}", 90 + page),
+                7.5,
+                page,
+                39.5,
+                None,
+            ));
+        }
+
+        let result = strip_repeated_lines(lines, 200);
+
+        assert!(
+            result
+                .iter()
+                .all(|line| !line.text().contains("Na tional Libra")),
+            "garbled bottom running footer should be removed from every page"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|line| line.text().contains("unique body content page 1 row 0")),
+            "body text should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_strip_repeated_document_wide_garbled_footers_removes_all_occurrences() {
+        let mut lines = Vec::new();
+        for page in 1..=8u32 {
+            for row in 0..12u32 {
+                lines.push(make_line(
+                    &format!("unique body content page {page} row {row}"),
+                    9.5,
+                    page,
+                    600.0 - row as f32 * 20.0,
+                    None,
+                ));
+            }
+            lines.push(make_line(
+                &format!("F rom p rese rva tion to access a nd be yond {}", 90 + page),
+                7.5,
+                page,
+                39.5,
+                None,
+            ));
+        }
+
+        let result = strip_repeated_lines(lines, 8);
+
+        let footer_count = result
+            .iter()
+            .filter(|line| line.text().contains("be yond"))
+            .count();
+        assert_eq!(
+            footer_count, 0,
+            "document-wide garbled footers should be removed from every page"
+        );
+    }
+
+    #[test]
+    fn test_strip_repeated_sparse_uppercase_headers_keep_first_occurrence() {
+        let mut lines = Vec::new();
+        for page in 1..=5u32 {
+            lines.push(make_line(
+                "PROPOSICIÓN CON PUNTO DE ACUERDO POR EL QUE EL SENADO DE LA REPÚBLICA",
+                8.0,
+                page,
+                720.0,
+                None,
+            ));
+            lines.push(make_line(
+                "A TRAVÉS DE LA SECRETARÍA DE ECONOMÍA",
+                8.0,
+                page,
+                704.0,
+                None,
+            ));
+            lines.push(make_line(
+                &format!("unique sparse-page body text {page}"),
+                10.0,
+                page,
+                620.0,
+                None,
+            ));
+        }
+
+        let result = strip_repeated_lines(lines, 5);
+
+        let title_count = result
+            .iter()
+            .filter(|line| line.text().contains("PROPOSICIÓN CON PUNTO"))
+            .count();
+        assert_eq!(
+            title_count, 1,
+            "sparse repeated heading should keep the first occurrence"
+        );
+    }
+
+    #[test]
+    fn test_strip_repeated_bottom_footers_matches_minor_garbling() {
+        let mut lines = Vec::new();
+        for page in 1..=9u32 {
+            for row in 0..12u32 {
+                lines.push(make_line(
+                    &format!("distinct paragraph text page {page} row {row}"),
+                    9.5,
+                    page,
+                    600.0 - row as f32 * 20.0,
+                    None,
+                ));
+            }
+
+            let footer = if page == 1 {
+                "F rom p rese rva tion to access a nd be yond 95"
+            } else {
+                "F om r p rese rva tion to access a nd be yond 97"
+            };
+            lines.push(make_line(footer, 7.5, page, 39.5, None));
+        }
+
+        let result = strip_repeated_lines(lines, 200);
+
+        assert!(
+            result.iter().all(|line| !line.text().contains("be yond")),
+            "fuzzy footer variant should be removed once the repeated form is detected"
+        );
+        assert!(
+            result.iter().any(|line| line
+                .text()
+                .contains("distinct paragraph text page 9 row 11")),
+            "non-footer edge-adjacent body text should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_strip_repeated_bottom_footers_matches_sparse_first_page_variant() {
+        let mut lines = Vec::new();
+        for page in 1..=9u32 {
+            let body_rows = if page == 1 { 3 } else { 12 };
+            for row in 0..body_rows {
+                lines.push(make_line(
+                    &format!("distinct paragraph text page {page} row {row}"),
+                    9.5,
+                    page,
+                    600.0 - row as f32 * 20.0,
+                    None,
+                ));
+            }
+
+            let footer = if page == 1 {
+                "F rom p rese rva tion to access a nd be yond 95"
+            } else {
+                "F om r p rese rva tion to access a nd be yond 97"
+            };
+            lines.push(make_line(footer, 7.5, page, 39.5, None));
+        }
+
+        let result = strip_repeated_lines(lines, 200);
+
+        assert!(
+            result.iter().all(|line| !line.text().contains("be yond")),
+            "sparse first page variant should be removed once later lower-edge footers prove the candidate"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|line| line.text().contains("distinct paragraph text page 1 row 0")),
+            "sparse first page body text should be preserved"
+        );
     }
 }
