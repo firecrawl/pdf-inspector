@@ -917,6 +917,29 @@ pub fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
     is_dot_leader_toc(cells) || is_tabular_toc(cells) || is_page_number_toc(cells)
 }
 
+/// Canonical lowercase roman numeral for `n` (covers the i/v/x/l/c range).
+fn to_roman_lower(mut n: u32) -> String {
+    const TABLE: [(u32, &str); 9] = [
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut out = String::new();
+    for (val, sym) in TABLE {
+        while n >= val {
+            out.push_str(sym);
+            n -= val;
+        }
+    }
+    out
+}
+
 /// Parse a page-number-like token: a short arabic integer (≤4 digits) or a
 /// lowercase/uppercase roman numeral (front-matter pages: i, ii, …, xii).
 fn page_number_value(token: &str) -> Option<u32> {
@@ -927,6 +950,9 @@ fn page_number_value(token: &str) -> Option<u32> {
     if t.chars().all(|c| c.is_ascii_digit()) && t.len() <= 4 {
         return t.parse().ok();
     }
+    // Roman numeral: accept only *canonical* forms so ordinary words made of
+    // {i,v,x,l,c} — "civil", "ill", "mix" — aren't mistaken for page numbers.
+    // Parse subtractively, then require the value to re-encode to the input.
     let lower = t.to_ascii_lowercase();
     if !lower.is_empty() && lower.len() <= 6 && lower.chars().all(|c| "ivxlc".contains(c)) {
         let mut total = 0i32;
@@ -947,7 +973,8 @@ fn page_number_value(token: &str) -> Option<u32> {
                 prev = v;
             }
         }
-        return u32::try_from(total).ok().filter(|&n| n > 0);
+        let value = u32::try_from(total).ok().filter(|&n| n > 0)?;
+        return (to_roman_lower(value) == lower).then_some(value);
     }
     None
 }
@@ -968,15 +995,11 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
     let last = num_cols - 1;
 
     // No header row: a TOC's first row is already an entry, so its last cell is
-    // a page number. A data table's first row is a column header (non-numeric) —
-    // the tell that separates "Mineral | CEC" tables from real contents.
-    let first_last = cells
-        .iter()
-        .find_map(|row| {
-            let c = row.get(last).map(|s| s.trim()).unwrap_or("");
-            (!c.is_empty()).then_some(c)
-        })
-        .unwrap_or("");
+    // a page number. A data table's first row is a column header (non-numeric,
+    // or an empty units cell like "Category | ") — the tell that separates
+    // "Mineral | CEC" tables from real contents. Check the actual first row,
+    // not the first non-empty one, so a blank header cell still rejects.
+    let first_last = cells[0].get(last).map(|s| s.trim()).unwrap_or("");
     if page_number_value(first_last).is_none() {
         return false;
     }
@@ -1990,6 +2013,34 @@ mod tests {
     }
 
     #[test]
+    fn page_number_value_rejects_roman_lookalike_words() {
+        // Ordinary words made only of {i,v,x,l,c} are not page numbers.
+        assert!(page_number_value("civil").is_none());
+        assert!(page_number_value("mix").is_none());
+        assert!(page_number_value("ill").is_none());
+        assert!(page_number_value("lil").is_none());
+        // Canonical roman numerals still parse.
+        assert_eq!(page_number_value("vii"), Some(7));
+        assert_eq!(page_number_value("ix"), Some(9));
+        assert_eq!(page_number_value("xii"), Some(12));
+        assert_eq!(page_number_value("42"), Some(42));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_blank_header_cell() {
+        // First row is a header whose last cell is blank ("Category | ");
+        // must not be flattened even though later rows look TOC-like.
+        let cells = vec![
+            vec!["Category".into(), "".into()],
+            vec!["Alpha".into(), "3".into()],
+            vec!["Beta".into(), "9".into()],
+            vec!["Gamma".into(), "14".into()],
+            vec!["Delta".into(), "20".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
     fn page_number_toc_matches_title_based_contents() {
         // Title-left, page-number-right, no dot leaders, no section numbers.
         let cells = vec![
@@ -2023,13 +2074,18 @@ mod tests {
     #[test]
     fn page_number_toc_rejects_non_monotonic_pages() {
         // Text labels but the "page" column jumps around — a small data table,
-        // not a contents listing.
-        let cells = vec![
+        // not a contents listing. 5 rows so the row-count guard passes and the
+        // monotonicity check is what does the rejecting.
+        let cells: Vec<Vec<String>> = vec![
             vec!["Apples".into(), "42".into()],
             vec!["Oranges".into(), "7".into()],
             vec!["Pears".into(), "91".into()],
             vec!["Plums".into(), "3".into()],
+            vec!["Grapes".into(), "60".into()],
         ];
+        // Sanity: this input clears the row-count and header guards, so a
+        // failure here is genuinely the monotonicity check.
+        assert!(cells.len() >= 5 && page_number_value(cells[0][1].trim()).is_some());
         assert!(!is_page_number_toc(&cells));
     }
 
