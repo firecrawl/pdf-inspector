@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
     paths: ['Cargo.toml']
+  # Manual fallback: retry a publish that failed after the version was
+  # already merged (a plain re-push won't register as a version change).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,6 +17,10 @@ env:
 jobs:
   check-version:
     name: Check version change
+    # Guard manual dispatches: crates.io trusted publishing matches
+    # repo+workflow+environment but NOT branch, so without this a
+    # workflow_dispatch from any branch could publish unmerged code.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.check.outputs.changed }}
@@ -28,17 +35,26 @@ jobs:
         id: check
         run: |
           NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')
-          OLD_VERSION=$(git show HEAD~1:Cargo.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
-          echo "old=$OLD_VERSION new=$NEW_VERSION"
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
-          if [ "$NEW_VERSION" = "$OLD_VERSION" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual dispatch publishes the current version regardless of the
+            # previous commit; the crates.io check below still prevents
+            # double-publishing an already-released version.
+            echo "manual dispatch: publishing v$NEW_VERSION"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            OLD_VERSION=$(git show HEAD~1:Cargo.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
+            echo "old=$OLD_VERSION new=$NEW_VERSION"
 
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+            if [ "$NEW_VERSION" = "$OLD_VERSION" ]; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
           HTTP_STATUS=$(curl --silent --show-error --output /tmp/crate-version.json --write-out "%{http_code}" \
             -H "User-Agent: firecrawl/pdf-inspector publish workflow (https://github.com/firecrawl/pdf-inspector)" \

@@ -8,6 +8,15 @@ description = "Fast PDF inspection, classification, and text extraction with sma
 license = "MIT"
 repository = "https://github.com/firecrawl/pdf-inspector"
 readme = "docs/rust-api.md"
+# Explicit allowlist: crates.io caps uploads at 10 MiB and tests/fixtures
+# alone exceeds that. external/bcmaps ships in the crate — tounicode.rs
+# loads it at runtime relative to CARGO_MANIFEST_DIR.
+include = [
+    "src/**",
+    "external/bcmaps/**",
+    "docs/rust-api.md",
+    "LICENSE",
+]
 
 [lib]
 name = "pdf_inspector"
