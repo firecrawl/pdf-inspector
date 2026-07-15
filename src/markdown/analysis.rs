@@ -391,6 +391,25 @@ pub(crate) fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f
         }
     }
 
+    // Books often set section headings barely above body size (e.g. 11pt
+    // bold over 10pt text). When nothing clears the 1.2x ratio gate, fall
+    // back to bold lines modestly larger than body so those documents still
+    // get an H1 instead of every bold heading defaulting to H2.
+    if tiers.is_empty() {
+        let mut bold_sizes: Vec<f32> = lines
+            .iter()
+            .filter_map(|line| line.items.first())
+            .filter(|it| it.is_bold && it.font_size / base_size >= 1.05)
+            .map(|it| it.font_size)
+            .collect();
+        bold_sizes.sort_by(|a, b| b.total_cmp(a));
+        for size in bold_sizes {
+            if !tiers.iter().any(|&t| (t - size).abs() < 0.5) {
+                tiers.push(size);
+            }
+        }
+    }
+
     // Cap at 4 tiers
     tiers.truncate(4);
     tiers
@@ -406,17 +425,21 @@ pub(crate) fn detect_header_level(
 ) -> Option<usize> {
     let ratio = font_size / base_size;
 
-    if ratio < 1.2 {
-        return None; // Regular text
-    }
-
-    if !heading_tiers.is_empty() {
-        // Match font_size to a tier (within 0.5pt tolerance)
+    // Tier matches are trusted below the 1.2x gate (down to 1.05x): tiers
+    // from the bold fallback are legitimately close to body size.
+    if ratio >= 1.05 && !heading_tiers.is_empty() {
         for (i, &tier_size) in heading_tiers.iter().enumerate() {
             if (font_size - tier_size).abs() < 0.5 {
                 return Some(i + 1); // tier 0 → H1, tier 1 → H2, etc.
             }
         }
+    }
+
+    if ratio < 1.2 {
+        return None; // Regular text
+    }
+
+    if !heading_tiers.is_empty() {
         // No tier match but large ratio — assign level after last tier
         if ratio >= 1.5 {
             let level = (heading_tiers.len() + 1).min(4);
@@ -441,6 +464,60 @@ pub(crate) fn detect_header_level(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_of(text: &str, font_size: f32, bold: bool, y: f32) -> crate::types::TextLine {
+        let item = crate::types::TextItem {
+            text: text.into(),
+            x: 72.0,
+            y,
+            width: text.len() as f32 * font_size * 0.5,
+            height: font_size,
+            font: "Test".into(),
+            font_size,
+            page: 1,
+            is_bold: bold,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: crate::types::ItemType::Text,
+            mcid: None,
+        };
+        crate::types::TextLine {
+            items: vec![item],
+            y,
+            page: 1,
+            adaptive_threshold: 0.10,
+        }
+    }
+
+    #[test]
+    fn bold_fallback_tiers_when_nothing_clears_ratio_gate() {
+        // 10pt body, 11pt bold section headings (book-style): no size clears
+        // 1.2x, so bold sizes modestly above body form the tiers.
+        let lines = vec![
+            line_of("4. Entropy", 11.0, true, 700.0),
+            line_of("body text about entropy", 10.0, false, 680.0),
+            line_of("5. The dynamics", 11.0, true, 500.0),
+        ];
+        let tiers = compute_heading_tiers(&lines, 10.0);
+        assert_eq!(tiers, vec![11.0]);
+        assert_eq!(detect_header_level(11.0, 10.0, &tiers), Some(1));
+        // Non-tier body text stays regular.
+        assert_eq!(detect_header_level(10.0, 10.0, &tiers), None);
+    }
+
+    #[test]
+    fn bold_fallback_skipped_when_real_tiers_exist() {
+        let lines = vec![
+            line_of("Chapter One", 18.0, false, 700.0),
+            line_of("bold label", 11.0, true, 600.0),
+            line_of("body", 10.0, false, 580.0),
+        ];
+        let tiers = compute_heading_tiers(&lines, 10.0);
+        assert_eq!(tiers, vec![18.0]);
+        // The 11pt bold label does not match any tier and stays non-heading.
+        assert_eq!(detect_header_level(11.0, 10.0, &tiers), None);
+    }
 
     #[test]
     fn toc_entry_with_single_dot_group() {
