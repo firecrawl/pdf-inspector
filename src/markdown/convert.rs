@@ -725,7 +725,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 line_font_size,
                 base_size,
                 &heading_tiers,
-                line.items.first().is_some_and(|i| i.is_bold),
+                crate::markdown::analysis::line_is_mostly_bold(line),
             )
             .or_else(|| {
                 // Rarity-based heading detection (inspired by opendataloader).
@@ -1077,7 +1077,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 line_font_size,
                 base_size,
                 &heading_tiers,
-                line.items.first().is_some_and(|i| i.is_bold),
+                crate::markdown::analysis::line_is_mostly_bold(line),
             )
             .or_else(|| {
                 if line_font_size < base_size * 0.95 {

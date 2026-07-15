@@ -46,7 +46,7 @@ fn effective_heading_level(
         font,
         base_size,
         heading_tiers,
-        line.items.first().is_some_and(|i| i.is_bold),
+        crate::markdown::analysis::line_is_mostly_bold(line),
     )
 }
 

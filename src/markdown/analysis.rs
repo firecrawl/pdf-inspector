@@ -415,6 +415,16 @@ pub(crate) fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f
     tiers
 }
 
+/// Boldness of a line judged by character mass, so a heading with an
+/// unbold section-number prefix ("4. " + bold title) still counts as bold.
+pub(crate) fn line_is_mostly_bold(line: &TextLine) -> bool {
+    let (bold, total) = line.items.iter().fold((0usize, 0usize), |(b, t), it| {
+        let n = it.text.trim().chars().count();
+        (b + if it.is_bold { n } else { 0 }, t + n)
+    });
+    total > 0 && bold * 2 >= total
+}
+
 /// Detect header level from font size using document-specific heading tiers.
 /// When tiers are available, maps tier 0→H1, tier 1→H2, etc.
 /// Falls back to ratio-based thresholds when no tiers exist.
