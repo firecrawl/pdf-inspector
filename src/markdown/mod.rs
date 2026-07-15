@@ -179,6 +179,128 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
 /// zone layout (calendar months, form sections).  This function checks if hint
 /// regions pair up at the same Y bands and returns `[(x_min, split), (split,
 /// x_max)]` if a consistent split exists.
+/// True when a table-shaped rect cluster (≥6 rects) ends at an interior band
+/// boundary and its rows visibly continue on the far side: cell-like text
+/// across the boundary is y-aligned with most cluster rows, and nearly all
+/// far-side text in the cluster's y-range participates in that alignment.
+/// Tables often rule only their leading columns, so the text gap before the
+/// borderless columns masquerades as a page-layout gutter — a real second
+/// layout column would instead be dense prose that doesn't track table rows.
+fn rect_cluster_spans_band_boundary(
+    items: &[TextItem],
+    rects: &[PdfRect],
+    page: u32,
+    bands: &[(f32, f32)],
+) -> bool {
+    if bands.len() < 2 {
+        return false;
+    }
+    // Normalize: raw PDF rects can carry negative extents.
+    let page_rects: Vec<(f32, f32, f32, f32)> = rects
+        .iter()
+        .filter(|r| r.page == page)
+        .map(|r| {
+            let (x, w) = if r.width < 0.0 {
+                (r.x + r.width, -r.width)
+            } else {
+                (r.x, r.width)
+            };
+            let (y, h) = if r.height < 0.0 {
+                (r.y + r.height, -r.height)
+            } else {
+                (r.y, r.height)
+            };
+            (x, y, w, h)
+        })
+        .collect();
+    if page_rects.len() < 6 {
+        return false;
+    }
+    let clusters = crate::tables::detect_rects::cluster_rects(&page_rects, 3.0, 6);
+    let boundaries: Vec<f32> = bands[..bands.len() - 1].iter().map(|&(_, hi)| hi).collect();
+
+    boundaries.iter().any(|&b| {
+        // Y-ranges of clusters that individually indicate the split cuts a
+        // table: either ruled on both sides of the boundary, or ending at
+        // the boundary with cell-like text row-aligned beyond it.
+        let mut table_y_ranges: Vec<(f32, f32)> = Vec::new();
+        for cluster in &clusters {
+            let bbox = cluster.iter().fold(
+                (
+                    f32::INFINITY,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                ),
+                |(x0, y0, x1, y1), &i| {
+                    let (x, y, w, h) = page_rects[i];
+                    (x0.min(x), y0.min(y), x1.max(x + w), y1.max(y + h))
+                },
+            );
+            let spans = bbox.0 < b - 20.0 && bbox.2 > b + 20.0;
+            let ends_at = bbox.2 >= b - 60.0 && bbox.2 <= b + 10.0 && bbox.0 <= b;
+            if !spans && !ends_at {
+                continue;
+            }
+            // Distinct row baselines of items inside the cluster bbox.
+            let mut row_ys: Vec<f32> = Vec::new();
+            for it in items {
+                let cx = it.x + it.width / 2.0;
+                if it.page == page
+                    && cx > bbox.0
+                    && cx < bbox.2
+                    && it.y >= bbox.1 - 2.0
+                    && it.y <= bbox.3 + 2.0
+                    && !row_ys.iter().any(|&y| (y - it.y).abs() <= 2.0)
+                {
+                    row_ys.push(it.y);
+                }
+            }
+            if row_ys.len() < 2 {
+                continue;
+            }
+            // Cell-like far-side items row-aligned with the cluster.
+            let cell_like = |it: &&TextItem| it.width <= 150.0;
+            let far_aligned_rows = row_ys
+                .iter()
+                .filter(|&&y| {
+                    items.iter().any(|it| {
+                        it.page == page
+                            && it.x + it.width / 2.0 > b
+                            && cell_like(&it)
+                            && (it.y - y).abs() <= 2.0
+                    })
+                })
+                .count();
+            if far_aligned_rows >= 2 && far_aligned_rows * 2 >= row_ys.len() {
+                table_y_ranges.push((bbox.1, bbox.3));
+            }
+        }
+        if table_y_ranges.is_empty() {
+            return false;
+        }
+        // The split is only wrong if the table rows account for most of the
+        // far side. A figure legitimately spanning two text columns leaves
+        // the majority of far-side text (column prose) outside its y-range.
+        let far: Vec<&TextItem> = items
+            .iter()
+            .filter(|it| it.page == page && it.x + it.width / 2.0 > b)
+            .collect();
+        if far.is_empty() {
+            return false;
+        }
+        let inside = far
+            .iter()
+            .filter(|it| {
+                table_y_ranges
+                    .iter()
+                    .any(|&(lo, hi)| it.y >= lo - 2.0 && it.y <= hi + 2.0)
+            })
+            .count();
+        inside * 10 >= far.len() * 6
+    })
+}
+
 fn split_from_hint_regions(items: &[TextItem], rects: &[PdfRect], page: u32) -> Vec<(f32, f32)> {
     use crate::tables::{cluster_rects, RectHintRegion};
 
@@ -624,6 +746,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
         // Check for side-by-side layout (e.g. two tables placed left and right)
         let mut bands = split_side_by_side(&page_items);
+        // A rect table crossing a proposed split boundary means the "gutter"
+        // is really the gap between ruled and borderless table columns —
+        // splitting there cleaves the table in half. Veto the split.
+        if !bands.is_empty() && rect_cluster_spans_band_boundary(&page_items, rects, page, &bands) {
+            log::debug!(
+                "page {}: side-by-side split vetoed by spanning rect cluster",
+                page
+            );
+            bands.clear();
+        }
         // Fallback: use rect hint regions to detect side-by-side layout
         // when the text gap is too narrow for split_side_by_side to detect
         // (e.g. calendars with left/right month columns ~10pt apart).
@@ -1225,6 +1357,121 @@ mod tests {
             item_type: crate::types::ItemType::Text,
             mcid: None,
         }
+    }
+
+    fn make_item_w(x: f32, y: f32, width: f32, page: u32) -> TextItem {
+        let mut it = make_item(x, y, page);
+        it.width = width;
+        it
+    }
+
+    /// 4-row × 2-col ruled grid from x=100..300 (rows every 20pt from y=600).
+    fn ruled_cluster_rects() -> Vec<PdfRect> {
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            for col in 0..2 {
+                rects.push(PdfRect {
+                    x: 100.0 + col as f32 * 100.0,
+                    y: 600.0 + row as f32 * 20.0,
+                    width: 100.0,
+                    height: 20.0,
+                    page: 1,
+                });
+            }
+        }
+        rects
+    }
+
+    #[test]
+    fn band_veto_cluster_ruled_across_boundary() {
+        // Rects on both sides of the boundary and cell text on both sides,
+        // row-aligned → the split cuts straight through a drawn table.
+        let mut rects = ruled_cluster_rects();
+        for r in &mut rects {
+            r.width = 150.0; // right column now spans 250..400, past b=320
+        }
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 610.0 + row as f32 * 20.0;
+            items.push(make_item_w(110.0, y, 80.0, 1)); // left cells
+            items.push(make_item_w(330.0, y, 30.0, 1)); // right cells past b
+        }
+        assert!(rect_cluster_spans_band_boundary(
+            &items,
+            &rects,
+            1,
+            &[(90.0, 320.0), (320.0, 500.0)]
+        ));
+    }
+
+    #[test]
+    fn band_veto_ignores_spanning_figure() {
+        // A figure's rects span the boundary at the top of the page, but the
+        // far side is dominated by column prose below it → keep the split.
+        let mut rects = ruled_cluster_rects(); // y 600..680
+        for r in &mut rects {
+            r.width = 150.0; // spans past b=320
+        }
+        let mut items = Vec::new();
+        // A few figure labels inside the cluster, aligned rows.
+        for row in 0..4 {
+            let y = 610.0 + row as f32 * 20.0;
+            items.push(make_item_w(110.0, y, 40.0, 1));
+            items.push(make_item_w(330.0, y, 20.0, 1));
+        }
+        // Dense prose column far below the figure (outside cluster y-range).
+        let mut y = 100.0;
+        while y < 560.0 {
+            items.push(make_item_w(330.0, y, 140.0, 1));
+            y += 12.0;
+        }
+        assert!(!rect_cluster_spans_band_boundary(
+            &items,
+            &rects,
+            1,
+            &[(90.0, 320.0), (320.0, 500.0)]
+        ));
+    }
+
+    #[test]
+    fn band_veto_borderless_columns_continue_rows() {
+        // Rects end at x=300 (just short of b=320); cell-like text at x=340
+        // aligns with every grid row → the "gutter" is inside the table.
+        let rects = ruled_cluster_rects();
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 610.0 + row as f32 * 20.0;
+            items.push(make_item_w(110.0, y, 80.0, 1)); // label cells
+            items.push(make_item_w(340.0, y, 30.0, 1)); // borderless column
+        }
+        assert!(rect_cluster_spans_band_boundary(
+            &items,
+            &rects,
+            1,
+            &[(90.0, 320.0), (320.0, 500.0)]
+        ));
+    }
+
+    #[test]
+    fn band_veto_ignores_prose_column() {
+        // Dense prose right of the boundary: wide lines, three per grid row,
+        // mostly not row-aligned → keep the side-by-side split.
+        let rects = ruled_cluster_rects();
+        let mut items = Vec::new();
+        for row in 0..4 {
+            items.push(make_item_w(110.0, 610.0 + row as f32 * 20.0, 80.0, 1));
+        }
+        let mut y = 602.0;
+        while y < 680.0 {
+            items.push(make_item_w(340.0, y, 200.0, 1)); // full-width prose lines
+            y += 7.0;
+        }
+        assert!(!rect_cluster_spans_band_boundary(
+            &items,
+            &rects,
+            1,
+            &[(90.0, 320.0), (320.0, 500.0)]
+        ));
     }
 
     #[test]

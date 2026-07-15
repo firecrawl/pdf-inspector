@@ -4,7 +4,7 @@
 
 mod detect_heuristic;
 mod detect_lines;
-mod detect_rects;
+pub(crate) mod detect_rects;
 mod detect_struct;
 mod financial;
 mod format;
