@@ -3820,7 +3820,7 @@ mod tests {
         // corpus gains — too few boxes for the anti-prose guards to work.
         // If this ever becomes worth revisiting, the guards need stronger
         // signals first; flipping this assertion is the entry point.
-        let rects: Vec<PdfRect> = (0..3)
+        let mut rects: Vec<PdfRect> = (0..3)
             .map(|i| PdfRect {
                 x: 100.0,
                 y: 600.0 - i as f32 * 22.0,
@@ -3829,6 +3829,18 @@ mod tests {
                 page: 1,
             })
             .collect();
+        // Unrelated scattered rects push the page past the 6-rect page gate
+        // so the run reaches clustering, while the 3-box stack itself stays
+        // below the 6-rect cluster minimum.
+        for i in 0..4 {
+            rects.push(PdfRect {
+                x: 100.0 + i as f32 * 120.0,
+                y: 100.0,
+                width: 40.0,
+                height: 15.0,
+                page: 1,
+            });
+        }
         let items: Vec<TextItem> = ["Step One: Plan", "Step Two: Build", "Step Three: Ship"]
             .iter()
             .enumerate()
