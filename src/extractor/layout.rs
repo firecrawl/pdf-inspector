@@ -1519,12 +1519,12 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
                     }
                 }
             }
-            // Same baseline, but separated by a wide void, where the incoming
-            // run starts mid-sentence (lowercase): the neighboring column's
-            // body text sharing a y with this line, in gutters too narrow
-            // for column detection. Both sides must be multi-word prose —
-            // TOC page numbers, table cells (which start with numbers or
-            // capitalized labels), and dot leaders stay joined.
+            // Same baseline, but separated by a wide void, with the incoming
+            // run starting alphabetic: the neighboring column's body text
+            // sharing a y with this line, in gutters too narrow for column
+            // detection. Both sides must be multi-word prose — TOC page
+            // numbers, dot leaders, and outline-numbered table cells (which
+            // start with digits) stay joined.
             if let Some(last_item) = last_line.items.last() {
                 let gap = item.x - (last_item.x + last_item.width);
                 if gap > (item.font_size.max(last_item.font_size) * 3.0).max(30.0)
@@ -1533,9 +1533,12 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
                         .trim()
                         .chars()
                         .next()
-                        .is_some_and(|c| c.is_lowercase() && c.is_alphabetic())
+                        .is_some_and(|c| c.is_alphabetic())
                 {
-                    let wordy = |t: &str| {
+                    // The incoming run must be substantial prose; the line
+                    // side may be short (a wrapped heading's last words).
+                    let incoming_wordy = {
+                        let t = item.text.trim();
                         t.split_whitespace().count() >= 3
                             && t.chars().filter(|c| c.is_alphabetic()).count() >= 10
                     };
@@ -1545,7 +1548,21 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
                         .map(|i| i.text.trim())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    if wordy(&line_text) && wordy(item.text.trim()) {
+                    let line_wordy = line_text.split_whitespace().count() >= 2
+                        && line_text.chars().filter(|c| c.is_alphabetic()).count() >= 8;
+                    // Lowercase starts are mid-sentence continuations and
+                    // split on prose signals alone. Uppercase starts also
+                    // need a bold-style mismatch between the runs — a bold
+                    // heading beside regular body text — otherwise same-style
+                    // label rows (feature tiles, legends) would shatter.
+                    let starts_lower = item
+                        .text
+                        .trim()
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_lowercase());
+                    let style_mismatch = last_item.is_bold != item.is_bold;
+                    if line_wordy && incoming_wordy && (starts_lower || style_mismatch) {
                         return false;
                     }
                 }

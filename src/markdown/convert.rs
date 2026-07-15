@@ -160,6 +160,110 @@ fn find_isolated_lines(lines: &[TextLine], base_size: f32, para_threshold: f32) 
 /// wrapped visual line as "standalone" once the first line is misclassified,
 /// producing a stack of `##` headings.  Multi-line body-size bold runs with a
 /// paragraph-sized word count should stay paragraph text.
+/// Merge 2-3 consecutive all-bold body-size lines into one line when the
+/// group is isolated (paragraph break before and after) and short enough to
+/// be a heading. Longer/wordier bold runs are wrapped bold paragraphs and
+/// are left for `find_wrapped_bold_paragraph_lines` to suppress.
+/// "9.5. ", "12.3.1. " — section-numbered heading prefix followed by a word.
+fn starts_with_section_number(t: &str) -> bool {
+    let t = t.trim_start();
+    let mut rest = t;
+    let mut groups = 0;
+    loop {
+        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 || digits > 3 {
+            break;
+        }
+        groups += 1;
+        rest = &rest[digits..];
+        if let Some(r) = rest.strip_prefix('.') {
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    groups >= 1
+        && rest.starts_with(char::is_whitespace)
+        && rest.trim_start().starts_with(|c: char| c.is_alphabetic())
+}
+
+fn merge_wrapped_bold_heading_groups(
+    lines: Vec<TextLine>,
+    base_size: f32,
+    para_threshold: f32,
+) -> Vec<TextLine> {
+    let mut out: Vec<TextLine> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        if !is_body_size_all_bold_line(&lines[i], base_size) {
+            out.push(lines[i].clone());
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        let mut word_count = lines[i].text().split_whitespace().count();
+        while end + 1 < lines.len()
+            && is_body_size_all_bold_line(&lines[end + 1], base_size)
+            && is_wrapped_same_style_line(&lines[end], &lines[end + 1], para_threshold)
+        {
+            end += 1;
+            word_count += lines[end].text().split_whitespace().count();
+        }
+        let line_count = end - start + 1;
+        // Column-local isolation: on interleaved multi-column pages the
+        // vector neighbors may be the other column's lines, so judge the
+        // break by x-overlapping lines only.
+        let gx0 = lines[start..=end]
+            .iter()
+            .flat_map(|l| l.items.iter().map(|i| i.x))
+            .fold(f32::INFINITY, f32::min);
+        let gx1 = lines[start..=end]
+            .iter()
+            .flat_map(|l| l.items.iter().map(|i| i.x + i.width))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let overlaps_x = |l: &TextLine| {
+            let lx0 = l.items.iter().map(|i| i.x).fold(f32::INFINITY, f32::min);
+            let lx1 = l
+                .items
+                .iter()
+                .map(|i| i.x + i.width)
+                .fold(f32::NEG_INFINITY, f32::max);
+            lx0 < gx1 && lx1 > gx0
+        };
+        let page = lines[start].page;
+        let break_before = !lines.iter().any(|l| {
+            l.page == page
+                && l.y > lines[start].y
+                && l.y - lines[start].y <= para_threshold
+                && overlaps_x(l)
+        });
+        let break_after = !lines.iter().any(|l| {
+            l.page == page
+                && l.y < lines[end].y
+                && lines[end].y - l.y <= para_threshold
+                && overlaps_x(l)
+        });
+        let numbered = starts_with_section_number(&lines[start].text());
+        if (2..=3).contains(&line_count)
+            && word_count <= 15
+            && ((break_before && break_after) || numbered)
+        {
+            let mut merged = lines[start].clone();
+            for l in &lines[start + 1..=end] {
+                merged.items.extend(l.items.iter().cloned());
+            }
+            out.push(merged);
+        } else {
+            for l in &lines[start..=end] {
+                out.push(l.clone());
+            }
+        }
+        i = end + 1;
+    }
+    out
+}
+
 fn find_wrapped_bold_paragraph_lines(
     lines: &[TextLine],
     base_size: f32,
@@ -468,6 +572,17 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // threshold and cause every line to be treated as a paragraph break.
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
 
+    // Merge wrapped bold headings: a 2-3 line group of consecutive all-bold
+    // body-size lines that is isolated as a group (paragraph break before
+    // and after) is one heading that wrapped. Left split, the internal line
+    // gap breaks each line's isolation and neither classifies as a heading —
+    // the whole group then merges into the following body paragraph.
+    let lines = if std::env::var("PI_NO_MERGE").is_ok() {
+        lines
+    } else {
+        merge_wrapped_bold_heading_groups(lines, base_size, para_threshold)
+    };
+
     // Pre-scan: identify isolated lines (paragraph break before AND after).
     // These are heading candidates even without bold/large font — common in
     // academic papers where section titles like "Acknowledgements" sit alone
@@ -764,7 +879,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 // accept them only with the strongest signal combination.
                 let enough_words =
                     word_count >= 2 || (all_bold && isolated && plain_trimmed.len() >= 4);
-                if score >= 0.5 && standalone && enough_words && has_strong_signal {
+                let numbered_bold = all_bold && starts_with_section_number(plain_trimmed);
+                if numbered_bold
+                    || (score >= 0.5 && standalone && enough_words && has_strong_signal)
+                {
                     Some(bold_heading_level(&heading_tiers))
                 } else {
                     None
@@ -1214,6 +1332,19 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn section_number_prefix_detection() {
+        assert!(starts_with_section_number(
+            "9.5. Adapting to the New Normal"
+        ));
+        assert!(starts_with_section_number("12.3.1. Deep subsection"));
+        assert!(starts_with_section_number("2.1 Systems thinking"));
+        assert!(!starts_with_section_number("24% in October 2020."));
+        assert!(!starts_with_section_number("2020 was a hard year"));
+        assert!(!starts_with_section_number("Introduction"));
+    }
+
     use super::*;
     use crate::structure_tree::StructRole;
     use crate::types::TextItem;
