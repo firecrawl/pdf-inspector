@@ -1,8 +1,16 @@
-# Python API
+# pdf-inspector
 
-Python bindings via [PyO3](https://pyo3.rs). Requires Rust toolchain for building from source.
+Fast PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Python bindings via [PyO3](https://pyo3.rs) for the [pdf-inspector](https://github.com/firecrawl/pdf-inspector) Rust library.
+
+Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
 ## Install
+
+```bash
+pip install pdf-inspector
+```
+
+Prebuilt wheels cover CPython ≥3.8 on Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows (x64). Other platforms build from source, which requires a Rust toolchain. For local development in a repo checkout:
 
 ```bash
 pip install maturin
