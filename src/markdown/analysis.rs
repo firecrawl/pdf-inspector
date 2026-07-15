@@ -407,6 +407,11 @@ pub(crate) fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f
     if tiers.is_empty() {
         let mut bold_sizes: Vec<f32> = lines
             .iter()
+            .filter(|line| {
+                let text = line.text();
+                let t = text.trim();
+                !t.is_empty() && t.chars().any(|c| c.is_alphabetic())
+            })
             .filter_map(|line| line.items.first())
             .filter(|it| it.is_bold && it.font_size / base_size >= 1.05)
             .map(|it| it.font_size)

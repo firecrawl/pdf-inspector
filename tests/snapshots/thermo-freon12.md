@@ -6,9 +6,7 @@
 
 #### Thermodynamic Properties
 
-**of**
-
-®
+**of** ®
 
 # Freon 12
 
