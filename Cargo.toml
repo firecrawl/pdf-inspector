@@ -1,12 +1,13 @@
 [package]
 name = "pdf-inspector"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 autobins = false
 authors = ["Firecrawl Team"]
 description = "Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection"
 license = "MIT"
 repository = "https://github.com/firecrawl/pdf-inspector"
+readme = "docs/rust-api.md"
 
 [lib]
 name = "pdf_inspector"

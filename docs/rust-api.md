@@ -1,10 +1,26 @@
-# Rust API
+# pdf-inspector
 
-Add to your `Cargo.toml`:
+Fast PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Pure Rust, no ML models, no external services; the only PDF dependency is [lopdf](https://crates.io/crates/lopdf). Also available for [Python](https://pypi.org/project/pdf-inspector/) and [Node.js](https://www.npmjs.com/package/@firecrawl/pdf-inspector).
+
+Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
+
+## Install
+
+```bash
+cargo add pdf-inspector
+```
+
+For the latest unreleased changes, use the git dependency instead:
 
 ```toml
 [dependencies]
 pdf-inspector = { git = "https://github.com/firecrawl/pdf-inspector" }
+```
+
+The crate also ships CLI binaries — `pdf2md` (PDF → Markdown, with `--json`, `--pages`, `--select-pages`) and `detect-pdf` (classification, with `--analyze --json`):
+
+```bash
+cargo install pdf-inspector
 ```
 
 ## Usage
