@@ -1187,8 +1187,35 @@ pub(crate) fn extract_text_from_operand(
     })();
     result.map(|text| {
         let text = clean_symbol_pua(text);
+        let text = remap_texcm_math_symbols(text, base_font_name);
         normalize_cp1252_controls(text, use_cp1252_fallback)
     })
+}
+
+/// Fix a known producer bug in "TeXCMMathsSymbols" subset fonts (IntechOpen
+/// and sibling academic pipelines): the Computer Modern symbol glyphs are
+/// misnamed after Latin lookalikes (equal → /onequarter, plus → /thorn, …)
+/// and the generated ToUnicode faithfully propagates the wrong names. The
+/// remap applies only to text decoded from that font, keyed on the glyphs'
+/// observed misnames.
+fn remap_texcm_math_symbols(text: String, base_font_name: Option<&str>) -> String {
+    let is_texcm = base_font_name.is_some_and(|n| {
+        let n = n.rsplit_once('+').map_or(n, |(_, s)| s);
+        n.eq_ignore_ascii_case("TeXCMMathsSymbols")
+    });
+    if !is_texcm {
+        return text;
+    }
+    text.chars()
+        .map(|c| match c {
+            '¼' => '=',
+            '½' => '-',
+            'þ' => '+',
+            'ð' => '(',
+            'Þ' => ')',
+            _ => c,
+        })
+        .collect()
 }
 
 fn decode_single_byte_fallback(bytes: &[u8], use_cp1252_fallback: bool) -> String {
@@ -1409,6 +1436,21 @@ fn score_text(text: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn texcm_math_symbols_remap() {
+        assert_eq!(
+            super::remap_texcm_math_symbols("S ¼ kB þ 1".into(), Some("EEKVNO+TeXCMMathsSymbols")),
+            "S = kB + 1"
+        );
+        // Other fonts keep their genuine fractions/thorns.
+        assert_eq!(
+            super::remap_texcm_math_symbols("¼ cup þorn".into(), Some("Times-Roman")),
+            "¼ cup þorn"
+        );
+        assert_eq!(super::remap_texcm_math_symbols("¼".into(), None), "¼");
+    }
+
     use super::*;
     use lopdf::dictionary;
 
