@@ -16,7 +16,6 @@ pub use convert::to_markdown_from_lines;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::extractor::group_into_lines_with_thresholds;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
@@ -762,9 +761,8 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // rects or aligned text and get gridded into phantom tables. Their
         // items are excluded from every table detector below and flow through
         // as plain text instead.
-        let page_rect_vec: Vec<PdfRect> =
-            rects.iter().filter(|r| r.page == page).cloned().collect();
-        let chart_regions = crate::tables::detect_chart_regions(&page_items, &page_rect_vec, page);
+        let chart_regions: Vec<(f32, f32, f32, f32)> =
+            page_chart_map.get(&page).cloned().unwrap_or_default();
         // Pad the claim region: axis/category labels sit just outside the
         // bar rects (below the axis, left of the scale) and belong to the
         // chart as much as the bars do.
@@ -1313,11 +1311,14 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     .cloned()
                     .collect();
                 if !band_items.is_empty() {
-                    page_lines.extend(group_into_lines_with_thresholds(
-                        band_items,
-                        page_thresholds,
-                        &table_page_set,
-                    ));
+                    page_lines.extend(
+                        crate::extractor::group_into_lines_with_thresholds_and_charts(
+                            band_items,
+                            page_thresholds,
+                            &table_page_set,
+                            &page_chart_map,
+                        ),
+                    );
                 }
             }
             // Sort by Y descending (top to bottom) so left and right
