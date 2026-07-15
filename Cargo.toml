@@ -16,6 +16,9 @@ include = [
     "external/bcmaps/**",
     "docs/rust-api.md",
     "LICENSE",
+    # maturin derives the sdist file list from this allowlist; the stub must
+    # ship so wheels built from the sdist keep their type hints.
+    "pdf_inspector.pyi",
 ]
 
 [lib]

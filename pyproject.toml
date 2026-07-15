@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "pdf-inspector"
 # Bump this to publish to PyPI — CI publishes automatically when the version
 # changes on main (same flow as napi/package.json for npm).
-version = "0.2.3"
+version = "0.2.4"
 description = "Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection"
 readme = "docs/python.md"
 license = { text = "MIT" }
