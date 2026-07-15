@@ -12,7 +12,7 @@ npm install @firecrawl/pdf-inspector
 bun add @firecrawl/pdf-inspector
 ```
 
-Prebuilt binaries included for **linux-x64** and **macOS ARM64**. No Rust toolchain needed.
+Prebuilt binaries for **Linux x64**, **macOS ARM64**, and **Windows x64** — npm installs only the one matching your platform. No Rust toolchain needed.
 
 ## API
 
@@ -90,10 +90,13 @@ interface RegionText {
 
 ## Platforms
 
-| Platform | Architecture | Supported |
-|----------|-------------|-----------|
-| Linux    | x64         | Yes       |
-| macOS    | ARM64       | Yes       |
+Prebuilt binaries ship as platform-specific packages installed automatically via `optionalDependencies`:
+
+| Platform | Architecture | Package |
+|----------|-------------|---------|
+| Linux    | x64 (glibc) | `@firecrawl/pdf-inspector-linux-x64-gnu` |
+| macOS    | ARM64       | `@firecrawl/pdf-inspector-darwin-arm64` |
+| Windows  | x64         | `@firecrawl/pdf-inspector-win32-x64-msvc` |
 
 ## License
 
