@@ -81,16 +81,51 @@ result = pdf_inspector.extract_pages_markdown("document.pdf", pages=[0, 2])
 
 ## Types
 
-**`PdfResult` fields:** `pdf_type`, `markdown`, `page_count`, `processing_time_ms`, `pages_needing_ocr`, `title`, `confidence`, `is_complex_layout`, `pages_with_tables`, `pages_with_columns`, `has_encoding_issues`
+Type stubs (`pdf_inspector.pyi`) ship with the package. Result types at a glance:
 
-**`PdfClassification` fields:** `pdf_type`, `page_count`, `pages_needing_ocr` (0-indexed), `confidence`
+```python
+class PdfResult:                     # process_pdf / detect_pdf
+    pdf_type: str                    # "text_based" | "scanned" | "image_based" | "mixed"
+    markdown: str | None             # extracted Markdown (None for detect_pdf)
+    page_count: int
+    processing_time_ms: int
+    pages_needing_ocr: list[int]
+    title: str | None
+    confidence: float                # 0.0 - 1.0
+    is_complex_layout: bool
+    pages_with_tables: list[int]
+    pages_with_columns: list[int]
+    has_encoding_issues: bool        # broken font encodings — consider OCR fallback
 
-**`TextItem` fields:** `text`, `x`, `y`, `width`, `height`, `font`, `font_size`, `page`, `is_bold`, `is_italic`, `item_type`
+class PdfClassification:             # classify_pdf
+    pdf_type: str
+    page_count: int
+    pages_needing_ocr: list[int]     # 0-indexed
+    confidence: float
 
-**`RegionText` fields:** `text`, `needs_ocr`
+class TextItem:                      # extract_text_with_positions
+    text: str
+    x: float
+    y: float
+    width: float
+    height: float
+    font: str
+    font_size: float
+    page: int
+    is_bold: bool
+    is_italic: bool
+    is_underline: bool
+    is_strikeout: bool
+    item_type: str
 
-**`PageRegionTexts` fields:** `page` (0-indexed), `regions` (list of RegionText)
+class PageRegionTexts:               # extract_text_in_regions
+    page: int                        # 0-indexed
+    regions: list[RegionText]        # RegionText: text: str, needs_ocr: bool
 
-**`PageMarkdown` fields:** `page` (0-indexed), `markdown`, `needs_ocr`
-
-**`PagesExtractionResult` fields:** `pages` (list of PageMarkdown), `pages_with_tables` (1-indexed), `pages_with_columns` (1-indexed), `pages_needing_ocr` (1-indexed), `is_complex`
+class PagesExtractionResult:         # extract_pages_markdown
+    pages: list[PageMarkdown]        # PageMarkdown: page (0-indexed), markdown, needs_ocr
+    pages_with_tables: list[int]     # 1-indexed
+    pages_with_columns: list[int]    # 1-indexed
+    pages_needing_ocr: list[int]     # 1-indexed
+    is_complex: bool                 # any page has tables or multi-column layout
+```
