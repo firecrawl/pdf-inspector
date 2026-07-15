@@ -386,6 +386,8 @@ pub fn detect_tables_from_rects(
                 tables.push(table);
             } else if let Some(table) = detect_row_stripe_table(items, &group_rects, page) {
                 tables.push(table);
+            } else if let Some(table) = detect_stacked_box_table(items, &group_rects, page) {
+                tables.push(table);
             } else if let Some((left, right)) = split_wide_cluster(&group_rects, 15.0, 6) {
                 // Cluster was too wide — retry each half independently
                 debug!(
@@ -631,6 +633,238 @@ pub fn detect_tables_from_rects(
 /// overlap or are close (gap < 50pt).  This handles calendar-style layouts where a
 /// month zone's decorative rects split into 2-3 adjacent clusters with small X gaps.
 /// Runs iteratively until no more merges occur.
+/// Detect a single-column table drawn as a vertical stack of boxes, each
+/// holding one short line of text (framework/step lists on slide-style
+/// pages). The normal grid path rejects these — one column means only two
+/// x-edges — so the rows would otherwise flow into surrounding prose as a
+/// run-on paragraph.
+fn detect_stacked_box_table(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
+    // Candidate row boxes: single-text-line height, substantial width.
+    let cands: Vec<(f32, f32, f32, f32)> = group_rects
+        .iter()
+        .copied()
+        .filter(|&(_, _, w, h)| w >= 100.0 && (8.0..=80.0).contains(&h))
+        .collect();
+    // The row boxes form the largest family of same-width, x-aligned rects
+    // (backgrounds and decor have their own geometry and stay out).
+    let mut boxes: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for &anchor in &cands {
+        let family: Vec<(f32, f32, f32, f32)> = cands
+            .iter()
+            .copied()
+            .filter(|&(x, _, w, h)| {
+                (x - anchor.0).abs() <= 12.0
+                    && (w - anchor.2).abs() <= anchor.2 * 0.15
+                    && (h - anchor.3).abs() <= anchor.3 * 0.3
+            })
+            .collect();
+        if family.len() > boxes.len() {
+            boxes = family;
+        }
+    }
+    if boxes.len() < 3 {
+        return None;
+    }
+    // Boxes flanked at the same y-level — by other rects or by text outside
+    // the family's x-range — are one column of a wider structure. Leave
+    // those to the grid/cell-rect paths instead of collapsing to one column.
+    let flanked = boxes
+        .iter()
+        .filter(|&&(bx, by, bw, bh)| {
+            let rect_sibling = group_rects.iter().any(|&(ox, oy, ow, oh)| {
+                let y_overlap = (by + bh).min(oy + oh) - by.max(oy);
+                oh >= 8.0
+                    && y_overlap > bh * 0.5
+                    && (ox + ow <= bx + 2.0 || ox >= bx + bw - 2.0)
+                    && ow >= 30.0
+            });
+            let text_sibling = items.iter().any(|it| {
+                let cx = it.x + it.width / 2.0;
+                it.page == page
+                    && it.y >= by - 2.0
+                    && it.y <= by + bh + 2.0
+                    && (cx < bx - 5.0 || cx > bx + bw + 5.0)
+                    && it.width >= 10.0
+            });
+            rect_sibling || text_sibling
+        })
+        .count();
+    if flanked * 3 >= boxes.len() {
+        debug!(
+            "  stacked-box rejected: {}/{} boxes flanked by rects or text",
+            flanked,
+            boxes.len()
+        );
+        return None;
+    }
+    boxes.sort_by(|a, b| b.1.total_cmp(&a.1)); // top to bottom (descending y)
+
+    // Merge duplicates (border + fill pairs draw the same box twice), then
+    // require a clean vertical stack: no overlaps beyond a small tolerance.
+    boxes.dedup_by(|a, b| (a.1 - b.1).abs() <= 3.0 && (a.3 - b.3).abs() <= 6.0);
+    if boxes.len() < 3 {
+        return None;
+    }
+    for w in boxes.windows(2) {
+        let (upper, lower) = (w[0], w[1]);
+        let upper_bottom = upper.1;
+        let lower_top = lower.1 + lower.3;
+        if lower_top > upper_bottom + 4.0 {
+            return None; // vertical overlap — not a stack
+        }
+        if upper_bottom - lower_top > upper.3.max(lower.3) {
+            return None; // gap larger than a row — unrelated boxes
+        }
+    }
+
+    // Assign items to boxes; every box needs text and cells must stay short
+    // (prose paragraphs inside stacked frames are page decor, not a table).
+    let mut cells: Vec<Vec<String>> = Vec::with_capacity(boxes.len());
+    let mut item_indices: Vec<usize> = Vec::new();
+    let mut multi_run_boxes = 0usize;
+    for &(bx, by, bw, bh) in &boxes {
+        let mut in_box: Vec<(usize, &TextItem)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| {
+                it.page == page
+                    && it.y >= by - 2.0
+                    && it.y <= by + bh + 2.0
+                    && it.x + it.width / 2.0 >= bx
+                    && it.x + it.width / 2.0 <= bx + bw
+            })
+            .collect();
+        if in_box.is_empty() {
+            return None;
+        }
+        in_box.sort_by(|a, b| {
+            b.1.y
+                .partial_cmp(&a.1.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.1.x
+                        .partial_cmp(&b.1.x)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        // Count horizontally separated text runs inside the box. A single
+        // list row flows as one run; two-plus runs across most boxes means
+        // multi-column content (striped prose or a real grid) that must not
+        // collapse into a one-column table.
+        let mut runs = 1usize;
+        for pair in in_box.windows(2) {
+            let (prev, item) = (pair[0].1, pair[1].1);
+            if (prev.y - item.y).abs() <= 2.0 && item.x - (prev.x + prev.width) > 15.0 {
+                runs += 1;
+            }
+        }
+        if runs >= 2 {
+            multi_run_boxes += 1;
+        }
+        let text = in_box
+            .iter()
+            .map(|(_, it)| it.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.is_empty() || text.chars().count() > 120 {
+            return None;
+        }
+        item_indices.extend(in_box.iter().map(|(i, _)| *i));
+        cells.push(vec![text]);
+    }
+    if multi_run_boxes * 2 >= boxes.len() {
+        debug!(
+            "  stacked-box rejected: {}/{} boxes hold multiple text runs",
+            multi_run_boxes,
+            boxes.len()
+        );
+        return None;
+    }
+
+    // Reject prose behind per-line stripe rects: sentence fragments flowing
+    // across rows read as long, function-word-dense cells, while genuine
+    // list-table rows are short labels/titles.
+    const PROSE_WORDS: &[&str] = &[
+        "a", "an", "the", "of", "to", "is", "was", "are", "were", "be", "been", "in", "on", "at",
+        "with", "for", "by", "as", "and", "or", "but", "this", "that", "these", "those", "from",
+        "into", "has", "have", "had", "not", "it", "its", "their", "such", "shall", "which",
+    ];
+    let total_chars: usize = cells.iter().map(|r| r[0].chars().count()).sum();
+    let mean_chars = total_chars / cells.len().max(1);
+    let prose_cells = cells
+        .iter()
+        .filter(|r| {
+            r[0].to_ascii_lowercase()
+                .split(|c: char| !c.is_ascii_alphabetic() && c != '\'')
+                .any(|w| PROSE_WORDS.contains(&w))
+        })
+        .count();
+    if mean_chars > 60 && prose_cells * 5 >= cells.len() * 2 {
+        debug!(
+            "  stacked-box rejected: prose rows (mean {} chars, prose words {}/{})",
+            mean_chars,
+            prose_cells,
+            cells.len()
+        );
+        return None;
+    }
+    // Sentences wrapping across stripe rects: a row ending with a comma, or
+    // a row without terminal punctuation followed by a row starting
+    // lowercase, is mid-sentence flow — not list rows. Genuine label/title
+    // rows produce none of these, so even a small share is disqualifying.
+    let continuations = cells
+        .windows(2)
+        .filter(|pair| {
+            let prev = pair[0][0].trim_end();
+            let next = pair[1][0].trim_start();
+            let prev_open = !prev.ends_with(['.', ':', ';', '!', '?', ')', '"', '%']);
+            let next_lower = next.chars().next().is_some_and(|c| c.is_lowercase());
+            prev.ends_with(',') || (prev_open && next_lower)
+        })
+        .count();
+    if cells.len() >= 2 && (continuations >= 2 || continuations * 4 >= cells.len() - 1) {
+        debug!(
+            "  stacked-box rejected: {}/{} row pairs continue a sentence",
+            continuations,
+            cells.len() - 1
+        );
+        return None;
+    }
+    // Numbered/lettered list items behind decorative stripes stay lists:
+    // "1) content..." / "(ii) content..." / "a. content...".
+    let list_marker = |t: &str| {
+        let t = t.trim_start().strip_prefix('(').unwrap_or(t.trim_start());
+        let marker_len = t.chars().take_while(|c| c.is_ascii_alphanumeric()).count();
+        (1..=3).contains(&marker_len)
+            && t.chars()
+                .nth(marker_len)
+                .is_some_and(|c| c == ')' || c == '.')
+    };
+    let list_rows = cells.iter().filter(|r| list_marker(&r[0])).count();
+    if list_rows * 2 >= cells.len() {
+        debug!(
+            "  stacked-box rejected: {}/{} rows are numbered list items",
+            list_rows,
+            cells.len()
+        );
+        return None;
+    }
+
+    debug!(
+        "page {}: stacked-box table: {} single-column rows",
+        page,
+        cells.len()
+    );
+    let columns = vec![boxes[0].0 + boxes[0].2 / 2.0];
+    let rows: Vec<f32> = boxes.iter().map(|b| b.1 + b.3 / 2.0).collect();
+    Some(Table::new(columns, rows, cells, item_indices))
+}
+
 fn merge_overlapping_hints(mut hints: Vec<RectHintRegion>) -> Vec<RectHintRegion> {
     if hints.len() <= 1 {
         return hints;
@@ -2456,6 +2690,92 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    // --- detect_stacked_box_table ---
+
+    /// N stacked boxes at x=100, w=300, h=22, top-to-bottom from y=600.
+    fn stacked_boxes(n: usize) -> Vec<(f32, f32, f32, f32)> {
+        (0..n)
+            .map(|i| (100.0, 600.0 - i as f32 * 22.0, 300.0, 22.0))
+            .collect()
+    }
+
+    #[test]
+    fn stacked_box_list_becomes_single_column_table() {
+        let rects = stacked_boxes(5);
+        let items: Vec<TextItem> = (0..5)
+            .map(|i| make_item("#1: Recycling Basics", 120.0, 605.0 - i as f32 * 22.0, 10.0))
+            .collect();
+        let table = detect_stacked_box_table(&items, &rects, 1).expect("stacked-box table");
+        assert_eq!(table.cells.len(), 5);
+        assert_eq!(table.cells[0].len(), 1);
+    }
+
+    #[test]
+    fn stacked_box_rejects_wrapped_sentences() {
+        // Line stripes behind flowing prose: rows continue mid-sentence.
+        let rects = stacked_boxes(4);
+        let texts = [
+            "the provisions of this section apply to",
+            "companies subject to tax under those",
+            "sections, except that the copy of the",
+            "annual statement must be retained.",
+        ];
+        let items: Vec<TextItem> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| make_item(t, 120.0, 605.0 - i as f32 * 22.0, 10.0))
+            .collect();
+        assert!(detect_stacked_box_table(&items, &rects, 1).is_none());
+    }
+
+    #[test]
+    fn stacked_box_rejects_flanking_text() {
+        // A ruled label column with plain-text data columns beside it is one
+        // column of a wider table, not a single-column list.
+        let rects = stacked_boxes(4);
+        let mut items = Vec::new();
+        for i in 0..4 {
+            let y = 605.0 - i as f32 * 22.0;
+            items.push(make_item("Section 1.382", 120.0, y, 10.0));
+            items.push(make_item("removed text", 450.0, y, 10.0)); // beside the box
+        }
+        assert!(detect_stacked_box_table(&items, &rects, 1).is_none());
+    }
+
+    #[test]
+    fn stacked_box_rejects_two_column_content() {
+        // Boxes holding two separated runs are striped multi-column content.
+        let rects = stacked_boxes(4);
+        let mut items = Vec::new();
+        for i in 0..4 {
+            let y = 605.0 - i as f32 * 22.0;
+            let mut left = make_item("left words", 110.0, y, 10.0);
+            left.width = 60.0;
+            let mut right = make_item("right words", 250.0, y, 10.0);
+            right.width = 60.0;
+            items.push(left);
+            items.push(right);
+        }
+        assert!(detect_stacked_box_table(&items, &rects, 1).is_none());
+    }
+
+    #[test]
+    fn stacked_box_rejects_mixed_height_stripes() {
+        // Mixed 13/27pt stripes (redline markup) — height uniformity splits
+        // the family and the gap check rejects the remainder.
+        let mut rects = Vec::new();
+        let mut y = 600.0;
+        for i in 0..8 {
+            let h = if i % 3 == 0 { 27.0 } else { 13.5 };
+            y -= h;
+            rects.push((100.0, y, 300.0, h));
+        }
+        let items: Vec<TextItem> = (0..8)
+            .map(|i| make_item("PART 602 OMB CONTROL", 120.0, 590.0 - i as f32 * 18.0, 10.0))
+            .collect();
+        assert!(detect_stacked_box_table(&items, &rects, 1).is_none());
     }
 
     // --- has_dominant_prose_cell ---
