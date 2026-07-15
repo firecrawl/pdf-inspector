@@ -190,6 +190,7 @@ fn extract_positioned_text_impl(
         // outside the CropBox. Extracting it interleaves invisible text into
         // the page and poisons font statistics. Rotated pages are left alone
         // — their item coordinates are already transformed out of box space.
+        let mut clipped_box: Option<(f32, f32, f32, f32)> = None;
         if !coords_rotated {
             if let Some((bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
                 const TOL: f32 = 6.0;
@@ -245,6 +246,7 @@ fn extract_positioned_text_impl(
                             x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
                         };
                         rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
+                        clipped_box = Some((bx0, by0, bx1, by1));
                         lines.retain(|l| {
                             overlaps(
                                 l.x1.min(l.x2),
@@ -296,7 +298,14 @@ fn extract_positioned_text_impl(
         all_lines.extend(lines);
 
         // Extract hyperlinks from page annotations
-        let links = extract_page_links(doc, page_id, *page_num);
+        let mut links = extract_page_links(doc, page_id, *page_num);
+        // Annotations from the neighboring page are off-box too.
+        if let Some((bx0, by0, bx1, by1)) = clipped_box {
+            links.retain(|it| {
+                let cx = it.x + it.width / 2.0;
+                cx >= bx0 - 6.0 && cx <= bx1 + 6.0 && it.y >= by0 - 6.0 && it.y <= by1 + 6.0
+            });
+        }
         all_items.extend(links);
     }
 
