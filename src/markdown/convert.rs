@@ -877,10 +877,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 // paragraph continuity and minor font-size variation
                 // inflates rarity scores.
                 let has_strong_signal = all_bold || isolated || (rarity >= 0.97 && word_count <= 8);
-                // Single-word headings ("IMPLEMENTATION", "CONTENTS") are common;
-                // accept them only with the strongest signal combination.
-                let enough_words =
-                    word_count >= 2 || (all_bold && isolated && plain_trimmed.len() >= 4);
+                // Single-word headings ("IMPLEMENTATION", "CONTENTS",
+                // "Replace") are common. All-bold single words qualify when
+                // standalone (paragraph break before / page top) — headings
+                // hug their section's first paragraph, so requiring a break
+                // after as well missed most of them. Mixed bold lead-ins
+                // ("Note: ...") are excluded by all_bold.
+                let enough_words = word_count >= 2 || (all_bold && plain_trimmed.len() >= 4);
                 let numbered_bold = all_bold && starts_with_section_number(plain_trimmed);
                 if numbered_bold
                     || (score >= 0.5 && standalone && enough_words && has_strong_signal)
