@@ -744,6 +744,34 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             cols.len() >= 2
         };
 
+        // Chart-bar regions: bar charts drawn as filled rects read as cell
+        // rects or aligned text and get gridded into phantom tables. Their
+        // items are excluded from every table detector below and flow through
+        // as plain text instead.
+        let page_rect_vec: Vec<PdfRect> =
+            rects.iter().filter(|r| r.page == page).cloned().collect();
+        let chart_regions = crate::tables::detect_chart_regions(&page_items, &page_rect_vec, page);
+        // Pad the claim region: axis/category labels sit just outside the
+        // bar rects (below the axis, left of the scale) and belong to the
+        // chart as much as the bars do.
+        const CHART_PAD: f32 = 20.0;
+        let in_chart = |it: &TextItem| {
+            chart_regions.iter().any(|&(x0, y0, x1, y1)| {
+                let cx = it.x + it.width / 2.0;
+                cx >= x0 - CHART_PAD
+                    && cx <= x1 + CHART_PAD
+                    && it.y >= y0 - CHART_PAD
+                    && it.y <= y1 + CHART_PAD
+            })
+        };
+        if !chart_regions.is_empty() {
+            log::debug!(
+                "page {}: {} chart region(s) masked from table detection",
+                page,
+                chart_regions.len()
+            );
+        }
+
         // Check for side-by-side layout (e.g. two tables placed left and right)
         let mut bands = split_side_by_side(&page_items);
         // A rect table crossing a proposed split boundary means the "gutter"
@@ -836,6 +864,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
             // Track which band-local indices are claimed by structural detection
             let mut rect_claimed: HashSet<usize> = HashSet::new();
+
+            // Pre-claim chart items: every detector below skips claimed
+            // indices, and unclaimed-by-tables text flows out as plain lines.
+            if !chart_regions.is_empty() {
+                for (idx, item) in band_items.iter().enumerate() {
+                    if in_chart(item) {
+                        rect_claimed.insert(idx);
+                    }
+                }
+            }
 
             // 0. Structure-tree detection (highest priority — semantic PDF tagging)
             //    Only use struct-tree tables when they capture a majority (≥50%) of
@@ -1092,15 +1130,20 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 }
             }
             if synth_lines.len() >= 10 {
-                let page_text: Vec<TextItem> = text_items
+                // Chart text stays out of the thin-rect fallback too — a
+                // chart's thin grid rules would otherwise re-grid it.
+                let (page_text, page_text_map): (Vec<TextItem>, Vec<usize>) = text_items
                     .iter()
-                    .filter(|i| i.page == page)
-                    .cloned()
-                    .collect();
+                    .enumerate()
+                    .filter(|(_, i)| i.page == page && !in_chart(i))
+                    .map(|(idx, i)| (i.clone(), idx))
+                    .unzip();
                 let line_tables = detect_tables_from_lines(&page_text, &synth_lines, page);
                 for table in &line_tables {
                     for &idx in &table.item_indices {
-                        table_items.insert(idx);
+                        if let Some(&global_idx) = page_text_map.get(idx) {
+                            table_items.insert(global_idx);
+                        }
                     }
                     let table_y = table.rows.first().copied().unwrap_or(0.0);
                     let table_md = table_to_markdown(table);
@@ -1124,10 +1167,20 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 band_items.len(),
                 was_split
             );
-            let heuristic_tables = detect_tables(band_items, base_size, page_has_columns);
+            // Chart text stays out of the retry as well.
+            let (chart_free, chart_free_map): (Vec<TextItem>, Vec<usize>) = band_items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| !in_chart(it))
+                .map(|(i, it)| (it.clone(), i))
+                .unzip();
+            let heuristic_tables = detect_tables(&chart_free, base_size, page_has_columns);
             for table in &heuristic_tables {
                 for &idx in &table.item_indices {
-                    if let Some(&page_idx) = band_index_map.get(idx) {
+                    if let Some(&page_idx) = chart_free_map
+                        .get(idx)
+                        .and_then(|&band_idx| band_index_map.get(band_idx))
+                    {
                         if let Some(&(global_idx, _)) = group.get(page_idx) {
                             table_items.insert(global_idx);
                         }

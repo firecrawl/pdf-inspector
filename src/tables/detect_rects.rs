@@ -226,6 +226,67 @@ pub struct RectHintRegion {
 /// Also returns hint regions: bounding boxes of cell-sized rects from clusters
 /// that failed full grid validation.  These can be used to scope heuristic
 /// detection and prevent unrelated items from being merged into tables.
+/// Bounding boxes of chart-bar clusters on the page. Text inside these
+/// regions (axis labels, data values, legends) belongs to a figure and must
+/// not be gridded into a table by any detection strategy.
+pub fn detect_chart_regions(
+    items: &[TextItem],
+    rects: &[PdfRect],
+    page: u32,
+) -> Vec<(f32, f32, f32, f32)> {
+    // Match detect_tables_from_rects: image placeholders are not text and
+    // would defeat the bar-content check.
+    let items_owned: Vec<TextItem> = items
+        .iter()
+        .filter(|i| crate::extractor::is_text_layout_item(i))
+        .cloned()
+        .collect();
+    let items = items_owned.as_slice();
+    let page_rects: Vec<(f32, f32, f32, f32)> = rects
+        .iter()
+        .filter(|r| r.page == page)
+        .map(|r| {
+            let (x, w) = if r.width < 0.0 {
+                (r.x + r.width, -r.width)
+            } else {
+                (r.x, r.width)
+            };
+            let (y, h) = if r.height < 0.0 {
+                (r.y + r.height, -r.height)
+            } else {
+                (r.y, r.height)
+            };
+            (x, y, w, h)
+        })
+        // Origin-anchored page backgrounds/clipping paths are never chart
+        // geometry, and letting one bridge into a bar cluster would inflate
+        // the region to the whole page.
+        .filter(|&(x, y, w, h)| w >= 5.0 && h >= 5.0 && !(x < 5.0 && y < 5.0))
+        .collect();
+    if page_rects.len() < 6 {
+        return Vec::new();
+    }
+    let mut regions = Vec::new();
+    for cluster in &cluster_rects(&page_rects, 3.0, 6) {
+        let group: Vec<(f32, f32, f32, f32)> = cluster.iter().map(|&i| page_rects[i]).collect();
+        if is_chart_bar_cluster(items, &group, page) {
+            let bbox = group.iter().fold(
+                (
+                    f32::INFINITY,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                ),
+                |(x0, y0, x1, y1), &(x, y, w, h)| {
+                    (x0.min(x), y0.min(y), x1.max(x + w), y1.max(y + h))
+                },
+            );
+            regions.push(bbox);
+        }
+    }
+    regions
+}
+
 pub fn detect_tables_from_rects(
     items: &[TextItem],
     rects: &[PdfRect],
@@ -379,9 +440,23 @@ pub fn detect_tables_from_rects(
             .collect();
 
         debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
-        for cluster_indices in &clusters {
+        let mut chart_cluster_ids: Vec<usize> = Vec::new();
+        for (cluster_id, cluster_indices) in clusters.iter().enumerate() {
             let group_rects: Vec<(f32, f32, f32, f32)> =
                 cluster_indices.iter().map(|&i| page_rects[i]).collect();
+            // Chart bars are neither table cells nor a hint region — gridding
+            // a chart's axis labels scrambles the page. Skip the cluster
+            // entirely so it can't reach any detector, the merged fallback,
+            // or the hint fallback.
+            if is_chart_bar_cluster(items, &group_rects, page) {
+                debug!(
+                    "page {}: skipping chart-bar cluster ({} rects)",
+                    page,
+                    group_rects.len()
+                );
+                chart_cluster_ids.push(cluster_id);
+                continue;
+            }
             if let Some(table) = detect_table_from_rect_group(items, &group_rects, page) {
                 tables.push(table);
             } else if let Some(table) = detect_row_stripe_table(items, &group_rects, page) {
@@ -421,12 +496,19 @@ pub fn detect_tables_from_rects(
         // text-based column detection.
         let only_narrow = !tables.is_empty() && tables.iter().all(|t| t.columns.len() <= 3);
         if tables.is_empty() || only_narrow {
-            let total_clustered: usize = clusters.iter().map(|c| c.len()).sum();
-            if clusters.len() >= 3 && total_clustered >= 50 {
+            // Chart clusters stay out of the merge as well.
+            let table_clusters: Vec<&Vec<usize>> = clusters
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| !chart_cluster_ids.contains(id))
+                .map(|(_, c)| c)
+                .collect();
+            let total_clustered: usize = table_clusters.iter().map(|c| c.len()).sum();
+            if table_clusters.len() >= 3 && total_clustered >= 50 {
                 debug!(
                     "page {}: trying merged-cluster fallback ({} clusters, {} rects{})",
                     page,
-                    clusters.len(),
+                    table_clusters.len(),
                     total_clustered,
                     if only_narrow {
                         ", replacing narrow tables"
@@ -434,7 +516,7 @@ pub fn detect_tables_from_rects(
                         ""
                     }
                 );
-                let all_cluster_rects: Vec<(f32, f32, f32, f32)> = clusters
+                let all_cluster_rects: Vec<(f32, f32, f32, f32)> = table_clusters
                     .iter()
                     .flat_map(|idxs| idxs.iter().map(|&i| page_rects[i]))
                     .collect();
@@ -1827,6 +1909,118 @@ fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
 /// Uses rect Y-edges for row boundaries and text X-position clustering for
 /// columns.  Handles tables with cell backgrounds that don't form a clean
 /// X-edge grid (variable column widths, decorative fills).
+/// Chart-bar signature: ≥3 rects sharing an aligned bottom edge (the axis),
+/// with similar widths (bars) but strongly varying heights (data-driven),
+/// holding at most a single numeric data label each. Bar charts drawn as
+/// filled rects otherwise read as cell rects and grid their axis labels
+/// into a phantom table. The mirrored check catches horizontal bar charts.
+fn is_chart_bar_cluster(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> bool {
+    let numeric_or_empty = |(rx, ry, rw, rh): (f32, f32, f32, f32)| {
+        let inside: Vec<&TextItem> = items
+            .iter()
+            .filter(|it| {
+                let cx = it.x + it.width / 2.0;
+                it.page == page && cx >= rx && cx <= rx + rw && it.y >= ry && it.y <= ry + rh
+            })
+            .collect();
+        // Any number of numeric data labels is chart-like; a single run of
+        // word text inside means a table cell.
+        inside.iter().all(|it| {
+            let t = it.text.trim();
+            let data = t
+                .chars()
+                .filter(|c| c.is_ascii_digit() || ",.%-".contains(*c))
+                .count();
+            t.is_empty() || data * 2 >= t.chars().count()
+        })
+    };
+
+    // Bars: the dominant equal-width family, arranged in >=2 spaced columns
+    // (inter-column gap >= half a bar width — table cell rects touch), with
+    // data-driven height variation (checkbox/cell grids are uniform).
+    // Mirrored predicate catches horizontal bar charts.
+    let bar_family = |pos: fn(&(f32, f32, f32, f32)) -> f32,
+                      breadth: fn(&(f32, f32, f32, f32)) -> f32,
+                      length: fn(&(f32, f32, f32, f32)) -> f32,
+                      along: fn(&(f32, f32, f32, f32)) -> f32| {
+        group_rects.iter().any(|anchor| {
+            let bw = breadth(anchor);
+            if bw <= 0.0 {
+                return false;
+            }
+            let family: Vec<&(f32, f32, f32, f32)> = group_rects
+                .iter()
+                .filter(|r| {
+                    (breadth(r) - bw).abs() <= (bw * 0.1).max(2.0)
+                        && length(r) > 0.0
+                        && length(r) < bw * 20.0
+                })
+                .collect();
+            if family.len() < 4 {
+                return false;
+            }
+            // Distinct positions along the axis (bar columns).
+            let mut positions: Vec<f32> = Vec::new();
+            for r in &family {
+                let p = pos(r);
+                if !positions.iter().any(|&q| (q - p).abs() <= 2.0) {
+                    positions.push(p);
+                }
+            }
+            if positions.len() < 2 {
+                return false;
+            }
+            positions.sort_by(|a, b| a.total_cmp(b));
+            let min_gap = positions
+                .windows(2)
+                .map(|w| w[1] - w[0] - bw)
+                .fold(f32::INFINITY, f32::min);
+            if min_gap < bw * 0.5 {
+                return false;
+            }
+            // Data-driven variation along the bar direction.
+            let len_min = family
+                .iter()
+                .map(|r| length(r))
+                .fold(f32::INFINITY, f32::min);
+            let len_max = family
+                .iter()
+                .map(|r| length(r))
+                .fold(f32::NEG_INFINITY, f32::max);
+            if len_max < len_min * 1.3 {
+                return false;
+            }
+            // Grid rows disguise as bars: a table's cell rects have same-y,
+            // same-height partners in other columns (uniform row heights).
+            // Chart segments start where the previous datum ended, so their
+            // extents rarely pair up across positions.
+            let matched = family
+                .iter()
+                .filter(|r| {
+                    family.iter().any(|s| {
+                        (pos(s) - pos(r)).abs() > 2.0
+                            && (along(s) - along(r)).abs() <= 3.0
+                            && (length(s) - length(r)).abs() <= 3.0
+                    })
+                })
+                .count();
+            if matched * 5 >= family.len() * 3 {
+                return false;
+            }
+            family.iter().filter(|r| numeric_or_empty(***r)).count() * 3 >= family.len() * 2
+        })
+    };
+
+    // vertical bars: position/breadth = x/width, length = height, along = y
+    bar_family(|r| r.0, |r| r.2, |r| r.3, |r| r.1)
+        // horizontal bars: position/breadth = y/height, length = width, along = x
+        || bar_family(|r| r.1, |r| r.3, |r| r.2, |r| r.0)
+}
+
 fn detect_row_stripe_table_from_cell_rects(
     items: &[TextItem],
     group_rects: &[(f32, f32, f32, f32)],
@@ -2700,6 +2894,87 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    // --- is_chart_bar_cluster / detect_chart_regions ---
+
+    /// Stacked bar chart: frame + 3 columns of equal-width segments with
+    /// data-driven heights, holding numeric labels.
+    fn chart_rects() -> Vec<PdfRect> {
+        let mut rects = vec![PdfRect {
+            x: 126.0,
+            y: 548.0,
+            width: 396.0,
+            height: 216.0,
+            page: 1,
+        }];
+        let bars = [
+            (208.0, 618.0, 59.0),
+            (208.0, 661.0, 39.0),
+            (208.0, 696.0, 37.0),
+            (313.0, 618.0, 67.0),
+            (313.0, 670.0, 49.0),
+            (313.0, 691.0, 42.0),
+            (419.0, 618.0, 73.0),
+            (419.0, 684.0, 37.0),
+            (419.0, 708.0, 25.0),
+        ];
+        for (x, y, h) in bars {
+            rects.push(PdfRect {
+                x,
+                y,
+                width: 46.0,
+                height: h,
+                page: 1,
+            });
+        }
+        rects
+    }
+
+    #[test]
+    fn chart_bars_produce_region_not_table() {
+        let items: Vec<TextItem> = [
+            ("38", 228.0, 638.0),
+            ("30", 228.0, 676.0),
+            ("46", 333.0, 643.0),
+            ("17", 333.0, 679.0),
+            ("57", 438.0, 650.0),
+            ("20", 438.0, 694.0),
+        ]
+        .iter()
+        .map(|&(t, x, y)| make_item(t, x, y, 9.0))
+        .collect();
+        let rects = chart_rects();
+        let regions = detect_chart_regions(&items, &rects, 1);
+        assert_eq!(regions.len(), 1, "expected one chart region");
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(tables.is_empty(), "chart bars must not become a table");
+        assert!(hints.is_empty(), "chart bars must not become a hint region");
+    }
+
+    #[test]
+    fn uniform_cell_grid_is_not_a_chart() {
+        // Touching, uniform-height cell rects (a real table) must not match:
+        // no inter-column gap and no bar-length variation.
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            for col in 0..3 {
+                rects.push(PdfRect {
+                    x: 100.0 + col as f32 * 80.0,
+                    y: 600.0 - row as f32 * 20.0,
+                    width: 80.0,
+                    height: 20.0,
+                    page: 1,
+                });
+            }
+        }
+        let items: Vec<TextItem> = (0..4)
+            .flat_map(|r| {
+                (0..3).map(move |c| (100.0 + c as f32 * 80.0 + 10.0, 605.0 - r as f32 * 20.0))
+            })
+            .map(|(x, y)| make_item("42", x, y, 9.0))
+            .collect();
+        assert!(detect_chart_regions(&items, &rects, 1).is_empty());
     }
 
     // --- detect_stacked_box_table ---
