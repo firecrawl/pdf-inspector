@@ -176,14 +176,59 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let ((mut items, rects, lines), has_gid_fonts, _coords_rotated) = extract_page_text_items(
-            doc,
-            page_id,
-            *page_num,
-            font_cmaps,
-            include_invisible,
-            &mut style_cache,
-        )?;
+        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated) =
+            extract_page_text_items(
+                doc,
+                page_id,
+                *page_num,
+                font_cmaps,
+                include_invisible,
+                &mut style_cache,
+            )?;
+        // Clip to the visible page box: single-page extracts and imposed
+        // spreads keep neighboring pages' content in the stream, positioned
+        // outside the CropBox. Extracting it interleaves invisible text into
+        // the page and poisons font statistics. Rotated pages are left alone
+        // — their item coordinates are already transformed out of box space.
+        if !coords_rotated {
+            if let Some((bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
+                const TOL: f32 = 6.0;
+                if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 {
+                    let before = items.len();
+                    items.retain(|it| {
+                        let cx = it.x + it.width / 2.0;
+                        cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL
+                    });
+                    if items.len() < before {
+                        debug!(
+                            "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
+                            page_num,
+                            before - items.len(),
+                            bx0,
+                            by0,
+                            bx1,
+                            by1
+                        );
+                        // Only prune off-page geometry when off-page text
+                        // existed — same neighboring-page content.
+                        let overlaps = |x: f32, y: f32, w: f32, h: f32| {
+                            let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
+                            let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
+                            x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
+                        };
+                        rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
+                        lines.retain(|l| {
+                            overlaps(
+                                l.x1.min(l.x2),
+                                l.y1.min(l.y2),
+                                (l.x2 - l.x1).abs(),
+                                (l.y2 - l.y1).abs(),
+                            )
+                        });
+                    }
+                }
+            }
+        }
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
@@ -965,6 +1010,46 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
         Object::Real(r) => Some(*r),
         _ => None,
     }
+}
+
+/// Visible page box: CropBox if present, else MediaBox, walking page-tree
+/// inheritance (both attributes are inheritable). Returns normalized
+/// (x0, y0, x1, y1) in PDF space.
+fn get_page_box(doc: &Document, page_id: ObjectId) -> Option<(f32, f32, f32, f32)> {
+    fn find_box(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Vec<f32>> {
+        let mut id = page_id;
+        for _ in 0..32 {
+            let dict = doc.get_dictionary(id).ok()?;
+            if let Ok(obj) = dict.get(key) {
+                let arr = match obj {
+                    Object::Array(a) => Some(a.clone()),
+                    Object::Reference(r) => match doc.get_object(*r) {
+                        Ok(Object::Array(a)) => Some(a.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(arr) = arr {
+                    let vals: Vec<f32> = arr.iter().filter_map(get_number).collect();
+                    if vals.len() >= 4 {
+                        return Some(vals);
+                    }
+                }
+            }
+            match dict.get(b"Parent") {
+                Ok(Object::Reference(p)) => id = *p,
+                _ => return None,
+            }
+        }
+        None
+    }
+    let v = find_box(doc, page_id, b"CropBox").or_else(|| find_box(doc, page_id, b"MediaBox"))?;
+    Some((
+        v[0].min(v[2]),
+        v[1].min(v[3]),
+        v[0].max(v[2]),
+        v[1].max(v[3]),
+    ))
 }
 
 #[cfg(test)]
