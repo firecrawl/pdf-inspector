@@ -14,14 +14,242 @@ mod preprocess;
 
 pub use convert::to_markdown_from_lines;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::extractor::group_into_lines_with_thresholds;
+use crate::tables::Table;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
 use classify::{format_list_item, is_code_like, is_list_item};
 use convert::{merge_continuation_tables, to_markdown_from_lines_with_tables_and_images};
+
+/// Promote unclaimed header items sitting directly above a struct-tree table
+/// into the table's first row.
+///
+/// Some tagged PDFs mark only the data rows under `<Table>` / `<TR>` / `<TD>`,
+/// leaving the visible column headers above the grid untagged. Those headers
+/// then slip through to the heuristic fallback and reassemble into a spurious
+/// mini-table next to the real one. Instead, gather unclaimed items within a
+/// small vertical gap above the detected table's top and — if they align to
+/// the existing column centers — fold them into the table as the header row.
+fn promote_implicit_header_rows(mut table: Table, band_items: &[TextItem]) -> Table {
+    if table.cells.is_empty() || table.columns.is_empty() || table.item_indices.is_empty() {
+        return table;
+    }
+
+    let claimed: HashSet<usize> = table.item_indices.iter().copied().collect();
+    let mut x_min = f32::INFINITY;
+    let mut x_max = f32::NEG_INFINITY;
+    let mut y_top = f32::NEG_INFINITY;
+    for &idx in &table.item_indices {
+        if let Some(item) = band_items.get(idx) {
+            x_min = x_min.min(item.x);
+            x_max = x_max.max(item.x + item.width);
+            y_top = y_top.max(item.y + item.height);
+        }
+    }
+    if !y_top.is_finite() || !x_min.is_finite() {
+        return table;
+    }
+
+    let num_cols = table.columns.len();
+    let table_width = (x_max - x_min).max(1.0);
+    // Require each header item to sit within half a column's nominal width
+    // of a struct-tree column center. Any farther and we cannot be
+    // confident which column the text belongs to — e.g. a standalone
+    // section label above the table would otherwise be force-fit into
+    // the nearest column.
+    let col_tolerance = (table_width / num_cols as f32) * 0.5;
+    let max_gap = 60.0;
+
+    // Candidate header items: unclaimed, directly above table, within x span.
+    let mut candidates: Vec<(usize, &TextItem)> = band_items
+        .iter()
+        .enumerate()
+        .filter(|(i, item)| {
+            if claimed.contains(i) {
+                return false;
+            }
+            let above = item.y >= y_top - 2.0 && item.y < y_top + max_gap;
+            let within_x = item.x + item.width >= x_min - 5.0 && item.x <= x_max + 5.0;
+            above && within_x
+        })
+        .collect();
+
+    if candidates.len() < 2 {
+        return table;
+    }
+
+    // Group candidates into visual rows by Y (bucket within ~3pt).
+    candidates.sort_by(|a, b| b.1.y.total_cmp(&a.1.y)); // top-to-bottom (descending Y)
+    let mut rows_by_y: Vec<Vec<(usize, &TextItem)>> = Vec::new();
+    let row_bucket = 3.0;
+    for (idx, item) in candidates {
+        if let Some(last) = rows_by_y.last_mut() {
+            if let Some((_, ref_item)) = last.first() {
+                if (ref_item.y - item.y).abs() <= row_bucket {
+                    last.push((idx, item));
+                    continue;
+                }
+            }
+        }
+        rows_by_y.push(vec![(idx, item)]);
+    }
+
+    // Assign each item in each row to its nearest column. Skip items that are
+    // too far from any column center — they are likely unrelated captions,
+    // page titles, or body text that happens to sit near the table.
+    let mut header_rows: Vec<Vec<String>> = Vec::new();
+    let mut header_indices: Vec<usize> = Vec::new();
+    for row in &rows_by_y {
+        let mut cells_by_col: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+        let mut row_indices: Vec<usize> = Vec::new();
+        let mut dropped = 0usize;
+        for (idx, item) in row {
+            let text = item.text.trim();
+            // Skip stray punctuation or otherwise content-free fragments —
+            // a lone "." or "-" left over from the prior paragraph should
+            // never be promoted into a header cell.
+            if text.is_empty() || !text.chars().any(|c| c.is_alphanumeric()) {
+                continue;
+            }
+            // The struct-tree column positions are left edges (min X of the
+            // column's cell items), so compare against the header item's
+            // left edge too. Using the item center would penalise long
+            // wrapped phrases even when they start exactly at a column.
+            let cx = item.x;
+            let (col, dist) = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(c, &cv)| (c, (cv - cx).abs()))
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .expect("columns is non-empty");
+            if dist > col_tolerance {
+                dropped += 1;
+                continue;
+            }
+            cells_by_col.entry(col).or_default().push(text);
+            row_indices.push(*idx);
+        }
+        // Drop rows that have no aligned cells or where most items are outliers.
+        if cells_by_col.is_empty() || dropped > row_indices.len() {
+            continue;
+        }
+        let mut row_cells = vec![String::new(); num_cols];
+        for (col, parts) in cells_by_col {
+            let joined: String = parts
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            row_cells[col] = joined;
+        }
+        header_rows.push(row_cells);
+        header_indices.extend(row_indices);
+    }
+
+    if header_rows.is_empty() {
+        return table;
+    }
+
+    // Coalesce the discovered header rows into a single header row: each
+    // column's text is concatenated top-to-bottom across the wrapped lines.
+    // A real table header occupies one logical row even when visually wrapped.
+    let mut merged = vec![String::new(); num_cols];
+    for row in &header_rows {
+        for (c, cell) in row.iter().enumerate() {
+            if cell.is_empty() {
+                continue;
+            }
+            if !merged[c].is_empty() {
+                merged[c].push(' ');
+            }
+            merged[c].push_str(cell);
+        }
+    }
+
+    // Require ≥ 75% of columns to be filled before accepting the header.
+    // Real column headers label most or all columns; stray page headers,
+    // dates, and captions typically land on only one or two columns, so a
+    // lower threshold lets a single mis-aligned item drag in unrelated
+    // text as a first row.
+    let filled_cols = merged.iter().filter(|c| !c.trim().is_empty()).count();
+    if filled_cols < 2 || filled_cols * 4 < num_cols * 3 {
+        return table;
+    }
+
+    // Reject when any cell looks like a caption marker ("Table 1",
+    // "Appendix Table A2", "Figure 2", "Chart 3"). These are labels sitting
+    // above the grid, not column headers — folding them into the first row
+    // moves a caption out of the document flow and into the table itself.
+    let looks_like_caption = merged.iter().any(|cell| {
+        let t = cell.trim();
+        if classify::is_caption_line(t) {
+            return true;
+        }
+        // "Appendix Table N" / "Appendix Figure N" share the same semantics
+        // but have an extra word prefix, so handle them explicitly.
+        let lower = t.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("appendix ") {
+            let rest = rest.trim_start();
+            if rest.starts_with("table ")
+                || rest.starts_with("figure ")
+                || rest.starts_with("chart ")
+            {
+                return true;
+            }
+        }
+        false
+    });
+    if looks_like_caption {
+        return table;
+    }
+
+    // Reject when the merged "header" looks like prose or stray page
+    // elements: a cell that starts mid-sentence (lowercase), runs long
+    // (>12 words), or is suspiciously short (<3 chars, e.g. a stray "."
+    // left behind after a sentence). Real headers are short labels.
+    let looks_like_non_header = merged.iter().any(|cell| {
+        let t = cell.trim();
+        if t.is_empty() {
+            return false;
+        }
+        if t.len() < 3 {
+            return true;
+        }
+        if t.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+            return true;
+        }
+        t.split_whitespace().count() > 12
+    });
+    if looks_like_non_header {
+        return table;
+    }
+
+    // Reject when two filled cells hold identical text. Real column headers
+    // label distinct columns, so duplicates are a sign we grabbed a page
+    // title or event banner whose words happen to align across columns.
+    let mut filled: Vec<&str> = merged
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .collect();
+    filled.sort();
+    if filled.windows(2).any(|w| w[0] == w[1]) {
+        return table;
+    }
+
+    // Prepend the header row. rows/columns are centers — add an approximate
+    // Y above the current top row so downstream ordering stays correct.
+    table.cells.insert(0, merged);
+    let approx_row_height = 14.0;
+    let first_row_y = table.rows.first().copied().unwrap_or(y_top);
+    table.rows.insert(0, first_row_y + approx_row_height);
+    table.item_indices.extend(header_indices);
+    table
+}
 
 /// Detect side-by-side table layout by finding a significant X-position gap.
 ///
@@ -711,11 +939,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             //    through to geometry detection which sees all items.
             if !struct_tables.is_empty() {
                 let st_tables = detect_tables_from_struct_tree(band_items, struct_tables, page);
-                for table in &st_tables {
+                for table in st_tables {
                     let coverage = table.item_indices.len() as f32 / band_items.len().max(1) as f32;
                     if coverage < 0.5 {
                         continue;
                     }
+                    let table = promote_implicit_header_rows(table, band_items);
                     for &idx in &table.item_indices {
                         rect_claimed.insert(idx);
                         if let Some(&page_idx) = band_index_map.get(idx) {
@@ -725,7 +954,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         }
                     }
                     let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(table);
+                    let table_md = table_to_markdown(&table);
                     page_tables
                         .entry(page)
                         .or_default()
@@ -1258,6 +1487,105 @@ mod tests {
             })
             .collect();
         assert!(split_from_hint_regions(&items, &rects, 1).is_empty());
+    }
+
+    #[test]
+    fn promote_implicit_header_rows_merges_wrapped_header() {
+        // Struct-tree tagging often covers only the data rows and leaves the
+        // column-header row above the grid untagged. Simulate a 3-row 3-col
+        // data-only table with 3 wrapped header items above each column,
+        // aligned to the column left-edges. After promotion, the cells grid
+        // must carry a header row that concatenates each column's wrapped
+        // lines.
+        let make_item_at = |x: f32, y: f32, text: &str| {
+            let mut it = make_item(x, y, 1);
+            it.text = text.to_string();
+            it.width = 60.0;
+            it
+        };
+
+        let mut items = vec![
+            // Data row 1 at y=200
+            make_item_at(100.0, 200.0, "r1c1"),
+            make_item_at(250.0, 200.0, "r1c2"),
+            make_item_at(400.0, 200.0, "r1c3"),
+            // Data row 2 at y=180
+            make_item_at(100.0, 180.0, "r2c1"),
+            make_item_at(250.0, 180.0, "r2c2"),
+            make_item_at(400.0, 180.0, "r2c3"),
+            // Data row 3 at y=160
+            make_item_at(100.0, 160.0, "r3c1"),
+            make_item_at(250.0, 160.0, "r3c2"),
+            make_item_at(400.0, 160.0, "r3c3"),
+        ];
+        // Unclaimed header items wrapped onto two visual lines just above
+        // the data grid.
+        items.push(make_item_at(100.0, 240.0, "First"));
+        items.push(make_item_at(250.0, 240.0, "Second"));
+        items.push(make_item_at(400.0, 240.0, "Third"));
+        items.push(make_item_at(100.0, 225.0, "column"));
+        items.push(make_item_at(250.0, 225.0, "column"));
+        items.push(make_item_at(400.0, 225.0, "column"));
+
+        let data_indices: Vec<usize> = (0..9).collect();
+        let cells = vec![
+            vec!["r1c1".into(), "r1c2".into(), "r1c3".into()],
+            vec!["r2c1".into(), "r2c2".into(), "r2c3".into()],
+            vec!["r3c1".into(), "r3c2".into(), "r3c3".into()],
+        ];
+        let columns = vec![100.0, 250.0, 400.0];
+        let rows = vec![200.0, 180.0, 160.0];
+        let table = Table::new(columns, rows, cells, data_indices);
+
+        let promoted = promote_implicit_header_rows(table, &items);
+        assert_eq!(promoted.cells.len(), 4, "header row should be prepended");
+        assert_eq!(
+            promoted.cells[0],
+            vec![
+                "First column".to_string(),
+                "Second column".to_string(),
+                "Third column".to_string(),
+            ],
+            "wrapped headers should merge per-column"
+        );
+        assert_eq!(promoted.cells[1], vec!["r1c1", "r1c2", "r1c3"]);
+    }
+
+    #[test]
+    fn promote_implicit_header_rows_ignores_faraway_items() {
+        // A standalone section title sitting above the table with no column
+        // alignment must not be folded in as a (single-cell) header row.
+        let make_item_at = |x: f32, y: f32, text: &str| {
+            let mut it = make_item(x, y, 1);
+            it.text = text.to_string();
+            it.width = 60.0;
+            it
+        };
+
+        let mut items = vec![
+            make_item_at(100.0, 200.0, "r1c1"),
+            make_item_at(250.0, 200.0, "r1c2"),
+            make_item_at(100.0, 180.0, "r2c1"),
+            make_item_at(250.0, 180.0, "r2c2"),
+        ];
+        // Title far above the table and only in one x position — not a header.
+        items.push(make_item_at(50.0, 240.0, "Unrelated section title"));
+
+        let data_indices: Vec<usize> = (0..4).collect();
+        let cells = vec![
+            vec!["r1c1".into(), "r1c2".into()],
+            vec!["r2c1".into(), "r2c2".into()],
+        ];
+        let columns = vec![100.0, 250.0];
+        let rows = vec![200.0, 180.0];
+        let table = Table::new(columns, rows, cells, data_indices);
+
+        let promoted = promote_implicit_header_rows(table, &items);
+        assert_eq!(
+            promoted.cells.len(),
+            2,
+            "no header promotion when only one item aligns"
+        );
     }
 
     #[test]
