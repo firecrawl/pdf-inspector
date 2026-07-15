@@ -11,6 +11,37 @@ use std::process;
 use std::time::Instant;
 
 /// Escape a string for embedding in a JSON string value.
+fn format_detector_ocr_reasons(reasons: &std::collections::BTreeMap<u32, Vec<String>>) -> String {
+    reasons
+        .iter()
+        .map(|(page, page_reasons)| {
+            let reasons_json = page_reasons
+                .iter()
+                .map(|reason| format!(r#""{}""#, json_escape(reason)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#"{{"page":{},"reasons":[{}]}}"#, page, reasons_json)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_ocr_reasons_by_page(reasons: &[pdf_inspector::PageOcrReasons]) -> String {
+    reasons
+        .iter()
+        .map(|entry| {
+            let reasons_json = entry
+                .reasons
+                .iter()
+                .map(|reason| format!(r#""{}""#, json_escape(reason)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#"{{"page":{},"reasons":[{}]}}"#, entry.page, reasons_json)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     for ch in s.chars() {
@@ -117,11 +148,13 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
                     .iter()
                     .map(|p| p.to_string())
                     .collect();
+                let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"detection_time_ms":{}}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"detection_time_ms":{}}}"#,
                     pdf_type_str(&result.pdf_type),
                     result.page_count,
                     ocr_pages.join(","),
+                    ocr_reasons,
                     result.layout.is_complex,
                     table_pages.join(","),
                     col_pages.join(","),
@@ -144,6 +177,9 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
                 println!("Page count: {}", result.page_count);
                 if !result.pages_needing_ocr.is_empty() {
                     println!("Pages needing OCR: {:?}", result.pages_needing_ocr);
+                    for entry in &result.ocr_reasons_by_page {
+                        println!("  page {}: {}", entry.page, entry.reasons.join(", "));
+                    }
                 }
                 println!();
                 if result.layout.is_complex {
@@ -184,8 +220,9 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                     .iter()
                     .map(|p| p.to_string())
                     .collect();
+                let ocr_reasons = format_detector_ocr_reasons(&result.ocr_reasons_by_page);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},"title":{},"ocr_recommended":{},"pages_needing_ocr":[{}],"detection_time_ms":{}}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},"title":{},"ocr_recommended":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"detection_time_ms":{}}}"#,
                     pdf_type_str(&result.pdf_type),
                     result.page_count,
                     result.pages_sampled,
@@ -198,6 +235,7 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                         .unwrap_or_else(|| "null".to_string()),
                     result.ocr_recommended,
                     ocr_pages.join(","),
+                    ocr_reasons,
                     elapsed.as_millis()
                 );
             } else {
@@ -231,6 +269,9 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                             "Pages needing OCR: {:?} (of {})",
                             result.pages_needing_ocr, result.page_count
                         );
+                    }
+                    for (page, reasons) in &result.ocr_reasons_by_page {
+                        println!("  page {}: {}", page, reasons.join(", "));
                     }
                 }
                 if let Some(title) = &result.title {

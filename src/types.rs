@@ -120,6 +120,10 @@ pub struct TextItem {
     /// baseline — PDFs have no underline font flag, so this is detected
     /// geometrically after extraction; see `extractor::underline`).
     pub is_underline: bool,
+    /// Whether the text is struck out (drawn rule/thin rect crossing the
+    /// glyphs at mid x-height). Same geometric detection as underline,
+    /// different vertical window; see `extractor::underline`.
+    pub is_strikeout: bool,
     /// Type of item (text, image, link)
     pub item_type: ItemType,
     /// Marked Content ID from the content stream's BDC/BMC operator.

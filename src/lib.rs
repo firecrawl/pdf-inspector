@@ -39,6 +39,7 @@ pub mod markdown;
 pub mod process_mode;
 pub mod structure_tree;
 pub mod tables;
+mod text_quality;
 pub mod text_utils;
 pub mod tounicode;
 pub mod types;
@@ -60,11 +61,27 @@ pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use text_quality::{
+    analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
+    region_items_have_decoding_issue,
+};
 use tounicode::FontCMaps;
 
 /// OCR reason emitted when the extracted text layer appears garbled due to
 /// broken font decoding or mojibake.
 pub const OCR_REASON_SUSPECTED_GARBLED_TEXT: &str = "suspected_garbled_text";
+
+/// OCR reason: the page is a scanned image (a full-page raster / image-only
+/// page) with no usable text layer.
+pub const OCR_REASON_SCANNED: &str = "scanned";
+
+/// OCR reason: the page has no extractable text and no image to OCR — blank,
+/// or content the parser cannot reach.
+pub const OCR_REASON_NO_TEXT: &str = "no_text";
+
+/// OCR reason: the page's text is drawn as vector outlines (path operators)
+/// rather than real text operators, so it cannot be extracted as characters.
+pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
 
 // =========================================================================
 // Result type
@@ -120,7 +137,7 @@ pub struct PdfProcessResult {
 ///     .mode(ProcessMode::Analyze)
 ///     .pages([1, 3, 5]);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PdfOptions {
     /// How far the pipeline should run (default: [`ProcessMode::Full`]).
     pub mode: ProcessMode,
@@ -130,6 +147,23 @@ pub struct PdfOptions {
     pub markdown: MarkdownOptions,
     /// Optional set of 1-indexed pages to process.  `None` = all pages.
     pub page_filter: Option<HashSet<u32>>,
+    /// Password for decrypting an encrypted PDF. `None` falls back to the
+    /// empty password (owner-only encryption).
+    pub password: Option<String>,
+}
+
+// Manual `Debug` so the password is never leaked through debug logging or a
+// panic that formats the options; it renders as `Some("[REDACTED]")`.
+impl std::fmt::Debug for PdfOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PdfOptions")
+            .field("mode", &self.mode)
+            .field("detection", &self.detection)
+            .field("markdown", &self.markdown)
+            .field("page_filter", &self.page_filter)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl Default for PdfOptions {
@@ -139,6 +173,7 @@ impl Default for PdfOptions {
             detection: DetectionConfig::default(),
             markdown: MarkdownOptions::default(),
             page_filter: None,
+            password: None,
         }
     }
 }
@@ -180,6 +215,12 @@ impl PdfOptions {
         self.page_filter = Some(pages.into_iter().collect());
         self
     }
+
+    /// Set the password used to decrypt an encrypted PDF.
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
 }
 
 // =========================================================================
@@ -212,7 +253,8 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
     validate_pdf_file(&path)?;
 
     // Load the document once — shared by detection AND extraction.
-    let (doc, page_count) = load_document_from_path(&path)?;
+    let (doc, page_count) =
+        load_document_from_path_with_password(&path, options.password.as_deref())?;
 
     process_document(doc, page_count, options, start)
 }
@@ -237,7 +279,8 @@ pub fn process_pdf_mem_with_options(
     let start = std::time::Instant::now();
     validate_pdf_bytes(buffer)?;
 
-    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let (doc, page_count) =
+        load_document_from_mem_with_password(buffer, options.password.as_deref())?;
 
     process_document(doc, page_count, options, start)
 }
@@ -579,6 +622,7 @@ pub fn extract_text_in_regions_mem(
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -597,6 +641,7 @@ pub fn extract_text_in_regions_mem(
                 *page_num,
                 &font_cmaps,
                 false,
+                &mut style_cache,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -699,6 +744,7 @@ pub fn extract_tables_in_regions_mem(
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -714,6 +760,7 @@ pub fn extract_tables_in_regions_mem(
                 *page_num,
                 &font_cmaps,
                 false,
+                &mut style_cache,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -1019,6 +1066,7 @@ pub fn detect_vector_grid_in_region_mem(
             page_1idx,
             &font_cmaps,
             false,
+            &mut extractor::FontStyleCache::new(),
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
@@ -1205,8 +1253,15 @@ mod vector_grid_tests {
         let &page_id = pages.get(&1).unwrap();
         let needed: HashSet<u32> = HashSet::from([1]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) =
-            extract_page_text_items(&doc, page_id, 1, &cmaps, false).unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &cmaps,
+            false,
+            &mut crate::extractor::FontStyleCache::new(),
+        )
+        .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, 1);
         assert_eq!(rect_tables.len(), 1, "expected one rect-detected table");
@@ -1240,8 +1295,15 @@ mod vector_grid_tests {
         let &page_id = pages.get(&page_num).unwrap();
         let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) =
-            extract_page_text_items(&doc, page_id, page_num, &cmaps, false).unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
+            &doc,
+            page_id,
+            page_num,
+            &cmaps,
+            false,
+            &mut crate::extractor::FontStyleCache::new(),
+        )
+        .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, page_num);
         rect_tables
@@ -1966,6 +2028,7 @@ pub fn extract_tables_with_structure_cells_mem(
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -1981,6 +2044,7 @@ pub fn extract_tables_with_structure_cells_mem(
                 *page_num,
                 &font_cmaps,
                 false,
+                &mut style_cache,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -2782,6 +2846,7 @@ fn detect_tsr_quality_issue(
             page_1idx,
             &font_cmaps,
             false,
+            &mut extractor::FontStyleCache::new(),
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {
@@ -3241,23 +3306,39 @@ fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {
 pub(crate) fn load_document_from_path<P: AsRef<Path>>(
     path: P,
 ) -> Result<(Document, u32), PdfError> {
+    load_document_from_path_with_password(path, None)
+}
+
+/// Load a PDF file, decrypting with `password` if the file is encrypted.
+pub(crate) fn load_document_from_path_with_password<P: AsRef<Path>>(
+    path: P,
+    password: Option<&str>,
+) -> Result<(Document, u32), PdfError> {
     let buffer = std::fs::read(&path)?;
-    load_document_from_mem(&buffer)
+    load_document_from_mem_with_password(&buffer, password)
 }
 
 /// Load a PDF from a memory buffer.
 pub(crate) fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
+    load_document_from_mem_with_password(buffer, None)
+}
+
+/// Load a PDF from a memory buffer, decrypting with `password` if encrypted.
+pub(crate) fn load_document_from_mem_with_password(
+    buffer: &[u8],
+    password: Option<&str>,
+) -> Result<(Document, u32), PdfError> {
     // Fix malformed struct element names before parsing. Some PDF generators
     // write bare names (/S Code) instead of proper PDF names (/S /Code), which
     // causes lopdf to silently drop the entire object.
     let fixed = structure_tree::fix_bare_struct_names(buffer);
     let buf = fixed.as_ref();
 
-    let doc = match load_document_bytes(buf) {
+    let doc = match load_document_bytes(buf, password) {
         Ok(doc) => doc,
         Err(first_err) => {
             for repaired in repair_pdf_container_candidates(buf) {
-                match load_document_bytes(&repaired) {
+                match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
                         let page_count = doc.get_pages().len() as u32;
@@ -3277,13 +3358,31 @@ pub(crate) fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), P
     Ok((doc, page_count))
 }
 
-fn load_document_bytes(buf: &[u8]) -> Result<Document, lopdf::Error> {
+fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
     match Document::load_mem(buf) {
+        // Some encrypted PDFs load structurally but leave their streams
+        // encrypted (`is_encrypted()` stays true); reading them yields garbage
+        // until we re-load with a password. Others fail load_mem outright with
+        // an encryption error. Handle both by re-loading with the password.
+        Ok(doc) if doc.is_encrypted() => decrypt_document_bytes(buf, password),
         Ok(doc) => Ok(doc),
-        Err(ref e) if is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
-        }
+        Err(ref e) if is_encrypted_lopdf_error(e) => decrypt_document_bytes(buf, password),
         Err(e) => Err(e),
+    }
+}
+
+/// Re-load an encrypted PDF, decrypting with `password`. Falls back to the
+/// empty password (owner-only encryption, the common "protected" case) when a
+/// non-empty password was supplied but rejected.
+fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
+    let pw = password.unwrap_or("");
+    match Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(pw)) {
+        Ok(doc) => Ok(doc),
+        Err(inner) if !pw.is_empty() => {
+            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
+                .map_err(|_| inner)
+        }
+        Err(inner) => Err(inner),
     }
 }
 
@@ -3378,6 +3477,7 @@ fn process_document(
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
     let confidence = detection.confidence;
+    let detection_ocr_reasons = detection.ocr_reasons_by_page;
 
     // DetectOnly → return immediately
     if options.mode == ProcessMode::DetectOnly {
@@ -3387,7 +3487,7 @@ fn process_document(
             page_count,
             processing_time_ms: start.elapsed().as_millis() as u64,
             pages_needing_ocr,
-            ocr_reasons_by_page: Vec::new(),
+            ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3403,7 +3503,7 @@ fn process_document(
             page_count,
             processing_time_ms: start.elapsed().as_millis() as u64,
             pages_needing_ocr,
-            ocr_reasons_by_page: Vec::new(),
+            ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3669,7 +3769,13 @@ fn process_document(
         page_count,
         processing_time_ms: start.elapsed().as_millis() as u64,
         pages_needing_ocr,
-        ocr_reasons_by_page: page_ocr_reasons_vec(text_quality_reasons_by_page),
+        ocr_reasons_by_page: {
+            // Detector reasons (scanned / no_text / vector_text / garbled) merged
+            // with the markdown-stage garbled detection, deduped per page.
+            let mut merged = detection_ocr_reasons;
+            merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
+            page_ocr_reasons_vec(merged)
+        },
         title,
         confidence,
         layout,
@@ -3681,283 +3787,15 @@ fn process_document(
 // Internal helpers
 // =========================================================================
 
-/// Detect broken font encodings in extracted markdown text.
-///
-/// Two heuristics:
-/// 1. **U+FFFD**: Any replacement character indicates decode failures.
-/// 2. **Dollar-as-space**: Pattern like `Word$Word$Word` where `$` is used as a
-///    word separator due to broken ToUnicode CMaps. Triggers when either:
-///    - More than 50% of `$` are between letters (clear substitution pattern), OR
-///    - More than 20 letter-dollar-letter occurrences (even if some `$` are also
-///      used as trailing/leading separators, 20+ is far beyond normal financial text).
-fn detect_encoding_issues(markdown: &str) -> bool {
-    // Heuristic 1: U+FFFD replacement characters
-    if markdown.contains('\u{FFFD}') {
-        return true;
-    }
-
-    // Heuristic 2: dollar-as-space pattern
-    if has_dollar_as_space_pattern(markdown) {
-        return true;
-    }
-
-    // Heuristic 3: substitution-cipher letter statistics (broken ToUnicode)
-    let mut stats = CipherGarbleStats::default();
-    stats.add_text(markdown);
-    stats.looks_garbled()
-}
-
-fn has_dollar_as_space_pattern(markdown: &str) -> bool {
-    let total_dollars = markdown.matches('$').count();
-    if total_dollars > 10 {
-        let bytes = markdown.as_bytes();
-        let mut letter_dollar_letter = 0usize;
-        for i in 1..bytes.len().saturating_sub(1) {
-            if bytes[i] == b'$'
-                && bytes[i - 1].is_ascii_alphabetic()
-                && bytes[i + 1].is_ascii_alphabetic()
-            {
-                letter_dollar_letter += 1;
-            }
-        }
-        if letter_dollar_letter > 20 || letter_dollar_letter * 2 > total_dollars {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// English letter frequencies (percent, a–z). Used as a natural-language
-/// reference: every Latin-script language in the eval corpus (Swedish,
-/// Finnish, Turkish, German, romaji) scores ≥ 0.80 cosine similarity against
-/// it, while substitution-cipher text scores ~0.53.
-const ENGLISH_LETTER_FREQ: [f64; 26] = [
-    8.2, 1.5, 2.8, 4.3, 12.7, 2.2, 2.0, 6.1, 7.0, 0.15, 0.8, 4.0, 2.4, 6.7, 7.5, 1.9, 0.1, 6.0,
-    6.3, 9.1, 2.8, 1.0, 2.4, 0.15, 2.0, 0.07,
-];
-
-/// Letter statistics for detecting substitution-cipher garbling: broken
-/// ToUnicode CMaps that shift every character by a per-range constant (e.g.
-/// `Certificate` extracted as `8VceZWZTReV`). Such text is 100% printable
-/// ASCII with word-like token lengths, so it defeats `is_garbage_text` and
-/// produces no replacement characters — it needs its own discriminator.
-#[derive(Debug, Default)]
-struct CipherGarbleStats {
-    /// Case-folded ASCII letter histogram.
-    letter_counts: [u32; 26],
-    ascii_letters: usize,
-    ascii_vowels: usize,
-    /// Accented Latin letters (Latin-1 Supplement through Latin Extended-B,
-    /// plus Latin Extended Additional). Count toward Latin dominance only.
-    latin_ext_letters: usize,
-    non_latin_letters: usize,
-    /// Adjacent ASCII-letter pairs, and how many of them switch from
-    /// lowercase straight to uppercase mid-word.
-    letter_bigrams: usize,
-    case_shift_bigrams: usize,
-}
-
-impl CipherGarbleStats {
-    fn add_text(&mut self, text: &str) {
-        let mut prev: Option<char> = None;
-        for ch in text.chars() {
-            if ch.is_ascii_alphabetic() {
-                let idx = (ch.to_ascii_lowercase() as u8 - b'a') as usize;
-                self.letter_counts[idx] += 1;
-                self.ascii_letters += 1;
-                if matches!(ch.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u') {
-                    self.ascii_vowels += 1;
-                }
-                if let Some(p) = prev {
-                    self.letter_bigrams += 1;
-                    if p.is_ascii_lowercase() && ch.is_ascii_uppercase() {
-                        self.case_shift_bigrams += 1;
-                    }
-                }
-                prev = Some(ch);
-            } else {
-                if ch.is_alphabetic() {
-                    if matches!(ch as u32, 0xC0..=0x24F | 0x1E00..=0x1EFF) {
-                        self.latin_ext_letters += 1;
-                    } else {
-                        self.non_latin_letters += 1;
-                    }
-                }
-                prev = None;
-            }
-        }
-    }
-
-    /// Cosine similarity between the observed letter histogram and English
-    /// letter frequencies. A shifted alphabet permutes the histogram, which
-    /// destroys the similarity regardless of the shift amount.
-    fn english_cosine(&self) -> f64 {
-        if self.ascii_letters == 0 {
-            return 1.0;
-        }
-        let n = self.ascii_letters as f64;
-        let mut dot = 0.0;
-        let mut norm_obs = 0.0;
-        for (count, freq) in self.letter_counts.iter().zip(ENGLISH_LETTER_FREQ) {
-            let p = *count as f64 / n;
-            dot += p * freq;
-            norm_obs += p * p;
-        }
-        let norm_en = ENGLISH_LETTER_FREQ
-            .iter()
-            .map(|f| f * f)
-            .sum::<f64>()
-            .sqrt();
-        dot / (norm_obs.sqrt() * norm_en)
-    }
-
-    /// Cosine similarity between the observed histogram and English
-    /// frequencies after sorting BOTH descending — i.e. comparing the *shape*
-    /// of the frequency profile, ignoring which letter sits where. A
-    /// substitution cipher is a bijection, so it preserves this shape exactly
-    /// (att10k 0.97, arbitrary shifts 0.99) regardless of case or offset.
-    /// Non-linguistic ASCII has a different profile: a small alphabet is far
-    /// steeper (random DNA 0.74, hex dumps 0.81), so the shape diverges.
-    fn english_shape_cosine(&self) -> f64 {
-        if self.ascii_letters == 0 {
-            return 1.0;
-        }
-        let n = self.ascii_letters as f64;
-        let mut obs: [f64; 26] = std::array::from_fn(|i| self.letter_counts[i] as f64 / n);
-        obs.sort_unstable_by(|a, b| b.total_cmp(a));
-        let mut en = ENGLISH_LETTER_FREQ;
-        en.sort_unstable_by(|a, b| b.total_cmp(a));
-
-        let dot: f64 = obs.iter().zip(en).map(|(o, e)| o * e).sum();
-        let norm_obs = obs.iter().map(|o| o * o).sum::<f64>().sqrt();
-        let norm_en = en.iter().map(|e| e * e).sum::<f64>().sqrt();
-        dot / (norm_obs * norm_en)
-    }
-
-    /// Thresholds validated against the 380-document pdf-evals snapshot
-    /// corpus (0 false positives) and the garbled ParseBench `att10k` page
-    /// (vowel ratio 0.245, case-shift rate 0.225, cosine 0.532). Closest
-    /// legitimate document on each axis: vowel ratio 0.264 (circuit
-    /// schematic), case-shift rate 0.021, cosine 0.801.
-    fn looks_garbled(&self) -> bool {
-        // Need a statistically meaningful, Latin-dominant sample.
-        if self.ascii_letters < 200
-            || self.non_latin_letters > self.ascii_letters + self.latin_ext_letters
-        {
-            return false;
-        }
-
-        // Real Latin-script text keeps vowels above ~30% of letters even in
-        // acronym- and part-number-heavy documents; shifted text starves them.
-        let vowel_ratio = self.ascii_vowels as f64 / self.ascii_letters as f64;
-        if vowel_ratio > 0.30 {
-            return false;
-        }
-
-        // Signal 1: lowercase→uppercase transitions inside words. A shifted
-        // lowercase alphabet straddles the ASCII uppercase block ('i'→'Z',
-        // 't'→'e'), so garbled words flip case constantly. Real documents
-        // stay ≤ 0.02 even with camelCase identifiers.
-        let case_shifts = self.letter_bigrams >= 100
-            && self.case_shift_bigrams as f64 >= self.letter_bigrams as f64 * 0.10;
-
-        // Signal 2: the histogram is a permutation of natural language — an
-        // English-like frequency SHAPE (sorted cosine high) but with letters
-        // in the wrong POSITIONS (unsorted cosine low). This is the signature
-        // of a substitution cipher and is case-independent, so it catches
-        // all-lowercase and all-uppercase shifts as well as case-straddling
-        // ones. Genuinely non-linguistic ASCII that is merely "unlike English"
-        // fails one of the two halves: DNA/hex dumps have too steep a profile
-        // (shape cosine < 0.90), while protein sequences, ticker symbols and
-        // base64 are not sufficiently unlike English in position (unsorted
-        // cosine ≥ 0.60) — so none of them are routed to OCR.
-        let permuted_language = self.english_cosine() < 0.60 && self.english_shape_cosine() >= 0.90;
-
-        case_shifts || permuted_language
-    }
-}
-
-#[derive(Debug, Default)]
-struct TextQualityReport {
-    pages_needing_ocr: Vec<u32>,
-    has_encoding_issues: bool,
-    reasons_by_page: BTreeMap<u32, Vec<String>>,
-}
-
-#[derive(Debug, Default)]
-struct PageTextQualityEvidence {
-    chars: usize,
-    replacement_chars: usize,
-    replacement_spans: usize,
-    longest_replacement_run: usize,
-    cipher_garble: CipherGarbleStats,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextSpanIssueKind {
-    Replacement,
-    Strong,
-}
-
-fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
-    let mut reasons_by_page = BTreeMap::new();
-    let mut evidence_by_page = BTreeMap::<u32, PageTextQualityEvidence>::new();
-
-    for item in items {
-        if !matches!(item.item_type, crate::types::ItemType::Text) {
-            continue;
-        }
-
-        let evidence = evidence_by_page.entry(item.page).or_default();
-        evidence.chars += item.text.chars().filter(|ch| !ch.is_whitespace()).count();
-        evidence.cipher_garble.add_text(&item.text);
-
-        match text_span_decoding_issue_kind(&item.text) {
-            Some(TextSpanIssueKind::Strong) => {
-                add_ocr_reason(
-                    &mut reasons_by_page,
-                    item.page,
-                    OCR_REASON_SUSPECTED_GARBLED_TEXT,
-                );
-            }
-            Some(TextSpanIssueKind::Replacement) => {
-                let stats = replacement_text_stats(&item.text);
-                evidence.replacement_chars += stats.0;
-                evidence.replacement_spans += 1;
-                evidence.longest_replacement_run = evidence.longest_replacement_run.max(stats.1);
-            }
-            None => {}
-        }
-    }
-
-    for (page, evidence) in evidence_by_page {
-        if reasons_by_page.contains_key(&page) {
-            continue;
-        }
-        if page_replacement_evidence_needs_ocr(&evidence) || evidence.cipher_garble.looks_garbled()
-        {
-            add_ocr_reason(
-                &mut reasons_by_page,
-                page,
-                OCR_REASON_SUSPECTED_GARBLED_TEXT,
-            );
-        }
-    }
-
-    let pages_needing_ocr: Vec<u32> = reasons_by_page.keys().copied().collect();
-    TextQualityReport {
-        has_encoding_issues: !pages_needing_ocr.is_empty(),
-        pages_needing_ocr,
-        reasons_by_page,
-    }
-}
-
 fn suspected_garbled_reason() -> String {
     OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()
 }
 
-fn add_ocr_reason(reasons_by_page: &mut BTreeMap<u32, Vec<String>>, page: u32, reason: &str) {
+pub(crate) fn add_ocr_reason(
+    reasons_by_page: &mut BTreeMap<u32, Vec<String>>,
+    page: u32,
+    reason: &str,
+) {
     let reasons = reasons_by_page.entry(page).or_default();
     if !reasons.iter().any(|existing| existing == reason) {
         reasons.push(reason.to_string());
@@ -3987,225 +3825,6 @@ fn page_ocr_reasons_vec(reasons_by_page: BTreeMap<u32, Vec<String>>) -> Vec<Page
         .into_iter()
         .map(|(page, reasons)| PageOcrReasons { page, reasons })
         .collect()
-}
-
-fn region_items_have_decoding_issue(items: &[TextItem]) -> bool {
-    items.iter().any(|item| {
-        matches!(item.item_type, crate::types::ItemType::Text)
-            && text_span_has_decoding_issue(&item.text)
-    })
-}
-
-fn text_span_has_decoding_issue(text: &str) -> bool {
-    text_span_decoding_issue_kind(text).is_some()
-}
-
-fn text_span_decoding_issue_kind(text: &str) -> Option<TextSpanIssueKind> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-
-    if has_dollar_as_space_pattern(text)
-        || has_private_use_text_run(text)
-        || is_cid_garbage(text)
-        || has_cid_control_token(text)
-    {
-        return Some(TextSpanIssueKind::Strong);
-    }
-
-    if has_replacement_text_run(text) {
-        return Some(TextSpanIssueKind::Replacement);
-    }
-
-    None
-}
-
-fn replacement_text_stats(text: &str) -> (usize, usize) {
-    let mut replacement = 0usize;
-    let mut current_run = 0usize;
-    let mut longest_run = 0usize;
-
-    for ch in text.chars() {
-        if ch == '\u{FFFD}' {
-            replacement += 1;
-            current_run += 1;
-            longest_run = longest_run.max(current_run);
-        } else {
-            current_run = 0;
-        }
-    }
-
-    (replacement, longest_run)
-}
-
-fn page_replacement_evidence_needs_ocr(evidence: &PageTextQualityEvidence) -> bool {
-    if evidence.replacement_chars == 0 || evidence.chars == 0 {
-        return false;
-    }
-
-    // If the entire page is only a short broken text layer, even a short
-    // replacement run is enough evidence. On otherwise text-heavy pages,
-    // require density so math formulas do not force full-page OCR.
-    if evidence.chars <= 80 && evidence.longest_replacement_run >= 2 {
-        return true;
-    }
-
-    let replacement_density_bps = evidence.replacement_chars * 10_000 / evidence.chars;
-    let enough_bad_text = evidence.replacement_chars >= 12 && replacement_density_bps >= 500;
-    let repeated_bad_spans = evidence.replacement_spans >= 3 && replacement_density_bps >= 250;
-    let long_bad_run = evidence.longest_replacement_run >= 8 && replacement_density_bps >= 250;
-
-    enough_bad_text || repeated_bad_spans || long_bad_run
-}
-
-fn has_replacement_text_run(text: &str) -> bool {
-    let (replacement, longest_run) = replacement_text_stats(text);
-    longest_run >= 2 || replacement >= 3
-}
-
-fn has_private_use_text_run(text: &str) -> bool {
-    let mut total = 0usize;
-    let mut private_use = 0usize;
-    let mut current_run = 0usize;
-    let mut longest_run = 0usize;
-
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            current_run = 0;
-            continue;
-        }
-        total += 1;
-        if is_private_use_char(ch) {
-            private_use += 1;
-            current_run += 1;
-            longest_run = longest_run.max(current_run);
-        } else {
-            current_run = 0;
-        }
-    }
-
-    if private_use == 0 {
-        return false;
-    }
-
-    longest_run >= 3 || (total >= 5 && private_use >= 2 && private_use * 2 >= total)
-}
-
-fn has_cid_control_token(text: &str) -> bool {
-    text.split_whitespace().any(token_has_cid_control)
-}
-
-fn token_has_cid_control(token: &str) -> bool {
-    let mut total = 0usize;
-    let mut c1_control = 0usize;
-
-    for ch in token.chars() {
-        total += 1;
-        if ('\u{0080}'..='\u{009F}').contains(&ch) {
-            c1_control += 1;
-        }
-    }
-
-    total >= 5 && c1_control >= 2 && c1_control * 20 >= total
-}
-
-fn is_private_use_char(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
-    )
-}
-
-/// Check if extracted text is predominantly garbage (non-alphanumeric).
-///
-/// Broken font encodings produce text like "----1-.-.-.___  --.-. .._ I_---."
-/// where most characters are punctuation/symbols. Real text in any language
-/// has >50% alphanumeric characters.
-fn is_garbage_text(markdown: &str) -> bool {
-    let mut alphanum = 0usize;
-    let mut non_alphanum = 0usize;
-
-    let chars: Vec<char> = markdown.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        let ch = chars[i];
-        let mut run_end = i + 1;
-        while run_end < chars.len() && chars[run_end] == ch {
-            run_end += 1;
-        }
-
-        let is_decorative_leader = matches!(ch, '.' | '_' | '·') && run_end - i >= 3;
-        if !is_decorative_leader {
-            for &run_ch in &chars[i..run_end] {
-                if run_ch.is_whitespace() {
-                    continue;
-                }
-                // Skip markdown syntax chars that we add (not from the PDF)
-                if matches!(run_ch, '#' | '*' | '|' | '-' | '\n') {
-                    continue;
-                }
-                if run_ch.is_alphanumeric() {
-                    alphanum += 1;
-                } else {
-                    non_alphanum += 1;
-                }
-            }
-        }
-        i = run_end;
-    }
-
-    let total = alphanum + non_alphanum;
-    total >= 50 && alphanum * 2 < total
-}
-
-/// Detect garbage from failed CID-to-Unicode mapping on Identity-H fonts.
-///
-/// When CID values don't correspond to Unicode codepoints, the raw bytes often
-/// produce characters in the C1 control range (U+0080–U+009F) or Private Use
-/// Area, mixed with random Latin Extended characters.  Valid text in any
-/// language almost never contains C1 controls.  We also fall back to the
-/// general `is_garbage_text` check for non-alphanumeric-heavy patterns.
-fn is_cid_garbage(text: &str) -> bool {
-    if is_garbage_text(text) {
-        return true;
-    }
-    let mut total = 0usize;
-    let mut c1_control = 0usize;
-    let mut high_latin = 0usize;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            continue;
-        }
-        total += 1;
-        // C1 control characters (U+0080–U+009F) — almost never in real text
-        if ch == '·' {
-            continue;
-        }
-        if ('\u{0080}'..='\u{009F}').contains(&ch) {
-            c1_control += 1;
-        }
-        // High Latin-1 (U+00A0–U+00FF) — legitimate in Western European text
-        // but when combined with ASCII in CID passthrough, indicates mojibake
-        // from CID values being misinterpreted as Latin-1 characters.
-        if ('\u{00A0}'..='\u{00FF}').contains(&ch) {
-            high_latin += 1;
-        }
-    }
-    if total < 5 {
-        return false;
-    }
-    // If ≥5% of non-whitespace chars are C1 controls, it's garbage
-    if c1_control >= 2 && c1_control * 20 >= total {
-        return true;
-    }
-    // If ≥40% of non-whitespace chars are high Latin-1 AND the text has few
-    // ASCII letters, it's likely CID-as-Latin-1 mojibake (Japanese/CJK PDFs
-    // where CID values 0x80-0xFF become accented Latin characters).  Keep a
-    // minimum length so short math tokens like "2×()×" do not route a clean
-    // page to OCR.
-    let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    total >= 20 && high_latin * 5 >= total * 2 && ascii_letters * 3 < total
 }
 
 /// Detect markdown tables with suspicious structure that suggest the heuristic
@@ -5056,6 +4675,7 @@ mod text_cluster_column_undercount_tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -5331,6 +4951,7 @@ mod table_candidate_selection_tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -6078,6 +5699,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }

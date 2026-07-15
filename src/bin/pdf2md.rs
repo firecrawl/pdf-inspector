@@ -74,7 +74,7 @@ fn format_items_json(items: &[TextItem]) -> String {
                 _ => String::new(),
             };
             format!(
-                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"font":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"item_type":"{}","mcid":{}{}}}"#,
+                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"font":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"is_strikeout":{},"item_type":"{}","mcid":{}{}}}"#,
                 json_escape(&item.text),
                 item.page,
                 item.x,
@@ -86,6 +86,7 @@ fn format_items_json(items: &[TextItem]) -> String {
                 item.is_bold,
                 item.is_italic,
                 item.is_underline,
+                item.is_strikeout,
                 item_type_label(&item.item_type),
                 mcid,
                 link_url,
@@ -122,6 +123,7 @@ mod tests {
             is_bold: false,
             is_italic: true,
             is_underline: true,
+            is_strikeout: true,
             item_type: ItemType::Text,
             mcid: Some(7),
         }];
@@ -206,6 +208,7 @@ fn main() {
         eprintln!("  --raw               Output only markdown (no headers)");
         eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
         eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
+        eprintln!("  --password PW       Password for an encrypted PDF");
         eprintln!("  --detect-only       Only detect PDF type (no extraction)");
         eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
         process::exit(1);
@@ -218,6 +221,16 @@ fn main() {
     let page_numbers = args.iter().any(|a| a == "--pages");
     let detect_only = args.iter().any(|a| a == "--detect-only");
     let analyze = args.iter().any(|a| a == "--analyze");
+
+    // Parse --password value
+    let password = args.iter().position(|a| a == "--password").map(|i| {
+        args.get(i + 1)
+            .unwrap_or_else(|| {
+                eprintln!("Error: --password requires a value");
+                process::exit(1);
+            })
+            .clone()
+    });
 
     // Parse --select-pages value
     let page_filter = args
@@ -267,6 +280,7 @@ fn main() {
     if let Some(pages) = page_filter {
         options.page_filter = Some(pages);
     }
+    options.password = password;
 
     match process_pdf_with_options(pdf_path, options) {
         Ok(result) => {

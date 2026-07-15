@@ -1477,6 +1477,10 @@ fn detect_row_stripe_table(
         debug!("  row-stripe rejected: sparse outline/prose continuation shape");
         return None;
     }
+    if has_dominant_prose_cell(&cells) {
+        debug!("  row-stripe rejected: dominant prose cell (chart/figure region over body text)");
+        return None;
+    }
 
     let column_centers: Vec<f32> = (0..num_cols)
         .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
@@ -1493,6 +1497,34 @@ fn detect_row_stripe_table(
     );
 
     Some(Table::new(column_centers, row_centers, cells, item_indices))
+}
+
+/// Detect a grid that swallowed body text instead of tabular data.
+///
+/// Charts (bar graphs, axis gridlines) emit fields of drawing rects that can
+/// pass the row-stripe shape test; the resulting "table" then captures the
+/// page's prose. The signature: one cell holds an entire paragraph — ≥60 words
+/// AND at least a third of all words in the table.
+///
+/// There is deliberately no row-count exemption. A small table whose single
+/// long cell dominates its word count is indistinguishable by content from a
+/// phantom grid over body text, and across the regression corpora every such
+/// grid observed has been swallowed prose, never a real note table. The costs
+/// are also asymmetric: rejecting a real table degrades it to readable prose,
+/// while accepting a phantom scrambles the page into Y-interleaved cells.
+/// Larger legitimate tables are safe because the one-third-of-total threshold
+/// scales with table size.
+fn has_dominant_prose_cell(cells: &[Vec<String>]) -> bool {
+    let mut total_words = 0usize;
+    let mut max_cell_words = 0usize;
+    for row in cells {
+        for cell in row {
+            let words = cell.split_whitespace().count();
+            total_words += words;
+            max_cell_words = max_cell_words.max(words);
+        }
+    }
+    max_cell_words >= 60 && max_cell_words * 3 >= total_words
 }
 
 fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
@@ -2294,6 +2326,12 @@ fn detect_merged_cluster_table(
         );
         return None;
     }
+    if has_dominant_prose_cell(&cells) {
+        debug!(
+            "  merged-cluster rejected: dominant prose cell (chart/figure region over body text)"
+        );
+        return None;
+    }
 
     // No empty columns
     for col in 0..num_cols {
@@ -2329,7 +2367,29 @@ fn detect_merged_cluster_table(
 /// suitable for rect-backed tables where we already know tabular structure exists
 /// (no need for anti-paragraph safeguards).
 fn cluster_x_positions(items: &[(usize, &TextItem)], min_threshold: f32) -> Vec<f32> {
-    let mut x_positions: Vec<f32> = items.iter().map(|(_, i)| i.x).collect();
+    // Column edges come from where text STARTS. An item whose left edge hugs
+    // the previous item's right edge on the same line is a continuation run
+    // (style boundary, script change, underline split) — feeding its x-start
+    // in here fabricates a phantom column mid-cell.
+    let mut sorted: Vec<&TextItem> = items.iter().map(|&(_, i)| i).collect();
+    sorted.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+    let mut x_positions: Vec<f32> = Vec::with_capacity(sorted.len());
+    for (idx, item) in sorted.iter().enumerate() {
+        let is_continuation = idx > 0 && {
+            let prev = sorted[idx - 1];
+            // Style/underline splits leave runs that TOUCH (gap ~0); real
+            // cell boundaries in even the tightest tables keep a visible
+            // gap. 2pt separates the two without eating dense-table columns.
+            // The negative side is bounded too: text overhanging from an
+            // adjacent cell overlaps by far more than italic kerning ever
+            // does, and must still start its own column.
+            let gap = item.x - (prev.x + prev.width);
+            (prev.y - item.y).abs() <= 2.0 && gap < 2.0 && gap > -4.0 && item.x >= prev.x
+        };
+        if !is_continuation {
+            x_positions.push(item.x);
+        }
+    }
     x_positions.sort_by(|a, b| a.total_cmp(b));
 
     if x_positions.is_empty() {
@@ -2392,9 +2452,93 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    // --- has_dominant_prose_cell ---
+
+    fn cells_of(rows: &[&[&str]]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|r| r.iter().map(|c| c.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn dominant_prose_cell_rejects_swallowed_paragraph() {
+        // Two cells hold paragraphs (the shape every observed phantom grid
+        // has: swallowed body text spans multiple cells), rest are chart labels
+        let para = ["word"; 70].join(" ");
+        let para2 = ["word"; 35].join(" ");
+        let cells = cells_of(&[
+            &[para.as_str(), "81", "76"],
+            &[para2.as_str(), "56", "9"],
+            &["2019", "2020", ""],
+        ]);
+        assert!(has_dominant_prose_cell(&cells));
+    }
+
+    #[test]
+    fn dominant_prose_cell_rejects_small_table_dominated_by_one_cell() {
+        // Boundary case, documented as INTENDED: a small grid whose single
+        // long cell dominates the word count is rejected even at 4+ rows.
+        // By content alone this shape is indistinguishable from a phantom
+        // grid over body text, and every observed instance in the regression
+        // corpora was swallowed prose (chart/figure regions), not a real
+        // note table. Rejection degrades gracefully — the text is still
+        // extracted as prose — while accepting a phantom scrambles reading
+        // order.
+        let note = ["word"; 70].join(" ");
+        let cells = cells_of(&[
+            &["Purpose", note.as_str()],
+            &["Owner", "Facilities team"],
+            &["Date", "2024-06-01"],
+            &["Status", "Active"],
+        ]);
+        assert!(has_dominant_prose_cell(&cells));
+    }
+
+    #[test]
+    fn dominant_prose_cell_allows_description_column() {
+        // Long-ish description cells, but text is spread across the table
+        let desc = ["word"; 25].join(" ");
+        let cells = cells_of(&[
+            &["Item A", desc.as_str(), "100"],
+            &["Item B", desc.as_str(), "200"],
+            &["Item C", desc.as_str(), "300"],
+            &["Item D", desc.as_str(), "400"],
+        ]);
+        assert!(!has_dominant_prose_cell(&cells));
+    }
+
+    #[test]
+    fn dominant_prose_cell_allows_short_tables() {
+        let cells = cells_of(&[&["Name", "Value"], &["Total", "42"]]);
+        assert!(!has_dominant_prose_cell(&cells));
+    }
+
+    #[test]
+    fn dominant_prose_cell_allows_data_table_with_long_note() {
+        // A real 4+ row table with one verbose remark cell: the note is ≥60
+        // words but the table's other content carries more than 2× its word
+        // count, so concentration stays below the 1/3 threshold. The
+        // denominator scales with table size — this is what keeps large
+        // legitimate tables safe where a bare length cap would not.
+        let note = ["word"; 60].join(" ");
+        let row_text = ["data"; 12].join(" ");
+        let mut rows: Vec<Vec<String>> = (0..11)
+            .map(|i| {
+                vec![
+                    format!("Item {i}"),
+                    row_text.clone(),
+                    format!("{}", i * 100),
+                ]
+            })
+            .collect();
+        rows.push(vec!["Note".into(), note, String::new()]);
+        assert!(!has_dominant_prose_cell(&rows));
     }
 
     // --- rects_overlap ---
@@ -3366,6 +3510,7 @@ mod tests {
                     is_bold: false,
                     is_italic: false,
                     is_underline: false,
+                    is_strikeout: false,
                     item_type: crate::types::ItemType::Text,
                     mcid: None,
                 });
@@ -3676,6 +3821,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: crate::types::ItemType::Text,
                 mcid: None,
             });

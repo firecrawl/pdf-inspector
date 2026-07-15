@@ -76,6 +76,52 @@ pub enum StructRole {
 }
 
 impl StructRole {
+    /// Content roles whose text must never be promoted to a heading by the
+    /// visual heuristic. These carry an explicit non-heading meaning in the
+    /// struct tree (lists, quotes, notes, references, captions, formulas,
+    /// forms, ToC entries), yet their text is often short and visually
+    /// isolated — exactly what the heuristic keys on. Heading roles (H, H1–H6)
+    /// and generic container/flow roles (P, Div, Sect, Span, …) are excluded
+    /// so the heuristic can still fire there.
+    ///
+    /// `Figure` is deliberately NOT in this set: cover/banner pages routinely
+    /// tag the document title inside a Figure (alongside a seal or logo), and
+    /// that title is a real heading. `Formula` and `Form` stay — a line
+    /// explicitly tagged as an equation or form field is never a heading.
+    ///
+    /// Table roles (Table/TR/TH/TD/THead/TBody/TFoot) are included so that
+    /// when table reconstruction falls back and cells reach the line loop as
+    /// plain text, a short isolated cell — a `TH` column header especially —
+    /// is not promoted to a heading.
+    pub(crate) fn is_non_heading_content(&self) -> bool {
+        matches!(
+            self,
+            Self::L
+                | Self::LI
+                | Self::Lbl
+                | Self::LBody
+                | Self::BlockQuote
+                | Self::Quote
+                | Self::Caption
+                | Self::TOC
+                | Self::TOCI
+                | Self::Index
+                | Self::Note
+                | Self::Reference
+                | Self::BibEntry
+                | Self::Code
+                | Self::Formula
+                | Self::Form
+                | Self::Table
+                | Self::TR
+                | Self::TH
+                | Self::TD
+                | Self::THead
+                | Self::TBody
+                | Self::TFoot
+        )
+    }
+
     fn from_name(name: &str) -> Self {
         match name {
             "Document" => Self::Document,
@@ -855,6 +901,54 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_heading_content_roles() {
+        for r in [
+            StructRole::L,
+            StructRole::LI,
+            StructRole::BlockQuote,
+            StructRole::Quote,
+            StructRole::Caption,
+            StructRole::TOC,
+            StructRole::TOCI,
+            StructRole::Index,
+            StructRole::Note,
+            StructRole::Reference,
+            StructRole::BibEntry,
+            StructRole::Code,
+            StructRole::Formula,
+            StructRole::Form,
+            StructRole::Table,
+            StructRole::TR,
+            StructRole::TH,
+            StructRole::TD,
+            StructRole::THead,
+            StructRole::TBody,
+            StructRole::TFoot,
+        ] {
+            assert!(
+                r.is_non_heading_content(),
+                "{r:?} should block heading promotion"
+            );
+        }
+        // Heading and generic container/flow roles must NOT block promotion
+        for r in [
+            StructRole::H,
+            StructRole::H1,
+            StructRole::H3,
+            StructRole::P,
+            StructRole::Div,
+            StructRole::Sect,
+            StructRole::Span,
+            StructRole::Figure,
+        ] {
+            assert!(
+                !r.is_non_heading_content(),
+                "{r:?} should allow heading promotion"
+            );
+        }
+    }
 
     #[test]
     fn test_struct_role_from_name() {

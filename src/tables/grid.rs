@@ -521,6 +521,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -886,6 +887,7 @@ mod tests {
                         is_bold: false,
                         is_italic: false,
                         is_underline: false,
+                        is_strikeout: false,
                         item_type: ItemType::Text,
                         mcid: None,
                         page: 1,
@@ -923,6 +925,7 @@ mod tests {
                         is_bold: false,
                         is_italic: false,
                         is_underline: false,
+                        is_strikeout: false,
                         item_type: ItemType::Text,
                         mcid: None,
                         page: 1,

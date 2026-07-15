@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/pdf-inspector.svg)](https://crates.io/crates/pdf-inspector)
 [![npm](https://img.shields.io/npm/v/@firecrawl/pdf-inspector.svg)](https://www.npmjs.com/package/@firecrawl/pdf-inspector)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Fast Rust library for PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Includes bindings for [Python](docs/python.md) and [Node.js](napi/README.md).
 
@@ -25,16 +26,16 @@ Evaluated on the [opendataloader-bench](https://github.com/opendataloader-projec
 
 | Engine | Overall | Reading Order (NID) | Tables (TEDS) | Headings (MHS) | Speed (200 docs) |
 |---|---|---|---|---|---|
-| pdf-inspector | 0.78 | 0.87 | 0.59 | 0.57 | 4s |
+| pdf-inspector | 0.83 | 0.88 | 0.66 | 0.74 | 4s |
 | opendataloader | 0.84 | 0.91 | 0.49 | 0.74 | 11s |
 | pymupdf4llm | 0.73 | 0.89 | 0.40 | 0.41 | 18s |
 | markitdown | 0.58 | 0.88 | 0.00 | 0.00 | 8s |
 
-For context, engines that use OCR/ML (docling, marker, mineru) score 0.83-0.88 overall but take 2-180 minutes on the same corpus.
+For context, engines that use OCR/ML (docling, marker, mineru) score 0.83-0.88 overall but take 2-180 minutes on the same corpus — pdf-inspector reaches the low end of that range without any OCR, in 4 seconds.
 
-**Where we do well:** Speed (fastest of all engines), reading order, table detection vs other direct-text tools.
+**Where we do well:** Speed (fastest of all engines), the best table detection of any engine shown, and heading detection now on par with opendataloader. Overall lands within 0.01 of opendataloader at roughly 2.5× the speed.
 
-**Where we lag:** Heading detection trails opendataloader — many PDFs use bold text at body font size for headings, or headings that are only slightly larger than body text. Table detection trails OCR-based engines that can see visual table structure.
+**Where we lag:** Reading order still trails opendataloader slightly, and table structure trails OCR-based engines that can see visual layout.
 
 ## Quick start
 
@@ -242,4 +243,4 @@ See [docs/debugging.md](docs/debugging.md) for `RUST_LOG` environment variable u
 
 ## License
 
-MIT
+[MIT](LICENSE)

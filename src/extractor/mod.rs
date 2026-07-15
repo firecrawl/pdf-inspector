@@ -9,7 +9,7 @@ mod links;
 pub(crate) mod underline;
 mod xobjects;
 
-use crate::text_utils::is_rtl_text;
+use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
 use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
@@ -24,6 +24,7 @@ use links::{extract_form_fields, extract_page_links};
 // Re-export public types so existing `crate::extractor::X` paths keep working.
 pub use crate::text_utils::{is_bold_font, is_italic_font};
 pub use crate::types::{ItemType, TextLine};
+pub(crate) use fonts::FontStyleCache;
 pub(crate) use layout::detect_columns;
 pub use layout::group_into_lines;
 pub(crate) use layout::group_into_lines_with_thresholds;
@@ -161,6 +162,9 @@ fn extract_positioned_text_impl(
     let mut all_lines = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
+    // Embedded-font style flags are document-scoped: the same font program
+    // is shared across pages, so parse it once, not once per page.
+    let mut style_cache = FontStyleCache::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -172,8 +176,14 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let ((mut items, rects, lines), has_gid_fonts, _coords_rotated) =
-            extract_page_text_items(doc, page_id, *page_num, font_cmaps, include_invisible)?;
+        let ((mut items, rects, lines), has_gid_fonts, _coords_rotated) = extract_page_text_items(
+            doc,
+            page_id,
+            *page_num,
+            font_cmaps,
+            include_invisible,
+            &mut style_cache,
+        )?;
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
@@ -234,28 +244,62 @@ fn suppress_table_underlines(
     lines: &[PdfLine],
     page: u32,
 ) {
-    if !items.iter().any(|item| item.is_underline) {
+    if !items
+        .iter()
+        .any(|item| item.is_underline || item.is_strikeout)
+    {
         return;
     }
 
     let mut table_item_indices: HashSet<usize> = HashSet::new();
+    // A detected "table" that swallows nearly every text item on the page
+    // is a detection artifact (prose pages with boxed callouts or stacked
+    // underline rules read as one giant grid), not a real table — letting
+    // it through here erased every legitimate underline on the page
+    // (text_dense__underline: rect detection claimed 52/52 items). Real
+    // ruled tables share the page with headings, captions, and body text.
+    let plausible = |table: &crate::tables::Table| {
+        // Content sanity gate: prose pages with boxed callouts and stacked
+        // underline rules can detect as a structurally rich "table" that
+        // swallows every item on the page (text_dense__underline: a 4x8
+        // grid claiming 52/52 items, one "cell" holding 806 chars of body
+        // text) — suppressing there erased every legitimate underline on
+        // the page. Real data-table cells are short values; a cell with
+        // hundreds of characters means the grid captured flowing prose.
+        let lens: Vec<usize> = table
+            .cells
+            .iter()
+            .flatten()
+            .filter(|cell| !cell.trim().is_empty())
+            .map(|cell| cell.chars().count())
+            .collect();
+        if lens.is_empty() {
+            return false;
+        }
+        let long = lens.iter().filter(|&&n| n > 100).count();
+        (long as f32) < (lens.len() as f32) * 0.3
+    };
 
     if !rects.is_empty() {
         let (rect_tables, _) = crate::tables::detect_tables_from_rects(items, rects, page);
-        for table in rect_tables {
-            table_item_indices.extend(table.item_indices);
+        for table in rect_tables.iter().filter(|t| plausible(t)) {
+            table_item_indices.extend(table.item_indices.iter().copied());
         }
     }
 
     if !lines.is_empty() {
-        for table in crate::tables::detect_tables_from_lines(items, lines, page) {
-            table_item_indices.extend(table.item_indices);
+        for table in crate::tables::detect_tables_from_lines(items, lines, page)
+            .iter()
+            .filter(|t| plausible(t))
+        {
+            table_item_indices.extend(table.item_indices.iter().copied());
         }
     }
 
     for index in table_item_indices {
         if let Some(item) = items.get_mut(index) {
             item.is_underline = false;
+            item.is_strikeout = false;
         }
     }
 }
@@ -513,6 +557,136 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
     saw_backtrack
 }
 
+/// Detect a tracked (letter-spaced) run of single-glyph items and derive its
+/// run-local space floor.
+///
+/// Display type set with tracking renders one glyph per show op; the merge
+/// loop's fixed thresholds (0.08-0.13 em) then read every letter gap as a
+/// word boundary and emit "H O W" instead of "HOW". Within such a run the
+/// gaps carry the real signal: letter gaps cluster tightly just above the
+/// fixed threshold, word gaps sit clearly higher. Returns (run_end_index,
+/// space_floor) when the run starting at `start` is tracked — spaces are
+/// then inserted only at gaps above the floor (infinity = single word).
+/// Normal text (multi-char items, or single-char runs with sub-threshold
+/// gaps) returns None and keeps the existing behavior.
+/// Han/Kana scripts write without inter-word spaces. Hangul (Korean) DOES
+/// space between words and deliberately stays out of this set — a Korean
+/// tracked run keeps normal word-boundary handling.
+fn is_spaceless_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
+        | '\u{3040}'..='\u{309F}' // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        | '\u{FF00}'..='\u{FFEF}' // Halfwidth and Fullwidth Forms
+    )
+}
+
+fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, f32)> {
+    const MIN_GAPS: usize = 4;
+    let first = group[start];
+    if first.text.trim().chars().count() != 1 {
+        return None;
+    }
+    let fs = first.font_size;
+    if fs <= 0.0 {
+        return None;
+    }
+
+    // Walk the run under the SAME break conditions as the merge loop
+    // (size band, style equality, mergeable gap) so indices stay aligned.
+    let mut gaps: Vec<f32> = Vec::new();
+    let mut end_x = first.x + effective_merge_width(first);
+    let mut end = start;
+    for (offset, next) in group[start + 1..].iter().enumerate() {
+        if next.text.trim().chars().count() != 1 {
+            break;
+        }
+        if (next.font_size - fs).abs() > fs * 0.20 {
+            break;
+        }
+        if next.is_bold != first.is_bold
+            || next.is_italic != first.is_italic
+            || next.is_underline != first.is_underline
+            || next.is_strikeout != first.is_strikeout
+        {
+            break;
+        }
+        let gap = next.x - end_x;
+        if gap > fs * 0.5 || gap < -fs * 0.5 {
+            break;
+        }
+        gaps.push(gap / fs);
+        end_x = next.x + effective_merge_width(next);
+        end = start + 1 + offset;
+    }
+    if gaps.len() < 2 {
+        return None;
+    }
+
+    // Tracked signature: the run's TYPICAL gap clears the fixed space
+    // threshold (0.08) — the merge loop would break almost every letter
+    // pair into "words". Short runs (2-3 gaps: "H O W") demand a stricter
+    // shape — clearly wide, uniform, ALL-CAPS — because a genuine spaced
+    // sequence of single letters ("x y z" variables) has the same gap
+    // count; display tracking is a caps convention.
+    let mut sorted = gaps.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let median = sorted[sorted.len() / 2];
+    // Typographic convention gate, both tiers: display tracking is an
+    // all-caps convention, and Han/Kana never space between glyphs. Mixed-
+    // or lowercase Latin runs keep their boundaries because geometry alone
+    // cannot distinguish spaced singles ("A b c d e") from a tracked
+    // title-case word ("B u f f a l o").
+    let run_chars = || {
+        group[start..=end]
+            .iter()
+            .flat_map(|it| it.text.trim().chars())
+    };
+    let spaceless_cjk = run_chars().all(|c| is_spaceless_cjk(c) || !c.is_alphanumeric())
+        && run_chars().any(is_spaceless_cjk);
+    let all_caps = run_chars().all(|c| c.is_uppercase() || is_cjk_char(c) || !c.is_alphabetic());
+    if !(spaceless_cjk || all_caps) {
+        return None;
+    }
+
+    if gaps.len() >= MIN_GAPS {
+        if median <= 0.075 {
+            return None;
+        }
+    } else {
+        let uniform = sorted[sorted.len() - 1] <= sorted[0].max(0.01) * 1.4;
+        if median < 0.09 || !uniform {
+            return None;
+        }
+    }
+
+    // Han/Kana: no inter-glyph spaces, period — a nonuniform gap
+    // distribution (punctuation spacing, justification) must not
+    // manufacture word boundaries.
+    if spaceless_cjk {
+        return Some((end, f32::INFINITY));
+    }
+
+    // Word gaps, if present, form a second mode above the letter-gap
+    // cluster: split at the largest relative jump. Unimodal → one word.
+    let mut best_jump = 1.0f32;
+    let mut floor = f32::INFINITY;
+    for pair in sorted.windows(2) {
+        let (lo, hi) = (pair[0].max(0.01), pair[1].max(0.01));
+        let jump = hi / lo;
+        if jump > best_jump {
+            best_jump = jump;
+            floor = (lo + hi) / 2.0;
+        }
+    }
+    if best_jump < 1.4 {
+        floor = f32::INFINITY;
+    }
+    Some((end, floor * fs))
+}
+
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
@@ -560,6 +734,14 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
 
+            // Tracked display text: run-local space floor overrides the
+            // fixed thresholds for this run's junctions (see helper).
+            let tracked = if *preserve_stream_order {
+                None
+            } else {
+                tracked_run_space_floor(group, i)
+            };
+
             let mut j = i + 1;
             while j < group.len() {
                 let next = group[j];
@@ -576,6 +758,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 if next.is_bold != first.is_bold
                     || next.is_italic != first.is_italic
                     || next.is_underline != first.is_underline
+                    || next.is_strikeout != first.is_strikeout
                 {
                     break;
                 }
@@ -613,7 +796,11 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 let needs_bullet_space = *preserve_stream_order
                     && is_standalone_bullet_text(&text)
                     && !next.text.trim().is_empty();
-                if needs_bullet_space || gap > threshold {
+                let effective_threshold = match tracked {
+                    Some((run_end, floor)) if j <= run_end => floor,
+                    _ => threshold,
+                };
+                if needs_bullet_space || gap > effective_threshold {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
@@ -638,6 +825,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 is_bold: first.is_bold,
                 is_italic: first.is_italic,
                 is_underline: first.is_underline,
+                is_strikeout: first.is_strikeout,
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
             });
@@ -715,7 +903,17 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                         .chars()
                         .last()
                         .is_some_and(|c| c.is_alphabetic());
-                    if parent.font_size >= sub_threshold && ends_with_letter {
+                    // Strikeout boundaries block the merge (a struck word
+                    // must not extend its strike over a live footnote digit,
+                    // and a struck digit must not lose its own mark). An
+                    // underlined parent with an unmarked digit DOES merge:
+                    // the drawn rule easily misses the tiny digit's overlap
+                    // window, and refusing costs the whole subscript token
+                    // ("b"+"2" staying split). Visually the rule spans both.
+                    let marks_ok = parent.is_strikeout == item.is_strikeout
+                        && (parent.is_underline == item.is_underline
+                            || (parent.is_underline && !item.is_underline));
+                    if parent.font_size >= sub_threshold && ends_with_letter && marks_ok {
                         let parent_right = parent.x + parent.width;
                         let gap = item.x - parent_right;
                         // Subscripts must be tightly adjacent (within ~1pt)
@@ -776,6 +974,107 @@ mod tests {
     use crate::types::{ItemType, PdfLine, TextLine};
     use layout::{detect_columns, is_newspaper_layout, ColumnRegion};
 
+    /// Glyph-per-item run at `fs`=12 with the given inter-glyph gap (pt).
+    fn glyph_run(chars: &str, start_x: f32, glyph_w: f32, gap: f32) -> Vec<TextItem> {
+        let mut x = start_x;
+        let mut out = Vec::new();
+        for c in chars.chars() {
+            out.push(make_merge_item(&c.to_string(), x, glyph_w));
+            x += glyph_w + gap;
+        }
+        out
+    }
+
+    #[test]
+    fn tracked_caps_run_collapses_to_word() {
+        // Display tracking: every letter gap (0.19 em) clears the fixed
+        // space threshold — without the run-local floor this reads "H O W".
+        let items = glyph_run("HOW", 100.0, 10.0, 2.3);
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "HOW");
+    }
+
+    #[test]
+    fn tracked_run_keeps_word_gaps_bimodal() {
+        // Letters at 0.19 em, word gaps at 0.42 em (below the 0.5 em item
+        // break): the split must land between the modes. Needs >=4 gaps to
+        // enter the bimodal tier — short runs use the strict uniform gate.
+        let mut items = glyph_run("ITISOK", 100.0, 8.0, 2.3);
+        for i in 2..6 {
+            items[i].x += 2.8; // word gap at T|I
+        }
+        for i in 4..6 {
+            items[i].x += 2.8; // word gap at S|O
+        }
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "IT IS OK");
+    }
+
+    #[test]
+    fn lowercase_spaced_singles_stay_words() {
+        // "x y z" variables: same gap shape but lowercase — the short-run
+        // caps requirement keeps genuine spaced singles apart.
+        let items = glyph_run("xyz", 100.0, 6.0, 2.3);
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "x y z");
+    }
+
+    #[test]
+    fn kerned_singles_unaffected() {
+        // Tiny kerning gaps never triggered spaces before and still don't.
+        let items = glyph_run("WORD", 100.0, 8.0, 0.3);
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "WORD");
+    }
+
+    #[test]
+    fn long_lowercase_spaced_singles_keep_boundaries() {
+        // Review: a 5+ single-letter lowercase list has the tracked gap
+        // shape at any length — the convention gate must protect it in
+        // the >=4-gap tier too.
+        let items = glyph_run("abcde", 100.0, 6.0, 2.3);
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "a b c d e");
+    }
+
+    #[test]
+    fn han_run_with_nonuniform_gaps_never_gains_spaces() {
+        // Review: a bimodal gap distribution (justification, punctuation
+        // spacing) must not manufacture word boundaries in Han text.
+        let mut items = glyph_run("北京时事快报", 100.0, 12.0, 1.4);
+        for item in items.iter_mut().skip(3) {
+            item.x += 3.0; // wide gap after the third glyph
+        }
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "北京时事快报");
+    }
+
+    #[test]
+    fn uppercase_leading_spaced_singles_keep_boundaries() {
+        // "A b c d e" is indistinguishable from a title-case tracked word
+        // without reliable tracking metadata, so preserve its boundaries.
+        let items = glyph_run("Abcde", 100.0, 7.0, 2.3);
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "A b c d e");
+    }
+
+    #[test]
+    fn cjk_glyph_run_collapses_without_spaces() {
+        // CJK sets one glyph per item with loose gaps; CJK uses no spaces,
+        // and the non-alphabetic run passes the caps gate.
+        let items = glyph_run("北京时事", 100.0, 12.0, 1.4);
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "北京时事");
+    }
+
     fn make_merge_item(text: &str, x: f32, width: f32) -> TextItem {
         TextItem {
             text: text.into(),
@@ -789,6 +1088,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -991,6 +1291,7 @@ mod tests {
         items[3].y = 470.0;
         for item in &mut items {
             item.is_underline = true;
+            item.is_strikeout = true;
         }
         let lines = vec![
             make_line(100.0, 500.0, 300.0, 500.0),
@@ -1004,6 +1305,30 @@ mod tests {
         suppress_table_underlines(&mut items, &[], &lines, 1);
 
         assert!(items.iter().all(|item| !item.is_underline));
+        assert!(items.iter().all(|item| !item.is_strikeout));
+    }
+
+    #[test]
+    fn subscript_digit_with_different_marks_is_not_absorbed() {
+        // A struck-out word followed by an unmarked footnote digit: merging
+        // would widen the parent's strikeout claim over the digit (and the
+        // reverse would drop the digit's own mark). Style boundaries break
+        // the merge, as in merge_text_items.
+        let mut word = make_merge_item("word", 100.0, 24.0);
+        word.font_size = 10.0;
+        word.is_strikeout = true;
+        let mut digit = make_merge_item("2", 124.5, 4.0);
+        digit.font_size = 6.0;
+        digit.y = word.y + 3.0;
+
+        let merged = merge_subscript_items(vec![word.clone(), digit.clone()]);
+        assert_eq!(merged.len(), 2);
+
+        // Same marks still merge (footnote ref inside the strike).
+        digit.is_strikeout = true;
+        let merged = merge_subscript_items(vec![word, digit]);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].text.starts_with("word"));
     }
 
     #[test]
@@ -1021,6 +1346,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1036,6 +1362,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1051,6 +1378,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1106,6 +1434,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1121,6 +1450,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1136,6 +1466,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1162,6 +1493,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1177,6 +1509,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1192,6 +1525,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1220,6 +1554,7 @@ mod tests {
                 is_bold: true,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -1255,6 +1590,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -1291,6 +1627,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1306,6 +1643,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1321,6 +1659,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1344,6 +1683,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1457,6 +1797,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1472,6 +1813,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1497,6 +1839,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1512,6 +1855,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1553,6 +1897,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -1598,6 +1943,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -1643,6 +1989,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -1681,6 +2028,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }

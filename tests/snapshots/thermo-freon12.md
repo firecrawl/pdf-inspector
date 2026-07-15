@@ -43,9 +43,9 @@ l
 
 **Freon** **®** **12 Saturation Properties-Temperature Table**
 
-|Temp|Pressure||Volume|||Density||Enthalpy|||Entropy|Temp|
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-|°C|[kPa]|[m³ Liquid v f|/kg]|Vapour v g|Liquid d f|[kg/m³] Vapour d g|Liquid H f|[kJ/kg] Latent H fg|Vapour H g|Liquid S f|[kJ/K-kg] Vapour S g|°C|
+|Temp|Pressure||Volume||Density||Enthalpy|||Entropy|Temp|
+|---|---|---|---|---|---|---|---|---|---|---|---|
+|°C|[kPa]|[m³ Liquid v f|/kg] Vapour v g|[kg/m³ Liquid d f|] Vapour d g|Liquid H f|[kJ/kg] Latent H fg|Vapour H g|Liquid S f|[kJ/K-kg] Vapour S g|°C|
 
 |-100|1.2|0.0006|10.0000|1679.0|0.100|113.3|192.8|306.1|0.6077|1.7210|-100|
 |---|---|---|---|---|---|---|---|---|---|---|---|

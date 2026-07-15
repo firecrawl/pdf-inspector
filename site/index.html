@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdf-inspector — PDF classification &amp; text extraction, no OCR</title>
+<meta name="description" content="Fast Rust library that classifies PDFs (text-based vs scanned) and extracts clean Markdown — no OCR, no ML models. Bindings for Rust, Python, and Node.js.">
+<meta property="og:title" content="pdf-inspector">
+<meta property="og:description" content="Classify PDFs and extract clean Markdown in milliseconds. No OCR. No ML. Pure Rust.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%84%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Hanken+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #f4efe4;
+    --paper-2: #eee7d8;
+    --ink: #1b1712;
+    --ink-soft: #4a433a;
+    --muted: #8b8375;
+    --line: #d9cfbb;
+    --accent: #dd3f22;
+    --accent-deep: #b32d15;
+    --card: #faf6ec;
+    --display: "Bricolage Grotesque", serif;
+    --body: "Hanken Grotesk", sans-serif;
+    --mono: "JetBrains Mono", monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+    background-image:
+      radial-gradient(circle at 1px 1px, rgba(27,23,18,0.05) 1px, transparent 0);
+    background-size: 22px 22px;
+  }
+  ::selection { background: var(--accent); color: var(--paper); }
+  a { color: inherit; text-decoration: none; }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 28px; }
+
+  /* ── nav ── */
+  nav {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(244,239,228,0.82);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav-in { display: flex; align-items: center; gap: 22px; height: 60px; }
+  .brand { font-family: var(--mono); font-weight: 700; font-size: 15px; letter-spacing: -0.02em; display: flex; align-items: center; gap: 9px; }
+  .brand .dot { width: 9px; height: 9px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 0 3px rgba(221,63,34,0.18); }
+  .nav-links { margin-left: auto; display: flex; gap: 24px; align-items: center; font-size: 14.5px; font-weight: 500; }
+  .nav-links a { color: var(--ink-soft); transition: color .15s; }
+  .nav-links a:hover { color: var(--accent); }
+  .nav-gh { border: 1px solid var(--ink); border-radius: 999px; padding: 6px 15px; color: var(--ink) !important; transition: all .15s; }
+  .nav-gh:hover { background: var(--ink); color: var(--paper) !important; }
+  @media (max-width: 680px) { .nav-links .hide-sm { display: none; } }
+
+  /* ── hero ── */
+  header { padding: 74px 0 40px; position: relative; }
+  .eyebrow { font-family: var(--mono); font-size: 12.5px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent-deep); margin-bottom: 22px; }
+  h1 {
+    font-family: var(--display);
+    font-weight: 800;
+    font-size: clamp(2.9rem, 8vw, 6.1rem);
+    line-height: 0.96;
+    letter-spacing: -0.035em;
+    max-width: 15ch;
+  }
+  h1 .em { color: var(--accent); font-style: normal; position: relative; }
+  h1 .strike { position: relative; white-space: nowrap; }
+  h1 .strike::after { content: ""; position: absolute; left: -2%; right: -2%; top: 54%; height: 0.09em; background: var(--accent); transform: rotate(-3deg); }
+  .lede { margin-top: 28px; font-size: clamp(1.05rem, 2.2vw, 1.32rem); color: var(--ink-soft); max-width: 46ch; line-height: 1.5; }
+  .lede b { color: var(--ink); font-weight: 600; }
+
+  .hero-grid { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 48px; align-items: end; }
+  @media (max-width: 880px) { .hero-grid { grid-template-columns: 1fr; gap: 40px; } }
+
+  /* readout card */
+  .readout {
+    background: var(--ink); color: var(--paper);
+    border-radius: 14px; padding: 22px 22px 20px;
+    font-family: var(--mono); font-size: 13px;
+    box-shadow: 14px 14px 0 rgba(27,23,18,0.09);
+    position: relative;
+  }
+  .readout .rlabel { color: #b8ad98; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 16px; display: flex; justify-content: space-between; }
+  .readout .rrow { display: flex; justify-content: space-between; align-items: center; padding: 9px 0; border-top: 1px solid rgba(255,255,255,0.09); }
+  .readout .rrow:first-of-type { border-top: none; }
+  .readout .k { color: #cfc6b3; }
+  .readout .v { font-weight: 700; }
+  .readout .v.hot { color: var(--accent); }
+  .bar { height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden; margin-top: 3px; width: 96px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+
+  /* ── install row ── */
+  .installs { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; margin-top: 54px; }
+  @media (max-width: 720px) { .installs { grid-template-columns: 1fr; } }
+  .inst {
+    background: var(--card); border: 1px solid var(--line); border-radius: 11px;
+    padding: 15px 17px; transition: transform .16s, border-color .16s, box-shadow .16s;
+    cursor: pointer;
+  }
+  .inst:hover { transform: translateY(-3px); border-color: var(--accent); box-shadow: 0 8px 22px rgba(27,23,18,0.07); }
+  .inst .reg { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; display: flex; justify-content: space-between; }
+  .inst code { font-family: var(--mono); font-size: 14px; color: var(--ink); font-weight: 500; }
+  .inst .arrow { color: var(--accent); opacity: 0; transition: opacity .16s; }
+  .inst:hover .arrow { opacity: 1; }
+
+  /* ── section scaffold ── */
+  section { padding: 66px 0; border-top: 1px solid var(--line); }
+  .sec-head { display: flex; align-items: baseline; gap: 16px; margin-bottom: 40px; flex-wrap: wrap; }
+  .sec-num { font-family: var(--mono); font-size: 13px; color: var(--accent); font-weight: 700; }
+  .sec-title { font-family: var(--display); font-weight: 600; font-size: clamp(1.7rem, 4vw, 2.6rem); letter-spacing: -0.025em; }
+  .sec-sub { color: var(--ink-soft); max-width: 52ch; font-size: 1.02rem; }
+
+  /* ── features ── */
+  .feat-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  @media (max-width: 900px) { .feat-grid { grid-template-columns: repeat(2,1fr); } }
+  @media (max-width: 560px) { .feat-grid { grid-template-columns: 1fr; } }
+  .feat { background: var(--card); padding: 24px 22px; transition: background .16s; }
+  .feat:hover { background: #fff; }
+  .feat .fn { font-family: var(--mono); font-size: 12px; color: var(--accent); font-weight: 700; }
+  .feat h3 { font-family: var(--display); font-weight: 600; font-size: 1.16rem; margin: 12px 0 8px; letter-spacing: -0.01em; }
+  .feat p { font-size: 14.5px; color: var(--ink-soft); line-height: 1.5; }
+
+  /* ── benchmark ── */
+  .bench {
+    border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+    background: var(--card);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  thead th { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); text-align: right; padding: 15px 18px; background: var(--paper-2); border-bottom: 1px solid var(--line); font-weight: 500; }
+  thead th:first-child { text-align: left; }
+  tbody td { padding: 14px 18px; text-align: right; font-family: var(--mono); border-bottom: 1px solid var(--line); }
+  tbody td:first-child { text-align: left; font-family: var(--body); font-weight: 500; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr.us { background: rgba(221,63,34,0.06); }
+  tbody tr.us td:first-child { color: var(--accent-deep); font-weight: 700; }
+  tbody tr.us td:first-child::before { content: "▸ "; color: var(--accent); }
+  .bench-foot { padding: 15px 18px; font-size: 13.5px; color: var(--ink-soft); background: var(--paper-2); border-top: 1px solid var(--line); }
+  .bench-wrap { overflow-x: auto; }
+  .callouts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 22px; }
+  @media (max-width: 640px) { .callouts { grid-template-columns: 1fr; } }
+  .callout { border-left: 3px solid var(--accent); padding: 4px 0 4px 16px; }
+  .callout .ct { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent-deep); margin-bottom: 5px; }
+  .callout p { font-size: 14.5px; color: var(--ink-soft); }
+
+  /* ── quickstart tabs ── */
+  .tabs input { position: absolute; opacity: 0; pointer-events: none; }
+  .tablist { display: flex; gap: 6px; margin-bottom: 0; }
+  .tablist label {
+    font-family: var(--mono); font-size: 13px; font-weight: 500;
+    padding: 10px 18px; cursor: pointer; color: var(--muted);
+    border: 1px solid var(--line); border-bottom: none;
+    border-radius: 9px 9px 0 0; background: var(--paper-2); transition: all .15s;
+  }
+  .tablist label:hover { color: var(--ink); }
+  .panel { display: none; }
+  .code {
+    background: var(--ink); border-radius: 0 12px 12px 12px;
+    padding: 22px 24px; overflow-x: auto;
+    font-family: var(--mono); font-size: 13.5px; line-height: 1.7;
+    color: #e9e2d3;
+    box-shadow: 12px 12px 0 rgba(27,23,18,0.07);
+  }
+  .code .cm { color: #8a8069; }
+  .code .kw { color: #ff9f7a; }
+  .code .st { color: #cbb78a; }
+  .code .fn { color: #f4efe4; font-weight: 700; }
+  #t-rust:checked ~ .tablist label[for=t-rust],
+  #t-py:checked ~ .tablist label[for=t-py],
+  #t-node:checked ~ .tablist label[for=t-node],
+  #t-cli:checked ~ .tablist label[for=t-cli] {
+    background: var(--ink); color: var(--paper); border-color: var(--ink);
+  }
+  #t-rust:checked ~ .panels #p-rust,
+  #t-py:checked ~ .panels #p-py,
+  #t-node:checked ~ .panels #p-node,
+  #t-cli:checked ~ .panels #p-cli { display: block; }
+  .code a.ref { color: #ff9f7a; border-bottom: 1px dotted #ff9f7a; }
+
+  /* ── closing split (OSS vs hosted) ── */
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 780px) { .split { grid-template-columns: 1fr; } }
+  .path { border: 1px solid var(--line); border-radius: 16px; padding: 32px 30px; background: var(--card); display: flex; flex-direction: column; }
+  .path .ptag { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 15px; }
+  .path h3 { font-family: var(--display); font-weight: 600; font-size: 1.5rem; letter-spacing: -0.02em; line-height: 1.05; margin-bottom: 12px; }
+  .path p { color: var(--ink-soft); font-size: 15px; line-height: 1.5; flex: 1; margin-bottom: 24px; }
+  .pbtns { display: flex; gap: 12px; flex-wrap: wrap; }
+  .path-pro { background: var(--ink); border-color: var(--ink); box-shadow: 14px 14px 0 rgba(27,23,18,0.09); }
+  .path-pro .ptag { color: #b8ad98; }
+  .path-pro .ptag b { color: var(--accent); font-weight: 700; }
+  .path-pro h3 { color: var(--paper); }
+  .path-pro p { color: #cfc6b3; }
+  .btn { font-family: var(--mono); font-size: 14px; font-weight: 500; padding: 13px 24px; border-radius: 999px; transition: all .15s; border: 1px solid var(--ink); }
+  .btn-p { background: var(--accent); border-color: var(--accent); color: var(--paper); }
+  .btn-p:hover { background: var(--accent-deep); border-color: var(--accent-deep); }
+  .btn-s:hover { background: var(--ink); color: var(--paper); }
+  .btn-pro { background: var(--accent); border-color: var(--accent); color: var(--paper); }
+  .btn-pro:hover { background: var(--accent-deep); border-color: var(--accent-deep); }
+  .btn-ghost { color: var(--paper); border-color: rgba(255,255,255,0.3); }
+  .btn-ghost:hover { border-color: var(--paper); background: rgba(255,255,255,0.08); }
+  .fc-mark { height: 34px; width: auto; display: block; margin-bottom: 20px; }
+  .fc-wordmark { height: 15px; width: auto; vertical-align: -2px; transition: opacity .15s; }
+  .fc-wordmark:hover { opacity: 0.65; }
+  footer { border-top: 1px solid var(--line); padding: 34px 0; font-size: 14px; color: var(--muted); }
+  .foot-in { display: flex; justify-content: space-between; align-items: center; gap: 18px; flex-wrap: wrap; }
+  .foot-in a { color: var(--ink-soft); }
+  .foot-in a:hover { color: var(--accent); }
+  .foot-links { display: flex; gap: 20px; font-family: var(--mono); font-size: 13px; }
+
+  /* ── load animation ── */
+  .reveal { opacity: 0; transform: translateY(14px); animation: rise .7s cubic-bezier(.2,.7,.3,1) forwards; }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+  .d1 { animation-delay: .05s; } .d2 { animation-delay: .15s; } .d3 { animation-delay: .25s; }
+  .d4 { animation-delay: .35s; } .d5 { animation-delay: .45s; } .d6 { animation-delay: .55s; }
+  @media (prefers-reduced-motion: reduce) { .reveal { animation: none; opacity: 1; transform: none; } }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap nav-in">
+    <a href="#top" class="brand"><span class="dot"></span>pdf-inspector</a>
+    <div class="nav-links">
+      <a href="#features" class="hide-sm">Features</a>
+      <a href="#benchmark" class="hide-sm">Benchmark</a>
+      <a href="#start">Quick start</a>
+      <a class="nav-gh" href="https://github.com/firecrawl/pdf-inspector">GitHub ↗</a>
+    </div>
+  </div>
+</nav>
+
+<header id="top">
+  <div class="wrap hero-grid">
+    <div>
+      <div class="eyebrow reveal d1">Rust · Python · Node · CLI</div>
+      <h1 class="reveal d2">Classify PDFs. Extract Markdown. <span class="strike">No OCR.</span></h1>
+      <p class="lede reveal d3">A fast Rust library that tells text-based PDFs from scanned ones, then extracts position-aware text and clean Markdown — <b>locally, in milliseconds</b>. Skip the OCR bill for the ~54% of PDFs that never needed it.</p>
+    </div>
+    <div class="readout reveal d4" aria-hidden="true">
+      <div class="rlabel"><span>classify_pdf()</span><span>~12ms</span></div>
+      <div class="rrow"><span class="k">type</span><span class="v hot">TextBased</span></div>
+      <div class="rrow"><span class="k">confidence</span><span class="v">0.98</span></div>
+      <div class="rrow"><span class="k">needs_ocr</span><span class="v">false</span></div>
+      <div class="rrow"><span class="k">route</span><span class="v">local&nbsp;→&nbsp;md</span></div>
+      <div class="rrow" style="border-top:1px solid rgba(255,255,255,.09);padding-top:13px">
+        <span class="k">signal</span>
+        <span class="bar"><i style="width:98%"></i></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="installs">
+      <a class="inst reveal d4" href="https://crates.io/crates/pdf-inspector">
+        <div class="reg"><span>crates.io</span><span class="arrow">↗</span></div>
+        <code>cargo add pdf-inspector</code>
+      </a>
+      <a class="inst reveal d5" href="https://pypi.org/project/pdf-inspector/">
+        <div class="reg"><span>PyPI</span><span class="arrow">↗</span></div>
+        <code>pip install pdf-inspector</code>
+      </a>
+      <a class="inst reveal d6" href="https://www.npmjs.com/package/@firecrawl/pdf-inspector">
+        <div class="reg"><span>npm</span><span class="arrow">↗</span></div>
+        <code>npm i @firecrawl/pdf-inspector</code>
+      </a>
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">01</span>
+      <h2 class="sec-title">Built for routing, not just reading</h2>
+    </div>
+    <div class="feat-grid">
+      <div class="feat"><div class="fn">01</div><h3>Smart classification</h3><p>TextBased, Scanned, ImageBased, or Mixed in ~10–50ms by sampling content streams. Returns a confidence score and per-page OCR routing.</p></div>
+      <div class="feat"><div class="fn">02</div><h3>Position-aware text</h3><p>Extraction with font info, X/Y coordinates, and automatic multi-column reading order.</p></div>
+      <div class="feat"><div class="fn">03</div><h3>Markdown conversion</h3><p>Headings, bullet/numbered lists, code blocks, tables, bold/italic, URL linking, and page breaks.</p></div>
+      <div class="feat"><div class="fn">04</div><h3>Table detection</h3><p>Rectangle-based detection from drawing ops plus heuristic alignment detection. Financial tables, footnotes, and cross-page continuations.</p></div>
+      <div class="feat"><div class="fn">05</div><h3>CID font support</h3><p>ToUnicode CMap decoding for Type0/Identity-H fonts, with UTF-16BE, UTF-8, and Latin-1 encodings.</p></div>
+      <div class="feat"><div class="fn">06</div><h3>Multi-column layout</h3><p>Newspaper-style column detection, sequential reading order, and right-to-left text support.</p></div>
+      <div class="feat"><div class="fn">07</div><h3>Encoding checks</h3><p>Flags broken font encodings automatically so callers can fall back to OCR only when it's actually needed.</p></div>
+      <div class="feat"><div class="fn">08</div><h3>Lightweight</h3><p>Pure Rust. No ML models, no external services. A single parse shared between detection and extraction.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="benchmark">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">02</span>
+      <h2 class="sec-title">Fastest of the direct-text engines</h2>
+      <p class="sec-sub">Evaluated on the <a href="https://github.com/opendataloader-project/opendataloader-bench" style="color:var(--accent-deep);border-bottom:1px solid var(--line)">opendataloader-bench</a> corpus (200 PDFs). Direct text-extraction engines only — no OCR, no ML. Higher is better.</p>
+    </div>
+    <div class="bench">
+      <div class="bench-wrap">
+      <table>
+        <thead>
+          <tr><th>Engine</th><th>Overall</th><th>Reading order</th><th>Tables</th><th>Headings</th><th>200 docs</th></tr>
+        </thead>
+        <tbody>
+          <tr class="us"><td>pdf-inspector</td><td>0.83</td><td>0.88</td><td>0.66</td><td>0.74</td><td>4s</td></tr>
+          <tr><td>opendataloader</td><td>0.84</td><td>0.91</td><td>0.49</td><td>0.74</td><td>11s</td></tr>
+          <tr><td>pymupdf4llm</td><td>0.73</td><td>0.89</td><td>0.40</td><td>0.41</td><td>18s</td></tr>
+          <tr><td>markitdown</td><td>0.58</td><td>0.88</td><td>0.00</td><td>0.00</td><td>8s</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <div class="bench-foot">OCR/ML engines (docling, marker, mineru) score 0.83–0.88 overall — but take 2–180 minutes on the same corpus.</div>
+    </div>
+    <div class="callouts">
+      <div class="callout"><div class="ct">Where we win</div><p>Fastest engine measured, the best table detection of any engine here, and heading quality now on par with opendataloader — at ~2.5× its speed.</p></div>
+      <div class="callout"><div class="ct">Where we're working</div><p>Reading order still trails opendataloader slightly, and tables that need the visual structure only an OCR engine can see.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="start">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">03</span>
+      <h2 class="sec-title">Three lines to Markdown</h2>
+    </div>
+    <div class="tabs">
+      <input type="radio" name="tab" id="t-rust" checked>
+      <input type="radio" name="tab" id="t-py">
+      <input type="radio" name="tab" id="t-node">
+      <input type="radio" name="tab" id="t-cli">
+      <div class="tablist">
+        <label for="t-rust">Rust</label>
+        <label for="t-py">Python</label>
+        <label for="t-node">Node.js</label>
+        <label for="t-cli">CLI</label>
+      </div>
+      <div class="panels">
+        <div class="panel" id="p-rust"><pre class="code"><span class="kw">use</span> pdf_inspector::process_pdf;
+
+<span class="kw">let</span> result = <span class="fn">process_pdf</span>(<span class="st">"document.pdf"</span>)?;
+<span class="fn">println!</span>(<span class="st">"Type: {:?}"</span>, result.pdf_type);
+<span class="kw">if let</span> <span class="kw">Some</span>(markdown) = &amp;result.markdown {
+    <span class="fn">println!</span>(<span class="st">"{}"</span>, markdown);
+}
+<span class="cm">// full reference → </span><a class="ref" href="https://github.com/firecrawl/pdf-inspector/blob/main/docs/rust-api.md">docs/rust-api.md</a></pre></div>
+        <div class="panel" id="p-py"><pre class="code"><span class="kw">import</span> pdf_inspector
+
+result = pdf_inspector.<span class="fn">process_pdf</span>(<span class="st">"document.pdf"</span>)
+<span class="fn">print</span>(result.pdf_type)   <span class="cm"># "text_based" | "scanned" | "image_based" | "mixed"</span>
+<span class="fn">print</span>(result.markdown)   <span class="cm"># Markdown string or None</span>
+<span class="cm"># full reference → </span><a class="ref" href="https://github.com/firecrawl/pdf-inspector/blob/main/docs/python.md">docs/python.md</a></pre></div>
+        <div class="panel" id="p-node"><pre class="code"><span class="kw">import</span> { readFileSync } <span class="kw">from</span> <span class="st">'fs'</span>;
+<span class="kw">import</span> { processPdf } <span class="kw">from</span> <span class="st">'@firecrawl/pdf-inspector'</span>;
+
+<span class="kw">const</span> result = <span class="fn">processPdf</span>(<span class="fn">readFileSync</span>(<span class="st">'document.pdf'</span>));
+console.<span class="fn">log</span>(result.pdfType);   <span class="cm">// "TextBased" | "Scanned" | ...</span>
+console.<span class="fn">log</span>(result.markdown);  <span class="cm">// Markdown string or null</span>
+<span class="cm">// full reference → </span><a class="ref" href="https://github.com/firecrawl/pdf-inspector/blob/main/napi/README.md">napi/README.md</a></pre></div>
+        <div class="panel" id="p-cli"><pre class="code"><span class="cm"># install the CLI tools</span>
+cargo <span class="fn">install</span> pdf-inspector
+
+<span class="cm"># convert a PDF to Markdown</span>
+<span class="fn">pdf2md</span> document.pdf
+
+<span class="cm"># classify only — is it scanned?</span>
+<span class="fn">detect-pdf</span> document.pdf --analyze --json
+
+<span class="cm"># structured output for pipelines</span>
+<span class="fn">pdf2md</span> document.pdf --json</pre></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="close">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">04</span>
+      <h2 class="sec-title">Two ways to parse</h2>
+      <p class="sec-sub">Run the classifier locally for text-based PDFs; hand the scanned, OCR, and at-scale work to Firecrawl.</p>
+    </div>
+    <div class="split">
+      <div class="path">
+        <div class="ptag">Open source · runs local</div>
+        <h3>Use pdf-inspector yourself</h3>
+        <p>Pure-Rust library and CLI. Classify and extract text-based PDFs on your own machine in milliseconds — no external calls, no OCR bill, MIT licensed.</p>
+        <div class="pbtns">
+          <a class="btn btn-p" href="https://github.com/firecrawl/pdf-inspector">Get started</a>
+          <a class="btn btn-s" href="https://crates.io/crates/pdf-inspector">crates.io</a>
+        </div>
+      </div>
+      <div class="path path-pro">
+        <img class="fc-mark" src="assets/firecrawl-mark.svg" alt="Firecrawl" width="24" height="34">
+        <div class="ptag"><b>Firecrawl Parse</b> · hosted API</div>
+        <h3>Or let Firecrawl handle the hard ones</h3>
+        <p>Scanned documents, OCR, DOCX / XLSX / HTML, and parsing at scale — clean, LLM-ready Markdown from one API call. The downstream route for everything local parsing can't reach.</p>
+        <div class="pbtns">
+          <a class="btn btn-pro" href="https://docs.firecrawl.dev/api-reference/endpoint/parse">Firecrawl Parse ↗</a>
+          <a class="btn btn-ghost" href="https://firecrawl.dev">firecrawl.dev</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-in">
+    <div style="display:flex;align-items:center;gap:7px">Built by <a href="https://firecrawl.dev"><img class="fc-wordmark" src="assets/firecrawl-wordmark.svg" alt="Firecrawl"></a> · MIT licensed</div>
+    <div class="foot-links">
+      <a href="https://github.com/firecrawl/pdf-inspector">GitHub</a>
+      <a href="https://crates.io/crates/pdf-inspector">crates.io</a>
+      <a href="https://pypi.org/project/pdf-inspector/">PyPI</a>
+      <a href="https://www.npmjs.com/package/@firecrawl/pdf-inspector">npm</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

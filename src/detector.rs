@@ -60,6 +60,10 @@ pub struct PdfTypeResult {
     /// 1-indexed page numbers that need OCR (image-only or insufficient text).
     /// Empty for TextBased. All pages for Scanned/ImageBased. Specific pages for Mixed.
     pub pages_needing_ocr: Vec<u32>,
+    /// Per-page explanation for `pages_needing_ocr`: 1-indexed page → reason
+    /// codes (`scanned`, `no_text`, `vector_text`, `suspected_garbled_text`).
+    /// Only contains pages that need OCR.
+    pub ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>>,
 }
 
 /// Configuration for PDF type detection
@@ -382,7 +386,12 @@ pub(crate) fn detect_from_document(
                 let analysis = if let Some(cached) = analysis_cache.get(&page_num) {
                     cached.clone()
                 } else if let Some(&page_id) = pages.get(&page_num) {
-                    analyze_page_content(doc, page_id)
+                    // Cache the fresh analysis so the reason-classification pass
+                    // below sees the real signals (vector_text, etc.) instead of
+                    // defaulting to "scanned".
+                    let a = analyze_page_content(doc, page_id);
+                    analysis_cache.insert(page_num, a.clone());
+                    a
                 } else {
                     continue;
                 };
@@ -429,12 +438,28 @@ pub(crate) fn detect_from_document(
                 let analysis = analyze_page_content(doc, page_id);
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
+                    // Cache so the reason pass reports suspected_garbled_text
+                    // rather than defaulting to "scanned".
+                    analysis_cache.insert(page_num, analysis);
                 }
             }
         }
     }
     pages_needing_ocr.sort();
     pages_needing_ocr.dedup();
+
+    // Explain each OCR-flagged page. Pages we analyzed get a signal-derived
+    // reason; pages flagged only by whole-document classification (unsampled
+    // pages of a Scanned/ImageBased doc) default to `scanned`.
+    let mut ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for &page_num in &pages_needing_ocr {
+        let reasons = match analysis_cache.get(&page_num) {
+            Some(analysis) => page_ocr_reasons(analysis),
+            None => vec![crate::OCR_REASON_SCANNED],
+        };
+        ocr_reasons_by_page.insert(page_num, reasons.into_iter().map(String::from).collect());
+    }
 
     // Try to get title from metadata
     let title = get_document_title(doc);
@@ -448,6 +473,7 @@ pub(crate) fn detect_from_document(
         title,
         ocr_recommended,
         pages_needing_ocr,
+        ocr_reasons_by_page,
     })
 }
 
@@ -487,7 +513,7 @@ fn distribute_pages(n: u32, total: u32) -> Vec<u32> {
 }
 
 /// Page content analysis result
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct PageAnalysis {
     text_operator_count: u32,
     has_images: bool,
@@ -521,6 +547,31 @@ struct PageAnalysis {
     /// CID-encoded text with ToUnicode produces low unique_alphanum_chars in raw
     /// bytes but is fully decodable — this flag prevents misclassifying it as a scan.
     has_decodable_text_fonts: bool,
+}
+
+/// Explain *why* a page needs OCR, from its content analysis. Priority:
+/// undecodable fonts (`suspected_garbled_text`) and vector-outlined text
+/// (`vector_text`) come first because they persist even when a text layer is
+/// present; otherwise a page with no extractable text is `scanned` when an
+/// image backs it or `no_text` when nothing does.
+fn page_ocr_reasons(a: &PageAnalysis) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if a.has_identity_h_no_tounicode || a.has_only_type3_fonts {
+        reasons.push(crate::OCR_REASON_SUSPECTED_GARBLED_TEXT);
+    }
+    if a.has_vector_text {
+        reasons.push(crate::OCR_REASON_VECTOR_TEXT);
+    }
+    if reasons.is_empty() {
+        let has_extractable_text = a.text_operator_count > 0 && a.unique_text_chars > 0;
+        if !has_extractable_text && !a.has_images && !a.has_template_image {
+            reasons.push(crate::OCR_REASON_NO_TEXT);
+        } else {
+            // Image-backed with no usable text, or too little text to trust.
+            reasons.push(crate::OCR_REASON_SCANNED);
+        }
+    }
+    reasons
 }
 
 /// Extracted font information from a Resource dictionary entry.
@@ -1808,6 +1859,64 @@ fn get_document_title(doc: &Document) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_ocr_reasons_classify() {
+        // Scanned: no text, full-page image.
+        let scanned = PageAnalysis {
+            has_template_image: true,
+            ..Default::default()
+        };
+        assert_eq!(page_ocr_reasons(&scanned), vec![crate::OCR_REASON_SCANNED]);
+
+        // Image-only page (no template flag, but has an image).
+        let image_only = PageAnalysis {
+            has_images: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            page_ocr_reasons(&image_only),
+            vec![crate::OCR_REASON_SCANNED]
+        );
+
+        // No text, no image → no_text.
+        let blank = PageAnalysis::default();
+        assert_eq!(page_ocr_reasons(&blank), vec![crate::OCR_REASON_NO_TEXT]);
+
+        // Vector-outlined text.
+        let vector = PageAnalysis {
+            has_vector_text: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            page_ocr_reasons(&vector),
+            vec![crate::OCR_REASON_VECTOR_TEXT]
+        );
+
+        // Undecodable fonts → garbled, and it wins over the fall-through.
+        let garbled = PageAnalysis {
+            has_identity_h_no_tounicode: true,
+            has_images: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            page_ocr_reasons(&garbled),
+            vec![crate::OCR_REASON_SUSPECTED_GARBLED_TEXT]
+        );
+
+        // A page with real extractable text and an image is not flagged here
+        // as scanned/no_text (only reached for pages already needing OCR).
+        let text_with_image = PageAnalysis {
+            text_operator_count: 40,
+            unique_text_chars: 120,
+            has_images: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            page_ocr_reasons(&text_with_image),
+            vec![crate::OCR_REASON_SCANNED]
+        );
+    }
 
     #[test]
     fn test_scan_content_operators() {

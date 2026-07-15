@@ -1221,6 +1221,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: crate::types::ItemType::Text,
             mcid: None,
         }

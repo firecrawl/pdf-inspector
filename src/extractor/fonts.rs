@@ -4,7 +4,7 @@ use crate::glyph_names::glyph_to_char;
 use crate::tounicode::FontCMaps;
 use crate::types::{FontEncodingMap, FontWidthInfo, PageFontEncodings, PageFontWidths};
 use log::debug;
-use lopdf::{Document, Encoding, Object};
+use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -739,6 +739,171 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
         .map(|r| r.0)
 }
 
+/// Document-scoped memo of embedded-font style flags, keyed by the
+/// FontFile2/FontFile3 stream's object id. The same font program is
+/// referenced from every page that uses the font, and decompressing +
+/// parsing it dominates `descriptor_style_flags` — without the memo that
+/// cost repeats per page whenever the descriptor leaves a flag unset
+/// (the common case: regular fonts report neither italic nor bold).
+#[derive(Debug, Default)]
+pub(crate) struct FontStyleCache {
+    by_font_file: HashMap<ObjectId, (bool, bool)>,
+}
+
+impl FontStyleCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Style flags from the FontDescriptor, which survive subset fonts whose
+/// BaseFont names are opaque tags ("Tc1", "ABCDEF+F1") that defeat the
+/// name-based bold/italic heuristics.
+///
+/// Italic: `ItalicAngle` beyond a few degrees, or Flags bit 7 (Italic,
+/// value 64). Bold: Flags bit 19 (ForceBold, value 1<<18). The small
+/// ItalicAngle threshold skips fonts that declare a token slant.
+pub(crate) fn descriptor_style_flags(
+    doc: &Document,
+    font_dict: &lopdf::Dictionary,
+    style_cache: &mut FontStyleCache,
+) -> (bool, bool) {
+    let descriptor = font_dict
+        .get(b"FontDescriptor")
+        .ok()
+        .and_then(|obj| resolve_dict(doc, obj))
+        .or_else(|| {
+            // Type0 fonts hang the descriptor off DescendantFonts[0].
+            let desc_fonts = font_dict.get(b"DescendantFonts").ok()?;
+            let desc_fonts = resolve_array(doc, desc_fonts)?;
+            let cid_font_dict = resolve_dict(doc, desc_fonts.first()?)?;
+            resolve_dict(doc, cid_font_dict.get(b"FontDescriptor").ok()?)
+        });
+    let Some(descriptor) = descriptor else {
+        return (false, false);
+    };
+
+    let italic_angle = descriptor
+        .get(b"ItalicAngle")
+        .ok()
+        .and_then(|obj| match obj {
+            Object::Integer(i) => Some(*i as f32),
+            Object::Real(r) => Some(*r),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    let flags = descriptor
+        .get(b"Flags")
+        .ok()
+        .and_then(|obj| obj.as_i64().ok())
+        .unwrap_or(0);
+
+    let mut italic = italic_angle.abs() >= 4.0 || flags & (1 << 6) != 0;
+    let mut bold = flags & (1 << 18) != 0;
+
+    // Descriptors lie: subset generators write ItalicAngle 0 for genuinely
+    // italic faces. The embedded font file keeps the truth — OS/2
+    // fsSelection (via `Face::is_italic`) and the post table's italicAngle.
+    if !italic || !bold {
+        if let Some(ff_ref) = font_file_ref(descriptor) {
+            let (emb_italic, emb_bold) = *style_cache
+                .by_font_file
+                .entry(ff_ref)
+                .or_insert_with(|| embedded_style_flags(doc, ff_ref));
+            italic = italic || emb_italic;
+            bold = bold || emb_bold;
+        }
+    }
+    (italic, bold)
+}
+
+/// Style flags parsed from an embedded font program stream.
+fn embedded_style_flags(doc: &Document, ff_ref: ObjectId) -> (bool, bool) {
+    let Some(data) = font_file_data(doc, ff_ref) else {
+        return (false, false);
+    };
+    if let Ok(face) = ttf_parser::Face::parse(&data, 0) {
+        (
+            face.is_italic() || face.italic_angle().abs() >= 4.0,
+            face.is_bold(),
+        )
+    } else if let Some(name) = cff_font_name(&data) {
+        // FontFile3 is bare CFF (no sfnt container) — ttf_parser
+        // can't open it, but the CFF Name INDEX keeps the real
+        // PostScript name ("XXXXXX+Amplitude-LightItalic") even
+        // when the descriptor was rewritten to claim upright.
+        (
+            crate::text_utils::is_italic_font(&name),
+            crate::text_utils::is_bold_font(&name),
+        )
+    } else {
+        (false, false)
+    }
+}
+
+/// First PostScript name from a bare CFF font's Name INDEX (CFF spec §7).
+fn cff_font_name(data: &[u8]) -> Option<String> {
+    // Header: major(1) minor(1) hdrSize(1) offSize(1); major must be 1.
+    if data.len() < 4 || data[0] != 1 {
+        return None;
+    }
+    let hdr_size = data[2] as usize;
+    // Name INDEX: count(u16) offSize(u8) offsets[count+1] data
+    let count = u16::from_be_bytes([*data.get(hdr_size)?, *data.get(hdr_size + 1)?]) as usize;
+    if count == 0 {
+        return None;
+    }
+    let off_size = *data.get(hdr_size + 2)? as usize;
+    if !(1..=4).contains(&off_size) {
+        return None;
+    }
+    let read_offset = |idx: usize| -> Option<usize> {
+        let at = hdr_size + 3 + idx * off_size;
+        let bytes = data.get(at..at + off_size)?;
+        let mut v = 0usize;
+        for b in bytes {
+            v = (v << 8) | *b as usize;
+        }
+        Some(v)
+    };
+    let start = read_offset(0)?;
+    let end = read_offset(1)?;
+    if start == 0 || end < start {
+        return None;
+    }
+    // Offsets are 1-based from the byte before the object data.
+    let objects_base = hdr_size + 3 + (count + 1) * off_size - 1;
+    let name = data.get(objects_base + start..objects_base + end)?;
+    Some(String::from_utf8_lossy(name).to_string())
+}
+
+/// FontFile2/FontFile3 stream reference from a FontDescriptor.
+fn font_file_ref(descriptor: &lopdf::Dictionary) -> Option<ObjectId> {
+    descriptor
+        .get(b"FontFile2")
+        .ok()
+        .and_then(|o| o.as_reference().ok())
+        .or_else(|| {
+            descriptor
+                .get(b"FontFile3")
+                .ok()
+                .and_then(|o| o.as_reference().ok())
+        })
+}
+
+/// Decompressed embedded font program bytes.
+fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
+    let stream = doc
+        .get_object(ff_ref)
+        .and_then(lopdf::Object::as_stream)
+        .ok()?;
+    Some(
+        stream
+            .decompressed_content()
+            .unwrap_or_else(|_| stream.content.clone()),
+    )
+}
+
 /// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_text_from_operand(
@@ -1260,6 +1425,172 @@ mod tests {
             units_scale: 0.001,
             wmode: 0,
         }
+    }
+
+    fn doc_with_descriptor(descriptor: lopdf::Dictionary) -> (Document, lopdf::Dictionary) {
+        let mut doc = Document::with_version("1.4");
+        let desc_id = doc.add_object(descriptor);
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "Tc1",
+            "FontDescriptor" => desc_id,
+        };
+        (doc, font_dict)
+    }
+
+    #[test]
+    fn descriptor_italic_angle_sets_italic() {
+        // Subset font with an opaque BaseFont name ("Tc1") — the name
+        // heuristic sees nothing, the descriptor carries the truth.
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "ItalicAngle" => -12,
+            "Flags" => 32,
+        });
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn descriptor_italic_flag_bit_sets_italic() {
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "ItalicAngle" => 0,
+            "Flags" => 64, // bit 7: Italic
+        });
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn descriptor_force_bold_flag_sets_bold() {
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "ItalicAngle" => 0,
+            "Flags" => 1 << 18, // ForceBold
+        });
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn tiny_italic_angle_is_not_italic() {
+        // A token 1-degree slant is optical correction, not italic.
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "ItalicAngle" => lopdf::Object::Real(-1.0),
+            "Flags" => 32,
+        });
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn missing_descriptor_yields_no_flags() {
+        let doc = Document::with_version("1.4");
+        let font_dict = dictionary! { "Type" => "Font", "BaseFont" => "Tc1" };
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn type0_descendant_descriptor_is_resolved() {
+        let mut doc = Document::with_version("1.4");
+        let desc_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "ABCDEF+F1",
+            "ItalicAngle" => -15,
+        });
+        let cid_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "FontDescriptor" => desc_id,
+        });
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "ABCDEF+F1",
+            "DescendantFonts" => vec![lopdf::Object::Reference(cid_id)],
+        };
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (true, false)
+        );
+    }
+
+    /// Bare CFF: header + Name INDEX only — enough for `cff_font_name`.
+    fn bare_cff_with_name(name: &str) -> Vec<u8> {
+        let mut data = vec![1, 0, 4, 1]; // major, minor, hdrSize, offSize
+        data.extend_from_slice(&1u16.to_be_bytes()); // Name INDEX count
+        data.push(1); // offSize
+        data.push(1); // offset of first name
+        data.push(1 + name.len() as u8); // offset past last name
+        data.extend_from_slice(name.as_bytes());
+        data
+    }
+
+    #[test]
+    fn embedded_font_style_is_cached_by_font_file_object() {
+        use lopdf::{Object, Stream};
+
+        let mut doc = Document::with_version("1.4");
+        let ff_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            bare_cff_with_name("ABCDEF+Test-BoldItalic"),
+        )));
+        let desc_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "ABCDEF+Test-BoldItalic",
+            "ItalicAngle" => 0,
+            "Flags" => 32,
+            "FontFile3" => ff_id,
+        });
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Tc1",
+            "FontDescriptor" => desc_id,
+        };
+
+        let mut cache = FontStyleCache::new();
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut cache),
+            (true, true)
+        );
+        assert_eq!(cache.by_font_file.len(), 1);
+
+        // Replace the font program with garbage: a repeat call must serve
+        // the memo instead of re-reading the stream — repeated per-page
+        // decompression is exactly what the cache exists to avoid.
+        doc.objects.insert(
+            ff_id,
+            Object::Stream(Stream::new(dictionary! {}, vec![0u8; 4])),
+        );
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut cache),
+            (true, true)
+        );
+        // A cold cache parses the (now garbage) stream, proving the warm
+        // call above answered from the memo.
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (false, false)
+        );
     }
 
     #[test]

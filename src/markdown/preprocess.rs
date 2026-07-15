@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::structure_tree::StructRole;
-use crate::types::TextLine;
+use crate::types::{TextItem, TextLine};
 
 use super::analysis::detect_header_level;
 
@@ -86,6 +86,41 @@ pub(crate) fn merge_heading_lines(
         } else {
             false
         };
+
+        // Bold headings at body font size never reach a tier, so wrapped ones
+        // split into two output headings ("…of wood pellets and cost" /
+        // "structure in Japan"). Merge a fully-bold line into the previous
+        // fully-bold line when it reads as a wrap continuation: starts
+        // lowercase, tiny Y gap, and the previous line has no terminal
+        // punctuation. Kept deliberately narrow — bold list labels and bold
+        // sentences start with markers or capitals and are unaffected.
+        let should_merge = should_merge
+            || if let Some(prev) = result.last() {
+                let all_bold = |l: &TextLine| {
+                    !l.items.is_empty() && l.items.iter().all(|i: &TextItem| i.is_bold)
+                };
+                let prev_text = prev.text();
+                let prev_trim = prev_text.trim_end();
+                let curr_text = line.text();
+                let curr_trim = curr_text.trim();
+                let y_gap = prev.y - line.y;
+                // Both lines must be tier-less: a tiered/tagged bold heading
+                // followed by bold body text must not absorb it.
+                line_level.is_none()
+                    && effective_heading_level(prev, base_size, heading_tiers, struct_roles)
+                        .is_none()
+                    && prev.page == line.page
+                    && all_bold(prev)
+                    && all_bold(&line)
+                    && y_gap > 0.0
+                    && y_gap < line_font * 1.6
+                    && curr_trim.chars().next().is_some_and(|c| c.is_lowercase())
+                    && !prev_trim.ends_with(['.', ':', ';', '!', '?'])
+                    && prev_trim.split_whitespace().count() + curr_trim.split_whitespace().count()
+                        <= 20
+            } else {
+                false
+            };
 
         if should_merge {
             // Append this line's items to the previous line
@@ -543,6 +578,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid,
         }
@@ -683,5 +719,69 @@ mod tests {
             .find(|l| l.text().contains("VOICE OF SOUTH MARION"))
             .unwrap();
         assert_eq!(first_header.page, 1, "first occurrence should be on page 1");
+    }
+
+    fn make_bold_line(text: &str, page: u32, y: f32) -> TextLine {
+        let mut item = make_item(text, 12.0, None);
+        item.is_bold = true;
+        TextLine {
+            items: vec![item],
+            y,
+            page,
+            adaptive_threshold: 0.10,
+        }
+    }
+
+    #[test]
+    fn merge_wrapped_bold_heading_lowercase_continuation() {
+        // Bold-at-body-size heading wrapped across two lines: the second line
+        // starts lowercase and must merge into the first.
+        let lines = vec![
+            make_bold_line(
+                "3. Perspective of supply and demand balance and cost",
+                1,
+                700.0,
+            ),
+            make_bold_line("structure in Japan", 1, 686.0),
+            make_line("Body text paragraph follows here.", 12.0, 1, 660.0, None),
+        ];
+        let result = merge_heading_lines(lines, 12.0, &[], None);
+        assert_eq!(result.len(), 2, "wrapped bold heading should merge");
+        assert!(result[0].text().contains("cost structure in Japan"));
+    }
+
+    #[test]
+    fn no_merge_for_bold_sentences_or_new_headings() {
+        // Second bold line starts with a capital — a new heading or label,
+        // not a wrap continuation.
+        let lines = vec![
+            make_bold_line("Replace", 1, 700.0),
+            make_bold_line("Trash", 1, 686.0),
+        ];
+        let result = merge_heading_lines(lines, 12.0, &[], None);
+        assert_eq!(result.len(), 2, "distinct bold lines must not merge");
+
+        // Previous line ends a sentence — continuation must not merge.
+        let lines = vec![
+            make_bold_line("This is a bold sentence.", 1, 700.0),
+            make_bold_line("another bold line", 1, 686.0),
+        ];
+        let result = merge_heading_lines(lines, 12.0, &[], None);
+        assert_eq!(result.len(), 2, "sentence-final bold line must not merge");
+    }
+
+    #[test]
+    fn tiered_bold_heading_does_not_absorb_bold_body() {
+        // Previous line is a tier-level bold heading (16pt vs 12pt body);
+        // a following lowercase bold body line must NOT merge into it.
+        let mut heading = make_bold_line("Section Title", 1, 700.0);
+        heading.items[0].font_size = 16.0;
+        heading.items[0].height = 16.0;
+        let lines = vec![
+            heading,
+            make_bold_line("emphasized body text continues here", 1, 686.0),
+        ];
+        let result = merge_heading_lines(lines, 12.0, &[16.0], None);
+        assert_eq!(result.len(), 2, "tiered heading must not absorb bold body");
     }
 }

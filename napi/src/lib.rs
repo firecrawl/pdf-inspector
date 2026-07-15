@@ -83,6 +83,9 @@ pub struct TextItem {
     /// Underline detected geometrically (drawn rule/thin rect under the
     /// baseline) — PDFs carry no underline font flag.
     pub is_underline: bool,
+    /// Strikeout detected geometrically (rule crossing the glyphs at mid
+    /// x-height).
+    pub is_strikeout: bool,
     pub item_type: ItemType,
     /// URL for link items, `None` for other types.
     pub link_url: Option<String>,
@@ -294,6 +297,7 @@ pub fn extract_text_with_positions(
                     is_bold: item.is_bold,
                     is_italic: item.is_italic,
                     is_underline: item.is_underline,
+                    is_strikeout: item.is_strikeout,
                     item_type,
                     link_url,
                 }

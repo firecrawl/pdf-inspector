@@ -39,6 +39,7 @@ class TextItem:
     is_bold: bool
     is_italic: bool
     is_underline: bool
+    is_strikeout: bool
     item_type: str
 
 class RegionText:

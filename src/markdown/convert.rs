@@ -7,7 +7,8 @@ use crate::types::TextLine;
 
 use super::analysis::{
     bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
-    detect_header_level, font_size_rarity, has_dot_leaders,
+    detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment, is_toc_entry_line,
+    is_toc_marker_heading,
 };
 use super::classify::{
     format_list_item, is_caption_line, is_list_item, is_monospace_font, starts_with_bullet_marker,
@@ -140,8 +141,11 @@ fn find_isolated_lines(lines: &[TextLine], base_size: f32, para_threshold: f32) 
         }
     }
     for (&page, &(total, isolated)) in &page_line_counts {
-        if total > 0 && isolated as f32 / total as f32 > 0.25 {
-            // Too many isolated lines on this page — remove them all
+        // The ratio only means something on pages dense enough for a
+        // multi-column misfire; on sparse pages (covers, ToC pages with a
+        // lone title) one isolated line is 25%+ of the page and exactly the
+        // line isolation exists to find.
+        if total >= 10 && isolated as f32 / total as f32 > 0.25 {
             set.retain(|&i| lines[i].page != page);
         }
     }
@@ -486,6 +490,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut in_code_block = false;
     let mut prev_had_dot_leaders = false;
     let mut paragraph_in_wrapped_bold_run = false;
+    let mut toc_suppress_page: Option<u32> = None;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
     let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
 
@@ -698,11 +703,22 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 _ => false,
             };
 
+        // Lines explicitly tagged with a non-heading content role must never
+        // be promoted by the visual heuristic — a tagged list item, quote, or
+        // code line can look exactly like a heading (short, isolated).
+        let non_heading_role = struct_role
+            .as_ref()
+            .is_some_and(StructRole::is_non_heading_content);
         let heuristic_heading = if options.detect_headers
+            && !non_heading_role
+            && !is_code_line
             && !looks_like_list_continuation
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
             && !starts_with_bullet_marker(plain_trimmed)
+            && !is_toc_entry_line(plain_trimmed)
+            && !is_heading_fragment(plain_trimmed)
+            && toc_suppress_page != Some(line.page)
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
@@ -738,7 +754,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 // paragraph continuity and minor font-size variation
                 // inflates rarity scores.
                 let has_strong_signal = all_bold || isolated || (rarity >= 0.97 && word_count <= 8);
-                if score >= 0.5 && standalone && word_count >= 2 && has_strong_signal {
+                // Single-word headings ("IMPLEMENTATION", "CONTENTS") are common;
+                // accept them only with the strongest signal combination.
+                let enough_words =
+                    word_count >= 2 || (all_bold && isolated && plain_trimmed.len() >= 4);
+                if score >= 0.5 && standalone && enough_words && has_strong_signal {
                     Some(bold_heading_level(&heading_tiers))
                 } else {
                     None
@@ -763,6 +783,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 plain_text.clone()
             };
             output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
+            if is_toc_marker_heading(plain_trimmed) {
+                toc_suppress_page = Some(line.page);
+            }
             in_list = false;
             continue;
         }
@@ -959,6 +982,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut last_list_x: Option<f32> = None;
     let mut prev_had_dot_leaders = false;
     let mut paragraph_in_wrapped_bold_run = false;
+    let mut toc_suppress_page: Option<u32> = None;
 
     for (line_idx, line) in lines.iter().enumerate() {
         // Page break
@@ -1037,6 +1061,10 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         if options.detect_headers
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
+            && !is_toc_entry_line(plain_trimmed)
+            && !is_heading_fragment(plain_trimmed)
+            && toc_suppress_page != Some(line.page)
+            && !(options.detect_code && line.items.iter().any(|i| is_monospace_font(&i.font)))
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) =
@@ -1059,7 +1087,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                         + if all_bold { 0.3 } else { 0.0 }
                         + if standalone { 0.2 } else { 0.0 }
                         + if isolated { 0.3 } else { 0.0 };
-                    if score >= 0.5 && standalone && word_count >= 2 {
+                    let enough_words =
+                        word_count >= 2 || (all_bold && isolated && plain_trimmed.len() >= 4);
+                    if score >= 0.5 && standalone && enough_words {
                         return Some(bold_heading_level(&heading_tiers));
                     }
                     None
@@ -1078,6 +1108,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     plain_text.clone()
                 };
                 output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
+                if is_toc_marker_heading(plain_trimmed) {
+                    toc_suppress_page = Some(line.page);
+                }
                 in_list = false;
                 continue;
             }
@@ -1189,6 +1222,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: crate::types::ItemType::Text,
             mcid,
         }
@@ -1203,6 +1237,42 @@ mod tests {
             page,
             adaptive_threshold: 0.10,
         }
+    }
+
+    fn line_at(text: &str, page: u32, y: f32) -> TextLine {
+        let mut item = make_item(text, page, None);
+        item.y = y;
+        make_line(vec![item])
+    }
+
+    #[test]
+    fn isolated_lines_kept_on_sparse_pages() {
+        // A ToC page with a lone title and one entry far below: the density
+        // ratio is 50% but the page is too sparse for the multi-column
+        // misfire the guard targets — the title must stay isolated.
+        let lines = vec![
+            line_at("CONTENTS", 1, 700.0),
+            line_at("Chapter One 5", 1, 500.0),
+        ];
+        let isolated = find_isolated_lines(&lines, 12.0, 20.0);
+        assert!(
+            isolated.contains(&0),
+            "sparse-page title must stay isolated"
+        );
+    }
+
+    #[test]
+    fn isolated_lines_wiped_on_dense_pages() {
+        // 12 short lines all with paragraph gaps — the multi-column misfire
+        // shape. The guard must clear them all.
+        let lines: Vec<TextLine> = (0..12)
+            .map(|i| line_at("Short column line", 1, 700.0 - i as f32 * 50.0))
+            .collect();
+        let isolated = find_isolated_lines(&lines, 12.0, 20.0);
+        assert!(
+            isolated.is_empty(),
+            "dense page of isolated lines must be wiped"
+        );
     }
 
     #[test]
