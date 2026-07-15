@@ -7,6 +7,11 @@
       "devDependencies": {
         "@napi-rs/cli": "^3.4.1",
       },
+      "optionalDependencies": {
+        "@firecrawl/pdf-inspector-darwin-arm64": "1.11.0",
+        "@firecrawl/pdf-inspector-linux-x64-gnu": "1.11.0",
+        "@firecrawl/pdf-inspector-win32-x64-msvc": "1.11.0",
+      },
     },
   },
   "packages": {

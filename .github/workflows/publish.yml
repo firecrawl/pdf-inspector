@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
     paths: ['napi/package.json']
+  # Manual fallback: retry a publish that failed partway (per-package
+  # already-published checks make re-runs idempotent).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,6 +15,10 @@ permissions:
 jobs:
   check-version:
     name: Check version change
+    # Guard manual dispatches: npm trusted publishing matches
+    # repo+workflow+environment but NOT branch, so without this a
+    # workflow_dispatch from any branch could publish unmerged code.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.check.outputs.changed }}
@@ -25,11 +32,21 @@ jobs:
         id: check
         run: |
           NEW_VERSION=$(node -p "require('./napi/package.json').version")
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual dispatch rebuilds and publishes the current version; the
+            # per-package already-published checks in the publish job skip
+            # anything that made it out in a previous partial run.
+            echo "manual dispatch: publishing v$NEW_VERSION"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           OLD_VERSION=$(git show HEAD~1:napi/package.json | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
           echo "old=$OLD_VERSION new=$NEW_VERSION"
           if [ "$NEW_VERSION" != "$OLD_VERSION" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
@@ -115,14 +132,81 @@ jobs:
         with:
           path: napi/artifacts
 
-      - name: Collect binaries and publish
+      - name: Publish platform packages
         working-directory: napi
         run: |
-          cp artifacts/bindings-*/*.node .
+          VERSION="${{ needs.check-version.outputs.version }}"
+
+          for node_file in artifacts/bindings-*/pdf-inspector.*.node; do
+            base=$(basename "$node_file")
+            suffix=${base#pdf-inspector.}
+            suffix=${suffix%.node}
+            pkg="@firecrawl/pdf-inspector-$suffix"
+
+            if npm view "$pkg@$VERSION" version >/dev/null 2>&1; then
+              echo "$pkg@$VERSION already published — skipping"
+              continue
+            fi
+
+            dir="npm-dist/$suffix"
+            mkdir -p "$dir"
+            cp "$node_file" "$dir/"
+            node -e '
+              const [suffix, version] = process.argv.slice(1)
+              const meta = {
+                "linux-x64-gnu":  { os: ["linux"],  cpu: ["x64"], libc: ["glibc"] },
+                "darwin-arm64":   { os: ["darwin"], cpu: ["arm64"] },
+                "win32-x64-msvc": { os: ["win32"],  cpu: ["x64"] },
+              }[suffix]
+              if (!meta) {
+                console.error(`unknown platform suffix: ${suffix} — add it to the meta map`)
+                process.exit(1)
+              }
+              const pkg = {
+                name: `@firecrawl/pdf-inspector-${suffix}`,
+                version,
+                description: `Prebuilt ${suffix} binary for @firecrawl/pdf-inspector`,
+                main: `pdf-inspector.${suffix}.node`,
+                files: [`pdf-inspector.${suffix}.node`],
+                license: "MIT",
+                engines: { node: ">= 10" },
+                repository: { type: "git", url: "https://github.com/firecrawl/pdf-inspector" },
+                publishConfig: { access: "public" },
+                ...meta,
+              }
+              require("fs").writeFileSync(`npm-dist/${suffix}/package.json`, JSON.stringify(pkg, null, 2) + "\n")
+            ' "$suffix" "$VERSION"
+
+            echo "=== $pkg@$VERSION ==="
+            ls -la "$dir"
+            (cd "$dir" && npm publish --provenance --access public)
+          done
+
+      - name: Publish main package
+        working-directory: napi
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+
+          if npm view "@firecrawl/pdf-inspector@$VERSION" version >/dev/null 2>&1; then
+            echo "@firecrawl/pdf-inspector@$VERSION already published — skipping"
+            exit 0
+          fi
+
           cp artifacts/js-bindings/index.js .
           cp artifacts/js-bindings/index.d.ts .
 
-          echo "=== Package contents ==="
-          ls -la *.node index.js index.d.ts
+          # Stamp optionalDependencies to this exact version so the platform
+          # pins can never drift from the main package version.
+          node -e '
+            const fs = require("fs")
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"))
+            for (const dep of Object.keys(pkg.optionalDependencies ?? {})) {
+              pkg.optionalDependencies[dep] = pkg.version
+            }
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n")
+          '
+
+          echo "=== Main package contents ==="
+          npm pack --dry-run
 
           npm publish --provenance --access public

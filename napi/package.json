@@ -1,6 +1,6 @@
 {
   "name": "@firecrawl/pdf-inspector",
-  "version": "1.10.4",
+  "version": "1.11.0",
   "description": "Fast PDF classification and text extraction. Detect text-based vs scanned PDFs, extract text by region with quality checks. Native Rust performance via napi-rs.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -22,7 +22,6 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "*.node",
     "bin/",
     "README.md"
   ],
@@ -51,5 +50,10 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.4.1"
+  },
+  "optionalDependencies": {
+    "@firecrawl/pdf-inspector-linux-x64-gnu": "1.11.0",
+    "@firecrawl/pdf-inspector-darwin-arm64": "1.11.0",
+    "@firecrawl/pdf-inspector-win32-x64-msvc": "1.11.0"
   }
 }
