@@ -721,7 +721,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             && toc_suppress_page != Some(line.page)
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-            detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
+            detect_header_level(
+                line_font_size,
+                base_size,
+                &heading_tiers,
+                line.items.first().is_some_and(|i| i.is_bold),
+            )
+            .or_else(|| {
                 // Rarity-based heading detection (inspired by opendataloader).
                 // Heading probability scoring with lookahead context.
                 // Score = rarity * 0.5 + bold * 0.3 + standalone * 0.2
@@ -1067,34 +1073,38 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             && !(options.detect_code && line.items.iter().any(|i| is_monospace_font(&i.font)))
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-            if let Some(header_level) =
-                detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
-                    if line_font_size < base_size * 0.95 {
-                        return None;
-                    }
-                    let word_count = plain_trimmed.split_whitespace().count();
-                    if !(1..=15).contains(&word_count) {
-                        return None;
-                    }
-                    if wrapped_bold_paragraph_lines.contains(&line_idx) {
-                        return None;
-                    }
-                    let rarity = font_size_rarity(line_font_size, &font_stats);
-                    let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
-                    let standalone = !in_paragraph;
-                    let isolated = isolated_lines.contains(&line_idx);
-                    let score = rarity * 0.5
-                        + if all_bold { 0.3 } else { 0.0 }
-                        + if standalone { 0.2 } else { 0.0 }
-                        + if isolated { 0.3 } else { 0.0 };
-                    let enough_words =
-                        word_count >= 2 || (all_bold && isolated && plain_trimmed.len() >= 4);
-                    if score >= 0.5 && standalone && enough_words {
-                        return Some(bold_heading_level(&heading_tiers));
-                    }
-                    None
-                })
-            {
+            if let Some(header_level) = detect_header_level(
+                line_font_size,
+                base_size,
+                &heading_tiers,
+                line.items.first().is_some_and(|i| i.is_bold),
+            )
+            .or_else(|| {
+                if line_font_size < base_size * 0.95 {
+                    return None;
+                }
+                let word_count = plain_trimmed.split_whitespace().count();
+                if !(1..=15).contains(&word_count) {
+                    return None;
+                }
+                if wrapped_bold_paragraph_lines.contains(&line_idx) {
+                    return None;
+                }
+                let rarity = font_size_rarity(line_font_size, &font_stats);
+                let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
+                let standalone = !in_paragraph;
+                let isolated = isolated_lines.contains(&line_idx);
+                let score = rarity * 0.5
+                    + if all_bold { 0.3 } else { 0.0 }
+                    + if standalone { 0.2 } else { 0.0 }
+                    + if isolated { 0.3 } else { 0.0 };
+                let enough_words =
+                    word_count >= 2 || (all_bold && isolated && plain_trimmed.len() >= 4);
+                if score >= 0.5 && standalone && enough_words {
+                    return Some(bold_heading_level(&heading_tiers));
+                }
+                None
+            }) {
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;

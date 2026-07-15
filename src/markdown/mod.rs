@@ -1360,29 +1360,29 @@ mod tests {
     fn test_detect_header_level() {
         // With three tiers: 24→H1, 18→H2, 15→H3, 12→None
         let tiers = vec![24.0, 18.0, 15.0];
-        assert_eq!(detect_header_level(24.0, 12.0, &tiers), Some(1));
-        assert_eq!(detect_header_level(18.0, 12.0, &tiers), Some(2));
-        assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(3));
-        assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
+        assert_eq!(detect_header_level(24.0, 12.0, &tiers, false), Some(1));
+        assert_eq!(detect_header_level(18.0, 12.0, &tiers, false), Some(2));
+        assert_eq!(detect_header_level(15.0, 12.0, &tiers, false), Some(3));
+        assert_eq!(detect_header_level(12.0, 12.0, &tiers, false), None);
 
         // Single tier: 15→H1 (ratio 1.25 ≥ 1.2), 14→None (ratio 1.17 < 1.2)
         let tiers = vec![15.0];
-        assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(1));
-        assert_eq!(detect_header_level(14.0, 12.0, &tiers), None);
-        assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
+        assert_eq!(detect_header_level(15.0, 12.0, &tiers, false), Some(1));
+        assert_eq!(detect_header_level(14.0, 12.0, &tiers, false), None);
+        assert_eq!(detect_header_level(12.0, 12.0, &tiers, false), None);
 
         // No tiers (empty): falls back to ratio thresholds
         let tiers: Vec<f32> = vec![];
-        assert_eq!(detect_header_level(24.0, 12.0, &tiers), Some(1));
-        assert_eq!(detect_header_level(18.0, 12.0, &tiers), Some(2));
-        assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(3));
-        assert_eq!(detect_header_level(14.5, 12.0, &tiers), Some(4));
-        assert_eq!(detect_header_level(14.0, 12.0, &tiers), None);
-        assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
+        assert_eq!(detect_header_level(24.0, 12.0, &tiers, false), Some(1));
+        assert_eq!(detect_header_level(18.0, 12.0, &tiers, false), Some(2));
+        assert_eq!(detect_header_level(15.0, 12.0, &tiers, false), Some(3));
+        assert_eq!(detect_header_level(14.5, 12.0, &tiers, false), Some(4));
+        assert_eq!(detect_header_level(14.0, 12.0, &tiers, false), None);
+        assert_eq!(detect_header_level(12.0, 12.0, &tiers, false), None);
 
         // Body text excluded when tiers exist: 13pt (ratio 1.08) → None
         let tiers = vec![20.0];
-        assert_eq!(detect_header_level(13.0, 12.0, &tiers), None);
+        assert_eq!(detect_header_level(13.0, 12.0, &tiers, false), None);
     }
 
     #[test]

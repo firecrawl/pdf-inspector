@@ -422,12 +422,14 @@ pub(crate) fn detect_header_level(
     font_size: f32,
     base_size: f32,
     heading_tiers: &[f32],
+    is_bold: bool,
 ) -> Option<usize> {
     let ratio = font_size / base_size;
 
-    // Tier matches are trusted below the 1.2x gate (down to 1.05x): tiers
-    // from the bold fallback are legitimately close to body size.
-    if ratio >= 1.05 && !heading_tiers.is_empty() {
+    // Tier matches are trusted below the 1.2x gate (down to 1.05x) only for
+    // bold lines: sub-gate tiers come from the bold fallback, and honoring
+    // them for non-bold text at the same size would promote captions.
+    if (1.05..1.2).contains(&ratio) && is_bold && !heading_tiers.is_empty() {
         for (i, &tier_size) in heading_tiers.iter().enumerate() {
             if (font_size - tier_size).abs() < 0.5 {
                 return Some(i + 1); // tier 0 → H1, tier 1 → H2, etc.
@@ -440,6 +442,12 @@ pub(crate) fn detect_header_level(
     }
 
     if !heading_tiers.is_empty() {
+        // Match font_size to a tier (within 0.5pt tolerance)
+        for (i, &tier_size) in heading_tiers.iter().enumerate() {
+            if (font_size - tier_size).abs() < 0.5 {
+                return Some(i + 1); // tier 0 → H1, tier 1 → H2, etc.
+            }
+        }
         // No tier match but large ratio — assign level after last tier
         if ratio >= 1.5 {
             let level = (heading_tiers.len() + 1).min(4);
@@ -501,9 +509,11 @@ mod tests {
         ];
         let tiers = compute_heading_tiers(&lines, 10.0);
         assert_eq!(tiers, vec![11.0]);
-        assert_eq!(detect_header_level(11.0, 10.0, &tiers), Some(1));
+        assert_eq!(detect_header_level(11.0, 10.0, &tiers, true), Some(1));
+        // Non-bold text at the fallback size must not become a heading.
+        assert_eq!(detect_header_level(11.0, 10.0, &tiers, false), None);
         // Non-tier body text stays regular.
-        assert_eq!(detect_header_level(10.0, 10.0, &tiers), None);
+        assert_eq!(detect_header_level(10.0, 10.0, &tiers, true), None);
     }
 
     #[test]
@@ -516,7 +526,7 @@ mod tests {
         let tiers = compute_heading_tiers(&lines, 10.0);
         assert_eq!(tiers, vec![18.0]);
         // The 11pt bold label does not match any tier and stays non-heading.
-        assert_eq!(detect_header_level(11.0, 10.0, &tiers), None);
+        assert_eq!(detect_header_level(11.0, 10.0, &tiers, true), None);
     }
 
     #[test]
