@@ -4,6 +4,26 @@ Fast PDF classification and text extraction. Detects whether a PDF is text-based
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
+## Features
+
+- **Smart classification** — `text_based` / `scanned` / `image_based` / `mixed` in ~10–50ms, with a confidence score and per-page OCR routing.
+- **Markdown conversion** — headings, lists, code blocks, bold/italic, URL linking, and dual-mode table detection (PDF drawing ops + text-alignment heuristics).
+- **Layout-aware extraction** — multi-column reading order, position and font info per text item, RTL support.
+- **Robust text decoding** — CID/Type0 fonts via ToUnicode CMaps, plus automatic flagging of broken encodings so callers can fall back to OCR.
+- **Lightweight** — native Rust core, no ML models, no external services; ships type stubs.
+
+## Benchmark
+
+[opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) corpus (200 PDFs), direct-extraction engines only — no OCR, no ML. Scores 0–1, higher is better:
+
+| Engine | Overall | Reading order | Tables (TEDS) | Headings | Speed |
+|---|---|---|---|---|---|
+| **pdf-inspector** | 0.83 | 0.88 | **0.66** | 0.74 | **4s** |
+| opendataloader | 0.84 | 0.91 | 0.49 | 0.74 | 11s |
+| pymupdf4llm | 0.73 | 0.89 | 0.40 | 0.41 | 18s |
+
+OCR/ML engines (docling, marker, mineru) score 0.83–0.88 overall but take 2–180 minutes on the same corpus. Full numbers in the [repo README](https://github.com/firecrawl/pdf-inspector#benchmark).
+
 ## Install
 
 ```bash
