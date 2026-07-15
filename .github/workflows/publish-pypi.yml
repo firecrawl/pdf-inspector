@@ -45,7 +45,10 @@ jobs:
             exit 0
           fi
 
-          OLD_VERSION=$(git show HEAD~1:pyproject.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')
+          # .get(): the parent commit may predate the static version field
+          # (pyproject.toml used dynamic = ["version"]) — treat that as a change
+          # so the very first merge of this workflow publishes.
+          OLD_VERSION=$(git show HEAD~1:pyproject.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"].get("version", ""))')
           echo "old=$OLD_VERSION new=$NEW_VERSION"
 
           if [ "$NEW_VERSION" = "$OLD_VERSION" ]; then
