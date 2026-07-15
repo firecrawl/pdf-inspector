@@ -374,6 +374,15 @@ pub(crate) fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f
     for line in lines {
         if let Some(first) = line.items.first() {
             if first.font_size / base_size >= 1.2 {
+                // Digit-only lines (page numbers, issue numbers) must not
+                // define heading tiers: a large bold folio claims tier 0 and
+                // blocks the bold-size fallback for the document's real
+                // same-size headings.
+                let text = line.text();
+                let t = text.trim();
+                if !t.is_empty() && t.chars().all(|c| !c.is_alphabetic()) {
+                    continue;
+                }
                 heading_sizes.push(first.font_size);
             }
         }
@@ -506,6 +515,19 @@ mod tests {
             page: 1,
             adaptive_threshold: 0.10,
         }
+    }
+
+    #[test]
+    fn digit_only_lines_do_not_define_tiers() {
+        // A 14pt bold page number must not claim tier 0 — that both demotes
+        // every real heading a level and blocks the bold-size fallback.
+        let lines = vec![
+            line_of("76", 14.0, true, 760.0),
+            line_of("Replace", 11.0, true, 700.0),
+            line_of("body text at eleven points", 11.0, false, 680.0),
+        ];
+        let tiers = compute_heading_tiers(&lines, 11.0);
+        assert!(tiers.is_empty(), "page number claimed a tier: {tiers:?}");
     }
 
     #[test]
