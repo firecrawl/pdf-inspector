@@ -1561,7 +1561,9 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
                         .chars()
                         .next()
                         .is_some_and(|c| c.is_lowercase());
-                    let style_mismatch = last_item.is_bold != item.is_bold;
+                    // The whole line must be bold (a heading), not merely
+                    // its last run — mixed bold-label/value rows stay joined.
+                    let style_mismatch = last_line.items.iter().all(|i| i.is_bold) && !item.is_bold;
                     if line_wordy && incoming_wordy && (starts_lower || style_mismatch) {
                         return false;
                     }

@@ -182,7 +182,9 @@ fn starts_with_section_number(t: &str) -> bool {
             break;
         }
     }
-    groups >= 1
+    // Two components minimum ("9.5. "): a single "1. " is an ordered list
+    // item, and this prefix bypasses the isolation checks entirely.
+    groups >= 2
         && rest.starts_with(char::is_whitespace)
         && rest.trim_start().starts_with(|c: char| c.is_alphabetic())
 }
@@ -1340,6 +1342,7 @@ mod tests {
         ));
         assert!(starts_with_section_number("12.3.1. Deep subsection"));
         assert!(starts_with_section_number("2.1 Systems thinking"));
+        assert!(!starts_with_section_number("1. First item in a list"));
         assert!(!starts_with_section_number("24% in October 2020."));
         assert!(!starts_with_section_number("2020 was a hard year"));
         assert!(!starts_with_section_number("Introduction"));
