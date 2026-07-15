@@ -724,6 +724,20 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             .push((global_idx, item));
     }
 
+    // Chart regions per page: their text must not steer column detection
+    // during line grouping (it fills the gutter and fuses two-column lines).
+    let mut page_chart_map: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
+    for &page in page_groups.keys() {
+        let page_items_ref: Vec<TextItem> = page_groups[&page]
+            .iter()
+            .map(|(_, item)| (*item).clone())
+            .collect();
+        let regions = crate::tables::detect_chart_regions(&page_items_ref, rects, page);
+        if !regions.is_empty() {
+            page_chart_map.insert(page, regions);
+        }
+    }
+
     let mut pages: Vec<u32> = page_groups.keys().copied().collect();
     pages.sort();
     let page_count = pages.last().copied().unwrap_or(0) + 1;
@@ -1259,7 +1273,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // items from different side-by-side zones (e.g. left/right month columns
     // in a calendar) don't merge into the same line.
     let lines = if page_band_splits.is_empty() {
-        group_into_lines_with_thresholds(non_table_items, page_thresholds, &table_page_set)
+        crate::extractor::group_into_lines_with_thresholds_and_charts(
+            non_table_items,
+            page_thresholds,
+            &table_page_set,
+            &page_chart_map,
+        )
     } else {
         // Separate items into band-split pages and non-split pages
         let mut split_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
@@ -1272,8 +1291,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             }
         }
         // Process unsplit pages normally
-        let mut all_lines =
-            group_into_lines_with_thresholds(unsplit_items, page_thresholds, &table_page_set);
+        let mut all_lines = crate::extractor::group_into_lines_with_thresholds_and_charts(
+            unsplit_items,
+            page_thresholds,
+            &table_page_set,
+            &page_chart_map,
+        );
         // Process each split page's bands independently, then interleave
         // by Y position so paired zones (e.g. left/right months) appear together.
         let mut split_pages: Vec<u32> = split_page_items.keys().copied().collect();

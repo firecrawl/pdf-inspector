@@ -28,6 +28,7 @@ pub(crate) use fonts::FontStyleCache;
 pub(crate) use layout::detect_columns;
 pub use layout::group_into_lines;
 pub(crate) use layout::group_into_lines_with_thresholds;
+pub(crate) use layout::group_into_lines_with_thresholds_and_charts;
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
 

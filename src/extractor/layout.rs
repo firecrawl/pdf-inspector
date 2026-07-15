@@ -674,9 +674,24 @@ fn validate_and_build_columns(
     page: u32,
     center_assign: bool,
 ) -> Vec<ColumnRegion> {
-    // Compute Y range of the page
-    let y_min = page_items.iter().map(|i| i.y).fold(f32::INFINITY, f32::min);
-    let y_max = page_items
+    // Compute the Y range from column-eligible items only — the same items
+    // the histogram counted. Spanning items (full-width captions, titles)
+    // are excluded from the projection, so letting them stretch the page's
+    // vertical extent here would sink the overlap ratio for column regions
+    // that legitimately occupy only part of the page (e.g. two-column text
+    // below a figure).
+    let x_span = page_items
+        .iter()
+        .map(|i| i.x + effective_width(i))
+        .fold(f32::NEG_INFINITY, f32::max)
+        - page_items.iter().map(|i| i.x).fold(f32::INFINITY, f32::min);
+    let narrow: Vec<&&TextItem> = page_items
+        .iter()
+        .filter(|i| effective_width(i) <= x_span * 0.6)
+        .collect();
+    let span_items: &[&&TextItem] = if narrow.is_empty() { &[] } else { &narrow };
+    let y_min = span_items.iter().map(|i| i.y).fold(f32::INFINITY, f32::min);
+    let y_max = span_items
         .iter()
         .map(|i| i.y)
         .fold(f32::NEG_INFINITY, f32::max);
@@ -722,6 +737,10 @@ fn validate_and_build_columns(
             (right_items.len(), left_items.len())
         };
         if larger < min_items || smaller < 3 {
+            debug!(
+                "  valley rejected: counts smaller={} larger={}",
+                smaller, larger
+            );
             continue;
         }
 
@@ -735,6 +754,7 @@ fn validate_and_build_columns(
             &right_items
         };
         if is_list_marker_column(smaller_items) {
+            debug!("  valley rejected: list-marker column");
             continue;
         }
 
@@ -759,6 +779,13 @@ fn validate_and_build_columns(
             let overlap = (overlap_max - overlap_min).max(0.0);
 
             if overlap / y_range < min_vertical_span {
+                debug!(
+                    "  valley rejected: overlap {:.0}/{:.0} = {:.2} < {:.2}",
+                    overlap,
+                    y_range,
+                    overlap / y_range,
+                    min_vertical_span
+                );
                 continue;
             }
         }
@@ -1134,6 +1161,25 @@ pub(crate) fn group_into_lines_with_thresholds(
     page_thresholds: &HashMap<u32, f32>,
     table_pages: &HashSet<u32>,
 ) -> Vec<TextLine> {
+    group_into_lines_with_thresholds_and_charts(
+        items,
+        page_thresholds,
+        table_pages,
+        &HashMap::new(),
+    )
+}
+
+/// Like `group_into_lines_with_thresholds`, but items inside chart regions
+/// are excluded from column detection: chart text scattered across the page
+/// fills the gutter in the projection histogram, so two-column pages read as
+/// one column and same-baseline items from both columns fuse into one line
+/// (headings absorbed into the neighboring column's body text).
+pub(crate) fn group_into_lines_with_thresholds_and_charts(
+    items: Vec<TextItem>,
+    page_thresholds: &HashMap<u32, f32>,
+    table_pages: &HashSet<u32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -1159,8 +1205,35 @@ pub(crate) fn group_into_lines_with_thresholds(
         // Non-Canva pages use the default 0.10 threshold.
         let adaptive_threshold = page_thresholds.get(&page).copied().unwrap_or(0.10);
 
-        // Detect columns for this page
-        let columns = detect_columns(&page_items, page, table_pages.contains(&page));
+        // Detect columns for this page, blind to chart text.
+        debug!(
+            "page {}: grouping chart-aware={} regions={:?}",
+            page,
+            chart_regions.contains_key(&page),
+            chart_regions.get(&page).map(|v| v
+                .iter()
+                .map(|&(a, b, c, d)| (a as i32, b as i32, c as i32, d as i32))
+                .collect::<Vec<_>>())
+        );
+        let columns = match chart_regions.get(&page).filter(|r| !r.is_empty()) {
+            Some(regions) => {
+                let col_input: Vec<TextItem> = page_items
+                    .iter()
+                    .filter(|it| {
+                        let cx = it.x + it.width / 2.0;
+                        // Tight bounds: this only blinds the histogram to
+                        // chart-internal text; rows adjacent to the chart
+                        // belong to the column layout.
+                        !regions.iter().any(|&(x0, y0, x1, y1)| {
+                            cx >= x0 - 2.0 && cx <= x1 + 2.0 && it.y >= y0 - 2.0 && it.y <= y1 + 2.0
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                detect_columns(&col_input, page, table_pages.contains(&page))
+            }
+            None => detect_columns(&page_items, page, table_pages.contains(&page)),
+        };
 
         if columns.len() <= 1 {
             // Single column - use simple sorting
@@ -1446,6 +1519,37 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
                     }
                 }
             }
+            // Same baseline, but separated by a wide void, where the incoming
+            // run starts mid-sentence (lowercase): the neighboring column's
+            // body text sharing a y with this line, in gutters too narrow
+            // for column detection. Both sides must be multi-word prose —
+            // TOC page numbers, table cells (which start with numbers or
+            // capitalized labels), and dot leaders stay joined.
+            if let Some(last_item) = last_line.items.last() {
+                let gap = item.x - (last_item.x + last_item.width);
+                if gap > (item.font_size.max(last_item.font_size) * 3.0).max(30.0)
+                    && item
+                        .text
+                        .trim()
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_lowercase() && c.is_alphabetic())
+                {
+                    let wordy = |t: &str| {
+                        t.split_whitespace().count() >= 3
+                            && t.chars().filter(|c| c.is_alphabetic()).count() >= 10
+                    };
+                    let line_text = last_line
+                        .items
+                        .iter()
+                        .map(|i| i.text.trim())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if wordy(&line_text) && wordy(item.text.trim()) {
+                        return false;
+                    }
+                }
+            }
             true
         });
 
@@ -1517,6 +1621,29 @@ mod tests {
             y -= 14.0;
         }
         items
+    }
+
+    #[test]
+    fn same_baseline_wide_gap_lowercase_continuation_splits() {
+        // Heading in the left column, mid-sentence body text from the right
+        // column at the same y, separated by a wide void: two lines.
+        let items = vec![
+            make_item(1, 94.0, 242.0, "6.2. Expectations for Re-Hiring Staff"),
+            make_item(1, 380.0, 242.0, "they had no plans to re-hire and more"),
+        ];
+        let lines = group_single_column(items, 0.10);
+        assert_eq!(lines.len(), 2, "independent column runs must not fuse");
+    }
+
+    #[test]
+    fn same_baseline_wide_gap_table_label_stays_joined() {
+        // Outline-numbered cell content to the right: table-ish, keep joined.
+        let items = vec![
+            make_item(1, 94.0, 242.0, "2. Embracing complexity in"),
+            make_item(1, 380.0, 242.0, "2.1 Systems thinking and practice"),
+        ];
+        let lines = group_single_column(items, 0.10);
+        assert_eq!(lines.len(), 1, "numbered table cells stay on one line");
     }
 
     #[test]
