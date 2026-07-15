@@ -493,6 +493,14 @@ pub fn detect_tables_from_rects(
         }
     }
 
+    // NOTE: 3-5 box stacks never reach detect_stacked_box_table — the main
+    // loop requires >=6-rect clusters (and a >=6-rect page). This is a
+    // deliberate precision gate: routing smaller clusters through the
+    // detector was tried and regressed four pdf-evals documents (striped
+    // bullet lists, wrapped regulation text, stats-table columns) while
+    // improving nothing — with so few boxes the anti-prose guards have too
+    // little signal to discriminate. See stacked_box_three_rows_below_
+    // cluster_minimum for the pinned behavior.
     if tables.is_empty() {
         // When no tables detected but clusters exist, generate XY hint regions
         // from cluster bounding boxes to scope heuristic table detection.
@@ -754,7 +762,9 @@ fn detect_stacked_box_table(
         // Count horizontally separated text runs inside the box. A single
         // list row flows as one run; two-plus runs across most boxes means
         // multi-column content (striped prose or a real grid) that must not
-        // collapse into a one-column table.
+        // collapse into a one-column table. Same-baseline only: boxed
+        // display/diagram rows legitimately scatter segments at mixed
+        // baselines, and those must stay one row.
         let mut runs = 1usize;
         for pair in in_box.windows(2) {
             let (prev, item) = (pair[0].1, pair[1].1);
@@ -3798,6 +3808,37 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert!((merged[0].x_left - 20.0).abs() < 0.01);
         assert!((merged[0].x_right - 340.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn stacked_box_three_rows_below_cluster_minimum() {
+        // Pins a deliberate precision gate: a 3-box stack stays below the
+        // main loop's 6-rect cluster minimum and is NOT detected end-to-end.
+        // Routing smaller clusters through detect_stacked_box_table was
+        // tried and regressed four pdf-evals documents (striped bullet
+        // lists, wrapped regulation text, stats-table columns) with no
+        // corpus gains — too few boxes for the anti-prose guards to work.
+        // If this ever becomes worth revisiting, the guards need stronger
+        // signals first; flipping this assertion is the entry point.
+        let rects: Vec<PdfRect> = (0..3)
+            .map(|i| PdfRect {
+                x: 100.0,
+                y: 600.0 - i as f32 * 22.0,
+                width: 300.0,
+                height: 22.0,
+                page: 1,
+            })
+            .collect();
+        let items: Vec<TextItem> = ["Step One: Plan", "Step Two: Build", "Step Three: Ship"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| make_item(t, 120.0, 605.0 - i as f32 * 22.0, 10.0))
+            .collect();
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(
+            tables.is_empty(),
+            "3-box stacks are intentionally below the detection floor"
+        );
     }
 
     #[test]
