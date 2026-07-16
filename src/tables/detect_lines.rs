@@ -494,6 +494,7 @@ fn detect_text_anchor_rule_tables(
     items: &[TextItem],
     horizontals: &[HorizontalRule],
     verticals: &[VerticalRule],
+    path_lines: &[PdfLine],
     page: u32,
 ) -> Vec<Table> {
     let logical_rules = merge_horizontal_segments(horizontals);
@@ -521,7 +522,25 @@ fn detect_text_anchor_rule_tables(
                 .iter()
                 .map(|rule| rule.2)
                 .fold(f32::NEG_INFINITY, f32::max);
-            let intersecting_xs: Vec<f32> = verticals
+            let dense_path_region = path_lines
+                .iter()
+                .filter(|line| {
+                    line.page == page
+                        && line.x1.max(line.x2) >= x_left - RULE_JOIN_GAP
+                        && line.x1.min(line.x2) <= x_right + RULE_JOIN_GAP
+                        && line.y1.max(line.y2) >= y_bottom - RULE_Y_TOLERANCE
+                        && line.y1.min(line.y2) <= y_top + RULE_Y_TOLERANCE
+                })
+                .take(200)
+                .count()
+                >= 200;
+            if dense_path_region {
+                // Text-anchor inference is a sparse-geometry fallback. Dense
+                // line art inside the same band is a chart/schematic signal;
+                // physical grid and chart detectors should own that region.
+                continue;
+            }
+            let band_verticals: Vec<VerticalRule> = verticals
                 .iter()
                 .filter(|&&(x, y_min, y_max)| {
                     x >= x_left - RULE_JOIN_GAP
@@ -529,12 +548,22 @@ fn detect_text_anchor_rule_tables(
                         && y_max >= y_bottom - RULE_Y_TOLERANCE
                         && y_min <= y_top + RULE_Y_TOLERANCE
                 })
+                .copied()
+                .collect();
+            let spanning_xs: Vec<f32> = band_verticals
+                .iter()
+                .filter(|&&(_, y_min, y_max)| {
+                    y_min <= y_bottom + RULE_Y_TOLERANCE && y_max >= y_top - RULE_Y_TOLERANCE
+                })
                 .map(|rule| rule.0)
                 .collect();
+            let band_xs: Vec<f32> = band_verticals.iter().map(|rule| rule.0).collect();
             // Two coordinates can be the outer borders of an otherwise
             // borderless table. A physical multi-column grid needs at least
-            // one interior divider as well.
-            if snap_edges(&intersecting_xs, 3.0).len() >= 3 {
+            // one interior divider spanning the candidate as well. Conversely,
+            // many short coordinates are strong diagram/chart evidence even
+            // though no single mark proves a cell grid.
+            if snap_edges(&spanning_xs, 3.0).len() >= 3 || snap_edges(&band_xs, 3.0).len() >= 6 {
                 continue;
             }
             if let Some(table) = build_text_anchor_table(items, &rules, page) {
@@ -558,6 +587,52 @@ fn detect_text_anchor_rule_tables(
             .total_cmp(&left.rows.first().copied().unwrap_or_default())
     });
     tables
+}
+
+fn line_overlaps_table_region(line: &PdfLine, table: &Table) -> bool {
+    let (Some(&x_left), Some(&x_right)) = (table.columns.first(), table.columns.last()) else {
+        return false;
+    };
+    let y_top = table.rows.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let y_bottom = table.rows.iter().copied().fold(f32::INFINITY, f32::min);
+    if !y_top.is_finite() || !y_bottom.is_finite() {
+        return false;
+    }
+
+    // Table rows store text baselines rather than the outer rule positions.
+    // A modest pad covers the header/top and last-row/bottom rule gaps while
+    // keeping vertically separated tables independent.
+    const REGION_PADDING: f32 = 20.0;
+    let line_x_min = line.x1.min(line.x2);
+    let line_x_max = line.x1.max(line.x2);
+    let line_y_min = line.y1.min(line.y2);
+    let line_y_max = line.y1.max(line.y2);
+    line_x_max >= x_left - REGION_PADDING
+        && line_x_min <= x_right + REGION_PADDING
+        && line_y_max >= y_bottom - REGION_PADDING
+        && line_y_min <= y_top + REGION_PADDING
+}
+
+fn combine_non_overlapping_tables(mut primary: Vec<Table>, secondary: Vec<Table>) -> Vec<Table> {
+    let claimed_items: HashSet<usize> = primary
+        .iter()
+        .flat_map(|table| table.item_indices.iter().copied())
+        .collect();
+    primary.extend(secondary.into_iter().filter(|table| {
+        table
+            .item_indices
+            .iter()
+            .all(|index| !claimed_items.contains(index))
+    }));
+    primary.sort_by(|left, right| {
+        right
+            .rows
+            .first()
+            .copied()
+            .unwrap_or_default()
+            .total_cmp(&left.rows.first().copied().unwrap_or_default())
+    });
+    primary
 }
 
 /// Derive column edges from the x-endpoints of horizontal-rule
@@ -695,9 +770,25 @@ fn detect_tables_from_lines_inner(
     // legacy endpoint-grid path has a chance to collapse adjacent tables.
     if allow_text_anchors {
         let text_anchor_tables =
-            detect_text_anchor_rule_tables(items, &horizontals, &verticals, page);
+            detect_text_anchor_rule_tables(items, &horizontals, &verticals, lines, page);
         if !text_anchor_tables.is_empty() {
-            return text_anchor_tables;
+            // Sparse-rule and physical-grid tables can coexist on one page.
+            // Remove only the graphics belonging to the accepted sparse
+            // regions, then let the geometry-only path recover independent
+            // tables without allowing an overlapping lower-quality grid to
+            // replace the anchor-derived result.
+            let remaining_lines: Vec<PdfLine> = lines
+                .iter()
+                .filter(|line| {
+                    !text_anchor_tables
+                        .iter()
+                        .any(|table| line_overlaps_table_region(line, table))
+                })
+                .cloned()
+                .collect();
+            let vector_tables =
+                detect_tables_from_lines_inner(items, &remaining_lines, page, false);
+            return combine_non_overlapping_tables(text_anchor_tables, vector_tables);
         }
     }
     if horizontals.len() < 3 {
@@ -1222,6 +1313,130 @@ mod tests {
         let tables = detect_tables_from_lines(&items, &lines, 1);
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
+    }
+
+    #[test]
+    fn test_booktabs_table_ignores_short_interior_vertical_mark() {
+        let lines = vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(440.0, 80.0, 420.0, 1),
+            make_vline(80.0, 440.0, 500.0, 1),
+            make_vline(420.0, 440.0, 500.0, 1),
+            make_vline(220.0, 455.0, 480.0, 1),
+        ];
+        let items = vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("Accuracy", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+            make_item("Alpha", 100.0, 465.0, 1),
+            make_item("91.2", 220.0, 465.0, 1),
+            make_item("12", 340.0, 465.0, 1),
+            make_item("Beta", 100.0, 450.0, 1),
+            make_item("89.7", 220.0, 450.0, 1),
+            make_item("9", 340.0, 450.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
+    }
+
+    #[test]
+    fn test_many_short_vertical_marks_reject_text_anchor_candidate() {
+        let horizontals = vec![
+            (500.0, 80.0, 420.0),
+            (480.0, 80.0, 420.0),
+            (440.0, 80.0, 420.0),
+        ];
+        let verticals: Vec<VerticalRule> = [100.0, 150.0, 200.0, 250.0, 300.0, 350.0]
+            .into_iter()
+            .map(|x| (x, 455.0, 480.0))
+            .collect();
+        let items = vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("Accuracy", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+            make_item("Alpha", 100.0, 465.0, 1),
+            make_item("91.2", 220.0, 465.0, 1),
+            make_item("12", 340.0, 465.0, 1),
+            make_item("Beta", 100.0, 450.0, 1),
+            make_item("89.7", 220.0, 450.0, 1),
+            make_item("9", 340.0, 450.0, 1),
+        ];
+
+        assert!(
+            detect_text_anchor_rule_tables(&items, &horizontals, &verticals, &[], 1).is_empty()
+        );
+    }
+
+    #[test]
+    fn test_dense_line_art_rejects_text_anchor_candidate() {
+        let horizontals = vec![
+            (500.0, 80.0, 420.0),
+            (480.0, 80.0, 420.0),
+            (440.0, 80.0, 420.0),
+        ];
+        let path_lines: Vec<PdfLine> = (0..200)
+            .map(|index| PdfLine {
+                x1: 90.0 + index as f32,
+                y1: 445.0,
+                x2: 100.0 + index as f32,
+                y2: 495.0,
+                page: 1,
+            })
+            .collect();
+        let items = vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("Accuracy", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+            make_item("Alpha", 100.0, 465.0, 1),
+            make_item("91.2", 220.0, 465.0, 1),
+            make_item("12", 340.0, 465.0, 1),
+            make_item("Beta", 100.0, 450.0, 1),
+            make_item("89.7", 220.0, 450.0, 1),
+            make_item("9", 340.0, 450.0, 1),
+        ];
+
+        assert!(
+            detect_text_anchor_rule_tables(&items, &horizontals, &[], &path_lines, 1).is_empty()
+        );
+    }
+
+    #[test]
+    fn test_sparse_rule_and_vector_grid_tables_coexist() {
+        let lines = vec![
+            make_hline(700.0, 60.0, 360.0, 1),
+            make_hline(680.0, 60.0, 360.0, 1),
+            make_hline(640.0, 60.0, 360.0, 1),
+            make_hline(500.0, 400.0, 600.0, 1),
+            make_hline(480.0, 400.0, 600.0, 1),
+            make_hline(460.0, 400.0, 600.0, 1),
+            make_vline(400.0, 460.0, 500.0, 1),
+            make_vline(500.0, 460.0, 500.0, 1),
+            make_vline(600.0, 460.0, 500.0, 1),
+        ];
+        let items = vec![
+            make_item("Model", 80.0, 690.0, 1),
+            make_item("Accuracy", 180.0, 690.0, 1),
+            make_item("Latency", 280.0, 690.0, 1),
+            make_item("Alpha", 80.0, 665.0, 1),
+            make_item("91.2", 180.0, 665.0, 1),
+            make_item("12", 280.0, 665.0, 1),
+            make_item("Beta", 80.0, 650.0, 1),
+            make_item("89.7", 180.0, 650.0, 1),
+            make_item("9", 280.0, 650.0, 1),
+            make_item("Grid A", 410.0, 490.0, 1),
+            make_item("Grid B", 510.0, 490.0, 1),
+            make_item("one", 410.0, 470.0, 1),
+            make_item("two", 510.0, 470.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
+        assert_eq!(tables[1].cells[0], vec!["Grid A", "Grid B"]);
+        assert_eq!(tables[1].cells[1], vec!["one", "two"]);
     }
 
     #[test]
