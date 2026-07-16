@@ -310,21 +310,23 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     let mut non_empty = 0;
     let mut long_prose = 0;
     let mut rows_with_parallel_prose = 0;
+    let mut continuation_fragments = 0;
+    let mut continuation_columns = vec![false; table.columns.len()];
     let has_compact_header = table
         .cells
         .iter()
-        .find(|row| row.iter().filter(|cell| !cell.trim().is_empty()).count() >= 2)
+        .find(|row| row.iter().any(|cell| !cell.trim().is_empty()))
         .is_some_and(|row| {
-            row.iter()
-                .filter(|cell| !cell.trim().is_empty())
-                .all(|cell| {
+            let filled: Vec<&String> = row.iter().filter(|cell| !cell.trim().is_empty()).collect();
+            filled.len() >= 2
+                && filled.iter().all(|cell| {
                     cell.split_whitespace().count() <= 4 && cell.trim().chars().count() <= 28
                 })
         });
 
     for row in &table.cells {
         let mut row_long_prose = 0;
-        for cell in row {
+        for (column, cell) in row.iter().enumerate() {
             let text = cell.trim();
             if text.is_empty() {
                 continue;
@@ -333,6 +335,16 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
             let chars = text.chars().filter(|ch| !ch.is_whitespace()).count();
             let alphabetic = text.chars().filter(|ch| ch.is_alphabetic()).count();
             let words = text.split_whitespace().count();
+            let starts_with_lowercase = text
+                .chars()
+                .find(|ch| ch.is_alphabetic())
+                .is_some_and(|ch| ch.is_lowercase());
+            if chars >= 18 && words >= 3 && alphabetic * 5 >= chars * 3 && starts_with_lowercase {
+                continuation_fragments += 1;
+                if let Some(has_continuation) = continuation_columns.get_mut(column) {
+                    *has_continuation = true;
+                }
+            }
             if chars >= 28 && words >= 5 && alphabetic * 5 >= chars * 3 {
                 long_prose += 1;
                 row_long_prose += 1;
@@ -347,14 +359,18 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
         && non_empty >= 5
         && long_prose >= 4
         && long_prose * 5 >= non_empty * 3
-        && rows_with_parallel_prose >= 1;
+        && rows_with_parallel_prose >= 1
+        && continuation_fragments >= 3
+        && continuation_columns.iter().filter(|&&value| value).count() >= 2;
     log::debug!(
-        "chart table hypothesis: {}x{}, non_empty={}, long_prose={}, parallel_rows={}, reject={}",
+        "chart table hypothesis: {}x{}, non_empty={}, long_prose={}, parallel_rows={}, continuation_fragments={}, continuation_columns={}, reject={}",
         table.rows.len(),
         table.columns.len(),
         non_empty,
         long_prose,
         rows_with_parallel_prose,
+        continuation_fragments,
+        continuation_columns.iter().filter(|&&value| value).count(),
         is_parallel
     );
     is_parallel
@@ -1920,6 +1936,49 @@ mod tests {
             (0..6).collect(),
         );
         assert!(!is_parallel_prose_table(&headed_text_table));
+
+        let sparse_first_row_then_compact_body = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![340.0, 320.0, 300.0, 280.0],
+            vec![
+                vec![
+                    "This introductory prose fragment occupies only the left column".into(),
+                    "".into(),
+                ],
+                vec!["short".into(), "row".into()],
+                vec![
+                    "continuation text remains aligned with the left prose anchor".into(),
+                    "parallel text continues down the right prose column".into(),
+                ],
+                vec![
+                    "another wrapped fragment follows in the left column".into(),
+                    "while its neighboring prose fragment continues on the right".into(),
+                ],
+            ],
+            (0..8).collect(),
+        );
+        assert!(is_parallel_prose_table(&sparse_first_row_then_compact_body));
+
+        let headerless_description_table = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![320.0, 300.0, 280.0],
+            vec![
+                vec![
+                    "Community preparedness and emergency response planning".into(),
+                    "provides detailed support for local continuity programs".into(),
+                ],
+                vec![
+                    "Regional supplier and market development assistance".into(),
+                    "connects eligible producers with new distribution partners".into(),
+                ],
+                vec![
+                    "Financial continuity and business recovery program".into(),
+                    "offers tailored guidance to firms affected by disruptions".into(),
+                ],
+            ],
+            (0..6).collect(),
+        );
+        assert!(!is_parallel_prose_table(&headerless_description_table));
     }
 
     /// 4-row × 2-col ruled grid from x=100..300 (rows every 20pt from y=600).
