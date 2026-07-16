@@ -17,6 +17,7 @@ const RULE_SPAN_TOLERANCE: f32 = 8.0;
 const TEXT_ROW_TOLERANCE: f32 = 2.5;
 
 type HorizontalRule = (f32, f32, f32); // (y, x_min, x_max)
+type VerticalRule = (f32, f32, f32); // (x, y_min, y_max)
 type AnchoredRow<'a> = (f32, Vec<(usize, &'a TextItem)>);
 
 /// Merge touching path segments into logical horizontal rules.
@@ -298,10 +299,19 @@ fn build_text_anchor_table(
     if !(2..=25).contains(&anchors.len()) || anchors.last()? - anchors[0] < 30.0 {
         return None;
     }
+    let numeric_header_cells = rows[0]
+        .1
+        .iter()
+        .filter(|(_, item)| {
+            let text = item.text.trim();
+            text.chars().any(|c| c.is_ascii_digit()) && !text.chars().any(char::is_alphabetic)
+        })
+        .count();
     if rows[0]
         .1
         .iter()
         .all(|(_, item)| !item.text.chars().any(char::is_alphabetic))
+        || numeric_header_cells * 2 > rows[0].1.len()
         || rows[1..]
             .iter()
             .flat_map(|(_, row)| row)
@@ -465,6 +475,7 @@ fn build_text_anchor_table(
 fn detect_text_anchor_rule_tables(
     items: &[TextItem],
     horizontals: &[HorizontalRule],
+    verticals: &[VerticalRule],
     page: u32,
 ) -> Vec<Table> {
     let logical_rules = merge_horizontal_segments(horizontals);
@@ -476,6 +487,35 @@ fn detect_text_anchor_rule_tables(
     let mut tables = Vec::new();
     for span_group in group_rules_by_span(&logical_rules) {
         for rules in split_rules_at_captions(&span_group, items, page) {
+            let y_top = rules
+                .iter()
+                .map(|rule| rule.0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let y_bottom = rules
+                .iter()
+                .map(|rule| rule.0)
+                .fold(f32::INFINITY, f32::min);
+            let x_left = rules
+                .iter()
+                .map(|rule| rule.1)
+                .fold(f32::INFINITY, f32::min);
+            let x_right = rules
+                .iter()
+                .map(|rule| rule.2)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let intersecting_xs: Vec<f32> = verticals
+                .iter()
+                .filter(|&&(x, y_min, y_max)| {
+                    x >= x_left - RULE_JOIN_GAP
+                        && x <= x_right + RULE_JOIN_GAP
+                        && y_max >= y_bottom - RULE_Y_TOLERANCE
+                        && y_min <= y_top + RULE_Y_TOLERANCE
+                })
+                .map(|rule| rule.0)
+                .collect();
+            if snap_edges(&intersecting_xs, 3.0).len() >= 2 {
+                continue;
+            }
             if let Some(table) = build_text_anchor_table(items, &rules, page) {
                 log::debug!(
                     "detect_lines p{}: accepted text-anchor rule table {}x{} from {} rules",
@@ -632,8 +672,9 @@ fn detect_tables_from_lines_inner(
     // Their rules describe table bands, not row/cell boundaries, so infer
     // columns from the first text row and rows from text baselines before the
     // legacy endpoint-grid path has a chance to collapse adjacent tables.
-    if allow_text_anchors && verticals.len() < 2 {
-        let text_anchor_tables = detect_text_anchor_rule_tables(items, &horizontals, page);
+    if allow_text_anchors {
+        let text_anchor_tables =
+            detect_text_anchor_rule_tables(items, &horizontals, &verticals, page);
         if !text_anchor_tables.is_empty() {
             return text_anchor_tables;
         }
@@ -1083,6 +1124,53 @@ mod tests {
         assert_eq!(tables[0].cells.len(), 3);
         assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
         assert_eq!(tables[0].cells[2], vec!["Beta", "89.7", "9"]);
+    }
+
+    #[test]
+    fn test_booktabs_table_ignores_unrelated_vertical_strokes() {
+        let lines = vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(440.0, 80.0, 420.0, 1),
+            make_vline(30.0, 80.0, 140.0, 1),
+            make_vline(550.0, 700.0, 780.0, 1),
+        ];
+        let items = vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("Accuracy", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+            make_item("Alpha", 100.0, 465.0, 1),
+            make_item("91.2", 220.0, 465.0, 1),
+            make_item("12", 340.0, 465.0, 1),
+            make_item("Beta", 100.0, 450.0, 1),
+            make_item("89.7", 220.0, 450.0, 1),
+            make_item("9", 340.0, 450.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
+    }
+
+    #[test]
+    fn test_numeric_data_row_is_not_used_as_booktabs_header() {
+        let lines = vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(440.0, 80.0, 420.0, 1),
+        ];
+        let items = vec![
+            make_item("Multifamily", 100.0, 490.0, 1),
+            make_item("0.187", 200.0, 490.0, 1),
+            make_item("0.771", 280.0, 490.0, 1),
+            make_item("0.068", 360.0, 490.0, 1),
+            make_item("Industrial", 100.0, 460.0, 1),
+            make_item("-0.221", 200.0, 460.0, 1),
+            make_item("0.748", 280.0, 460.0, 1),
+            make_item("-0.307", 360.0, 460.0, 1),
+        ];
+
+        assert!(detect_tables_from_lines(&items, &lines, 1).is_empty());
     }
 
     #[test]
