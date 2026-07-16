@@ -373,6 +373,10 @@ fn looks_like_numbered_section_heading(text: &str) -> bool {
             .is_some_and(|ch| ch.is_uppercase())
 }
 
+fn merged_retry_skips_body_font(detected_columns: bool, has_chart_regions: bool) -> bool {
+    detected_columns && !has_chart_regions
+}
+
 /// Reject a heuristic table only when its cells are overwhelmingly parallel
 /// prose fragments. This is deliberately narrower than disabling body-font
 /// detection for the whole page: numeric, compact, headed, and otherwise
@@ -1115,7 +1119,6 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 .filter(|&split_x| chart_spans_prose_split(region, split_x))
         });
         let chart_prose_columns = chart_prose_split.is_some();
-        let page_has_columns = detected_columns || chart_prose_columns;
 
         // Check for side-by-side layout (e.g. two tables placed left and right)
         let mut bands = split_side_by_side(&page_items);
@@ -1533,8 +1536,24 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 .filter(|(_, it)| !in_chart(it))
                 .map(|(i, it)| (it.clone(), i))
                 .unzip();
-            let heuristic_tables = detect_tables(&chart_free, base_size, page_has_columns);
+            // A chart-derived column signal must not disable body-font table
+            // detection during the merged-band retry: this retry exists for
+            // tables that only become visible after recombining false layout
+            // bands. Keep the legacy skip on ordinary detected-column pages,
+            // and reject chart-page prose candidates individually below.
+            let skip_body_font =
+                merged_retry_skips_body_font(detected_columns, !chart_regions.is_empty());
+            let heuristic_tables = detect_tables(&chart_free, base_size, skip_body_font);
             for table in &heuristic_tables {
+                if !chart_regions.is_empty() && is_parallel_prose_table(table) {
+                    log::debug!(
+                        "page {}: rejected {}x{} merged-band parallel-prose table hypothesis",
+                        page,
+                        table.rows.len(),
+                        table.columns.len()
+                    );
+                    continue;
+                }
                 for &idx in &table.item_indices {
                     if let Some(&page_idx) = chart_free_map
                         .get(idx)
@@ -2001,6 +2020,10 @@ mod tests {
 
     #[test]
     fn parallel_prose_table_is_rejected_but_real_table_is_preserved() {
+        assert!(merged_retry_skips_body_font(true, false));
+        assert!(!merged_retry_skips_body_font(true, true));
+        assert!(!merged_retry_skips_body_font(false, true));
+
         assert!(looks_like_numbered_section_heading(
             "9.5. Adapting to the New Normal: Changing Business Models"
         ));

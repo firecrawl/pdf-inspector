@@ -641,14 +641,16 @@ fn count_table_columns(table_md: &str) -> usize {
 /// Flush any remaining tables and images for a given page
 fn flush_page_tables_and_images(
     page: u32,
-    page_tables: &std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
-    page_images: &std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
+    page_blocks: &HashMap<u32, Vec<PositionedBlockRef<'_>>>,
     inserted_tables: &mut HashSet<(u32, usize)>,
     inserted_images: &mut HashSet<(u32, usize)>,
     output: &mut String,
     in_paragraph: &mut bool,
 ) {
-    for (kind, idx, block) in positioned_blocks_for_page(page, page_tables, page_images) {
+    let Some(blocks) = page_blocks.get(&page) else {
+        return;
+    };
+    for &(kind, idx, block) in blocks {
         let already_inserted = match kind {
             PositionedBlockKind::Table => inserted_tables.contains(&(page, idx)),
             PositionedBlockKind::Image => inserted_images.contains(&(page, idx)),
@@ -755,6 +757,18 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         .collect();
     all_content_pages.sort();
     all_content_pages.dedup();
+    // Build the unified table/image order once per page. This is only a
+    // meaningful sort on chart/prose pages; ordinary pages retain their
+    // legacy table-then-image order without repeating work for every line.
+    let page_blocks: HashMap<u32, Vec<PositionedBlockRef<'_>>> = all_content_pages
+        .iter()
+        .map(|&page| {
+            (
+                page,
+                positioned_blocks_for_page(page, &page_tables, &page_images),
+            )
+        })
+        .collect();
 
     for (line_idx, line) in lines.iter().enumerate() {
         // Page break
@@ -767,8 +781,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 }
                 flush_page_tables_and_images(
                     current_page,
-                    &page_tables,
-                    &page_images,
+                    &page_blocks,
                     &mut inserted_tables,
                     &mut inserted_images,
                     &mut output,
@@ -792,8 +805,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 }
                 flush_page_tables_and_images(
                     p,
-                    &page_tables,
-                    &page_images,
+                    &page_blocks,
                     &mut inserted_tables,
                     &mut inserted_images,
                     &mut output,
@@ -819,28 +831,28 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         // Insert tables and images through one ordered stream. Chart/prose
         // pages sort by zone, column, and physical Y; ordinary pages retain
         // the legacy table-then-image input order.
-        for (kind, idx, block) in
-            positioned_blocks_for_page(current_page, &page_tables, &page_images)
-        {
-            let already_inserted = match kind {
-                PositionedBlockKind::Table => inserted_tables.contains(&(current_page, idx)),
-                PositionedBlockKind::Image => inserted_images.contains(&(current_page, idx)),
-            };
-            if positioned_block_precedes_line(block, line) && !already_inserted {
-                if in_paragraph {
-                    output.push_str("\n\n");
-                    in_paragraph = false;
-                    paragraph_in_wrapped_bold_run = false;
-                }
-                output.push('\n');
-                output.push_str(&block.markdown);
-                output.push('\n');
-                match kind {
-                    PositionedBlockKind::Table => {
-                        inserted_tables.insert((current_page, idx));
+        if let Some(blocks) = page_blocks.get(&current_page) {
+            for &(kind, idx, block) in blocks {
+                let already_inserted = match kind {
+                    PositionedBlockKind::Table => inserted_tables.contains(&(current_page, idx)),
+                    PositionedBlockKind::Image => inserted_images.contains(&(current_page, idx)),
+                };
+                if positioned_block_precedes_line(block, line) && !already_inserted {
+                    if in_paragraph {
+                        output.push_str("\n\n");
+                        in_paragraph = false;
+                        paragraph_in_wrapped_bold_run = false;
                     }
-                    PositionedBlockKind::Image => {
-                        inserted_images.insert((current_page, idx));
+                    output.push('\n');
+                    output.push_str(&block.markdown);
+                    output.push('\n');
+                    match kind {
+                        PositionedBlockKind::Table => {
+                            inserted_tables.insert((current_page, idx));
+                        }
+                        PositionedBlockKind::Image => {
+                            inserted_images.insert((current_page, idx));
+                        }
                     }
                 }
             }
@@ -1174,8 +1186,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // (handles table-only pages after the last text line, and trailing image-only pages)
     flush_page_tables_and_images(
         current_page,
-        &page_tables,
-        &page_images,
+        &page_blocks,
         &mut inserted_tables,
         &mut inserted_images,
         &mut output,
@@ -1187,8 +1198,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         }
         flush_page_tables_and_images(
             p,
-            &page_tables,
-            &page_images,
+            &page_blocks,
             &mut inserted_tables,
             &mut inserted_images,
             &mut output,
