@@ -1146,19 +1146,17 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         }
         // Anchor-derived prose splits are lower-confidence than physical
         // gutters, so they do not partition table detection. They are applied
-        // later only to vertical zones outside the chart.
-        let chart_prose_order = if bands.is_empty() {
-            chart_prose_split.and_then(|split_x| {
-                chart_regions.first().copied().map(|region| {
-                    page_chart_prose_splits.insert(page, split_x);
-                    let order = ChartProseOrder::new(split_x, region);
-                    page_chart_prose_orders.insert(page, order);
-                    order
-                })
+        // later only to vertical zones outside the chart. Physical bands can
+        // still scope table detection without disabling this page-level prose
+        // and positioned-block order.
+        let chart_prose_order = chart_prose_split.and_then(|split_x| {
+            chart_regions.first().copied().map(|region| {
+                page_chart_prose_splits.insert(page, split_x);
+                let order = ChartProseOrder::new(split_x, region);
+                page_chart_prose_orders.insert(page, order);
+                order
             })
-        } else {
-            None
-        };
+        });
 
         // Build list of (band_items, band_index_map, band_rects, band_lines).
         // band_index_map[local_band_idx] → page_items index.
@@ -2016,6 +2014,88 @@ mod tests {
             (300.0, 300.0, 520.0, 500.0),
             split_x
         ));
+    }
+
+    #[test]
+    fn chart_prose_order_survives_physical_gutter_detection() {
+        let mut items = Vec::new();
+        for row in 0..20 {
+            let y = 760.0 - row as f32 * 13.0;
+            let mut left = make_item_w(90.0, y, 100.0, 1);
+            left.text = format!("Left prose line {row} has several words");
+            items.push(left);
+            let mut right = make_item_w(340.0, y, 100.0, 1);
+            right.text = format!("Right prose line {row} has several words");
+            items.push(right);
+        }
+        assert!(
+            !split_side_by_side(&items).is_empty(),
+            "fixture must exercise the physical-gutter path"
+        );
+
+        // Connected, variably sized bars form a full-width chart separator.
+        let mut rects = vec![PdfRect {
+            x: 80.0,
+            y: 280.0,
+            width: 440.0,
+            height: 150.0,
+            page: 1,
+        }];
+        for (x, height) in [(120.0, 55.0), (210.0, 90.0), (300.0, 70.0), (390.0, 115.0)] {
+            rects.push(PdfRect {
+                x,
+                y: 280.0,
+                width: 45.0,
+                height,
+                page: 1,
+            });
+        }
+        // A second connected family keeps the bar cluster above the detector's
+        // minimum while retaining data-driven height variation.
+        for (x, y, height) in [
+            (120.0, 332.0, 45.0),
+            (210.0, 367.0, 55.0),
+            (300.0, 347.0, 35.0),
+            (390.0, 392.0, 30.0),
+        ] {
+            rects.push(PdfRect {
+                x,
+                y,
+                width: 45.0,
+                height,
+                page: 1,
+            });
+        }
+
+        // Detection/input order is deliberately right before left. Only the
+        // chart-scoped logical order can put these blocks into prose-column
+        // order after the physical bands have already scoped table detection.
+        let mut right_image = make_item(340.0, 650.0, 1);
+        right_image.text = "[Image: RightFigure]".into();
+        right_image.item_type = crate::types::ItemType::Image;
+        items.push(right_image);
+        let mut left_image = make_item(90.0, 600.0, 1);
+        left_image.text = "[Image: LeftFigure]".into();
+        left_image.item_type = crate::types::ItemType::Image;
+        items.push(left_image);
+
+        let options = MarkdownOptions {
+            include_images: true,
+            ..MarkdownOptions::default()
+        };
+        let markdown = to_markdown_from_items_with_rects(items, options, &rects);
+        let left_last = markdown.find("Left prose line 19").unwrap();
+        let right_first = markdown.find("Right prose line 0").unwrap();
+        assert!(
+            left_last < right_first,
+            "chart prose must read down the left column before the right even when table detection found physical bands:\n{markdown}"
+        );
+        let left_image = markdown.find("LeftFigure").unwrap();
+        let right_image = markdown.find("RightFigure").unwrap();
+        assert!(
+            left_image < right_image,
+            "chart blocks must retain column order when physical bands are present:\n{markdown}"
+        );
     }
 
     #[test]
