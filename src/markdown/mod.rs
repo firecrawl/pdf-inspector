@@ -22,6 +22,30 @@ use analysis::calculate_font_stats_from_items;
 use classify::{format_list_item, is_code_like, is_list_item};
 use convert::{merge_continuation_tables, to_markdown_from_lines_with_tables_and_images};
 
+const CHART_REGION_PAD: f32 = 20.0;
+const CHART_SEPARATOR_PAD: f32 = 8.0;
+
+fn item_is_in_chart_region(item: &TextItem, regions: &[(f32, f32, f32, f32)]) -> bool {
+    regions.iter().any(|&(x0, y0, x1, y1)| {
+        let cx = item.x + item.width / 2.0;
+        cx >= x0 - CHART_REGION_PAD
+            && cx <= x1 + CHART_REGION_PAD
+            && item.y >= y0 - CHART_REGION_PAD
+            && item.y <= y1 + CHART_REGION_PAD
+    })
+}
+
+fn items_outside_chart_regions(
+    items: &[TextItem],
+    regions: &[(f32, f32, f32, f32)],
+) -> Vec<TextItem> {
+    items
+        .iter()
+        .filter(|item| !item_is_in_chart_region(item, regions))
+        .cloned()
+        .collect()
+}
+
 /// Detect side-by-side table layout by finding a significant X-position gap.
 ///
 /// Returns X-band boundaries `[(x_min, split_x), (split_x, x_max)]` when a
@@ -169,6 +193,82 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
     }
 
     vec![(x_min, best_split), (best_split, x_max)]
+}
+
+/// Detect two short prose columns on a chart page from repeated left anchors.
+///
+/// Chart masking can leave fewer than 20 lines per column, while justified text
+/// can reduce the physical gutter below the projection detector's 8pt minimum.
+/// Repeated prose left edges remain reliable in that case. The caller scopes
+/// this signal to pages with a confirmed chart region.
+fn chart_page_prose_column_split(items: &[TextItem]) -> Option<f32> {
+    const X_TOLERANCE: f32 = 12.0;
+    const MIN_LINES_PER_COLUMN: usize = 6;
+    const MIN_ANCHOR_SEPARATION: f32 = 120.0;
+    const MIN_VERTICAL_SPAN: f32 = 60.0;
+
+    let mut prose: Vec<&TextItem> = items
+        .iter()
+        .filter(|item| {
+            let words = item.text.split_whitespace().count();
+            let chars = item.text.chars().count().max(1);
+            let alphabetic = item.text.chars().filter(|c| c.is_alphabetic()).count();
+            words >= 4 && item.width >= 80.0 && alphabetic * 2 >= chars
+        })
+        .collect();
+    if prose.len() < MIN_LINES_PER_COLUMN * 2 {
+        return None;
+    }
+    prose.sort_by(|a, b| a.x.total_cmp(&b.x));
+
+    let mut clusters: Vec<(f32, Vec<&TextItem>)> = Vec::new();
+    for item in prose {
+        if let Some((anchor, members)) = clusters
+            .iter_mut()
+            .find(|(anchor, _)| (item.x - *anchor).abs() <= X_TOLERANCE)
+        {
+            members.push(item);
+            *anchor = members.iter().map(|member| member.x).sum::<f32>() / members.len() as f32;
+        } else {
+            clusters.push((item.x, vec![item]));
+        }
+    }
+
+    let mut dominant: Vec<(f32, Vec<&TextItem>)> = clusters
+        .into_iter()
+        .filter(|(_, members)| members.len() >= MIN_LINES_PER_COLUMN)
+        .collect();
+    if dominant.len() != 2 {
+        return None;
+    }
+    dominant.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if dominant[1].0 - dominant[0].0 < MIN_ANCHOR_SEPARATION {
+        return None;
+    }
+
+    let vertical_range = |members: &[&TextItem]| {
+        let y_min = members
+            .iter()
+            .map(|item| item.y)
+            .fold(f32::INFINITY, f32::min);
+        let y_max = members
+            .iter()
+            .map(|item| item.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        (y_min, y_max)
+    };
+    let left_y = vertical_range(&dominant[0].1);
+    let right_y = vertical_range(&dominant[1].1);
+    if left_y.1 - left_y.0 < MIN_VERTICAL_SPAN || right_y.1 - right_y.0 < MIN_VERTICAL_SPAN {
+        return None;
+    }
+    let overlap = (left_y.1.min(right_y.1) - left_y.0.max(right_y.0)).max(0.0);
+    let shorter_span = (left_y.1 - left_y.0).min(right_y.1 - right_y.0);
+    if overlap < shorter_span * 0.4 {
+        return None;
+    }
+
+    Some((dominant[0].0 + dominant[1].0) / 2.0)
 }
 
 /// Derive a side-by-side split from rect hint regions.
@@ -760,19 +860,13 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Track band splits per page so we can split non-table items later
     let mut page_band_splits: HashMap<u32, Vec<(f32, f32)>> = HashMap::new();
+    // Chart pages with two prose columns use the chart's vertical span as a
+    // full-width separator and read each surrounding prose zone by column.
+    let mut page_chart_prose_splits: HashMap<u32, f32> = HashMap::new();
 
     for page in pages {
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
-
-        // Detect columns early — on multi-column pages, the merged-band retry
-        // should skip body-font heuristic table detection (which mistakes column
-        // text for tables). Individual band heuristic detection is left enabled
-        // because bands are scoped to single columns.
-        let page_has_columns = {
-            let cols = crate::extractor::detect_columns(&page_items, page, false);
-            cols.len() >= 2
-        };
 
         // Chart-bar regions: bar charts drawn as filled rects read as cell
         // rects or aligned text and get gridded into phantom tables. Their
@@ -780,18 +874,15 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // as plain text instead.
         let chart_regions: Vec<(f32, f32, f32, f32)> =
             page_chart_map.get(&page).cloned().unwrap_or_default();
-        // Pad the claim region: axis/category labels sit just outside the
-        // bar rects (below the axis, left of the scale) and belong to the
-        // chart as much as the bars do.
-        const CHART_PAD: f32 = 20.0;
-        let in_chart = |it: &TextItem| {
-            chart_regions.iter().any(|&(x0, y0, x1, y1)| {
-                let cx = it.x + it.width / 2.0;
-                cx >= x0 - CHART_PAD
-                    && cx <= x1 + CHART_PAD
-                    && it.y >= y0 - CHART_PAD
-                    && it.y <= y1 + CHART_PAD
-            })
+        let in_chart = |item: &TextItem| item_is_in_chart_region(item, &chart_regions);
+        let page_layout_items = items_outside_chart_regions(&page_items, &chart_regions);
+
+        // Detect columns on chart-free text. Chart labels and values often fill
+        // the prose gutter, hiding real columns and allowing body text to reach
+        // heuristic table detection as one page-wide region.
+        let detected_columns = {
+            let cols = crate::extractor::detect_columns(&page_layout_items, page, false);
+            cols.len() >= 2
         };
         if !chart_regions.is_empty() {
             log::debug!(
@@ -800,6 +891,21 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 chart_regions.len()
             );
         }
+
+        // Repeated prose anchors provide a second, chart-scoped column signal.
+        // It does not partition table detection: a narrow or partly spanning
+        // gutter is too ambiguous for that. It can reject a body-font table
+        // hypothesis and later order prose within chart-separated zones.
+        // Multiple charts create several narrow vertical zones whose local
+        // column structure needs stronger region-graph reasoning. Keep those
+        // pages on the conservative full-page grouping path for now.
+        let chart_prose_split = if chart_regions.len() != 1 {
+            None
+        } else {
+            chart_page_prose_column_split(&page_layout_items)
+        };
+        let chart_prose_columns = chart_prose_split.is_some();
+        let page_has_columns = detected_columns || chart_prose_columns;
 
         // Check for side-by-side layout (e.g. two tables placed left and right)
         let mut bands = split_side_by_side(&page_items);
@@ -823,6 +929,14 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             // their non-table items should flow through normal line grouping.
             if !bands.is_empty() {
                 page_band_splits.insert(page, bands.clone());
+            }
+        }
+        // Anchor-derived prose splits are lower-confidence than physical
+        // gutters, so they do not partition table detection. They are applied
+        // later only to vertical zones outside the chart.
+        if bands.is_empty() {
+            if let Some(split_x) = chart_prose_split {
+                page_chart_prose_splits.insert(page, split_x);
             }
         }
 
@@ -1032,7 +1146,11 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     if subset_items.len() < min_items {
                         return;
                     }
-                    let tables = detect_tables(subset_items, base_size, false);
+                    // When chart-free prose anchors reveal columns but no safe
+                    // band split was possible, suppress the body-font pass. It
+                    // otherwise mistakes aligned prose lines for table rows.
+                    let skip_body_font = chart_prose_columns && !was_split;
+                    let tables = detect_tables(subset_items, base_size, skip_body_font);
                     for table in tables {
                         for &idx in &table.item_indices {
                             if let Some(&band_idx) = index_map.get(idx) {
@@ -1287,7 +1405,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // Split non-table items by band boundaries before line grouping so that
     // items from different side-by-side zones (e.g. left/right month columns
     // in a calendar) don't merge into the same line.
-    let lines = if page_band_splits.is_empty() {
+    let lines = if page_band_splits.is_empty() && page_chart_prose_splits.is_empty() {
         crate::extractor::group_into_lines_with_thresholds_and_charts(
             non_table_items,
             page_thresholds,
@@ -1295,11 +1413,20 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             &page_chart_map,
         )
     } else {
-        // Separate items into band-split pages and non-split pages
+        // Separate items into physical-band pages, chart/prose pages, and
+        // ordinary pages. Chart/prose pages need a different reading order:
+        // each chart is a full-width separator, while prose above and below
+        // it reads down the left column and then down the right column.
         let mut split_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
+        let mut chart_prose_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
         let mut unsplit_items: Vec<TextItem> = Vec::new();
         for item in non_table_items {
-            if page_band_splits.contains_key(&item.page) {
+            if page_chart_prose_splits.contains_key(&item.page) {
+                chart_prose_page_items
+                    .entry(item.page)
+                    .or_default()
+                    .push(item);
+            } else if page_band_splits.contains_key(&item.page) {
                 split_page_items.entry(item.page).or_default().push(item);
             } else {
                 unsplit_items.push(item);
@@ -1343,6 +1470,76 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             page_lines.sort_by(|a, b| b.y.total_cmp(&a.y));
             all_lines.extend(page_lines);
         }
+
+        // Process chart/prose pages as alternating vertical zones. Within a
+        // prose zone, group each column independently and append columns in
+        // newspaper order. Within a chart zone, group the full width normally.
+        let mut chart_prose_pages: Vec<u32> = chart_prose_page_items.keys().copied().collect();
+        chart_prose_pages.sort();
+        for page in chart_prose_pages {
+            let mut remaining = chart_prose_page_items.remove(&page).unwrap();
+            let split_x = page_chart_prose_splits[&page];
+            let group_prose_zone = |zone_items: Vec<TextItem>| {
+                let mut zone_lines = Vec::new();
+                for right_column in [false, true] {
+                    let column_items: Vec<TextItem> = zone_items
+                        .iter()
+                        .filter(|item| (item.x >= split_x) == right_column)
+                        .cloned()
+                        .collect();
+                    if !column_items.is_empty() {
+                        zone_lines.extend(
+                            crate::extractor::group_into_lines_with_thresholds_and_charts(
+                                column_items,
+                                page_thresholds,
+                                &table_page_set,
+                                &page_chart_map,
+                            ),
+                        );
+                    }
+                }
+                zone_lines
+            };
+
+            let mut chart_y_bands: Vec<(f32, f32)> = page_chart_map[&page]
+                .iter()
+                .map(|&(_, y0, _, y1)| (y0 - CHART_SEPARATOR_PAD, y1 + CHART_SEPARATOR_PAD))
+                .collect();
+            chart_y_bands.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let mut merged_chart_y_bands: Vec<(f32, f32)> = Vec::new();
+            for (low, high) in chart_y_bands {
+                if let Some(last) = merged_chart_y_bands.last_mut() {
+                    if high >= last.0 {
+                        last.0 = last.0.min(low);
+                        last.1 = last.1.max(high);
+                        continue;
+                    }
+                }
+                merged_chart_y_bands.push((low, high));
+            }
+
+            for (low, high) in merged_chart_y_bands {
+                let (above, at_or_below): (Vec<TextItem>, Vec<TextItem>) =
+                    remaining.into_iter().partition(|item| item.y > high);
+                all_lines.extend(group_prose_zone(above));
+
+                let (chart_zone, below): (Vec<TextItem>, Vec<TextItem>) =
+                    at_or_below.into_iter().partition(|item| item.y >= low);
+                all_lines.extend(
+                    crate::extractor::group_into_lines_with_thresholds_and_charts(
+                        chart_zone,
+                        page_thresholds,
+                        &table_page_set,
+                        &page_chart_map,
+                    ),
+                );
+                remaining = below;
+            }
+            all_lines.extend(group_prose_zone(remaining));
+        }
+        // The three processing paths above are accumulated separately. Restore
+        // document page order while preserving each page's chosen line order.
+        all_lines.sort_by_key(|line| line.page);
         all_lines
     };
 
@@ -1354,7 +1551,8 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     };
 
     // Convert to markdown, inserting tables and images at appropriate positions
-    let band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
+    let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
+    band_split_page_set.extend(page_chart_prose_splits.keys().copied());
     to_markdown_from_lines_with_tables_and_images(
         lines,
         options,
@@ -1457,6 +1655,65 @@ mod tests {
         let mut it = make_item(x, y, page);
         it.width = width;
         it
+    }
+
+    #[test]
+    fn early_layout_excludes_chart_items_before_column_detection() {
+        let mut items = Vec::new();
+        for row in 0..20 {
+            let y = 100.0 + row as f32 * 14.0;
+            items.push(make_item_w(90.0, y, 180.0, 1));
+            items.push(make_item_w(340.0, y, 180.0, 1));
+        }
+        for col in 0..12 {
+            items.push(make_item_w(
+                100.0 + col as f32 * 35.0,
+                620.0 - col as f32 * 4.0,
+                25.0,
+                1,
+            ));
+        }
+
+        let chart_regions = vec![(90.0, 540.0, 530.0, 700.0)];
+        let layout_items = items_outside_chart_regions(&items, &chart_regions);
+
+        assert_eq!(layout_items.len(), 40);
+        assert_eq!(
+            crate::extractor::detect_columns(&layout_items, 1, false).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn chart_page_detects_two_short_prose_columns() {
+        let mut items = Vec::new();
+        for row in 0..12 {
+            let y = 100.0 + row as f32 * 14.0;
+            let mut left = make_item_w(90.0, y, 180.0, 1);
+            left.text = "A complete prose line in the left column".into();
+            items.push(left);
+            let mut right = make_item_w(340.0, y, 180.0, 1);
+            right.text = "A complete prose line in the right column".into();
+            items.push(right);
+        }
+
+        let split = chart_page_prose_column_split(&items).unwrap();
+        assert!(split > 200.0 && split < 300.0);
+    }
+
+    #[test]
+    fn chart_page_rejects_non_overlapping_prose_anchors() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let mut left = make_item_w(90.0, 100.0 + row as f32 * 14.0, 180.0, 1);
+            left.text = "A complete prose line in the upper column".into();
+            items.push(left);
+            let mut right = make_item_w(340.0, 300.0 + row as f32 * 14.0, 180.0, 1);
+            right.text = "A complete prose line in the lower column".into();
+            items.push(right);
+        }
+
+        assert_eq!(chart_page_prose_column_split(&items), None);
     }
 
     /// 4-row × 2-col ruled grid from x=100..300 (rows every 20pt from y=600).
