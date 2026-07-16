@@ -280,6 +280,83 @@ fn chart_page_prose_column_split(items: &[TextItem]) -> Option<f32> {
     Some((dominant[0].0 + dominant[1].0) / 2.0)
 }
 
+/// True when a chart crosses the inferred prose gutter by enough to act as a
+/// page-wide separator. A chart confined to one column must stay in that
+/// column's local reading order instead of reordering the entire page.
+fn chart_spans_prose_split(region: (f32, f32, f32, f32), split_x: f32) -> bool {
+    const MIN_CHART_WIDTH_PER_SIDE: f32 = 40.0;
+
+    let (x0, _, x1, _) = region;
+    let left = x0.min(x1);
+    let right = x0.max(x1);
+    split_x - left >= MIN_CHART_WIDTH_PER_SIDE && right - split_x >= MIN_CHART_WIDTH_PER_SIDE
+}
+
+/// Reject a heuristic table only when its cells are overwhelmingly parallel
+/// prose fragments. This is deliberately narrower than disabling body-font
+/// detection for the whole page: numeric, compact, headed, and otherwise
+/// table-shaped candidates remain eligible on chart pages.
+fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
+    if table.kind != crate::tables::TableKind::Data
+        || !(2..=3).contains(&table.columns.len())
+        || table.rows.len() < 3
+    {
+        return false;
+    }
+
+    let mut non_empty = 0;
+    let mut long_prose = 0;
+    let mut rows_with_parallel_prose = 0;
+    let has_compact_header = table
+        .cells
+        .iter()
+        .find(|row| row.iter().filter(|cell| !cell.trim().is_empty()).count() >= 2)
+        .is_some_and(|row| {
+            row.iter()
+                .filter(|cell| !cell.trim().is_empty())
+                .all(|cell| {
+                    cell.split_whitespace().count() <= 4 && cell.trim().chars().count() <= 28
+                })
+        });
+
+    for row in &table.cells {
+        let mut row_long_prose = 0;
+        for cell in row {
+            let text = cell.trim();
+            if text.is_empty() {
+                continue;
+            }
+            non_empty += 1;
+            let chars = text.chars().filter(|ch| !ch.is_whitespace()).count();
+            let alphabetic = text.chars().filter(|ch| ch.is_alphabetic()).count();
+            let words = text.split_whitespace().count();
+            if chars >= 28 && words >= 5 && alphabetic * 5 >= chars * 3 {
+                long_prose += 1;
+                row_long_prose += 1;
+            }
+        }
+        if row_long_prose >= 2 {
+            rows_with_parallel_prose += 1;
+        }
+    }
+
+    let is_parallel = !has_compact_header
+        && non_empty >= 5
+        && long_prose >= 4
+        && long_prose * 5 >= non_empty * 3
+        && rows_with_parallel_prose >= 1;
+    log::debug!(
+        "chart table hypothesis: {}x{}, non_empty={}, long_prose={}, parallel_rows={}, reject={}",
+        table.rows.len(),
+        table.columns.len(),
+        non_empty,
+        long_prose,
+        rows_with_parallel_prose,
+        is_parallel
+    );
+    is_parallel
+}
+
 /// Derive a side-by-side split from rect hint regions.
 ///
 /// When `split_side_by_side` doesn't detect a gap (e.g. the text gap is too
@@ -908,11 +985,13 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // Multiple charts create several narrow vertical zones whose local
         // column structure needs stronger region-graph reasoning. Keep those
         // pages on the conservative full-page grouping path for now.
-        let chart_prose_split = if chart_regions.len() != 1 {
-            None
-        } else {
+        let chart_prose_split = chart_regions.first().and_then(|&region| {
+            if chart_regions.len() != 1 {
+                return None;
+            }
             chart_page_prose_column_split(&page_layout_items)
-        };
+                .filter(|&split_x| chart_spans_prose_split(region, split_x))
+        });
         let chart_prose_columns = chart_prose_split.is_some();
         let page_has_columns = detected_columns || chart_prose_columns;
 
@@ -1155,12 +1234,21 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     if subset_items.len() < min_items {
                         return;
                     }
-                    // When chart-free prose anchors reveal columns but no safe
-                    // band split was possible, suppress the body-font pass. It
-                    // otherwise mistakes aligned prose lines for table rows.
-                    let skip_body_font = chart_prose_columns && !was_split;
-                    let tables = detect_tables(subset_items, base_size, skip_body_font);
+                    // Keep body-font detection available on chart pages: a real
+                    // table can share the prose anchors. Reject only candidates
+                    // whose cells prove they are parallel prose fragments.
+                    let reject_parallel_prose = chart_prose_columns && !was_split;
+                    let tables = detect_tables(subset_items, base_size, false);
                     for table in tables {
+                        if reject_parallel_prose && is_parallel_prose_table(&table) {
+                            log::debug!(
+                                "page {}: rejected {}x{} parallel-prose table hypothesis",
+                                page,
+                                table.rows.len(),
+                                table.columns.len()
+                            );
+                            continue;
+                        }
                         for &idx in &table.item_indices {
                             if let Some(&band_idx) = index_map.get(idx) {
                                 if let Some(&page_idx) = band_index_map.get(band_idx) {
@@ -1749,6 +1837,78 @@ mod tests {
         }
 
         assert_eq!(chart_page_prose_column_split(&items), None);
+    }
+
+    #[test]
+    fn chart_separator_must_span_both_prose_columns() {
+        let split_x = 280.0;
+
+        assert!(chart_spans_prose_split(
+            (100.0, 300.0, 500.0, 500.0),
+            split_x
+        ));
+        assert!(!chart_spans_prose_split(
+            (90.0, 300.0, 260.0, 500.0),
+            split_x
+        ));
+        assert!(!chart_spans_prose_split(
+            (300.0, 300.0, 520.0, 500.0),
+            split_x
+        ));
+    }
+
+    #[test]
+    fn parallel_prose_table_is_rejected_but_real_table_is_preserved() {
+        let prose = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![300.0, 280.0, 260.0],
+            vec![
+                vec![
+                    "This section investigates the impact of public health measures".into(),
+                    "course of the research period and the impacts continued".into(),
+                ],
+                vec![
+                    "measures on business operations during the national lockdown".into(),
+                    "felt by firms working under reduced operating conditions".into(),
+                ],
+                vec![
+                    "respondents described their expectations for business recovery".into(),
+                    "while many other businesses remained temporarily closed".into(),
+                ],
+            ],
+            (0..6).collect(),
+        );
+        assert!(is_parallel_prose_table(&prose));
+
+        let data = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![300.0, 280.0, 260.0],
+            vec![
+                vec!["Sector".into(), "Revenue".into()],
+                vec!["Tourism".into(), "$1,240".into()],
+                vec!["Agriculture".into(), "$980".into()],
+            ],
+            (0..6).collect(),
+        );
+        assert!(!is_parallel_prose_table(&data));
+
+        let headed_text_table = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![320.0, 300.0, 280.0],
+            vec![
+                vec!["Program".into(), "Description".into()],
+                vec![
+                    "Business recovery and continuity planning support".into(),
+                    "Provides tailored guidance to firms affected by disruptions".into(),
+                ],
+                vec![
+                    "Regional market access and supplier development".into(),
+                    "Connects eligible producers with new distribution partners".into(),
+                ],
+            ],
+            (0..6).collect(),
+        );
+        assert!(!is_parallel_prose_table(&headed_text_table));
     }
 
     /// 4-row × 2-col ruled grid from x=100..300 (rows every 20pt from y=600).
