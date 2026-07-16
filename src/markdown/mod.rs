@@ -350,6 +350,29 @@ fn is_cross_row_prose_continuation(previous: &str, current: &str) -> bool {
     previous_is_open && current_starts_as_continuation
 }
 
+/// Section-numbered headings embedded in a candidate are strong evidence that
+/// a heuristic grid has captured page prose rather than a real table.
+fn looks_like_numbered_section_heading(text: &str) -> bool {
+    let Some((prefix, title)) = text.trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    let prefix = prefix.trim_end_matches('.');
+    let mut group_count = 0;
+    for group in prefix.split('.') {
+        if group.is_empty() || group.len() > 3 || !group.chars().all(|ch| ch.is_ascii_digit()) {
+            return false;
+        }
+        group_count += 1;
+    }
+    let title = title.trim();
+    (1..=4).contains(&group_count)
+        && title.split_whitespace().count() >= 3
+        && title
+            .chars()
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(|ch| ch.is_uppercase())
+}
+
 /// Reject a heuristic table only when its cells are overwhelmingly parallel
 /// prose fragments. This is deliberately narrower than disabling body-font
 /// detection for the whole page: numeric, compact, headed, and otherwise
@@ -365,6 +388,12 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     let mut non_empty = 0;
     let mut long_prose = 0;
     let mut rows_with_parallel_prose = 0;
+    let mut occupied_rows = 0;
+    let has_numbered_section_heading = table
+        .cells
+        .iter()
+        .flatten()
+        .any(|cell| looks_like_numbered_section_heading(cell));
     let has_compact_header = table
         .cells
         .iter()
@@ -379,12 +408,14 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
 
     for row in &table.cells {
         let mut row_long_prose = 0;
+        let mut row_non_empty = 0;
         for cell in row {
             let text = cell.trim();
             if text.is_empty() {
                 continue;
             }
             non_empty += 1;
+            row_non_empty += 1;
             let chars = text.chars().filter(|ch| !ch.is_whitespace()).count();
             let alphabetic = text.chars().filter(|ch| ch.is_alphabetic()).count();
             let words = text.split_whitespace().count();
@@ -395,6 +426,9 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
         }
         if row_long_prose >= 2 {
             rows_with_parallel_prose += 1;
+        }
+        if row_non_empty > 0 {
+            occupied_rows += 1;
         }
     }
 
@@ -424,16 +458,24 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
         && non_empty < table.cells.len() * table.columns.len()
         && long_prose >= 4
         && long_prose * 5 >= non_empty * 3
-        && rows_with_parallel_prose >= 1
+        // Row-spanning blanks are common in real headerless description
+        // tables. Require long text in parallel on at least half of occupied
+        // rows, unless a section heading was swallowed into the grid: that is
+        // direct evidence that this candidate is page prose.
+        && ((rows_with_parallel_prose >= 2
+            && rows_with_parallel_prose * 2 >= occupied_rows)
+            || (rows_with_parallel_prose >= 1 && has_numbered_section_heading))
         && continuation_fragments >= 3
         && continuation_columns.iter().filter(|&&value| value).count() >= 2;
     log::debug!(
-        "chart table hypothesis: {}x{}, non_empty={}, long_prose={}, parallel_rows={}, continuation_fragments={}, continuation_columns={}, reject={}",
+        "chart table hypothesis: {}x{}, non_empty={}, long_prose={}, parallel_rows={}/{}, section_heading={}, continuation_fragments={}, continuation_columns={}, reject={}",
         table.rows.len(),
         table.columns.len(),
         non_empty,
         long_prose,
         rows_with_parallel_prose,
+        occupied_rows,
+        has_numbered_section_heading,
         continuation_fragments,
         continuation_columns.iter().filter(|&&value| value).count(),
         is_parallel
@@ -1959,6 +2001,13 @@ mod tests {
 
     #[test]
     fn parallel_prose_table_is_rejected_but_real_table_is_preserved() {
+        assert!(looks_like_numbered_section_heading(
+            "9.5. Adapting to the New Normal: Changing Business Models"
+        ));
+        assert!(!looks_like_numbered_section_heading(
+            "2024 revenue by business segment"
+        ));
+
         let prose = crate::tables::Table::new(
             vec![90.0, 340.0],
             vec![320.0, 300.0, 280.0, 260.0],
@@ -2056,6 +2105,41 @@ mod tests {
             (0..6).collect(),
         );
         assert!(!is_parallel_prose_table(&headerless_description_table));
+
+        let sparse_rowspanning_description_table = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![360.0, 340.0, 320.0, 300.0, 280.0, 260.0],
+            vec![
+                vec![
+                    "community preparedness and emergency response planning support".into(),
+                    "provides detailed support for local continuity program delivery".into(),
+                ],
+                vec![
+                    "through coordinated training and regional response exercises".into(),
+                    "".into(),
+                ],
+                vec![
+                    "".into(),
+                    "with technical assistance for participating local organizations".into(),
+                ],
+                vec![
+                    "regional supplier and market development assistance program".into(),
+                    "connects eligible producers with new distribution opportunities".into(),
+                ],
+                vec![
+                    "through procurement guidance and tailored readiness workshops".into(),
+                    "".into(),
+                ],
+                vec![
+                    "".into(),
+                    "while expanding access to qualified commercial partners".into(),
+                ],
+            ],
+            (0..8).collect(),
+        );
+        assert!(!is_parallel_prose_table(
+            &sparse_rowspanning_description_table
+        ));
     }
 
     /// 4-row × 2-col ruled grid from x=100..300 (rows every 20pt from y=600).
