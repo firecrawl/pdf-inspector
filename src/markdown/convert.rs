@@ -14,6 +14,7 @@ use super::analysis::{
 use super::classify::{
     format_list_item, is_caption_line, is_list_item, is_monospace_font, starts_with_bullet_marker,
 };
+use super::heading::classify_heading_sequences;
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
 use super::{item_is_in_chart_region, MarkdownOptions, CHART_SEPARATOR_PAD};
@@ -682,6 +683,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     options: MarkdownOptions,
     page_tables: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
     page_images: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
+    page_chart_regions: &std::collections::HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     band_split_pages: &HashSet<u32>,
     struct_roles: Option<
         &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
@@ -731,6 +733,33 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
     let wrapped_bold_paragraph_lines =
         find_wrapped_bold_paragraph_lines(&lines, base_size, para_threshold);
+
+    let mut sequence_excluded_lines = wrapped_bold_paragraph_lines.clone();
+    for (line_idx, line) in lines.iter().enumerate() {
+        if page_chart_regions.get(&line.page).is_some_and(|regions| {
+            line.items
+                .iter()
+                .any(|item| item_is_in_chart_region(item, regions))
+        }) {
+            sequence_excluded_lines.insert(line_idx);
+        }
+    }
+    if let Some(roles) = struct_roles {
+        for (line_idx, line) in lines.iter().enumerate() {
+            if resolve_line_struct_role(line, roles)
+                .is_some_and(|role| role.is_non_heading_content())
+            {
+                sequence_excluded_lines.insert(line_idx);
+            }
+        }
+    }
+    let sequence_heading_levels = classify_heading_sequences(
+        &lines,
+        base_size,
+        &heading_tiers,
+        &isolated_lines,
+        &sequence_excluded_lines,
+    );
 
     // Detect struct heading levels that are overused (body text mistagged as headings)
     let overused_heading_levels = detect_overused_struct_heading_levels(&lines, struct_roles);
@@ -1035,6 +1064,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     None
                 }
             })
+            .or_else(|| sequence_heading_levels.get(&line_idx).copied())
         } else {
             None
         };
@@ -1242,6 +1272,13 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
     let wrapped_bold_paragraph_lines =
         find_wrapped_bold_paragraph_lines(&lines, base_size, para_threshold);
+    let sequence_heading_levels = classify_heading_sequences(
+        &lines,
+        base_size,
+        &heading_tiers,
+        &isolated_lines,
+        &wrapped_bold_paragraph_lines,
+    );
 
     let mut output = String::new();
     let mut current_page = 0u32;
@@ -1367,7 +1404,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     return Some(bold_heading_level(&heading_tiers));
                 }
                 None
-            }) {
+            })
+            .or_else(|| sequence_heading_levels.get(&line_idx).copied())
+            {
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;
@@ -1593,6 +1632,7 @@ mod tests {
             MarkdownOptions::default(),
             tables,
             images,
+            &HashMap::new(),
             &HashSet::from([1]),
             None,
         );
@@ -1668,6 +1708,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1696,6 +1737,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1737,6 +1779,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1773,6 +1816,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1808,6 +1852,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1837,6 +1882,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
         );
@@ -1878,6 +1924,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1926,6 +1973,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
         );
@@ -2027,6 +2075,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
         );
@@ -2074,6 +2123,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -2213,6 +2263,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
         );

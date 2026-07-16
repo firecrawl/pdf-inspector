@@ -9,6 +9,7 @@
 pub(crate) mod analysis;
 mod classify;
 mod convert;
+mod heading;
 mod postprocess;
 mod preprocess;
 
@@ -1811,6 +1812,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         options,
         page_tables,
         page_images,
+        &page_chart_map,
         &band_split_page_set,
         effective_struct_roles,
     )
