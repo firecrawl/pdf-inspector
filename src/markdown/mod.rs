@@ -20,7 +20,10 @@ use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
 use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
-use convert::{merge_continuation_tables, to_markdown_from_lines_with_tables_and_images};
+use convert::{
+    merge_continuation_tables, to_markdown_from_lines_with_tables_and_images, ChartProseOrder,
+    PositionedMarkdown,
+};
 
 const CHART_REGION_PAD: f32 = 20.0;
 const CHART_SEPARATOR_PAD: f32 = 8.0;
@@ -355,6 +358,18 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
         is_parallel
     );
     is_parallel
+}
+
+fn positioned_table(
+    table: &crate::tables::Table,
+    chart_order: Option<ChartProseOrder>,
+) -> PositionedMarkdown {
+    PositionedMarkdown::new(
+        table.rows.first().copied().unwrap_or(0.0),
+        table.columns.first().copied().unwrap_or(0.0),
+        crate::tables::table_to_markdown(table),
+        chart_order,
+    )
 }
 
 /// Derive a side-by-side split from rect hint regions.
@@ -859,7 +874,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 ) -> String {
     use crate::tables::{
         detect_tables, detect_tables_from_lines, detect_tables_from_rects,
-        detect_tables_from_struct_tree, table_to_markdown, try_build_rect_guided_table,
+        detect_tables_from_struct_tree, try_build_rect_guided_table,
     };
     use crate::types::ItemType;
 
@@ -898,24 +913,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Detect tables on each page
     let mut table_items: HashSet<usize> = HashSet::new();
-    let mut page_tables: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
-
-    // Store images by page and Y position for insertion
-    let mut page_images: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
-
-    for img in &images {
-        // Extract image name from "[Image: Im0]" format
-        let img_name = img
-            .text
-            .strip_prefix("[Image: ")
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(&img.text);
-        let img_md = format!("![Image: {}](image)\n", img_name);
-        page_images
-            .entry(img.page)
-            .or_default()
-            .push((img.y, img_md));
-    }
+    let mut page_tables: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
 
     // Pre-group items by page with their global indices (O(n) instead of O(pages*n))
     let mut page_groups: HashMap<u32, Vec<(usize, &TextItem)>> = HashMap::new();
@@ -949,6 +947,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // Chart pages with two prose columns use the chart's vertical span as a
     // full-width separator and read each surrounding prose zone by column.
     let mut page_chart_prose_splits: HashMap<u32, f32> = HashMap::new();
+    let mut page_chart_prose_orders: HashMap<u32, ChartProseOrder> = HashMap::new();
 
     for page in pages {
         let group = page_groups.get(&page).unwrap();
@@ -1022,11 +1021,18 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // Anchor-derived prose splits are lower-confidence than physical
         // gutters, so they do not partition table detection. They are applied
         // later only to vertical zones outside the chart.
-        if bands.is_empty() {
-            if let Some(split_x) = chart_prose_split {
-                page_chart_prose_splits.insert(page, split_x);
-            }
-        }
+        let chart_prose_order = if bands.is_empty() {
+            chart_prose_split.and_then(|split_x| {
+                chart_regions.first().copied().map(|region| {
+                    page_chart_prose_splits.insert(page, split_x);
+                    let order = ChartProseOrder::new(split_x, region);
+                    page_chart_prose_orders.insert(page, order);
+                    order
+                })
+            })
+        } else {
+            None
+        };
 
         // Build list of (band_items, band_index_map, band_rects, band_lines).
         // band_index_map[local_band_idx] → page_items index.
@@ -1125,12 +1131,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(table);
                     page_tables
                         .entry(page)
                         .or_default()
-                        .push((table_y, table_md));
+                        .push(positioned_table(table, chart_prose_order));
                 }
             }
 
@@ -1154,12 +1158,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         }
                     }
                 }
-                let table_y = table.rows.first().copied().unwrap_or(0.0);
-                let table_md = table_to_markdown(table);
                 page_tables
                     .entry(page)
                     .or_default()
-                    .push((table_y, table_md));
+                    .push(positioned_table(table, chart_prose_order));
             }
 
             // 2. Line-based detection on unclaimed items (when rects didn't find tables)
@@ -1174,12 +1176,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(table);
                     page_tables
                         .entry(page)
                         .or_default()
-                        .push((table_y, table_md));
+                        .push(positioned_table(table, chart_prose_order));
                 }
             }
 
@@ -1215,12 +1215,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                                 }
                             }
                         }
-                        let table_y = table.rows.first().copied().unwrap_or(0.0);
-                        let table_md = table_to_markdown(&table);
                         page_tables
                             .entry(page)
                             .or_default()
-                            .push((table_y, table_md));
+                            .push(positioned_table(&table, chart_prose_order));
                         for &band_idx in &inside_map {
                             rect_claimed.insert(band_idx);
                         }
@@ -1258,12 +1256,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                                 }
                             }
                         }
-                        let table_y = table.rows.first().copied().unwrap_or(0.0);
-                        let table_md = table_to_markdown(&table);
                         page_tables
                             .entry(page)
                             .or_default()
-                            .push((table_y, table_md));
+                            .push(positioned_table(&table, chart_prose_order));
                     }
                 };
 
@@ -1325,12 +1321,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(&table);
                     page_tables
                         .entry(page)
                         .or_default()
-                        .push((table_y, table_md));
+                        .push(positioned_table(&table, chart_prose_order));
                 }
             }
         }
@@ -1389,12 +1383,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             table_items.insert(global_idx);
                         }
                     }
-                    let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(table);
                     page_tables
                         .entry(page)
                         .or_default()
-                        .push((table_y, table_md));
+                        .push(positioned_table(table, chart_prose_order));
                 }
             }
         }
@@ -1430,14 +1422,33 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         }
                     }
                 }
-                let table_y = table.rows.first().copied().unwrap_or(0.0);
-                let table_md = table_to_markdown(table);
                 page_tables
                     .entry(page)
                     .or_default()
-                    .push((table_y, table_md));
+                    .push(positioned_table(table, chart_prose_order));
             }
         }
+    }
+
+    // Images are also removed before line grouping, so give them the same
+    // logical chart-page position as tables before reinsertion.
+    let mut page_images: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
+    for img in &images {
+        let img_name = img
+            .text
+            .strip_prefix("[Image: ")
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(&img.text);
+        let img_md = format!("![Image: {}](image)\n", img_name);
+        page_images
+            .entry(img.page)
+            .or_default()
+            .push(PositionedMarkdown::new(
+                img.y,
+                img.x,
+                img_md,
+                page_chart_prose_orders.get(&img.page).copied(),
+            ));
     }
 
     // Check structure tree coverage on ALL text items (before table filtering)
