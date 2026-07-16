@@ -500,9 +500,25 @@ pub(crate) fn filter_lines_to_band(
         .collect()
 }
 
+/// Output policy for Markdown post-processing.
+///
+/// [`MarkdownProfile::Fidelity`] preserves source characters wherever possible.
+/// [`MarkdownProfile::Compact`] enables optional token-saving rewrites that may
+/// be useful for agent context windows but are not byte-faithful to the PDF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarkdownProfile {
+    /// Preserve source text fidelity. This is the default.
+    #[default]
+    Fidelity,
+    /// Prefer token-efficient output, including collapsing long dot leaders.
+    Compact,
+}
+
 /// Options for markdown conversion
 #[derive(Debug, Clone)]
 pub struct MarkdownOptions {
+    /// Source-fidelity versus token-efficient post-processing policy.
+    pub profile: MarkdownProfile,
     /// Detect headers by font size
     pub detect_headers: bool,
     /// Detect list items
@@ -536,6 +552,7 @@ pub struct MarkdownOptions {
 impl Default for MarkdownOptions {
     fn default() -> Self {
         Self {
+            profile: MarkdownProfile::default(),
             detect_headers: true,
             detect_lists: true,
             detect_code: true,

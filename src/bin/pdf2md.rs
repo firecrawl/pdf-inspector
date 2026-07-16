@@ -206,6 +206,9 @@ fn main() {
         eprintln!("  --json              Output result as JSON");
         eprintln!("  --items-json        Output positioned TextItem JSON");
         eprintln!("  --raw               Output only markdown (no headers)");
+        eprintln!(
+            "  --compact           Collapse token-heavy source formatting such as dot leaders"
+        );
         eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
         eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
         eprintln!("  --password PW       Password for an encrypted PDF");
@@ -218,6 +221,7 @@ fn main() {
     let json_output = args.iter().any(|a| a == "--json");
     let items_json_output = args.iter().any(|a| a == "--items-json");
     let raw_output = args.iter().any(|a| a == "--raw");
+    let compact_output = args.iter().any(|a| a == "--compact");
     let page_numbers = args.iter().any(|a| a == "--pages");
     let detect_only = args.iter().any(|a| a == "--detect-only");
     let analyze = args.iter().any(|a| a == "--analyze");
@@ -276,6 +280,9 @@ fn main() {
     };
 
     let mut options = PdfOptions::new().mode(process_mode);
+    if compact_output {
+        options.markdown.profile = pdf_inspector::MarkdownProfile::Compact;
+    }
     options.markdown.include_page_numbers = page_numbers;
     if let Some(pages) = page_filter {
         options.page_filter = Some(pages);

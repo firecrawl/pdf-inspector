@@ -2,12 +2,15 @@
 
 use regex::Regex;
 
-use super::MarkdownOptions;
+use super::{MarkdownOptions, MarkdownProfile};
 
 /// Clean up markdown output with post-processing
 pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> String {
-    // Collapse dot leaders (e.g. TOC entries: "Introduction...............................1")
-    text = collapse_dot_leaders(&text);
+    if options.profile == MarkdownProfile::Compact {
+        // Dot-leader collapse saves tokens but changes source text, so it is
+        // reserved for the explicit compact profile.
+        text = collapse_dot_leaders(&text);
+    }
 
     // Fix hyphenation first (before other processing)
     if options.fix_hyphenation {
@@ -354,6 +357,23 @@ fn format_urls(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fidelity_profile_preserves_dot_leaders() {
+        let input = "Introduction............................1".to_string();
+        let result = clean_markdown(input.clone(), &MarkdownOptions::default());
+        assert_eq!(result, format!("{input}\n"));
+    }
+
+    #[test]
+    fn compact_profile_collapses_dot_leaders() {
+        let input = "Introduction............................1".to_string();
+        let options = MarkdownOptions {
+            profile: MarkdownProfile::Compact,
+            ..MarkdownOptions::default()
+        };
+        assert_eq!(clean_markdown(input, &options), "Introduction ... 1\n");
+    }
 
     // --- collapse_dot_leaders ---
 

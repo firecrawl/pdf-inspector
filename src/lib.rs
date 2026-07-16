@@ -54,6 +54,7 @@ pub use extractor::{
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
+    MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
 pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};

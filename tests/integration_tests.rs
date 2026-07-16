@@ -337,6 +337,7 @@ fn test_group_into_lines_sorting_by_x() {
 #[test]
 fn test_markdown_options_default() {
     let opts = MarkdownOptions::default();
+    assert_eq!(opts.profile, pdf_inspector::MarkdownProfile::Fidelity);
     assert!(opts.detect_headers);
     assert!(opts.detect_lists);
     assert!(opts.detect_code);
@@ -346,6 +347,7 @@ fn test_markdown_options_default() {
 #[test]
 fn test_markdown_options_custom() {
     let opts = MarkdownOptions {
+        profile: pdf_inspector::MarkdownProfile::Compact,
         detect_headers: false,
         detect_lists: true,
         detect_code: false,
@@ -361,6 +363,7 @@ fn test_markdown_options_custom() {
         ..Default::default()
     };
     assert!(!opts.detect_headers);
+    assert_eq!(opts.profile, pdf_inspector::MarkdownProfile::Compact);
     assert!(opts.detect_lists);
     assert!(!opts.detect_code);
     assert_eq!(opts.base_font_size, Some(14.0));

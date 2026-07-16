@@ -37,7 +37,7 @@ For the latest unreleased changes, use the git dependency instead:
 pdf-inspector = { git = "https://github.com/firecrawl/pdf-inspector" }
 ```
 
-The crate also ships CLI binaries — `pdf2md` (PDF → Markdown, with `--json`, `--pages`, `--select-pages`) and `detect-pdf` (classification, with `--analyze --json`):
+The crate also ships CLI binaries — `pdf2md` (PDF → Markdown, with `--json`, `--pages`, `--select-pages`, and the opt-in token-saving `--compact` profile) and `detect-pdf` (classification, with `--analyze --json`):
 
 ```bash
 cargo install pdf-inspector

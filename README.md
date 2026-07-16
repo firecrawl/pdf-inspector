@@ -119,6 +119,9 @@ pdf2md document.pdf --items-json
 # Raw markdown only (no headers)
 pdf2md document.pdf --raw
 
+# Token-efficient output (collapses long dot leaders and similar source padding)
+pdf2md document.pdf --compact
+
 # Insert page break markers (<!-- Page N -->)
 pdf2md document.pdf --pages
 
