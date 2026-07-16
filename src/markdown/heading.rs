@@ -211,13 +211,23 @@ fn numbering_has_section_separation(
 /// Fixed-size sidebar labels need stronger evidence than typography alone.
 ///
 /// Table headers and parallel-column fragments often repeat the same small,
-/// bold font at a displaced x position. They normally have another text line
-/// on the same baseline, whereas a standalone sidebar label does not.
+/// bold font at a displaced x position. Their peer text may survive as a
+/// separate line or may already be grouped into the same `TextLine`.
 fn has_displaced_baseline_peer(lines: &[TextLine], line_idx: usize) -> bool {
     let line = &lines[line_idx];
     let Some(x) = line.items.first().map(|item| item.x) else {
         return false;
     };
+
+    let mut items: Vec<_> = line.items.iter().collect();
+    items.sort_by(|left, right| left.x.total_cmp(&right.x));
+    if items.windows(2).any(|pair| {
+        let left_edge = pair[0].x + pair[0].width.max(0.0);
+        pair[1].x - left_edge >= X_BUCKET_POINTS
+    }) {
+        return true;
+    }
+
     lines.iter().enumerate().any(|(other_idx, other)| {
         other_idx != line_idx
             && other.page == line.page
@@ -380,8 +390,13 @@ pub(super) fn classify_heading_sequences(
     );
 
     let mut decisions = HashMap::new();
+    let eligible_line_count = lines
+        .iter()
+        .enumerate()
+        .filter(|(line_idx, line)| !excluded_lines.contains(line_idx) && !line.items.is_empty())
+        .count();
     let sparse_candidate_population =
-        candidates.len() * 100 <= lines.len() * MAX_SEQUENCE_DENSITY_PERCENT;
+        candidates.len() * 100 <= eligible_line_count * MAX_SEQUENCE_DENSITY_PERCENT;
 
     // Repeated visual styles: same font, emphasis, and approximate indent.
     // Repetition alone is weak evidence because captions, author lists, and
@@ -395,7 +410,7 @@ pub(super) fn classify_heading_sequences(
             .push(candidate);
     }
     for group in visual_groups.values() {
-        let max_sequence_lines = (lines.len() * MAX_SEQUENCE_DENSITY_PERCENT / 100).max(4);
+        let max_sequence_lines = (eligible_line_count * MAX_SEQUENCE_DENSITY_PERCENT / 100).max(4);
         if group.len() < 2 || group.len() > max_sequence_lines {
             continue;
         }
@@ -803,6 +818,39 @@ mod tests {
     }
 
     #[test]
+    fn fixed_size_same_line_table_cells_are_not_promoted() {
+        let mut lines = Vec::new();
+        for idx in 0..12 {
+            if idx == 1 || idx == 7 {
+                let mut table_row = line(
+                    &format!("Table Label {idx}"),
+                    700.0 - idx as f32 * 25.0,
+                    462.0,
+                    10.5,
+                    "TableBold",
+                    true,
+                );
+                let mut peer = line("Peer", table_row.y, 620.0, 10.5, "TableBold", true);
+                table_row.items.append(&mut peer.items);
+                lines.push(table_row);
+            } else {
+                lines.push(line(
+                    &format!("Ordinary body paragraph number {idx}."),
+                    700.0 - idx as f32 * 25.0,
+                    72.0,
+                    13.0,
+                    "Body",
+                    false,
+                ));
+            }
+        }
+
+        let decisions =
+            classify_heading_sequences(&lines, 13.0, &[], &HashSet::new(), &HashSet::new());
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
     fn repeated_fixed_size_table_label_is_not_promoted() {
         let mut lines = Vec::new();
         for idx in 0..12 {
@@ -829,6 +877,36 @@ mod tests {
 
         let decisions =
             classify_heading_sequences(&lines, 13.0, &[], &HashSet::new(), &HashSet::new());
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn excluded_lines_do_not_dilute_sidebar_density() {
+        let mut lines = Vec::new();
+        for idx in 0..10 {
+            if idx == 1 || idx == 6 {
+                lines.push(line(
+                    &format!("Sidebar Topic {idx}"),
+                    700.0 - idx as f32 * 25.0,
+                    462.0,
+                    10.5,
+                    "SidebarBold",
+                    true,
+                ));
+            } else {
+                lines.push(line(
+                    &format!("Excluded chart label number {idx}."),
+                    700.0 - idx as f32 * 25.0,
+                    72.0,
+                    13.0,
+                    "Body",
+                    false,
+                ));
+            }
+        }
+        let excluded = HashSet::from([0usize, 2, 3, 4, 5, 7, 8, 9]);
+
+        let decisions = classify_heading_sequences(&lines, 13.0, &[], &HashSet::new(), &excluded);
         assert!(decisions.is_empty());
     }
 
