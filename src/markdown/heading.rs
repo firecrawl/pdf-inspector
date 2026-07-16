@@ -16,6 +16,7 @@ use super::analysis::{is_heading_fragment, is_toc_entry_line};
 use super::classify::{is_caption_line, is_list_item, starts_with_bullet_marker};
 
 const X_BUCKET_POINTS: f32 = 24.0;
+const BASELINE_PEER_TOLERANCE: f32 = 2.0;
 const MIN_FONT_RATIO: f32 = 0.72;
 const MAX_SEQUENCE_DENSITY_PERCENT: usize = 20;
 
@@ -207,6 +208,54 @@ fn numbering_has_section_separation(
         || left.line_idx.abs_diff(right.line_idx) >= 3
 }
 
+/// Fixed-size sidebar labels need stronger evidence than typography alone.
+///
+/// Table headers and parallel-column fragments often repeat the same small,
+/// bold font at a displaced x position. They normally have another text line
+/// on the same baseline, whereas a standalone sidebar label does not.
+fn has_displaced_baseline_peer(lines: &[TextLine], line_idx: usize) -> bool {
+    let line = &lines[line_idx];
+    let Some(x) = line.items.first().map(|item| item.x) else {
+        return false;
+    };
+    lines.iter().enumerate().any(|(other_idx, other)| {
+        other_idx != line_idx
+            && other.page == line.page
+            && (other.y - line.y).abs() <= BASELINE_PEER_TOLERANCE
+            && other
+                .items
+                .first()
+                .is_some_and(|item| (item.x - x).abs() >= X_BUCKET_POINTS)
+    })
+}
+
+fn complete_sidebar_label(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.ends_with('-') {
+        return false;
+    }
+
+    let last_word = trimmed
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    const CONTINUATION_WORDS: &[&str] = &[
+        "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to",
+        "with",
+    ];
+    if CONTINUATION_WORDS.contains(&last_word.as_str()) {
+        return false;
+    }
+
+    // Margin references such as "G 02" are navigation codes, not headings.
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    !(words.len() == 2
+        && words[0].chars().count() == 1
+        && words[0].chars().all(|c| c.is_alphabetic())
+        && words[1].chars().all(|c| c.is_ascii_digit()))
+}
+
 fn title_like(text: &str, numbered: bool, bold: bool) -> bool {
     let trimmed = text.trim();
     let word_count = trimmed.split_whitespace().count();
@@ -386,9 +435,19 @@ pub(super) fn classify_heading_sequences(
             .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), size| {
                 (min.min(size), max.max(size))
             });
+        let distinct_sidebar_labels: HashSet<String> = group
+            .iter()
+            .map(|candidate| lines[candidate.line_idx].text().trim().to_lowercase())
+            .collect();
+        let fixed_size_sidebar_evidence = sidebar_size_span.1 - sidebar_size_span.0 < 0.4
+            && distinct_sidebar_labels.len() >= 2
+            && group.iter().all(|candidate| {
+                complete_sidebar_label(&lines[candidate.line_idx].text())
+                    && !has_displaced_baseline_peer(lines, candidate.line_idx)
+            });
         let displaced_sidebar = distinct_bold_face
             && sparse_candidate_population
-            && sidebar_size_span.1 - sidebar_size_span.0 >= 0.4
+            && (sidebar_size_span.1 - sidebar_size_span.0 >= 0.4 || fixed_size_sidebar_evidence)
             && group
                 .iter()
                 .all(|candidate| lines[candidate.line_idx].page == lines[group[0].line_idx].page)
@@ -674,6 +733,103 @@ mod tests {
         assert!(decisions.contains_key(&1));
         assert!(decisions.contains_key(&6));
         assert!(decisions.contains_key(&11));
+    }
+
+    #[test]
+    fn fixed_size_sidebar_style_is_promoted() {
+        let mut lines = Vec::new();
+        for idx in 0..12 {
+            if idx == 1 || idx == 6 {
+                lines.push(line(
+                    &format!("Sidebar Topic {idx}"),
+                    700.0 - idx as f32 * 25.0,
+                    462.0,
+                    10.5,
+                    "SidebarBold",
+                    true,
+                ));
+            } else {
+                lines.push(line(
+                    &format!("Ordinary body paragraph number {idx}."),
+                    700.0 - idx as f32 * 25.0,
+                    72.0,
+                    13.0,
+                    "Body",
+                    false,
+                ));
+            }
+        }
+
+        let decisions =
+            classify_heading_sequences(&lines, 13.0, &[], &HashSet::new(), &HashSet::new());
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.contains_key(&1));
+        assert!(decisions.contains_key(&6));
+    }
+
+    #[test]
+    fn fixed_size_parallel_table_headers_are_not_promoted() {
+        let mut lines = Vec::new();
+        for idx in 0..12 {
+            if idx == 1 || idx == 7 {
+                lines.push(line(
+                    &format!("Table Column {idx}"),
+                    700.0 - idx as f32 * 25.0,
+                    462.0,
+                    10.5,
+                    "TableBold",
+                    true,
+                ));
+            } else {
+                lines.push(line(
+                    &format!("Ordinary body paragraph number {idx}."),
+                    700.0 - idx as f32 * 25.0,
+                    72.0,
+                    13.0,
+                    "Body",
+                    false,
+                ));
+            }
+        }
+        // These lines occupy another table column on the exact header
+        // baselines. They may be separated in reading order, so line-index
+        // adjacency is not sufficient to recognize the table shape.
+        lines.push(line("Peer value one.", 675.0, 300.0, 10.5, "Body", false));
+        lines.push(line("Peer value two.", 525.0, 300.0, 10.5, "Body", false));
+
+        let decisions =
+            classify_heading_sequences(&lines, 13.0, &[], &HashSet::new(), &HashSet::new());
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn repeated_fixed_size_table_label_is_not_promoted() {
+        let mut lines = Vec::new();
+        for idx in 0..12 {
+            if idx == 1 || idx == 7 {
+                lines.push(line(
+                    "Carrying",
+                    700.0 - idx as f32 * 25.0,
+                    462.0,
+                    10.5,
+                    "TableBold",
+                    true,
+                ));
+            } else {
+                lines.push(line(
+                    &format!("Ordinary body paragraph number {idx}."),
+                    700.0 - idx as f32 * 25.0,
+                    72.0,
+                    13.0,
+                    "Body",
+                    false,
+                ));
+            }
+        }
+
+        let decisions =
+            classify_heading_sequences(&lines, 13.0, &[], &HashSet::new(), &HashSet::new());
+        assert!(decisions.is_empty());
     }
 
     #[test]
