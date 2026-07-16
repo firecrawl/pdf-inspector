@@ -19,19 +19,28 @@ use std::collections::{HashMap, HashSet};
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
-use classify::{format_list_item, is_code_like, is_list_item};
+use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
 use convert::{merge_continuation_tables, to_markdown_from_lines_with_tables_and_images};
 
 const CHART_REGION_PAD: f32 = 20.0;
 const CHART_SEPARATOR_PAD: f32 = 8.0;
 
+fn is_chart_adjacent_label(item: &TextItem) -> bool {
+    let text = item.text.trim();
+    let is_bare_bullet = matches!(text, "•" | "●" | "○" | "◦" | "-" | "*");
+    (text.split_whitespace().count() <= 5 && !is_list_item(text) && !is_bare_bullet)
+        || is_caption_line(text)
+}
+
 fn item_is_in_chart_region(item: &TextItem, regions: &[(f32, f32, f32, f32)]) -> bool {
     regions.iter().any(|&(x0, y0, x1, y1)| {
         let cx = item.x + item.width / 2.0;
-        cx >= x0 - CHART_REGION_PAD
-            && cx <= x1 + CHART_REGION_PAD
-            && item.y >= y0 - CHART_REGION_PAD
+        let within_padded_x = cx >= x0 - CHART_REGION_PAD && cx <= x1 + CHART_REGION_PAD;
+        let within_core_y = item.y >= y0 && item.y <= y1;
+        let within_padded_y = item.y >= y0 - CHART_REGION_PAD
             && item.y <= y1 + CHART_REGION_PAD
+            && is_chart_adjacent_label(item);
+        within_padded_x && (within_core_y || within_padded_y)
     })
 }
 
@@ -1479,6 +1488,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         for page in chart_prose_pages {
             let mut remaining = chart_prose_page_items.remove(&page).unwrap();
             let split_x = page_chart_prose_splits[&page];
+            let chart_regions = &page_chart_map[&page];
             let group_prose_zone = |zone_items: Vec<TextItem>| {
                 let mut zone_lines = Vec::new();
                 for right_column in [false, true] {
@@ -1520,11 +1530,15 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
             for (low, high) in merged_chart_y_bands {
                 let (above, at_or_below): (Vec<TextItem>, Vec<TextItem>) =
-                    remaining.into_iter().partition(|item| item.y > high);
+                    remaining.into_iter().partition(|item| {
+                        item.y > high && !item_is_in_chart_region(item, chart_regions)
+                    });
                 all_lines.extend(group_prose_zone(above));
 
                 let (chart_zone, below): (Vec<TextItem>, Vec<TextItem>) =
-                    at_or_below.into_iter().partition(|item| item.y >= low);
+                    at_or_below.into_iter().partition(|item| {
+                        item.y >= low || item_is_in_chart_region(item, chart_regions)
+                    });
                 all_lines.extend(
                     crate::extractor::group_into_lines_with_thresholds_and_charts(
                         chart_zone,
@@ -1682,6 +1696,27 @@ mod tests {
             crate::extractor::detect_columns(&layout_items, 1, false).len(),
             2
         );
+    }
+
+    #[test]
+    fn chart_padding_claims_labels_but_not_adjacent_prose() {
+        let regions = vec![(100.0, 100.0, 500.0, 300.0)];
+
+        let mut label = make_item_w(220.0, 90.0, 60.0, 1);
+        label.text = "January 2021".into();
+        assert!(item_is_in_chart_region(&label, &regions));
+
+        let mut caption = make_item_w(120.0, 310.0, 350.0, 1);
+        caption.text = "Figure 3. Results across every survey phase and sector".into();
+        assert!(item_is_in_chart_region(&caption, &regions));
+
+        let mut prose = make_item_w(120.0, 90.0, 350.0, 1);
+        prose.text = "This paragraph continues below the chart into the next prose column".into();
+        assert!(!item_is_in_chart_region(&prose, &regions));
+
+        let mut bullet = make_item_w(340.0, 90.0, 5.0, 1);
+        bullet.text = "•".into();
+        assert!(!item_is_in_chart_region(&bullet, &regions));
     }
 
     #[test]
