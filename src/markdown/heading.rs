@@ -54,6 +54,28 @@ fn dominant_font(line: &TextLine) -> Option<String> {
         .map(|(font, _)| font.to_string())
 }
 
+/// Character-weighted font size for the visible title portion of a line.
+///
+/// Section numbers are sometimes emitted as a separate, smaller text item
+/// (or even as superscript). Using the first item's size would then reject the
+/// whole heading even though the title itself has the document's heading
+/// size. Character weighting makes the longer title win while preserving the
+/// exact size for ordinary one-item lines.
+fn dominant_font_size(line: &TextLine) -> Option<f32> {
+    let mut weights: HashMap<i32, usize> = HashMap::new();
+    for item in &line.items {
+        let bucket = (item.font_size * 10.0).round() as i32;
+        let weight = item.text.trim().chars().count().max(1);
+        *weights.entry(bucket).or_default() += weight;
+    }
+    weights
+        .into_iter()
+        .max_by(|(size_a, weight_a), (size_b, weight_b)| {
+            weight_a.cmp(weight_b).then_with(|| size_a.cmp(size_b))
+        })
+        .map(|(bucket, _)| bucket as f32 / 10.0)
+}
+
 fn document_body_font(lines: &[TextLine]) -> Option<String> {
     let mut weights: HashMap<&str, usize> = HashMap::new();
     for line in lines {
@@ -172,6 +194,19 @@ fn numbering_forms_hierarchy(left: &[u32], right: &[u32]) -> bool {
     left.len() != right.len() && (left.starts_with(right) || right.starts_with(left))
 }
 
+/// A compact parent/child numbering run is more likely an ordered list than
+/// a document section hierarchy. Genuine section headings normally have body
+/// content between levels; requiring at least two intervening lines keeps
+/// nested `1.` / `1.1.` list items in the list formatter.
+fn numbering_has_section_separation(
+    left: &Candidate,
+    right: &Candidate,
+    lines: &[TextLine],
+) -> bool {
+    lines[left.line_idx].page != lines[right.line_idx].page
+        || left.line_idx.abs_diff(right.line_idx) >= 3
+}
+
 fn title_like(text: &str, numbered: bool, bold: bool) -> bool {
     let trimmed = text.trim();
     let word_count = trimmed.split_whitespace().count();
@@ -250,10 +285,13 @@ pub(super) fn classify_heading_sequences(
             );
             continue;
         }
-        let Some(first) = line.items.first() else {
+        if line.items.is_empty() {
+            continue;
+        }
+        let Some(font_size) = dominant_font_size(line) else {
             continue;
         };
-        if first.font_size < base_size * MIN_FONT_RATIO {
+        if font_size < base_size * MIN_FONT_RATIO {
             continue;
         }
         let text = line.text();
@@ -269,7 +307,7 @@ pub(super) fn classify_heading_sequences(
         }
         let candidate = Candidate {
             line_idx,
-            font_size: first.font_size,
+            font_size,
             style,
             numbering,
         };
@@ -320,9 +358,11 @@ pub(super) fn classify_heading_sequences(
             .copied()
             .filter(|candidate| {
                 candidate.numbering.is_some()
-                    && (candidate.style.bold
-                        || isolated_lines.contains(&candidate.line_idx)
-                        || candidate.font_size >= base_size * 1.05)
+                    && (candidate.font_size >= base_size * 1.05
+                        || (candidate.style.bold
+                            && body_font
+                                .as_ref()
+                                .is_none_or(|body| candidate.style.font != *body)))
             })
             .collect();
         let mut hierarchical_lines = HashSet::new();
@@ -331,7 +371,10 @@ pub(super) fn classify_heading_sequences(
             for right in supported_numbered.iter().skip(idx + 1) {
                 let (right_kind, _, right_parts) =
                     right.numbering.as_ref().expect("filtered above");
-                if left_kind == right_kind && numbering_forms_hierarchy(left_parts, right_parts) {
+                if left_kind == right_kind
+                    && numbering_forms_hierarchy(left_parts, right_parts)
+                    && numbering_has_section_separation(left, right, lines)
+                {
                     hierarchical_lines.insert(left.line_idx);
                     hierarchical_lines.insert(right.line_idx);
                 }
@@ -345,10 +388,13 @@ pub(super) fn classify_heading_sequences(
             });
         let displaced_sidebar = distinct_bold_face
             && sparse_candidate_population
-            && group.len() == 2
             && sidebar_size_span.1 - sidebar_size_span.0 >= 0.4
-            && lines[group[0].line_idx].page == lines[group[1].line_idx].page
-            && group[1].line_idx.saturating_sub(group[0].line_idx) >= 4
+            && group
+                .iter()
+                .all(|candidate| lines[candidate.line_idx].page == lines[group[0].line_idx].page)
+            && group
+                .windows(2)
+                .all(|pair| pair[1].line_idx.saturating_sub(pair[0].line_idx) >= 4)
             && body_x_bucket.is_some_and(|body_x| (style.x_bucket - body_x).abs() >= 4)
             && group
                 .iter()
@@ -530,16 +576,104 @@ mod tests {
         let lines = vec![
             line("7. Theory", 700.0, 72.0, 12.0, "Section", true),
             line("body prose", 680.0, 72.0, 12.0, "Body", false),
+            line("body prose continues", 660.0, 72.0, 12.0, "Body", false),
             line("7.1. Free Vortex", 500.0, 72.0, 12.0, "Section", true),
         ];
         let decisions = classify_heading_sequences(
             &lines,
             12.0,
             &[],
-            &HashSet::from([0usize, 2usize]),
+            &HashSet::from([0usize, 3usize]),
             &HashSet::new(),
         );
         assert_eq!(decisions.len(), 2);
+    }
+
+    #[test]
+    fn dominant_title_size_survives_smaller_number_prefix() {
+        let mut parent = line("7.", 700.0, 72.0, 6.0, "Section", true);
+        parent.items.push(TextItem {
+            text: "Theory".into(),
+            x: 86.0,
+            y: 700.0,
+            width: 38.0,
+            height: 12.0,
+            font: "Section".into(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: true,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        });
+        let lines = vec![
+            parent,
+            line("body prose", 680.0, 72.0, 12.0, "Body", false),
+            line("body prose continues", 660.0, 72.0, 12.0, "Body", false),
+            line("7.1. Free Vortex", 500.0, 72.0, 12.0, "Section", true),
+        ];
+
+        let decisions =
+            classify_heading_sequences(&lines, 12.0, &[], &HashSet::new(), &HashSet::new());
+        assert_eq!(decisions.get(&0), Some(&1));
+        assert_eq!(decisions.get(&3), Some(&2));
+    }
+
+    #[test]
+    fn compact_nested_ordered_list_is_not_promoted() {
+        let lines = vec![
+            line("1. Configure Server", 700.0, 72.0, 12.0, "ListBold", true),
+            line("1.1. Install Package", 680.0, 72.0, 12.0, "ListBold", true),
+            line("Explanation", 660.0, 72.0, 12.0, "Body", false),
+        ];
+        let decisions = classify_heading_sequences(
+            &lines,
+            12.0,
+            &[],
+            &HashSet::from([0usize, 1usize]),
+            &HashSet::new(),
+        );
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn complete_three_heading_sidebar_style_is_promoted() {
+        let mut lines = Vec::new();
+        for idx in 0..18 {
+            if idx == 1 || idx == 6 || idx == 11 {
+                let size = match idx {
+                    1 => 10.2,
+                    6 => 10.7,
+                    _ => 10.4,
+                };
+                lines.push(line(
+                    &format!("Sidebar Topic {idx}"),
+                    700.0 - idx as f32 * 25.0,
+                    462.0,
+                    size,
+                    "SidebarBold",
+                    true,
+                ));
+            } else {
+                lines.push(line(
+                    &format!("Ordinary body paragraph number {idx}."),
+                    700.0 - idx as f32 * 25.0,
+                    72.0,
+                    13.0,
+                    "Body",
+                    false,
+                ));
+            }
+        }
+
+        let decisions =
+            classify_heading_sequences(&lines, 13.0, &[], &HashSet::new(), &HashSet::new());
+        assert_eq!(decisions.len(), 3);
+        assert!(decisions.contains_key(&1));
+        assert!(decisions.contains_key(&6));
+        assert!(decisions.contains_key(&11));
     }
 
     #[test]
