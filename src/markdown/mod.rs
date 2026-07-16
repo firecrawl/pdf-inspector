@@ -295,6 +295,28 @@ fn chart_spans_prose_split(region: (f32, f32, f32, f32), split_x: f32) -> bool {
     split_x - left >= MIN_CHART_WIDTH_PER_SIDE && right - split_x >= MIN_CHART_WIDTH_PER_SIDE
 }
 
+/// True when adjacent physical rows form an unterminated, lowercase prose
+/// continuation in the same projected column.
+fn is_cross_row_prose_continuation(previous: &str, current: &str) -> bool {
+    let previous = previous.trim();
+    let current = current.trim();
+    if previous.is_empty() || current.is_empty() {
+        return false;
+    }
+
+    let previous_without_closers = previous.trim_end_matches(['"', '\'', '”', ')', ']']);
+    let previous_is_open = previous_without_closers
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !matches!(ch, '.' | '!' | '?' | ':' | ';'));
+    let current_starts_as_continuation = current
+        .chars()
+        .find(|ch| ch.is_alphabetic())
+        .is_some_and(|ch| ch.is_lowercase());
+
+    previous_is_open && current_starts_as_continuation
+}
+
 /// Reject a heuristic table only when its cells are overwhelmingly parallel
 /// prose fragments. This is deliberately narrower than disabling body-font
 /// detection for the whole page: numeric, compact, headed, and otherwise
@@ -310,8 +332,6 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     let mut non_empty = 0;
     let mut long_prose = 0;
     let mut rows_with_parallel_prose = 0;
-    let mut continuation_fragments = 0;
-    let mut continuation_columns = vec![false; table.columns.len()];
     let has_compact_header = table
         .cells
         .iter()
@@ -326,7 +346,7 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
 
     for row in &table.cells {
         let mut row_long_prose = 0;
-        for (column, cell) in row.iter().enumerate() {
+        for cell in row {
             let text = cell.trim();
             if text.is_empty() {
                 continue;
@@ -335,16 +355,6 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
             let chars = text.chars().filter(|ch| !ch.is_whitespace()).count();
             let alphabetic = text.chars().filter(|ch| ch.is_alphabetic()).count();
             let words = text.split_whitespace().count();
-            let starts_with_lowercase = text
-                .chars()
-                .find(|ch| ch.is_alphabetic())
-                .is_some_and(|ch| ch.is_lowercase());
-            if chars >= 18 && words >= 3 && alphabetic * 5 >= chars * 3 && starts_with_lowercase {
-                continuation_fragments += 1;
-                if let Some(has_continuation) = continuation_columns.get_mut(column) {
-                    *has_continuation = true;
-                }
-            }
             if chars >= 28 && words >= 5 && alphabetic * 5 >= chars * 3 {
                 long_prose += 1;
                 row_long_prose += 1;
@@ -355,8 +365,30 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
         }
     }
 
+    // A lowercase cell is not continuation evidence by itself: legitimate
+    // headerless tables often use sentence fragments as row values. Require a
+    // direct physical-row transition from an unterminated cell in the same
+    // column. This is the shape produced when independent prose columns are
+    // accidentally projected onto one table grid.
+    let mut continuation_fragments = 0;
+    let mut continuation_columns = vec![false; table.columns.len()];
+    for rows in table.cells.windows(2) {
+        for (column, has_continuation) in continuation_columns.iter_mut().enumerate() {
+            let previous = rows[0].get(column).map(String::as_str).unwrap_or("");
+            let current = rows[1].get(column).map(String::as_str).unwrap_or("");
+            if is_cross_row_prose_continuation(previous, current) {
+                continuation_fragments += 1;
+                *has_continuation = true;
+            }
+        }
+    }
+
     let is_parallel = !has_compact_header
         && non_empty >= 5
+        // Independent prose columns have asynchronous line/paragraph breaks;
+        // a fully populated grid is positive evidence for a real descriptive
+        // table even when every value is a lowercase sentence fragment.
+        && non_empty < table.cells.len() * table.columns.len()
         && long_prose >= 4
         && long_prose * 5 >= non_empty * 3
         && rows_with_parallel_prose >= 1
@@ -1888,7 +1920,7 @@ mod tests {
     fn parallel_prose_table_is_rejected_but_real_table_is_preserved() {
         let prose = crate::tables::Table::new(
             vec![90.0, 340.0],
-            vec![300.0, 280.0, 260.0],
+            vec![320.0, 300.0, 280.0, 260.0],
             vec![
                 vec![
                     "This section investigates the impact of public health measures".into(),
@@ -1896,6 +1928,10 @@ mod tests {
                 ],
                 vec![
                     "measures on business operations during the national lockdown".into(),
+                    "".into(),
+                ],
+                vec![
+                    "asked about their expectations for business recovery".into(),
                     "felt by firms working under reduced operating conditions".into(),
                 ],
                 vec![
@@ -1903,7 +1939,7 @@ mod tests {
                     "while many other businesses remained temporarily closed".into(),
                 ],
             ],
-            (0..6).collect(),
+            (0..7).collect(),
         );
         assert!(is_parallel_prose_table(&prose));
 
@@ -1964,15 +2000,15 @@ mod tests {
             vec![320.0, 300.0, 280.0],
             vec![
                 vec![
-                    "Community preparedness and emergency response planning".into(),
+                    "community preparedness and emergency response planning".into(),
                     "provides detailed support for local continuity programs".into(),
                 ],
                 vec![
-                    "Regional supplier and market development assistance".into(),
+                    "regional supplier and market development assistance".into(),
                     "connects eligible producers with new distribution partners".into(),
                 ],
                 vec![
-                    "Financial continuity and business recovery program".into(),
+                    "financial continuity and business recovery program".into(),
                     "offers tailored guidance to firms affected by disruptions".into(),
                 ],
             ],
