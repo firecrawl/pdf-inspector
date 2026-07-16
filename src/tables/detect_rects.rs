@@ -453,7 +453,7 @@ pub fn detect_tables_from_rects(
             .collect();
 
         debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
-        let mut chart_cluster_ids: Vec<usize> = Vec::new();
+        let mut merge_excluded_cluster_ids: Vec<usize> = Vec::new();
         for (cluster_id, cluster_indices) in clusters.iter().enumerate() {
             let group_rects: Vec<(f32, f32, f32, f32)> =
                 cluster_indices.iter().map(|&i| page_rects[i]).collect();
@@ -505,6 +505,12 @@ pub fn detect_tables_from_rects(
                         table.rows.len(),
                         table.columns.len()
                     );
+                    // The accepted hypothesis is based on normalized
+                    // geometry. Keep the original chart-like cluster out of
+                    // the merged fallback: reintroducing its repeated page
+                    // fills can manufacture a wider candidate that replaces
+                    // this valid narrow table below.
+                    merge_excluded_cluster_ids.push(cluster_id);
                     tables.push(table);
                     continue;
                 } else {
@@ -513,7 +519,7 @@ pub fn detect_tables_from_rects(
                         page,
                         group_rects.len()
                     );
-                    chart_cluster_ids.push(cluster_id);
+                    merge_excluded_cluster_ids.push(cluster_id);
                     continue;
                 }
             }
@@ -556,7 +562,7 @@ pub fn detect_tables_from_rects(
             let table_clusters: Vec<&Vec<usize>> = clusters
                 .iter()
                 .enumerate()
-                .filter(|(id, _)| !chart_cluster_ids.contains(id))
+                .filter(|(id, _)| !merge_excluded_cluster_ids.contains(id))
                 .map(|(_, c)| c)
                 .collect();
             let total_clustered: usize = table_clusters.iter().map(|c| c.len()).sum();

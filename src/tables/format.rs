@@ -188,6 +188,21 @@ fn starts_with_numbered_label(cell: &str) -> bool {
             .is_some_and(|c| matches!(c, '.' | ')' | '-' | ':'))
 }
 
+fn starts_with_hierarchical_numbered_label(cell: &str) -> bool {
+    let token = cell
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(['.', ')', ':', '-']);
+    let levels: Vec<&str> = token.split('.').collect();
+    (2..=4).contains(&levels.len())
+        && levels.iter().all(|level| {
+            !level.is_empty()
+                && level.len() <= 3
+                && level.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
 fn alpha_word_count(cell: &str) -> usize {
     cell.split_whitespace()
         .filter(|word| word.chars().any(|c| c.is_alphabetic()))
@@ -343,7 +358,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let looks_like_hierarchical_subrow = first_cell.is_empty()
             && first_non_empty_col == Some(1)
             && looks_like_compact_entry_label(first_non_empty_cell)
-            && ((row.len() == 2 && starts_with_numbered_label(first_non_empty_cell))
+            && ((row.len() == 2 && starts_with_hierarchical_numbered_label(first_non_empty_cell))
                 || (row.len() >= 3 && non_first_cells.len() >= 2 && title_like_later_cells > 0)
                 || (non_first_cells.len() == 1
                     && row.len() >= 3
@@ -711,6 +726,22 @@ mod tests {
         assert_eq!(cleaned[2], vec!["", "1.2 Supporting fairness"]);
         assert_eq!(cleaned[3], vec!["", "1.3 Promoting nature"]);
         assert_eq!(cleaned[5], vec!["", "2.2 Critical thinking"]);
+    }
+
+    #[test]
+    fn test_clean_table_cells_two_column_numbered_continuation_merges() {
+        let cells = vec![
+            vec!["Area".into(), "Requirement".into()],
+            vec!["Safety".into(), "The program includes".into()],
+            vec!["".into(), "1. First requirement for every operator".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 2);
+        assert_eq!(
+            cleaned[1][1],
+            "The program includes 1. First requirement for every operator"
+        );
     }
 
     #[test]
