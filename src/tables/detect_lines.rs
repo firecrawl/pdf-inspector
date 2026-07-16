@@ -413,14 +413,32 @@ fn build_text_anchor_table(
         return None;
     }
 
-    // Three sparse rules around a full multi-column text region can expose
-    // dozens of baselines whose starts repeat at the column margins. Tables
-    // usually contain many short labels or numeric values; prose repeatedly
-    // fills most of each inferred column. Bound very tall sparse candidates,
-    // and reject sustained column-filling text while leaving compact tables
-    // and densely ruled forms alone.
-    if (rules.len() <= 4 && rows.len() > 40)
-        || ((3..=4).contains(&anchors.len()) && rows.len() > rules.len() * 2 + 2)
+    // Sparse rules around a full multi-column text region can expose dozens
+    // of paragraph baselines whose starts repeat at the column margins. Reject
+    // sustained prose, not height alone: long tables made of short labels and
+    // values remain valid regardless of their row count.
+    let body_cells: Vec<&str> = cells
+        .iter()
+        .skip(1)
+        .flatten()
+        .map(String::as_str)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    let prose_like_body_cells = body_cells
+        .iter()
+        .filter(|cell| {
+            let alpha_words = cell
+                .split_whitespace()
+                .filter(|word| word.chars().any(char::is_alphabetic))
+                .count();
+            alpha_words >= 3 && cell.chars().count() >= 12
+        })
+        .count();
+    let sustained_sparse_prose = rules.len() <= 4
+        && rows.len() > rules.len() * 2 + 2
+        && !body_cells.is_empty()
+        && prose_like_body_cells * 2 >= body_cells.len();
+    if sustained_sparse_prose
         || (anchors.len() >= 3
             && rows.len() >= 4
             && measured_items > 0
@@ -513,7 +531,10 @@ fn detect_text_anchor_rule_tables(
                 })
                 .map(|rule| rule.0)
                 .collect();
-            if snap_edges(&intersecting_xs, 3.0).len() >= 2 {
+            // Two coordinates can be the outer borders of an otherwise
+            // borderless table. A physical multi-column grid needs at least
+            // one interior divider as well.
+            if snap_edges(&intersecting_xs, 3.0).len() >= 3 {
                 continue;
             }
             if let Some(table) = build_text_anchor_table(items, &rules, page) {
@@ -1127,6 +1148,57 @@ mod tests {
     }
 
     #[test]
+    fn test_long_booktabs_table_uses_short_cell_evidence() {
+        let lines = vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(280.0, 80.0, 420.0, 1),
+        ];
+        let mut items = vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("Accuracy", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+        ];
+        for index in 0..10 {
+            let y = 465.0 - index as f32 * 16.0;
+            items.push(make_item(&format!("M{index}"), 100.0, y, 1));
+            items.push(make_item(&format!("{}%", 90 + index), 220.0, y, 1));
+            items.push(make_item(&format!("{}ms", 5 + index), 340.0, y, 1));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells.len(), 11);
+        assert_eq!(tables[0].cells[10], vec!["M9", "99%", "14ms"]);
+    }
+
+    #[test]
+    fn test_booktabs_table_with_outer_borders_uses_text_anchors() {
+        let lines = vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(440.0, 80.0, 420.0, 1),
+            make_vline(80.0, 440.0, 500.0, 1),
+            make_vline(420.0, 440.0, 500.0, 1),
+        ];
+        let items = vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("Accuracy", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+            make_item("Alpha", 100.0, 465.0, 1),
+            make_item("91.2", 220.0, 465.0, 1),
+            make_item("12", 340.0, 465.0, 1),
+            make_item("Beta", 100.0, 450.0, 1),
+            make_item("89.7", 220.0, 450.0, 1),
+            make_item("9", 340.0, 450.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
+    }
+
+    #[test]
     fn test_booktabs_table_ignores_unrelated_vertical_strokes() {
         let lines = vec![
             make_hline(500.0, 80.0, 420.0, 1),
@@ -1249,9 +1321,24 @@ mod tests {
         ];
         let mut items = Vec::new();
         for (index, y) in (0..12).map(|index| (index, 485.0 - index as f32 * 20.0)) {
-            items.push(make_item(&format!("left {index}"), 80.0, y, 1));
-            items.push(make_item(&format!("middle {index}"), 240.0, y, 1));
-            items.push(make_item(&format!("right {index}"), 400.0, y, 1));
+            items.push(make_item(
+                &format!("left narrative line {index}"),
+                80.0,
+                y,
+                1,
+            ));
+            items.push(make_item(
+                &format!("middle narrative line {index}"),
+                240.0,
+                y,
+                1,
+            ));
+            items.push(make_item(
+                &format!("right narrative line {index}"),
+                400.0,
+                y,
+                1,
+            ));
         }
 
         let tables = detect_tables_from_lines(&items, &lines, 1);
