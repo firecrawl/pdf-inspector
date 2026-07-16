@@ -1174,7 +1174,7 @@ pub fn detect_vector_grid_in_region_mem(
     }
 
     let line_tables =
-        tables::detect_tables_from_lines(&items_in_region, &lines_in_region, page_1idx);
+        tables::detect_vector_grid_tables_from_lines(&items_in_region, &lines_in_region, page_1idx);
     for table in line_tables {
         if let Some(result) = vector_grid_result_from_table(
             &table,

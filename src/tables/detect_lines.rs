@@ -11,6 +11,494 @@ use crate::types::{PdfLine, TextItem};
 
 use super::detect_rects::{assign_items_to_grid, snap_edges};
 
+const RULE_Y_TOLERANCE: f32 = 2.0;
+const RULE_JOIN_GAP: f32 = 6.0;
+const RULE_SPAN_TOLERANCE: f32 = 8.0;
+const TEXT_ROW_TOLERANCE: f32 = 2.5;
+
+type HorizontalRule = (f32, f32, f32); // (y, x_min, x_max)
+type AnchoredRow<'a> = (f32, Vec<(usize, &'a TextItem)>);
+
+/// Merge touching path segments into logical horizontal rules.
+///
+/// Forms and segmented-cell tables often stroke one segment per cell at the
+/// same y coordinate. Treating those as unrelated rules manufactures column
+/// edges from path endpoints; joining them first exposes the actual table
+/// band while text anchors recover the columns.
+fn merge_horizontal_segments(horizontals: &[HorizontalRule]) -> Vec<HorizontalRule> {
+    let mut sorted = horizontals.to_vec();
+    sorted.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.total_cmp(&right.1))
+    });
+
+    let mut y_groups: Vec<Vec<HorizontalRule>> = Vec::new();
+    for rule in sorted {
+        if y_groups
+            .last()
+            .and_then(|group| group.first())
+            .is_some_and(|first| (first.0 - rule.0).abs() <= RULE_Y_TOLERANCE)
+        {
+            y_groups.last_mut().expect("checked above").push(rule);
+        } else {
+            y_groups.push(vec![rule]);
+        }
+    }
+
+    let mut merged = Vec::new();
+    for mut group in y_groups {
+        group.sort_by(|left, right| left.1.total_cmp(&right.1));
+        let y = group.iter().map(|rule| rule.0).sum::<f32>() / group.len() as f32;
+        let mut current = (y, group[0].1, group[0].2);
+        for rule in group.into_iter().skip(1) {
+            if rule.1 <= current.2 + RULE_JOIN_GAP {
+                current.2 = current.2.max(rule.2);
+            } else {
+                merged.push(current);
+                current = (y, rule.1, rule.2);
+            }
+        }
+        merged.push(current);
+    }
+    merged.sort_by(|left, right| right.0.total_cmp(&left.0));
+    merged
+}
+
+fn group_rules_by_span(rules: &[HorizontalRule]) -> Vec<Vec<HorizontalRule>> {
+    let mut groups: Vec<Vec<HorizontalRule>> = Vec::new();
+    for &rule in rules {
+        let best_group = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| {
+                let first = group[0];
+                let endpoint_error = (first.1 - rule.1).abs() + (first.2 - rule.2).abs();
+                ((first.1 - rule.1).abs() <= RULE_SPAN_TOLERANCE
+                    && (first.2 - rule.2).abs() <= RULE_SPAN_TOLERANCE)
+                    .then_some((index, endpoint_error))
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(index, _)| index);
+        if let Some(index) = best_group {
+            groups[index].push(rule);
+        } else {
+            groups.push(vec![rule]);
+        }
+    }
+    for group in &mut groups {
+        group.sort_by(|left, right| right.0.total_cmp(&left.0));
+    }
+    groups
+}
+
+fn numbered_table_caption(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("table ") else {
+        return false;
+    };
+    rest.split_whitespace().next().is_some_and(|token| {
+        token
+            .trim_matches(|c: char| !c.is_ascii_digit())
+            .parse::<u32>()
+            .is_ok()
+    })
+}
+
+/// Split equal-width rule groups when a numbered caption occupies the gap.
+/// This handles consecutive booktabs tables that happen to share a width.
+fn split_rules_at_captions(
+    rules: &[HorizontalRule],
+    items: &[TextItem],
+    page: u32,
+) -> Vec<Vec<HorizontalRule>> {
+    let Some(&first) = rules.first() else {
+        return Vec::new();
+    };
+    let mut groups = Vec::new();
+    let mut current = vec![first];
+    for pair in rules.windows(2) {
+        let y_min = pair[0].0.min(pair[1].0);
+        let y_max = pair[0].0.max(pair[1].0);
+        let has_caption = items.iter().any(|item| {
+            item.page == page
+                && item.y > y_min
+                && item.y < y_max
+                && numbered_table_caption(&item.text)
+        });
+        if has_caption {
+            groups.push(current);
+            current = vec![pair[1]];
+        } else {
+            current.push(pair[1]);
+        }
+    }
+    groups.push(current);
+    groups
+}
+
+fn collect_anchored_rows<'a>(
+    items: &'a [TextItem],
+    rules: &[HorizontalRule],
+    page: u32,
+) -> Vec<AnchoredRow<'a>> {
+    let y_top = rules
+        .iter()
+        .map(|rule| rule.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let y_bottom = rules
+        .iter()
+        .map(|rule| rule.0)
+        .fold(f32::INFINITY, f32::min);
+    let x_min = rules
+        .iter()
+        .map(|rule| rule.1)
+        .fold(f32::INFINITY, f32::min);
+    let x_max = rules
+        .iter()
+        .map(|rule| rule.2)
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let mut selected: Vec<(usize, &TextItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.page == page
+                && crate::extractor::is_text_layout_item(item)
+                && !item.text.trim().is_empty()
+                && item.y >= y_bottom - RULE_Y_TOLERANCE
+                && item.y <= y_top + RULE_Y_TOLERANCE
+                && item.x + item.width.max(0.0) >= x_min - RULE_JOIN_GAP
+                && item.x <= x_max + RULE_JOIN_GAP
+        })
+        .collect();
+    selected.sort_by(|left, right| {
+        right
+            .1
+            .y
+            .total_cmp(&left.1.y)
+            .then_with(|| left.1.x.total_cmp(&right.1.x))
+    });
+
+    let mut rows: Vec<AnchoredRow<'a>> = Vec::new();
+    for (index, item) in selected {
+        if let Some((row_y, row_items)) = rows.last_mut() {
+            if (*row_y - item.y).abs() <= TEXT_ROW_TOLERANCE {
+                row_items.push((index, item));
+                continue;
+            }
+        }
+        rows.push((item.y, vec![(index, item)]));
+    }
+    for (_, row) in &mut rows {
+        row.sort_by(|left, right| left.1.x.total_cmp(&right.1.x));
+    }
+    rows
+}
+
+fn rules_are_uniform_grid(rules: &[HorizontalRule]) -> bool {
+    if rules.len() < 5 {
+        return false;
+    }
+    let spacings: Vec<f32> = rules
+        .windows(2)
+        .map(|pair| (pair[0].0 - pair[1].0).abs())
+        .collect();
+    let mean = spacings.iter().sum::<f32>() / spacings.len() as f32;
+    if mean <= 0.1 {
+        return false;
+    }
+    let variance = spacings
+        .iter()
+        .map(|spacing| (spacing - mean).powi(2))
+        .sum::<f32>()
+        / spacings.len() as f32;
+    variance.sqrt() / mean < 0.02
+}
+
+fn build_stacked_token_table(rows: &[AnchoredRow<'_>], rules: &[HorizontalRule]) -> Option<Table> {
+    if rules.len() != 3 || rows.len() < 5 || rows.iter().any(|(_, row)| row.len() != 1) {
+        return None;
+    }
+    let anchor_x = rows[0].1[0].1.x;
+    if rows
+        .iter()
+        .any(|(_, row)| (row[0].1.x - anchor_x).abs() > RULE_JOIN_GAP)
+    {
+        return None;
+    }
+    let body = &rows[1..];
+    let token_rows = body
+        .iter()
+        .filter(|(_, row)| {
+            let text = row[0].1.text.trim();
+            text.split_whitespace().count() == 1 && text.chars().any(|c| c == '_' || c == ':')
+        })
+        .count();
+    if token_rows * 4 < body.len() * 3 {
+        return None;
+    }
+
+    let header = rows[0].1[0].1.text.trim().to_string();
+    let value = body
+        .iter()
+        .map(|(_, row)| row[0].1.text.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut item_indices: Vec<usize> = rows
+        .iter()
+        .flat_map(|(_, row)| row.iter().map(|(index, _)| *index))
+        .collect();
+    item_indices.sort_unstable();
+    item_indices.dedup();
+
+    let x_min = rules
+        .iter()
+        .map(|rule| rule.1)
+        .fold(f32::INFINITY, f32::min);
+    let x_max = rules
+        .iter()
+        .map(|rule| rule.2)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let split = x_min + (x_max - x_min) * 0.35;
+    Some(Table::new(
+        vec![x_min, split, x_max],
+        vec![rows[0].0],
+        vec![vec![header, value]],
+        item_indices,
+    ))
+}
+
+fn build_text_anchor_table(
+    items: &[TextItem],
+    rules: &[HorizontalRule],
+    page: u32,
+) -> Option<Table> {
+    if rules.len() < 2 || rules_are_uniform_grid(rules) {
+        return None;
+    }
+    let rows = collect_anchored_rows(items, rules, page);
+    if rows.len() < 2 {
+        return None;
+    }
+
+    let mut anchors: Vec<f32> = Vec::new();
+    for (_, item) in &rows[0].1 {
+        if anchors
+            .last()
+            .is_none_or(|last| (item.x - *last).abs() > RULE_JOIN_GAP)
+        {
+            anchors.push(item.x);
+        }
+    }
+    if anchors.len() == 1 {
+        return build_stacked_token_table(&rows, rules);
+    }
+    if !(2..=25).contains(&anchors.len()) || anchors.last()? - anchors[0] < 30.0 {
+        return None;
+    }
+    if rows[0]
+        .1
+        .iter()
+        .all(|(_, item)| !item.text.chars().any(char::is_alphabetic))
+        || rows[1..]
+            .iter()
+            .flat_map(|(_, row)| row)
+            .any(|(_, item)| item.x < anchors[0] - RULE_JOIN_GAP)
+    {
+        // Header anchors must describe every column. A numeric data row is
+        // weak evidence for a header, and a body stub to the left of the
+        // first header anchor proves that the inferred grid omitted a column.
+        // Let the legacy line/segment detector handle these partial views.
+        return None;
+    }
+    if rules.len() == 2 {
+        // A bounded response form can have only top/bottom rules: the header
+        // names both columns, while each prompt row fills the leading column
+        // and deliberately leaves the response column blank.
+        let response_form = rows.len() >= 5
+            && anchors.len() <= 4
+            && rows[1..].iter().all(|(_, row)| {
+                !row.is_empty()
+                    && row.len() < anchors.len()
+                    && row.iter().all(|(_, item)| {
+                        item.text.split_whitespace().count() <= 4
+                            && (item.x - anchors[0]).abs() <= RULE_JOIN_GAP
+                    })
+            });
+        if !response_form {
+            return None;
+        }
+    } else if anchors.len() == 2 && (rules.len() < 5 || rows.len() > rules.len() + 2) {
+        // Two text columns bracketed by a few decorative rules are
+        // indistinguishable from a two-column prose layout using geometry
+        // alone. Keep the high-confidence cases: response forms (above), the
+        // stacked-token special case, and densely ruled forms where rule and
+        // row counts corroborate one another. Wider booktabs tables have much
+        // stronger anchor evidence and do not need this restriction.
+        return None;
+    }
+    if anchors.len() > 2 && rules.len() > 3 {
+        // Four or more full-width rules describe row structure, not a sparse
+        // booktabs band. Other table detectors can combine that evidence with
+        // rectangles, segments, or whitespace; first-row anchors alone may
+        // start below a real header and preempt a better hypothesis.
+        return None;
+    }
+
+    let x_min = rules
+        .iter()
+        .map(|rule| rule.1)
+        .fold(f32::INFINITY, f32::min)
+        .min(anchors[0]);
+    let x_max = rules
+        .iter()
+        .map(|rule| rule.2)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .max(*anchors.last()?);
+    if x_max - x_min < 50.0 {
+        return None;
+    }
+    let mut columns = vec![x_min];
+    columns.extend(anchors.windows(2).map(|pair| (pair[0] + pair[1]) / 2.0));
+    columns.push(x_max);
+
+    let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
+    let mut item_indices = Vec::new();
+    let mut wide_items = 0usize;
+    let mut measured_items = 0usize;
+    for (row_index, (_, row)) in rows.iter().enumerate() {
+        for (item_index, item) in row {
+            let column = anchors
+                .iter()
+                .enumerate()
+                .min_by(|left, right| (left.1 - item.x).abs().total_cmp(&(right.1 - item.x).abs()))
+                .map(|(index, _)| index)?;
+            let column_width = columns[column + 1] - columns[column];
+            if column_width > 0.0 {
+                measured_items += 1;
+                if item.width.max(0.0) > column_width * 0.72 {
+                    wide_items += 1;
+                }
+            }
+            if !cells[row_index][column].is_empty() {
+                cells[row_index][column].push(' ');
+            }
+            cells[row_index][column].push_str(item.text.trim());
+            item_indices.push(*item_index);
+        }
+    }
+    item_indices.sort_unstable();
+    item_indices.dedup();
+
+    let occupied_rows = cells
+        .iter()
+        .filter(|row| row.iter().any(|cell| !cell.is_empty()))
+        .count();
+    let occupied_columns = (0..anchors.len())
+        .filter(|&column| cells.iter().any(|row| !row[column].is_empty()))
+        .count();
+    if occupied_rows < 2 || occupied_columns < 2 {
+        return None;
+    }
+
+    // Three sparse rules around a full multi-column text region can expose
+    // dozens of baselines whose starts repeat at the column margins. Tables
+    // usually contain many short labels or numeric values; prose repeatedly
+    // fills most of each inferred column. Bound very tall sparse candidates,
+    // and reject sustained column-filling text while leaving compact tables
+    // and densely ruled forms alone.
+    if (rules.len() <= 4 && rows.len() > 40)
+        || ((3..=4).contains(&anchors.len()) && rows.len() > rules.len() * 2 + 2)
+        || (anchors.len() >= 3
+            && rows.len() >= 4
+            && measured_items > 0
+            && wide_items * 3 >= measured_items)
+    {
+        log::trace!(
+            "detect_lines p{}: rejected unbounded text-anchor candidate ({} rows, {} wide of {} items)",
+            page,
+            rows.len(),
+            wide_items,
+            measured_items
+        );
+        return None;
+    }
+
+    // A handful of long decorative rules can bracket an entire multi-column
+    // prose region. Its first baseline then looks like a header and the text
+    // anchors look like columns, but assigning the intervening paragraphs to
+    // those anchors produces very large "cells". Real ruled tables can wrap
+    // labels, so use a deliberately loose guard: reject only an extreme cell,
+    // or a sustained concentration of paragraph-sized cells.
+    let nonempty_cells: Vec<&str> = cells
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    let long_cells = nonempty_cells
+        .iter()
+        .filter(|cell| cell.chars().count() > 100)
+        .count();
+    if nonempty_cells.iter().any(|cell| cell.chars().count() > 240)
+        || (long_cells >= 2 && long_cells * 5 >= nonempty_cells.len())
+    {
+        log::trace!(
+            "detect_lines p{}: rejected prose-like text-anchor candidate ({} long of {} cells)",
+            page,
+            long_cells,
+            nonempty_cells.len()
+        );
+        return None;
+    }
+
+    Some(Table::new(
+        columns,
+        rows.iter().map(|(y, _)| *y).collect(),
+        cells,
+        item_indices,
+    ))
+}
+
+fn detect_text_anchor_rule_tables(
+    items: &[TextItem],
+    horizontals: &[HorizontalRule],
+    page: u32,
+) -> Vec<Table> {
+    let logical_rules = merge_horizontal_segments(horizontals);
+    log::trace!(
+        "detect_lines p{}: logical horizontal rules: {:?}",
+        page,
+        logical_rules
+    );
+    let mut tables = Vec::new();
+    for span_group in group_rules_by_span(&logical_rules) {
+        for rules in split_rules_at_captions(&span_group, items, page) {
+            if let Some(table) = build_text_anchor_table(items, &rules, page) {
+                log::debug!(
+                    "detect_lines p{}: accepted text-anchor rule table {}x{} from {} rules",
+                    page,
+                    table.cells.len(),
+                    table.cells.first().map_or(0, Vec::len),
+                    rules.len()
+                );
+                tables.push(table);
+            }
+        }
+    }
+    tables.sort_by(|left, right| {
+        right
+            .rows
+            .first()
+            .copied()
+            .unwrap_or_default()
+            .total_cmp(&left.rows.first().copied().unwrap_or_default())
+    });
+    tables
+}
+
 /// Derive column edges from the x-endpoints of horizontal-rule
 /// segments when no vertical lines were drawn.
 ///
@@ -77,6 +565,27 @@ fn derive_columns_from_horizontal_segments(horizontals: &[(f32, f32, f32)]) -> O
 /// Lines are classified as horizontal or vertical, snapped into grid edges,
 /// and validated before assigning text items to the resulting grid.
 pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32) -> Vec<Table> {
+    detect_tables_from_lines_inner(items, lines, page, true)
+}
+
+/// Detect only tables whose cell grid is backed by explicit vector geometry.
+///
+/// Region-level TSR callers need physical cell boundaries for crop bboxes, so
+/// text-anchor columns inferred from sparse rules are deliberately excluded.
+pub(crate) fn detect_vector_grid_tables_from_lines(
+    items: &[TextItem],
+    lines: &[PdfLine],
+    page: u32,
+) -> Vec<Table> {
+    detect_tables_from_lines_inner(items, lines, page, false)
+}
+
+fn detect_tables_from_lines_inner(
+    items: &[TextItem],
+    lines: &[PdfLine],
+    page: u32,
+    allow_text_anchors: bool,
+) -> Vec<Table> {
     // Filter lines for this page
     let page_lines: Vec<&PdfLine> = lines.iter().filter(|l| l.page == page).collect();
     if page_lines.is_empty() {
@@ -115,6 +624,20 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
         // Diagonal lines are ignored
     }
 
+    if horizontals.len() < 2 {
+        return Vec::new();
+    }
+
+    // Booktabs and response-form tables commonly draw horizontal rules only.
+    // Their rules describe table bands, not row/cell boundaries, so infer
+    // columns from the first text row and rows from text baselines before the
+    // legacy endpoint-grid path has a chance to collapse adjacent tables.
+    if allow_text_anchors && verticals.len() < 2 {
+        let text_anchor_tables = detect_text_anchor_rule_tables(items, &horizontals, page);
+        if !text_anchor_tables.is_empty() {
+            return text_anchor_tables;
+        }
+    }
     if horizontals.len() < 3 {
         return Vec::new();
     }
@@ -513,6 +1036,164 @@ mod tests {
 
         let tables = detect_tables_from_lines(&items, &lines, 1);
         assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_two_rule_response_form_uses_header_anchors() {
+        let lines = vec![
+            make_hline(500.0, 80.0, 300.0, 1),
+            make_hline(400.0, 80.0, 300.0, 1),
+        ];
+        let mut items = vec![
+            make_item("Prompt", 100.0, 485.0, 1),
+            make_item("Response", 200.0, 485.0, 1),
+        ];
+        for (index, y) in [470.0, 455.0, 440.0, 425.0, 410.0].into_iter().enumerate() {
+            items.push(make_item(&format!("item {index}"), 100.0, y, 1));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells.len(), 6);
+        assert_eq!(tables[0].cells[0], vec!["Prompt", "Response"]);
+        assert!(tables[0].cells[1..].iter().all(|row| row[1].is_empty()));
+    }
+
+    #[test]
+    fn test_booktabs_table_uses_text_anchors_for_columns() {
+        let lines = vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(440.0, 80.0, 420.0, 1),
+        ];
+        let items = vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("Accuracy", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+            make_item("Alpha", 100.0, 465.0, 1),
+            make_item("91.2", 220.0, 465.0, 1),
+            make_item("12", 340.0, 465.0, 1),
+            make_item("Beta", 100.0, 450.0, 1),
+            make_item("89.7", 220.0, 450.0, 1),
+            make_item("9", 340.0, 450.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells.len(), 3);
+        assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
+        assert_eq!(tables[0].cells[2], vec!["Beta", "89.7", "9"]);
+    }
+
+    #[test]
+    fn test_header_missing_stub_column_defers_to_legacy_detector() {
+        let lines = vec![
+            make_hline(500.0, 60.0, 500.0, 1),
+            make_hline(480.0, 60.0, 500.0, 1),
+            make_hline(440.0, 60.0, 500.0, 1),
+        ];
+        let items = vec![
+            make_item("Year 0", 140.0, 490.0, 1),
+            make_item("Year 1", 220.0, 490.0, 1),
+            make_item("Year 2", 300.0, 490.0, 1),
+            make_item("Year 3", 380.0, 490.0, 1),
+            make_item("NOI", 80.0, 460.0, 1),
+            make_item("100", 140.0, 460.0, 1),
+            make_item("103", 220.0, 460.0, 1),
+            make_item("106", 300.0, 460.0, 1),
+            make_item("109", 380.0, 460.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_dense_row_rules_defer_to_other_table_detectors() {
+        let lines = [500.0, 480.0, 455.0, 435.0, 410.0]
+            .into_iter()
+            .map(|y| make_hline(y, 60.0, 500.0, 1))
+            .collect::<Vec<_>>();
+        let mut items = Vec::new();
+        for (row, y) in [490.0, 470.0, 445.0, 422.0].into_iter().enumerate() {
+            items.push(make_item(&format!("label {row}"), 80.0, y, 1));
+            items.push(make_item(&format!("value {row}"), 240.0, y, 1));
+            items.push(make_item(&format!("note {row}"), 400.0, y, 1));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_sparse_rules_do_not_turn_two_column_prose_into_table() {
+        let lines = vec![
+            make_hline(500.0, 60.0, 540.0, 1),
+            make_hline(350.0, 60.0, 540.0, 1),
+            make_hline(200.0, 60.0, 540.0, 1),
+        ];
+        let mut items = Vec::new();
+        for (index, y) in (0..12).map(|index| (index, 485.0 - index as f32 * 20.0)) {
+            items.push(make_item(
+                &format!("left paragraph line {index}"),
+                80.0,
+                y,
+                1,
+            ));
+            items.push(make_item(
+                &format!("right paragraph line {index}"),
+                310.0,
+                y,
+                1,
+            ));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_sparse_rules_do_not_wrap_narrow_text_region() {
+        let lines = vec![
+            make_hline(500.0, 60.0, 540.0, 1),
+            make_hline(350.0, 60.0, 540.0, 1),
+            make_hline(200.0, 60.0, 540.0, 1),
+        ];
+        let mut items = Vec::new();
+        for (index, y) in (0..12).map(|index| (index, 485.0 - index as f32 * 20.0)) {
+            items.push(make_item(&format!("left {index}"), 80.0, y, 1));
+            items.push(make_item(&format!("middle {index}"), 240.0, y, 1));
+            items.push(make_item(&format!("right {index}"), 400.0, y, 1));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_stacked_machine_tokens_form_single_value_cell() {
+        let lines = vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(400.0, 80.0, 420.0, 1),
+        ];
+        let items = vec![
+            make_item("Filtered Task Name", 100.0, 490.0, 1),
+            make_item("task_228", 100.0, 470.0, 1),
+            make_item("arc:1.0.0", 100.0, 455.0, 1),
+            make_item("task_229", 100.0, 440.0, 1),
+            make_item("gsm8k:1.0.0", 100.0, 425.0, 1),
+            make_item("drop:2.0.0", 100.0, 410.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells.len(), 1);
+        assert_eq!(tables[0].cells[0][0], "Filtered Task Name");
+        assert_eq!(
+            tables[0].cells[0][1],
+            "task_228 arc:1.0.0 task_229 gsm8k:1.0.0 drop:2.0.0"
+        );
     }
 
     #[test]
