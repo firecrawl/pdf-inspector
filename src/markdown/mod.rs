@@ -28,11 +28,44 @@ use convert::{
 const CHART_REGION_PAD: f32 = 20.0;
 const CHART_SEPARATOR_PAD: f32 = 8.0;
 
-fn is_chart_adjacent_label(item: &TextItem) -> bool {
+fn is_chart_adjacent_label(item: &TextItem, region: (f32, f32, f32, f32)) -> bool {
     let text = item.text.trim();
     let is_bare_bullet = matches!(text, "•" | "●" | "○" | "◦" | "-" | "*");
-    (text.split_whitespace().count() <= 5 && !is_list_item(text) && !is_bare_bullet)
-        || is_caption_line(text)
+    if text.is_empty() || is_list_item(text) || is_bare_bullet {
+        return false;
+    }
+
+    let (x0, y0, x1, y1) = region;
+    let (left, right) = (x0.min(x1), x0.max(x1));
+    let (bottom, top) = (y0.min(y1), y0.max(y1));
+    let item_left = item.x.min(item.x + item.width);
+    let item_right = item.x.max(item.x + item.width);
+    let item_width = (item_right - item_left).max(1.0);
+    let chart_width = (right - left).max(1.0);
+    let horizontal_overlap = (item_right.min(right) - item_left.max(left)).max(0.0);
+    let mostly_inside_chart_width = horizontal_overlap >= item_width * 0.8;
+    let vertical_gap = if item.y < bottom {
+        bottom - item.y
+    } else if item.y > top {
+        item.y - top
+    } else {
+        0.0
+    };
+    let is_caption = is_caption_line(text);
+    let em = item.height.max(item.font_size).max(1.0);
+    let compact_label = item_width <= em * 18.5;
+    let category_band = (em * 1.85).clamp(6.0, CHART_REGION_PAD);
+    let close_to_chart_edge = if is_caption {
+        vertical_gap <= CHART_REGION_PAD
+    } else {
+        vertical_gap <= category_band
+    };
+    let category_sized = item_width <= chart_width * 0.75;
+
+    vertical_gap <= CHART_REGION_PAD
+        && (compact_label
+            || is_caption
+            || (mostly_inside_chart_width && close_to_chart_edge && category_sized))
 }
 
 fn item_is_in_chart_region(item: &TextItem, regions: &[(f32, f32, f32, f32)]) -> bool {
@@ -42,7 +75,7 @@ fn item_is_in_chart_region(item: &TextItem, regions: &[(f32, f32, f32, f32)]) ->
         let within_core_y = item.y >= y0 && item.y <= y1;
         let within_padded_y = item.y >= y0 - CHART_REGION_PAD
             && item.y <= y1 + CHART_REGION_PAD
-            && is_chart_adjacent_label(item);
+            && is_chart_adjacent_label(item, (x0, y0, x1, y1));
         within_padded_x && (within_core_y || within_padded_y)
     })
 }
@@ -1853,9 +1886,17 @@ mod tests {
         label.text = "January 2021".into();
         assert!(item_is_in_chart_region(&label, &regions));
 
+        let mut long_label = make_item_w(210.0, 90.0, 180.0, 1);
+        long_label.text = "Share of respondents by employment sector".into();
+        assert!(item_is_in_chart_region(&long_label, &regions));
+
         let mut caption = make_item_w(120.0, 310.0, 350.0, 1);
         caption.text = "Figure 3. Results across every survey phase and sector".into();
         assert!(item_is_in_chart_region(&caption, &regions));
+
+        let mut wide_short_prose = make_item_w(120.0, 90.0, 350.0, 1);
+        wide_short_prose.text = "Results improved across all sectors".into();
+        assert!(!item_is_in_chart_region(&wide_short_prose, &regions));
 
         let mut prose = make_item_w(120.0, 90.0, 350.0, 1);
         prose.text = "This paragraph continues below the chart into the next prose column".into();
