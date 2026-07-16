@@ -20,6 +20,15 @@ type HorizontalRule = (f32, f32, f32); // (y, x_min, x_max)
 type VerticalRule = (f32, f32, f32); // (x, y_min, y_max)
 type AnchoredRow<'a> = (f32, Vec<(usize, &'a TextItem)>);
 
+#[derive(Debug)]
+struct TextAnchorTable {
+    table: Table,
+    x_left: f32,
+    x_right: f32,
+    y_bottom: f32,
+    y_top: f32,
+}
+
 /// Merge touching path segments into logical horizontal rules.
 ///
 /// Forms and segmented-cell tables often stroke one segment per cell at the
@@ -107,9 +116,14 @@ fn numbered_table_caption(text: &str) -> bool {
     })
 }
 
-/// Split equal-width rule groups when a numbered caption occupies the gap.
-/// This handles consecutive booktabs tables that happen to share a width.
-fn split_rules_at_captions(
+/// Split equal-width rules into independent vertical runs.
+///
+/// Consecutive booktabs tables often share identical x endpoints. A numbered
+/// caption is an explicit separator; a large mostly-empty gap is the fallback
+/// for captionless tables. Requiring at least two rules on both sides and a
+/// proportionally large empty interval protects long tables whose top/middle/
+/// bottom rules surround many regularly spaced text rows.
+fn split_independent_rule_runs(
     rules: &[HorizontalRule],
     items: &[TextItem],
     page: u32,
@@ -119,7 +133,7 @@ fn split_rules_at_captions(
     };
     let mut groups = Vec::new();
     let mut current = vec![first];
-    for pair in rules.windows(2) {
+    for (index, pair) in rules.windows(2).enumerate() {
         let y_min = pair[0].0.min(pair[1].0);
         let y_max = pair[0].0.max(pair[1].0);
         let has_caption = items.iter().any(|item| {
@@ -128,7 +142,35 @@ fn split_rules_at_captions(
                 && item.y < y_max
                 && numbered_table_caption(&item.text)
         });
-        if has_caption {
+        let can_form_two_runs = index + 1 >= 2 && rules.len() - (index + 1) >= 2;
+        let rule_gap = y_max - y_min;
+        let has_empty_separator = can_form_two_runs && rule_gap >= 36.0 && {
+            let x_min = pair[0].1.min(pair[1].1) - RULE_JOIN_GAP;
+            let x_max = pair[0].2.max(pair[1].2) + RULE_JOIN_GAP;
+            let mut occupied_y: Vec<f32> = items
+                .iter()
+                .filter(|item| {
+                    item.page == page
+                        && crate::extractor::is_text_layout_item(item)
+                        && !item.text.trim().is_empty()
+                        && item.y > y_min
+                        && item.y < y_max
+                        && item.x + item.width.max(0.0) >= x_min
+                        && item.x <= x_max
+                })
+                .map(|item| item.y)
+                .collect();
+            occupied_y.push(y_min);
+            occupied_y.push(y_max);
+            occupied_y.sort_by(|left, right| left.total_cmp(right));
+            occupied_y.dedup_by(|left, right| (*left - *right).abs() <= TEXT_ROW_TOLERANCE);
+            let largest_empty_gap = occupied_y
+                .windows(2)
+                .map(|window| window[1] - window[0])
+                .fold(0.0_f32, f32::max);
+            largest_empty_gap >= 36.0_f32.max(rule_gap * 0.45)
+        };
+        if has_caption || has_empty_separator {
             groups.push(current);
             current = vec![pair[1]];
         } else {
@@ -496,7 +538,7 @@ fn detect_text_anchor_rule_tables(
     verticals: &[VerticalRule],
     path_lines: &[PdfLine],
     page: u32,
-) -> Vec<Table> {
+) -> Vec<TextAnchorTable> {
     let logical_rules = merge_horizontal_segments(horizontals);
     log::trace!(
         "detect_lines p{}: logical horizontal rules: {:?}",
@@ -505,7 +547,7 @@ fn detect_text_anchor_rule_tables(
     );
     let mut tables = Vec::new();
     for span_group in group_rules_by_span(&logical_rules) {
-        for rules in split_rules_at_captions(&span_group, items, page) {
+        for rules in split_independent_rule_runs(&span_group, items, page) {
             let y_top = rules
                 .iter()
                 .map(|rule| rule.0)
@@ -574,43 +616,37 @@ fn detect_text_anchor_rule_tables(
                     table.cells.first().map_or(0, Vec::len),
                     rules.len()
                 );
-                tables.push(table);
+                tables.push(TextAnchorTable {
+                    table,
+                    x_left,
+                    x_right,
+                    y_bottom,
+                    y_top,
+                });
             }
         }
     }
     tables.sort_by(|left, right| {
         right
+            .table
             .rows
             .first()
             .copied()
             .unwrap_or_default()
-            .total_cmp(&left.rows.first().copied().unwrap_or_default())
+            .total_cmp(&left.table.rows.first().copied().unwrap_or_default())
     });
     tables
 }
 
-fn line_overlaps_table_region(line: &PdfLine, table: &Table) -> bool {
-    let (Some(&x_left), Some(&x_right)) = (table.columns.first(), table.columns.last()) else {
-        return false;
-    };
-    let y_top = table.rows.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let y_bottom = table.rows.iter().copied().fold(f32::INFINITY, f32::min);
-    if !y_top.is_finite() || !y_bottom.is_finite() {
-        return false;
-    }
-
-    // Table rows store text baselines rather than the outer rule positions.
-    // A modest pad covers the header/top and last-row/bottom rule gaps while
-    // keeping vertically separated tables independent.
-    const REGION_PADDING: f32 = 20.0;
+fn line_overlaps_text_anchor_band(line: &PdfLine, table: &TextAnchorTable) -> bool {
     let line_x_min = line.x1.min(line.x2);
     let line_x_max = line.x1.max(line.x2);
     let line_y_min = line.y1.min(line.y2);
     let line_y_max = line.y1.max(line.y2);
-    line_x_max >= x_left - REGION_PADDING
-        && line_x_min <= x_right + REGION_PADDING
-        && line_y_max >= y_bottom - REGION_PADDING
-        && line_y_min <= y_top + REGION_PADDING
+    line_x_max >= table.x_left - RULE_JOIN_GAP
+        && line_x_min <= table.x_right + RULE_JOIN_GAP
+        && line_y_max >= table.y_bottom - RULE_Y_TOLERANCE
+        && line_y_min <= table.y_top + RULE_Y_TOLERANCE
 }
 
 fn combine_non_overlapping_tables(mut primary: Vec<Table>, secondary: Vec<Table>) -> Vec<Table> {
@@ -782,12 +818,16 @@ fn detect_tables_from_lines_inner(
                 .filter(|line| {
                     !text_anchor_tables
                         .iter()
-                        .any(|table| line_overlaps_table_region(line, table))
+                        .any(|table| line_overlaps_text_anchor_band(line, table))
                 })
                 .cloned()
                 .collect();
             let vector_tables =
                 detect_tables_from_lines_inner(items, &remaining_lines, page, false);
+            let text_anchor_tables = text_anchor_tables
+                .into_iter()
+                .map(|candidate| candidate.table)
+                .collect();
             return combine_non_overlapping_tables(text_anchor_tables, vector_tables);
         }
     }
@@ -1437,6 +1477,81 @@ mod tests {
         assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
         assert_eq!(tables[1].cells[0], vec!["Grid A", "Grid B"]);
         assert_eq!(tables[1].cells[1], vec!["one", "two"]);
+    }
+
+    #[test]
+    fn test_captionless_stacked_booktabs_tables_split_at_empty_rule_gap() {
+        let lines = vec![
+            make_hline(700.0, 60.0, 360.0, 1),
+            make_hline(680.0, 60.0, 360.0, 1),
+            make_hline(640.0, 60.0, 360.0, 1),
+            make_hline(500.0, 60.0, 360.0, 1),
+            make_hline(480.0, 60.0, 360.0, 1),
+            make_hline(440.0, 60.0, 360.0, 1),
+        ];
+        let items = vec![
+            make_item("Model", 80.0, 690.0, 1),
+            make_item("Accuracy", 180.0, 690.0, 1),
+            make_item("Latency", 280.0, 690.0, 1),
+            make_item("Alpha", 80.0, 665.0, 1),
+            make_item("91.2", 180.0, 665.0, 1),
+            make_item("12", 280.0, 665.0, 1),
+            make_item("Beta", 80.0, 650.0, 1),
+            make_item("89.7", 180.0, 650.0, 1),
+            make_item("9", 280.0, 650.0, 1),
+            make_item("Region", 80.0, 490.0, 1),
+            make_item("Revenue", 180.0, 490.0, 1),
+            make_item("Growth", 280.0, 490.0, 1),
+            make_item("North", 80.0, 465.0, 1),
+            make_item("120", 180.0, 465.0, 1),
+            make_item("8%", 280.0, 465.0, 1),
+            make_item("South", 80.0, 450.0, 1),
+            make_item("105", 180.0, 450.0, 1),
+            make_item("6%", 280.0, 450.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
+        assert_eq!(tables[1].cells[0], vec!["Region", "Revenue", "Growth"]);
+    }
+
+    #[test]
+    fn test_sparse_rule_mask_stops_at_rule_band_before_vector_table() {
+        let lines = vec![
+            make_hline(700.0, 60.0, 360.0, 1),
+            make_hline(680.0, 60.0, 360.0, 1),
+            make_hline(640.0, 60.0, 360.0, 1),
+            // The vector table starts only 10pt below the sparse table's
+            // bottom rule. Baseline-derived 20pt padding used to consume its
+            // top edge and verticals.
+            make_hline(630.0, 60.0, 260.0, 1),
+            make_hline(610.0, 60.0, 260.0, 1),
+            make_hline(590.0, 60.0, 260.0, 1),
+            make_vline(60.0, 590.0, 630.0, 1),
+            make_vline(160.0, 590.0, 630.0, 1),
+            make_vline(260.0, 590.0, 630.0, 1),
+        ];
+        let items = vec![
+            make_item("Model", 80.0, 690.0, 1),
+            make_item("Accuracy", 180.0, 690.0, 1),
+            make_item("Latency", 280.0, 690.0, 1),
+            make_item("Alpha", 80.0, 665.0, 1),
+            make_item("91.2", 180.0, 665.0, 1),
+            make_item("12", 280.0, 665.0, 1),
+            make_item("Beta", 80.0, 650.0, 1),
+            make_item("89.7", 180.0, 650.0, 1),
+            make_item("9", 280.0, 650.0, 1),
+            make_item("Grid A", 70.0, 620.0, 1),
+            make_item("Grid B", 170.0, 620.0, 1),
+            make_item("one", 70.0, 600.0, 1),
+            make_item("two", 170.0, 600.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
+        assert_eq!(tables[1].cells[0], vec!["Grid A", "Grid B"]);
     }
 
     #[test]
