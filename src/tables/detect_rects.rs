@@ -8,6 +8,9 @@ use crate::types::{PdfRect, TextItem};
 
 use super::Table;
 
+const DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS: usize = 8;
+const COMPETING_TABLE_MIN_ROWS: usize = 8;
+
 /// Disjoint-set (union-find) with component sizes for clustering indices.
 struct UnionFind {
     parent: Vec<usize>,
@@ -287,6 +290,16 @@ pub fn detect_chart_regions(
     regions
 }
 
+fn detect_direct_rect_table(
+    items: &[TextItem],
+    rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
+    detect_table_from_rect_group(items, rects, page)
+        .or_else(|| detect_row_stripe_table(items, rects, page))
+        .or_else(|| detect_stacked_box_table(items, rects, page))
+}
+
 pub fn detect_tables_from_rects(
     items: &[TextItem],
     rects: &[PdfRect],
@@ -449,19 +462,62 @@ pub fn detect_tables_from_rects(
             // entirely so it can't reach any detector, the merged fallback,
             // or the hint fallback.
             if is_chart_bar_cluster(items, &group_rects, page) {
-                debug!(
-                    "page {}: skipping chart-bar cluster ({} rects)",
-                    page,
-                    group_rects.len()
-                );
-                chart_cluster_ids.push(cluster_id);
-                continue;
+                // Repeated page fills can dominate the geometry and make a
+                // real shaded-cell table look like a chart. Remove those fills,
+                // re-cluster the remaining geometry, and evaluate valid table
+                // candidates as a competing hypothesis before the chart
+                // rejection wins.
+                let normalized = without_dominant_page_backgrounds(&group_rects);
+                let normalized_table = (normalized.len() < group_rects.len())
+                    .then(|| {
+                        cluster_rects(&normalized, 3.0, 6)
+                            .iter()
+                            .filter_map(|indices| {
+                                let candidate: Vec<(f32, f32, f32, f32)> =
+                                    indices.iter().map(|&i| normalized[i]).collect();
+                                if is_chart_bar_cluster(items, &candidate, page) {
+                                    None
+                                } else {
+                                    detect_table_from_rect_group(items, &candidate, page)
+                                        .or_else(|| {
+                                            detect_row_stripe_table_from_cell_rects(
+                                                items, &candidate, page,
+                                            )
+                                        })
+                                        // Small chart panels can still form
+                                        // plausible grids from their labels.
+                                        // Require sustained row evidence; the
+                                        // motivating table has 17 rows.
+                                        .filter(|table| {
+                                            table.rows.len() >= COMPETING_TABLE_MIN_ROWS
+                                        })
+                                }
+                            })
+                            .max_by_key(|table| table.rows.len() * table.columns.len())
+                    })
+                    .flatten();
+                if let Some(table) = normalized_table {
+                    debug!(
+                        "page {}: chart-like cluster normalized from {} to {} rects; accepted {}x{} table hypothesis",
+                        page,
+                        group_rects.len(),
+                        normalized.len(),
+                        table.rows.len(),
+                        table.columns.len()
+                    );
+                    tables.push(table);
+                    continue;
+                } else {
+                    debug!(
+                        "page {}: skipping chart-bar cluster ({} rects)",
+                        page,
+                        group_rects.len()
+                    );
+                    chart_cluster_ids.push(cluster_id);
+                    continue;
+                }
             }
-            if let Some(table) = detect_table_from_rect_group(items, &group_rects, page) {
-                tables.push(table);
-            } else if let Some(table) = detect_row_stripe_table(items, &group_rects, page) {
-                tables.push(table);
-            } else if let Some(table) = detect_stacked_box_table(items, &group_rects, page) {
+            if let Some(table) = detect_direct_rect_table(items, &group_rects, page) {
                 tables.push(table);
             } else if let Some((left, right)) = split_wide_cluster(&group_rects, 15.0, 6) {
                 // Cluster was too wide — retry each half independently
@@ -1904,6 +1960,36 @@ fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
     long_dense_cells * 2 >= dense_count
 }
 
+/// Remove repeated page-scale fills from a chart-like cluster so the actual
+/// cell/bar geometry can be evaluated independently. A small number of
+/// coincident origin frames may be meaningful table structure, so repetition
+/// only becomes normalization evidence when it dominates the cluster.
+fn without_dominant_page_backgrounds(rects: &[(f32, f32, f32, f32)]) -> Vec<(f32, f32, f32, f32)> {
+    let x_max = rects
+        .iter()
+        .map(|&(x, _, width, _)| x + width)
+        .fold(0.0_f32, f32::max);
+    let y_max = rects
+        .iter()
+        .map(|&(_, y, _, height)| y + height)
+        .fold(0.0_f32, f32::max);
+    let is_page_scale = |&(x, y, width, height): &(f32, f32, f32, f32)| {
+        x < 5.0 && y < 5.0 && width >= x_max * 0.9 && height >= y_max * 0.9
+    };
+
+    if rects.iter().filter(|rect| is_page_scale(rect)).count()
+        < DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS
+    {
+        return rects.to_vec();
+    }
+
+    rects
+        .iter()
+        .filter(|rect| !is_page_scale(rect))
+        .copied()
+        .collect()
+}
+
 /// Detect a table from cell-background rects that failed grid detection.
 ///
 /// Uses rect Y-edges for row boundaries and text X-position clustering for
@@ -2950,6 +3036,20 @@ mod tests {
         let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
         assert!(tables.is_empty(), "chart bars must not become a table");
         assert!(hints.is_empty(), "chart bars must not become a hint region");
+    }
+
+    #[test]
+    fn dominant_page_backgrounds_are_normalized_only_after_repetition() {
+        let page_fill = (0.0, 0.0, 600.0, 800.0);
+        let cell = (100.0, 500.0, 120.0, 20.0);
+
+        let mut dominant = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        dominant.push(cell);
+        assert_eq!(without_dominant_page_backgrounds(&dominant), vec![cell]);
+
+        let mut incidental = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS - 1];
+        incidental.push(cell);
+        assert_eq!(without_dominant_page_backgrounds(&incidental), incidental);
     }
 
     #[test]

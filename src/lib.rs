@@ -1527,16 +1527,10 @@ mod vector_grid_tests {
     /// strip while body rows are drawn with `m`/`l` operators, so the rect
     /// cluster has only 2 Y-edges and `try_build_grid` rejects.
     ///
-    /// IGNORED: lifting this shape required the exact-duplicate early-dedup
-    /// (PR #76 first iteration), which had broad collateral damage on
-    /// SEC 10-K TOCs and similar docs that draw rule-rects above + below
-    /// section dividers (production diff: 0001104659-25-093871 lost its
-    /// TOC structure, perf-graph data table, and qualifications matrix).
-    /// Re-enable once a more surgical lift exists in `try_build_grid` or
-    /// `snap_edges` that handles cell-border + inner-fill + text-bg rect
-    /// triplets without page-wide dedup.
+    /// The page repeats a full-page background many times. Those fills must be
+    /// removed from clustering before chart/table evidence is evaluated, or
+    /// they swamp the real cell rectangles and make this table look chart-like.
     #[test]
-    #[ignore]
     fn greencomp_competence_two_cols() {
         let tables = detect_rect_tables_in_fixture("tests/fixtures/greencomp_competence.pdf");
         assert!(

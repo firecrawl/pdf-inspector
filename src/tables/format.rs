@@ -341,11 +341,12 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         // mid-sentence/lowercase ("continued text here", "with 3.5%...") or
         // carry lowercase fragments in the later cells, so keep those mergeable.
         let looks_like_hierarchical_subrow = first_cell.is_empty()
-            && row.len() >= 3
             && first_non_empty_col == Some(1)
             && looks_like_compact_entry_label(first_non_empty_cell)
-            && ((non_first_cells.len() >= 2 && title_like_later_cells > 0)
+            && ((row.len() == 2 && starts_with_numbered_label(first_non_empty_cell))
+                || (row.len() >= 3 && non_first_cells.len() >= 2 && title_like_later_cells > 0)
                 || (non_first_cells.len() == 1
+                    && row.len() >= 3
                     && prev_first_cell_empty
                     && alpha_word_count(first_non_empty_cell) >= 2));
         let looks_like_new_first_column_entry = !first_cell.is_empty()
@@ -686,6 +687,30 @@ mod tests {
         assert_eq!(cleaned[2][1], "Storage setup");
         assert_eq!(cleaned[3][1], "Label workspace");
         assert_eq!(cleaned[4][1], "Model training");
+    }
+
+    #[test]
+    fn test_clean_table_cells_two_column_numbered_subrows_not_merged() {
+        let cells = vec![
+            vec!["Area".into(), "Competence".into()],
+            vec![
+                "1. Embodying sustainability values".into(),
+                "1.1 Valuing sustainability".into(),
+            ],
+            vec!["".into(), "1.2 Supporting fairness".into()],
+            vec!["".into(), "1.3 Promoting nature".into()],
+            vec![
+                "2. Embracing complexity".into(),
+                "2.1 Systems thinking".into(),
+            ],
+            vec!["".into(), "2.2 Critical thinking".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 6);
+        assert_eq!(cleaned[2], vec!["", "1.2 Supporting fairness"]);
+        assert_eq!(cleaned[3], vec!["", "1.3 Promoting nature"]);
+        assert_eq!(cleaned[5], vec!["", "2.2 Critical thinking"]);
     }
 
     #[test]
