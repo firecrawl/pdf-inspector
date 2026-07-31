@@ -3,7 +3,7 @@ name: Publish Python package
 on:
   push:
     branches: [main]
-    paths: ['pyproject.toml']
+    paths: ['bindings/python/pyproject.toml']
   # Manual fallback: re-publish the current version without a version bump
   # (e.g. first run after PyPI trusted publishing is configured).
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
       - name: Check if version changed
         id: check
         run: |
-          NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("bindings/python/pyproject.toml").read_text())["project"]["version"])')
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -45,10 +45,13 @@ jobs:
             exit 0
           fi
 
-          # .get(): the parent commit may predate the static version field
-          # (pyproject.toml used dynamic = ["version"]) — treat that as a change
-          # so the very first merge of this workflow publishes.
-          OLD_VERSION=$(git show HEAD~1:pyproject.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"].get("version", ""))')
+          if git cat-file -e HEAD~1:bindings/python/pyproject.toml 2>/dev/null; then
+            OLD_MANIFEST=bindings/python/pyproject.toml
+          else
+            # Migration fallback for the commit that moved the Python package.
+            OLD_MANIFEST=pyproject.toml
+          fi
+          OLD_VERSION=$(git show "HEAD~1:$OLD_MANIFEST" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"].get("version", ""))')
           echo "old=$OLD_VERSION new=$NEW_VERSION"
 
           if [ "$NEW_VERSION" = "$OLD_VERSION" ]; then
@@ -108,7 +111,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --manifest-path bindings/python/Cargo.toml --release --out dist
           manylinux: auto
 
       - name: Upload wheel
@@ -130,7 +133,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --out dist
+          args: --manifest-path bindings/python/Cargo.toml --out dist
 
       - name: Upload sdist
         uses: actions/upload-artifact@v4

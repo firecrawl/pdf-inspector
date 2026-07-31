@@ -16,19 +16,12 @@ include = [
     "/external/bcmaps/**",
     "/docs/rust-api.md",
     "/LICENSE",
-    # maturin derives the sdist file list from this allowlist; the stub must
-    # ship so wheels built from the sdist keep their type hints.
-    "/pdf_inspector.pyi",
 ]
 
 [lib]
 name = "pdf_inspector"
-crate-type = ["lib", "cdylib"]
 
 [dependencies]
-# Python bindings
-pyo3 = { version = "0.25", features = ["extension-module", "abi3-py38"], optional = true }
-
 # Error handling
 thiserror = "2.0"
 
@@ -59,10 +52,6 @@ include_dir = "0.7"
 [dev-dependencies]
 tempfile = "3.3"
 
-[features]
-default = []
-python = ["pyo3"]
-
 [[bin]]
 name = "pdf2md"
 path = "src/bin/pdf2md.rs"
@@ -74,3 +63,20 @@ path = "src/bin/detect_pdf.rs"
 [[bin]]
 name = "dump_ops"
 path = "src/bin/dump_ops.rs"
+
+[workspace]
+members = ["bindings/node", "bindings/python", "bindings/wasm"]
+default-members = ["."]
+resolver = "2"
+
+# Native packages benefit from LTO. Browser builds use a size-focused custom
+# profile selected by the wasm-pack release command.
+[profile.release]
+lto = true
+strip = "debuginfo"
+
+[profile.wasm-release]
+inherits = "release"
+codegen-units = 1
+opt-level = "s"
+strip = true

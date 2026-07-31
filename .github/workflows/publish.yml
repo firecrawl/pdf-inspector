@@ -3,7 +3,7 @@ name: Publish npm package
 on:
   push:
     branches: [main]
-    paths: ['napi/package.json']
+    paths: ['bindings/node/package.json']
   # Manual fallback: retry a publish that failed partway (per-package
   # already-published checks make re-runs idempotent).
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
       - name: Check if version changed
         id: check
         run: |
-          NEW_VERSION=$(node -p "require('./napi/package.json').version")
+          NEW_VERSION=$(node -p "require('./bindings/node/package.json').version")
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -43,7 +43,13 @@ jobs:
             exit 0
           fi
 
-          OLD_VERSION=$(git show HEAD~1:napi/package.json | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
+          if git cat-file -e HEAD~1:bindings/node/package.json 2>/dev/null; then
+            OLD_MANIFEST=bindings/node/package.json
+          else
+            # Migration fallback for the commit that moved napi/.
+            OLD_MANIFEST=napi/package.json
+          fi
+          OLD_VERSION=$(git show "HEAD~1:$OLD_MANIFEST" | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
           echo "old=$OLD_VERSION new=$NEW_VERSION"
           if [ "$NEW_VERSION" != "$OLD_VERSION" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -82,24 +88,24 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            napi/target/
+            target/
           key: ${{ runner.os }}-cargo-napi-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-napi-
 
       - name: Install dependencies
-        working-directory: napi
-        run: bun install
+        working-directory: bindings/node
+        run: bun install --frozen-lockfile
 
       - name: Build native addon
-        working-directory: napi
+        working-directory: bindings/node
         run: bunx napi build --platform --release
 
       - name: Upload native binary
         uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.target }}
-          path: napi/*.node
+          path: bindings/node/*.node
           if-no-files-found: error
 
       - name: Upload generated JS bindings
@@ -108,8 +114,8 @@ jobs:
         with:
           name: js-bindings
           path: |
-            napi/index.js
-            napi/index.d.ts
+            bindings/node/index.js
+            bindings/node/index.d.ts
           if-no-files-found: error
 
   publish:
@@ -130,10 +136,10 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: napi/artifacts
+          path: bindings/node/artifacts
 
       - name: Publish platform packages
-        working-directory: napi
+        working-directory: bindings/node
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
 
@@ -183,7 +189,7 @@ jobs:
           done
 
       - name: Publish main package
-        working-directory: napi
+        working-directory: bindings/node
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
 

@@ -42,9 +42,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check WASM formatting
-        run: cargo fmt --manifest-path wasm/Cargo.toml -- --check
-
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -99,21 +96,79 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            wasm -> target
           key: wasm
 
       - name: Check WebAssembly bindings
-        run: cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+        run: cargo check --package pdf-inspector-wasm --target wasm32-unknown-unknown
 
       - name: Check root package for WebAssembly
         run: cargo check --target wasm32-unknown-unknown
 
       - name: Lint WebAssembly bindings
-        run: cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+        run: cargo clippy --package pdf-inspector-wasm --target wasm32-unknown-unknown -- -D warnings
 
       - name: Install wasm-pack
         run: cargo install wasm-pack --version 0.15.0 --locked
 
       - name: Test WebAssembly package
-        run: wasm-pack test --node --release wasm
+        run: wasm-pack test --node --release bindings/wasm
+
+  node:
+    name: Node.js binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: node
+
+      - name: Install dependencies
+        working-directory: bindings/node
+        run: bun install --frozen-lockfile
+
+      - name: Build binding
+        working-directory: bindings/node
+        run: bunx napi build --platform --release
+
+      - name: Run binding tests
+        working-directory: bindings/node
+        run: node test.mjs
+
+  python:
+    name: Python binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: python
+
+      - name: Install build and test tools
+        run: python -m pip install maturin pytest
+
+      - name: Build wheel
+        run: maturin build --manifest-path bindings/python/Cargo.toml --release --out dist
+
+      - name: Install wheel
+        run: python -m pip install dist/*.whl
+
+      - name: Run binding tests
+        run: python -m pytest bindings/python/tests

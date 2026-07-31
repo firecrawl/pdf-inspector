@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/pdf-inspector.svg)](https://pypi.org/project/pdf-inspector/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Fast Rust library for PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Includes bindings for [Python](docs/python.md), [Node.js](napi/README.md), and [browser WebAssembly](wasm/README.md).
+Fast Rust library for PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Includes bindings for [Python](bindings/python/README.md), [Node.js](bindings/node/README.md), and [browser WebAssembly](bindings/wasm/README.md).
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
@@ -47,8 +47,7 @@ Use the [paired benchmark harness](docs/benchmarking.md) to compare two local bu
 ### Python
 
 ```bash
-pip install maturin
-maturin develop --release
+pip install pdf-inspector
 ```
 
 ```python
@@ -59,7 +58,7 @@ print(result.pdf_type)   # "text_based", "scanned", "image_based", "mixed"
 print(result.markdown)   # Markdown string or None
 ```
 
-> Full API reference: [docs/python.md](docs/python.md)
+> Full API reference: [bindings/python/README.md](bindings/python/README.md)
 
 ### Node.js
 
@@ -76,7 +75,7 @@ console.log(result.pdfType);   // "TextBased", "Scanned", "ImageBased", "Mixed"
 console.log(result.markdown);  // Markdown string or null
 ```
 
-> Full API reference: [napi/README.md](napi/README.md)
+> Full API reference: [bindings/node/README.md](bindings/node/README.md)
 
 ### Browser WebAssembly
 
@@ -96,7 +95,7 @@ console.log(result.pdfType);
 console.log(result.markdown);
 ```
 
-> Full API reference: [wasm/README.md](wasm/README.md)
+> Full API reference: [bindings/wasm/README.md](bindings/wasm/README.md)
 
 ### Rust
 
@@ -197,7 +196,6 @@ The document is loaded **once** via `load_document_from_path` / `load_document_f
 ```
 src/
   lib.rs                — Public API, PdfOptions builder, convenience functions
-  python.rs             — PyO3 Python bindings
   types.rs              — Shared types: TextItem, TextLine, PdfRect, ItemType
   text_utils.rs         — Character/text helpers (CJK, RTL, ligatures, bold/italic)
   process_mode.rs       — ProcessMode enum (DetectOnly, Analyze, Full)
@@ -208,8 +206,11 @@ src/
   tables/               — Table detection and formatting
   markdown/             — Markdown conversion and structure detection
   bin/                  — CLI tools (pdf2md, detect_pdf)
-napi/                   — Node.js/Bun bindings (napi-rs)
-wasm/                   — Browser bindings (wasm-bindgen)
+bindings/
+  node/                 — Node.js/Bun package and CLI (napi-rs)
+  python/               — Python package (PyO3 + maturin)
+  wasm/                 — Browser package (wasm-bindgen)
+tests/fixtures/         — Shared PDFs used across core and binding tests
 ```
 
 ## How classification works

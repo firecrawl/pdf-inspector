@@ -292,8 +292,8 @@ mod tests {
     use js_sys::Reflect;
     use wasm_bindgen_test::*;
 
-    const TEXT_PDF: &[u8] = include_bytes!("../../tests/fixtures/thermo-freon12.pdf");
-    const ENCRYPTED_PDF: &[u8] = include_bytes!("../../tests/fixtures/encrypted-secret123.pdf");
+    const TEXT_PDF: &[u8] = include_bytes!("../../../tests/fixtures/thermo-freon12.pdf");
+    const ENCRYPTED_PDF: &[u8] = include_bytes!("../../../tests/fixtures/encrypted-secret123.pdf");
 
     fn synthetic_korea1_pdf() -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();

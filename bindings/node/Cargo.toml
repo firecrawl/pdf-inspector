@@ -1,19 +1,16 @@
 [package]
-name = "pdf-inspector-napi"
+name = "pdf-inspector-node"
 version = "0.2.2"
 edition = "2021"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-pdf-inspector = { path = ".." }
+pdf-inspector = { path = "../.." }
 napi = { version = "3.0.0", features = ["serde-json"] }
 napi-derive = "3.0.0"
 
 [build-dependencies]
 napi-build = "2"
-
-[profile.release]
-lto = true
-strip = "debuginfo"

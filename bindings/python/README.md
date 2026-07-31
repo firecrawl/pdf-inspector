@@ -36,6 +36,7 @@ Prebuilt wheels cover CPython ≥3.8 on Linux (x86_64, aarch64), macOS (Intel, A
 
 ```bash
 pip install maturin
+cd bindings/python
 maturin develop --release
 ```
 

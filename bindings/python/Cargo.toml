@@ -1,0 +1,18 @@
+[package]
+name = "pdf-inspector-python"
+version = "0.2.5"
+edition = "2021"
+authors = ["Firecrawl Team"]
+description = "Python bindings for pdf-inspector"
+license = "MIT"
+repository = "https://github.com/firecrawl/pdf-inspector"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "pdf_inspector"
+crate-type = ["cdylib"]
+
+[dependencies]
+pdf-inspector = { path = "../.." }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py38"] }

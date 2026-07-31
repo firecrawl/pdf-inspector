@@ -1,14 +1,16 @@
 """Tests for the pdf_inspector Python bindings."""
 
 import os
+from pathlib import Path
+
 import pytest
 import pdf_inspector
 
-FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+FIXTURES_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures"
 
 
 def fixture_path(name: str) -> str:
-    return os.path.join(FIXTURES_DIR, name)
+    return str(FIXTURES_DIR / name)
 
 
 def fixture_bytes(name: str) -> bytes:
@@ -389,7 +391,11 @@ class TestMultipleFixtures:
 
     @pytest.mark.parametrize(
         "filename",
-        [f for f in os.listdir(FIXTURES_DIR) if f.endswith(".pdf")],
+        [
+            f
+            for f in os.listdir(FIXTURES_DIR)
+            if f.endswith(".pdf") and f != "encrypted-secret123.pdf"
+        ],
     )
     def test_process_all_fixtures(self, filename):
         result = pdf_inspector.process_pdf(fixture_path(filename))
@@ -401,3 +407,7 @@ class TestMultipleFixtures:
         )
         assert result.page_count > 0
         assert result.confidence >= 0.0
+
+    def test_password_protected_fixture_reports_error(self):
+        with pytest.raises(ValueError, match="encrypted"):
+            pdf_inspector.process_pdf(fixture_path("encrypted-secret123.pdf"))

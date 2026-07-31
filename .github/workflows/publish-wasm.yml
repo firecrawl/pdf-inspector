@@ -3,7 +3,7 @@ name: Publish WebAssembly package
 on:
   push:
     branches: [main]
-    paths: ['wasm/Cargo.toml']
+    paths: ['bindings/wasm/Cargo.toml']
   workflow_dispatch:
 
 permissions:
@@ -31,20 +31,24 @@ jobs:
       - name: Check package version
         id: check
         run: |
-          NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("wasm/Cargo.toml").read_text())["package"]["version"])')
+          NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("bindings/wasm/Cargo.toml").read_text())["package"]["version"])')
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
-          elif git cat-file -e HEAD~1:wasm/Cargo.toml 2>/dev/null; then
-            OLD_VERSION=$(git show HEAD~1:wasm/Cargo.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
+          else
+            if git cat-file -e HEAD~1:bindings/wasm/Cargo.toml 2>/dev/null; then
+              OLD_MANIFEST=bindings/wasm/Cargo.toml
+            else
+              # Migration fallback for the commit that moved wasm/.
+              OLD_MANIFEST=wasm/Cargo.toml
+            fi
+            OLD_VERSION=$(git show "HEAD~1:$OLD_MANIFEST" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
             if [ "$NEW_VERSION" = "$OLD_VERSION" ]; then
               echo "changed=false" >> "$GITHUB_OUTPUT"
               echo "published=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -87,25 +91,25 @@ jobs:
         run: cargo install wasm-pack --version 0.15.0 --locked
 
       - name: Build browser package
-        run: wasm-pack build wasm --target web --scope firecrawl --out-dir pkg --release
+        run: wasm-pack build bindings/wasm --target web --scope firecrawl --out-dir pkg --profile wasm-release --no-opt
 
       - name: Prepare package metadata
         run: |
           node -e '
             const fs = require("fs")
-            const path = "wasm/pkg/package.json"
+            const path = "bindings/wasm/pkg/package.json"
             const pkg = JSON.parse(fs.readFileSync(path, "utf8"))
             pkg.name = "@firecrawl/pdf-inspector-wasm"
             pkg.description = "Browser WebAssembly bindings for the pdf-inspector Rust PDF parser"
             pkg.keywords = ["pdf", "pdf-parser", "webassembly", "wasm", "markdown", "rust", "firecrawl"]
             pkg.repository = { type: "git", url: "https://github.com/firecrawl/pdf-inspector" }
-            pkg.homepage = "https://github.com/firecrawl/pdf-inspector/tree/main/wasm"
+            pkg.homepage = "https://github.com/firecrawl/pdf-inspector/tree/main/bindings/wasm"
             pkg.publishConfig = { access: "public" }
             fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n")
           '
 
       - name: Inspect package contents
-        run: npm pack --dry-run ./wasm/pkg
+        run: npm pack --dry-run ./bindings/wasm/pkg
 
       - name: Publish package
-        run: npm publish ./wasm/pkg --provenance --access public
+        run: npm publish ./bindings/wasm/pkg --provenance --access public

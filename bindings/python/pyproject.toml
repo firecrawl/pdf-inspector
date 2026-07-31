@@ -5,10 +5,10 @@ build-backend = "maturin"
 [project]
 name = "pdf-inspector"
 # Bump this to publish to PyPI — CI publishes automatically when the version
-# changes on main (same flow as napi/package.json for npm).
+# changes on main (same flow as bindings/node/package.json for npm).
 version = "0.2.5"
 description = "Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection"
-readme = "docs/python.md"
+readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
 classifiers = [
@@ -23,7 +23,8 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/firecrawl/pdf-inspector"
 Repository = "https://github.com/firecrawl/pdf-inspector"
-Documentation = "https://github.com/firecrawl/pdf-inspector/blob/main/docs/python.md"
+Documentation = "https://github.com/firecrawl/pdf-inspector/blob/main/bindings/python/README.md"
 
 [tool.maturin]
-features = ["python"]
+bindings = "pyo3"
+module-name = "pdf_inspector"

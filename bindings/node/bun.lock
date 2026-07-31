@@ -8,9 +8,9 @@
         "@napi-rs/cli": "^3.4.1",
       },
       "optionalDependencies": {
-        "@firecrawl/pdf-inspector-darwin-arm64": "1.11.0",
-        "@firecrawl/pdf-inspector-linux-x64-gnu": "1.11.0",
-        "@firecrawl/pdf-inspector-win32-x64-msvc": "1.11.0",
+        "@firecrawl/pdf-inspector-darwin-arm64": "1.11.1",
+        "@firecrawl/pdf-inspector-linux-x64-gnu": "1.11.1",
+        "@firecrawl/pdf-inspector-win32-x64-msvc": "1.11.1",
       },
     },
   },
@@ -20,6 +20,12 @@
     "@emnapi/runtime": ["@emnapi/runtime@1.9.2", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-3U4+MIWHImeyu1wnmVygh5WlgfYDtyf0k8AbLhMFxOipihf6nrWC4syIm/SwEeec0mNSafiiNnMJwbza/Is6Lw=="],
 
     "@emnapi/wasi-threads": ["@emnapi/wasi-threads@1.2.1", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-uTII7OYF+/Mes/MrcIOYp5yOtSMLBWSIoLPpcgwipoiKbli6k322tcoFsxoIIxPDqW01SQGAgko4EzZi2BNv2w=="],
+
+    "@firecrawl/pdf-inspector-darwin-arm64": ["@firecrawl/pdf-inspector-darwin-arm64@1.11.1", "", { "os": "darwin", "cpu": "arm64" }, "sha512-MYworvuQ84dRxMhVmhSuSP8gVdrxqKfnTC+spGc+OIEaJGHNuzgBUzgi9O7p3wSP/hkK9QdCDEbl6wdBO9a4rA=="],
+
+    "@firecrawl/pdf-inspector-linux-x64-gnu": ["@firecrawl/pdf-inspector-linux-x64-gnu@1.11.1", "", { "os": "linux", "cpu": "x64" }, "sha512-Vyp7EpmplnWFsyi7YGK1yKE97PIrueIpo7jJx9zfU5wVAjSQuBRwykYbSUywsS3GPEbfgFlMDAW0Cls4lbtPqw=="],
+
+    "@firecrawl/pdf-inspector-win32-x64-msvc": ["@firecrawl/pdf-inspector-win32-x64-msvc@1.11.1", "", { "os": "win32", "cpu": "x64" }, "sha512-B3hpMRHlJFaOdZaWiG0wyGcfVkf3AQh232tRd0kN4EpAIyo/sEU6+cbEarH1Z+ypd7QRNlO6fcnSYHelZaqS0A=="],
 
     "@inquirer/ansi": ["@inquirer/ansi@2.0.4", "", {}, "sha512-DpcZrQObd7S0R/U3bFdkcT5ebRwbTTC4D3tCc1vsJizmgPLxNJBo+AAFmrZwe8zk30P2QzgzGWZ3Q9uJwWuhIg=="],
 

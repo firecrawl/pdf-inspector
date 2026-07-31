@@ -52,7 +52,7 @@ The package also exports:
 
 ```bash
 cargo install wasm-pack --version 0.15.0 --locked
-wasm-pack build wasm --target web --scope firecrawl --release
+wasm-pack build bindings/wasm --target web --scope firecrawl --profile wasm-release --no-opt
 ```
 
 ## License

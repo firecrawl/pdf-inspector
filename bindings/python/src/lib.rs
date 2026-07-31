@@ -4,8 +4,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
-use crate::detector::PdfType;
-use crate::types::ItemType;
+use ::pdf_inspector as core;
+use core::detector::PdfType;
+use core::types::ItemType;
 
 // ---------------------------------------------------------------------------
 // Result wrapper
@@ -299,7 +300,7 @@ fn pdf_type_str(t: PdfType) -> String {
     }
 }
 
-fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
+fn to_py_result(r: core::PdfProcessResult) -> PyPdfResult {
     PyPdfResult {
         pdf_type: pdf_type_str(r.pdf_type),
         markdown: r.markdown,
@@ -316,7 +317,7 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
     }
 }
 
-fn to_py_page_ocr_reasons(reasons: Vec<crate::PageOcrReasons>) -> Vec<PyPageOcrReasons> {
+fn to_py_page_ocr_reasons(reasons: Vec<core::PageOcrReasons>) -> Vec<PyPageOcrReasons> {
     reasons
         .into_iter()
         .map(|reason| PyPageOcrReasons {
@@ -326,7 +327,7 @@ fn to_py_page_ocr_reasons(reasons: Vec<crate::PageOcrReasons>) -> Vec<PyPageOcrR
         .collect()
 }
 
-fn to_py_err(e: crate::PdfError) -> PyErr {
+fn to_py_err(e: core::PdfError) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
@@ -339,7 +340,7 @@ fn item_type_str(t: &ItemType) -> String {
     }
 }
 
-fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
+fn convert_text_items(items: Vec<core::TextItem>) -> Vec<PyTextItem> {
     items
         .into_iter()
         .map(|item| PyTextItem {
@@ -392,7 +393,7 @@ fn parse_page_regions(
         .collect()
 }
 
-fn to_py_pages_result(r: crate::PagesExtractionResult) -> PyPagesExtractionResult {
+fn to_py_pages_result(r: core::PagesExtractionResult) -> PyPagesExtractionResult {
     PyPagesExtractionResult {
         pages: r
             .pages
@@ -412,7 +413,7 @@ fn to_py_pages_result(r: crate::PagesExtractionResult) -> PyPagesExtractionResul
     }
 }
 
-fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRegionTexts> {
+fn convert_region_results(results: Vec<core::PageRegionResult>) -> Vec<PyPageRegionTexts> {
     results
         .into_iter()
         .map(|page_result| PyPageRegionTexts {
@@ -438,11 +439,11 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
 #[pyfunction]
 #[pyo3(signature = (path, pages=None))]
 fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
+    let mut opts = core::PdfOptions::new();
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
-    let result = crate::process_pdf_with_options(path, opts).map_err(to_py_err)?;
+    let result = core::process_pdf_with_options(path, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
@@ -450,25 +451,25 @@ fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
 #[pyfunction]
 #[pyo3(signature = (data, pages=None))]
 fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
+    let mut opts = core::PdfOptions::new();
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
-    let result = crate::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
+    let result = core::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
 /// Fast detection only — no text extraction or markdown.
 #[pyfunction]
 fn detect_pdf(path: &str) -> PyResult<PyPdfResult> {
-    let result = crate::detect_pdf(path).map_err(to_py_err)?;
+    let result = core::detect_pdf(path).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
 /// Fast detection from bytes — no text extraction or markdown.
 #[pyfunction]
 fn detect_pdf_bytes(data: &[u8]) -> PyResult<PyPdfResult> {
-    let result = crate::detect_pdf_mem(data).map_err(to_py_err)?;
+    let result = core::detect_pdf_mem(data).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
@@ -485,7 +486,7 @@ fn classify_pdf(path: &str) -> PyResult<PyPdfClassification> {
 /// Pages in pages_needing_ocr are 0-indexed.
 #[pyfunction]
 fn classify_pdf_bytes(data: &[u8]) -> PyResult<PyPdfClassification> {
-    let result = crate::classify_pdf_mem(data).map_err(to_py_err)?;
+    let result = core::classify_pdf_mem(data).map_err(to_py_err)?;
     Ok(PyPdfClassification {
         pdf_type: pdf_type_str(result.pdf_type),
         page_count: result.page_count,
@@ -497,13 +498,13 @@ fn classify_pdf_bytes(data: &[u8]) -> PyResult<PyPdfClassification> {
 /// Extract plain text from a PDF file.
 #[pyfunction]
 fn extract_text(path: &str) -> PyResult<String> {
-    crate::extract_text(path).map_err(to_py_err)
+    core::extract_text(path).map_err(to_py_err)
 }
 
 /// Extract plain text from PDF bytes.
 #[pyfunction]
 fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
-    crate::extractor::extract_text_mem(data).map_err(to_py_err)
+    core::extractor::extract_text_mem(data).map_err(to_py_err)
 }
 
 /// Extract text with position information from a file.
@@ -513,9 +514,9 @@ fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<
     let items = match pages {
         Some(p) => {
             let page_set: HashSet<u32> = p.into_iter().collect();
-            crate::extract_text_with_positions_pages(path, Some(&page_set)).map_err(to_py_err)?
+            core::extract_text_with_positions_pages(path, Some(&page_set)).map_err(to_py_err)?
         }
-        None => crate::extract_text_with_positions(path).map_err(to_py_err)?,
+        None => core::extract_text_with_positions(path).map_err(to_py_err)?,
     };
     Ok(convert_text_items(items))
 }
@@ -530,10 +531,10 @@ fn extract_text_with_positions_bytes(
     let items = match pages {
         Some(p) => {
             let page_set: HashSet<u32> = p.into_iter().collect();
-            crate::extractor::extract_text_with_positions_mem_pages(data, Some(&page_set))
+            core::extractor::extract_text_with_positions_mem_pages(data, Some(&page_set))
                 .map_err(to_py_err)?
         }
-        None => crate::extractor::extract_text_with_positions_mem(data).map_err(to_py_err)?,
+        None => core::extractor::extract_text_with_positions_mem(data).map_err(to_py_err)?,
     };
     Ok(convert_text_items(items))
 }
@@ -571,7 +572,7 @@ fn extract_text_in_regions_bytes(
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let regions = parse_page_regions(page_regions)?;
-    let results = crate::extract_text_in_regions_mem(data, &regions).map_err(to_py_err)?;
+    let results = core::extract_text_in_regions_mem(data, &regions).map_err(to_py_err)?;
     Ok(convert_region_results(results))
 }
 
@@ -596,7 +597,7 @@ fn extract_pages_markdown(
     path: &str,
     pages: Option<Vec<u32>>,
 ) -> PyResult<PyPagesExtractionResult> {
-    let result = crate::extract_pages_markdown(path, pages.as_deref()).map_err(to_py_err)?;
+    let result = core::extract_pages_markdown(path, pages.as_deref()).map_err(to_py_err)?;
     Ok(to_py_pages_result(result))
 }
 
@@ -609,7 +610,7 @@ fn extract_pages_markdown_bytes(
     data: &[u8],
     pages: Option<Vec<u32>>,
 ) -> PyResult<PyPagesExtractionResult> {
-    let result = crate::extract_pages_markdown_mem(data, pages.as_deref()).map_err(to_py_err)?;
+    let result = core::extract_pages_markdown_mem(data, pages.as_deref()).map_err(to_py_err)?;
     Ok(to_py_pages_result(result))
 }
 

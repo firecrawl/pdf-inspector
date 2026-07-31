@@ -11,7 +11,7 @@ import {
   extractPagesMarkdown,
 } from './index.js';
 
-const fixture = readFileSync('../tests/fixtures/thermo-freon12.pdf');
+const fixture = readFileSync('../../tests/fixtures/thermo-freon12.pdf');
 
 // --- processPdf ---
 console.log('Testing processPdf...');

@@ -45,6 +45,10 @@ src/
     classify.rs                 – line classification (header, list, code, caption)
     preprocess.rs               – drop cap merging, heading line merging
     postprocess.rs              – dot leaders, hyphenation, page numbers, URL formatting
+bindings/
+  node/                        – npm package, bundled CLI, and napi-rs adapter
+  python/                      – PyPI package, type stubs, tests, and PyO3 adapter
+  wasm/                        – browser npm package and wasm-bindgen adapter
 ```
 
 ## Key design decisions

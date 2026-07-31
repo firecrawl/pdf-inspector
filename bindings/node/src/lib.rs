@@ -153,9 +153,7 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
     }
 }
 
-fn to_napi_page_ocr_reasons(
-    reasons: Vec<pdf_inspector::PageOcrReasons>,
-) -> Vec<PageOcrReasons> {
+fn to_napi_page_ocr_reasons(reasons: Vec<pdf_inspector::PageOcrReasons>) -> Vec<PageOcrReasons> {
     reasons
         .into_iter()
         .map(|reason| PageOcrReasons {
