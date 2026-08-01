@@ -40,6 +40,8 @@ class TextItem:
     is_italic: bool
     is_underline: bool
     is_strikeout: bool
+    from_font_without_tounicode: bool
+    """True when the run used a font with no /ToUnicode entry."""
     item_type: str
 
 class RegionText:

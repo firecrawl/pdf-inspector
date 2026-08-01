@@ -176,6 +176,12 @@ pub(crate) fn extract_page_text_items(
         std::collections::HashMap::new();
     let mut font_style_flags: std::collections::HashMap<String, (bool, bool)> =
         std::collections::HashMap::new();
+    // True when a font that needs ToUnicode for reliable decode lacks it.
+    // Type1/TrueType with standard encodings are fine without ToUnicode;
+    // Type0 Identity-H/V and Type3 are not. FontFile2 fallbacks do not count
+    // as having ToUnicode — consumers want the explicit map signal.
+    let mut font_missing_required_tounicode: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
     for (font_name, font_dict) in &fonts {
         let resource_name = String::from_utf8_lossy(font_name).to_string();
         if let Ok(base_font) = font_dict.get(b"BaseFont") {
@@ -192,8 +198,21 @@ pub(crate) fn extract_page_text_items(
         }
         // Track ToUnicode object reference, with FontFile2 fallback for Identity-H/V.
         // Also handle inline ToUnicode streams.
+        let subtype = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        let encoding = font_dict
+            .get(b"Encoding")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        let needs_tounicode = matches!(subtype, Some(b"Type3"))
+            || (matches!(subtype, Some(b"Type0"))
+                && matches!(encoding, Some(b"Identity-H") | Some(b"Identity-V")));
+
         match font_dict.get(b"ToUnicode") {
             Ok(tounicode) => {
+                font_missing_required_tounicode.insert(resource_name.clone(), false);
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
@@ -208,6 +227,7 @@ pub(crate) fn extract_page_text_items(
                 }
             }
             Err(_) => {
+                font_missing_required_tounicode.insert(resource_name.clone(), needs_tounicode);
                 if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
                     font_tounicode_refs.insert(resource_name, ff2_obj_num);
                 }
@@ -540,6 +560,10 @@ pub(crate) fn extract_page_text_items(
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
+                                from_font_without_tounicode: font_missing_required_tounicode
+                                    .get(&current_font)
+                                    .copied()
+                                    .unwrap_or(false),
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -713,6 +737,10 @@ pub(crate) fn extract_page_text_items(
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    from_font_without_tounicode: font_missing_required_tounicode
+                                        .get(&current_font)
+                                        .copied()
+                                        .unwrap_or(false),
                                     item_type: ItemType::Text,
                                     mcid: current_mcid(&marked_content_stack),
                                 });
@@ -809,6 +837,10 @@ pub(crate) fn extract_page_text_items(
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
+                                from_font_without_tounicode: font_missing_required_tounicode
+                                    .get(&current_font)
+                                    .copied()
+                                    .unwrap_or(false),
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -853,6 +885,7 @@ pub(crate) fn extract_page_text_items(
                                         is_italic: false,
                                         is_underline: false,
                                         is_strikeout: false,
+                                        from_font_without_tounicode: false,
                                         item_type: ItemType::Image,
                                         mcid: current_mcid(&marked_content_stack),
                                     });
@@ -960,6 +993,10 @@ pub(crate) fn extract_page_text_items(
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    from_font_without_tounicode: font_missing_required_tounicode
+                                        .get(&current_font)
+                                        .copied()
+                                        .unwrap_or(false),
                                     item_type: ItemType::Text,
                                     mcid: entry
                                         .mcid

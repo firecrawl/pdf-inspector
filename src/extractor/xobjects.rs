@@ -173,6 +173,7 @@ fn extract_form_xobject_text_inner(
     let mut inline_cmaps: HashMap<String, crate::tounicode::CMapEntry> = HashMap::new();
 
     let mut font_style_flags: HashMap<String, (bool, bool)> = HashMap::new();
+    let mut font_missing_required_tounicode: HashMap<String, bool> = HashMap::new();
     for (font_name, font_dict) in &form_fonts {
         let resource_name = String::from_utf8_lossy(font_name).to_string();
         if let Ok(base_font) = font_dict.get(b"BaseFont") {
@@ -185,8 +186,21 @@ fn extract_form_xobject_text_inner(
         if style != (false, false) {
             font_style_flags.insert(resource_name.clone(), style);
         }
+        let subtype = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        let encoding = font_dict
+            .get(b"Encoding")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        let needs_tounicode = matches!(subtype, Some(b"Type3"))
+            || (matches!(subtype, Some(b"Type0"))
+                && matches!(encoding, Some(b"Identity-H") | Some(b"Identity-V")));
+
         match font_dict.get(b"ToUnicode") {
             Ok(tounicode) => {
+                font_missing_required_tounicode.insert(resource_name.clone(), false);
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
@@ -201,6 +215,7 @@ fn extract_form_xobject_text_inner(
                 }
             }
             Err(_) => {
+                font_missing_required_tounicode.insert(resource_name.clone(), needs_tounicode);
                 if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
                     font_tounicode_refs.insert(resource_name, ff2_obj_num);
                 }
@@ -307,6 +322,7 @@ fn extract_form_xobject_text_inner(
                                     is_italic: false,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    from_font_without_tounicode: false,
                                     item_type: ItemType::Image,
                                     mcid: None,
                                 });
@@ -457,6 +473,10 @@ fn extract_form_xobject_text_inner(
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
+                                from_font_without_tounicode: font_missing_required_tounicode
+                                    .get(&current_font)
+                                    .copied()
+                                    .unwrap_or(false),
                                 item_type: ItemType::Text,
                                 mcid: None,
                             });
@@ -611,6 +631,10 @@ fn extract_form_xobject_text_inner(
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    from_font_without_tounicode: font_missing_required_tounicode
+                                        .get(&current_font)
+                                        .copied()
+                                        .unwrap_or(false),
                                     item_type: ItemType::Text,
                                     mcid: None,
                                 });

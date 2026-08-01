@@ -124,6 +124,12 @@ pub struct TextItem {
     /// glyphs at mid x-height). Same geometric detection as underline,
     /// different vertical window; see `extractor::underline`.
     pub is_strikeout: bool,
+    /// True when this run was drawn with a Type0 Identity-H/V or Type3 font
+    /// that has no `/ToUnicode` entry. Standard Type1/TrueType encodings are
+    /// not flagged. Presence of ToUnicode does not guarantee a *valid* map
+    /// (shifted/broken CMaps still need `has_encoding_issues`); this flag is
+    /// the deterministic "map missing" signal for OCR routing.
+    pub from_font_without_tounicode: bool,
     /// Type of item (text, image, link)
     pub item_type: ItemType,
     /// Marked Content ID from the content stream's BDC/BMC operator.

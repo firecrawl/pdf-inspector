@@ -50,7 +50,7 @@ pub use detector::{
 };
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_mem,
-    extract_text_with_positions_pages,
+    extract_text_with_positions_pages, tounicode_missing_width_fraction,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
@@ -4767,6 +4767,7 @@ mod text_cluster_column_undercount_tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            from_font_without_tounicode: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -5043,6 +5044,7 @@ mod table_candidate_selection_tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            from_font_without_tounicode: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -5791,6 +5793,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            from_font_without_tounicode: false,
             item_type: ItemType::Text,
             mcid: None,
         }

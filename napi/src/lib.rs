@@ -86,6 +86,9 @@ pub struct TextItem {
     /// Strikeout detected geometrically (rule crossing the glyphs at mid
     /// x-height).
     pub is_strikeout: bool,
+    /// True when this run used a Type0 Identity-H/V or Type3 font with no
+    /// `/ToUnicode` entry. Presence ≠ validity; use with encoding heuristics.
+    pub from_font_without_tounicode: bool,
     pub item_type: ItemType,
     /// URL for link items, `None` for other types.
     pub link_url: Option<String>,
@@ -298,6 +301,7 @@ pub fn extract_text_with_positions(
                     is_italic: item.is_italic,
                     is_underline: item.is_underline,
                     is_strikeout: item.is_strikeout,
+                    from_font_without_tounicode: item.from_font_without_tounicode,
                     item_type,
                     link_url,
                 }

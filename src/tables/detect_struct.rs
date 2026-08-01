@@ -588,6 +588,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            from_font_without_tounicode: false,
             item_type: ItemType::Text,
             mcid,
         }

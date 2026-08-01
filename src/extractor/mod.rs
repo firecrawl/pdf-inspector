@@ -68,6 +68,32 @@ fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
         .map_err(|e| PdfError::Parse(e.to_string()))
 }
 
+/// Fraction of text-run width drawn with fonts that lack a required `/ToUnicode`
+/// map (Type0 Identity-H/V or Type3 without ToUnicode).
+///
+/// Returns `0.0` when there is no measurable text width. Image/link/form items
+/// are ignored. Useful as a page-level summary of
+/// [`TextItem::from_font_without_tounicode`].
+pub fn tounicode_missing_width_fraction(items: &[TextItem]) -> f32 {
+    let mut total = 0.0f32;
+    let mut missing = 0.0f32;
+    for item in items {
+        if !matches!(item.item_type, ItemType::Text) || item.text.trim().is_empty() {
+            continue;
+        }
+        let w = item.width.max(0.0);
+        total += w;
+        if item.from_font_without_tounicode {
+            missing += w;
+        }
+    }
+    if total <= f32::EPSILON {
+        0.0
+    } else {
+        missing / total
+    }
+}
+
 /// Extract text with position information from PDF file
 pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextItem>, PdfError> {
     extract_text_with_positions_pages(path, None)
@@ -822,6 +848,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let first = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
+            let mut from_font_without_tounicode = first.from_font_without_tounicode;
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
@@ -893,6 +920,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
+                from_font_without_tounicode |= next.from_font_without_tounicode;
                 let next_end = next.x + effective_merge_width(next);
                 end_x = if *preserve_stream_order {
                     end_x.max(next_end)
@@ -915,6 +943,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 is_italic: first.is_italic,
                 is_underline: first.is_underline,
                 is_strikeout: first.is_strikeout,
+                from_font_without_tounicode,
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
             });
@@ -1019,6 +1048,7 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                             let raised = item.y > parent.y + parent.font_size * 0.1;
                             parent.text.push_str(&map_script_digits(&item.text, raised));
                             parent.width = (item.x + item.width) - parent.x;
+                            parent.from_font_without_tounicode |= item.from_font_without_tounicode;
                             continue;
                         }
                     }
@@ -1218,6 +1248,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            from_font_without_tounicode: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1476,6 +1507,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1492,6 +1524,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1508,6 +1541,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1576,6 +1610,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1592,6 +1627,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1608,6 +1644,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1635,6 +1672,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1651,6 +1689,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1667,6 +1706,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1696,6 +1736,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -1732,6 +1773,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -1769,6 +1811,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1785,6 +1828,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1801,6 +1845,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1825,6 +1870,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            from_font_without_tounicode: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1939,6 +1985,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1955,6 +2002,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1981,6 +2029,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1997,6 +2046,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2039,6 +2089,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -2085,6 +2136,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -2131,6 +2183,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                from_font_without_tounicode: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -2170,6 +2223,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            from_font_without_tounicode: false,
             item_type: ItemType::Text,
             mcid: None,
         }

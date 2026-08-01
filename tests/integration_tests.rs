@@ -8,8 +8,8 @@ use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
-    process_pdf_mem, process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions,
-    PdfType, TextItem,
+    process_pdf_mem, process_pdf_with_options, to_markdown, tounicode_missing_width_fraction,
+    MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
 };
 use std::collections::HashSet;
 
@@ -106,6 +106,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         is_italic: false,
         is_underline: false,
         is_strikeout: false,
+        from_font_without_tounicode: false,
         item_type: ItemType::Text,
         mcid: None,
     }
@@ -133,6 +134,7 @@ fn make_text_item_with_font(
         is_italic: is_italic_font(font),
         is_underline: false,
         is_strikeout: false,
+        from_font_without_tounicode: false,
         item_type: ItemType::Text,
         mcid: None,
     }
@@ -3651,4 +3653,87 @@ fn pdf_options_debug_redacts_password() {
         "password leaked in Debug: {dbg}"
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
+}
+
+// ============================================================================
+// Per-TextItem ToUnicode presence (#122)
+// ============================================================================
+
+#[test]
+fn test_shinagawa_identity_h_marks_from_font_without_tounicode() {
+    // Fixture: YuGothic Identity-H with no ToUnicode — deterministic OCR signal.
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let items = extract_text_with_positions_mem(&buf).expect("extract");
+    let text_items: Vec<_> = items
+        .iter()
+        .filter(|i| matches!(i.item_type, ItemType::Text) && !i.text.trim().is_empty())
+        .collect();
+    assert!(
+        !text_items.is_empty(),
+        "expected text items from shinagawa fixture"
+    );
+    assert!(
+        text_items.iter().any(|i| i.from_font_without_tounicode),
+        "Identity-H font without ToUnicode should set from_font_without_tounicode; sample={:?}",
+        text_items
+            .iter()
+            .take(3)
+            .map(|i| (&i.text, i.from_font_without_tounicode, &i.font))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_broken_tounicode_present_does_not_set_missing_flag() {
+    // Font has a /ToUnicode entry (malformed) — missing-map flag stays false;
+    // garbled decode is still caught by encoding-issue heuristics.
+    let buf = synthetic_type0_broken_tounicode_pdf();
+    let items = extract_text_with_positions_mem(&buf).expect("extract");
+    let text_items: Vec<_> = items
+        .iter()
+        .filter(|i| matches!(i.item_type, ItemType::Text))
+        .collect();
+    assert!(
+        !text_items.is_empty(),
+        "expected text items from synthetic Type0 PDF"
+    );
+    assert!(
+        text_items.iter().all(|i| !i.from_font_without_tounicode),
+        "broken-but-present ToUnicode must not set from_font_without_tounicode; items={:?}",
+        text_items
+            .iter()
+            .map(|i| (&i.text, i.from_font_without_tounicode))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_standard_type1_helvetica_not_flagged_without_tounicode() {
+    // Helvetica Type1 typically has no ToUnicode and does not need one.
+    let buf = make_minimal_text_pdf();
+    let items = extract_text_with_positions_mem(&buf).expect("extract");
+    let text_items: Vec<_> = items
+        .iter()
+        .filter(|i| matches!(i.item_type, ItemType::Text) && !i.text.trim().is_empty())
+        .collect();
+    assert!(!text_items.is_empty(), "expected text from minimal PDF");
+    assert!(
+        text_items.iter().all(|i| !i.from_font_without_tounicode),
+        "standard Type1 must not be flagged; items={:?}",
+        text_items
+            .iter()
+            .map(|i| (&i.text, i.from_font_without_tounicode, &i.font))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_tounicode_missing_width_fraction_shinagawa() {
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let items = extract_text_with_positions_mem(&buf).expect("extract");
+    let frac = tounicode_missing_width_fraction(&items);
+    assert!(
+        frac > 0.5,
+        "most shinagawa text width should lack required ToUnicode, got {frac}"
+    );
 }

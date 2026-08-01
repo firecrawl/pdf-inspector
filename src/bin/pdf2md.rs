@@ -124,6 +124,7 @@ mod tests {
             is_italic: true,
             is_underline: true,
             is_strikeout: true,
+            from_font_without_tounicode: false,
             item_type: ItemType::Text,
             mcid: Some(7),
         }];
