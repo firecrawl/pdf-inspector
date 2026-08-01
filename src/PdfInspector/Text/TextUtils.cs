@@ -793,3 +793,84 @@ internal static class FloatMath
         return total;
     }
 }
+
+/// <summary>
+/// Splits on runs of whitespace without allocating, the equivalent of
+/// <c>text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)</c>.
+/// </summary>
+/// <remarks>
+/// This is Rust's <c>split_whitespace</c>, which borrows. The direct
+/// translation allocates an array plus one string per word, and the ported code
+/// mostly only counts the words or scans them — on a text-heavy document that
+/// put <c>String.Split</c> at 8% of the run.
+/// </remarks>
+internal ref struct WhitespaceTokens(ReadOnlySpan<char> text)
+{
+    private ReadOnlySpan<char> _rest = text;
+
+    public ReadOnlySpan<char> Current { get; private set; } = default;
+
+    public readonly WhitespaceTokens GetEnumerator() => this;
+
+    public bool MoveNext()
+    {
+        var rest = _rest;
+        var i = 0;
+        while (i < rest.Length && char.IsWhiteSpace(rest[i]))
+        {
+            i++;
+        }
+
+        if (i >= rest.Length)
+        {
+            _rest = default;
+            return false;
+        }
+
+        var start = i;
+        while (i < rest.Length && !char.IsWhiteSpace(rest[i]))
+        {
+            i++;
+        }
+
+        Current = rest[start..i];
+        _rest = rest[i..];
+        return true;
+    }
+}
+
+/// <summary>Whitespace-splitting helpers over spans.</summary>
+internal static class WhitespaceSplit
+{
+    /// <summary>Enumerates the whitespace-separated tokens of <paramref name="text"/>.</summary>
+    public static WhitespaceTokens SplitWhitespace(this ReadOnlySpan<char> text) => new(text);
+
+    /// <inheritdoc cref="SplitWhitespace(ReadOnlySpan{char})"/>
+    public static WhitespaceTokens SplitWhitespace(this string text) => new(text.AsSpan());
+
+    /// <summary>Counts whitespace-separated tokens.</summary>
+    public static int CountWords(this ReadOnlySpan<char> text)
+    {
+        var count = 0;
+        foreach (var _ in text.SplitWhitespace())
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <inheritdoc cref="CountWords(ReadOnlySpan{char})"/>
+    public static int CountWords(this string text) => text.AsSpan().CountWords();
+
+    /// <summary>The first whitespace-separated token, or an empty span if there is none.</summary>
+    public static ReadOnlySpan<char> FirstWord(this ReadOnlySpan<char> text)
+    {
+        foreach (var token in text.SplitWhitespace())
+        {
+            return token;
+        }
+
+        return default;
+    }
+}

@@ -720,8 +720,7 @@ internal static class Convert
     }
 
     /// <summary>Counts whitespace-separated words.</summary>
-    private static int WordCount(string text) =>
-        text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+    private static int WordCount(string text) => text.CountWords();
 
     /// <summary>
     /// Converts text lines to markdown, inserting tables and images at the right Y

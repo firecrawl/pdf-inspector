@@ -1,5 +1,7 @@
 // Ported from reference/src/extractor/fonts.rs
+using System.Buffers;
 using System.Text;
+using System.Text.Unicode;
 using PdfInspector.Pdf;
 using PdfInspector.ToUnicode;
 
@@ -218,7 +220,8 @@ internal static class TextDecoder
 
         // Some producers embed UTF-8 in a single-byte encoded font, writing
         // "José" as the two bytes C3 A9 rather than WinAnsi's E9.
-        if (bytes.Any(b => b > 0x7F) && TryDecodeStrictUtf8(bytes) is { } utf8Text)
+        if (bytes.AsSpan().IndexOfAnyExceptInRange((byte)0x00, (byte)0x7F) >= 0
+            && TryDecodeStrictUtf8(bytes) is { } utf8Text)
         {
             return utf8Text;
         }
@@ -775,16 +778,42 @@ internal static class TextDecoder
     }
 
     /// <summary>Decodes strict UTF-8, returning null when the bytes are not valid.</summary>
+    /// <remarks>
+    /// Most single-byte-encoded strings are not UTF-8, so this fails far more
+    /// often than it succeeds — which makes a throwing decoder the wrong tool.
+    /// Exception dispatch alone was 2% of a text-heavy document, and the
+    /// per-call <c>UTF8Encoding</c> added lock traffic on top.
+    /// <see cref="Utf8.ToUtf16"/> returns the same verdict as a status code.
+    /// </remarks>
     private static string? TryDecodeStrictUtf8(byte[] bytes)
     {
+        // A UTF-8 byte yields at most one UTF-16 unit: the only multi-unit form
+        // is the four-byte sequence, and that produces two.
+        char[]? rented = null;
+        Span<char> chars = bytes.Length <= 256
+            ? stackalloc char[256]
+            : (rented = ArrayPool<char>.Shared.Rent(bytes.Length));
+
         try
         {
-            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
-                .GetString(bytes);
+            var status = Utf8.ToUtf16(
+                bytes,
+                chars,
+                out var read,
+                out var written,
+                replaceInvalidSequences: false,
+                isFinalBlock: true);
+
+            return status == OperationStatus.Done && read == bytes.Length
+                ? new string(chars[..written])
+                : null;
         }
-        catch (DecoderFallbackException)
+        finally
         {
-            return null;
+            if (rented is not null)
+            {
+                ArrayPool<char>.Shared.Return(rented);
+            }
         }
     }
 }

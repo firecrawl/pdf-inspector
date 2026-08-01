@@ -140,9 +140,42 @@ internal sealed class PdfLexer(byte[] data, int position = 0)
     }
 
     /// <summary>Reads a literal string, handling nesting, escapes, and octal codes. The opening paren must already be consumed.</summary>
+    /// <remarks>
+    /// A content stream is mostly literal strings, and building each one a byte
+    /// at a time through a fresh <see cref="List{T}"/> — growing from four, then
+    /// copied again by the final <c>ToArray</c> — put this at 8% of a
+    /// text-heavy document. The overwhelmingly common literal contains no
+    /// escape at all, so it is a slice of the input that needs exactly one copy;
+    /// the escaped path builds into a buffer that lives on the lexer and is
+    /// reused across every string in the stream.
+    /// </remarks>
     public byte[] ReadLiteralStringBody()
     {
-        var buffer = new List<byte>();
+        var data = Data;
+        var start = Position;
+
+        // Fast path: no backslash before the closing paren.
+        var scanDepth = 1;
+        for (var i = start; i < data.Length; i++)
+        {
+            var b = data[i];
+            if (b == (byte)'\\')
+            {
+                break;
+            }
+
+            if (b == (byte)'(')
+            {
+                scanDepth++;
+            }
+            else if (b == (byte)')' && --scanDepth == 0)
+            {
+                Position = i + 1;
+                return data.AsSpan(start, i - start).ToArray();
+            }
+        }
+
+        var buffer = new ScratchWriter(this);
         var depth = 1;
 
         while (Position < Data.Length)
@@ -210,7 +243,7 @@ internal sealed class PdfLexer(byte[] data, int position = 0)
                     depth--;
                     if (depth == 0)
                     {
-                        return [.. buffer];
+                        return buffer.ToArray();
                     }
 
                     buffer.Add(b);
@@ -222,13 +255,13 @@ internal sealed class PdfLexer(byte[] data, int position = 0)
             }
         }
 
-        return [.. buffer];
+        return buffer.ToArray();
     }
 
     /// <summary>Reads a hex string body. The opening angle bracket must already be consumed.</summary>
     public byte[] ReadHexStringBody()
     {
-        var buffer = new List<byte>();
+        var buffer = new ScratchWriter(this);
         int? pending = null;
 
         while (Position < Data.Length)
@@ -261,8 +294,36 @@ internal sealed class PdfLexer(byte[] data, int position = 0)
             buffer.Add((byte)(pending.Value << 4));
         }
 
-        return [.. buffer];
+        return buffer.ToArray();
     }
+
+    /// <summary>
+    /// Appends into a buffer owned by the lexer, so consecutive strings in one
+    /// stream reuse the same allocation instead of each growing its own from
+    /// nothing. Only one writer is live at a time — every caller runs to
+    /// <see cref="ToArray"/> before the next begins.
+    /// </summary>
+    private ref struct ScratchWriter(PdfLexer lexer)
+    {
+        private readonly PdfLexer _lexer = lexer;
+        private int _count = 0;
+
+        public void Add(byte value)
+        {
+            var scratch = _lexer._scratch;
+            if (_count == scratch.Length)
+            {
+                Array.Resize(ref _lexer._scratch, scratch.Length == 0 ? 64 : scratch.Length * 2);
+                scratch = _lexer._scratch;
+            }
+
+            scratch[_count++] = value;
+        }
+
+        public readonly byte[] ToArray() => _lexer._scratch.AsSpan(0, _count).ToArray();
+    }
+
+    private byte[] _scratch = [];
 
     public static bool TryHex(byte b, out int value)
     {

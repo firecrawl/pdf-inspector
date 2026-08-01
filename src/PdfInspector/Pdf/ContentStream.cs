@@ -20,9 +20,17 @@ public static class ContentStream
     /// </summary>
     public static List<PdfOperation> Decode(byte[] data)
     {
-        var operations = new List<PdfOperation>();
+        // A content-stream operation averages a couple of dozen bytes, so this
+        // lands within a doubling of the final count and skips the growth
+        // sequence a text-heavy page would otherwise walk.
+        var operations = new List<PdfOperation>(Math.Min((data.Length / 24) + 8, 1 << 16));
         var parser = new PdfParser(data);
         var lexer = new PdfLexer(data);
+
+        // Operands accumulate here and are copied out at exact size when the
+        // operator arrives. A fresh list per operation grew 0 -> 4 -> 8 for
+        // every one of them, which was the single largest allocation site in
+        // the extractor.
         var operands = new List<PdfObject>();
 
         while (true)
@@ -108,8 +116,10 @@ public static class ContentStream
                 continue;
             }
 
-            operations.Add(new PdfOperation(Operators.Intern(token), operands));
-            operands = [];
+            operations.Add(new PdfOperation(
+                Operators.Intern(token),
+                operands.Count == 0 ? [] : [.. operands]));
+            operands.Clear();
         }
 
         return operations;

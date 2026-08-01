@@ -185,42 +185,40 @@ internal static class Program
     }
 
     /// <summary>
-    /// Runs the fixture until the code under test has finished tiering up, or
-    /// until the warmup wall clock runs out.
+    /// Repeats the fixture for a fixed stretch of wall clock, which is long
+    /// enough for the code under test to finish tiering up.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A fixed three-iteration warmup is badly wrong on .NET, and so is a
-    /// convergence rule. Measured directly: td9264 reported 80 ms run alone and
-    /// 20 ms when other fixtures had already warmed the shared code. Same work,
-    /// four times the number, purely an artefact of the harness — and a rule
-    /// that stopped once the timings held steady for five passes still read
-    /// 110 ms, because tier-up is a delayed step down rather than a glide.
+    /// A fixed three-pass warmup is badly wrong on .NET, and so is a convergence
+    /// rule. Measured directly: td9264 reported 84 ms run alone and 20 ms when
+    /// other fixtures had already warmed the shared code. Same work, four times
+    /// the number, purely an artefact of the harness — and a rule that stopped
+    /// once the timings held steady for five passes still read 110 ms, because
+    /// tier-up is a delayed step down rather than a glide.
     /// </para>
     /// <para>
-    /// The cause is call counting. A method is promoted to tier-1 after
-    /// <see cref="TierUpCallTarget"/>-ish invocations, and one extraction calls
-    /// most of the pipeline's per-document methods exactly once. Loop bodies
-    /// escape this via on-stack replacement, which is why the multi-second
-    /// fixtures are insensitive to warmup length, but everything called once per
-    /// page or once per document needs real repetition. Nothing in the timings
-    /// signals that the promotions are still pending, so waiting on the numbers
-    /// cannot work; waiting on the call count can.
+    /// The cause is call counting. A method reaches tier-1 only after enough
+    /// invocations, and one extraction calls most of the pipeline's
+    /// per-document methods exactly once. Loop bodies escape this through
+    /// on-stack replacement, which is why the multi-second fixtures are
+    /// insensitive to warmup length, but everything called once per page or once
+    /// per document needs real repetition.
     /// </para>
     /// <para>
-    /// Hence: repeat until the call target is met, capped by a wall clock so a
-    /// fixture whose single pass already takes seconds does not warm for an
-    /// hour. Those fixtures are precisely the ones that do not need it. Measured
-    /// on td9264, alone: 84 ms at the old rule, 28 ms at 50 passes, 22.6 ms at
-    /// 100 — against 21 ms for a 300-iteration run, and 20 ms for the same
-    /// fixture inside a full sweep.
+    /// A fixed pass count does not work either, because how many passes that
+    /// takes scales with how small the document is: 300 passes settle td9264,
+    /// while <c>wireless_two_col_no_rects</c> — a quarter the size — still reads
+    /// 13.4 ms at 100 passes, 4.9 at 400 and 4.0 at 1000. What the two have in
+    /// common is the wall clock: both are settled after roughly four seconds of
+    /// repetition. So that is the rule, and it needs no cap — a fixture whose
+    /// single pass already takes seconds satisfies it after one or two, which is
+    /// all such a fixture needs.
     /// </para>
     /// </remarks>
     private static (int Warmups, long OutputBytes) WarmUntilStable(byte[] bytes, BenchOptions options)
     {
-        // A fixture whose single pass already runs for seconds must not spend
-        // minutes warming, and does not need to.
-        var maxWarmupMs = Math.Max(options.BudgetMs * 2, 10_000);
+        var warmupMs = Math.Max(options.BudgetMs, MinWarmupMs);
 
         var sw = Stopwatch.StartNew();
         var warmups = 0;
@@ -231,12 +229,7 @@ internal static class Program
             outputBytes = RunOnce(bytes);
             warmups++;
 
-            if (warmups >= options.WarmupIterations && warmups >= TierUpCallTarget)
-            {
-                break;
-            }
-
-            if (sw.ElapsedMilliseconds > maxWarmupMs)
+            if (warmups >= options.WarmupIterations && sw.ElapsedMilliseconds >= warmupMs)
             {
                 break;
             }
@@ -246,12 +239,10 @@ internal static class Program
     }
 
     /// <summary>
-    /// Warmup passes needed for the per-document methods to reach tier-1. The
-    /// runtime's own call-counting threshold is 30, but promotion is deferred
-    /// while the process is still meeting new methods and the compilation is
-    /// then queued to a background thread, so the effective count is higher.
+    /// How long a fixture is repeated before it is measured. Four seconds is
+    /// where the smallest fixture stops improving; five leaves margin.
     /// </summary>
-    private const int TierUpCallTarget = 100;
+    private const int MinWarmupMs = 5_000;
 
     /// <summary>
     /// One full extraction. The result is consumed so nothing folds away, and

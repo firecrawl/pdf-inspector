@@ -223,24 +223,47 @@ internal static class RectGrid
             }
         }
 
-        var groups = new Dictionary<int, List<int>>();
+        // Resolve every root and size its component before filling anything, so
+        // each surviving group's list is allocated once at its final size. A
+        // cluster runs to thousands of rects, and growing those lists a doubling
+        // at a time was the largest copy in rect detection.
+        var roots = new int[n];
+        var sizes = new Dictionary<int, int>();
         for (var i = 0; i < n; i++)
         {
             var root = uf.Find(i);
-            if (!groups.TryGetValue(root, out var group))
-            {
-                group = [];
-                groups[root] = group;
-            }
+            roots[i] = root;
+            sizes[root] = sizes.TryGetValue(root, out var count) ? count + 1 : 1;
+        }
 
-            group.Add(i);
+        var groups = new Dictionary<int, List<int>>(sizes.Count);
+        foreach (var (root, size) in sizes)
+        {
+            if (size >= minSize)
+            {
+                groups[root] = new List<int>(size);
+            }
+        }
+
+        for (var i = 0; i < n; i++)
+        {
+            if (groups.TryGetValue(roots[i], out var group))
+            {
+                group.Add(i);
+            }
         }
 
         // Ordered by root index, for deterministic output.
-        return [.. groups
-            .Where(kv => kv.Value.Count >= minSize)
-            .OrderBy(kv => kv.Key)
-            .Select(kv => kv.Value)];
+        var order = new List<int>(groups.Keys);
+        order.Sort();
+
+        var result = new List<List<int>>(order.Count);
+        foreach (var root in order)
+        {
+            result.Add(groups[root]);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -584,19 +607,10 @@ internal static class RectGrid
         var numCols = colEdges.Count - 1;
         var numRows = rowEdges.Count - 1;
 
-        var cellItems = new List<List<List<TextItem>>>(numRows);
-        for (var r = 0; r < numRows; r++)
-        {
-            var row = new List<List<TextItem>>(numCols);
-            for (var c = 0; c < numCols; c++)
-            {
-                row.Add([]);
-            }
-
-            cellItems.Add(row);
-        }
+        var numCells = numCols * numRows;
 
         var indices = new List<int>();
+        var cellOfIndex = new List<int>();
 
         for (var idx = 0; idx < items.Count; idx++)
         {
@@ -632,25 +646,73 @@ internal static class RectGrid
 
             if (col is { } c2 && row is { } r2)
             {
-                cellItems[r2][c2].Add(item);
                 indices.Add(idx);
+                cellOfIndex.Add((r2 * numCols) + c2);
             }
         }
 
+        // Count each cell's occupants before filling anything. A grid is mostly
+        // empty cells, and allocating a list for every one of them and growing
+        // the occupied ones a doubling at a time was the largest copy in grid
+        // building — this runs three times per candidate table.
+        var counts = ArrayPool<int>.Shared.Rent(numCells);
+        Array.Clear(counts, 0, numCells);
+        foreach (var cell in cellOfIndex)
+        {
+            counts[cell]++;
+        }
+
+        var buckets = new List<TextItem>?[numCells];
+        for (var i = 0; i < numCells; i++)
+        {
+            if (counts[i] > 0)
+            {
+                buckets[i] = new List<TextItem>(counts[i]);
+            }
+        }
+
+        ArrayPool<int>.Shared.Return(counts);
+
+        for (var k = 0; k < indices.Count; k++)
+        {
+            buckets[cellOfIndex[k]]!.Add(items[indices[k]]);
+        }
+
         var cells = new List<List<string>>(numRows);
-        foreach (var rowItems in cellItems)
+        var text = new StringBuilder();
+
+        for (var r = 0; r < numRows; r++)
         {
             var rowCells = new List<string>(numCols);
-            foreach (var colItems in rowItems)
+            for (var c = 0; c < numCols; c++)
             {
-                colItems.Sort((a, b) =>
+                var colItems = buckets[(r * numCols) + c];
+                if (colItems is null)
                 {
-                    var byY = FloatTotalOrder.Instance.Compare(b.Y, a.Y);
-                    return byY != 0 ? byY : FloatTotalOrder.Instance.Compare(a.X, b.X);
-                });
+                    rowCells.Add(string.Empty);
+                    continue;
+                }
 
-                var text = string.Join(" ", colItems.Select(i => i.Text.Trim()).Where(t => t.Length > 0));
-                rowCells.Add(RemoveInnerDelimiterSpaces(text));
+                colItems.Sort(CellReadingOrder);
+
+                text.Clear();
+                foreach (var item in colItems)
+                {
+                    var trimmed = item.Text.AsSpan().Trim();
+                    if (trimmed.IsEmpty)
+                    {
+                        continue;
+                    }
+
+                    if (text.Length > 0)
+                    {
+                        text.Append(' ');
+                    }
+
+                    text.Append(trimmed);
+                }
+
+                rowCells.Add(RemoveInnerDelimiterSpaces(text.ToString()));
             }
 
             cells.Add(rowCells);
@@ -658,6 +720,13 @@ internal static class RectGrid
 
         return (cells, indices);
     }
+
+    /// <summary>Top-to-bottom, then left-to-right — the order text reads inside a cell.</summary>
+    private static readonly Comparison<TextItem> CellReadingOrder = (a, b) =>
+    {
+        var byY = FloatTotalOrder.Instance.Compare(b.Y, a.Y);
+        return byY != 0 ? byY : FloatTotalOrder.Instance.Compare(a.X, b.X);
+    };
 
     /// <summary>Drops the spaces that joining leaves just inside brackets.</summary>
     private static string RemoveInnerDelimiterSpaces(string text)

@@ -141,14 +141,14 @@ fn measure(path: &Path, opts: &Options) -> FixtureResult {
         .to_string();
     let bytes = std::fs::read(path).expect("read fixture");
 
-    // Warmup, under exactly the rule the C# harness uses: repeat until the call
-    // target is met or the wall clock runs out. There is no JIT here, so the
-    // repetitions buy only settled caches, branch predictors and allocator free
-    // lists — but running the identical protocol on both sides is what keeps the
-    // comparison honest. See `WarmUntilStable` in the C# harness for why the
-    // count is what it is.
-    const TIER_UP_CALL_TARGET: usize = 100;
-    let max_warmup_ms = (opts.budget_ms * 2).max(10_000);
+    // Warmup, under exactly the rule the C# harness uses: repeat the fixture for
+    // a fixed stretch of wall clock. There is no JIT here, so the repetitions
+    // buy only settled caches, branch predictors and allocator free lists — but
+    // running the identical protocol on both sides is what keeps the comparison
+    // honest. See `WarmUntilStable` in the C# harness for why the rule is what
+    // it is.
+    const MIN_WARMUP_MS: u128 = 5_000;
+    let warmup_ms = opts.budget_ms.max(MIN_WARMUP_MS);
 
     let warm_start = Instant::now();
     let mut warmups = 0usize;
@@ -156,10 +156,7 @@ fn measure(path: &Path, opts: &Options) -> FixtureResult {
         black_box(run_once(&bytes));
         warmups += 1;
 
-        if warmups >= opts.warmup_iterations && warmups >= TIER_UP_CALL_TARGET {
-            break;
-        }
-        if warm_start.elapsed().as_millis() > max_warmup_ms {
+        if warmups >= opts.warmup_iterations && warm_start.elapsed().as_millis() >= warmup_ms {
             break;
         }
     }

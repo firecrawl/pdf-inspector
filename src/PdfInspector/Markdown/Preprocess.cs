@@ -1,4 +1,5 @@
 // Ported from reference/src/markdown/preprocess.rs
+using System.Text;
 using PdfInspector.Structure;
 using PdfInspector.Text;
 using PdfInspector.Types;
@@ -160,8 +161,7 @@ internal static class Preprocess
     }
 
     /// <summary>Counts whitespace-separated words.</summary>
-    private static int WordCount(string text) =>
-        text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+    private static int WordCount(string text) => text.CountWords();
 
     /// <summary>True when every item on the line is bold.</summary>
     private static bool AllBold(TextLine line) => line.Items.Count > 0 && line.Items.All(i => i.IsBold);
@@ -245,8 +245,21 @@ internal static class Preprocess
     }
 
     /// <summary>Trims and collapses internal whitespace runs, for comparison.</summary>
-    private static string NormalizeWhitespace(string s) =>
-        string.Join(' ', s.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+    private static string NormalizeWhitespace(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        foreach (var token in s.SplitWhitespace())
+        {
+            if (sb.Length > 0)
+            {
+                sb.Append(' ');
+            }
+
+            sb.Append(token);
+        }
+
+        return sb.ToString();
+    }
 
     /// <summary>
     /// Normalises text for frequency comparison: collapses whitespace and strips

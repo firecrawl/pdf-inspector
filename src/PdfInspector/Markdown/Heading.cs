@@ -226,13 +226,13 @@ internal static class Heading
     /// <summary>Parses a leading section number such as "3.", "4.2)" or "IV.".</summary>
     private static Numbering? ParseNumbering(string text)
     {
-        var first = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-        if (first is null || first.Length == 0 || first[^1] is not ('.' or ')' or ':'))
+        var firstWord = text.AsSpan().FirstWord();
+        if (firstWord.IsEmpty || firstWord[^1] is not ('.' or ')' or ':'))
         {
             return null;
         }
 
-        var token = first.TrimEnd('.', ')', ':');
+        var token = firstWord.TrimEnd(".):").ToString();
         if (token.Length == 0)
         {
             return null;
@@ -394,7 +394,7 @@ internal static class Heading
     private static bool TitleLike(string text, bool numbered, bool bold)
     {
         var trimmed = text.Trim();
-        var wordCount = trimmed.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+        var wordCount = trimmed.CountWords();
         if (wordCount is < 1 or > 12
             || TextUtils.ByteLength(trimmed) is < 4 or > 140
             || !trimmed.Any(char.IsLetter)

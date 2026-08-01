@@ -1,5 +1,6 @@
 // Ported from reference/src/text_quality.rs
 using System.Text;
+using PdfInspector.Text;
 using PdfInspector.Types;
 
 namespace PdfInspector.Quality;
@@ -401,10 +402,20 @@ internal static class TextQuality
         return longestRun >= 3 || (total >= 5 && privateUse >= 2 && privateUse * 2 >= total);
     }
 
-    private static bool HasCidControlToken(string text) =>
-        text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Any(TokenHasCidControl);
+    private static bool HasCidControlToken(string text)
+    {
+        foreach (var token in text.SplitWhitespace())
+        {
+            if (TokenHasCidControl(token))
+            {
+                return true;
+            }
+        }
 
-    private static bool TokenHasCidControl(string token)
+        return false;
+    }
+
+    private static bool TokenHasCidControl(ReadOnlySpan<char> token)
     {
         var total = 0;
         var c1Control = 0;

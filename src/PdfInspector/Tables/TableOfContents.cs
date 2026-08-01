@@ -229,9 +229,14 @@ internal static class TableOfContents
                 continue;
             }
 
-            totalWords += row[0]
-                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
-                .Count(t => t.Any(char.IsLetter));
+            foreach (var token in row[0].SplitWhitespace())
+            {
+                if (ContainsLetter(token))
+                {
+                    totalWords++;
+                }
+            }
+
             titledRows++;
         }
 
@@ -468,9 +473,15 @@ internal static class TableOfContents
 
             lastFilled++;
 
-            var isPageNums = cell
-                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
-                .All(tok => tok.All(char.IsAsciiDigit));
+            var isPageNums = true;
+            foreach (var token in cell.SplitWhitespace())
+            {
+                if (token.ContainsAnyExceptInRange('0', '9'))
+                {
+                    isPageNums = false;
+                    break;
+                }
+            }
 
             if (isPageNums)
             {
@@ -482,6 +493,20 @@ internal static class TableOfContents
         var pageNumLastRatio = lastFilled > 0 ? (float)lastPageNum / lastFilled : 0.0f;
 
         return sectionRatio >= 0.6f && lastFilled >= 3 && pageNumLastRatio >= 0.7f;
+    }
+
+    /// <summary>True when the span holds at least one letter.</summary>
+    private static bool ContainsLetter(ReadOnlySpan<char> text)
+    {
+        foreach (var c in text)
+        {
+            if (char.IsLetter(c))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>A dashed section-page identifier as technical manuals use: "5-21", "A-1", "TC-2".</summary>
@@ -496,13 +521,13 @@ internal static class TableOfContents
     /// </summary>
     private static bool StartsWithSectionNumber(string s)
     {
-        var first = s.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-        if (first is null)
+        var firstWord = s.AsSpan().FirstWord();
+        if (firstWord.IsEmpty)
         {
             return false;
         }
 
-        first = first.TrimEnd('.');
+        var first = firstWord.TrimEnd('.').ToString();
         var parts = first.Split('.');
 
         if (parts.Length is < 2 or > 6)

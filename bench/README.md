@@ -39,7 +39,7 @@ pass, because a one-shot run never leaves tier-0 code. Both harnesses therefore
 warm up until the hot paths are compiled and the caches are settled, then time
 repeated runs in-process and report the distribution.
 
-## Why warmup is 100 passes
+## Why warmup is five seconds
 
 Long enough to look like overkill, and it isn't. .NET promotes a method to
 tier-1 by counting its invocations, and one extraction calls most of the
@@ -51,29 +51,30 @@ the shared code and the same work reports 20 ms.
 Nothing in the timings marks the moment the promotions land, so a convergence
 rule — stop once five consecutive passes fail to improve — does not fix it: it
 stops at pass 12, still reading 110 ms, because tier-up is a delayed step down
-rather than a glide. Waiting on the call count does fix it. Measured on
-`td9264` alone: 84 ms under the old rule, 28 ms at 50 passes, 22 ms at 100,
-against 21 ms for a 300-pass run.
+rather than a glide.
 
-The wall clock caps it at `max(2 × budget, 10 s)`, so a fixture whose single
-pass already takes seconds warms only a handful of times. Those are exactly the
-fixtures that do not need it — their time is inside loops, which on-stack
-replacement promotes without waiting for a call count. `multiline_indent_cell_rect_grid`
-reads 1649 ms at 3 warmups and 1690 ms at 100.
+A fixed pass count does not fix it either, because how many passes it takes
+scales with how small the document is:
+
+| passes | `td9264` | `wireless_two_col_no_rects` |
+|---|---|---|
+| 100 | 22.6 ms | 13.4 ms |
+| 300 | 18.4 ms | — |
+| 400 | — | 4.9 ms |
+| 1000 | — | 4.0 ms |
+| 1750 | — | 4.0 ms |
+
+What the two have in common is the wall clock: both settle after roughly four
+seconds of repetition. So that is the rule — repeat for
+`max(budget, 5 s)` — and it needs no cap. A fixture whose single pass already
+takes seconds satisfies it after one or two, which is all such a fixture needs:
+its time is inside loops, which on-stack replacement promotes without waiting
+for a call count. `multiline_indent_cell_rect_grid` reads 1649 ms at 3 warmups
+and 1690 ms at 100.
 
 The Rust harness runs the identical rule. It has no JIT, so the repetitions buy
 only settled caches and allocator free lists, but a protocol that differs
 between the two sides is not a comparison.
-
-The headline figure is the **median**. A shared VM stalls occasionally and the
-mean absorbs those stalls; `min` is the cleanest view of the code itself and
-`p95`/`sd` show how noisy the machine was. The C# harness also reports bytes
-allocated per pass and the gen-0/gen-2 collection counts, which is what
-optimisation work here is usually chasing.
-
-A fixture whose single pass already outruns the budget is timed once and
-reported with `n=1`. Treat those as indicative: there is no distribution behind
-them.
 
 ## The calibration kernels
 
