@@ -54,6 +54,39 @@ pub(crate) struct UnderlineLine {
     pub(crate) page: u32,
 }
 
+/// Transform a user-space point through a CTM.
+pub(crate) fn transform_path_point(x: f32, y: f32, ctm: &[f32; 6]) -> (f32, f32) {
+    (
+        x * ctm[0] + y * ctm[2] + ctm[4],
+        x * ctm[1] + y * ctm[3] + ctm[5],
+    )
+}
+
+/// Scale a stroke width by the CTM component perpendicular to the segment.
+pub(crate) fn transformed_stroke_width(
+    line_width: f32,
+    ctm: &[f32; 6],
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+) -> f32 {
+    let user_width = line_width.abs();
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= f32::EPSILON {
+        return user_width;
+    }
+
+    // PDF stroke width scales perpendicular to the path direction.
+    let nx = -dy / len;
+    let ny = dx / len;
+    let ndx = nx * ctm[0] + ny * ctm[2];
+    let ndy = nx * ctm[1] + ny * ctm[3];
+    user_width * (ndx * ndx + ndy * ndy).sqrt()
+}
+
 /// A horizontal rule candidate in page coordinates (PDF y-up).
 #[derive(Clone)]
 struct Rule {

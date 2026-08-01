@@ -18,7 +18,7 @@ use super::fonts::{
     extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
     FontStyleCache,
 };
-use super::underline::UnderlineLine;
+use super::underline::{transform_path_point, transformed_stroke_width, UnderlineLine};
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -74,37 +74,6 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     }
 
     result
-}
-
-fn transform_path_point(x: f32, y: f32, ctm: &[f32; 6]) -> (f32, f32) {
-    (
-        x * ctm[0] + y * ctm[2] + ctm[4],
-        x * ctm[1] + y * ctm[3] + ctm[5],
-    )
-}
-
-fn transformed_stroke_width(
-    line_width: f32,
-    ctm: &[f32; 6],
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-) -> f32 {
-    let user_width = line_width.abs();
-    let dx = x2 - x1;
-    let dy = y2 - y1;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len <= f32::EPSILON {
-        return user_width;
-    }
-
-    // PDF stroke width scales perpendicular to the path direction.
-    let nx = -dy / len;
-    let ny = dx / len;
-    let ndx = nx * ctm[0] + ny * ctm[2];
-    let ndy = nx * ctm[1] + ny * ctm[3];
-    user_width * (ndx * ndx + ndy * ndy).sqrt()
 }
 
 /// Text rise (Ts) displaces the glyph origin by (0, rise) in unscaled text
@@ -858,8 +827,10 @@ pub(crate) fn extract_page_text_items(
                                     });
                                 }
                                 XObjectType::Form(form_id) => {
-                                    // Extract text from Form XObject
-                                    let form_items = extract_form_xobject_text(
+                                    // Extract text + painted underline graphics
+                                    // from the Form XObject (rules drawn inside
+                                    // forms never reached the page-level pass).
+                                    let form = extract_form_xobject_text(
                                         doc,
                                         *form_id,
                                         page_num,
@@ -868,7 +839,9 @@ pub(crate) fn extract_page_text_items(
                                         &mut cmap_decisions,
                                         style_cache,
                                     );
-                                    items.extend(form_items);
+                                    items.extend(form.items);
+                                    painted_rects.extend(form.painted_rects);
+                                    underline_lines.extend(form.underline_lines);
                                 }
                             }
                         }

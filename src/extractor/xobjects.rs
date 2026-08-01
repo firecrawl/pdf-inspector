@@ -3,7 +3,7 @@
 use super::fonts::descriptor_style_flags;
 use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_italic_font};
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, TextItem};
+use crate::types::{ItemType, PdfRect, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -11,6 +11,7 @@ use super::fonts::{
     build_font_encodings, build_font_widths, compute_string_width_ts, extract_text_from_operand,
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
+use super::underline::{transform_path_point, transformed_stroke_width, UnderlineLine};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
@@ -107,7 +108,25 @@ fn collect_xobjects_from_dict(
     }
 }
 
-/// Extract text items from a Form XObject
+/// Text plus underline/strikeout graphics extracted from a Form XObject.
+#[derive(Default)]
+pub(crate) struct FormXObjectExtract {
+    pub(crate) items: Vec<TextItem>,
+    /// Painted `re`/`f` rectangles in page device space (for underline detection).
+    pub(crate) painted_rects: Vec<PdfRect>,
+    /// Stroked horizontal segments in page device space.
+    pub(crate) underline_lines: Vec<UnderlineLine>,
+}
+
+impl FormXObjectExtract {
+    fn append(&mut self, other: FormXObjectExtract) {
+        self.items.extend(other.items);
+        self.painted_rects.extend(other.painted_rects);
+        self.underline_lines.extend(other.underline_lines);
+    }
+}
+
+/// Extract text items and painted underline graphics from a Form XObject.
 pub(crate) fn extract_form_xobject_text(
     doc: &Document,
     form_id: ObjectId,
@@ -116,7 +135,7 @@ pub(crate) fn extract_form_xobject_text(
     parent_ctm: &[f32; 6],
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
-) -> Vec<TextItem> {
+) -> FormXObjectExtract {
     extract_form_xobject_text_inner(
         doc,
         form_id,
@@ -139,14 +158,14 @@ fn extract_form_xobject_text_inner(
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
-) -> Vec<TextItem> {
+) -> FormXObjectExtract {
     use lopdf::content::Content;
 
-    let mut items = Vec::new();
+    let mut extract = FormXObjectExtract::default();
 
     // Get the Form XObject stream
     let Ok(Object::Stream(stream)) = doc.get_object(form_id) else {
-        return items;
+        return extract;
     };
 
     // Decompress the content stream (fall back to raw bytes for uncompressed streams)
@@ -157,7 +176,7 @@ fn extract_form_xobject_text_inner(
 
     // Decode the content stream
     let Ok(content) = Content::decode(&content_data) else {
-        return items;
+        return extract;
     };
 
     // Get fonts from the Form's Resources
@@ -249,6 +268,16 @@ fn extract_form_xobject_text_inner(
     let mut ctm = base_ctm;
     let mut ctm_stack: Vec<[f32; 6]> = Vec::new();
 
+    // Path / paint state — mirrors the page-level underline collectors so
+    // rules drawn inside Form XObjects reach mark_underlined_items.
+    let mut line_width: f32 = 1.0;
+    let mut path_subpath_start: Option<(f32, f32)> = None;
+    let mut path_current: Option<(f32, f32)> = None;
+    let mut pending_lines: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut pending_subpaths: Vec<Vec<(f32, f32, f32, f32)>> = Vec::new();
+    let mut pending_re_rects: Vec<PdfRect> = Vec::new();
+    let mut fill_rects: Vec<PdfRect> = Vec::new();
+
     for op in &content.operations {
         match op.operator.as_str() {
             "q" => {
@@ -275,7 +304,7 @@ fn extract_form_xobject_text_inner(
                         match form_xobjects.get(&xobj_name) {
                             Some(XObjectType::Form(nested_id)) => {
                                 if depth < MAX_FORM_XOBJECT_DEPTH {
-                                    let nested_items = extract_form_xobject_text_inner(
+                                    let nested = extract_form_xobject_text_inner(
                                         doc,
                                         *nested_id,
                                         page_num,
@@ -285,7 +314,7 @@ fn extract_form_xobject_text_inner(
                                         style_cache,
                                         depth + 1,
                                     );
-                                    items.extend(nested_items);
+                                    extract.append(nested);
                                 }
                             }
                             Some(XObjectType::Image) => {
@@ -294,7 +323,7 @@ fn extract_form_xobject_text_inner(
                                 // inside Form XObjects (common in print-to-PDF
                                 // workflows) aren't silently dropped.
                                 let (x, y, width, height) = image_bbox_from_ctm(&ctm);
-                                items.push(TextItem {
+                                extract.items.push(TextItem {
                                     text: format!("[Image: {}]", xobj_name),
                                     x,
                                     y,
@@ -444,7 +473,7 @@ fn extract_form_xobject_text_inner(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
-                            items.push(TextItem {
+                            extract.items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x,
                                 y,
@@ -598,7 +627,7 @@ fn extract_form_xobject_text_inner(
                                 } else {
                                     0.0
                                 };
-                                items.push(TextItem {
+                                extract.items.push(TextItem {
                                     text: expand_ligatures(text),
                                     x,
                                     y,
@@ -624,11 +653,179 @@ fn extract_form_xobject_text_inner(
                     }
                 }
             }
+            // ── Path construction / painting (underline graphics) ──
+            "w" => {
+                if let Some(width) = op.operands.first().and_then(get_number) {
+                    line_width = width;
+                }
+            }
+            "re" => {
+                if op.operands.len() >= 4 {
+                    let rx = get_number(&op.operands[0]).unwrap_or(0.0);
+                    let ry = get_number(&op.operands[1]).unwrap_or(0.0);
+                    let rw = get_number(&op.operands[2]).unwrap_or(0.0);
+                    let rh = get_number(&op.operands[3]).unwrap_or(0.0);
+                    let x_dev = rx * ctm[0] + ry * ctm[2] + ctm[4];
+                    let y_dev = rx * ctm[1] + ry * ctm[3] + ctm[5];
+                    let w_dev = rw * ctm[0];
+                    let h_dev = rh * ctm[3];
+                    pending_re_rects.push(PdfRect {
+                        x: x_dev,
+                        y: y_dev,
+                        width: w_dev,
+                        height: h_dev,
+                        page: page_num,
+                    });
+                }
+            }
+            "m" => {
+                if op.operands.len() >= 2 {
+                    let px = get_number(&op.operands[0]).unwrap_or(0.0);
+                    let py = get_number(&op.operands[1]).unwrap_or(0.0);
+                    path_subpath_start = Some((px, py));
+                    path_current = Some((px, py));
+                }
+            }
+            "l" => {
+                if op.operands.len() >= 2 {
+                    if let Some((cx, cy)) = path_current {
+                        let px = get_number(&op.operands[0]).unwrap_or(0.0);
+                        let py = get_number(&op.operands[1]).unwrap_or(0.0);
+                        pending_lines.push((cx, cy, px, py));
+                        path_current = Some((px, py));
+                    }
+                }
+            }
+            "h" => {
+                if let (Some((cx, cy)), Some((sx, sy))) = (path_current, path_subpath_start) {
+                    if (cx - sx).abs() > 0.01 || (cy - sy).abs() > 0.01 {
+                        pending_lines.push((cx, cy, sx, sy));
+                    }
+                    path_current = path_subpath_start;
+                }
+                if !pending_lines.is_empty() {
+                    pending_subpaths.push(std::mem::take(&mut pending_lines));
+                }
+            }
+            "S" | "s" => {
+                if op.operator == "s" {
+                    if let (Some((cx, cy)), Some((sx, sy))) = (path_current, path_subpath_start) {
+                        if (cx - sx).abs() > 0.01 || (cy - sy).abs() > 0.01 {
+                            pending_lines.push((cx, cy, sx, sy));
+                        }
+                    }
+                }
+                for (x1, y1, x2, y2) in pending_lines.drain(..) {
+                    let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
+                    let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
+                    extract.underline_lines.push(UnderlineLine {
+                        x1: x1d,
+                        y1: y1d,
+                        x2: x2d,
+                        y2: y2d,
+                        stroke_width: transformed_stroke_width(line_width, &ctm, x1, y1, x2, y2),
+                        page: page_num,
+                    });
+                }
+                extract.painted_rects.append(&mut pending_re_rects);
+                pending_subpaths.clear();
+                path_subpath_start = None;
+                path_current = None;
+            }
+            "B" | "B*" | "b" | "b*" => {
+                if op.operator == "b" || op.operator == "b*" {
+                    if let (Some((cx, cy)), Some((sx, sy))) = (path_current, path_subpath_start) {
+                        if (cx - sx).abs() > 0.01 || (cy - sy).abs() > 0.01 {
+                            pending_lines.push((cx, cy, sx, sy));
+                        }
+                    }
+                }
+                for (x1, y1, x2, y2) in pending_lines.drain(..) {
+                    let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
+                    let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
+                    extract.underline_lines.push(UnderlineLine {
+                        x1: x1d,
+                        y1: y1d,
+                        x2: x2d,
+                        y2: y2d,
+                        stroke_width: transformed_stroke_width(line_width, &ctm, x1, y1, x2, y2),
+                        page: page_num,
+                    });
+                }
+                extract.painted_rects.append(&mut pending_re_rects);
+                pending_subpaths.clear();
+                path_subpath_start = None;
+                path_current = None;
+            }
+            "f" | "F" | "f*" => {
+                if !pending_lines.is_empty() {
+                    pending_subpaths.push(std::mem::take(&mut pending_lines));
+                }
+                for subpath in pending_subpaths.drain(..) {
+                    let mut segs = subpath;
+                    if segs.len() == 3 {
+                        let (x0, y0, _, _) = segs[0];
+                        let (_, _, ex, ey) = segs[2];
+                        if (ex - x0).abs() > 0.01 || (ey - y0).abs() > 0.01 {
+                            segs.push((ex, ey, x0, y0));
+                        }
+                    }
+                    if segs.len() == 4 {
+                        let mut xs = Vec::with_capacity(8);
+                        let mut ys = Vec::with_capacity(8);
+                        for &(x1, y1, x2, y2) in &segs {
+                            xs.push(x1);
+                            xs.push(x2);
+                            ys.push(y1);
+                            ys.push(y2);
+                        }
+                        let min_x = xs.iter().copied().fold(f32::INFINITY, f32::min);
+                        let max_x = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let min_y = ys.iter().copied().fold(f32::INFINITY, f32::min);
+                        let max_y = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let w = max_x - min_x;
+                        let h = max_y - min_y;
+                        let eps: f32 = 0.5;
+                        let axis_aligned = xs
+                            .iter()
+                            .all(|&x| (x - min_x).abs() < eps || (x - max_x).abs() < eps)
+                            && ys
+                                .iter()
+                                .all(|&y| (y - min_y).abs() < eps || (y - max_y).abs() < eps);
+                        if axis_aligned && w > 1.0 && h > 1.0 {
+                            let x_dev = min_x * ctm[0] + min_y * ctm[2] + ctm[4];
+                            let y_dev = min_x * ctm[1] + min_y * ctm[3] + ctm[5];
+                            let w_dev = w * ctm[0];
+                            let h_dev = h * ctm[3];
+                            fill_rects.push(PdfRect {
+                                x: x_dev,
+                                y: y_dev,
+                                width: w_dev,
+                                height: h_dev,
+                                page: page_num,
+                            });
+                        }
+                    }
+                }
+                extract.painted_rects.append(&mut pending_re_rects);
+                pending_lines.clear();
+                path_subpath_start = None;
+                path_current = None;
+            }
+            "n" => {
+                // Discard unpainted paths — clip-only `re W n` must not underline.
+                pending_re_rects.clear();
+                pending_lines.clear();
+                pending_subpaths.clear();
+                path_subpath_start = None;
+                path_current = None;
+            }
             _ => {}
         }
     }
 
-    items
+    extract.painted_rects.extend(fill_rects);
+    extract
 }
 
 /// Get fonts from a Form XObject's Resources

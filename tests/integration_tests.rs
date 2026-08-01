@@ -3652,3 +3652,319 @@ fn pdf_options_debug_redacts_password() {
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
 }
+
+// ============================================================================
+// Form XObject underline / strikeout graphics (#126)
+// ============================================================================
+
+/// Build a PDF whose Form XObject draws text plus a painted underline rule.
+/// `paint` selects how the rule is drawn:
+/// - `"stroke"` — `m`/`l`/`S` under the baseline
+/// - `"rect"` — thin filled `re`/`f` under the baseline
+/// - `"clip"` — `re W n` clip-only (must NOT underline)
+fn make_pdf_with_form_underline(paint: &str) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+    let form_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 32,
+            "LastChar" => 126,
+            // Uniform 600-unit advance so "Underlined" (10 chars) ≈ 72pt at size 12.
+            "Widths" => Object::Array(vec![Object::Integer(600); 95]),
+        }
+        .into(),
+    );
+
+    // Form content: text at (100, 500) with width ~60 for "Underlined"
+    let mut form_ops = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+        Operation::new("Td", vec![100.into(), 500.into()]),
+        Operation::new("Tj", vec![Object::string_literal("Underlined")]),
+        Operation::new("ET", vec![]),
+    ];
+    match paint {
+        "stroke" => {
+            form_ops.push(Operation::new("w", vec![Object::Real(0.5)]));
+            form_ops.push(Operation::new("m", vec![100.into(), 498.into()]));
+            form_ops.push(Operation::new("l", vec![160.into(), 498.into()]));
+            form_ops.push(Operation::new("S", vec![]));
+        }
+        "rect" => {
+            // Thin filled rect just under the baseline.
+            form_ops.push(Operation::new(
+                "re",
+                vec![
+                    100.into(),
+                    Object::Real(497.5),
+                    60.into(),
+                    Object::Real(1.0),
+                ],
+            ));
+            form_ops.push(Operation::new("f", vec![]));
+        }
+        "clip" => {
+            form_ops.push(Operation::new(
+                "re",
+                vec![
+                    100.into(),
+                    Object::Real(497.5),
+                    60.into(),
+                    Object::Real(1.0),
+                ],
+            ));
+            form_ops.push(Operation::new("W", vec![]));
+            form_ops.push(Operation::new("n", vec![]));
+        }
+        other => panic!("unknown paint mode: {other}"),
+    }
+
+    let form_content = Content {
+        operations: form_ops,
+    }
+    .encode()
+    .unwrap();
+    doc.objects.insert(
+        form_id,
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => font_id,
+                    },
+                },
+            },
+            form_content,
+        )
+        .into(),
+    );
+
+    // Page merely invokes the form.
+    let page_ops = vec![Operation::new("Do", vec!["Fm0".into()])];
+    let page_content = Content {
+        operations: page_ops,
+    }
+    .encode()
+    .unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, page_content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+                "XObject" => dictionary! {
+                    "Fm0" => form_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_form_xobject_stroked_underline_marks_text() {
+    let pdf = make_pdf_with_form_underline("stroke");
+    let items = extract_text_with_positions_mem(&pdf).expect("extract");
+    let hit = items
+        .iter()
+        .find(|i| i.text.contains("Underlined"))
+        .expect("text item from form");
+    assert!(
+        hit.is_underline,
+        "stroked rule inside Form XObject should mark underline; item={hit:?}"
+    );
+}
+
+#[test]
+fn test_form_xobject_filled_rect_underline_marks_text() {
+    let pdf = make_pdf_with_form_underline("rect");
+    let items = extract_text_with_positions_mem(&pdf).expect("extract");
+    let hit = items
+        .iter()
+        .find(|i| i.text.contains("Underlined"))
+        .expect("text item from form");
+    assert!(
+        hit.is_underline,
+        "filled thin rect inside Form XObject should mark underline; item={hit:?}"
+    );
+}
+
+#[test]
+fn test_form_xobject_clip_only_rect_does_not_underline() {
+    let pdf = make_pdf_with_form_underline("clip");
+    let items = extract_text_with_positions_mem(&pdf).expect("extract");
+    let hit = items
+        .iter()
+        .find(|i| i.text.contains("Underlined"))
+        .expect("text item from form");
+    assert!(
+        !hit.is_underline,
+        "clip-only re W n inside Form must not underline; item={hit:?}"
+    );
+}
+
+#[test]
+fn test_form_xobject_matrix_transforms_underline() {
+    // Form Matrix translates content by (+40, -20). Text at local (100,500)
+    // lands at (140,480); underline stroke must transform with it.
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+    let form_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 32,
+            "LastChar" => 126,
+            // Uniform 600-unit advance so "Underlined" (10 chars) ≈ 72pt at size 12.
+            "Widths" => Object::Array(vec![Object::Integer(600); 95]),
+        }
+        .into(),
+    );
+
+    let form_ops = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+        Operation::new("Td", vec![100.into(), 500.into()]),
+        Operation::new("Tj", vec![Object::string_literal("Shifted")]),
+        Operation::new("ET", vec![]),
+        Operation::new("w", vec![Object::Real(0.5)]),
+        Operation::new("m", vec![100.into(), 498.into()]),
+        Operation::new("l", vec![150.into(), 498.into()]),
+        Operation::new("S", vec![]),
+    ];
+    let form_content = Content {
+        operations: form_ops,
+    }
+    .encode()
+    .unwrap();
+    doc.objects.insert(
+        form_id,
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Matrix" => vec![1.into(), 0.into(), 0.into(), 1.into(), 40.into(), Object::Integer(-20)],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => font_id,
+                    },
+                },
+            },
+            form_content,
+        )
+        .into(),
+    );
+
+    let page_ops = vec![Operation::new("Do", vec!["Fm0".into()])];
+    let page_content = Content {
+        operations: page_ops,
+    }
+    .encode()
+    .unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, page_content).into());
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! {
+                    "Fm0" => form_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+
+    let items = extract_text_with_positions_mem(&bytes).expect("extract");
+    let hit = items
+        .iter()
+        .find(|i| i.text.contains("Shifted"))
+        .expect("text item");
+    assert!(
+        (hit.x - 140.0).abs() < 1.0,
+        "form Matrix should shift x to ~140, got {}",
+        hit.x
+    );
+    assert!(
+        (hit.y - 480.0).abs() < 1.0,
+        "form Matrix should shift y to ~480, got {}",
+        hit.y
+    );
+    assert!(
+        hit.is_underline,
+        "underline transformed by Form Matrix should still match; item={hit:?}"
+    );
+}
