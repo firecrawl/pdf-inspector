@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO.Compression;
 
 namespace PdfInspector.Pdf;
@@ -171,17 +172,25 @@ internal static class StreamFilters
 
     private static byte[]? TryInflate(byte[] data, int offset, bool zlib)
     {
-        var output = new MemoryStream();
+        var compressedLength = data.Length - offset;
+
+        // An unsized MemoryStream starts at 256 bytes and doubles, so a
+        // megabyte-sized font program is copied a dozen times on the way out and
+        // once more by ToArray. Deflate on PDF content and font programs runs
+        // around 3-4x, so starting there usually avoids the growth entirely and
+        // never wastes more than one doubling when it does not.
+        var output = new MemoryStream(Math.Max(compressedLength * 3, 4096));
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+
         try
         {
-            using var input = new MemoryStream(data, offset, data.Length - offset, writable: false);
+            using var input = new MemoryStream(data, offset, compressedLength, writable: false);
             Stream decompressor = zlib
                 ? new ZLibStream(input, CompressionMode.Decompress, leaveOpen: true)
                 : new DeflateStream(input, CompressionMode.Decompress, leaveOpen: true);
 
             using (decompressor)
             {
-                var buffer = new byte[64 * 1024];
                 int read;
                 while ((read = decompressor.Read(buffer, 0, buffer.Length)) > 0)
                 {
@@ -196,6 +205,10 @@ internal static class StreamFilters
         catch (NotSupportedException)
         {
             return null;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
 
         return output.ToArray();
