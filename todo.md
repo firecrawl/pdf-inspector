@@ -27,13 +27,13 @@ All 22 fixtures load; page counts match the Rust reference exactly.
 
 ## Phase 2 — foundational modules
 - [x] `types.rs` → `Types/`
-- [ ] `process_mode.rs`
+- [x] `process_mode.rs`
 - [x] `text_utils.rs` (CJK/RTL, Otsu, ligatures, NFKC)
 - [x] `glyph_names.rs` (generated table)
 - [x] `adobe_korea1.rs` (generated table)
 - [x] `tounicode.rs` (CMap parsing, CID decoding, bcmap loading)
-- [ ] `structure_tree.rs`
-- [ ] `text_quality.rs`
+- [x] `structure_tree.rs`
+- [x] `text_quality.rs`
 
 ## Phase 3 — extractor
 - [ ] `content_stream.rs`
