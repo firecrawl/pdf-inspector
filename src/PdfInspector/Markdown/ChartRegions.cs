@@ -16,6 +16,14 @@ internal readonly record struct ChartRegion(float X0, float Y0, float X1, float 
     public float Bottom => MathF.Min(Y0, Y1);
 
     public float Top => MathF.Max(Y0, Y1);
+
+    /// <summary>Converts to the tuple form the layout engine takes.</summary>
+    public static implicit operator (float X0, float Y0, float X1, float Y1)(ChartRegion r) =>
+        (r.X0, r.Y0, r.X1, r.Y1);
+
+    /// <summary>Converts from the layout engine's tuple form.</summary>
+    public static implicit operator ChartRegion((float X0, float Y0, float X1, float Y1) t) =>
+        new(t.X0, t.Y0, t.X1, t.Y1);
 }
 
 /// <summary>Chart-region membership tests shared by conversion and layout.</summary>
