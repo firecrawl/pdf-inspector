@@ -158,6 +158,56 @@ public sealed class TrueTypeFace
         CmapSubtables = subtables;
     }
 
+    /// <summary>
+    /// True when the font declares itself italic, from the OS/2 table's
+    /// fsSelection bit. Falls back to the <c>head</c> table's macStyle for fonts
+    /// with no OS/2 table.
+    /// </summary>
+    public bool IsItalic
+    {
+        get
+        {
+            if (_tables.TryGetValue("OS/2", out var os2) && os2.Length >= 64)
+            {
+                return (ReadUInt16(_data, os2.Offset + 62) & 0x01) != 0;
+            }
+
+            return _tables.TryGetValue("head", out var head) && head.Length >= 46
+                && (ReadUInt16(_data, head.Offset + 44) & 0x02) != 0;
+        }
+    }
+
+    /// <summary>True when the font declares itself bold, from OS/2 fsSelection or head macStyle.</summary>
+    public bool IsBold
+    {
+        get
+        {
+            if (_tables.TryGetValue("OS/2", out var os2) && os2.Length >= 64)
+            {
+                return (ReadUInt16(_data, os2.Offset + 62) & 0x20) != 0;
+            }
+
+            return _tables.TryGetValue("head", out var head) && head.Length >= 46
+                && (ReadUInt16(_data, head.Offset + 44) & 0x01) != 0;
+        }
+    }
+
+    /// <summary>The <c>post</c> table's italic angle in degrees, zero when absent.</summary>
+    public float ItalicAngle
+    {
+        get
+        {
+            if (!_tables.TryGetValue("post", out var post) || post.Length < 12)
+            {
+                return 0f;
+            }
+
+            // A 16.16 signed fixed-point value.
+            var raw = (int)ReadUInt32(_data, post.Offset + 4);
+            return raw / 65536f;
+        }
+    }
+
     /// <summary>The glyph's name from the <c>post</c> table, or null when unavailable.</summary>
     public string? GlyphName(ushort glyphId)
     {

@@ -37,7 +37,7 @@ All 22 fixtures load; page counts match the Rust reference exactly.
 
 ## Phase 3 — extractor
 - [ ] `content_stream.rs`
-- [ ] `fonts.rs`
+- [x] `fonts.rs` (widths, encodings, styles, text decoding)
 - [ ] `xobjects.rs`
 - [ ] `links.rs`
 - [ ] `underline.rs`
