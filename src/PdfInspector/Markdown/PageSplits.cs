@@ -201,7 +201,7 @@ internal static class PageSplits
                 }
 
                 clusters[i].Members.Add(item);
-                clusters[i] = (clusters[i].Members.Sum(m => m.X) / clusters[i].Members.Count, clusters[i].Members);
+                clusters[i] = (clusters[i].Members.SumF32(m => m.X) / clusters[i].Members.Count, clusters[i].Members);
                 found = true;
                 break;
             }

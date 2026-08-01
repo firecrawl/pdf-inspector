@@ -15,6 +15,7 @@ public static class PdfDetector
     /// <summary>Detects a PDF's type from a file path.</summary>
     public static PdfTypeResult DetectPdfType(string path, DetectionConfig? config = null)
     {
+        Validation.ValidatePdfFile(path);
         var doc = PdfDocument.LoadFile(path);
         return DetectFromDocument(doc, (uint)doc.PageCount, config ?? new DetectionConfig());
     }
@@ -22,6 +23,7 @@ public static class PdfDetector
     /// <summary>Detects a PDF's type from an in-memory buffer.</summary>
     public static PdfTypeResult DetectPdfTypeMem(byte[] buffer, DetectionConfig? config = null)
     {
+        Validation.ValidatePdfBytes(buffer);
         var doc = PdfDocument.Load(buffer);
         return DetectFromDocument(doc, (uint)doc.PageCount, config ?? new DetectionConfig());
     }

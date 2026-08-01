@@ -89,7 +89,7 @@ internal static class TextAnchorTables
         {
             group.Sort((a, b) => FloatTotalOrder.Instance.Compare(a.XMin, b.XMin));
 
-            var y = group.Sum(r => r.Y) / group.Count;
+            var y = group.SumF32(r => r.Y) / group.Count;
             var current = new HorizontalRule(y, group[0].XMin, group[0].XMax);
 
             foreach (var rule in group.Skip(1))
@@ -331,13 +331,13 @@ internal static class TextAnchorTables
             spacings.Add(MathF.Abs(rules[i].Y - rules[i + 1].Y));
         }
 
-        var mean = spacings.Sum() / spacings.Count;
+        var mean = spacings.SumF32() / spacings.Count;
         if (mean <= 0.1f)
         {
             return false;
         }
 
-        var variance = spacings.Sum(s => (s - mean) * (s - mean)) / spacings.Count;
+        var variance = spacings.SumF32(s => (s - mean) * (s - mean)) / spacings.Count;
         return MathF.Sqrt(variance) / mean < 0.02f;
     }
 
@@ -789,13 +789,13 @@ internal static class TextAnchorTables
                 distinctRuleYs[i + 2] - distinctRuleYs[i + 3],
             ];
 
-            var mean = spacings.Sum() / spacings.Length;
+            var mean = spacings.SumF32() / spacings.Length;
             if (mean <= 0.1f)
             {
                 continue;
             }
 
-            var variance = spacings.Sum(s => (s - mean) * (s - mean)) / spacings.Length;
+            var variance = spacings.SumF32(s => (s - mean) * (s - mean)) / spacings.Length;
             hasUniformRun = MathF.Sqrt(variance) / mean < 0.02f;
         }
 

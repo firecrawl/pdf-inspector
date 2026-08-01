@@ -101,7 +101,7 @@ internal static class Grid
         {
             var x = xPositions[i];
             var lastCluster = clusterXs[^1];
-            var reference = useEdgeClustering ? lastCluster[^1] : lastCluster.Sum() / lastCluster.Count;
+            var reference = useEdgeClustering ? lastCluster[^1] : lastCluster.SumF32() / lastCluster.Count;
 
             if (x - reference > clusterThreshold)
             {
@@ -121,7 +121,7 @@ internal static class Grid
             clusterXs = MergeNumericAdjacentClusters(clusterXs, items, clusterThreshold);
         }
 
-        var columns = clusterXs.Select(xs => xs.Sum() / xs.Count).ToList();
+        var columns = clusterXs.Select(xs => xs.SumF32() / xs.Count).ToList();
 
         // Each column must carry more than a stray item.
         var minItemsPerCol = Math.Max(items.Count / Math.Max(columns.Count, 1) / 4, 2);
@@ -174,7 +174,7 @@ internal static class Grid
     {
         (float Center, int Count, float NumericFraction) ComputeInfo(List<float> xs)
         {
-            var center = xs.Sum() / xs.Count;
+            var center = xs.SumF32() / xs.Count;
             var total = 0;
             var numeric = 0;
 
@@ -269,7 +269,7 @@ internal static class Grid
         for (var i = 1; i < yPositions.Count; i++)
         {
             var y = yPositions[i];
-            var clusterCenter = clusterItems.Sum() / clusterItems.Count;
+            var clusterCenter = clusterItems.SumF32() / clusterItems.Count;
 
             if (clusterCenter - y >= clusterThreshold)
             {
@@ -284,7 +284,7 @@ internal static class Grid
 
         if (clusterItems.Count > 0)
         {
-            rows.Add(clusterItems.Sum() / clusterItems.Count);
+            rows.Add(clusterItems.SumF32() / clusterItems.Count);
         }
 
         return rows;

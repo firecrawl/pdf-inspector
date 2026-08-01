@@ -93,7 +93,7 @@ internal static class ReadingOrder
             if (last is not null && MathF.Abs(last.Y - item.Y) <= YTolerance)
             {
                 last.Items.Add(item);
-                last.Y = last.Items.Sum(m => m.Y) / last.Items.Count;
+                last.Y = last.Items.SumF32(m => m.Y) / last.Items.Count;
             }
             else
             {
@@ -225,7 +225,7 @@ internal static class ReadingOrder
         foreach (var candidate in candidates)
         {
             var cluster = clusters.FirstOrDefault(c =>
-                MathF.Abs((c.Sum(e => e.Split) / c.Count) - candidate.Split) <= SplitClusterTolerance);
+                MathF.Abs((c.SumF32(e => e.Split) / c.Count) - candidate.Split) <= SplitClusterTolerance);
 
             if (cluster is not null)
             {
@@ -243,7 +243,7 @@ internal static class ReadingOrder
             return null;
         }
 
-        var splitX = dominant.Sum(e => e.Split) / dominant.Count;
+        var splitX = dominant.SumF32(e => e.Split) / dominant.Count;
         var yTop = dominant.Max(e => e.Y) + 3.0f;
 
         // The columns must sit a caption's distance below the image — closer

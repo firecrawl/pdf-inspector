@@ -240,6 +240,51 @@ public static partial class PdfProcessor
         return Extractor.TextExtractor.ExtractPositionedText(doc, cmaps, pageFilter).Items;
     }
 
+    /// <summary>
+    /// Extracts positioned text items from an in-memory PDF, optionally limited
+    /// to a set of 1-indexed pages.
+    /// </summary>
+    public static List<TextItem> ExtractTextWithPositionsMem(
+        byte[] buffer,
+        IReadOnlySet<uint>? pageFilter = null,
+        string? password = null)
+    {
+        Validation.ValidatePdfBytes(buffer);
+        var doc = LoadDocument(buffer, password);
+        var cmaps = ToUnicode.FontCMaps.FromDocument(doc);
+        return Extractor.TextExtractor.ExtractPositionedText(doc, cmaps, pageFilter).Items;
+    }
+
+    /// <summary>Extracts a PDF file's text as one plain string.</summary>
+    public static string ExtractText(string path, string? password = null)
+    {
+        Validation.ValidatePdfFile(path);
+        return ExtractTextFromDocument(LoadDocument(ReadFile(path), password));
+    }
+
+    /// <summary>Extracts an in-memory PDF's text as one plain string.</summary>
+    public static string ExtractTextMem(byte[] buffer, string? password = null)
+    {
+        Validation.ValidatePdfBytes(buffer);
+        return ExtractTextFromDocument(LoadDocument(buffer, password));
+    }
+
+    /// <summary>
+    /// Flattens a document to plain text, one line per grouped baseline.
+    /// </summary>
+    /// <remarks>
+    /// The Rust original delegates this to lopdf's own simple extractor. With
+    /// the PDF core ported in-tree there is no separate simple path, so the
+    /// positioned extractor's line grouping supplies the lines — which gives
+    /// the same content with better spacing than a raw operand dump.
+    /// </remarks>
+    private static string ExtractTextFromDocument(PdfDocument doc)
+    {
+        var cmaps = ToUnicode.FontCMaps.FromDocument(doc);
+        var items = Extractor.TextExtractor.ExtractPositionedText(doc, cmaps, null).Items;
+        return string.Join('\n', Extractor.Layout.GroupIntoLines(items).Select(line => line.Text()));
+    }
+
     /// <summary>Flattens the per-page reason map into the public list form.</summary>
     internal static List<PageOcrReasons> ToPageOcrReasons(SortedDictionary<uint, List<string>> reasonsByPage) =>
         [.. reasonsByPage.Select(kv => new PageOcrReasons(kv.Key, kv.Value))];

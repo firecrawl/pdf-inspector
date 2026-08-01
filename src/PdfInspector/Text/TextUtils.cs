@@ -755,3 +755,41 @@ internal sealed class FloatTotalOrder : IComparer<float>
         return left.CompareTo(right);
     }
 }
+
+/// <summary>Float arithmetic that matches Rust's single-precision behaviour.</summary>
+internal static class FloatMath
+{
+    /// <summary>
+    /// Sums floats with a float accumulator, the way Rust's
+    /// <c>sum::&lt;f32&gt;()</c> does.
+    /// </summary>
+    /// <remarks>
+    /// LINQ's own <c>Sum</c> accumulates in double and rounds once at the end,
+    /// which lands up to one ulp away from a running float sum. That is enough
+    /// to move a table's row band off the text baseline it should coincide
+    /// with, which in turn flips whether the table is emitted before or after
+    /// that line.
+    /// </remarks>
+    public static float SumF32(this IEnumerable<float> values)
+    {
+        var total = 0.0f;
+        foreach (var value in values)
+        {
+            total += value;
+        }
+
+        return total;
+    }
+
+    /// <summary>Sums a projection of each element with a float accumulator.</summary>
+    public static float SumF32<T>(this IEnumerable<T> values, Func<T, float> selector)
+    {
+        var total = 0.0f;
+        foreach (var value in values)
+        {
+            total += selector(value);
+        }
+
+        return total;
+    }
+}

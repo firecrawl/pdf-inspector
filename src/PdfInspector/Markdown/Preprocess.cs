@@ -384,7 +384,7 @@ internal static class Preprocess
         var avgSpan = 1.0f;
         if (pageYRange.Count > 0)
         {
-            var total = pageYRange.Values.Sum(r => r.Hi - r.Lo);
+            var total = pageYRange.Values.SumF32(r => r.Hi - r.Lo);
             avgSpan = MathF.Max(total / pageYRange.Count, 1.0f);
         }
 
@@ -462,8 +462,8 @@ internal static class Preprocess
             }
 
             var n = pos.Count;
-            var mean = pos.Sum() / n;
-            var variance = pos.Sum(y => (y - mean) * (y - mean)) / n;
+            var mean = pos.SumF32() / n;
+            var variance = pos.SumF32(y => (y - mean) * (y - mean)) / n;
             return MathF.Sqrt(variance) / avgSpan < 0.05f;
         }
 

@@ -1,4 +1,5 @@
 // Ported from reference/src/extractor/underline.rs
+using PdfInspector.Text;
 using PdfInspector.Types;
 
 namespace PdfInspector.Extractor;
@@ -247,7 +248,7 @@ internal static class Underline
             return false;
         }
 
-        var covered = matched.Sum(i => i.Width);
+        var covered = matched.SumF32(i => i.Width);
         if (covered < rule.Width * 0.6f)
         {
             return false;

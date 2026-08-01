@@ -411,7 +411,7 @@ public static class VectorGrid
             {
                 if (cluster.Count > 0)
                 {
-                    snapped.Add(cluster.Sum() / cluster.Count);
+                    snapped.Add(cluster.SumF32() / cluster.Count);
                 }
 
                 cluster = [value];
@@ -420,7 +420,7 @@ public static class VectorGrid
 
         if (cluster.Count > 0)
         {
-            snapped.Add(cluster.Sum() / cluster.Count);
+            snapped.Add(cluster.SumF32() / cluster.Count);
         }
 
         if (descending)

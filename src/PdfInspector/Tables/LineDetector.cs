@@ -251,10 +251,10 @@ internal static class LineDetector
                 spacings.Add(MathF.Abs(rowEdgesDesc[i] - rowEdgesDesc[i + 1]));
             }
 
-            var meanSpacing = spacings.Sum() / spacings.Count;
+            var meanSpacing = spacings.SumF32() / spacings.Count;
             if (meanSpacing > 0.1f)
             {
-                var variance = spacings.Sum(s => (s - meanSpacing) * (s - meanSpacing)) / spacings.Count;
+                var variance = spacings.SumF32(s => (s - meanSpacing) * (s - meanSpacing)) / spacings.Count;
                 if (MathF.Sqrt(variance) / meanSpacing < 0.02f)
                 {
                     return SelectTableHypothesis([], alternatives, page);

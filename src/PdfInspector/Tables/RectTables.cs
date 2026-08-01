@@ -2145,7 +2145,7 @@ internal static class RectTables
 
         foreach (var x in xPositions.Skip(1))
         {
-            var clusterCenter = clusterItems.Sum() / clusterItems.Count;
+            var clusterCenter = clusterItems.SumF32() / clusterItems.Count;
             if (x - clusterCenter > clusterThreshold)
             {
                 columns.Add(clusterCenter);
@@ -2159,7 +2159,7 @@ internal static class RectTables
 
         if (clusterItems.Count > 0)
         {
-            columns.Add(clusterItems.Sum() / clusterItems.Count);
+            columns.Add(clusterItems.SumF32() / clusterItems.Count);
         }
 
         // Every column needs multiple items behind it.
