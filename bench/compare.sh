@@ -14,6 +14,12 @@
 #
 # The ratio is rust_median / csharp_median, so above 1.00 means the C# port is
 # ahead.
+#
+# Give it enough samples. At `--iters 15 --budget 5000` the fast fixtures do not
+# resolve: one sweep read td9264 at 25.04 ms against Rust's 20.04 and called it a
+# loss, and the same pair at `--iters 40 --budget 12000` read 19.22 against 19.36.
+# Anything inside about 10% needs the longer run before its verdict means
+# anything.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -76,6 +76,41 @@ The Rust harness runs the identical rule. It has no JIT, so the repetitions buy
 only settled caches and allocator free lists, but a protocol that differs
 between the two sides is not a comparison.
 
+## Comparing the two implementations
+
+`bench/compare.sh` runs both harnesses and prints a per-fixture ratio. Two
+things about it are load-bearing.
+
+It **interleaves**: each fixture is measured by Rust and then immediately by
+C#, rather than sweeping one side and then the other. Sweeping a side at a time,
+the two halves can land in different machine states — one pair of sweeps saw
+memory bandwidth at 8.76 GiB/s and 6.39, which is wider than most of the gaps
+being measured. Each fixture also carries the calibration it was measured under,
+so whatever drift remains shows in the `drift` column instead of disappearing
+into the ratio.
+
+It **needs enough samples**. At `--iters 15 --budget 5000` the fast fixtures do
+not resolve: one sweep read `td9264` at 25.04 ms against Rust's 20.04 and called
+it a loss, and the same pair at `--iters 40 --budget 12000` read 19.22 against
+19.36. Treat anything inside about 10% as unresolved until it has been re-run
+long.
+
+## Two places the port does less work than the reference
+
+Worth knowing when reading a ratio, because neither is a like-for-like win:
+
+- **`ForOrdering` caches parsed CMaps** for the process, where the reference
+  re-parses per call. The reference reads its bundled files from an
+  `include_dir` static slice, so it pays the parse but not the I/O; this port
+  pays neither after the first document. Real for anything processing more than
+  one file, but it flatters `shinagawa_identity_h` against a single-document
+  baseline.
+- **`2013-app2` is not a comparison at all.** The reference's parser cannot read
+  that file's page 7; this port's recovery scan can. The Rust binary is timed
+  skipping a page of content that the C# binary extracts, so its number is
+  lower for a reason no optimisation should chase. `SnapshotTests` pins the
+  extra output, and `DifferentialMarkdownTests` lists the divergence.
+
 ## The calibration kernels
 
 Cloud VMs move between host generations and throttle under contention, so a

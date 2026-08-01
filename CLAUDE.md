@@ -123,20 +123,43 @@ dotnet build -c Release
 
 ## Performance notes
 
-Rect table detection is the most expensive stage of the pipeline and runs twice
-per document, since the extractor needs it to tell a table's ruling lines from a
-text underline. Optimisation work should start there and be driven by
-`--detectors`, not by guesswork — the first two candidates that looked obvious
-(the containment dedup pass, the grid coverage sweep) turned out to be 1.4% and
-noise respectively, while `IsChartBarCluster` was 58%.
+**Measure first, and measure the right thing.** Every candidate that looked
+obvious from reading the code has been wrong. The containment dedup pass was
+1.4% of rect detection; the grid coverage sweep was noise; `ClusterRects` showed
+7.4% self time and neither flattening its geometry nor vectorising its pairing
+scan moved the fixture at all (1440, 1439 and 1397 ms against 1375 for the plain
+form — the sampler was charging the group-building phase to the enclosing
+function). Both rewrites were reverted. Use `--phases` and `--detectors`, and a
+`dotnet-trace --profile dotnet-sampled-thread-time` profile attributed to
+callers, not intuition.
 
-What made that function slow was not its algorithm but its shape: geometry read
-through `Func<RectBox, float>` delegates that cannot inline, a quadratic pairing
-scan written as `family.Count(r => family.Any(s => …))`, and a body re-run per
-rect when it depends only on the anchor's breadth. Flat float arrays, one visit
-per distinct breadth, and a vectorised pairing scan took it from 2617 ms to
-121 ms on the 269-page fixture. The same three shapes are worth looking for
-elsewhere.
+**The wins have almost all been duplicated or quadratic work, not slow code.**
+In order of what they were worth:
+
+- The detector inflated the same embedded font stream four times per document by
+  calling `StreamFilters` directly instead of `PdfStream.DecompressedContent` —
+  a quarter of a CJK document.
+- `FormatUrls` copied everything before each match and counted its brackets
+  twice; `ComputeLayoutComplexity` re-filtered every item, rect and line once per
+  page; `MarkUnderlinedItems` re-derived the candidate item set per rule and
+  re-sorted every rule in a row per rule. All quadratic in the page or document.
+- Anything on the per-operand path is called millions of times on a large
+  document. `ShouldUseCp1252SingleByteFallback` allocated two arrays, two
+  closures, a lower-cased name and a subset-stripped name per operand to answer a
+  question about the font's name.
+
+**Allocation shape matters as much as allocation volume.** Growing a `List` from
+zero per item, allocating a trimmed copy of a string only to test its length,
+and taking a `MemoryStream` from 256 bytes to a megabyte by doubling were each
+worth several percent. Size containers from a counting pass, trim with
+`AsSpan().Trim()`, and prefer an array where nothing mutates the result.
+
+`IsChartBarCluster` was the first of these and remains the largest single one:
+geometry read through `Func<RectBox, float>` delegates that cannot inline, a
+quadratic pairing scan written as `family.Count(r => family.Any(s => …))`, and a
+body re-run per rect when it depends only on the anchor's breadth. Flat float
+arrays, one visit per distinct breadth and a vectorised pairing scan took it from
+2617 ms to 121 ms on the 269-page fixture.
 
 ## Debugging
 
