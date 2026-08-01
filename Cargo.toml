@@ -46,14 +46,14 @@ ttf-parser = "0.25"
 # Native builds keep lopdf's parallel parser and CLI logging. Browser WASM is
 # deliberately single-threaded so it works without cross-origin isolation.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-lopdf = { version = "0.41.0", features = ["rayon"] }
+lopdf = { version = "0.42.0", features = ["rayon"] }
 rayon = "1.10"
 env_logger = "0.11"
 
 # Browser builds use JavaScript randomness for encrypted PDFs and embed the
 # bundled CMaps because there is no filesystem at runtime.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-lopdf = { version = "0.41.0", default-features = false, features = ["wasm_js"] }
+lopdf = { version = "0.42.0", default-features = false, features = ["wasm_js"] }
 include_dir = "0.7"
 
 [dev-dependencies]
