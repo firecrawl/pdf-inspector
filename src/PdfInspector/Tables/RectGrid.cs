@@ -198,28 +198,6 @@ internal static class RectGrid
         var n = rects.Count;
         var uf = new UnionFind(n);
 
-        // The pairing scan is quadratic and reads four floats per rect on both
-        // sides, so it is projected into flat arrays first: through
-        // IReadOnlyList every access is an interface call that also copies the
-        // struct, and the tolerance is folded into the edges rather than added
-        // n² times. The comparisons keep their original form — writing them as
-        // >= instead of !(<) would change the verdict on a NaN edge, which a
-        // malformed file can produce.
-        var edgeBuffer = ArrayPool<float>.Shared.Rent(n * 4);
-        var rightPlus = edgeBuffer.AsSpan(0, n);
-        var leftMinus = edgeBuffer.AsSpan(n, n);
-        var topPlus = edgeBuffer.AsSpan(n * 2, n);
-        var bottomMinus = edgeBuffer.AsSpan(n * 3, n);
-
-        for (var i = 0; i < n; i++)
-        {
-            var r = rects[i];
-            rightPlus[i] = r.Right + tolerance;
-            leftMinus[i] = r.Left - tolerance;
-            topPlus[i] = r.Top + tolerance;
-            bottomMinus[i] = r.Bottom - tolerance;
-        }
-
         for (var i = 0; i < n; i++)
         {
             // A rect already in an oversized component cannot contribute to a
@@ -229,15 +207,9 @@ internal static class RectGrid
                 continue;
             }
 
-            var ri = rightPlus[i];
-            var li = leftMinus[i];
-            var ti = topPlus[i];
-            var bi = bottomMinus[i];
-
             for (var j = i + 1; j < n; j++)
             {
-                if (ri < leftMinus[j] || rightPlus[j] < li
-                    || ti < bottomMinus[j] || topPlus[j] < bi)
+                if (!RectsOverlap(rects[i], rects[j], tolerance))
                 {
                     continue;
                 }
@@ -250,8 +222,6 @@ internal static class RectGrid
                 }
             }
         }
-
-        ArrayPool<float>.Shared.Return(edgeBuffer);
 
         // Resolve every root and size its component before filling anything, so
         // each surviving group's list is allocated once at its final size. A
