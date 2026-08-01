@@ -1045,27 +1045,36 @@ pub(crate) fn extract_page_text_items(
                         }
                     }
                 }
-                for (x1, y1, x2, y2) in pending_lines.drain(..) {
-                    let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
-                    let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
-                    lines.push(PdfLine {
-                        x1: x1d,
-                        y1: y1d,
-                        x2: x2d,
-                        y2: y2d,
-                        page: page_num,
-                    });
-                    underline_lines.push(UnderlineLine {
-                        x1: x1d,
-                        y1: y1d,
-                        x2: x2d,
-                        y2: y2d,
-                        stroke_width: transformed_stroke_width(line_width, &ctm, x1, y1, x2, y2),
-                        page: page_num,
-                    });
+                // `h` already moved closed subpaths into pending_subpaths —
+                // drain those too so closed stroked rules reach underline
+                // detection (and PdfLine export) instead of being dropped.
+                if !pending_lines.is_empty() {
+                    pending_subpaths.push(std::mem::take(&mut pending_lines));
+                }
+                for subpath in pending_subpaths.drain(..) {
+                    for (x1, y1, x2, y2) in subpath {
+                        let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
+                        let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
+                        lines.push(PdfLine {
+                            x1: x1d,
+                            y1: y1d,
+                            x2: x2d,
+                            y2: y2d,
+                            page: page_num,
+                        });
+                        underline_lines.push(UnderlineLine {
+                            x1: x1d,
+                            y1: y1d,
+                            x2: x2d,
+                            y2: y2d,
+                            stroke_width: transformed_stroke_width(
+                                line_width, &ctm, x1, y1, x2, y2,
+                            ),
+                            page: page_num,
+                        });
+                    }
                 }
                 painted_rects.append(&mut pending_re_rects);
-                pending_subpaths.clear();
                 path_subpath_start = None;
                 path_current = None;
             }
@@ -1079,27 +1088,33 @@ pub(crate) fn extract_page_text_items(
                         }
                     }
                 }
-                for (x1, y1, x2, y2) in pending_lines.drain(..) {
-                    let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
-                    let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
-                    lines.push(PdfLine {
-                        x1: x1d,
-                        y1: y1d,
-                        x2: x2d,
-                        y2: y2d,
-                        page: page_num,
-                    });
-                    underline_lines.push(UnderlineLine {
-                        x1: x1d,
-                        y1: y1d,
-                        x2: x2d,
-                        y2: y2d,
-                        stroke_width: transformed_stroke_width(line_width, &ctm, x1, y1, x2, y2),
-                        page: page_num,
-                    });
+                if !pending_lines.is_empty() {
+                    pending_subpaths.push(std::mem::take(&mut pending_lines));
+                }
+                for subpath in pending_subpaths.drain(..) {
+                    for (x1, y1, x2, y2) in subpath {
+                        let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
+                        let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
+                        lines.push(PdfLine {
+                            x1: x1d,
+                            y1: y1d,
+                            x2: x2d,
+                            y2: y2d,
+                            page: page_num,
+                        });
+                        underline_lines.push(UnderlineLine {
+                            x1: x1d,
+                            y1: y1d,
+                            x2: x2d,
+                            y2: y2d,
+                            stroke_width: transformed_stroke_width(
+                                line_width, &ctm, x1, y1, x2, y2,
+                            ),
+                            page: page_num,
+                        });
+                    }
                 }
                 painted_rects.append(&mut pending_re_rects);
-                pending_subpaths.clear();
                 path_subpath_start = None;
                 path_current = None;
             }
@@ -1558,6 +1573,22 @@ BT /F1 12 Tf 1 0 0 1 100 480 Tm (THIN) Tj ET
 
         assert!(!thick.is_underline);
         assert!(thin.is_underline);
+    }
+
+    #[test]
+    fn closed_stroked_rule_marks_underline() {
+        // After `h`, segments live in pending_subpaths — stroke must drain
+        // those, not only the (empty) pending_lines buffer.
+        let content = b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (CLOSED) Tj ET
+1 w
+100 498 m 160 498 l h S";
+
+        let items = extract_simple_items(content);
+        let hit = items.iter().find(|item| item.text == "CLOSED").unwrap();
+        assert!(
+            hit.is_underline,
+            "closed h/S stroked rule should mark underline; item={hit:?}"
+        );
     }
 
     #[test]
