@@ -1,11 +1,18 @@
 namespace PdfInspector.Pdf;
 
 /// <summary>A single content-stream operator with the operands that preceded it.</summary>
-public sealed class PdfOperation(string @operator, List<PdfObject> operands)
+/// <remarks>
+/// The operands are an array rather than a list because nothing downstream
+/// mutates them, and a content stream is mostly operators that take none —
+/// <c>q</c>, <c>Q</c>, <c>BT</c>, <c>ET</c>, <c>W</c>, <c>n</c>. An empty array
+/// is free, where an empty list is still an allocation, and a document whose
+/// content streams run to megabytes has millions of these.
+/// </remarks>
+public sealed class PdfOperation(string @operator, PdfObject[] operands)
 {
     public string Operator { get; } = @operator;
 
-    public List<PdfObject> Operands { get; } = operands;
+    public PdfObject[] Operands { get; } = operands;
 
     public override string ToString() => string.Join(" ", Operands) + " " + Operator;
 }

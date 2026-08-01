@@ -261,7 +261,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "cm":
-                    if (operands.Count >= 6)
+                    if (operands.Length >= 6)
                     {
                         ctm = ReadCmOperands(operands).Multiply(ctm);
                     }
@@ -269,7 +269,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "w":
-                    if (operands.Count >= 1 && Geometry.GetNumber(operands[0]) is { } width)
+                    if (operands.Length >= 1 && Geometry.GetNumber(operands[0]) is { } width)
                     {
                         lineWidth = width;
                     }
@@ -288,7 +288,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "Tf":
-                    if (operands.Count >= 2)
+                    if (operands.Length >= 2)
                     {
                         if (operands[0].AsName() is { } fontName)
                         {
@@ -304,7 +304,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "TL":
-                    if (operands.Count >= 1 && Geometry.GetNumber(operands[0]) is { } leading)
+                    if (operands.Length >= 1 && Geometry.GetNumber(operands[0]) is { } leading)
                     {
                         textLeading = leading;
                     }
@@ -312,7 +312,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "Tr":
-                    if (operands.Count >= 1 && Geometry.GetNumber(operands[0]) is { } mode)
+                    if (operands.Length >= 1 && Geometry.GetNumber(operands[0]) is { } mode)
                     {
                         textRenderingMode = (int)mode;
                     }
@@ -320,7 +320,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "Tc":
-                    if (operands.Count >= 1 && Geometry.GetNumber(operands[0]) is { } tc)
+                    if (operands.Length >= 1 && Geometry.GetNumber(operands[0]) is { } tc)
                     {
                         charSpacing = tc;
                     }
@@ -328,7 +328,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "Tw":
-                    if (operands.Count >= 1 && Geometry.GetNumber(operands[0]) is { } tw)
+                    if (operands.Length >= 1 && Geometry.GetNumber(operands[0]) is { } tw)
                     {
                         wordSpacing = tw;
                     }
@@ -336,7 +336,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "Ts":
-                    if (operands.Count >= 1 && Geometry.GetNumber(operands[0]) is { } ts)
+                    if (operands.Length >= 1 && Geometry.GetNumber(operands[0]) is { } ts)
                     {
                         textRise = ts;
                     }
@@ -345,7 +345,7 @@ internal static class ContentStreamExtractor
 
                 case "Td":
                 case "TD":
-                    if (operands.Count >= 2)
+                    if (operands.Length >= 2)
                     {
                         var tx = Geometry.GetNumber(operands[0]) ?? 0.0f;
                         var ty = Geometry.GetNumber(operands[1]) ?? 0.0f;
@@ -361,7 +361,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "Tm":
-                    if (operands.Count >= 6)
+                    if (operands.Length >= 6)
                     {
                         textMatrix = XObjects.ReadMatrixOperands(operands, defaultDiagonal: true);
                         lineMatrix = textMatrix;
@@ -379,7 +379,7 @@ internal static class ContentStreamExtractor
 
                 case "Tj":
                 {
-                    if (!inTextBlock || operands.Count == 0)
+                    if (!inTextBlock || operands.Length == 0)
                     {
                         break;
                     }
@@ -454,7 +454,7 @@ internal static class ContentStreamExtractor
 
                 case "TJ":
                 {
-                    if (!inTextBlock || operands.Count == 0 || operands[0].AsArray() is not { } array)
+                    if (!inTextBlock || operands.Length == 0 || operands[0].AsArray() is not { } array)
                     {
                         break;
                     }
@@ -517,7 +517,7 @@ internal static class ContentStreamExtractor
                     context.Widths.TryGetValue(currentFont, out var fontInfo);
 
                     float? advanceTs = null;
-                    if (fontInfo is not null && operands.Count > 0 && operands[0] is PdfString str)
+                    if (fontInfo is not null && operands.Length > 0 && operands[0] is PdfString str)
                     {
                         advanceTs = FontWidths.ComputeStringWidthTs(
                             str.Bytes, fontInfo, currentFontSize, charSpacing, wordSpacing);
@@ -525,7 +525,7 @@ internal static class ContentStreamExtractor
 
                     var skip = (textRenderingMode == 3 && !includeInvisible)
                         || suppressGlyphExtraction
-                        || operands.Count == 0;
+                        || operands.Length == 0;
 
                     if (!skip && DecodeOperand(operands[0]) is { } text && text.Trim().Length > 0)
                     {
@@ -551,7 +551,7 @@ internal static class ContentStreamExtractor
 
                 case "Do":
                 {
-                    if (operands.Count == 0 || operands[0].AsName() is not { } xobjName)
+                    if (operands.Length == 0 || operands[0].AsName() is not { } xobjName)
                     {
                         break;
                     }
@@ -595,7 +595,7 @@ internal static class ContentStreamExtractor
                     string? actualText = null;
                     long? mcid = null;
 
-                    if (operands.Count >= 2)
+                    if (operands.Length >= 2)
                     {
                         var dict = operands[1] as PdfDictionary ?? doc.Resolve(operands[1]).AsDictionary();
                         if (dict is not null)
@@ -675,7 +675,7 @@ internal static class ContentStreamExtractor
 
                 case "re":
                 {
-                    if (operands.Count < 4)
+                    if (operands.Length < 4)
                     {
                         break;
                     }
@@ -697,7 +697,7 @@ internal static class ContentStreamExtractor
                 // ── Path construction ────────────────────────────────────
 
                 case "m":
-                    if (operands.Count >= 2)
+                    if (operands.Length >= 2)
                     {
                         var px = Geometry.GetNumber(operands[0]) ?? 0.0f;
                         var py = Geometry.GetNumber(operands[1]) ?? 0.0f;
@@ -708,7 +708,7 @@ internal static class ContentStreamExtractor
                     break;
 
                 case "l":
-                    if (operands.Count >= 2 && pathCurrent is { } from)
+                    if (operands.Length >= 2 && pathCurrent is { } from)
                     {
                         var px = Geometry.GetNumber(operands[0]) ?? 0.0f;
                         var py = Geometry.GetNumber(operands[1]) ?? 0.0f;
@@ -1112,7 +1112,7 @@ internal static class ContentStreamExtractor
     }
 
     /// <summary>Reads the six operands of a <c>cm</c>, defaulting every missing value to zero.</summary>
-    private static Matrix ReadCmOperands(List<PdfObject> operands) => new(
+    private static Matrix ReadCmOperands(PdfObject[] operands) => new(
         Geometry.GetNumber(operands[0]) ?? 1.0f,
         Geometry.GetNumber(operands[1]) ?? 0.0f,
         Geometry.GetNumber(operands[2]) ?? 0.0f,

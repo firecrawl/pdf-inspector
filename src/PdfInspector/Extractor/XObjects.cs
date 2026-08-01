@@ -153,7 +153,7 @@ internal static class XObjects
                     break;
 
                 case "cm":
-                    if (operands.Count >= 6)
+                    if (operands.Length >= 6)
                     {
                         ctm = ReadMatrixOperands(operands, defaultDiagonal: false).Multiply(ctm);
                     }
@@ -162,7 +162,7 @@ internal static class XObjects
 
                 case "Do":
                 {
-                    if (operands.Count == 0 || operands[0].AsName() is not { } xobjName)
+                    if (operands.Length == 0 || operands[0].AsName() is not { } xobjName)
                     {
                         break;
                     }
@@ -207,7 +207,7 @@ internal static class XObjects
                     break;
 
                 case "Tf":
-                    if (operands.Count >= 2)
+                    if (operands.Length >= 2)
                     {
                         if (operands[0].AsName() is { } fontName)
                         {
@@ -221,7 +221,7 @@ internal static class XObjects
 
                 case "Td":
                 case "TD":
-                    if (operands.Count >= 2)
+                    if (operands.Length >= 2)
                     {
                         var tx = Geometry.GetNumber(operands[0]) ?? 0.0f;
                         var ty = Geometry.GetNumber(operands[1]) ?? 0.0f;
@@ -231,7 +231,7 @@ internal static class XObjects
                     break;
 
                 case "Tm":
-                    if (operands.Count >= 6)
+                    if (operands.Length >= 6)
                     {
                         textMatrix = ReadMatrixOperands(operands, defaultDiagonal: true);
                     }
@@ -244,7 +244,7 @@ internal static class XObjects
                     break;
 
                 case "rg":
-                    if (operands.Count >= 3)
+                    if (operands.Length >= 3)
                     {
                         fillIsWhite = (Geometry.GetNumber(operands[0]) ?? 0f) > 0.95f
                             && (Geometry.GetNumber(operands[1]) ?? 0f) > 0.95f
@@ -254,7 +254,7 @@ internal static class XObjects
                     break;
 
                 case "k":
-                    if (operands.Count >= 4)
+                    if (operands.Length >= 4)
                     {
                         fillIsWhite = (Geometry.GetNumber(operands[0]) ?? 1f) < 0.05f
                             && (Geometry.GetNumber(operands[1]) ?? 1f) < 0.05f
@@ -279,7 +279,7 @@ internal static class XObjects
 
                 case "Tj":
                 {
-                    if (!inTextBlock || operands.Count == 0)
+                    if (!inTextBlock || operands.Length == 0)
                     {
                         break;
                     }
@@ -330,7 +330,7 @@ internal static class XObjects
 
                 case "TJ":
                 {
-                    if (!inTextBlock || operands.Count == 0 || operands[0].AsArray() is not { } array)
+                    if (!inTextBlock || operands.Length == 0 || operands[0].AsArray() is not { } array)
                     {
                         break;
                     }
@@ -454,7 +454,7 @@ internal static class XObjects
     /// and to zero otherwise — matching how the reference build treats <c>cm</c>
     /// and <c>Tm</c> differently.
     /// </summary>
-    internal static Matrix ReadMatrixOperands(List<PdfObject> operands, bool defaultDiagonal)
+    internal static Matrix ReadMatrixOperands(PdfObject[] operands, bool defaultDiagonal)
     {
         float At(int i)
         {
