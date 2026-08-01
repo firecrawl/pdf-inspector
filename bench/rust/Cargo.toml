@@ -1,0 +1,20 @@
+[package]
+name = "pdf-inspector-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The reference crate is the behavioural source of truth and is kept verbatim,
+# so the harness lives outside it and depends on it by path rather than adding
+# a bin target inside it.
+[dependencies]
+pdf-inspector = { path = "../../reference" }
+
+[[bin]]
+name = "pdf-inspector-bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

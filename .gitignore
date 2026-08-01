@@ -5,3 +5,4 @@ obj/
 
 # Rust reference build output
 reference/target/
+bench/rust/target/

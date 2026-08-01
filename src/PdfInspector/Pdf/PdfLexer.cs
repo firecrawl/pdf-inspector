@@ -58,18 +58,32 @@ internal sealed class PdfLexer(byte[] data, int position = 0)
     /// <summary>Reads a run of regular characters — a keyword, number, or operator.</summary>
     public string ReadToken()
     {
+        var span = ReadTokenSpan();
+        return span.IsEmpty ? string.Empty : Encoding.ASCII.GetString(span);
+    }
+
+    /// <summary>
+    /// Reads a token without allocating, as a window over the source bytes.
+    /// </summary>
+    /// <remarks>
+    /// The content-stream decoder runs this millions of times on a large
+    /// document — once per number, operator and keyword. Materialising a string
+    /// for each was the single largest allocation source in extraction, and
+    /// almost all of those strings were numbers thrown away immediately after
+    /// parsing. Callers that genuinely need a string call <see cref="ReadToken"/>.
+    /// </remarks>
+    public ReadOnlySpan<byte> ReadTokenSpan()
+    {
         var start = Position;
-        while (Position < Data.Length && IsRegular(Data[Position]))
+        var data = Data;
+        var i = Position;
+        while (i < data.Length && IsRegular(data[i]))
         {
-            Position++;
+            i++;
         }
 
-        if (Position == start)
-        {
-            return string.Empty;
-        }
-
-        return Encoding.ASCII.GetString(Data, start, Position - start);
+        Position = i;
+        return data.AsSpan(start, i - start);
     }
 
     /// <summary>True when the bytes at the cursor match <paramref name="keyword"/>.</summary>
@@ -275,24 +289,48 @@ internal sealed class PdfLexer(byte[] data, int position = 0)
     /// </summary>
     public static PdfObject? ParseNumber(string token)
     {
+        Span<byte> bytes = token.Length <= 64 ? stackalloc byte[64] : new byte[token.Length];
+        var count = Encoding.ASCII.GetBytes(token, bytes);
+        return ParseNumber(bytes[..count]);
+    }
+
+    /// <summary>
+    /// Parses a PDF numeric token from raw bytes, without allocating.
+    /// </summary>
+    /// <remarks>
+    /// The cleaned digits are gathered into a stack buffer and handed to the
+    /// framework's own parser rather than accumulated arithmetically. Rolling a
+    /// mantissa by hand would be faster still, but it would not round
+    /// identically to <c>double.Parse</c> in every case, and a single ulp of
+    /// drift in a coordinate is enough to move a table's row band off the text
+    /// baseline it should coincide with — see the note on float handling in
+    /// CLAUDE.md. Same parser, same bits, no allocation.
+    /// </remarks>
+    public static PdfObject? ParseNumber(ReadOnlySpan<byte> token)
+    {
         if (token.Length == 0)
         {
             return null;
         }
 
+        // A PDF number longer than this is malformed; the surplus is junk that
+        // the cleaning loop below would discard anyway.
+        const int MaxDigits = 64;
+        Span<char> clean = stackalloc char[MaxDigits];
+        var length = 0;
         var isReal = false;
-        var clean = new StringBuilder(token.Length);
-        for (var i = 0; i < token.Length; i++)
+
+        foreach (var b in token)
         {
-            var c = token[i];
+            var c = (char)b;
             if (c is '-' or '+')
             {
                 // Only a leading sign is meaningful; interior signs terminate the number.
-                if (clean.Length == 0)
+                if (length == 0)
                 {
                     if (c == '-')
                     {
-                        clean.Append('-');
+                        clean[length++] = '-';
                     }
 
                     continue;
@@ -309,21 +347,29 @@ internal sealed class PdfLexer(byte[] data, int position = 0)
                 }
 
                 isReal = true;
-                clean.Append('.');
+                if (length < MaxDigits)
+                {
+                    clean[length++] = '.';
+                }
+
                 continue;
             }
 
             if (c is >= '0' and <= '9')
             {
-                clean.Append(c);
+                if (length < MaxDigits)
+                {
+                    clean[length++] = c;
+                }
+
                 continue;
             }
 
             break;
         }
 
-        var text = clean.ToString();
-        if (text.Length == 0 || text == "-" || text == "." || text == "-.")
+        var text = clean[..length];
+        if (length == 0 || text.SequenceEqual("-") || text.SequenceEqual(".") || text.SequenceEqual("-."))
         {
             return isReal ? new PdfReal(0) : null;
         }
@@ -337,7 +383,7 @@ internal sealed class PdfLexer(byte[] data, int position = 0)
 
         if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
         {
-            return new PdfInteger(integer);
+            return PdfInteger.Create(integer);
         }
 
         // Out-of-range integers still carry usable magnitude for heuristics.
@@ -349,4 +395,9 @@ internal sealed class PdfLexer(byte[] data, int position = 0)
     /// <summary>True when the token could begin a number.</summary>
     public static bool LooksNumeric(string token) =>
         token.Length > 0 && (token[0] is >= '0' and <= '9' or '-' or '+' or '.');
+
+    /// <summary>True when the token could begin a number.</summary>
+    public static bool LooksNumeric(ReadOnlySpan<byte> token) =>
+        token.Length > 0 && (token[0] is >= (byte)'0' and <= (byte)'9'
+            or (byte)'-' or (byte)'+' or (byte)'.');
 }

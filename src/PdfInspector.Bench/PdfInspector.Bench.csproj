@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>PdfInspector.Bench</RootNamespace>
+    <AssemblyName>pdf-inspector-bench</AssemblyName>
+
+    <!-- The harness measures steady-state library throughput, so the process
+         must reach tier-1 code and stay there. Warmup iterations do the
+         promoting; these settings keep the runtime from working against it. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PdfInspector\PdfInspector.csproj" />
+  </ItemGroup>
+
+</Project>

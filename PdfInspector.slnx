@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/PdfInspector.Cli/PdfInspector.Cli.csproj" />
     <Project Path="src/PdfInspector/PdfInspector.csproj" />
+    <Project Path="src/PdfInspector.Bench/PdfInspector.Bench.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/PdfInspector.Tests/PdfInspector.Tests.csproj" />

@@ -1,4 +1,6 @@
 // Ported from reference/src/tables/detect_rects.rs
+using System.Buffers;
+using System.Numerics;
 using PdfInspector.Extractor;
 using PdfInspector.Text;
 using PdfInspector.Types;
@@ -37,6 +39,106 @@ internal sealed class RectHintRegion
 internal static class RectTables
 {
     private const string Module = "tables";
+
+    /// <summary>
+    /// Drops every rectangle that sits wholly inside a similarly sized neighbour.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every rectangle is tested against every other, which is unavoidable —
+    /// containment is not a sortable relation. What is avoidable is the cost per
+    /// pair: this was written as <c>RemoveAll(a =&gt; snapshot.Any(b =&gt; …))</c>,
+    /// which pays a delegate call and an enumerator step for each of the n²
+    /// pairs. On a 269-page document with 42k rectangles that dominated rect
+    /// detection, which in turn is the single most expensive stage of the
+    /// pipeline and runs twice per document.
+    /// </para>
+    /// <para>
+    /// The rewrite keeps the semantics exactly: containment is judged against a
+    /// snapshot of the original set, so no rectangle's removal can affect
+    /// another's, and the surviving order is preserved. Sorting by descending
+    /// area lets the inner scan stop as soon as the candidates are too small to
+    /// contain anything, since the predicate requires the container to be at
+    /// least 1.2× the area.
+    /// </para>
+    /// </remarks>
+    private static void RemoveContainedSubRects(List<RectBox> pageRects)
+    {
+        const float Tol = 2.0f;
+        var n = pageRects.Count;
+        if (n < 2)
+        {
+            return;
+        }
+
+        var rects = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(pageRects);
+
+        // Indices ordered by descending area, so the inner loop can stop early.
+        var byArea = new int[n];
+        for (var i = 0; i < n; i++)
+        {
+            byArea[i] = i;
+        }
+
+        var areas = new float[n];
+        for (var i = 0; i < n; i++)
+        {
+            areas[i] = rects[i].Area;
+        }
+
+        Array.Sort(byArea, (l, r) => areas[r].CompareTo(areas[l]));
+
+        var contained = new bool[n];
+        for (var ai = 0; ai < n; ai++)
+        {
+            ref readonly var a = ref rects[ai];
+            var minContainerArea = a.Area * 1.2f;
+            var maxContainerHeight = a.H * 4.0f;
+            var aLeft = a.Left + Tol;
+            var aRight = a.Right - Tol;
+            var aBottom = a.Bottom + Tol;
+            var aTop = a.Top - Tol;
+
+            foreach (var bi in byArea)
+            {
+                ref readonly var b = ref rects[bi];
+
+                // Candidates only shrink from here, so nothing further can qualify.
+                if (!(b.Area > minContainerArea))
+                {
+                    break;
+                }
+
+                // An origin-anchored page background is never a container: it
+                // would swallow the table frames that hold clusters together.
+                if (b.X < 5.0f && b.Y < 5.0f)
+                {
+                    continue;
+                }
+
+                if (b.H < maxContainerHeight
+                    && b.Left <= aLeft
+                    && b.Right >= aRight
+                    && b.Bottom <= aBottom
+                    && b.Top >= aTop)
+                {
+                    contained[ai] = true;
+                    break;
+                }
+            }
+        }
+
+        var write = 0;
+        for (var i = 0; i < n; i++)
+        {
+            if (!contained[i])
+            {
+                pageRects[write++] = pageRects[i];
+            }
+        }
+
+        pageRects.RemoveRange(write, n - write);
+    }
 
     /// <summary>
     /// A handful of coincident origin frames may be real structure, so repeated
@@ -235,22 +337,7 @@ internal static class RectTables
             if (pageRects.Count < RectGrid.MaxClusterRects)
             {
                 var beforeDedup = pageRects.Count;
-                var snapshot = pageRects.ToList();
-                pageRects.RemoveAll(a =>
-                {
-                    const float Tol = 2.0f;
-                    return snapshot.Any(b =>
-                    {
-                        var containerIsPageBg = b.X < 5.0f && b.Y < 5.0f;
-                        return b.Area > a.Area * 1.2f
-                            && b.H < a.H * 4.0f
-                            && !containerIsPageBg
-                            && b.Left <= a.Left + Tol
-                            && b.Right >= a.Right - Tol
-                            && b.Bottom <= a.Bottom + Tol
-                            && b.Top >= a.Top - Tol;
-                    });
-                });
+                RemoveContainedSubRects(pageRects);
                 if (pageRects.Count < beforeDedup)
                 {
                     Log.Debug(Module, () =>
@@ -1347,120 +1434,395 @@ internal static class RectTables
     /// axis labels into a phantom table. The check runs mirrored to catch
     /// horizontal bar charts too.
     /// </summary>
+    /// <summary>
+    /// True when a rect cluster is a bar chart rather than a table.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Bars form a dominant equal-breadth family arranged in two or more spaced
+    /// columns — an inter-column gap of at least half a bar breadth, since table
+    /// cell rects touch — with data-driven length variation, where checkbox and
+    /// cell grids stay uniform. The test runs once per orientation, mirrored, so
+    /// horizontal bar charts are caught too.
+    /// </para>
+    /// <para>
+    /// This is the most expensive single test in the pipeline: rect detection is
+    /// the costliest stage of a document and, before this rewrite, 58% of it was
+    /// spent here. Three things made it slow, none of them the algorithm itself.
+    /// The geometry accessors were <c>Func&lt;RectBox, float&gt;</c> delegates,
+    /// so every one of the millions of reads was an un-inlinable call. The
+    /// cross-column pairing scan was <c>family.Count(r =&gt; family.Any(s =&gt;
+    /// …))</c> — quadratic, with a delegate per pair. And the whole body ran once
+    /// per rect even though it depends only on the anchor's breadth, which on a
+    /// bar chart is by definition shared by most of the cluster.
+    /// </para>
+    /// <para>
+    /// The rewrite projects the geometry into flat float arrays once per
+    /// orientation, visits each distinct breadth once instead of each rect, and
+    /// vectorises the pairing scan. Every decision the original made is
+    /// preserved, including iteration order where it is observable: families are
+    /// built in cluster order, positions are kept on first occurrence, and the
+    /// search still stops at the first anchor that qualifies.
+    /// </para>
+    /// </remarks>
     private static bool IsChartBarCluster(
         IReadOnlyList<TextItem> items,
         IReadOnlyList<RectBox> groupRects,
         uint page)
     {
-        bool NumericOrEmpty(RectBox r)
+        var n = groupRects.Count;
+        if (n == 0)
         {
-            // Any number of numeric data labels is chart-like; a single run of word
-            // text inside means a table cell.
-            return items
-                .Where(it =>
-                {
-                    var cx = it.X + (it.Width / 2.0f);
-                    return it.Page == page && cx >= r.Left && cx <= r.Right && it.Y >= r.Bottom && it.Y <= r.Top;
-                })
-                .All(it =>
-                {
-                    var t = it.Text.Trim();
-                    var data = t.Count(c => char.IsAsciiDigit(c) || ",.%-".Contains(c, StringComparison.Ordinal));
-                    return t.Length == 0 || data * 2 >= TextUtils.CharCount(t);
-                });
+            return false;
         }
 
-        // Bars: the dominant equal-breadth family, arranged in two or more spaced
-        // columns — an inter-column gap of at least half a bar breadth, since table
-        // cell rects touch — with data-driven length variation, where checkbox and
-        // cell grids stay uniform. Running the predicate mirrored catches
-        // horizontal bar charts.
-        bool BarFamily(
-            Func<RectBox, float> pos,
-            Func<RectBox, float> breadth,
-            Func<RectBox, float> length,
-            Func<RectBox, float> along)
+        // Only this page's items can fall inside the cluster, and the filter is
+        // invariant across every containment test below.
+        var pageItems = new List<TextItem>();
+        foreach (var it in items)
         {
-            foreach (var anchor in groupRects)
+            if (it.Page == page)
             {
-                var bw = breadth(anchor);
-                if (bw <= 0.0f)
-                {
-                    continue;
-                }
-
-                var family = groupRects
-                    .Where(r => MathF.Abs(breadth(r) - bw) <= MathF.Max(bw * 0.1f, 2.0f)
-                        && length(r) > 0.0f
-                        && length(r) < bw * 20.0f)
-                    .ToList();
-                if (family.Count < 4)
-                {
-                    continue;
-                }
-
-                // Distinct positions along the axis are the bar columns.
-                var positions = new List<float>();
-                foreach (var r in family)
-                {
-                    var p = pos(r);
-                    if (!positions.Any(q => MathF.Abs(q - p) <= 2.0f))
-                    {
-                        positions.Add(p);
-                    }
-                }
-
-                if (positions.Count < 2)
-                {
-                    continue;
-                }
-
-                positions.Sort(FloatTotalOrder.Instance);
-                var minGap = float.PositiveInfinity;
-                for (var i = 0; i + 1 < positions.Count; i++)
-                {
-                    minGap = MathF.Min(minGap, positions[i + 1] - positions[i] - bw);
-                }
-
-                if (minGap < bw * 0.5f)
-                {
-                    continue;
-                }
-
-                // Data-driven variation along the bar direction.
-                var lenMin = family.Min(length);
-                var lenMax = family.Max(length);
-                if (lenMax < lenMin * 1.3f)
-                {
-                    continue;
-                }
-
-                // Grid rows disguise themselves as bars: a table's cell rects have
-                // same-position, same-length partners in other columns, since row
-                // heights are uniform. Chart segments start where the previous datum
-                // ended, so their extents rarely pair up across positions.
-                var matched = family.Count(r => family.Any(s =>
-                    MathF.Abs(pos(s) - pos(r)) > 2.0f
-                    && MathF.Abs(along(s) - along(r)) <= 3.0f
-                    && MathF.Abs(length(s) - length(r)) <= 3.0f));
-                if (matched * 5 >= family.Count * 3)
-                {
-                    continue;
-                }
-
-                if (family.Count(NumericOrEmpty) * 3 >= family.Count * 2)
-                {
-                    return true;
-                }
+                pageItems.Add(it);
             }
-
-            return false;
         }
 
         // Vertical bars: position and breadth are x and width, length is height,
         // along is y. Horizontal bars mirror that.
-        return BarFamily(r => r.X, r => r.W, r => r.H, r => r.Y)
-            || BarFamily(r => r.Y, r => r.H, r => r.W, r => r.X);
+        return BarFamily(groupRects, pageItems, vertical: true)
+            || BarFamily(groupRects, pageItems, vertical: false);
+    }
+
+    /// <summary>
+    /// Tests one orientation for a bar-chart family. With
+    /// <paramref name="vertical"/> set, position and breadth read from x and
+    /// width and length from height; otherwise the axes swap.
+    /// </summary>
+    private static bool BarFamily(
+        IReadOnlyList<RectBox> groupRects,
+        List<TextItem> pageItems,
+        bool vertical)
+    {
+        var n = groupRects.Count;
+
+        // Project the geometry once. Flat arrays keep the scans below free of
+        // delegate calls and let the pairing loop vectorise.
+        var pos = new float[n];
+        var breadth = new float[n];
+        var length = new float[n];
+        var along = new float[n];
+
+        for (var i = 0; i < n; i++)
+        {
+            var r = groupRects[i];
+            if (vertical)
+            {
+                pos[i] = r.X;
+                breadth[i] = r.W;
+                length[i] = r.H;
+                along[i] = r.Y;
+            }
+            else
+            {
+                pos[i] = r.Y;
+                breadth[i] = r.H;
+                length[i] = r.W;
+                along[i] = r.X;
+            }
+        }
+
+        // Whether each rect holds only numeric or empty text, computed at most
+        // once per rect rather than once per family membership.
+        var numericOrEmpty = new byte[n];
+
+        // Anchors differing only in breadth-identical values produce identical
+        // families and therefore identical verdicts, so each distinct breadth is
+        // visited once. Bars share a breadth by definition, which is what makes
+        // this collapse the outer loop so sharply.
+        var seenBreadths = new List<float>();
+        var familyIndices = new List<int>(n);
+        var positions = new List<float>();
+
+        for (var anchor = 0; anchor < n; anchor++)
+        {
+            var bw = breadth[anchor];
+            if (bw <= 0.0f)
+            {
+                continue;
+            }
+
+            var alreadySeen = false;
+            foreach (var seen in seenBreadths)
+            {
+                if (seen.Equals(bw))
+                {
+                    alreadySeen = true;
+                    break;
+                }
+            }
+
+            if (alreadySeen)
+            {
+                continue;
+            }
+
+            seenBreadths.Add(bw);
+
+            var tolerance = MathF.Max(bw * 0.1f, 2.0f);
+            var maxLength = bw * 20.0f;
+
+            familyIndices.Clear();
+            for (var i = 0; i < n; i++)
+            {
+                if (MathF.Abs(breadth[i] - bw) <= tolerance
+                    && length[i] > 0.0f
+                    && length[i] < maxLength)
+                {
+                    familyIndices.Add(i);
+                }
+            }
+
+            var count = familyIndices.Count;
+            if (count < 4)
+            {
+                continue;
+            }
+
+            // Distinct positions along the axis are the bar columns.
+            positions.Clear();
+            foreach (var i in familyIndices)
+            {
+                var p = pos[i];
+                var isNew = true;
+                foreach (var q in positions)
+                {
+                    if (MathF.Abs(q - p) <= 2.0f)
+                    {
+                        isNew = false;
+                        break;
+                    }
+                }
+
+                if (isNew)
+                {
+                    positions.Add(p);
+                }
+            }
+
+            if (positions.Count < 2)
+            {
+                continue;
+            }
+
+            positions.Sort(FloatTotalOrder.Instance);
+            var minGap = float.PositiveInfinity;
+            for (var i = 0; i + 1 < positions.Count; i++)
+            {
+                minGap = MathF.Min(minGap, positions[i + 1] - positions[i] - bw);
+            }
+
+            if (minGap < bw * 0.5f)
+            {
+                continue;
+            }
+
+            // Data-driven variation along the bar direction.
+            var lenMin = float.PositiveInfinity;
+            var lenMax = float.NegativeInfinity;
+            foreach (var i in familyIndices)
+            {
+                lenMin = MathF.Min(lenMin, length[i]);
+                lenMax = MathF.Max(lenMax, length[i]);
+            }
+
+            if (lenMax < lenMin * 1.3f)
+            {
+                continue;
+            }
+
+            // Grid rows disguise themselves as bars: a table's cell rects have
+            // same-position, same-length partners in other columns, since row
+            // heights are uniform. Chart segments start where the previous datum
+            // ended, so their extents rarely pair up across positions.
+            var matched = CountPairedAcrossColumns(familyIndices, pos, along, length);
+            if (matched * 5 >= count * 3)
+            {
+                continue;
+            }
+
+            var numeric = 0;
+            foreach (var i in familyIndices)
+            {
+                if (numericOrEmpty[i] == 0)
+                {
+                    numericOrEmpty[i] = NumericOrEmpty(pageItems, groupRects[i]) ? (byte)1 : (byte)2;
+                }
+
+                if (numericOrEmpty[i] == 1)
+                {
+                    numeric++;
+                }
+            }
+
+            if (numeric * 3 >= count * 2)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Counts family members that have a partner in another column at the same
+    /// offset and length — the signature of a grid rather than a chart.
+    /// </summary>
+    /// <remarks>
+    /// Quadratic by nature, and the inner scan is three independent float
+    /// comparisons over contiguous data, so it vectorises cleanly. The scalar
+    /// tail below the vector width runs the identical predicate.
+    /// </remarks>
+    private static int CountPairedAcrossColumns(
+        List<int> familyIndices,
+        float[] pos,
+        float[] along,
+        float[] length)
+    {
+        var count = familyIndices.Count;
+
+        // Gather the family's geometry into contiguous buffers so the inner scan
+        // reads straight through memory instead of chasing indices.
+        var fPos = ArrayPool<float>.Shared.Rent(count);
+        var fAlong = ArrayPool<float>.Shared.Rent(count);
+        var fLength = ArrayPool<float>.Shared.Rent(count);
+
+        try
+        {
+            for (var i = 0; i < count; i++)
+            {
+                var idx = familyIndices[i];
+                fPos[i] = pos[idx];
+                fAlong[i] = along[idx];
+                fLength[i] = length[idx];
+            }
+
+            var posSpan = fPos.AsSpan(0, count);
+            var alongSpan = fAlong.AsSpan(0, count);
+            var lengthSpan = fLength.AsSpan(0, count);
+
+            var matched = 0;
+            for (var r = 0; r < count; r++)
+            {
+                if (HasPartner(posSpan, alongSpan, lengthSpan, posSpan[r], alongSpan[r], lengthSpan[r]))
+                {
+                    matched++;
+                }
+            }
+
+            return matched;
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(fPos);
+            ArrayPool<float>.Shared.Return(fAlong);
+            ArrayPool<float>.Shared.Return(fLength);
+        }
+    }
+
+    /// <summary>
+    /// True when any entry sits in a different column but at the same offset and
+    /// length, within the tolerances the chart test uses.
+    /// </summary>
+    private static bool HasPartner(
+        ReadOnlySpan<float> pos,
+        ReadOnlySpan<float> along,
+        ReadOnlySpan<float> length,
+        float rPos,
+        float rAlong,
+        float rLength)
+    {
+        var i = 0;
+
+        if (Vector.IsHardwareAccelerated && pos.Length >= Vector<float>.Count)
+        {
+            var vPos = new Vector<float>(rPos);
+            var vAlong = new Vector<float>(rAlong);
+            var vLength = new Vector<float>(rLength);
+            var posTol = new Vector<float>(2.0f);
+            var tol = new Vector<float>(3.0f);
+
+            for (; i <= pos.Length - Vector<float>.Count; i += Vector<float>.Count)
+            {
+                var sPos = new Vector<float>(pos.Slice(i, Vector<float>.Count));
+                var sAlong = new Vector<float>(along.Slice(i, Vector<float>.Count));
+                var sLength = new Vector<float>(length.Slice(i, Vector<float>.Count));
+
+                var differentColumn = Vector.GreaterThan(Vector.Abs(sPos - vPos), posTol);
+                var sameAlong = Vector.LessThanOrEqual(Vector.Abs(sAlong - vAlong), tol);
+                var sameLength = Vector.LessThanOrEqual(Vector.Abs(sLength - vLength), tol);
+
+                if (Vector.EqualsAny(differentColumn & sameAlong & sameLength, new Vector<int>(-1)))
+                {
+                    return true;
+                }
+            }
+        }
+
+        for (; i < pos.Length; i++)
+        {
+            if (MathF.Abs(pos[i] - rPos) > 2.0f
+                && MathF.Abs(along[i] - rAlong) <= 3.0f
+                && MathF.Abs(length[i] - rLength) <= 3.0f)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// True when every text item whose centre falls inside the rect is numeric
+    /// or blank. Any number of numeric data labels is chart-like; a single run
+    /// of word text inside means a table cell.
+    /// </summary>
+    private static bool NumericOrEmpty(List<TextItem> pageItems, RectBox r)
+    {
+        var left = r.Left;
+        var right = r.Right;
+        var bottom = r.Bottom;
+        var top = r.Top;
+
+        foreach (var it in pageItems)
+        {
+            var cx = it.X + (it.Width / 2.0f);
+            if (cx < left || cx > right || it.Y < bottom || it.Y > top)
+            {
+                continue;
+            }
+
+            var t = it.Text.Trim();
+            if (t.Length == 0)
+            {
+                continue;
+            }
+
+            var data = 0;
+            foreach (var c in t)
+            {
+                if (char.IsAsciiDigit(c) || c is ',' or '.' or '%' or '-')
+                {
+                    data++;
+                }
+            }
+
+            if (data * 2 < TextUtils.CharCount(t))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>

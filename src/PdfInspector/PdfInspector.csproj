@@ -14,6 +14,10 @@
     <!-- The test suite covers the internal heuristics directly, mirroring the
          Rust crate's in-module unit tests. -->
     <InternalsVisibleTo Include="PdfInspector.Tests" />
+
+    <!-- The benchmark harness times individual pipeline stages, which are
+         internal; the shipping path stays free of measurement hooks. -->
+    <InternalsVisibleTo Include="pdf-inspector-bench" />
   </ItemGroup>
 
   <ItemGroup>

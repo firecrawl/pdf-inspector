@@ -62,7 +62,7 @@ public static class ContentStream
                 continue;
             }
 
-            var token = lexer.ReadToken();
+            var token = lexer.ReadTokenSpan();
             if (token.Length == 0)
             {
                 lexer.Position++;
@@ -80,27 +80,35 @@ public static class ContentStream
                 continue;
             }
 
-            switch (token)
+            if (token.SequenceEqual("true"u8))
             {
-                case "true":
-                    operands.Add(PdfBoolean.True);
-                    continue;
-                case "false":
-                    operands.Add(PdfBoolean.False);
-                    continue;
-                case "null":
-                    operands.Add(PdfObject.Null);
-                    continue;
-                case "BI":
-                    // Inline image: the binary payload between ID and EI is not
-                    // PDF syntax, so it must be skipped as raw bytes.
-                    lexer.Position = SkipInlineImage(data, lexer.Position);
-                    operations.Add(new PdfOperation("BI", []));
-                    operands.Clear();
-                    continue;
+                operands.Add(PdfBoolean.True);
+                continue;
             }
 
-            operations.Add(new PdfOperation(token, operands));
+            if (token.SequenceEqual("false"u8))
+            {
+                operands.Add(PdfBoolean.False);
+                continue;
+            }
+
+            if (token.SequenceEqual("null"u8))
+            {
+                operands.Add(PdfObject.Null);
+                continue;
+            }
+
+            if (token.SequenceEqual("BI"u8))
+            {
+                // Inline image: the binary payload between ID and EI is not
+                // PDF syntax, so it must be skipped as raw bytes.
+                lexer.Position = SkipInlineImage(data, lexer.Position);
+                operations.Add(new PdfOperation(Operators.Intern("BI"u8), []));
+                operands.Clear();
+                continue;
+            }
+
+            operations.Add(new PdfOperation(Operators.Intern(token), operands));
             operands = [];
         }
 

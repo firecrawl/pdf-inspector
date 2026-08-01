@@ -72,6 +72,34 @@ public sealed class PdfBoolean(bool value) : PdfObject
 
 public sealed class PdfInteger(long value) : PdfObject
 {
+    /// <summary>
+    /// Instances for the small values content streams are made of. Font sizes,
+    /// glyph displacements, colour components and array indices land here
+    /// almost every time, so caching this range removes most integer
+    /// allocation from stream decoding.
+    /// </summary>
+    private const int CacheMin = -1024;
+    private const int CacheMax = 4096;
+
+    private static readonly PdfInteger[] Cache = BuildCache();
+
+    private static PdfInteger[] BuildCache()
+    {
+        var cache = new PdfInteger[CacheMax - CacheMin + 1];
+        for (var i = 0; i < cache.Length; i++)
+        {
+            cache[i] = new PdfInteger(i + CacheMin);
+        }
+
+        return cache;
+    }
+
+    /// <summary>Returns a cached instance for small values, or a new one.</summary>
+    public static PdfInteger Create(long value) =>
+        value is >= CacheMin and <= CacheMax
+            ? Cache[(int)value - CacheMin]
+            : new PdfInteger(value);
+
     public long Value { get; } = value;
 
     public override long? AsInteger() => Value;

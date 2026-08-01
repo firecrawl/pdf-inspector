@@ -1,4 +1,5 @@
 // Ported from reference/src/tables/detect_rects.rs
+using System.Buffers;
 using System.Text;
 using PdfInspector.Text;
 using PdfInspector.Types;
@@ -92,6 +93,94 @@ internal static class RectGrid
     /// overlap checks are skipped so pathological pages stay fast.
     /// </summary>
     public const int MaxClusterRects = 2000;
+
+    /// <summary>
+    /// Counts grid cells wholly covered by at least one rectangle.
+    /// </summary>
+    /// <remarks>
+    /// Written the obvious way — <c>groupRects.Any(…)</c> per cell — this is
+    /// rows × columns × rectangles, and the closure capturing each cell's edges
+    /// allocates once per cell on top. Walking the rectangles instead inverts
+    /// the cost: a rectangle covers a contiguous block of columns and rows
+    /// (both edge lists are sorted), so each one marks its block directly and
+    /// the answer is the number of marks. Same predicate, same result, without
+    /// the per-cell sweep.
+    /// </remarks>
+    private static uint CountCoveredCells(
+        IReadOnlyList<RectBox> groupRects,
+        List<float> colEdges,
+        List<float> rowEdges,
+        int numCols,
+        int numRows)
+    {
+        const float Tol = 6.0f;
+
+        var cells = ArrayPool<bool>.Shared.Rent(numCols * numRows);
+        try
+        {
+            Array.Clear(cells, 0, numCols * numRows);
+
+            foreach (var r in groupRects)
+            {
+                // Columns ascend, so the covered ones form the run whose own
+                // edges sit inside the rectangle.
+                var firstCol = -1;
+                var lastCol = -2;
+                for (var col = 0; col < numCols; col++)
+                {
+                    if (r.Left <= colEdges[col] + Tol && r.Right >= colEdges[col + 1] - Tol)
+                    {
+                        if (firstCol < 0)
+                        {
+                            firstCol = col;
+                        }
+
+                        lastCol = col;
+                    }
+                    else if (firstCol >= 0)
+                    {
+                        break;
+                    }
+                }
+
+                if (firstCol < 0)
+                {
+                    continue;
+                }
+
+                // Rows descend — the highest y first — but are equally contiguous.
+                for (var row = 0; row < numRows; row++)
+                {
+                    if (r.Bottom > rowEdges[row] + Tol || r.Top < rowEdges[row + 1] - Tol)
+                    {
+                        continue;
+                    }
+
+                    var offset = row * numCols;
+                    for (var col = firstCol; col <= lastCol; col++)
+                    {
+                        cells[offset + col] = true;
+                    }
+                }
+            }
+
+            var filled = 0u;
+            var span = cells.AsSpan(0, numCols * numRows);
+            foreach (var covered in span)
+            {
+                if (covered)
+                {
+                    filled++;
+                }
+            }
+
+            return filled;
+        }
+        finally
+        {
+            ArrayPool<bool>.Shared.Return(cells);
+        }
+    }
 
     /// <summary>True when two rectangles overlap once each is expanded by the tolerance.</summary>
     public static bool RectsOverlap(in RectBox a, in RectBox b, float tol) =>
@@ -367,30 +456,7 @@ internal static class RectGrid
             return (GridOutcome.Failed, null);
         }
 
-        var filledCells = 0u;
-        for (var row = 0; row < numRows; row++)
-        {
-            var yTop = rowEdges[row];
-            var yBot = rowEdges[row + 1];
-
-            for (var col = 0; col < numCols; col++)
-            {
-                var xLeft = colEdges[col];
-                var xRight = colEdges[col + 1];
-
-                const float Tol = 6.0f;
-                var covered = groupRects.Any(r =>
-                    r.Left <= xLeft + Tol
-                    && r.Right >= xRight - Tol
-                    && r.Bottom <= yTop + Tol
-                    && r.Top >= yBot - Tol);
-
-                if (covered)
-                {
-                    filledCells++;
-                }
-            }
-        }
+        var filledCells = CountCoveredCells(groupRects, colEdges, rowEdges, numCols, numRows);
 
         var totalCells = (float)(numCols * numRows);
         var fillRatio = filledCells / totalCells;

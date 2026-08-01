@@ -103,6 +103,41 @@ a known divergence, so drifting either way fails.
 dotnet test --filter Category!=Differential   # skip the minutes-long fixture sweep
 ```
 
+## Benchmarks
+
+`bench/README.md` covers the two harnesses in full. In short: both
+implementations are measured in-process with warmup, because a cold CLI pass
+measures JIT far more than the extractor — `bits_pilani_feedback` is ~15 s warm
+and ~190 s cold. Every run prints a CPU line and three calibration kernels
+(scalar int, scalar float, streaming memory) so runs from different VMs can be
+scaled into agreement; the kernels are duplicated in
+`src/PdfInspector.Bench/MachineProfile.cs` and `bench/rust/src/kernels.rs` and
+must stay identical.
+
+```bash
+dotnet build -c Release
+./src/PdfInspector.Bench/bin/Release/net10.0/pdf-inspector-bench --iters 5
+./src/PdfInspector.Bench/bin/Release/net10.0/pdf-inspector-bench --phases FILE.pdf
+./src/PdfInspector.Bench/bin/Release/net10.0/pdf-inspector-bench --detectors FILE.pdf
+```
+
+## Performance notes
+
+Rect table detection is the most expensive stage of the pipeline and runs twice
+per document, since the extractor needs it to tell a table's ruling lines from a
+text underline. Optimisation work should start there and be driven by
+`--detectors`, not by guesswork — the first two candidates that looked obvious
+(the containment dedup pass, the grid coverage sweep) turned out to be 1.4% and
+noise respectively, while `IsChartBarCluster` was 58%.
+
+What made that function slow was not its algorithm but its shape: geometry read
+through `Func<RectBox, float>` delegates that cannot inline, a quadratic pairing
+scan written as `family.Count(r => family.Any(s => …))`, and a body re-run per
+rect when it depends only on the anchor's breadth. Flat float arrays, one visit
+per distinct breadth, and a vectorised pairing scan took it from 2617 ms to
+121 ms on the 269-page fixture. The same three shapes are worth looking for
+elsewhere.
+
 ## Debugging
 
 Set `PDFINSPECTOR_LOG` to a comma-separated list of module names for trace output:
