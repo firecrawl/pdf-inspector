@@ -37,7 +37,7 @@ All 22 fixtures load; page counts match the Rust reference exactly.
 - [x] `text_quality.rs`
 - [x] TrueType face reader replacing `ttf-parser` (`Fonts/TrueTypeFace.cs`)
 
-## Phase 3 — extractor — in progress
+## Phase 3 — extractor — done
 - [x] `fonts.rs` → `FontWidths`, `FontEncodings`, `StandardEncodings`, `FontStyles`, `TextDecoder`
 - [x] `content_stream.rs` → `ContentStreamExtractor`
 - [x] `xobjects.rs` → `XObjects`
@@ -46,8 +46,8 @@ All 22 fixtures load; page counts match the Rust reference exactly.
 - [x] item merging from `mod.rs` → `ItemMerging`
 - [x] `layout.rs` — column detection, line grouping, reading-order layout
 - [x] `reading_order.rs`
-- [ ] `mod.rs` pipeline — `extract_positioned_text_impl`, page-box clipping,
-      `suppress_table_underlines` (needs Phase 4), public `extract_text*` API
+- [x] `mod.rs` pipeline → `TextExtractor` (page-box clipping, thresholds,
+      `suppress_table_underlines`)
 
 ## Phase 4 — tables — done
 - [x] `grid.rs` → `Grid`
