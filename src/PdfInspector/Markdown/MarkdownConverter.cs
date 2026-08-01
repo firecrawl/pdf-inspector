@@ -184,13 +184,20 @@ public static class MarkdownConverter
             group.Add((globalIdx, item));
         }
 
+        // Bucketed once. Every per-page consumer below filters the document's
+        // rects and lines down to its own page, so handing each the whole list
+        // walks all of them once per page — quadratic on a document with many
+        // pages and many drawn rects.
+        var rectsByPage = GroupByPage(rects, r => r.Page);
+        var linesByPage = GroupByPage(pdfLines, l => l.Page);
+
         // A page's chart regions must not steer column detection during line
         // grouping: their text fills the gutter and fuses two-column lines.
         var pageChartMap = new Dictionary<uint, List<ChartRegion>>();
         foreach (var page in pageGroups.Keys)
         {
             var pageItemsRef = pageGroups[page].Select(p => p.Item).ToList();
-            var regions = RectTables.DetectChartRegions(pageItemsRef, rects, page)
+            var regions = RectTables.DetectChartRegions(pageItemsRef, PageRects(rectsByPage, page), page)
                 .Select(r => new ChartRegion(r.Left, r.Bottom, r.Right, r.Top))
                 .ToList();
             if (regions.Count > 0)
@@ -254,7 +261,8 @@ public static class MarkdownConverter
             // A rect table crossing a proposed boundary means the "gutter" is really
             // the gap between ruled and borderless table columns, so splitting there
             // would cleave the table in half.
-            if (bands.Count > 0 && PageSplits.RectClusterSpansBandBoundary(pageItems, rects, page, bands))
+            if (bands.Count > 0 && PageSplits.RectClusterSpansBandBoundary(
+                pageItems, PageRects(rectsByPage, page), page, bands))
             {
                 Log.Debug(Module, () => $"page {page}: side-by-side split vetoed by spanning rect cluster");
                 bands.Clear();
@@ -265,7 +273,7 @@ public static class MarkdownConverter
             // 10pt apart.
             if (bands.Count == 0)
             {
-                bands = PageSplits.SplitFromHintRegions(pageItems, rects, page);
+                bands = PageSplits.SplitFromHintRegions(pageItems, PageRects(rectsByPage, page), page);
 
                 // Only hint-derived splits are tracked for non-table line grouping:
                 // projection splits already scope table detection, and their non-table
@@ -287,7 +295,8 @@ public static class MarkdownConverter
                 pageChartProseOrders[page] = chartProseOrder.Value;
             }
 
-            var bandSpecs = BuildBandSpecs(bands, pageItems, rects, pdfLines, page);
+            var bandSpecs = BuildBandSpecs(
+                bands, pageItems, PageRects(rectsByPage, page), PageLines(linesByPage, page), page);
 
             // When the page splits into bands but no band produces a table, the whole
             // page is retried as one band. This catches borderless tables whose column
@@ -415,6 +424,31 @@ public static class MarkdownConverter
             $"structure tree coverage: {tagged}/{textItems.Count} items ({coverage * 100.0f:F0}%)");
         return coverage >= 0.5f;
     }
+
+    /// <summary>Buckets a list by page number, preserving each page's original order.</summary>
+    private static Dictionary<uint, List<T>> GroupByPage<T>(IReadOnlyList<T> values, Func<T, uint> pageOf)
+    {
+        var groups = new Dictionary<uint, List<T>>();
+        foreach (var value in values)
+        {
+            var page = pageOf(value);
+            if (!groups.TryGetValue(page, out var group))
+            {
+                group = [];
+                groups[page] = group;
+            }
+
+            group.Add(value);
+        }
+
+        return groups;
+    }
+
+    private static List<PdfRect> PageRects(Dictionary<uint, List<PdfRect>> byPage, uint page) =>
+        byPage.TryGetValue(page, out var rects) ? rects : [];
+
+    private static List<PdfLine> PageLines(Dictionary<uint, List<PdfLine>> byPage, uint page) =>
+        byPage.TryGetValue(page, out var lines) ? lines : [];
 
     /// <summary>Builds the per-band item, index, rect and line slices for a page.</summary>
     private static List<BandSpec> BuildBandSpecs(
