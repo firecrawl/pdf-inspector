@@ -24,9 +24,25 @@ internal sealed class EncodingResult
 /// encoding and any <c>/Differences</c> overrides. This replaces the encoding
 /// handling the Rust build inherits from lopdf.
 /// </summary>
-internal sealed class SimpleFontEncoding(char?[] table)
+internal sealed class SimpleFontEncoding
 {
-    public char?[] Table { get; } = table;
+    private readonly ToUnicodeCMap? _cidCMap;
+
+    public SimpleFontEncoding(char?[] table) => Table = table;
+
+    /// <summary>
+    /// The Identity-H/V form: two-byte CIDs resolved through the font's own
+    /// ToUnicode CMap. The reference inherits this case from lopdf, whose
+    /// <c>get_font_encoding</c> turns an Identity encoding into a ToUnicode-backed
+    /// one rather than a byte table.
+    /// </summary>
+    private SimpleFontEncoding(ToUnicodeCMap cidCMap)
+    {
+        Table = [];
+        _cidCMap = cidCMap;
+    }
+
+    public char?[] Table { get; }
 
     /// <summary>
     /// Builds the encoding for a font, or returns null when the font declares
@@ -37,8 +53,13 @@ internal sealed class SimpleFontEncoding(char?[] table)
         var subtype = fontDict.Get("Subtype")?.AsName();
         if (subtype == "Type0")
         {
-            // Composite fonts decode through their CMap, not a byte table.
-            return null;
+            // A composite font has no byte table. An Identity encoding still
+            // gets an encoding here, resolving two-byte CIDs through the font's
+            // own ToUnicode CMap, because the reference's decoding chain
+            // consults it before falling back to byte interpretation — and an
+            // unmapped CID must surface as a replacement character there rather
+            // than as a stray Latin-1 letter.
+            return BuildIdentityCidEncoding(doc, fontDict);
         }
 
         var encodingObj = fontDict.Get("Encoding");
@@ -74,6 +95,27 @@ internal sealed class SimpleFontEncoding(char?[] table)
         }
 
         return new SimpleFontEncoding(table);
+    }
+
+    /// <summary>
+    /// Builds the ToUnicode-backed encoding for an Identity-H/V composite font,
+    /// or null when the font declares another encoding or has no usable CMap.
+    /// </summary>
+    private static SimpleFontEncoding? BuildIdentityCidEncoding(PdfDocument doc, PdfDictionary fontDict)
+    {
+        if (doc.Resolve(fontDict.Get("Encoding")) is not PdfName encoding
+            || encoding.Value is not ("Identity-H" or "Identity-V"))
+        {
+            return null;
+        }
+
+        if (doc.Resolve(fontDict.Get("ToUnicode")) is not PdfStream stream)
+        {
+            return null;
+        }
+
+        var cmap = ToUnicodeCMap.Parse(stream.DecompressedContent() ?? stream.RawData);
+        return cmap is null ? null : new SimpleFontEncoding(cmap);
     }
 
     /// <summary>
@@ -118,6 +160,11 @@ internal sealed class SimpleFontEncoding(char?[] table)
     /// </summary>
     public string? Decode(ReadOnlySpan<byte> bytes)
     {
+        if (_cidCMap is not null)
+        {
+            return DecodeCidCodes(bytes);
+        }
+
         var builder = new System.Text.StringBuilder(bytes.Length);
         var resolved = false;
 
@@ -138,6 +185,26 @@ internal sealed class SimpleFontEncoding(char?[] table)
         }
 
         return resolved || bytes.Length == 0 ? builder.ToString() : null;
+    }
+
+    /// <summary>
+    /// Decodes two-byte CIDs through the ToUnicode CMap, emitting a replacement
+    /// character for each unmapped code. Unlike the byte-table path this always
+    /// returns a string: the caller distinguishes success from failure by
+    /// looking for the replacement character, exactly as the reference does.
+    /// </summary>
+    private string DecodeCidCodes(ReadOnlySpan<byte> bytes)
+    {
+        var builder = new System.Text.StringBuilder(bytes.Length / 2);
+
+        for (var i = 0; i + 1 < bytes.Length; i += 2)
+        {
+            var cid = (ushort)((bytes[i] << 8) | bytes[i + 1]);
+            var mapped = _cidCMap!.Lookup(cid);
+            builder.Append(mapped is null || mapped.Contains('\uFFFD') ? "\uFFFD" : mapped);
+        }
+
+        return builder.ToString();
     }
 }
 

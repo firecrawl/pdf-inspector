@@ -159,38 +159,54 @@ public sealed class TrueTypeFace
     }
 
     /// <summary>
-    /// True when the font declares itself italic, from the OS/2 table's
-    /// fsSelection bit. Falls back to the <c>head</c> table's macStyle for fonts
-    /// with no OS/2 table.
+    /// True when the font declares itself italic or oblique in OS/2, or carries
+    /// a non-zero <c>post</c> italic angle.
     /// </summary>
+    /// <remarks>
+    /// The <c>head</c> table's macStyle is deliberately not consulted. The Rust
+    /// build reads these flags through ttf-parser, which reports a face with no
+    /// OS/2 table as neither italic nor bold; falling back to macStyle would
+    /// style text the reference leaves plain.
+    /// </remarks>
     public bool IsItalic
     {
         get
         {
-            if (_tables.TryGetValue("OS/2", out var os2) && os2.Length >= 64)
+            if (SelectionFlags is { } flags)
             {
-                return (ReadUInt16(_data, os2.Offset + 62) & 0x01) != 0;
+                // Bit 0 is italic; bit 9 is oblique, and only meaningful from
+                // OS/2 version 4 onwards.
+                if ((flags & 0x0001) != 0 || (Os2Version >= 4 && (flags & 0x0200) != 0))
+                {
+                    return true;
+                }
             }
 
-            return _tables.TryGetValue("head", out var head) && head.Length >= 46
-                && (ReadUInt16(_data, head.Offset + 44) & 0x02) != 0;
+            return ItalicAngle != 0f;
         }
     }
 
-    /// <summary>True when the font declares itself bold, from OS/2 fsSelection or head macStyle.</summary>
+    /// <summary>True when the font declares itself bold in OS/2 fsSelection.</summary>
     public bool IsBold
     {
         get
         {
-            if (_tables.TryGetValue("OS/2", out var os2) && os2.Length >= 64)
-            {
-                return (ReadUInt16(_data, os2.Offset + 62) & 0x20) != 0;
-            }
-
-            return _tables.TryGetValue("head", out var head) && head.Length >= 46
-                && (ReadUInt16(_data, head.Offset + 44) & 0x01) != 0;
+            // As with italic, a face with no OS/2 table reports plain.
+            return SelectionFlags is { } flags && (flags & 0x0020) != 0;
         }
     }
+
+    /// <summary>The OS/2 table's <c>fsSelection</c> field, or null when the table is absent.</summary>
+    private ushort? SelectionFlags =>
+        _tables.TryGetValue("OS/2", out var os2) && os2.Length >= 64
+            ? ReadUInt16(_data, os2.Offset + 62)
+            : null;
+
+    /// <summary>The OS/2 table's version, or zero when the table is absent.</summary>
+    private ushort Os2Version =>
+        _tables.TryGetValue("OS/2", out var os2) && os2.Length >= 2
+            ? ReadUInt16(_data, os2.Offset)
+            : (ushort)0;
 
     /// <summary>The <c>post</c> table's italic angle in degrees, zero when absent.</summary>
     public float ItalicAngle
