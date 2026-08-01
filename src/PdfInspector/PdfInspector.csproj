@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>PdfInspector</RootNamespace>
+    <AssemblyName>PdfInspector</AssemblyName>
+    <PackageId>PdfInspector</PackageId>
+    <Description>Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection.</Description>
+    <Version>0.1.0</Version>
+    <Authors>Firecrawl Team</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Bundled Adobe CMap binaries, loaded at runtime by the ToUnicode layer. -->
+    <EmbeddedResource Include="..\..\reference\external\bcmaps\*.bcmap">
+      <LogicalName>bcmaps/%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>

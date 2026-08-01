@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>PdfInspector.Cli</RootNamespace>
+    <AssemblyName>pdf-inspector</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PdfInspector\PdfInspector.csproj" />
+  </ItemGroup>
+
+</Project>
