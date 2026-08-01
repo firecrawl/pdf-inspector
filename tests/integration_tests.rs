@@ -3660,9 +3660,22 @@ fn pdf_options_debug_redacts_password() {
 /// Build a PDF whose Form XObject draws text plus a painted underline rule.
 /// `paint` selects how the rule is drawn:
 /// - `"stroke"` — `m`/`l`/`S` under the baseline
+/// - `"closed_stroke"` — `m`/`l`/`h`/`S` (closed path; segments live in subpaths)
 /// - `"rect"` — thin filled `re`/`f` under the baseline
 /// - `"clip"` — `re W n` clip-only (must NOT underline)
+/// - `"inherit_stroke"` — form strokes without its own `w` (uses page line width)
 fn make_pdf_with_form_underline(paint: &str) -> Vec<u8> {
+    make_pdf_with_form_underline_ex(paint, None, "Underlined", None)
+}
+
+/// Same as [`make_pdf_with_form_underline`], with optional Form `/Matrix`,
+/// text label, and page-level content ops prepended before `Do`.
+fn make_pdf_with_form_underline_ex(
+    paint: &str,
+    form_matrix: Option<[lopdf::Object; 6]>,
+    label: &str,
+    page_prefix_ops: Option<Vec<lopdf::content::Operation>>,
+) -> Vec<u8> {
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Document, Object, Stream};
 
@@ -3681,35 +3694,45 @@ fn make_pdf_with_form_underline(paint: &str) -> Vec<u8> {
             "BaseFont" => "Helvetica",
             "FirstChar" => 32,
             "LastChar" => 126,
-            // Uniform 600-unit advance so "Underlined" (10 chars) ≈ 72pt at size 12.
+            // Uniform 600-unit advance so 10 chars ≈ 72pt at size 12.
             "Widths" => Object::Array(vec![Object::Integer(600); 95]),
         }
         .into(),
     );
 
-    // Form content: text at (100, 500) with width ~60 for "Underlined"
+    // Form content: text at (100, 500); rule span sized for the label width
+    // (Widths=600 units → advance = n * 0.6 * font_size).
+    let label_width = ((label.len() as i64) * 600 * 12 / 1000).max(60);
     let mut form_ops = vec![
         Operation::new("BT", vec![]),
         Operation::new("Tf", vec!["F1".into(), 12.into()]),
         Operation::new("Td", vec![100.into(), 500.into()]),
-        Operation::new("Tj", vec![Object::string_literal("Underlined")]),
+        Operation::new("Tj", vec![Object::string_literal(label)]),
         Operation::new("ET", vec![]),
     ];
     match paint {
-        "stroke" => {
+        "stroke" | "inherit_stroke" => {
+            if paint == "stroke" {
+                form_ops.push(Operation::new("w", vec![Object::Real(0.5)]));
+            }
+            form_ops.push(Operation::new("m", vec![100.into(), 498.into()]));
+            form_ops.push(Operation::new("l", vec![Object::Integer(100 + label_width), 498.into()]));
+            form_ops.push(Operation::new("S", vec![]));
+        }
+        "closed_stroke" => {
             form_ops.push(Operation::new("w", vec![Object::Real(0.5)]));
             form_ops.push(Operation::new("m", vec![100.into(), 498.into()]));
-            form_ops.push(Operation::new("l", vec![160.into(), 498.into()]));
+            form_ops.push(Operation::new("l", vec![Object::Integer(100 + label_width), 498.into()]));
+            form_ops.push(Operation::new("h", vec![]));
             form_ops.push(Operation::new("S", vec![]));
         }
         "rect" => {
-            // Thin filled rect just under the baseline.
             form_ops.push(Operation::new(
                 "re",
                 vec![
                     100.into(),
                     Object::Real(497.5),
-                    60.into(),
+                    Object::Integer(label_width),
                     Object::Real(1.0),
                 ],
             ));
@@ -3721,7 +3744,7 @@ fn make_pdf_with_form_underline(paint: &str) -> Vec<u8> {
                 vec![
                     100.into(),
                     Object::Real(497.5),
-                    60.into(),
+                    Object::Integer(label_width),
                     Object::Real(1.0),
                 ],
             ));
@@ -3736,26 +3759,26 @@ fn make_pdf_with_form_underline(paint: &str) -> Vec<u8> {
     }
     .encode()
     .unwrap();
+    let mut form_dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Form",
+        "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! {
+                "F1" => font_id,
+            },
+        },
+    };
+    if let Some(m) = form_matrix {
+        form_dict.set("Matrix", Object::Array(m.to_vec()));
+    }
     doc.objects.insert(
         form_id,
-        Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Form",
-                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-                "Resources" => dictionary! {
-                    "Font" => dictionary! {
-                        "F1" => font_id,
-                    },
-                },
-            },
-            form_content,
-        )
-        .into(),
+        Stream::new(form_dict, form_content).into(),
     );
 
-    // Page merely invokes the form.
-    let page_ops = vec![Operation::new("Do", vec!["Fm0".into()])];
+    let mut page_ops = page_prefix_ops.unwrap_or_default();
+    page_ops.push(Operation::new("Do", vec!["Fm0".into()]));
     let page_content = Content {
         operations: page_ops,
     }
@@ -3848,107 +3871,22 @@ fn test_form_xobject_clip_only_rect_does_not_underline() {
 fn test_form_xobject_matrix_transforms_underline() {
     // Form Matrix translates content by (+40, -20). Text at local (100,500)
     // lands at (140,480); underline stroke must transform with it.
-    use lopdf::content::{Content, Operation};
-    use lopdf::{dictionary, Document, Object, Stream};
+    use lopdf::Object;
 
-    let mut doc = Document::with_version("1.5");
-    let pages_id = doc.new_object_id();
-    let page_id = doc.new_object_id();
-    let font_id = doc.new_object_id();
-    let content_id = doc.new_object_id();
-    let form_id = doc.new_object_id();
-
-    doc.objects.insert(
-        font_id,
-        dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type1",
-            "BaseFont" => "Helvetica",
-            "FirstChar" => 32,
-            "LastChar" => 126,
-            // Uniform 600-unit advance so "Underlined" (10 chars) ≈ 72pt at size 12.
-            "Widths" => Object::Array(vec![Object::Integer(600); 95]),
-        }
-        .into(),
+    let pdf = make_pdf_with_form_underline_ex(
+        "stroke",
+        Some([
+            1.into(),
+            0.into(),
+            0.into(),
+            1.into(),
+            40.into(),
+            Object::Integer(-20),
+        ]),
+        "Shifted",
+        None,
     );
-
-    let form_ops = vec![
-        Operation::new("BT", vec![]),
-        Operation::new("Tf", vec!["F1".into(), 12.into()]),
-        Operation::new("Td", vec![100.into(), 500.into()]),
-        Operation::new("Tj", vec![Object::string_literal("Shifted")]),
-        Operation::new("ET", vec![]),
-        Operation::new("w", vec![Object::Real(0.5)]),
-        Operation::new("m", vec![100.into(), 498.into()]),
-        Operation::new("l", vec![150.into(), 498.into()]),
-        Operation::new("S", vec![]),
-    ];
-    let form_content = Content {
-        operations: form_ops,
-    }
-    .encode()
-    .unwrap();
-    doc.objects.insert(
-        form_id,
-        Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Form",
-                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-                "Matrix" => vec![1.into(), 0.into(), 0.into(), 1.into(), 40.into(), Object::Integer(-20)],
-                "Resources" => dictionary! {
-                    "Font" => dictionary! {
-                        "F1" => font_id,
-                    },
-                },
-            },
-            form_content,
-        )
-        .into(),
-    );
-
-    let page_ops = vec![Operation::new("Do", vec!["Fm0".into()])];
-    let page_content = Content {
-        operations: page_ops,
-    }
-    .encode()
-    .unwrap();
-    doc.objects
-        .insert(content_id, Stream::new(dictionary! {}, page_content).into());
-    doc.objects.insert(
-        page_id,
-        dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-            "Resources" => dictionary! {
-                "XObject" => dictionary! {
-                    "Fm0" => form_id,
-                },
-            },
-            "Contents" => content_id,
-        }
-        .into(),
-    );
-    doc.objects.insert(
-        pages_id,
-        dictionary! {
-            "Type" => "Pages",
-            "Kids" => vec![page_id.into()],
-            "Count" => 1,
-        }
-        .into(),
-    );
-    let catalog_id = doc.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => pages_id,
-    });
-    doc.trailer.set("Root", catalog_id);
-
-    let mut bytes = Vec::new();
-    doc.save_to(&mut bytes).unwrap();
-
-    let items = extract_text_with_positions_mem(&bytes).expect("extract");
+    let items = extract_text_with_positions_mem(&pdf).expect("extract");
     let hit = items
         .iter()
         .find(|i| i.text.contains("Shifted"))
@@ -3966,5 +3904,43 @@ fn test_form_xobject_matrix_transforms_underline() {
     assert!(
         hit.is_underline,
         "underline transformed by Form Matrix should still match; item={hit:?}"
+    );
+}
+
+#[test]
+fn test_form_xobject_closed_stroke_underline_marks_text() {
+    let pdf = make_pdf_with_form_underline("closed_stroke");
+    let items = extract_text_with_positions_mem(&pdf).expect("extract");
+    let hit = items
+        .iter()
+        .find(|i| i.text.contains("Underlined"))
+        .expect("text item from form");
+    assert!(
+        hit.is_underline,
+        "closed h/S stroke inside Form should mark underline; item={hit:?}"
+    );
+}
+
+#[test]
+fn test_form_xobject_inherits_page_line_width() {
+    // Page sets a thick stroke (10pt). Form strokes without its own `w`, so
+    // the inherited width must reject the rule as an underline.
+    use lopdf::content::Operation;
+    use lopdf::Object;
+
+    let pdf = make_pdf_with_form_underline_ex(
+        "inherit_stroke",
+        None,
+        "Underlined",
+        Some(vec![Operation::new("w", vec![Object::Real(10.0)])]),
+    );
+    let items = extract_text_with_positions_mem(&pdf).expect("extract");
+    let hit = items
+        .iter()
+        .find(|i| i.text.contains("Underlined"))
+        .expect("text item from form");
+    assert!(
+        !hit.is_underline,
+        "thick inherited page line width must not mark underline; item={hit:?}"
     );
 }

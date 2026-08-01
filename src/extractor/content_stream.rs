@@ -836,6 +836,7 @@ pub(crate) fn extract_page_text_items(
                                         page_num,
                                         font_cmaps,
                                         &ctm,
+                                        line_width,
                                         &mut cmap_decisions,
                                         style_cache,
                                     );

@@ -63,6 +63,11 @@ pub(crate) fn transform_path_point(x: f32, y: f32, ctm: &[f32; 6]) -> (f32, f32)
 }
 
 /// Scale a stroke width by the CTM component perpendicular to the segment.
+///
+/// PDF stroke thickness is measured perpendicular to the path in user space.
+/// Under an affine CTM the device-space thickness is
+/// `user_width * |det(CTM)| / ||CTM · tangent||` — not the length of the
+/// transformed source normal (which overstates thickness under shear).
 pub(crate) fn transformed_stroke_width(
     line_width: f32,
     ctm: &[f32; 6],
@@ -79,12 +84,52 @@ pub(crate) fn transformed_stroke_width(
         return user_width;
     }
 
-    // PDF stroke width scales perpendicular to the path direction.
-    let nx = -dy / len;
-    let ny = dx / len;
-    let ndx = nx * ctm[0] + ny * ctm[2];
-    let ndy = nx * ctm[1] + ny * ctm[3];
-    user_width * (ndx * ndx + ndy * ndy).sqrt()
+    let tx = dx / len;
+    let ty = dy / len;
+    let tdx = tx * ctm[0] + ty * ctm[2];
+    let tdy = tx * ctm[1] + ty * ctm[3];
+    let transformed_len = (tdx * tdx + tdy * tdy).sqrt();
+    if transformed_len <= f32::EPSILON {
+        return 0.0;
+    }
+    user_width * (ctm[0] * ctm[3] - ctm[1] * ctm[2]).abs() / transformed_len
+}
+
+/// Transform a user-space axis-aligned rect through `ctm`, returning the
+/// axis-aligned bounding box `(x, y, width, height)` in device space.
+///
+/// Uses all four corners so shear/rotation Forms keep correct extents
+/// (diagonal CTM components alone are wrong for non-orthogonal matrices).
+pub(crate) fn transform_user_rect(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    ctm: &[f32; 6],
+) -> (f32, f32, f32, f32) {
+    let corners = [
+        transform_path_point(x, y, ctm),
+        transform_path_point(x + w, y, ctm),
+        transform_path_point(x, y + h, ctm),
+        transform_path_point(x + w, y + h, ctm),
+    ];
+    let min_x = corners
+        .iter()
+        .map(|c| c.0)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = corners
+        .iter()
+        .map(|c| c.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = corners
+        .iter()
+        .map(|c| c.1)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = corners
+        .iter()
+        .map(|c| c.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    (min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
 /// A horizontal rule candidate in page coordinates (PDF y-up).
@@ -873,5 +918,27 @@ mod tests {
         mark_underlined_items(&mut items, &[], &lines, 1);
 
         assert!(items.iter().all(|item| !item.is_underline));
+    }
+
+    #[test]
+    fn sheared_ctm_preserves_horizontal_stroke_thickness() {
+        // CTM [1, 0, 100, 1, 0, 0]: horizontal unit tangent stays length 1,
+        // |det| = 1, so a 1-pt stroke must stay ~1 pt (not ~100).
+        let ctm = [1.0, 0.0, 100.0, 1.0, 0.0, 0.0];
+        let w = transformed_stroke_width(1.0, &ctm, 0.0, 0.0, 10.0, 0.0);
+        assert!(
+            (w - 1.0).abs() < 1e-4,
+            "sheared horizontal stroke thickness should stay 1.0, got {w}"
+        );
+    }
+
+    #[test]
+    fn transform_user_rect_uses_all_corners_under_shear() {
+        let ctm = [1.0, 0.0, 100.0, 1.0, 0.0, 0.0];
+        // User rect (0,0)–(10,1) maps corners to (0,0), (10,0), (100,1), (110,1).
+        let (x, y, w, h) = transform_user_rect(0.0, 0.0, 10.0, 1.0, &ctm);
+        assert!((x - 0.0).abs() < 1e-4 && (y - 0.0).abs() < 1e-4);
+        assert!((w - 110.0).abs() < 1e-4, "expected width 110, got {w}");
+        assert!((h - 1.0).abs() < 1e-4, "expected height 1, got {h}");
     }
 }

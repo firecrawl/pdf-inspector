@@ -11,7 +11,9 @@ use super::fonts::{
     build_font_encodings, build_font_widths, compute_string_width_ts, extract_text_from_operand,
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
-use super::underline::{transform_path_point, transformed_stroke_width, UnderlineLine};
+use super::underline::{
+    transform_path_point, transform_user_rect, transformed_stroke_width, UnderlineLine,
+};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
@@ -127,12 +129,14 @@ impl FormXObjectExtract {
 }
 
 /// Extract text items and painted underline graphics from a Form XObject.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_form_xobject_text(
     doc: &Document,
     form_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    parent_line_width: f32,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
 ) -> FormXObjectExtract {
@@ -142,6 +146,7 @@ pub(crate) fn extract_form_xobject_text(
         page_num,
         font_cmaps,
         parent_ctm,
+        parent_line_width,
         cmap_decisions,
         style_cache,
         0,
@@ -155,6 +160,7 @@ fn extract_form_xobject_text_inner(
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    parent_line_width: f32,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
@@ -266,11 +272,17 @@ fn extract_form_xobject_text_inner(
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
-    let mut ctm_stack: Vec<[f32; 6]> = Vec::new();
+    // Inherit the caller's stroke width — Form XObjects do not reset it —
+    // and restore it across q/Q with the CTM (PDF graphics state).
+    let mut line_width: f32 = parent_line_width;
+    struct FormGraphicsState {
+        ctm: [f32; 6],
+        line_width: f32,
+    }
+    let mut gstate_stack: Vec<FormGraphicsState> = Vec::new();
 
     // Path / paint state — mirrors the page-level underline collectors so
     // rules drawn inside Form XObjects reach mark_underlined_items.
-    let mut line_width: f32 = 1.0;
     let mut path_subpath_start: Option<(f32, f32)> = None;
     let mut path_current: Option<(f32, f32)> = None;
     let mut pending_lines: Vec<(f32, f32, f32, f32)> = Vec::new();
@@ -281,11 +293,12 @@ fn extract_form_xobject_text_inner(
     for op in &content.operations {
         match op.operator.as_str() {
             "q" => {
-                ctm_stack.push(ctm);
+                gstate_stack.push(FormGraphicsState { ctm, line_width });
             }
             "Q" => {
-                if let Some(saved) = ctm_stack.pop() {
-                    ctm = saved;
+                if let Some(saved) = gstate_stack.pop() {
+                    ctm = saved.ctm;
+                    line_width = saved.line_width;
                 }
             }
             "cm" => {
@@ -310,6 +323,7 @@ fn extract_form_xobject_text_inner(
                                         page_num,
                                         font_cmaps,
                                         &ctm,
+                                        line_width,
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
@@ -665,10 +679,8 @@ fn extract_form_xobject_text_inner(
                     let ry = get_number(&op.operands[1]).unwrap_or(0.0);
                     let rw = get_number(&op.operands[2]).unwrap_or(0.0);
                     let rh = get_number(&op.operands[3]).unwrap_or(0.0);
-                    let x_dev = rx * ctm[0] + ry * ctm[2] + ctm[4];
-                    let y_dev = rx * ctm[1] + ry * ctm[3] + ctm[5];
-                    let w_dev = rw * ctm[0];
-                    let h_dev = rh * ctm[3];
+                    let (x_dev, y_dev, w_dev, h_dev) =
+                        transform_user_rect(rx, ry, rw, rh, &ctm);
                     pending_re_rects.push(PdfRect {
                         x: x_dev,
                         y: y_dev,
@@ -715,20 +727,28 @@ fn extract_form_xobject_text_inner(
                         }
                     }
                 }
-                for (x1, y1, x2, y2) in pending_lines.drain(..) {
-                    let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
-                    let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
-                    extract.underline_lines.push(UnderlineLine {
-                        x1: x1d,
-                        y1: y1d,
-                        x2: x2d,
-                        y2: y2d,
-                        stroke_width: transformed_stroke_width(line_width, &ctm, x1, y1, x2, y2),
-                        page: page_num,
-                    });
+                // `h` already moved closed subpaths into pending_subpaths —
+                // drain those too so closed stroked rules are not dropped.
+                if !pending_lines.is_empty() {
+                    pending_subpaths.push(std::mem::take(&mut pending_lines));
+                }
+                for subpath in pending_subpaths.drain(..) {
+                    for (x1, y1, x2, y2) in subpath {
+                        let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
+                        let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
+                        extract.underline_lines.push(UnderlineLine {
+                            x1: x1d,
+                            y1: y1d,
+                            x2: x2d,
+                            y2: y2d,
+                            stroke_width: transformed_stroke_width(
+                                line_width, &ctm, x1, y1, x2, y2,
+                            ),
+                            page: page_num,
+                        });
+                    }
                 }
                 extract.painted_rects.append(&mut pending_re_rects);
-                pending_subpaths.clear();
                 path_subpath_start = None;
                 path_current = None;
             }
@@ -740,20 +760,26 @@ fn extract_form_xobject_text_inner(
                         }
                     }
                 }
-                for (x1, y1, x2, y2) in pending_lines.drain(..) {
-                    let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
-                    let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
-                    extract.underline_lines.push(UnderlineLine {
-                        x1: x1d,
-                        y1: y1d,
-                        x2: x2d,
-                        y2: y2d,
-                        stroke_width: transformed_stroke_width(line_width, &ctm, x1, y1, x2, y2),
-                        page: page_num,
-                    });
+                if !pending_lines.is_empty() {
+                    pending_subpaths.push(std::mem::take(&mut pending_lines));
+                }
+                for subpath in pending_subpaths.drain(..) {
+                    for (x1, y1, x2, y2) in subpath {
+                        let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
+                        let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
+                        extract.underline_lines.push(UnderlineLine {
+                            x1: x1d,
+                            y1: y1d,
+                            x2: x2d,
+                            y2: y2d,
+                            stroke_width: transformed_stroke_width(
+                                line_width, &ctm, x1, y1, x2, y2,
+                            ),
+                            page: page_num,
+                        });
+                    }
                 }
                 extract.painted_rects.append(&mut pending_re_rects);
-                pending_subpaths.clear();
                 path_subpath_start = None;
                 path_current = None;
             }
@@ -793,10 +819,8 @@ fn extract_form_xobject_text_inner(
                                 .iter()
                                 .all(|&y| (y - min_y).abs() < eps || (y - max_y).abs() < eps);
                         if axis_aligned && w > 1.0 && h > 1.0 {
-                            let x_dev = min_x * ctm[0] + min_y * ctm[2] + ctm[4];
-                            let y_dev = min_x * ctm[1] + min_y * ctm[3] + ctm[5];
-                            let w_dev = w * ctm[0];
-                            let h_dev = h * ctm[3];
+                            let (x_dev, y_dev, w_dev, h_dev) =
+                                transform_user_rect(min_x, min_y, w, h, &ctm);
                             fill_rects.push(PdfRect {
                                 x: x_dev,
                                 y: y_dev,
