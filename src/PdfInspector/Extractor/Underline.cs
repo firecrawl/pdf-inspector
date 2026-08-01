@@ -137,9 +137,28 @@ internal static class Underline
         // matches are culled by the tabular filter afterwards. Same-row segmented
         // rules are always rulings, since each segment snugly owns its column
         // label, so snugness must not override that check.
+        var candidates = UnderlineCandidates(items);
+
+        // The segmented-row verdict depends only on the rule's Y, and a ruled
+        // table draws many rules per row, so it is settled once per distinct Y
+        // instead of once per rule — the scan behind it sorts every rule sharing
+        // that row.
+        var segmentedByY = new Dictionary<float, bool>();
+
+        bool Segmented(Rule rule)
+        {
+            if (!segmentedByY.TryGetValue(rule.Y, out var verdict))
+            {
+                verdict = IsSegmentedRowRulingRule(rule, rules);
+                segmentedByY[rule.Y] = verdict;
+            }
+
+            return verdict;
+        }
+
         return [.. rules.Where(rule =>
-            !IsSegmentedRowRulingRule(rule, rules)
-            && ((HasSnugTextOwner(rule, items) && !HasFlankingVerticals(rule, rects, lines, page))
+            !Segmented(rule)
+            && ((HasSnugTextOwner(rule, candidates) && !HasFlankingVerticals(rule, rects, lines, page))
                 || !IsRepeatedRulingRule(rule, rules)))];
     }
 
@@ -230,9 +249,9 @@ internal static class Underline
     /// ownership is judged against their union. Table and form rulings overshoot
     /// their row's text and fail either containment or coverage.
     /// </summary>
-    private static bool HasSnugTextOwner(Rule rule, IReadOnlyList<TextItem> items)
+    private static bool HasSnugTextOwner(Rule rule, List<TextItem> candidates)
     {
-        var matched = items.Where(item => IsUnderlineCandidate(item) && RuleMatchesItem(rule, item)).ToList();
+        var matched = MatchingItems(rule, candidates);
         if (matched.Count == 0)
         {
             return false;
@@ -334,11 +353,12 @@ internal static class Underline
     private static HashSet<int> TabularRowSeparatorRuleIndices(List<Rule> rules, IReadOnlyList<TextItem> items)
     {
         var tabularRules = new HashSet<int>();
+        var candidates = UnderlineCandidates(items);
 
         for (var ruleIdx = 0; ruleIdx < rules.Count; ruleIdx++)
         {
             var rule = rules[ruleIdx];
-            var matched = items.Where(item => IsUnderlineCandidate(item) && RuleMatchesItem(rule, item)).ToList();
+            var matched = MatchingItems(rule, candidates);
 
             if (matched.Count < MinTabularRuleItems)
             {
@@ -370,7 +390,41 @@ internal static class Underline
     }
 
     private static bool IsUnderlineCandidate(TextItem item) =>
-        item.Kind == ItemKind.Text && item.Text.Trim().Length > 0 && item.Width > 0.0f;
+        item.Kind == ItemKind.Text && !item.Text.AsSpan().Trim().IsEmpty && item.Width > 0.0f;
+
+    /// <summary>
+    /// The items a rule could plausibly underline, filtered once for a whole
+    /// pass. Both rule scans below are rules × items, so re-deriving this per
+    /// rule made them quadratic in the page.
+    /// </summary>
+    private static List<TextItem> UnderlineCandidates(IReadOnlyList<TextItem> items)
+    {
+        var candidates = new List<TextItem>(items.Count);
+        foreach (var item in items)
+        {
+            if (IsUnderlineCandidate(item))
+            {
+                candidates.Add(item);
+            }
+        }
+
+        return candidates;
+    }
+
+    /// <summary>The pre-filtered candidates a rule matches, in page order.</summary>
+    private static List<TextItem> MatchingItems(Rule rule, List<TextItem> candidates)
+    {
+        var matched = new List<TextItem>();
+        foreach (var item in candidates)
+        {
+            if (RuleMatchesItem(rule, item))
+            {
+                matched.Add(item);
+            }
+        }
+
+        return matched;
+    }
 
     private static bool RuleMatchesItem(Rule rule, TextItem item)
     {

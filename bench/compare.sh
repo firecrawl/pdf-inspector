@@ -3,14 +3,22 @@
 #
 # Usage: bench/compare.sh [--filter SUBSTR] [--iters N] [--budget MS]
 #
+# The two sides are interleaved: each fixture is measured by Rust and then
+# immediately by C#, rather than sweeping one implementation and then the
+# other. On a shared VM that matters. Sweeping a whole side at a time, the two
+# halves can land in different machine states — one run saw memory bandwidth at
+# 8.76 GiB/s and the other at 6.39, which is wider than most of the gaps being
+# measured. Interleaving puts both sides in the same state, and each fixture
+# carries the calibration it was measured under, so any drift that remains is
+# visible in the `drift` column rather than folded silently into the ratio.
+#
 # The ratio is rust_median / csharp_median, so above 1.00 means the C# port is
-# ahead. Both sides also print their calibration kernels; if those disagree
-# between the two runs the machine moved underneath them and the ratios need
-# scaling before they mean anything.
+# ahead.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${TMPDIR:-/tmp}/pdf-inspector-compare"
+rm -rf "$OUT"
 mkdir -p "$OUT"
 
 CS="$ROOT/src/PdfInspector.Bench/bin/Release/net10.0/pdf-inspector-bench"
@@ -23,42 +31,81 @@ for binary in "$CS" "$RS"; do
   fi
 done
 
+FILTER=""
+PASSTHROUGH=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --filter) FILTER="$2"; shift 2 ;;
+    *) PASSTHROUGH+=("$1"); shift ;;
+  esac
+done
+
 cd "$ROOT"
-echo "── rust ─────────────────────────────────────────────" >&2
-"$RS" "$@" --json "$OUT/rust.json" 2>&1 >/dev/null | grep -E "^(cpu|calibration):" >&2
-echo "── c# ───────────────────────────────────────────────" >&2
-"$CS" "$@" --json "$OUT/csharp.json" 2>&1 >/dev/null | grep -E "^(cpu|calibration):" >&2
 
-python3 - "$OUT/rust.json" "$OUT/csharp.json" <<'PY'
-import json, sys
+FIXTURES=()
+for path in reference/tests/fixtures/*.pdf; do
+  name="$(basename "$path" .pdf)"
+  # The encrypted fixture needs a password; neither harness supplies one.
+  case "$name" in encrypted-*) continue ;; esac
+  if [ -n "$FILTER" ] && [[ "$name" != *"$FILTER"* ]]; then
+    continue
+  fi
+  FIXTURES+=("$name")
+done
 
-rust = json.load(open(sys.argv[1]))
-cs = json.load(open(sys.argv[2]))
+if [ ${#FIXTURES[@]} -eq 0 ]; then
+  echo "no fixtures matched" >&2
+  exit 1
+fi
 
-rs = {f["name"]: f for f in rust["fixtures"]}
-cf = {f["name"]: f for f in cs["fixtures"]}
+for name in "${FIXTURES[@]}"; do
+  printf '%-42s' "$name" >&2
+  "$RS" --filter "$name" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
+      --json "$OUT/rust-$name.json" >/dev/null 2>&1
+  printf 'rust ' >&2
+  "$CS" --filter "$name" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
+      --json "$OUT/csharp-$name.json" >/dev/null 2>&1
+  printf 'c#\n' >&2
+done
 
-rc, cc = rust["calibration"], cs["calibration"]
-print(f"\ncalibration  int {rc['intNsPerOp']:.3f} vs {cc['intNsPerOp']:.3f} ns/op   "
-      f"float {rc['floatNsPerOp']:.3f} vs {cc['floatNsPerOp']:.3f}   "
-      f"mem {rc['memGiBPerSec']:.2f} vs {cc['memGiBPerSec']:.2f} GiB/s")
+python3 - "$OUT" <<'PY'
+import glob, json, os, sys
 
-print(f"\n{'fixture':<40} {'rust ms':>10} {'c# ms':>10} {'ratio':>8}  verdict")
-print("─" * 82)
+out = sys.argv[1]
+
+def load(prefix):
+    runs = {}
+    for path in glob.glob(os.path.join(out, f"{prefix}-*.json")):
+        doc = json.load(open(path))
+        for fixture in doc["fixtures"]:
+            runs[fixture["name"]] = (fixture, doc["calibration"])
+    return runs
+
+rust, cs = load("rust"), load("csharp")
+
+print(f"\n{'fixture':<40} {'rust ms':>10} {'c# ms':>10} {'ratio':>8}  {'drift':>6}  verdict")
+print("─" * 92)
 
 wins = losses = 0
 worst = []
-for name in sorted(rs.keys() & cf.keys()):
-    r, c = rs[name]["medianMs"], cf[name]["medianMs"]
+for name in sorted(rust.keys() & cs.keys()):
+    (rf, rc), (cf, cc) = rust[name], cs[name]
+    r, c = rf["medianMs"], cf["medianMs"]
     ratio = r / c if c > 0 else float("inf")
+
+    # How far the machine moved between the pair, by the float kernel — the one
+    # the layout and table heuristics spend their time on. A ratio is only worth
+    # reading when this sits near 1.00.
+    drift = cc["floatNsPerOp"] / rc["floatNsPerOp"]
+
     if ratio >= 1.0:
         verdict, wins = "c# ahead", wins + 1
     else:
         verdict, losses = "RUST AHEAD", losses + 1
         worst.append((ratio, name, r, c))
-    print(f"{name:<40} {r:>10.2f} {c:>10.2f} {ratio:>8.2f}  {verdict}")
+    print(f"{name:<40} {r:>10.2f} {c:>10.2f} {ratio:>8.2f}  {drift:>6.2f}  {verdict}")
 
-print("─" * 82)
+print("─" * 92)
 print(f"{wins} fixtures where C# is ahead, {losses} where Rust is")
 if worst:
     print("\nremaining gaps, widest first:")
