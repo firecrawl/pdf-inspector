@@ -48,7 +48,10 @@ public sealed partial class PdfDocument
 
     public static PdfDocument Load(byte[] data, string? password = null)
     {
-        var document = new PdfDocument(data);
+        // Malformed struct element names are repaired before parsing: some
+        // generators write a bare name ("/S Code" rather than "/S /Code"), which
+        // otherwise makes the whole object unparseable and silently drops it.
+        var document = new PdfDocument(Structure.BareStructNames.Fix(data));
         document.Initialise(password);
         return document;
     }

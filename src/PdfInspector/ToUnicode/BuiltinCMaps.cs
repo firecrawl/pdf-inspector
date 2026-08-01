@@ -232,7 +232,13 @@ internal static class BuiltinCMaps
         }
         catch (EndOfStreamException)
         {
-            // Keep whatever parsed cleanly before the truncation.
+            // A record that runs off the end means the stream is no longer
+            // aligned, so every later offset is guesswork. The reference discards
+            // the whole map rather than keeping a partial one, and a partial map
+            // is worse than none: it decodes some CIDs into plausible-looking but
+            // wrong characters instead of leaving the markers that let the
+            // garbled-text detection fire.
+            return null;
         }
 
         cmap.Ranges.Sort((a, b) => a.Start.CompareTo(b.Start));
