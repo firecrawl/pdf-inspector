@@ -623,7 +623,7 @@ public sealed class MarkdownFromLinesTests
 {
     [Fact]
     public void EmptyLinesProduceEmptyMarkdown() =>
-        Assert.Empty(Markdown.Convert.ToMarkdownFromLines([], new MarkdownOptions()));
+        Assert.Empty(MarkdownConverter.ToMarkdownFromLines([], new MarkdownOptions()));
 
     [Fact]
     public void LinesAreRenderedInOrder()
@@ -645,7 +645,7 @@ public sealed class MarkdownFromLinesTests
                 AdaptiveThreshold = 0.10f,
             },
         ];
-        var md = Markdown.Convert.ToMarkdownFromLines(lines, new MarkdownOptions());
+        var md = MarkdownConverter.ToMarkdownFromLines(lines, new MarkdownOptions());
         Assert.Contains("First", md, StringComparison.Ordinal);
         Assert.Contains("Second", md, StringComparison.Ordinal);
     }

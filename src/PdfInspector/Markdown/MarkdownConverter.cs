@@ -98,6 +98,10 @@ public static class MarkdownConverter
     public static string ToMarkdownFromItems(List<TextItem> items, MarkdownOptions options) =>
         ToMarkdownFromItemsWithRects(items, options, []);
 
+    /// <summary>Converts already-grouped lines to markdown.</summary>
+    public static string ToMarkdownFromLines(List<TextLine> lines, MarkdownOptions options) =>
+        Convert.ToMarkdownFromLines(lines, options);
+
     /// <summary>Converts positioned text items to markdown, using rects for table detection.</summary>
     public static string ToMarkdownFromItemsWithRects(
         List<TextItem> items,
