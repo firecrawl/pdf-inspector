@@ -60,14 +60,14 @@ All 22 fixtures load; page counts match the Rust reference exactly.
 - [x] `format.rs` → `TableFormat`
 - [x] `mod.rs` → `Table`, `TableBuilders`, `KeyValueTables`
 
-## Phase 5 — markdown — not started
-- [ ] `analysis.rs`
-- [ ] `classify.rs`
-- [ ] `preprocess.rs`
-- [ ] `heading.rs`
-- [ ] `convert.rs`
-- [ ] `postprocess.rs`
-- [ ] `mod.rs`
+## Phase 5 — markdown — done
+- [x] `analysis.rs` → `Analysis`
+- [x] `classify.rs` → `Classify`
+- [x] `preprocess.rs` → `Preprocess`
+- [x] `heading.rs` → `Heading`
+- [x] `convert.rs` → `Convert`, `PositionedMarkdown`
+- [x] `postprocess.rs` → `Postprocess`, `MarkdownOptions`
+- [x] `mod.rs` → `MarkdownConverter`, `PageSplits`, `ChartRegions`, `ParallelProse`
 
 ## Phase 6 — detector + public API — not started
 - [ ] `detector.rs`
