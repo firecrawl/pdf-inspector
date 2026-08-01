@@ -1,4 +1,6 @@
 // Ported from reference/src/markdown/classify.rs
+using PdfInspector.Text;
+
 namespace PdfInspector.Markdown;
 
 /// <summary>Line classification: captions, lists, and code detection.</summary>
@@ -183,7 +185,7 @@ internal static class Classify
         }
 
         var specialChars = trimmed.Count(c => c is '{' or '}' or '(' or ')' or '[' or ']' or ';' or '=' or '<' or '>');
-        if (specialChars >= 3 && trimmed.Length < 200)
+        if (specialChars >= 3 && TextUtils.ByteLength(trimmed) < 200)
         {
             return true;
         }

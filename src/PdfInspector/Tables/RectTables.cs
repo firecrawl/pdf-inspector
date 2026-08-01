@@ -1101,7 +1101,7 @@ internal static class RectTables
         // narrow grids with giant cells are usually layout backgrounds, but only
         // when the row count is small too. A 4-row key/value table with one
         // descriptive column reads as a real table on every other gate.
-        var maxCellLen = cells.SelectMany(row => row).Select(c => c.Length).DefaultIfEmpty(0).Max();
+        var maxCellLen = cells.SelectMany(row => row).Select(TextUtils.ByteLength).DefaultIfEmpty(0).Max();
         var maxAllowed = numCols >= 3 ? 2000 : 500;
         if (maxCellLen > maxAllowed && nonEmptyRows < 4)
         {
@@ -1715,7 +1715,7 @@ internal static class RectTables
         // banners — where a single big rectangle holds a wall of prose. Spare
         // multi-row key/value tables whose value column is a multi-bullet
         // description pass every other gate and should not die on cell length.
-        var maxCellLen = cells.SelectMany(row => row).Select(c => c.Length).DefaultIfEmpty(0).Max();
+        var maxCellLen = cells.SelectMany(row => row).Select(TextUtils.ByteLength).DefaultIfEmpty(0).Max();
         if (maxCellLen > 500 && nonEmptyRows < 4)
         {
             Log.Debug(Module, () =>
@@ -2049,7 +2049,7 @@ internal static class RectTables
         // "cells" holding paragraphs, not short data-table values. Multi-row
         // key/value tables can legitimately have one long descriptive column, so
         // only narrow-row layouts are rejected here.
-        var maxCellLen = cells.SelectMany(row => row).Select(c => c.Length).DefaultIfEmpty(0).Max();
+        var maxCellLen = cells.SelectMany(row => row).Select(TextUtils.ByteLength).DefaultIfEmpty(0).Max();
         if (maxCellLen > 500 && nonEmptyRows < 4)
         {
             Log.Debug(Module, () =>

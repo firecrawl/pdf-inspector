@@ -1,6 +1,8 @@
 // Ported from reference/src/tables/detect_heuristic.rs and mod.rs
 using System.Text;
 
+using PdfInspector.Text;
+
 namespace PdfInspector.Tables;
 
 /// <summary>
@@ -47,7 +49,7 @@ internal static class TableOfContents
     {
         var lower = token.Trim().ToLowerInvariant();
 
-        if (lower.Length == 0 || lower.Length > 8 || !lower.All(c => "ivxlc".Contains(c, StringComparison.Ordinal)))
+        if (lower.Length == 0 || TextUtils.ByteLength(lower) > 8 || !lower.All(c => "ivxlc".Contains(c, StringComparison.Ordinal)))
         {
             return null;
         }
@@ -104,7 +106,7 @@ internal static class TableOfContents
             return null;
         }
 
-        if (t.Length <= 4 && t.All(char.IsAsciiDigit))
+        if (t.All(char.IsAsciiDigit) && TextUtils.ByteLength(t) <= 4)
         {
             return uint.TryParse(t, out var value) ? value : null;
         }
@@ -304,7 +306,7 @@ internal static class TableOfContents
 
             var dotCount = trimmed.Count(c => c == '.');
             var isMostlyDots = dotCount >= 3
-                && dotCount > trimmed.Length / 2
+                && dotCount > TextUtils.ByteLength(trimmed) / 2
                 && trimmed.All(c => c == '.' || char.IsWhiteSpace(c));
 
             if (isMostlyDots)
@@ -346,7 +348,7 @@ internal static class TableOfContents
         }
 
         var withoutDots = trimmed.TrimEnd('.');
-        if (trimmed.Length - withoutDots.Length < 3)
+        if (TextUtils.ByteLength(trimmed) - TextUtils.ByteLength(withoutDots) < 3)
         {
             return false;
         }
@@ -376,7 +378,7 @@ internal static class TableOfContents
         // The comma-space separator distinguishes a real page list from a
         // thousands-separated number such as "189,164".
         var parts = t.Split(", ");
-        return parts.All(p => p.Length is > 0 and <= 4 && p.All(char.IsAsciiDigit));
+        return parts.All(p => p.Length > 0 && TextUtils.ByteLength(p) <= 4 && p.All(char.IsAsciiDigit));
     }
 
     /// <summary>
@@ -508,6 +510,6 @@ internal static class TableOfContents
             return false;
         }
 
-        return parts.All(p => p.Length is > 0 and <= 3 && p.All(char.IsAsciiDigit));
+        return parts.All(p => p.Length > 0 && TextUtils.ByteLength(p) <= 3 && p.All(char.IsAsciiDigit));
     }
 }

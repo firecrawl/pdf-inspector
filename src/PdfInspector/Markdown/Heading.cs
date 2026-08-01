@@ -1,4 +1,5 @@
 // Ported from reference/src/markdown/heading.rs
+using PdfInspector.Text;
 using PdfInspector.Types;
 
 namespace PdfInspector.Markdown;
@@ -189,7 +190,7 @@ internal static class Heading
     /// <summary>The value of an uppercase roman numeral, or null when the token is not one.</summary>
     private static uint? RomanValue(string token)
     {
-        if (token.Length is 0 or > 8)
+        if (token.Length == 0 || TextUtils.ByteLength(token) > 8)
         {
             return null;
         }
@@ -241,7 +242,7 @@ internal static class Heading
         var decimalOk = true;
         foreach (var part in token.Split('.'))
         {
-            if (part.Length is 0 or > 3 || !part.All(char.IsAsciiDigit) || !uint.TryParse(part, out var value))
+            if (part.Length == 0 || TextUtils.ByteLength(part) > 3 || !part.All(char.IsAsciiDigit) || !uint.TryParse(part, out var value))
             {
                 decimalOk = false;
                 break;
@@ -395,7 +396,7 @@ internal static class Heading
         var trimmed = text.Trim();
         var wordCount = trimmed.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
         if (wordCount is < 1 or > 12
-            || trimmed.Length is < 4 or > 140
+            || TextUtils.ByteLength(trimmed) is < 4 or > 140
             || !trimmed.Any(char.IsLetter)
             || trimmed[^1] is '.' or ',' or ';')
         {

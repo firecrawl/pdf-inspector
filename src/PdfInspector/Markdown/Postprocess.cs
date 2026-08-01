@@ -2,6 +2,8 @@
 using System.Text;
 using System.Text.RegularExpressions;
 
+using PdfInspector.Text;
+
 namespace PdfInspector.Markdown;
 
 /// <summary>Markdown cleanup and post-processing.</summary>
@@ -230,7 +232,7 @@ internal static partial class Postprocess
         }
 
         // A bare one- to four-digit number.
-        if (trimmed.Length <= 4 && trimmed.All(char.IsAsciiDigit))
+        if (trimmed.All(char.IsAsciiDigit) && TextUtils.ByteLength(trimmed) <= 4)
         {
             return true;
         }
@@ -272,7 +274,7 @@ internal static partial class Postprocess
         }
 
         // A centred "- X -" page number.
-        if (trimmed.Length >= 3 && trimmed.StartsWith('-') && trimmed.EndsWith('-'))
+        if (TextUtils.ByteLength(trimmed) >= 3 && trimmed.StartsWith('-') && trimmed.EndsWith('-'))
         {
             var inner = trimmed[1..^1].Trim();
             if (inner.Length > 0 && inner.All(char.IsAsciiDigit))

@@ -478,7 +478,7 @@ internal static class KeyValueTables
     private static bool LooksLikeKeyValueHeaderCell(string cell)
     {
         var trimmed = cell.Trim();
-        if (trimmed.Length is < 2 or > 40)
+        if (TextUtils.ByteLength(trimmed) is < 2 or > 40)
         {
             return false;
         }
@@ -503,7 +503,7 @@ internal static class KeyValueTables
     private static bool LooksLikeKeyValueLabel(string cell)
     {
         var trimmed = cell.Trim();
-        if (trimmed.Length is < 2 or > 90)
+        if (TextUtils.ByteLength(trimmed) is < 2 or > 90)
         {
             return false;
         }
@@ -555,7 +555,7 @@ internal static class KeyValueTables
         }
 
         var inner = trimmed[1..^1];
-        return inner.Length is > 0 and <= 48
+        return inner.Length > 0 && TextUtils.ByteLength(inner) <= 48
             && inner.All(ch => char.IsAsciiLetterUpper(ch) || char.IsAsciiDigit(ch) || ch is '-' or '_');
     }
 

@@ -1002,7 +1002,7 @@ internal static class Convert
                 && !nonHeadingRole
                 && !isCodeLine
                 && !looksLikeListContinuation
-                && plainTrimmed.Length > 3
+                && TextUtils.ByteLength(plainTrimmed) > 3
                 && WordCount(plainTrimmed) <= 15
                 && !Classify.StartsWithBulletMarker(plainTrimmed)
                 && !Analysis.IsTocEntryLine(plainTrimmed)
@@ -1235,7 +1235,7 @@ internal static class Convert
         // page top — since headings hug their section's first paragraph and
         // requiring a break after as well missed most of them. A mixed bold lead-in
         // ("Note: ...") is excluded by the all-bold test.
-        var enoughWords = wordCount >= 2 || (allBold && plainTrimmed.Length >= 4);
+        var enoughWords = wordCount >= 2 || (allBold && TextUtils.ByteLength(plainTrimmed) >= 4);
         var numberedBold = allBold && StartsWithSectionNumber(plainTrimmed);
 
         return numberedBold || (score >= 0.5f && standalone && enoughWords && hasStrongSignal)
@@ -1349,7 +1349,7 @@ internal static class Convert
             }
 
             if (options.DetectHeaders
-                && plainTrimmed.Length > 3
+                && TextUtils.ByteLength(plainTrimmed) > 3
                 && WordCount(plainTrimmed) <= 15
                 && !Analysis.IsTocEntryLine(plainTrimmed)
                 && !Analysis.IsHeadingFragment(plainTrimmed)
@@ -1504,7 +1504,7 @@ internal static class Convert
             + (standalone ? 0.2f : 0.0f)
             + (isolated ? 0.3f : 0.0f);
 
-        var enoughWords = wordCount >= 2 || (allBold && isolated && plainTrimmed.Length >= 4);
+        var enoughWords = wordCount >= 2 || (allBold && isolated && TextUtils.ByteLength(plainTrimmed) >= 4);
 
         return score >= 0.5f && standalone && enoughWords ? Analysis.BoldHeadingLevel(headingTiers) : null;
     }

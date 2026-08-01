@@ -340,6 +340,17 @@ internal static class TextUtils
     public static bool IsCidFont(string font) =>
         font.StartsWith("C2_", StringComparison.Ordinal) || font.StartsWith("C0_", StringComparison.Ordinal);
 
+    /// <summary>
+    /// The UTF-8 byte length of a string, matching Rust's <c>str::len()</c>.
+    /// </summary>
+    /// <remarks>
+    /// The reference compares text lengths against tuned thresholds using byte
+    /// length, so a non-ASCII cell counts for more there than its character count
+    /// suggests. Using the character count instead would silently shift every one
+    /// of those thresholds on non-ASCII text.
+    /// </remarks>
+    public static int ByteLength(string text) => System.Text.Encoding.UTF8.GetByteCount(text);
+
     /// <summary>Counts Unicode scalar values, matching Rust's <c>chars().count()</c>.</summary>
     public static int CharCount(string text)
     {

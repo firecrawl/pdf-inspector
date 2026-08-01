@@ -116,7 +116,9 @@ internal sealed class ProcessingPipeline(
             && pagesNeedingOcr.Count == 0
             && markdown is not null)
         {
-            var mdLen = markdown.Length;
+            // The reference measures the markdown in UTF-8 bytes, so a non-Latin
+            // document clears this floor sooner than its character count implies.
+            var mdLen = Text.TextUtils.ByteLength(markdown);
             var charsPerPage = mdLen / (float)pageCount;
             if (charsPerPage < 50.0f && mdLen < 500)
             {

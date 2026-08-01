@@ -1,5 +1,6 @@
 // Ported from reference/src/tables/format.rs
 using System.Text;
+using PdfInspector.Text;
 
 namespace PdfInspector.Tables;
 
@@ -161,14 +162,14 @@ internal static class TableFormat
 
         return tokens.All(t =>
         {
-            if (t.Length == 0 || t.Length > 8)
+            if (t.Length == 0 || TextUtils.ByteLength(t) > 8)
             {
                 return false;
             }
 
             if (t.All(char.IsAsciiDigit))
             {
-                return t.Length <= 4;
+                return TextUtils.ByteLength(t) <= 4;
             }
 
             if (TableOfContents.CanonicalRomanValue(t) is not null)
@@ -255,7 +256,7 @@ internal static class TableFormat
         var token = first.TrimEnd('.', ')', ':', '-');
         var levels = token.Split('.');
         return levels.Length is >= 2 and <= 4
-            && levels.All(level => level.Length is > 0 and <= 3 && level.All(char.IsAsciiDigit));
+            && levels.All(level => level.Length > 0 && TextUtils.ByteLength(level) <= 3 && level.All(char.IsAsciiDigit));
     }
 
     /// <summary>Counts whitespace-separated words that contain at least one letter.</summary>
@@ -267,7 +268,7 @@ internal static class TableFormat
     private static bool LooksLikeCompactEntryLabel(string cell)
     {
         var trimmed = cell.Trim();
-        if (trimmed.Length is < 3 or > 80)
+        if (TextUtils.ByteLength(trimmed) is < 3 or > 80)
         {
             return false;
         }
@@ -289,7 +290,7 @@ internal static class TableFormat
     private static bool LooksLikePlainSectionLabel(string cell)
     {
         var trimmed = cell.Trim();
-        if (trimmed.Length is < 4 or > 40)
+        if (TextUtils.ByteLength(trimmed) is < 4 or > 40)
         {
             return false;
         }
@@ -299,7 +300,7 @@ internal static class TableFormat
             return false;
         }
 
-        if (trimmed.Length <= 4 && !trimmed.Any(char.IsLower))
+        if (TextUtils.ByteLength(trimmed) <= 4 && !trimmed.Any(char.IsLower))
         {
             return false;
         }
@@ -352,7 +353,7 @@ internal static class TableFormat
             // so it stays put. A row with content in many columns is a real data row
             // whose first-column cell spans, not text overflow.
             var nonFirstCells = row.Skip(1).Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
-            var isShortSubheader = nonFirstCells.Count == 1 && nonFirstCells[0].Length <= 5;
+            var isShortSubheader = nonFirstCells.Count == 1 && TextUtils.ByteLength(nonFirstCells[0]) <= 5;
 
             // Rows of several short values — numeric data in a lookup table — are
             // data rows with a spanning first column, not overflow from the row
@@ -360,7 +361,7 @@ internal static class TableFormat
             // carry short numbers.
             var avgCellLen = nonFirstCells.Count == 0
                 ? 0.0f
-                : nonFirstCells.Sum(c => c.Length) / (float)nonFirstCells.Count;
+                : nonFirstCells.Sum(TextUtils.ByteLength) / (float)nonFirstCells.Count;
             var numericCells = nonFirstCells.Count(c =>
                 c.All(ch => char.IsAsciiDigit(ch) || ch is '.' or '-' or ',' or ' '));
             var looksLikeDataRow = nonFirstCells.Count >= 2

@@ -181,7 +181,7 @@ internal static class Preprocess
 
             // A drop cap is one character, or one plus a space, at least 2.5× the
             // base font, and uppercase.
-            var isDropCap = trimmed.Length <= 2
+            var isDropCap = TextUtils.ByteLength(trimmed) <= 2
                 && (line.Items.Count > 0 ? line.Items[0].FontSize : 0.0f) >= baseSize * 2.5f
                 && trimmed.Length > 0
                 && char.IsUpper(trimmed[0]);
@@ -412,7 +412,7 @@ internal static class Preprocess
             }
 
             var normalized = NormalizeForComparison(line.Text());
-            if (normalized.Length < 10 || IsDecorativeSeparator(normalized))
+            if (TextUtils.ByteLength(normalized) < 10 || IsDecorativeSeparator(normalized))
             {
                 continue;
             }
@@ -439,7 +439,7 @@ internal static class Preprocess
             }
 
             var normalized = NormalizeForComparison(CoalesceBand(lines, indices));
-            if (normalized.Length < 10 || IsDecorativeSeparator(normalized))
+            if (TextUtils.ByteLength(normalized) < 10 || IsDecorativeSeparator(normalized))
             {
                 continue;
             }

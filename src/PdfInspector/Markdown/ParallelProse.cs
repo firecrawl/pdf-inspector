@@ -63,7 +63,7 @@ internal static class ParallelProse
         var groupCount = 0;
         foreach (var group in prefix.Split('.'))
         {
-            if (group.Length is 0 or > 3 || !group.All(char.IsAsciiDigit))
+            if (group.Length == 0 || TextUtils.ByteLength(group) > 3 || !group.All(char.IsAsciiDigit))
             {
                 return false;
             }

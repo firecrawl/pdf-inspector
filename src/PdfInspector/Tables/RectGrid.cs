@@ -456,7 +456,7 @@ internal static class RectGrid
         // A very long cell in strict mode means a paragraph was caught in the grid.
         if (strict)
         {
-            var maxCellLen = cells.SelectMany(row => row).Select(c => c.Length).DefaultIfEmpty(0).Max();
+            var maxCellLen = cells.SelectMany(row => row).Select(TextUtils.ByteLength).DefaultIfEmpty(0).Max();
             if (maxCellLen > 200)
             {
                 Log.Debug(Module, () => $"  rejected: max cell length {maxCellLen} > 200 (likely paragraph text)");

@@ -685,7 +685,7 @@ internal static class HeuristicDetector
 
             var first = row.Count > 0 ? row[0].Trim() : string.Empty;
             if (first.EndsWith(':')
-                || (first.Length > 3 && first.All(c => char.IsUpper(c) || char.IsWhiteSpace(c) || c is '(' or ')')))
+                || (TextUtils.ByteLength(first) > 3 && first.All(c => char.IsUpper(c) || char.IsWhiteSpace(c) || c is '(' or ')')))
             {
                 labelLikeFirstCol++;
             }
@@ -786,7 +786,7 @@ internal static class HeuristicDetector
                 .Skip(1)
                 .SelectMany(row => row)
                 .Where(c => c.Trim().Length > 0)
-                .Select(c => c.Trim().Length)
+                .Select(c => TextUtils.ByteLength(c.Trim()))
                 .ToList();
 
             if (lengths.Count > 0)
@@ -813,7 +813,7 @@ internal static class HeuristicDetector
         }
 
         // Dates in any of the common orders.
-        if (s.Length <= 10
+        if (TextUtils.ByteLength(s) <= 10
             && s.Count(char.IsAsciiDigit) >= 4
             && (s.Contains('/') || s.Contains('-'))
             && s.All(c => char.IsAsciiDigit(c) || c is '/' or '-'))
@@ -822,7 +822,7 @@ internal static class HeuristicDetector
         }
 
         // Part numbers and model codes: short alphanumerics carrying a digit.
-        if (s.Length <= 10 && s.All(char.IsLetterOrDigit) && s.Any(char.IsAsciiDigit))
+        if (TextUtils.ByteLength(s) <= 10 && s.All(char.IsLetterOrDigit) && s.Any(char.IsAsciiDigit))
         {
             return true;
         }
@@ -897,7 +897,7 @@ internal static class HeuristicDetector
 
         // A cell ending in a hyphen after a letter is a word break across
         // columns; real cells almost never do that.
-        var hyphenBreaks = filled.Count(c => c.Length > 1 && c.EndsWith('-') && char.IsLetter(c[^2]));
+        var hyphenBreaks = filled.Count(c => c.EndsWith('-') && TextUtils.ByteLength(c) > 1 && c.Length > 1 && char.IsLetter(c[^2]));
 
         if ((float)hyphenBreaks / filled.Count > 0.03f)
         {
@@ -936,9 +936,9 @@ internal static class HeuristicDetector
             return true;
         }
 
-        var longCells = filled.Count(c => c.Length > 60);
+        var longCells = filled.Count(c => TextUtils.ByteLength(c) > 60);
         var longRatio = (float)longCells / filled.Count;
-        var avgLen = (float)filled.Sum(c => c.Length) / filled.Count;
+        var avgLen = (float)filled.Sum(TextUtils.ByteLength) / filled.Count;
 
         return (avgLen > 40.0f && longRatio > 0.2f) || longRatio > 0.3f;
     }
@@ -980,7 +980,7 @@ internal static class HeuristicDetector
         static bool IsFormCell(string cell)
         {
             var text = cell.Trim();
-            return (text.EndsWith(':') && text.Length > 1)
+            return (text.EndsWith(':') && TextUtils.ByteLength(text) > 1)
                 || (text.Contains(": ", StringComparison.Ordinal) && !LooksLikeNumber(text));
         }
 
@@ -1113,8 +1113,9 @@ internal static class HeuristicDetector
                 return false;
             }
 
+            var totalChars = TextUtils.CharCount(text);
             var dataChars = text.Count(c => char.IsAsciiDigit(c) || ",.-+%€$£¥()".Contains(c, StringComparison.Ordinal));
-            return (float)dataChars / text.Length >= 0.6f;
+            return totalChars > 0 && (float)dataChars / totalChars >= 0.6f;
         });
 
         var totalNonEmpty = table.Cells.SelectMany(row => row).Count(c => c.Trim().Length > 0);

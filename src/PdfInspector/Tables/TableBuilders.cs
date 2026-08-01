@@ -498,7 +498,7 @@ internal static class TableBuilders
             .Count(c =>
             {
                 var t = c.Trim();
-                return t.Length > 20 && (t.EndsWith('.') || t.EndsWith('!') || t.EndsWith('?') || t.EndsWith(':'));
+                return TextUtils.ByteLength(t) > 20 && (t.EndsWith('.') || t.EndsWith('!') || t.EndsWith('?') || t.EndsWith(':'));
             });
         if (filledCells > 0 && proseCells / (float)filledCells > 0.15f)
         {
