@@ -46,14 +46,20 @@ internal sealed class UnionFind(int n)
         return root;
     }
 
-    public void Union(int a, int b)
+    /// <summary>
+    /// Merges two components and returns the size of the result, so a caller
+    /// watching for an oversized component does not need a second
+    /// <see cref="ComponentSize"/> — which is another <see cref="Find"/> — right
+    /// after every union.
+    /// </summary>
+    public int Union(int a, int b)
     {
         var ra = Find(a);
         var rb = Find(b);
 
         if (ra == rb)
         {
-            return;
+            return _size[ra];
         }
 
         var newSize = _size[ra] + _size[rb];
@@ -74,6 +80,8 @@ internal sealed class UnionFind(int n)
             _size[ra] = newSize;
             _rank[ra]++;
         }
+
+        return newSize;
     }
 
     public int ComponentSize(int x) => _size[Find(x)];
@@ -214,9 +222,7 @@ internal static class RectGrid
                     continue;
                 }
 
-                uf.Union(i, j);
-
-                if (uf.ComponentSize(i) >= MaxClusterRects)
+                if (uf.Union(i, j) >= MaxClusterRects)
                 {
                     break;
                 }
@@ -624,25 +630,8 @@ internal static class RectGrid
             var cx = item.X + (item.Width / 2.0f);
             var cy = item.Y;
 
-            int? col = null;
-            for (var c = 0; c < numCols; c++)
-            {
-                if (cx >= colEdges[c] - 2.0f && cx <= colEdges[c + 1] + 2.0f)
-                {
-                    col = c;
-                    break;
-                }
-            }
-
-            int? row = null;
-            for (var r = 0; r < numRows; r++)
-            {
-                if (cy >= rowEdges[r + 1] - 2.0f && cy <= rowEdges[r] + 2.0f)
-                {
-                    row = r;
-                    break;
-                }
-            }
+            var col = FirstCell(colEdges, numCols, cx, ascending: true);
+            var row = FirstCell(rowEdges, numRows, cy, ascending: false);
 
             if (col is { } c2 && row is { } r2)
             {
@@ -719,6 +708,48 @@ internal static class RectGrid
         }
 
         return (cells, indices);
+    }
+
+    /// <summary>
+    /// The first cell whose edges bracket <paramref name="value"/>, within the
+    /// two-unit tolerance, or null when none does.
+    /// </summary>
+    /// <remarks>
+    /// The linear scan this replaces compared against every edge for every item,
+    /// on every candidate grid. Both edge lists are sorted — columns ascending,
+    /// rows descending — so the far edge's test is monotonic in the cell index
+    /// and a binary search finds the same first match. The near edge is then
+    /// checked once: if it fails there it fails for every later cell too, since
+    /// that edge only moves further away.
+    /// </remarks>
+    private static int? FirstCell(List<float> edges, int count, float value, bool ascending)
+    {
+        // Smallest index whose far edge reaches the value.
+        var lo = 0;
+        var hi = count;
+        while (lo < hi)
+        {
+            var mid = lo + ((hi - lo) / 2);
+            var far = edges[mid + 1];
+            var reaches = ascending ? far >= value - 2.0f : value >= far - 2.0f;
+            if (reaches)
+            {
+                hi = mid;
+            }
+            else
+            {
+                lo = mid + 1;
+            }
+        }
+
+        if (lo >= count)
+        {
+            return null;
+        }
+
+        var near = edges[lo];
+        var brackets = ascending ? value >= near - 2.0f : value <= near + 2.0f;
+        return brackets ? lo : null;
     }
 
     /// <summary>Top-to-bottom, then left-to-right — the order text reads inside a cell.</summary>
