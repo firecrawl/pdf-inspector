@@ -44,21 +44,21 @@ All 22 fixtures load; page counts match the Rust reference exactly.
 - [x] `underline.rs` → `Underline`
 - [x] `links.rs` → `Links`
 - [x] item merging from `mod.rs` → `ItemMerging`
-- [ ] `layout.rs` — column detection, line grouping, reading-order layout (2153 lines)
-- [ ] `reading_order.rs` (591 lines)
+- [x] `layout.rs` — column detection, line grouping, reading-order layout
+- [x] `reading_order.rs`
 - [ ] `mod.rs` pipeline — `extract_positioned_text_impl`, page-box clipping,
       `suppress_table_underlines` (needs Phase 4), public `extract_text*` API
 
-## Phase 4 — tables — not started
-- [ ] `grid.rs`
-- [ ] `detect_rects.rs`
-- [ ] `detect_lines.rs`
-- [ ] `detect_heuristic.rs`
-- [ ] `detect_struct.rs`
-- [ ] `financial.rs`
-- [ ] `structured.rs`
-- [ ] `format.rs`
-- [ ] `mod.rs`
+## Phase 4 — tables — done
+- [x] `grid.rs` → `Grid`
+- [x] `detect_rects.rs` → `RectGrid`, `RectTables`
+- [x] `detect_lines.rs` → `LineDetector`, `TextAnchorTables`
+- [x] `detect_heuristic.rs` → `HeuristicDetector`, `TableOfContents`
+- [x] `detect_struct.rs` → `StructTables`
+- [x] `financial.rs` → `Financial`
+- [x] `structured.rs` → `StructuredCells`
+- [x] `format.rs` → `TableFormat`
+- [x] `mod.rs` → `Table`, `TableBuilders`, `KeyValueTables`
 
 ## Phase 5 — markdown — not started
 - [ ] `analysis.rs`
