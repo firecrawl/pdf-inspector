@@ -827,8 +827,11 @@ internal static class ContentStreamExtractor
 
         // Underline detection reads only painted ink: confirmed `re` rects plus
         // filled subpaths, never clip-only rects.
-        var underlineRects = new List<PdfRect>(paintedRects);
-        underlineRects.AddRange(fillRects);
+        //
+        // These are copies, not shared references: the same rectangles also reach
+        // the table detectors through `rects`, and a rotated page transforms both
+        // lists. Sharing the objects would rotate each rectangle twice.
+        var underlineRects = paintedRects.Concat(fillRects).Select(r => r.Clone()).ToList();
 
         rects = ChooseRects(rects, clipRects, fillRects);
 
