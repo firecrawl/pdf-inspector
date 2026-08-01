@@ -69,31 +69,52 @@ All 22 fixtures load; page counts match the Rust reference exactly.
 - [x] `postprocess.rs` → `Postprocess`, `MarkdownOptions`
 - [x] `mod.rs` → `MarkdownConverter`, `PageSplits`, `ChartRegions`, `ParallelProse`
 
-## Phase 6 — detector + public API — not started
-- [ ] `detector.rs`
-- [ ] `lib.rs` public surface (`PdfOptions`, `process_pdf*`, region/table APIs, `PdfError`)
+## Phase 6 — detector + public API — done
+- [x] `detector.rs` → `PdfDetector`, `PageAnalyzer`, `PdfTypeResult`
+- [x] `lib.rs` core surface → `PdfProcessor`, `PdfOptions`, `PdfException`, `ProcessingPipeline`
+- [x] `lib.rs` region surface → `Regions/` (`RegionExtraction`, `VectorGrid`, `TsrTables`,
+      `RegionGeometry`, `TableCandidates`)
+- [x] `lib.rs` per-page surface → `PagesMarkdown.cs` (`ExtractPagesMarkdown*`, `ClassifyPdfMem`)
 
-## Phase 7 — CLI — not started
-- [ ] `pdf2md`
-- [ ] `detect-pdf`
+## Phase 7 — CLI — done
+- [x] `pdf2md`
+- [x] `detect-pdf`
 
-## Phase 8 — validation
+## Phase 8 — validation — done
 - [x] Unit tests for the PDF core, filters, text utilities, CMaps, and glyph names
 - [x] Fixture suite: all 22 fixtures load and decode; encrypted fixture round-trips
-- [ ] Port `reference/tests/integration_tests.rs`
-- [ ] Differential check vs the release Rust binaries over `reference/tests/fixtures`
-- [ ] Snapshot comparison against `reference/tests/snapshots`
+- [x] Port `reference/tests/integration_tests.rs`
+- [x] Differential check vs the release Rust binaries over `reference/tests/fixtures`
+      (`DifferentialMarkdownTests`, `DetectorFixtureTests`)
+- [x] Snapshot comparison against `reference/tests/snapshots` (`SnapshotTests`)
 
-## Current test status
+## Current status
 
-`dotnet test` → 78 passed, 0 failed.
+`dotnet test` → 388 passed, 0 failed.
+
+Markdown parity with the reference binary: **20 of 21** open fixtures are
+byte-identical. Detection output (type, page count, OCR recommendation, pages
+needing OCR) matches on all of them.
+
+## The one deliberate divergence
+
+`2013-app2.pdf` — the reference's parser cannot read page 7 (lopdf logs
+"Object load error at offset 48234" and extracts zero items from it), so both
+the reference binary and its pinned snapshot omit that page's 48 rows. This
+port's recovery scan reads the page and emits them, which is strictly more of
+the document. `SnapshotTests` pins the exact shape of the addition — the
+snapshot must reappear once that one contiguous block is removed — and
+`DifferentialMarkdownTests` lists it as a known divergence and asserts it still
+differs, so an accidental regression to the reference's behaviour would fail.
 
 ## Notes for resuming
 
-- `reference/target/release/{pdf2md,detect-pdf}` are built and serve as the
-  golden reference for differential checks.
-- `extractor/mod.rs`'s `suppress_table_underlines` calls into `tables`, so the
-  extractor pipeline must be finished *after* Phase 4.
-- `shinagawa_identity_h.pdf` extracts as garbled text in both implementations;
-  the reference flags it `suspected_garbled_text` and emits empty markdown.
-  That fixture is a decoder-failure case, not a port defect.
+- `reference/target/release/{pdf2md,detect-pdf}` are the golden reference for
+  the differential checks; build them with `cargo build --release --bins`.
+  Both differential tests skip themselves when the binaries are absent.
+- `DifferentialMarkdownTests` runs both implementations over every fixture and
+  takes minutes; `dotnet test --filter Category!=Differential` skips it.
+- Float fidelity matters: LINQ's `Sum` over floats accumulates in double, so
+  every place the reference sums `f32` uses `FloatMath.SumF32` instead. A single
+  ulp is enough to move a table's row band off a text baseline and reorder the
+  output.

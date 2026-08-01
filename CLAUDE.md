@@ -41,6 +41,9 @@ src/PdfInspector/
   Tables/                      – rect / line / heuristic / struct table detection, grid building, formatting
   Markdown/                    – line→Markdown conversion, heading tiers, classification, pre/post-processing
   Detector/                    – PDF type classification, tiled-scan detection, page sampling
+  Regions/                     – region-scoped text/table extraction, vector grids, TSR tables
+  Quality/                     – garbage, CID and encoding-issue detection
+  Structure/                   – tagged-PDF structure tree and roles
 ```
 
 ## Key design decisions
@@ -61,7 +64,15 @@ These carry over from the Rust original; see `reference/CLAUDE.md` for the long-
 - Rust `Option<T>` becomes a nullable reference or `T?`; `Result<T, E>` becomes an exception
   or a `bool TryX(out T)` pair, whichever reads better at the call site.
 - `f32` is preserved as `float` throughout. The layout and table heuristics compare
-  against tuned thresholds, so widening to `double` changes output.
+  against tuned thresholds, so widening to `double` changes output. Sum floats with
+  `FloatMath.SumF32`, never LINQ's `Sum`: LINQ accumulates in double and rounds once
+  at the end, and a single ulp is enough to move a table's row band off the text
+  baseline it should coincide with, which reorders the output.
+- `str::len()` is UTF-8 bytes while `string.Length` is UTF-16 units. Where the Rust
+  compares a length against a tuned threshold, use `TextUtils.ByteLength`.
+- Rust structs are values; C# classes are references. Clone before mutating anything
+  that also reaches another consumer — two lists holding the same `PdfRect` will
+  otherwise transform it twice.
 - Iterator chains become LINQ only where it stays readable; hot loops in the extractor
   and table detectors stay imperative.
 - `rayon` parallelism maps to `Parallel.For`/PLINQ, and only where the Rust used it.
@@ -78,7 +89,19 @@ dotnet run --project src/PdfInspector.Cli -- pdf2md FILE.pdf
 
 `tests/PdfInspector.Tests` includes a differential suite that runs both over
 `reference/tests/fixtures` and compares. Snapshots in `reference/tests/snapshots`
-are checked directly.
+are checked directly. Both differential tests skip themselves when the Rust
+binaries have not been built.
+
+20 of the 21 open fixtures are byte-identical to the reference binary, and
+detection output matches on all of them. The exception is `2013-app2.pdf`: the
+reference's parser cannot read page 7 at all, so it — and its pinned snapshot —
+omit that page's rows, while this port's recovery scan reads them. `SnapshotTests`
+pins the exact shape of that addition and `DifferentialMarkdownTests` lists it as
+a known divergence, so drifting either way fails.
+
+```bash
+dotnet test --filter Category!=Differential   # skip the minutes-long fixture sweep
+```
 
 ## Debugging
 
