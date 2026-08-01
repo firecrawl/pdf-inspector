@@ -114,7 +114,7 @@ public sealed class PdfOptions
 }
 
 /// <summary>The library's high-level entry points.</summary>
-public static class PdfProcessor
+public static partial class PdfProcessor
 {
     /// <summary>
     /// Processes a PDF file end to end: detect, extract, convert to markdown.
@@ -162,6 +162,10 @@ public static class PdfProcessor
             throw new PdfException(PdfException.FailureKind.Io, $"IO error: {ex.Message}", ex);
         }
     }
+
+    /// <summary>Loads a document, translating parse and decryption failures.</summary>
+    internal static PdfDocument LoadDocumentOrThrow(byte[] bytes, string? password) =>
+        LoadDocument(bytes, password);
 
     /// <summary>Loads a document, translating parse and decryption failures.</summary>
     private static PdfDocument LoadDocument(byte[] bytes, string? password)
