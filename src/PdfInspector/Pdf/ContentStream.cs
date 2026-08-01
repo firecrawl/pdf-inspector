@@ -23,7 +23,7 @@ public static class ContentStream
         // A content-stream operation averages a couple of dozen bytes, so this
         // lands within a doubling of the final count and skips the growth
         // sequence a text-heavy page would otherwise walk.
-        var operations = new List<PdfOperation>(Math.Min((data.Length / 24) + 8, 1 << 16));
+        var operations = new List<PdfOperation>(Math.Min((data.Length / 24) + 8, 1 << 21));
         var parser = new PdfParser(data);
         var lexer = new PdfLexer(data);
 

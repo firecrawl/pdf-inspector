@@ -439,7 +439,11 @@ internal static class PageAnalyzer
     /// </summary>
     private static bool EmbeddedFontHasCmap(PdfStream stream)
     {
-        var data = StreamFilters.Decode(stream);
+        // Through the stream's own memo, not StreamFilters directly: the three
+        // Identity-H checks each reach the same embedded font, and the extractor
+        // reads it again afterwards. Inflating it once per caller was a quarter
+        // of the run on a CJK document.
+        var data = stream.DecompressedContent();
         if (data is null || data.Length == 0)
         {
             return false;
@@ -507,7 +511,7 @@ internal static class PageAnalyzer
 
             if (subtype == "Form")
             {
-                var content = StreamFilters.Decode(stream) ?? stream.RawData;
+                var content = stream.DecompressedContent() ?? stream.RawData;
                 var xobjFontNames = new HashSet<string>(StringComparer.Ordinal);
                 var scan = ScanContentForTextOperators(content, uniqueChars, xobjFontNames);
                 textOps += scan.TextOps;

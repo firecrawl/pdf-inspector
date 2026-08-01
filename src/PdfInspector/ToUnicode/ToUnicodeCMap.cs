@@ -30,11 +30,15 @@ public sealed class ToUnicodeCMap
             CidPassthrough = CidPassthrough,
         };
 
+        // A bundled Adobe CMap runs to tens of thousands of entries, so both
+        // containers are sized before they are filled.
+        copy.CharMap.EnsureCapacity(CharMap.Count);
         foreach (var (key, value) in CharMap)
         {
             copy.CharMap[key] = value;
         }
 
+        copy.Ranges.Capacity = Ranges.Count;
         copy.Ranges.AddRange(Ranges);
         return copy;
     }

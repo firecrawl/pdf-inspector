@@ -287,24 +287,43 @@ internal static partial class Postprocess
     }
 
     /// <summary>Converts bare URLs into markdown links, leaving already-linked ones alone.</summary>
+    /// <remarks>
+    /// The bracket balance is carried forward rather than recomputed. Written the
+    /// obvious way — take everything before the match and count its brackets —
+    /// each URL copies the whole preceding document and scans that copy twice,
+    /// which is quadratic in the document and was a tenth of the run on the
+    /// link-heavy fixture.
+    /// </remarks>
     private static string FormatUrls(string text)
     {
         var result = new StringBuilder(text.Length);
         var lastEnd = 0;
+
+        var scanned = 0;
+        var opens = 0;
+        var closes = 0;
 
         foreach (Match match in UrlRegex.Matches(text))
         {
             var start = match.Index;
             var url = match.Value;
 
+            // Matches arrive in order, so the balance only ever moves forward.
+            for (; scanned < start; scanned++)
+            {
+                switch (text[scanned])
+                {
+                    case '[': opens++; break;
+                    case ']': closes++; break;
+                    default: break;
+                }
+            }
+
             // A URL already inside a markdown link is preceded by "](".
-            var checkStart = Math.Max(start - 2, 0);
-            var before = text[checkStart..start];
-            var alreadyLinked = before.EndsWith("](", StringComparison.Ordinal);
+            var alreadyLinked = start >= 2 && text[start - 2] == ']' && text[start - 1] == '(';
 
             // A URL inside link text sits between an unclosed "[" and its "]".
-            var prefix = text[..start];
-            var insideLinkText = prefix.Count(c => c == '[') > prefix.Count(c => c == ']');
+            var insideLinkText = opens > closes;
 
             if (alreadyLinked || insideLinkText)
             {

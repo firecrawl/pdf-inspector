@@ -324,6 +324,25 @@ internal static class LayoutAnalysis
     /// per page, with side-by-side band splitting, then checking each page for
     /// multiple columns.
     /// </summary>
+    /// <summary>Buckets a list by page number, preserving each page's original order.</summary>
+    private static Dictionary<uint, List<T>> GroupByPage<T>(List<T> values, Func<T, uint> pageOf)
+    {
+        var groups = new Dictionary<uint, List<T>>();
+        foreach (var value in values)
+        {
+            var page = pageOf(value);
+            if (!groups.TryGetValue(page, out var group))
+            {
+                group = [];
+                groups[page] = group;
+            }
+
+            group.Add(value);
+        }
+
+        return groups;
+    }
+
     public static LayoutComplexity ComputeLayoutComplexity(
         List<TextItem> items,
         List<PdfRect> rects,
@@ -332,11 +351,20 @@ internal static class LayoutAnalysis
         var seenPages = items.Select(i => i.Page).Distinct().OrderBy(p => p).ToList();
         var baseSize = Analysis.CalculateFontStatsFromItems(items).MostCommonSize;
 
+        // Bucketed once rather than re-filtered per page: the direct
+        // translation walks every item, rect and line once per page, which on a
+        // few-hundred-page document is quadratic and was the largest single cost
+        // in this function. A forward pass keeps each bucket in the same order
+        // the filter produced.
+        var itemsByPage = GroupByPage(items, i => i.Page);
+        var rectsByPage = GroupByPage(rects, r => r.Page);
+        var linesByPage = GroupByPage(lines, l => l.Page);
+
         var pagesWithTables = new List<uint>();
 
         foreach (var page in seenPages)
         {
-            var pageItems = items.Where(i => i.Page == page).ToList();
+            var pageItems = itemsByPage.TryGetValue(page, out var bucket) ? bucket : [];
             var bands = PageSplits.SplitSideBySide(pageItems);
 
             // With no split, a single sentinel band covers the whole page.
@@ -353,11 +381,11 @@ internal static class LayoutAnalysis
                     : pageItems.Where(item => item.X >= xLo - Margin && item.X < xHi + Margin).ToList();
 
                 var bandRects = wholePage
-                    ? rects.Where(r => r.Page == page).ToList()
+                    ? (rectsByPage.TryGetValue(page, out var pageRects) ? pageRects : [])
                     : PageSplits.FilterRectsToBand(rects, page, xLo, xHi);
 
                 var bandLines = wholePage
-                    ? lines.Where(l => l.Page == page).ToList()
+                    ? (linesByPage.TryGetValue(page, out var pageLines) ? pageLines : [])
                     : PageSplits.FilterLinesToBand(lines, page, xLo, xHi);
 
                 // A contents page routes through the table detector but renders as a

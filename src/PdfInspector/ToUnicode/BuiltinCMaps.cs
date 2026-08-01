@@ -15,6 +15,8 @@ internal static class BuiltinCMaps
 
     private static readonly Dictionary<string, ToUnicodeCMap?> Cache = [];
 
+    private static readonly Dictionary<string, ToUnicodeCMap?> OrderingCache = [];
+
     private static readonly Lock CacheLock = new();
 
     /// <summary>Guards against a cycle in <c>usecmap</c> chains.</summary>
@@ -45,9 +47,36 @@ internal static class BuiltinCMaps
     }
 
     /// <summary>Builds a UCS-2 CMap for a character-collection ordering such as "Japan1".</summary>
+    /// <remarks>
+    /// Cached like <see cref="LoadByName"/>, and for the same reason: these files
+    /// hold tens of thousands of mappings, and reading and parsing one per
+    /// document was over a sixth of the run on a CJK fixture. Callers may adjust
+    /// what they get back, so the cache hands out clones.
+    /// </remarks>
     public static ToUnicodeCMap? ForOrdering(string ordering)
     {
         var name = $"Adobe-{ordering}-UCS2.bcmap";
+
+        lock (CacheLock)
+        {
+            if (OrderingCache.TryGetValue(ordering, out var hit))
+            {
+                return hit?.Clone();
+            }
+        }
+
+        var cmap = BuildForOrdering(name);
+
+        lock (CacheLock)
+        {
+            OrderingCache[ordering] = cmap;
+        }
+
+        return cmap?.Clone();
+    }
+
+    private static ToUnicodeCMap? BuildForOrdering(string name)
+    {
         var data = ReadFile(name);
         if (data is null)
         {

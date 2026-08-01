@@ -198,6 +198,28 @@ internal static class RectGrid
         var n = rects.Count;
         var uf = new UnionFind(n);
 
+        // The pairing scan is quadratic and reads four floats per rect on both
+        // sides, so it is projected into flat arrays first: through
+        // IReadOnlyList every access is an interface call that also copies the
+        // struct, and the tolerance is folded into the edges rather than added
+        // n² times. The comparisons keep their original form — writing them as
+        // >= instead of !(<) would change the verdict on a NaN edge, which a
+        // malformed file can produce.
+        var edgeBuffer = ArrayPool<float>.Shared.Rent(n * 4);
+        var rightPlus = edgeBuffer.AsSpan(0, n);
+        var leftMinus = edgeBuffer.AsSpan(n, n);
+        var topPlus = edgeBuffer.AsSpan(n * 2, n);
+        var bottomMinus = edgeBuffer.AsSpan(n * 3, n);
+
+        for (var i = 0; i < n; i++)
+        {
+            var r = rects[i];
+            rightPlus[i] = r.Right + tolerance;
+            leftMinus[i] = r.Left - tolerance;
+            topPlus[i] = r.Top + tolerance;
+            bottomMinus[i] = r.Bottom - tolerance;
+        }
+
         for (var i = 0; i < n; i++)
         {
             // A rect already in an oversized component cannot contribute to a
@@ -207,9 +229,15 @@ internal static class RectGrid
                 continue;
             }
 
+            var ri = rightPlus[i];
+            var li = leftMinus[i];
+            var ti = topPlus[i];
+            var bi = bottomMinus[i];
+
             for (var j = i + 1; j < n; j++)
             {
-                if (!RectsOverlap(rects[i], rects[j], tolerance))
+                if (ri < leftMinus[j] || rightPlus[j] < li
+                    || ti < bottomMinus[j] || topPlus[j] < bi)
                 {
                     continue;
                 }
@@ -222,6 +250,8 @@ internal static class RectGrid
                 }
             }
         }
+
+        ArrayPool<float>.Shared.Return(edgeBuffer);
 
         // Resolve every root and size its component before filling anything, so
         // each surviving group's list is allocated once at its final size. A
@@ -521,7 +551,7 @@ internal static class RectGrid
             return (GridOutcome.Failed, null);
         }
 
-        var nonEmptyRows = cells.Count(row => row.Any(c => c.Trim().Length > 0));
+        var nonEmptyRows = cells.Count(row => row.Any(HasContent));
         var minRows = strict ? numRows / 2 : 2;
 
         if (nonEmptyRows < minRows)
@@ -530,7 +560,7 @@ internal static class RectGrid
             return (GridOutcome.FewNonEmptyRows, null);
         }
 
-        var nonEmptyCells = cells.SelectMany(row => row).Count(c => c.Trim().Length > 0);
+        var nonEmptyCells = cells.SelectMany(row => row).Count(HasContent);
         var contentRatio = nonEmptyCells / totalCells;
         var minContent = strict ? 0.40f : 0.25f;
 
@@ -560,7 +590,7 @@ internal static class RectGrid
 
         for (var col = 0; col < numCols; col++)
         {
-            if (cells.Any(row => col < row.Count && row[col].Trim().Length > 0))
+            if (cells.Any(row => col < row.Count && HasContent(row[col])))
             {
                 firstNonEmpty ??= col;
                 lastNonEmpty = col;
@@ -757,6 +787,14 @@ internal static class RectGrid
     /// sub-row, so the downstream continuation merge collapses the sub-rows
     /// correctly.
     /// </summary>
+    /// <summary>
+    /// True when a cell holds anything but whitespace. The direct translation,
+    /// <c>cell.Trim().Length > 0</c>, allocates a trimmed copy of every cell
+    /// each time a candidate grid is scored, and each grid is scored several
+    /// times over.
+    /// </summary>
+    private static bool HasContent(string cell) => !cell.AsSpan().Trim().IsEmpty;
+
     private static void PropagateMergedCells(
         List<List<string>> cells,
         List<float> colEdges,
@@ -767,6 +805,8 @@ internal static class RectGrid
         var numCols = colEdges.Count - 1;
         var numRows = rowEdges.Count - 1;
         const float Tol = 6.0f;
+
+        var combined = new StringBuilder();
 
         for (var col = 0; col < numCols; col++)
         {
@@ -786,23 +826,22 @@ internal static class RectGrid
                     continue;
                 }
 
-                // Real overlap is required, not mere tolerance slack: a rect
-                // whose top equals a row's bottom lies entirely below that row,
-                // and counting it would cascade unrelated text into one cell.
-                bool Spans(int r)
-                {
-                    var rowTop = rowEdges[r];
-                    var rowBot = rowEdges[r + 1];
-                    var overlap = MathF.Max(MathF.Min(rowTop, rect.Top) - MathF.Max(rowBot, rect.Bottom), 0.0f);
-                    return overlap > Tol;
-                }
-
                 int? firstRow = null;
                 int? lastRow = null;
 
                 for (var r = 0; r < numRows; r++)
                 {
-                    if (Spans(r))
+                    // Real overlap is required, not mere tolerance slack: a rect
+                    // whose top equals a row's bottom lies entirely below that
+                    // row, and counting it would cascade unrelated text into one
+                    // cell. Written inline rather than as a local function,
+                    // which captured the rect and so allocated once per rect
+                    // per column.
+                    var overlap = MathF.Max(
+                        MathF.Min(rowEdges[r], rect.Top) - MathF.Max(rowEdges[r + 1], rect.Bottom),
+                        0.0f);
+
+                    if (overlap > Tol)
                     {
                         firstRow ??= r;
                         lastRow = r;
@@ -814,11 +853,11 @@ internal static class RectGrid
                     continue;
                 }
 
-                var combined = new StringBuilder();
+                combined.Clear();
                 for (var row = first; row <= last; row++)
                 {
-                    var text = cells[row][col].Trim();
-                    if (text.Length == 0)
+                    var text = cells[row][col].AsSpan().Trim();
+                    if (text.IsEmpty)
                     {
                         continue;
                     }

@@ -1478,7 +1478,7 @@ internal static class RectTables
 
         // Only this page's items can fall inside the cluster, and the filter is
         // invariant across every containment test below.
-        var pageItems = new List<TextItem>();
+        var pageItems = new List<TextItem>(items.Count);
         foreach (var it in items)
         {
             if (it.Page == page)
