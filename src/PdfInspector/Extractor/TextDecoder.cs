@@ -78,7 +78,11 @@ internal sealed class PageFontContext
     /// <summary>Glyph metrics, by resource name.</summary>
     public Dictionary<string, FontWidthInfo> Widths { get; init; } = [];
 
-    public CMapDecisionCache CMapDecisions { get; } = new();
+    /// <summary>
+    /// Shared with any Form XObject the page draws, so a font's primary/remapped
+    /// verdict stays consistent across the page and its forms.
+    /// </summary>
+    public CMapDecisionCache CMapDecisions { get; init; } = new();
 }
 
 /// <summary>

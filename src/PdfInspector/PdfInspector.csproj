@@ -11,6 +11,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The test suite covers the internal heuristics directly, mirroring the
+         Rust crate's in-module unit tests. -->
+    <InternalsVisibleTo Include="PdfInspector.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Bundled Adobe CMap binaries, loaded at runtime by the ToUnicode layer. -->
     <EmbeddedResource Include="..\..\reference\external\bcmaps\*.bcmap">
       <LogicalName>bcmaps/%(Filename)%(Extension)</LogicalName>
