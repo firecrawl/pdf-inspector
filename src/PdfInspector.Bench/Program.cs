@@ -140,27 +140,9 @@ internal static class Program
         var name = Path.GetFileNameWithoutExtension(path);
         var bytes = File.ReadAllBytes(path);
 
-        // Warmup: enough calls to promote the hot methods out of tier-0, plus
-        // whatever else fits in a quarter of the measurement budget.
-        var warmupSw = Stopwatch.StartNew();
-        var warmups = 0;
-        long outputBytes = 0;
-        do
-        {
-            outputBytes = RunOnce(bytes);
-            warmups++;
-
-            // The iteration floor exists to reach tier-1 code, but a fixture
-            // whose single pass already outruns the budget is minutes of work
-            // per repeat. Past that point one pass has to be enough — the
-            // report marks such fixtures as low-confidence.
-            if (warmupSw.ElapsedMilliseconds > options.BudgetMs)
-            {
-                break;
-            }
-        }
-        while (warmups < options.WarmupIterations
-            || warmupSw.ElapsedMilliseconds < options.BudgetMs / 4);
+        // Warmup: enough calls to promote the hot methods out of tier-0, or as
+        // many as the warmup wall clock allows.
+        var (warmups, outputBytes) = WarmUntilStable(bytes, options);
 
         // Settle the heap so the timed section starts from a known state and a
         // collection triggered by warmup garbage is not charged to it.
@@ -201,6 +183,75 @@ internal static class Program
             WarmupIterations = warmups,
         };
     }
+
+    /// <summary>
+    /// Runs the fixture until the code under test has finished tiering up, or
+    /// until the warmup wall clock runs out.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A fixed three-iteration warmup is badly wrong on .NET, and so is a
+    /// convergence rule. Measured directly: td9264 reported 80 ms run alone and
+    /// 20 ms when other fixtures had already warmed the shared code. Same work,
+    /// four times the number, purely an artefact of the harness — and a rule
+    /// that stopped once the timings held steady for five passes still read
+    /// 110 ms, because tier-up is a delayed step down rather than a glide.
+    /// </para>
+    /// <para>
+    /// The cause is call counting. A method is promoted to tier-1 after
+    /// <see cref="TierUpCallTarget"/>-ish invocations, and one extraction calls
+    /// most of the pipeline's per-document methods exactly once. Loop bodies
+    /// escape this via on-stack replacement, which is why the multi-second
+    /// fixtures are insensitive to warmup length, but everything called once per
+    /// page or once per document needs real repetition. Nothing in the timings
+    /// signals that the promotions are still pending, so waiting on the numbers
+    /// cannot work; waiting on the call count can.
+    /// </para>
+    /// <para>
+    /// Hence: repeat until the call target is met, capped by a wall clock so a
+    /// fixture whose single pass already takes seconds does not warm for an
+    /// hour. Those fixtures are precisely the ones that do not need it. Measured
+    /// on td9264, alone: 84 ms at the old rule, 28 ms at 50 passes, 22.6 ms at
+    /// 100 — against 21 ms for a 300-iteration run, and 20 ms for the same
+    /// fixture inside a full sweep.
+    /// </para>
+    /// </remarks>
+    private static (int Warmups, long OutputBytes) WarmUntilStable(byte[] bytes, BenchOptions options)
+    {
+        // A fixture whose single pass already runs for seconds must not spend
+        // minutes warming, and does not need to.
+        var maxWarmupMs = Math.Max(options.BudgetMs * 2, 10_000);
+
+        var sw = Stopwatch.StartNew();
+        var warmups = 0;
+        long outputBytes = 0;
+
+        while (true)
+        {
+            outputBytes = RunOnce(bytes);
+            warmups++;
+
+            if (warmups >= options.WarmupIterations && warmups >= TierUpCallTarget)
+            {
+                break;
+            }
+
+            if (sw.ElapsedMilliseconds > maxWarmupMs)
+            {
+                break;
+            }
+        }
+
+        return (warmups, outputBytes);
+    }
+
+    /// <summary>
+    /// Warmup passes needed for the per-document methods to reach tier-1. The
+    /// runtime's own call-counting threshold is 30, but promotion is deferred
+    /// while the process is still meeting new methods and the compilation is
+    /// then queued to a background thread, so the effective count is higher.
+    /// </summary>
+    private const int TierUpCallTarget = 100;
 
     /// <summary>
     /// One full extraction. The result is consumed so nothing folds away, and
@@ -381,7 +432,7 @@ internal sealed class FixtureResult
 
     public string ToLine() => string.Create(CultureInfo.InvariantCulture,
         $"{Name,-40} {Median,9:F2} ms  (min {Min,8:F2}  p95 {P95,8:F2}  sd {StdDev,6:F2})  "
-        + $"n={Samples.Count,-3} alloc {AllocatedBytesPerIteration / 1048576.0,7:F1} MiB  "
+        + $"n={Samples.Count,-3} w={WarmupIterations,-4} alloc {AllocatedBytesPerIteration / 1048576.0,7:F1} MiB  "
         + $"gc {Gen0Collections}/{Gen2Collections}");
 
     public string ToJson() => string.Create(CultureInfo.InvariantCulture,

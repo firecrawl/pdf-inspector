@@ -141,41 +141,42 @@ fn measure(path: &Path, opts: &Options) -> FixtureResult {
         .to_string();
     let bytes = std::fs::read(path).expect("read fixture");
 
-    // Warmup. There is no JIT here, but caches, branch predictors and the
-    // allocator's free lists all settle — and running the same protocol on both
-    // sides keeps the comparison honest.
+    // Warmup, under exactly the rule the C# harness uses: repeat until the call
+    // target is met or the wall clock runs out. There is no JIT here, so the
+    // repetitions buy only settled caches, branch predictors and allocator free
+    // lists — but running the identical protocol on both sides is what keeps the
+    // comparison honest. See `WarmUntilStable` in the C# harness for why the
+    // count is what it is.
+    const TIER_UP_CALL_TARGET: usize = 100;
+    let max_warmup_ms = (opts.budget_ms * 2).max(10_000);
+
     let warm_start = Instant::now();
     let mut warmups = 0usize;
-    let mut output;
     loop {
-        output = black_box(run_once(&bytes));
+        black_box(run_once(&bytes));
         warmups += 1;
-        let elapsed = warm_start.elapsed().as_millis();
 
-        // A fixture whose single pass already outruns the budget is minutes of
-        // work per repeat; past that point one pass has to be enough.
-        if elapsed > opts.budget_ms {
+        if warmups >= opts.warmup_iterations && warmups >= TIER_UP_CALL_TARGET {
             break;
         }
-        if warmups >= opts.warmup_iterations && elapsed >= opts.budget_ms / 4 {
+        if warm_start.elapsed().as_millis() > max_warmup_ms {
             break;
         }
     }
 
     let mut samples: Vec<f64> = Vec::with_capacity(opts.min_iterations * 2);
     let total_start = Instant::now();
-    loop {
+    let output = loop {
         let t = Instant::now();
-        output = black_box(run_once(&bytes));
+        let out = black_box(run_once(&bytes));
         samples.push(t.elapsed().as_secs_f64() * 1e3);
 
-        if total_start.elapsed().as_millis() > opts.budget_ms {
-            break;
+        if total_start.elapsed().as_millis() > opts.budget_ms
+            || samples.len() >= opts.min_iterations
+        {
+            break out;
         }
-        if samples.len() >= opts.min_iterations {
-            break;
-        }
-    }
+    };
 
     FixtureResult {
         name,

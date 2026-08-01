@@ -39,6 +39,32 @@ pass, because a one-shot run never leaves tier-0 code. Both harnesses therefore
 warm up until the hot paths are compiled and the caches are settled, then time
 repeated runs in-process and report the distribution.
 
+## Why warmup is 100 passes
+
+Long enough to look like overkill, and it isn't. .NET promotes a method to
+tier-1 by counting its invocations, and one extraction calls most of the
+pipeline's per-document methods exactly once — so a short warmup finishes with
+much of the pipeline still in tier-0 code. Run `td9264` alone under a
+three-pass warmup and it reports 84 ms; run it after other fixtures have warmed
+the shared code and the same work reports 20 ms.
+
+Nothing in the timings marks the moment the promotions land, so a convergence
+rule — stop once five consecutive passes fail to improve — does not fix it: it
+stops at pass 12, still reading 110 ms, because tier-up is a delayed step down
+rather than a glide. Waiting on the call count does fix it. Measured on
+`td9264` alone: 84 ms under the old rule, 28 ms at 50 passes, 22 ms at 100,
+against 21 ms for a 300-pass run.
+
+The wall clock caps it at `max(2 × budget, 10 s)`, so a fixture whose single
+pass already takes seconds warms only a handful of times. Those are exactly the
+fixtures that do not need it — their time is inside loops, which on-stack
+replacement promotes without waiting for a call count. `multiline_indent_cell_rect_grid`
+reads 1649 ms at 3 warmups and 1690 ms at 100.
+
+The Rust harness runs the identical rule. It has no JIT, so the repetitions buy
+only settled caches and allocator free lists, but a protocol that differs
+between the two sides is not a comparison.
+
 The headline figure is the **median**. A shared VM stalls occasionally and the
 mean absorbs those stalls; `min` is the cleanest view of the code itself and
 `p95`/`sd` show how noisy the machine was. The C# harness also reports bytes
