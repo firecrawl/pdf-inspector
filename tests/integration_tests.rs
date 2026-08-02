@@ -3652,3 +3652,28 @@ fn pdf_options_debug_redacts_password() {
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
 }
+
+/// Regression test for #205: a scanned form where every page is one
+/// near-full-page raster image plus a real digitally-generated header and
+/// footer. Real text on every page pushes `text_ratio` to 1.0, but the
+/// pages are still scans — the fixture's incidental text has 50+ Tj ops
+/// per page, which clears the narrow single-image/<50-op
+/// `has_template_images` filter, so before the fix this misrouted straight
+/// to `TextBased` with `ocr_recommended = false` and silently dropped the
+/// scan content instead of reaching the `Mixed` classification.
+#[test]
+fn test_detect_pdf_type_scanned_form_with_real_header_footer_is_mixed() {
+    let result = detect_pdf_type("tests/fixtures/scanned_form_real_header_footer.pdf")
+        .expect("fixture should parse");
+
+    assert_eq!(
+        result.pdf_type,
+        PdfType::Mixed,
+        "a near-full-page scan on every page must not classify as TextBased just because \
+         each page also carries real incidental header/footer text"
+    );
+    assert!(
+        result.ocr_recommended,
+        "scan content must still route to OCR even though real text is present"
+    );
+}
