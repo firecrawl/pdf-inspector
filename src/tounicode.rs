@@ -886,13 +886,16 @@ fn try_remap_subset_cmap(
     // after subsetting and renumbering it corrupts otherwise-correct text.
     // CIDToGIDMap is likewise CIDFontType2-only (PDF 32000-1:2008, 9.7.4.2), so this
     // also ignores a CIDToGIDMap that a malformed producer attached to a CFF font.
-    let is_cid_font_type2 = cid_font_dict
-        .get(b"Subtype")
-        .ok()
-        .and_then(|o| o.as_name().ok())
-        .is_some_and(|n| n == b"CIDFontType2");
-    if !is_cid_font_type2 {
-        debug!("Subset remap skipped for obj={obj_num}: not a CIDFontType2 descendant");
+    // /Subtype may be an indirect reference, so resolve it through the document.
+    // Only bail out when the descendant is *explicitly* something other than
+    // CIDFontType2: a missing or unresolvable /Subtype keeps the previous
+    // behaviour rather than silently disabling the repair.
+    let subtype = cid_font_dict.get(b"Subtype").ok().and_then(|o| match o {
+        Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_name().ok()),
+        other => other.as_name().ok(),
+    });
+    if subtype.is_some_and(|name| name != b"CIDFontType2") {
+        debug!("Subset remap skipped for obj={obj_num}: descendant is not CIDFontType2");
         return (cmap, None);
     }
 
@@ -3109,7 +3112,6 @@ endbfrange
         // Build a CIDFont dict with Identity CIDToGIDMap and a W array that
         // covers CID 633 via `597 [widths...]`.
         let mut cid_font = lopdf::Dictionary::new();
-        cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType2".to_vec()));
         cid_font.set("CIDToGIDMap", lopdf::Object::Name(b"Identity".to_vec()));
         cid_font.set(
             "W",
@@ -3153,7 +3155,6 @@ endbfrange
 
         let mut doc = Document::new();
         let mut cid_font = lopdf::Dictionary::new();
-        cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType2".to_vec()));
         cid_font.set("CIDToGIDMap", lopdf::Object::Name(b"Identity".to_vec()));
         cid_font.set(
             "W",
@@ -3196,11 +3197,20 @@ endbfrange
         let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
 
         let mut doc = Document::new();
+
+        // CIDToGIDMap is CIDFontType2-only, but a malformed producer can still emit
+        // one on a CFF font. Use a real stream (not /Identity, which is treated as
+        // "no map") so this also fails if the guard is moved back below the
+        // CIDToGIDMap branch: cid 1 -> gid 0x0200, which the CMap resolves.
+        let mut cid_to_gid = vec![0u8; 68];
+        cid_to_gid[2] = 0x02;
+        cid_to_gid[3] = 0x00;
+        let cid_to_gid_id =
+            doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), cid_to_gid));
+
         let mut cid_font = lopdf::Dictionary::new();
         cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType0".to_vec()));
-        // CIDToGIDMap is CIDFontType2-only, but a malformed producer can still emit
-        // it on a CFF font. It must not be used to rewrite the CMap either.
-        cid_font.set("CIDToGIDMap", lopdf::Object::Name(b"Identity".to_vec()));
+        cid_font.set("CIDToGIDMap", lopdf::Object::Reference(cid_to_gid_id));
         cid_font.set(
             "W",
             lopdf::Object::Array(vec![
@@ -3220,9 +3230,54 @@ endbfrange
         let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 789);
         assert!(
             remapped.is_none(),
-            "Remap must be skipped for CIDFontType0 (CFF) descendants"
+            "Remap must be skipped for CIDFontType0 (CFF) descendants, including a \
+             CIDToGIDMap a malformed producer attached to one"
         );
         // The original CMap must still resolve its own CIDs.
         assert_eq!(primary.lookup(0x0200), Some("\u{0410}".to_string()));
+    }
+
+    #[test]
+    fn test_try_remap_resolves_indirect_subtype() {
+        // /Subtype may be stored as an indirect reference. A genuine CIDFontType2
+        // font must still get the repair, so the guard has to dereference it rather
+        // than treat the unresolved value as "not CIDFontType2".
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfrange
+<0200> <0220> <0410>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        let mut doc = Document::new();
+        let subtype_id = doc.add_object(lopdf::Object::Name(b"CIDFontType2".to_vec()));
+
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("Subtype", lopdf::Object::Reference(subtype_id));
+        cid_font.set("CIDToGIDMap", lopdf::Object::Name(b"Identity".to_vec()));
+        cid_font.set(
+            "W",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Array(vec![lopdf::Object::Integer(500); 34]),
+            ]),
+        );
+        let cid_font_id = doc.add_object(cid_font);
+
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set("Encoding", lopdf::Object::Name(b"Identity-H".to_vec()));
+        font_dict.set(
+            "DescendantFonts",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
+        );
+
+        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 790);
+        assert!(
+            remapped.is_some(),
+            "An indirect /Subtype naming CIDFontType2 must still reach the remap"
+        );
     }
 }
