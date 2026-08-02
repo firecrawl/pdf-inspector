@@ -1177,6 +1177,87 @@ fn test_detection_counters_on_text_pdf() {
     assert_eq!(classification.pages_with_template_images, 0);
 }
 
+/// A single page whose only content is a full-page 1000×1000 image — the
+/// shape of a scanned document. The declared dimensions exceed the 500K-pixel
+/// template threshold; the stream itself stays one byte.
+fn make_full_page_image_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+    );
+    let content = "q 612 0 0 792 0 0 cm /Im0 Do Q";
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /XObject /Subtype /Image /Width 1000 /Height 1000 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\nx\nendstream",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn test_detection_counters_on_scanned_pdf() {
+    let pdf = make_full_page_image_pdf();
+
+    let classification = pdf_inspector::classify_pdf_mem(&pdf).unwrap();
+    assert_eq!(classification.pdf_type, PdfType::Scanned);
+    assert_eq!(classification.pages_sampled, 1);
+    assert_eq!(classification.pages_with_text, 0);
+    assert_eq!(classification.pages_with_images, 1);
+    assert_eq!(classification.pages_with_template_images, 1);
+}
+
 #[test]
 fn test_firecrawl_tagged_pdf_struct_tree() {
     use lopdf::Document;

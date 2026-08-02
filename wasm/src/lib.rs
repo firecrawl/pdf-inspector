@@ -421,9 +421,19 @@ mod tests {
             .expect("pdfType")
             .as_string()
             .expect("pdfType string");
+        let get_count = |key: &str| {
+            Reflect::get(&classification, &JsValue::from_str(key))
+                .expect(key)
+                .as_f64()
+                .expect("count number")
+        };
         let text = extract_text(TEXT_PDF).expect("extract text");
 
         assert_eq!(pdf_type, "TextBased");
+        assert!(get_count("pagesSampled") >= 1.0);
+        assert!(get_count("pagesWithText") >= 1.0);
+        assert!(get_count("pagesWithImages") >= 0.0);
+        assert_eq!(get_count("pagesWithTemplateImages"), 0.0);
         assert!(!text.is_empty());
     }
 
