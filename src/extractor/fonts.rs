@@ -1078,8 +1078,7 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
         .and_then(lopdf::Object::as_stream)
         .ok()?;
     Some(
-        stream
-            .decompressed_content()
+        crate::safe_decompress::decompressed_content_capped(stream)
             .unwrap_or_else(|_| stream.content.clone()),
     )
 }

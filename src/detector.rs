@@ -758,7 +758,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
+            let content = match crate::safe_decompress::decompressed_content_capped(stream) {
                 Ok(data) => data,
                 Err(_) => stream.content.clone(),
             };
@@ -1038,7 +1038,7 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let data = match stream.decompressed_content() {
+    let data = match crate::safe_decompress::decompressed_content_capped(stream) {
         Ok(d) => d,
         Err(_) => return false,
     };
@@ -1296,8 +1296,7 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
+                    let content = crate::safe_decompress::decompressed_content_capped(stream)
                         .unwrap_or_else(|_| stream.content.clone());
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();

@@ -151,7 +151,7 @@ fn extract_form_xobject_text_inner(
     };
 
     // Decompress the content stream (fall back to raw bytes for uncompressed streams)
-    let content_data = match stream.decompressed_content() {
+    let content_data = match crate::safe_decompress::decompressed_content_capped(stream) {
         Ok(data) => data,
         Err(_) => stream.content.clone(),
     };
@@ -192,8 +192,7 @@ fn extract_form_xobject_text_inner(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data = s
-                        .decompressed_content()
+                    let data = crate::safe_decompress::decompressed_content_capped(s)
                         .unwrap_or_else(|_| s.content.clone());
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
