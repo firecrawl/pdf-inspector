@@ -34,17 +34,54 @@ pub(crate) fn is_rtl_char(c: char) -> bool {
         | '\u{07C0}'..='\u{07FF}' // NKo
         | '\u{0800}'..='\u{083F}' // Samaritan
         | '\u{0840}'..='\u{085F}' // Mandaic
+        | '\u{0870}'..='\u{089F}' // Arabic Extended-B
         | '\u{08A0}'..='\u{08FF}' // Arabic Extended-A
+        | '\u{10E60}'..='\u{10E7F}' // Rumi Numeral Symbols
+        | '\u{10EC0}'..='\u{10EFF}' // Arabic Extended-C
+        | '\u{1EC70}'..='\u{1ECBF}' // Indic Siyaq Numbers
+        | '\u{1ED00}'..='\u{1ED4F}' // Ottoman Siyaq Numbers
+        | '\u{1EE00}'..='\u{1EEFF}' // Arabic Mathematical Alphabetic Symbols
         | '\u{FB1D}'..='\u{FB4F}' // Hebrew Presentation Forms
         | '\u{FB50}'..='\u{FDFF}' // Arabic Presentation Forms-A
-        | '\u{FE70}'..='\u{FEFF}' // Arabic Presentation Forms-B
+        | '\u{FE70}'..='\u{FEFE}' // Arabic Presentation Forms-B
     )
 }
 
 fn is_arabic_presentation_form(c: char) -> bool {
-    // U+FEFF is BOM/ZWNJ, not an Arabic presentation form despite falling
-    // in the Presentation Forms-B codepoint range.
+    // U+FEFF is BOM / zero-width no-break, not an Arabic presentation form
+    // despite falling in the Presentation Forms-B codepoint range.
     matches!(c, '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFE}')
+}
+
+fn is_arabic_combining_mark(c: char) -> bool {
+    matches!(c,
+        '\u{0610}'..='\u{061A}'
+        | '\u{064B}'..='\u{065F}'
+        | '\u{0670}'
+        | '\u{06D6}'..='\u{06ED}'
+        | '\u{0898}'..='\u{089F}'
+        | '\u{08CA}'..='\u{08FF}'
+    )
+}
+
+fn is_arabic_script_char(c: char) -> bool {
+    matches!(c,
+        '\u{0600}'..='\u{06FF}' // Arabic
+        | '\u{0750}'..='\u{077F}' // Arabic Supplement
+        | '\u{0870}'..='\u{089F}' // Arabic Extended-B
+        | '\u{08A0}'..='\u{08FF}' // Arabic Extended-A
+        | '\u{10E60}'..='\u{10E7F}' // Rumi Numeral Symbols
+        | '\u{10EC0}'..='\u{10EFF}' // Arabic Extended-C
+        | '\u{1EC70}'..='\u{1ECBF}' // Indic Siyaq Numbers
+        | '\u{1ED00}'..='\u{1ED4F}' // Ottoman Siyaq Numbers
+        | '\u{1EE00}'..='\u{1EEFF}' // Arabic Mathematical Alphabetic Symbols
+        | '\u{FB50}'..='\u{FDFF}' // Arabic Presentation Forms-A
+        | '\u{FE70}'..='\u{FEFE}' // Arabic Presentation Forms-B
+    )
+}
+
+fn is_arabic_token_char(c: char) -> bool {
+    is_arabic_script_char(c) && (c.is_alphabetic() || is_arabic_combining_mark(c))
 }
 
 pub(crate) fn is_rtl_text<I, S>(texts: I) -> bool
@@ -136,7 +173,7 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
     let had_presentation_forms = text.chars().any(is_arabic_presentation_form);
 
     // Apply NFKC normalization only when Arabic presentation forms are present.
-    // This converts forms (U+FB50-FDFF, U+FE70-FEFF) back to base Arabic
+    // This converts forms (U+FB50-FDFF, U+FE70-FEFE) back to base Arabic
     // (U+0600-06FF). We avoid broad NFKC on all non-ASCII text because it
     // would convert NBSP (U+00A0) to regular space, breaking downstream logic.
     // Latin ligatures are already handled by the explicit match arms below.
@@ -174,8 +211,9 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
 
     // If the original text had Arabic presentation forms, the characters are in
     // visual (LTR screen) order. After NFKC normalization, reverse to restore
-    // logical reading order.
-    if had_presentation_forms {
+    // logical reading order. Strong base-Arabic visual-order spans are handled
+    // here; short clue-less runs are handled later with page context.
+    if had_presentation_forms || looks_like_visual_order_base_arabic(&result) {
         result = reverse_visual_arabic(&result);
     }
 
@@ -188,29 +226,27 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
 /// Mixed content (embedded numbers or Latin words) splits into LTR and non-LTR
 /// runs: run order is reversed, and only non-LTR runs are reversed internally.
 fn reverse_visual_arabic(text: &str) -> String {
-    // Check if there are any LTR runs (ASCII letters or digits)
-    let has_ltr = text.chars().any(|c| c.is_ascii_alphanumeric());
+    // Check if there are any LTR runs (Latin letters or digits). Arabic-Indic
+    // digits are weak bidi characters but their internal order should stay LTR.
+    let has_ltr = text.chars().any(is_visual_ltr_base_char);
 
     if !has_ltr {
-        // Pure RTL: simple reversal
-        return text.chars().rev().collect();
+        return reverse_rtl_run(text);
     }
 
-    // Mixed content: split into runs of LTR (ASCII alphanumeric + adjacent
+    // Mixed content: split into runs of LTR (Latin/numeric + adjacent
     // punctuation like '.', ',', '/', '-') vs non-LTR (Arabic + spaces + other).
     let chars: Vec<char> = text.chars().collect();
     let mut runs: Vec<(bool, String)> = Vec::new(); // (is_ltr, content)
 
     let mut i = 0;
     while i < chars.len() {
-        let is_ltr = chars[i].is_ascii_alphanumeric()
-            || (chars[i].is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
+        let is_ltr = is_visual_ltr_run_char(&chars, i);
 
         let mut run = String::new();
         while i < chars.len() {
             let c = chars[i];
-            let c_is_ltr = c.is_ascii_alphanumeric()
-                || (c.is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
+            let c_is_ltr = is_visual_ltr_run_char(&chars, i);
             if c_is_ltr != is_ltr {
                 break;
             }
@@ -227,16 +263,266 @@ fn reverse_visual_arabic(text: &str) -> String {
         if *is_ltr {
             result.push_str(content);
         } else {
-            result.extend(content.chars().rev());
+            result.push_str(&reverse_rtl_run(content));
         }
     }
     result
 }
 
-/// Check if the character at `idx` is adjacent to an ASCII alphanumeric character.
-fn is_adjacent_to_ascii_alnum(chars: &[char], idx: usize) -> bool {
-    (idx > 0 && chars[idx - 1].is_ascii_alphanumeric())
-        || (idx + 1 < chars.len() && chars[idx + 1].is_ascii_alphanumeric())
+fn reverse_rtl_run(text: &str) -> String {
+    let mut clusters: Vec<String> = Vec::new();
+    for c in text.chars() {
+        if is_arabic_combining_mark(c) {
+            if let Some(last) = clusters.last_mut() {
+                last.push(c);
+            } else {
+                clusters.push(c.to_string());
+            }
+        } else {
+            clusters.push(c.to_string());
+        }
+    }
+    clusters.reverse();
+    clusters.concat()
+}
+
+fn is_visual_ltr_base_char(c: char) -> bool {
+    c.is_numeric()
+        || c.is_ascii_alphabetic()
+        || (c.is_alphabetic() && !is_rtl_char(c) && !is_cjk_char(c))
+}
+
+fn is_visual_ltr_punctuation(c: char) -> bool {
+    c.is_ascii_punctuation() || matches!(c, '\u{066B}' | '\u{066C}')
+}
+
+fn is_visual_ltr_run_char(chars: &[char], idx: usize) -> bool {
+    is_visual_ltr_base_char(chars[idx])
+        || (is_visual_ltr_punctuation(chars[idx]) && is_adjacent_to_ltr_base(chars, idx))
+}
+
+fn is_adjacent_to_ltr_base(chars: &[char], idx: usize) -> bool {
+    (idx > 0 && is_visual_ltr_base_char(chars[idx - 1]))
+        || (idx + 1 < chars.len() && is_visual_ltr_base_char(chars[idx + 1]))
+}
+
+fn is_no_space_before_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '.' | ','
+            | ';'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '}'
+            | '\''
+            | '%'
+            | '\u{060C}' // Arabic comma
+            | '\u{061B}' // Arabic semicolon
+            | '\u{061F}' // Arabic question mark
+            | '\u{066A}' // Arabic percent sign
+            | '\u{066B}' // Arabic decimal separator
+            | '\u{066C}' // Arabic thousands separator
+            | '\u{06D4}' // Arabic full stop
+    )
+}
+
+pub(crate) fn normalize_visual_order_arabic_items(items: &mut [TextItem]) {
+    if !page_looks_like_visual_order_base_arabic(items) {
+        return;
+    }
+
+    for item in items.iter_mut() {
+        if !matches!(item.item_type, crate::types::ItemType::Text) {
+            continue;
+        }
+        if should_reverse_base_arabic_item_on_visual_page(&item.text) {
+            item.text = reverse_visual_arabic(&item.text);
+        }
+    }
+}
+
+fn page_looks_like_visual_order_base_arabic(items: &[TextItem]) -> bool {
+    let mut visual_score = 0u32;
+    let mut logical_score = 0u32;
+    let mut arabic_items = 0u32;
+
+    for item in items {
+        if !matches!(item.item_type, crate::types::ItemType::Text) {
+            continue;
+        }
+        let arabic_alpha = item
+            .text
+            .chars()
+            .filter(|&c| is_arabic_token_char(c))
+            .count();
+        if arabic_alpha < 2 || !is_rtl_text(std::iter::once(item.text.as_str())) {
+            continue;
+        }
+        arabic_items += 1;
+        let (visual, logical) = visual_logical_arabic_scores(&item.text);
+        visual_score += visual;
+        logical_score += logical;
+    }
+
+    arabic_items >= 3 && visual_score >= 6 && visual_score > logical_score
+}
+
+fn should_reverse_base_arabic_item_on_visual_page(text: &str) -> bool {
+    let arabic_alpha = text.chars().filter(|&c| is_arabic_token_char(c)).count();
+    if arabic_alpha < 2 || !is_rtl_text(std::iter::once(text)) {
+        return false;
+    }
+
+    let (visual_score, logical_score) = visual_logical_arabic_scores(text);
+    logical_score == 0 || visual_score > logical_score
+}
+
+fn looks_like_visual_order_base_arabic(text: &str) -> bool {
+    let arabic_alpha = text.chars().filter(|&c| is_arabic_token_char(c)).count();
+    if arabic_alpha < 4 || !is_rtl_text(std::iter::once(text)) {
+        return false;
+    }
+    let (visual_score, logical_score) = visual_logical_arabic_scores(text);
+    visual_score >= 2 && visual_score > logical_score
+}
+
+fn visual_logical_arabic_scores(text: &str) -> (u32, u32) {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if is_arabic_token_char(c) {
+            current.push(c);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    visual_logical_arabic_token_scores(tokens)
+}
+
+fn visual_logical_arabic_token_scores(tokens: Vec<String>) -> (u32, u32) {
+    let mut visual_score = 0;
+    let mut logical_score = 0;
+    for token in tokens {
+        let normalized = strip_arabic_combining_marks(&token);
+        let len = normalized.chars().count();
+        if len >= 4 {
+            if has_logical_arabic_article_prefix(&normalized) {
+                logical_score += 2;
+            }
+            if has_visual_arabic_article_suffix(&normalized) {
+                visual_score += 2;
+            }
+        }
+        if is_common_logical_arabic_token(&normalized) {
+            logical_score += 3;
+        }
+        if is_common_visual_arabic_token(&normalized) {
+            visual_score += 3;
+        }
+    }
+    (visual_score, logical_score)
+}
+
+fn has_logical_arabic_article_prefix(token: &str) -> bool {
+    [
+        "ال", "الأ", "الإ", "وال", "فالأ", "بال", "بالأ", "كال", "كالأ", "لل",
+    ]
+    .iter()
+    .any(|prefix| token.starts_with(prefix) && token.chars().count() > prefix.chars().count())
+}
+
+fn has_visual_arabic_article_suffix(token: &str) -> bool {
+    ["لا", "لأا", "لإا", "لاو", "لأاف", "لاب", "لأاب", "لاك", "لأاك"]
+        .iter()
+        .any(|suffix| token.ends_with(suffix) && token.chars().count() > suffix.chars().count())
+}
+
+fn strip_arabic_combining_marks(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !is_arabic_combining_mark(c))
+        .collect()
+}
+
+fn is_common_logical_arabic_token(token: &str) -> bool {
+    matches!(
+        token,
+        "في" | "من"
+            | "على"
+            | "إلى"
+            | "الى"
+            | "عن"
+            | "أن"
+            | "إن"
+            | "هو"
+            | "هي"
+            | "هذا"
+            | "ذلك"
+            | "الذي"
+            | "التي"
+            | "بسم"
+            | "الله"
+            | "الرحمن"
+            | "الرحيم"
+            | "الحمد"
+            | "الكتاب"
+            | "الفقه"
+            | "أصول"
+            | "اصول"
+            | "الأنوار"
+            | "الانوار"
+            | "المنار"
+            | "متن"
+    )
+}
+
+fn is_common_visual_arabic_token(token: &str) -> bool {
+    matches!(
+        token,
+        "يف" | "نم"
+            | "ىلع"
+            | "ىلإ"
+            | "ىلا"
+            | "نع"
+            | "نأ"
+            | "نإ"
+            | "وه"
+            | "يه"
+            | "اذه"
+            | "كلذ"
+            | "يذلا"
+            | "يتلا"
+            | "مسب"
+            | "للها"
+            | "هللا"
+            | "نمحرلا"
+            | "ميحرلا"
+            | "دمحلا"
+            | "باتكلا"
+            | "هقفلا"
+            | "لوصأ"
+            | "لوصا"
+            | "راونألا"
+            | "راونلأا"
+            | "راونالا"
+            | "رانملا"
+            | "نتم"
+            | "تايوتحملا"
+            | "ةلماشلا"
+            | "ةبتكملا"
+            | "فلؤملا"
+            | "ردصملا"
+            | "لولاا"
+            | "لوألا"
+            | "نياثلا"
+            | "ثلاثلا"
+            | "عبارلا"
+            | "عاونأ"
+    )
 }
 
 /// Decode a PDF text string (ActualText, etc.) that may be UTF-16BE (BOM \xFE\xFF)
@@ -558,7 +844,7 @@ pub(crate) fn should_join_items(
     // Always join if current starts with punctuation that typically follows without space
     // e.g., "www" + ".com" → "www.com", not "www .com"
     if let Some(c) = curr_first {
-        if matches!(c, '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}' | '\'') {
+        if is_no_space_before_punctuation(c) {
             return true;
         }
     }
@@ -846,6 +1132,39 @@ mod tests {
     }
 
     #[test]
+    fn no_reversal_for_logical_base_arabic_common_words() {
+        let input = "بسم الله الرحمن الرحيم";
+        let result = expand_ligatures(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn reverse_visual_order_base_arabic_common_words() {
+        let mut items = vec![
+            make_text_item("يفسنلا تاكربلا وبأ", 300.0, 120.0, 12.0),
+            make_text_item("هوجو", 250.0, 30.0, 12.0),
+            make_text_item("ةنسلاو", 200.0, 40.0, 12.0),
+        ];
+        normalize_visual_order_arabic_items(&mut items);
+        assert_eq!(items[0].text, "أبو البركات النسفي");
+        assert_eq!(items[1].text, "وجوه");
+        assert_eq!(items[2].text, "والسنة");
+    }
+
+    #[test]
+    fn reverse_visual_order_base_arabic_with_arabic_indic_digits() {
+        let mut items = vec![
+            make_text_item("٢٠٢١-٠٣-١٧ :ينمزلا عباطلا", 300.0, 180.0, 12.0),
+            make_text_item("راونألا رانم", 300.0, 90.0, 12.0),
+            make_text_item("ةلماشلا ةبتكملا", 300.0, 90.0, 12.0),
+        ];
+        normalize_visual_order_arabic_items(&mut items);
+        assert_eq!(items[0].text, "الطابع الزمني: ٢٠٢١-٠٣-١٧");
+        assert_eq!(items[1].text, "منار الأنوار");
+        assert_eq!(items[2].text, "المكتبة الشاملة");
+    }
+
+    #[test]
     fn latin_text_unaffected() {
         assert_eq!(expand_ligatures("Hello World"), "Hello World");
     }
@@ -870,6 +1189,20 @@ mod tests {
     }
 
     #[test]
+    fn reverse_visual_arabic_keeps_arabic_indic_digits() {
+        let input = "\u{0623}\u{0661}\u{0662}\u{0663}\u{0628}";
+        let result = reverse_visual_arabic(input);
+        assert_eq!(result, "\u{0628}\u{0661}\u{0662}\u{0663}\u{0623}");
+    }
+
+    #[test]
+    fn reverse_visual_arabic_preserves_diacritic_clusters() {
+        let input = "\u{0628}\u{064E}\u{0627}";
+        let result = reverse_visual_arabic(input);
+        assert_eq!(result, "\u{0627}\u{0628}\u{064E}");
+    }
+
+    #[test]
     fn arabic_presentation_form_detection() {
         // Presentation Forms-A range
         assert!(is_arabic_presentation_form('\u{FB50}'));
@@ -882,6 +1215,26 @@ mod tests {
         assert!(!is_arabic_presentation_form('\u{0645}'));
         // Latin
         assert!(!is_arabic_presentation_form('A'));
+    }
+
+    #[test]
+    fn rtl_detection_covers_modern_arabic_blocks() {
+        assert!(is_rtl_char('\u{0870}')); // Arabic Extended-B
+        assert!(is_rtl_char('\u{10EC0}')); // Arabic Extended-C
+        assert!(is_rtl_char('\u{1EE00}')); // Arabic Mathematical Alphabetic Symbols
+        assert!(!is_rtl_char('\u{FEFF}')); // BOM, not Arabic text
+    }
+
+    #[test]
+    fn joins_before_arabic_punctuation() {
+        let word = make_text_item(
+            "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}",
+            100.0,
+            40.0,
+            12.0,
+        );
+        let comma = make_text_item("\u{060C}", 143.0, 3.0, 12.0);
+        assert!(should_join_items(&word, &comma, 0.10));
     }
 
     /// Helper to create a single-char TextItem at a given x position with width.
