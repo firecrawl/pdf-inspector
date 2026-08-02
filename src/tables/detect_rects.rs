@@ -2345,11 +2345,19 @@ fn has_chart_bar_signature(
         || bar_family(|r| r.1, |r| r.3, |r| r.2, |r| r.0)
 }
 
+/// Above this many rects in a cluster, the expensive chart-signature checks
+/// become prohibitively costly on dense forms and checkbox grids.
+const MAX_CHART_CLUSTER_RECTS: usize = 300;
+
 fn is_chart_bar_cluster(
     items: &[TextItem],
     group_rects: &[(f32, f32, f32, f32)],
     page: u32,
 ) -> bool {
+    if group_rects.len() > MAX_CHART_CLUSTER_RECTS {
+        return false;
+    }
+
     let has_bar_signature = has_chart_bar_signature(items, group_rects, page);
 
     // A segmented horizontal chart can share most of its edges across rows.
@@ -5110,6 +5118,19 @@ mod tests {
             table.rows.len() <= 8,
             "table should have at most ~7 rows from group 1, got {}",
             table.rows.len()
+        );
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_bails_out_above_max_size() {
+        let oversized: Vec<(f32, f32, f32, f32)> = (0..MAX_CHART_CLUSTER_RECTS + 1)
+            .map(|i| (i as f32 * 12.0, 0.0, 10.0, 20.0))
+            .collect();
+        let items: Vec<TextItem> = Vec::new();
+
+        assert!(
+            !is_chart_bar_cluster(&items, &oversized, 1),
+            "oversized cluster must not be classified as a chart"
         );
     }
 }
