@@ -880,6 +880,22 @@ fn try_remap_subset_cmap(
         None => return (cmap, None),
     };
 
+    // Both repair paths below assume CIDs are glyph indices that a subsetter can
+    // renumber, which is only true for CIDFontType2 (TrueType). For CIDFontType0
+    // (CFF), CIDs are resolved through the CFF charset, so a valid CMap stays valid
+    // after subsetting and renumbering it corrupts otherwise-correct text.
+    // CIDToGIDMap is likewise CIDFontType2-only (PDF 32000-1:2008, 9.7.4.2), so this
+    // also ignores a CIDToGIDMap that a malformed producer attached to a CFF font.
+    let is_cid_font_type2 = cid_font_dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .is_some_and(|n| n == b"CIDFontType2");
+    if !is_cid_font_type2 {
+        debug!("Subset remap skipped for obj={obj_num}: not a CIDFontType2 descendant");
+        return (cmap, None);
+    }
+
     // If there's an explicit CIDToGIDMap, build a repaired CMap using it.
     if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
         if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
@@ -3093,6 +3109,7 @@ endbfrange
         // Build a CIDFont dict with Identity CIDToGIDMap and a W array that
         // covers CID 633 via `597 [widths...]`.
         let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType2".to_vec()));
         cid_font.set("CIDToGIDMap", lopdf::Object::Name(b"Identity".to_vec()));
         cid_font.set(
             "W",
@@ -3136,6 +3153,7 @@ endbfrange
 
         let mut doc = Document::new();
         let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType2".to_vec()));
         cid_font.set("CIDToGIDMap", lopdf::Object::Name(b"Identity".to_vec()));
         cid_font.set(
             "W",
@@ -3158,5 +3176,53 @@ endbfrange
             remapped.is_some(),
             "Remap must fire when CMap's CIDs are outside W array coverage"
         );
+    }
+
+    #[test]
+    fn test_try_remap_skipped_for_cid_font_type0() {
+        // Same W/CMap mismatch as the CIDFontType2 case above, but the descendant is
+        // CIDFontType0 (CFF). There CIDs are resolved through the CFF charset, so the
+        // ToUnicode CIDs stay valid after subsetting and must not be renumbered.
+        // Real-world case: Japanese Adobe-Japan1 PDFs (e.g. National Diet Library
+        // minutes) where remapping turned correct text into unrelated glyphs.
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfrange
+<0200> <0220> <0410>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        let mut doc = Document::new();
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType0".to_vec()));
+        // CIDToGIDMap is CIDFontType2-only, but a malformed producer can still emit
+        // it on a CFF font. It must not be used to rewrite the CMap either.
+        cid_font.set("CIDToGIDMap", lopdf::Object::Name(b"Identity".to_vec()));
+        cid_font.set(
+            "W",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(1),
+                lopdf::Object::Array(vec![lopdf::Object::Integer(500); 34]),
+            ]),
+        );
+        let cid_font_id = doc.add_object(cid_font);
+
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set("Encoding", lopdf::Object::Name(b"Identity-H".to_vec()));
+        font_dict.set(
+            "DescendantFonts",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
+        );
+
+        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 789);
+        assert!(
+            remapped.is_none(),
+            "Remap must be skipped for CIDFontType0 (CFF) descendants"
+        );
+        // The original CMap must still resolve its own CIDs.
+        assert_eq!(primary.lookup(0x0200), Some("\u{0410}".to_string()));
     }
 }
