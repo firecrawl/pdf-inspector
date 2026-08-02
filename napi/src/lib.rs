@@ -207,13 +207,22 @@ where
 // ---------------------------------------------------------------------------
 
 /// Process a PDF from a Buffer: detect type, extract text, and convert to Markdown.
+///
+/// `password` decrypts an encrypted PDF; omit it for unencrypted files.
 #[napi]
-pub fn process_pdf(buffer: Buffer, pages: Option<Vec<u32>>) -> Result<PdfResult> {
+pub fn process_pdf(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+    password: Option<String>,
+) -> Result<PdfResult> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("process_pdf", move || {
         let mut opts = pdf_inspector::PdfOptions::new();
         if let Some(p) = pages {
             opts = opts.pages(p);
+        }
+        if let Some(pw) = password {
+            opts = opts.password(pw);
         }
         let result = pdf_inspector::process_pdf_mem_with_options(&bytes, opts)
             .map_err(|e| to_napi_err(e, "process_pdf"))?;
@@ -222,12 +231,18 @@ pub fn process_pdf(buffer: Buffer, pages: Option<Vec<u32>>) -> Result<PdfResult>
 }
 
 /// Fast detection only — no text extraction or markdown.
+///
+/// `password` decrypts an encrypted PDF; omit it for unencrypted files.
 #[napi]
-pub fn detect_pdf(buffer: Buffer) -> Result<PdfResult> {
+pub fn detect_pdf(buffer: Buffer, password: Option<String>) -> Result<PdfResult> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("detect_pdf", move || {
-        let result =
-            pdf_inspector::detect_pdf_mem(&bytes).map_err(|e| to_napi_err(e, "detect_pdf"))?;
+        let mut opts = pdf_inspector::PdfOptions::detect_only();
+        if let Some(pw) = password {
+            opts = opts.password(pw);
+        }
+        let result = pdf_inspector::process_pdf_mem_with_options(&bytes, opts)
+            .map_err(|e| to_napi_err(e, "detect_pdf"))?;
         Ok(to_napi_result(result))
     })
 }
@@ -235,12 +250,15 @@ pub fn detect_pdf(buffer: Buffer) -> Result<PdfResult> {
 /// Lightweight PDF classification — returns type, page count, and OCR pages.
 /// Faster than detectPdf as it skips building the full PdfResult.
 /// Pages in pagesNeedingOcr are 0-indexed.
+///
+/// `password` decrypts an encrypted PDF; omit it for unencrypted files.
 #[napi]
-pub fn classify_pdf(buffer: Buffer) -> Result<PdfClassification> {
+pub fn classify_pdf(buffer: Buffer, password: Option<String>) -> Result<PdfClassification> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("classify_pdf", move || {
         let result =
-            pdf_inspector::classify_pdf_mem(&bytes).map_err(|e| to_napi_err(e, "classify_pdf"))?;
+            pdf_inspector::classify_pdf_mem_with_password(&bytes, password.as_deref())
+                .map_err(|e| to_napi_err(e, "classify_pdf"))?;
         Ok(PdfClassification {
             pdf_type: convert_pdf_type(result.pdf_type),
             page_count: result.page_count,

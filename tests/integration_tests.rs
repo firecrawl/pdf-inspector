@@ -3643,6 +3643,39 @@ fn encrypted_pdf_decrypts_with_correct_password() {
 }
 
 #[test]
+fn classify_pdf_mem_decrypts_with_correct_password() {
+    let bytes = std::fs::read("tests/fixtures/encrypted-secret123.pdf")
+        .expect("encrypted fixture should be readable");
+
+    // No password: classification can't get past the encryption.
+    let no_pw = pdf_inspector::classify_pdf_mem(&bytes);
+    assert!(
+        matches!(no_pw, Err(PdfError::Encrypted)),
+        "expected Encrypted without a password, got {no_pw:?}"
+    );
+
+    // Wrong password: still rejected.
+    let wrong = pdf_inspector::classify_pdf_mem_with_password(&bytes, Some("wrong"));
+    assert!(
+        matches!(wrong, Err(PdfError::Encrypted)),
+        "expected Encrypted with a wrong password, got {wrong:?}"
+    );
+
+    // Correct password: classifies the decrypted document.
+    let ok = pdf_inspector::classify_pdf_mem_with_password(&bytes, Some("secret123"))
+        .expect("correct password should decrypt");
+    assert!(
+        ok.page_count > 0,
+        "decrypted classification should see pages"
+    );
+    assert_eq!(
+        ok.pdf_type,
+        PdfType::TextBased,
+        "the fixture has a real text layer once decrypted"
+    );
+}
+
+#[test]
 fn pdf_options_debug_redacts_password() {
     let opts = PdfOptions::new().password("secret123");
     let dbg = format!("{opts:?}");
