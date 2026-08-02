@@ -27,7 +27,7 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 # Python bindings
-pyo3 = { version = "0.25", features = ["extension-module", "abi3-py38"], optional = true }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py38"], optional = true }
 
 # Error handling
 thiserror = "2.0"
