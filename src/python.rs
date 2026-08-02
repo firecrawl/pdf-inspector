@@ -40,13 +40,34 @@ impl PyDetectionConfig {
                 "the pages argument is only valid with strategy 'pages'",
             ));
         }
+        if !(0.0..=1.0).contains(&text_page_ratio_threshold) {
+            return Err(PyValueError::new_err(
+                "text_page_ratio_threshold must be between 0.0 and 1.0",
+            ));
+        }
         let strategy = match strategy {
-            "sample" => ScanStrategy::Sample(sample_pages),
+            "sample" => {
+                if sample_pages == 0 {
+                    return Err(PyValueError::new_err("sample_pages must be at least 1"));
+                }
+                ScanStrategy::Sample(sample_pages)
+            }
             "full" => ScanStrategy::Full,
             "early_exit" => ScanStrategy::EarlyExit,
-            "pages" => ScanStrategy::Pages(pages.ok_or_else(|| {
-                PyValueError::new_err("strategy 'pages' requires the pages argument")
-            })?),
+            "pages" => {
+                let pages = pages.ok_or_else(|| {
+                    PyValueError::new_err("strategy 'pages' requires the pages argument")
+                })?;
+                if pages.is_empty() {
+                    return Err(PyValueError::new_err("pages must not be empty"));
+                }
+                if pages.contains(&0) {
+                    return Err(PyValueError::new_err(
+                        "pages are 1-indexed; page 0 is invalid",
+                    ));
+                }
+                ScanStrategy::Pages(pages)
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "unknown strategy '{strategy}'; expected 'sample', 'full', 'early_exit', or 'pages'"
