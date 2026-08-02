@@ -65,6 +65,10 @@ if result.pdf_type == "text_based":
 else:
     print(f"Pages needing OCR: {result.pages_needing_ocr}")
 
+# Scan every page instead of sampling 8 (most accurate for mixed/scanned)
+config = pdf_inspector.DetectionConfig(strategy="full")
+result = pdf_inspector.detect_pdf("document.pdf", detection=config)
+
 # Plain text extraction
 text = pdf_inspector.extract_text("document.pdf")
 
@@ -86,12 +90,12 @@ result = pdf_inspector.extract_pages_markdown("document.pdf", pages=[0, 2])
 
 | Function | Description |
 |---|---|
-| `process_pdf(path, pages=None)` | Full processing (detect + extract + markdown) |
-| `process_pdf_bytes(data, pages=None)` | Full processing from bytes |
-| `detect_pdf(path)` | Fast detection only (returns PdfResult) |
-| `detect_pdf_bytes(data)` | Fast detection from bytes |
-| `classify_pdf(path)` | Lightweight classification (returns PdfClassification) |
-| `classify_pdf_bytes(data)` | Lightweight classification from bytes |
+| `process_pdf(path, pages=None, detection=None)` | Full processing (detect + extract + markdown) |
+| `process_pdf_bytes(data, pages=None, detection=None)` | Full processing from bytes |
+| `detect_pdf(path, detection=None)` | Fast detection only (returns PdfResult) |
+| `detect_pdf_bytes(data, detection=None)` | Fast detection from bytes |
+| `classify_pdf(path, detection=None)` | Lightweight classification (returns PdfClassification) |
+| `classify_pdf_bytes(data, detection=None)` | Lightweight classification from bytes |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_bytes(data)` | Plain text extraction from bytes |
 | `extract_text_with_positions(path, pages=None)` | Text with X/Y coords and font info |
@@ -124,6 +128,16 @@ class PdfClassification:             # classify_pdf
     page_count: int
     pages_needing_ocr: list[int]     # 0-indexed
     confidence: float
+
+class DetectionConfig:               # optional `detection=` argument
+    def __init__(
+        self,
+        strategy: str = "sample",            # "sample" | "full" | "early_exit" | "pages"
+        sample_pages: int = 8,               # page budget for "sample"
+        pages: list[int] | None = None,      # 1-indexed pages, only for "pages"
+        min_text_ops_per_page: int = 3,
+        text_page_ratio_threshold: float = 0.6,
+    ) -> None: ...
 
 class TextItem:                      # extract_text_with_positions
     text: str

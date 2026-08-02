@@ -2,6 +2,22 @@
 
 from typing import Optional
 
+class DetectionConfig:
+    """Configuration for PDF type detection.
+
+    strategy is 'sample' (up to sample_pages evenly distributed pages),
+    'full' (every page), 'early_exit' (stop at the first non-text page),
+    or 'pages' (only the given 1-indexed pages).
+    """
+    def __init__(
+        self,
+        strategy: str = "sample",
+        sample_pages: int = 8,
+        pages: Optional[list[int]] = None,
+        min_text_ops_per_page: int = 3,
+        text_page_ratio_threshold: float = 0.6,
+    ) -> None: ...
+
 class PdfResult:
     """Result of processing a PDF file."""
     pdf_type: str
@@ -76,27 +92,38 @@ class PagesExtractionResult:
     is_complex: bool
     """True if any page has tables or multi-column layout."""
 
-def process_pdf(path: str, pages: Optional[list[int]] = None) -> PdfResult:
+def process_pdf(
+    path: str,
+    pages: Optional[list[int]] = None,
+    detection: Optional[DetectionConfig] = None,
+) -> PdfResult:
     """Process a PDF: detect type, extract text, convert to Markdown."""
     ...
 
-def process_pdf_bytes(data: bytes, pages: Optional[list[int]] = None) -> PdfResult:
+def process_pdf_bytes(
+    data: bytes,
+    pages: Optional[list[int]] = None,
+    detection: Optional[DetectionConfig] = None,
+) -> PdfResult:
     """Process a PDF from bytes in memory."""
     ...
 
-def detect_pdf(path: str) -> PdfResult:
+def detect_pdf(path: str, detection: Optional[DetectionConfig] = None) -> PdfResult:
     """Fast detection only — no text extraction."""
     ...
 
-def detect_pdf_bytes(data: bytes) -> PdfResult:
+def detect_pdf_bytes(data: bytes, detection: Optional[DetectionConfig] = None) -> PdfResult:
     """Fast detection from bytes."""
     ...
 
-def classify_pdf(path: str) -> PdfClassification:
+def classify_pdf(path: str, detection: Optional[DetectionConfig] = None) -> PdfClassification:
     """Lightweight classification — type, page count, and OCR pages (0-indexed)."""
     ...
 
-def classify_pdf_bytes(data: bytes) -> PdfClassification:
+def classify_pdf_bytes(
+    data: bytes,
+    detection: Optional[DetectionConfig] = None,
+) -> PdfClassification:
     """Lightweight classification from bytes."""
     ...
 

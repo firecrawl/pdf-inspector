@@ -4,8 +4,77 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
-use crate::detector::PdfType;
+use crate::detector::{DetectionConfig, PdfType, ScanStrategy};
 use crate::types::ItemType;
+
+// ---------------------------------------------------------------------------
+// Detection config wrapper
+// ---------------------------------------------------------------------------
+
+/// Configuration for PDF type detection.
+#[pyclass(name = "DetectionConfig")]
+#[derive(Clone)]
+pub struct PyDetectionConfig {
+    inner: DetectionConfig,
+}
+
+#[pymethods]
+impl PyDetectionConfig {
+    #[new]
+    #[pyo3(signature = (
+        strategy="sample",
+        sample_pages=8,
+        pages=None,
+        min_text_ops_per_page=3,
+        text_page_ratio_threshold=0.6,
+    ))]
+    fn new(
+        strategy: &str,
+        sample_pages: u32,
+        pages: Option<Vec<u32>>,
+        min_text_ops_per_page: u32,
+        text_page_ratio_threshold: f32,
+    ) -> PyResult<Self> {
+        if strategy != "pages" && pages.is_some() {
+            return Err(PyValueError::new_err(
+                "the pages argument is only valid with strategy 'pages'",
+            ));
+        }
+        let strategy = match strategy {
+            "sample" => ScanStrategy::Sample(sample_pages),
+            "full" => ScanStrategy::Full,
+            "early_exit" => ScanStrategy::EarlyExit,
+            "pages" => ScanStrategy::Pages(pages.ok_or_else(|| {
+                PyValueError::new_err("strategy 'pages' requires the pages argument")
+            })?),
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown strategy '{strategy}'; expected 'sample', 'full', 'early_exit', or 'pages'"
+                )))
+            }
+        };
+        Ok(Self {
+            inner: DetectionConfig {
+                strategy,
+                min_text_ops_per_page,
+                text_page_ratio_threshold,
+            },
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        let strategy = match &self.inner.strategy {
+            ScanStrategy::EarlyExit => "early_exit".to_string(),
+            ScanStrategy::Full => "full".to_string(),
+            ScanStrategy::Sample(n) => format!("sample({n})"),
+            ScanStrategy::Pages(pages) => format!("pages({pages:?})"),
+        };
+        format!(
+            "DetectionConfig(strategy={strategy}, min_text_ops_per_page={}, text_page_ratio_threshold={})",
+            self.inner.min_text_ops_per_page, self.inner.text_page_ratio_threshold
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Result wrapper
@@ -434,41 +503,62 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
 // Public Python API
 // ---------------------------------------------------------------------------
 
-/// Process a PDF file: detect type, extract text, and convert to Markdown.
-#[pyfunction]
-#[pyo3(signature = (path, pages=None))]
-fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
+fn build_options(
+    pages: Option<Vec<u32>>,
+    detection: Option<PyDetectionConfig>,
+    base: crate::PdfOptions,
+) -> crate::PdfOptions {
+    let mut opts = base;
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
+    if let Some(d) = detection {
+        opts = opts.detection(d.inner);
+    }
+    opts
+}
+
+/// Process a PDF file: detect type, extract text, and convert to Markdown.
+#[pyfunction]
+#[pyo3(signature = (path, pages=None, detection=None))]
+fn process_pdf(
+    path: &str,
+    pages: Option<Vec<u32>>,
+    detection: Option<PyDetectionConfig>,
+) -> PyResult<PyPdfResult> {
+    let opts = build_options(pages, detection, crate::PdfOptions::new());
     let result = crate::process_pdf_with_options(path, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
 /// Process a PDF from bytes in memory.
 #[pyfunction]
-#[pyo3(signature = (data, pages=None))]
-fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
-    if let Some(p) = pages {
-        opts = opts.pages(p);
-    }
+#[pyo3(signature = (data, pages=None, detection=None))]
+fn process_pdf_bytes(
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+    detection: Option<PyDetectionConfig>,
+) -> PyResult<PyPdfResult> {
+    let opts = build_options(pages, detection, crate::PdfOptions::new());
     let result = crate::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
 /// Fast detection only — no text extraction or markdown.
 #[pyfunction]
-fn detect_pdf(path: &str) -> PyResult<PyPdfResult> {
-    let result = crate::detect_pdf(path).map_err(to_py_err)?;
+#[pyo3(signature = (path, detection=None))]
+fn detect_pdf(path: &str, detection: Option<PyDetectionConfig>) -> PyResult<PyPdfResult> {
+    let opts = build_options(None, detection, crate::PdfOptions::detect_only());
+    let result = crate::process_pdf_with_options(path, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
 /// Fast detection from bytes — no text extraction or markdown.
 #[pyfunction]
-fn detect_pdf_bytes(data: &[u8]) -> PyResult<PyPdfResult> {
-    let result = crate::detect_pdf_mem(data).map_err(to_py_err)?;
+#[pyo3(signature = (data, detection=None))]
+fn detect_pdf_bytes(data: &[u8], detection: Option<PyDetectionConfig>) -> PyResult<PyPdfResult> {
+    let opts = build_options(None, detection, crate::PdfOptions::detect_only());
+    let result = crate::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
@@ -476,16 +566,22 @@ fn detect_pdf_bytes(data: &[u8]) -> PyResult<PyPdfResult> {
 /// Faster than detect_pdf as it skips building the full PdfProcessResult.
 /// Pages in pages_needing_ocr are 0-indexed.
 #[pyfunction]
-fn classify_pdf(path: &str) -> PyResult<PyPdfClassification> {
+#[pyo3(signature = (path, detection=None))]
+fn classify_pdf(path: &str, detection: Option<PyDetectionConfig>) -> PyResult<PyPdfClassification> {
     let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    classify_pdf_bytes(&data)
+    classify_pdf_bytes(&data, detection)
 }
 
 /// Lightweight PDF classification from bytes.
 /// Pages in pages_needing_ocr are 0-indexed.
 #[pyfunction]
-fn classify_pdf_bytes(data: &[u8]) -> PyResult<PyPdfClassification> {
-    let result = crate::classify_pdf_mem(data).map_err(to_py_err)?;
+#[pyo3(signature = (data, detection=None))]
+fn classify_pdf_bytes(
+    data: &[u8],
+    detection: Option<PyDetectionConfig>,
+) -> PyResult<PyPdfClassification> {
+    let config = detection.map(|d| d.inner).unwrap_or_default();
+    let result = crate::classify_pdf_mem_with_config(data, config).map_err(to_py_err)?;
     Ok(PyPdfClassification {
         pdf_type: pdf_type_str(result.pdf_type),
         page_count: result.page_count,
@@ -616,6 +712,7 @@ fn extract_pages_markdown_bytes(
 /// Python module definition.
 #[pymodule]
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyDetectionConfig>()?;
     m.add_class::<PyPdfResult>()?;
     m.add_class::<PyPageOcrReasons>()?;
     m.add_class::<PyPdfClassification>()?;

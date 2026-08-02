@@ -1161,6 +1161,20 @@ startxref
 }
 
 #[test]
+fn test_classify_pdf_mem_with_config_full_scan() {
+    let pdf = make_minimal_text_pdf();
+
+    let config = DetectionConfig {
+        strategy: ScanStrategy::Full,
+        ..DetectionConfig::default()
+    };
+    let result = pdf_inspector::classify_pdf_mem_with_config(&pdf, config).unwrap();
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert_eq!(result.page_count, 1);
+    assert!(result.pages_needing_ocr.is_empty());
+}
+
+#[test]
 fn test_firecrawl_tagged_pdf_struct_tree() {
     use lopdf::Document;
     use pdf_inspector::structure_tree::{StructRole, StructTree};
