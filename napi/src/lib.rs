@@ -62,6 +62,15 @@ pub struct PageOcrReasons {
 pub struct PdfClassification {
     pub pdf_type: PdfType,
     pub page_count: u32,
+    /// Number of pages sampled for detection.
+    pub pages_sampled: u32,
+    /// Number of sampled pages with extractable text.
+    pub pages_with_text: u32,
+    /// Number of sampled pages containing images.
+    pub pages_with_images: u32,
+    /// Number of sampled pages that look like a scan (single full-page
+    /// template image with little real text).
+    pub pages_with_template_images: u32,
     /// 0-indexed page numbers that need OCR.
     pub pages_needing_ocr: Vec<u32>,
     pub confidence: f64,
@@ -153,9 +162,7 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
     }
 }
 
-fn to_napi_page_ocr_reasons(
-    reasons: Vec<pdf_inspector::PageOcrReasons>,
-) -> Vec<PageOcrReasons> {
+fn to_napi_page_ocr_reasons(reasons: Vec<pdf_inspector::PageOcrReasons>) -> Vec<PageOcrReasons> {
     reasons
         .into_iter()
         .map(|reason| PageOcrReasons {
@@ -244,6 +251,10 @@ pub fn classify_pdf(buffer: Buffer) -> Result<PdfClassification> {
         Ok(PdfClassification {
             pdf_type: convert_pdf_type(result.pdf_type),
             page_count: result.page_count,
+            pages_sampled: result.pages_sampled,
+            pages_with_text: result.pages_with_text,
+            pages_with_images: result.pages_with_images,
+            pages_with_template_images: result.pages_with_template_images,
             pages_needing_ocr: result.pages_needing_ocr,
             confidence: result.confidence as f64,
         })

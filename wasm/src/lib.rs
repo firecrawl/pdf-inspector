@@ -54,6 +54,14 @@ export interface PdfProcessResult {
 export interface PdfClassification {
   pdfType: PdfType;
   pageCount: number;
+  /** Number of pages sampled for detection. */
+  pagesSampled: number;
+  /** Number of sampled pages with extractable text. */
+  pagesWithText: number;
+  /** Number of sampled pages containing images. */
+  pagesWithImages: number;
+  /** Number of sampled pages that look like a scan (single full-page template image with little real text). */
+  pagesWithTemplateImages: number;
   /** 0-indexed page numbers, matching the native Node.js API. */
   pagesNeedingOcr: number[];
   confidence: number;
@@ -158,6 +166,10 @@ impl From<PdfProcessResult> for WasmPdfProcessResult {
 struct WasmPdfClassification {
     pdf_type: &'static str,
     page_count: u32,
+    pages_sampled: u32,
+    pages_with_text: u32,
+    pages_with_images: u32,
+    pages_with_template_images: u32,
     pages_needing_ocr: Vec<u32>,
     confidence: f64,
 }
@@ -259,6 +271,10 @@ pub fn classify_pdf(data: &[u8]) -> Result<JsValue, JsValue> {
     serialize(&WasmPdfClassification {
         pdf_type: pdf_type_name(result.pdf_type),
         page_count: result.page_count,
+        pages_sampled: result.pages_sampled,
+        pages_with_text: result.pages_with_text,
+        pages_with_images: result.pages_with_images,
+        pages_with_template_images: result.pages_with_template_images,
         pages_needing_ocr: result.pages_needing_ocr,
         confidence: result.confidence as f64,
     })

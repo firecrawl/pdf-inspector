@@ -89,6 +89,10 @@ for (const region of result[0].regions) {
 interface PdfClassification {
   pdfType: string          // "TextBased" | "Scanned" | "Mixed" | "ImageBased"
   pageCount: number
+  pagesSampled: number      // pages sampled for detection
+  pagesWithText: number     // sampled pages with extractable text
+  pagesWithImages: number   // sampled pages containing images
+  pagesWithTemplateImages: number // sampled pages that look like a scan
   pagesNeedingOcr: number[] // 0-indexed page numbers
   confidence: number        // 0.0 - 1.0
 }

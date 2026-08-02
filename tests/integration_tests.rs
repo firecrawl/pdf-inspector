@@ -1101,6 +1101,8 @@ fn test_pages_needing_ocr_field_accessible() {
         page_count: 1,
         pages_sampled: 1,
         pages_with_text: 1,
+        pages_with_images: 0,
+        pages_with_template_images: 0,
         confidence: 1.0,
         title: None,
         ocr_recommended: false,
@@ -1158,6 +1160,21 @@ startxref
             result.pages_needing_ocr
         );
     }
+}
+
+#[test]
+fn test_detection_counters_on_text_pdf() {
+    let pdf = make_minimal_text_pdf();
+
+    let detection = pdf_inspector::detect_pdf_type_mem(&pdf).unwrap();
+    assert_eq!(detection.pages_with_images, 0);
+    assert_eq!(detection.pages_with_template_images, 0);
+
+    let classification = pdf_inspector::classify_pdf_mem(&pdf).unwrap();
+    assert_eq!(classification.pages_sampled, 1);
+    assert_eq!(classification.pages_with_text, 1);
+    assert_eq!(classification.pages_with_images, 0);
+    assert_eq!(classification.pages_with_template_images, 0);
 }
 
 #[test]

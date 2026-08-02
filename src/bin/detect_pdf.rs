@@ -223,11 +223,13 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                     .collect();
                 let ocr_reasons = format_detector_ocr_reasons(&result.ocr_reasons_by_page);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},"title":{},"ocr_recommended":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"detection_time_ms":{}}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"pages_with_images":{},"pages_with_template_images":{},"confidence":{:.2},"title":{},"ocr_recommended":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"detection_time_ms":{}}}"#,
                     pdf_type_str(&result.pdf_type),
                     result.page_count,
                     result.pages_sampled,
                     result.pages_with_text,
+                    result.pages_with_images,
+                    result.pages_with_template_images,
                     result.confidence,
                     result
                         .title
@@ -258,6 +260,11 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                 println!("Page count: {}", result.page_count);
                 println!("Pages sampled: {}", result.pages_sampled);
                 println!("Pages with text: {}", result.pages_with_text);
+                println!("Pages with images: {}", result.pages_with_images);
+                println!(
+                    "Pages with template images: {}",
+                    result.pages_with_template_images
+                );
                 println!(
                     "OCR recommended: {}",
                     if result.ocr_recommended { "YES" } else { "NO" }

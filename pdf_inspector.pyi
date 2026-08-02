@@ -22,6 +22,15 @@ class PdfClassification:
     pdf_type: str
     """'text_based', 'scanned', 'image_based', or 'mixed'."""
     page_count: int
+    pages_sampled: int
+    """Number of pages sampled for detection."""
+    pages_with_text: int
+    """Number of sampled pages with extractable text."""
+    pages_with_images: int
+    """Number of sampled pages containing images."""
+    pages_with_template_images: int
+    """Number of sampled pages that look like a scan (single full-page
+    template image with little real text)."""
     pages_needing_ocr: list[int]
     """0-indexed page numbers that need OCR."""
     confidence: float
