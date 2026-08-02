@@ -209,8 +209,7 @@ pub(crate) fn extract_page_text_items(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data = crate::safe_decompress::decompressed_content_capped(s)
-                        .unwrap_or_else(|_| s.content.clone());
+                    let data = crate::safe_decompress::decompressed_or_raw(s);
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                     {

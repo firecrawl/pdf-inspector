@@ -40,9 +40,11 @@ regex = "1.10"
 once_cell = "1.19"
 unicode-normalization = "0.1"
 
-# Bounded FlateDecode re-implementation (see src/safe_decompress.rs) — caps
+# Bounded Flate/LZW re-implementation (see src/safe_decompress.rs) — caps
 # decompression-bomb streams that lopdf's own decoder inflates unbounded.
+# weezl version pinned to match lopdf's own transitive dependency.
 flate2 = "1.0"
+weezl = "0.1.12"
 
 # TrueType font parsing (for Identity-H CID font cmap extraction)
 ttf-parser = "0.25"

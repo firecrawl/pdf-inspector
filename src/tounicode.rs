@@ -2049,10 +2049,7 @@ impl FontCMaps {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let data = match crate::safe_decompress::decompressed_content_capped(stream) {
-                Ok(d) => d,
-                Err(_) => stream.content.clone(),
-            };
+            let data = crate::safe_decompress::decompressed_or_raw(stream);
             if let Some(cmap) = ToUnicodeCMap::parse(&data) {
                 debug!(
                     "CMap obj={:<6} code_byte_length={} char_map={} ranges={}",
@@ -2218,10 +2215,7 @@ impl FontCMaps {
             // Try parsing embedded TrueType/OpenType cmap
             if let Some(ff_ref) = font_file_ref {
                 if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                    let data = match crate::safe_decompress::decompressed_content_capped(stream) {
-                        Ok(d) => d,
-                        Err(_) => stream.content.clone(),
-                    };
+                    let data = crate::safe_decompress::decompressed_or_raw(stream);
                     if let Some(cmap) = build_cmap_from_truetype(&data) {
                         debug!(
                             "TrueType CMap obj={:<6} (embedded font) char_map={}",
