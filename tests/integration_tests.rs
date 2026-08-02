@@ -2939,6 +2939,28 @@ fn test_extract_pages_markdown_out_of_range() {
     assert!(result.pages_needing_ocr.contains(&10000)); // 1-indexed
 }
 
+/// Issue #202: a page carrying one unmappable glyph must still return its
+/// text. The fixture is ~700 characters of Helvetica prose plus a single CID
+/// drawn from an Identity-H font with no ToUnicode CMap, which extracts as one
+/// U+FFFD — the shape a word processor emits when the body font lacks a glyph.
+///
+/// Before the fix this page came back as `markdown: ""` with
+/// `ocr_reason: "suspected_garbled_text"`, while `process_pdf` kept the same
+/// content on the same file.
+#[test]
+fn test_extract_pages_markdown_keeps_page_with_isolated_replacement_char() {
+    let buf = std::fs::read("tests/fixtures/isolated_replacement_char.pdf").unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
+
+    let page = &result.pages[0];
+    assert_eq!(page.markdown.matches('\u{FFFD}').count(), 1);
+    assert!(page.markdown.contains("Section 4"));
+    assert!(page.markdown.contains("Rinse the funnel"));
+    assert!(!page.needs_ocr);
+    assert_eq!(page.ocr_reason, None);
+    assert!(result.pages_needing_ocr.is_empty());
+}
+
 #[test]
 fn test_extract_pages_markdown_empty_pages_list() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
