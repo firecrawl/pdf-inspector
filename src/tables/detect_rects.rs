@@ -2346,8 +2346,10 @@ fn has_chart_bar_signature(
 }
 
 /// Above this many rects in a cluster, the expensive chart-signature checks
-/// become prohibitively costly on dense forms and checkbox grids.
-const MAX_CHART_CLUSTER_RECTS: usize = 300;
+/// become prohibitively costly on dense forms and checkbox grids. The cap
+/// leaves headroom for large multi-series charts while keeping pathological
+/// clusters well below their observed size.
+const MAX_CHART_CLUSTER_RECTS: usize = 500;
 
 fn is_chart_bar_cluster(
     items: &[TextItem],
