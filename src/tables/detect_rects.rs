@@ -5123,12 +5123,50 @@ mod tests {
         );
     }
 
+    /// Builds `n` vertical bars shaped to satisfy every check in
+    /// `bar_family` (spaced apart past the touching-gap threshold, strictly
+    /// increasing heights so no two bars pair up within tolerance, and one
+    /// numeric data-label item per bar) — a genuinely chart-like cluster,
+    /// not just "many rects". Used to prove the oversized-cluster bailout
+    /// test actually exercises the bailout, rather than incidentally
+    /// passing for an unrelated reason (touching rects, degenerate
+    /// geometry, or `numeric_or_empty` vacuously passing on no items).
+    #[allow(clippy::type_complexity)]
+    fn chart_shaped_cluster(n: usize) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+        let bw = 10.0;
+        let mut rects = Vec::with_capacity(n);
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = i as f32 * (bw * 2.0); // gap = bw, well past the bw*0.5 touching threshold
+            let height = 20.0 + i as f32 * 5.0; // strictly increasing: no two bars match within tolerance 3
+            rects.push((x, 0.0, bw, height));
+            items.push(make_item("5", x + 1.0, 5.0, 6.0)); // numeric data label inside the bar
+        }
+        (items, rects)
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_detects_genuine_chart_below_cap() {
+        // Sanity check that `chart_shaped_cluster` actually produces a
+        // chart-shaped cluster per `bar_family`'s own rules, at a size well
+        // under MAX_CHART_CLUSTER_RECTS — establishes that the `false`
+        // result in the oversized test below can only come from the size
+        // bailout, not from this shape failing on its own merits.
+        let (items, rects) = chart_shaped_cluster(10);
+        assert!(
+            is_chart_bar_cluster(&items, &rects, 1),
+            "a spaced, varied-height, labeled bar cluster should be chart-like"
+        );
+    }
+
     #[test]
     fn is_chart_bar_cluster_bails_out_above_max_size() {
-        let oversized: Vec<(f32, f32, f32, f32)> = (0..MAX_CHART_CLUSTER_RECTS + 1)
-            .map(|i| (i as f32 * 12.0, 0.0, 10.0, 20.0))
-            .collect();
-        let items: Vec<TextItem> = Vec::new();
+        // A cluster larger than MAX_CHART_CLUSTER_RECTS must short-circuit
+        // before running the expensive chart checks. This uses the same
+        // genuinely chart-shaped geometry the sibling test proves succeeds
+        // below the cap, so the false result specifically exercises the
+        // size bailout.
+        let (items, oversized) = chart_shaped_cluster(MAX_CHART_CLUSTER_RECTS + 1);
 
         assert!(
             !is_chart_bar_cluster(&items, &oversized, 1),

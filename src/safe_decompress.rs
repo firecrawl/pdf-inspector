@@ -80,7 +80,7 @@ pub(crate) fn decompressed_content_capped(stream: &Stream) -> Result<Vec<u8>, De
         data = match filter {
             b"FlateDecode" => bounded_zlib_with_predictor(&data, params)?,
             b"LZWDecode" => bounded_lzw_with_predictor(&data, params)?,
-            b"ASCII85Decode" => decode_ascii85(&data),
+            b"ASCII85Decode" => decode_ascii85(&data)?,
             _ => {
                 return Err(DecompressError::failed(
                     "unimplemented decompression algorithm",
@@ -277,7 +277,23 @@ fn bounded_lzw_with_predictor(
 /// unbounded `decompressed_content`. Decoding can only shrink data (5 ASCII
 /// chars -> 4 bytes, or the `z` shorthand for 4 zero bytes), so no cap is
 /// needed here — output is always <= input length.
-fn decode_ascii85(input: &[u8]) -> Vec<u8> {
+/// Decodes one base-85 group into a big-endian u32, via checked arithmetic.
+/// Valid ASCII85 groups always encode a value that fits (they come from
+/// encoding a real `u32`), but 85^5 - 1 exceeds `u32::MAX`, so a malformed or
+/// corrupted stream can present a 5-digit group with no valid decoding. That
+/// must surface as an error rather than a wrapped/garbage value: silently
+/// returning wrong bytes here means the caller unknowingly parses noise
+/// instead of taking the `Failed` fallback path like every other malformed
+/// stream in this module.
+fn decode_ascii85_group(group: &[u8]) -> Result<u32, DecompressError> {
+    group.iter().try_fold(0u32, |acc, &d| {
+        acc.checked_mul(85)
+            .and_then(|v| v.checked_add(d as u32))
+            .ok_or_else(|| DecompressError::failed("ASCII85 group overflows u32"))
+    })
+}
+
+fn decode_ascii85(input: &[u8]) -> Result<Vec<u8>, DecompressError> {
     let mut out = Vec::with_capacity(input.len());
     let mut group = [0u8; 5];
     let mut group_len = 0usize;
@@ -299,9 +315,7 @@ fn decode_ascii85(input: &[u8]) -> Vec<u8> {
         group[group_len] = byte - b'!';
         group_len += 1;
         if group_len == 5 {
-            let value = group
-                .iter()
-                .fold(0u32, |acc, &d| acc.wrapping_mul(85).wrapping_add(d as u32));
+            let value = decode_ascii85_group(&group)?;
             out.extend_from_slice(&value.to_be_bytes());
             group_len = 0;
         }
@@ -311,14 +325,12 @@ fn decode_ascii85(input: &[u8]) -> Vec<u8> {
         for slot in group.iter_mut().take(5).skip(group_len) {
             *slot = 84; // pad with 'u' - 33, matching the spec's padding value
         }
-        let value = group
-            .iter()
-            .fold(0u32, |acc, &d| acc.wrapping_mul(85).wrapping_add(d as u32));
+        let value = decode_ascii85_group(&group)?;
         let bytes = value.to_be_bytes();
         out.extend_from_slice(&bytes[..group_len - 1]);
     }
 
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -430,6 +442,22 @@ mod tests {
             assert_ok(decompressed_content_capped(&stream)),
             vec![0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn rejects_ascii85_group_overflowing_u32() {
+        // "uuuuu" is the maximum possible 5-digit group (all digits = 84),
+        // which decodes to 85^5 - 1 = 4_437_053_124 — past u32::MAX. A real
+        // encoder never emits this; it only appears in malformed/corrupted
+        // input, which must take the `Failed` path (not silently wrap into
+        // an arbitrary decoded value).
+        let mut dict = Dictionary::new();
+        dict.set("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+        let stream = Stream::new(dict, b"uuuuu~>".to_vec());
+        assert!(matches!(
+            decompressed_content_capped(&stream),
+            Err(DecompressError::Failed(_))
+        ));
     }
 
     #[test]
