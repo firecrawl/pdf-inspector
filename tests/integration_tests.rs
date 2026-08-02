@@ -3677,3 +3677,26 @@ fn test_detect_pdf_type_scanned_form_with_real_header_footer_is_mixed() {
         "scan content must still route to OCR even though real text is present"
     );
 }
+
+/// Boundary regression for the #205 fix's own review: a document where
+/// exactly half of the text pages carry a near-full-page image and half
+/// are plain text with no image at all. `has_template_image` is the broad
+/// per-page "has a large image" flag, not a scan-specific one, so a
+/// legitimate report with some image-heavy pages and some plain pages must
+/// not flip to Mixed at an exact 50/50 split — only a real majority should.
+#[test]
+fn test_detect_pdf_type_half_pages_with_large_image_stays_text_based() {
+    let result = detect_pdf_type("tests/fixtures/half_pages_with_large_image.pdf")
+        .expect("fixture should parse");
+
+    assert_eq!(
+        result.pdf_type,
+        PdfType::TextBased,
+        "an exact 50/50 split of image-bearing vs. plain text pages is not \
+         \"most\" pages, so this must stay TextBased, not flip to Mixed"
+    );
+    assert!(
+        !result.ocr_recommended,
+        "should not be routed to OCR just because half its pages have an incidental large image"
+    );
+}

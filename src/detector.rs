@@ -312,9 +312,18 @@ pub(crate) fn detect_from_document(
     // flags the narrow scan-with-OCR-overlay shape (single image,
     // text_operator_count < 50, low alphanumeric diversity), so it misses
     // scans whose incidental real text (a digitally-generated header or
-    // footer) clears that bound. When most "text" pages are actually
+    // footer) clears that bound. When *most* "text" pages are actually
     // near-full-page scans, the text_ratio short-circuit below must not
     // fire — see #205.
+    //
+    // `has_template_image` here is the broad per-page "has a large image"
+    // flag, not the narrow scan-with-overlay filter — a legitimate text
+    // document can incidentally have large images (a diagram, a cover
+    // photo) on some pages without being a scan. The gate below is
+    // deliberately a strict majority (`> 0.5`, not `>= 0.5`): an exact
+    // 50/50 split isn't "most" pages, so it stays TextBased. Only a real
+    // majority of text pages doubling as near-full-page images routes to
+    // Mixed.
     let template_overlap_in_text_pages = if pages_with_text > 0 {
         pages_with_text_and_template_image as f32 / pages_with_text as f32
     } else {
@@ -331,7 +340,8 @@ pub(crate) fn detect_from_document(
         ocr_recommended = true;
         // Template-based PDF: has text but images provide essential context
         (PdfType::Mixed, 0.5 + (0.3 * (1.0 - template_ratio)))
-    } else if text_ratio >= config.text_page_ratio_threshold && template_overlap_in_text_pages < 0.5
+    } else if text_ratio >= config.text_page_ratio_threshold
+        && template_overlap_in_text_pages <= 0.5
     {
         ocr_recommended = false;
         (PdfType::TextBased, text_ratio)
