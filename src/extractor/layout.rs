@@ -1237,9 +1237,59 @@ fn group_into_lines_with_thresholds_and_regions_impl(
     // Markdown output omits standalone numeric headers/footers. Plain-text
     // callers opt out because dropping extracted text violates that API.
     let items = if filter_page_numbers {
+        // `is_page_number` only looks at one item's own text/position — it
+        // can't tell a lone footer digit from a short numeric item that
+        // happens to sit inline next to other text (a subscript/
+        // superscript that failed to merge into its parent, positioned
+        // near the top/bottom margin: a title-line formula, an exponent,
+        // a footnote reference). Only drop a page-number candidate when
+        // it's actually isolated — no *tightly adjacent* neighbor on the
+        // same line.
+        //
+        // The neighbor check requires near-touching X proximity, not just
+        // shared Y: a real page number commonly shares its footer row with
+        // an unrelated element (a marketing tagline, a document title) at
+        // ordinary word-gap distance, and that must still be dropped. A
+        // subscript/superscript that failed to merge into its parent sits
+        // right against it (near-zero gap) — that's the actual signal to
+        // protect, not "anything else on the page at a similar height".
+        let mut items_by_page: HashMap<u32, Vec<&TextItem>> = HashMap::new();
+        for item in &items {
+            items_by_page.entry(item.page).or_default().push(item);
+        }
+        let y_tol = 5.0;
+        let drop: Vec<bool> = items
+            .iter()
+            .map(|item| {
+                if !is_page_number(item) {
+                    return false;
+                }
+                let page_items = items_by_page
+                    .get(&item.page)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                !page_items.iter().any(|other| {
+                    if std::ptr::eq(*other, item)
+                        || other.text.trim().is_empty()
+                        || (other.y - item.y).abs() >= y_tol
+                    {
+                        return false;
+                    }
+                    let gap = if item.x <= other.x {
+                        other.x - (item.x + item.width.max(0.0))
+                    } else {
+                        item.x - (other.x + other.width.max(0.0))
+                    };
+                    let max_font_size = item.font_size.max(other.font_size);
+                    gap < max_font_size * 1.5 && gap > -max_font_size
+                })
+            })
+            .collect();
         items
             .into_iter()
-            .filter(|item| !is_page_number(item))
+            .zip(drop)
+            .filter(|(_, drop)| !*drop)
+            .map(|(item, _)| item)
             .collect()
     } else {
         items

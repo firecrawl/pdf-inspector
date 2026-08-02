@@ -3652,3 +3652,40 @@ fn pdf_options_debug_redacts_password() {
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
 }
+/// Regression for a silent-drop bug: `is_page_number` flags any 1-4-digit
+/// item near the top/bottom margin (y > 720 or y < 100) with no check for
+/// whether it's actually isolated. A subscript/superscript digit that
+/// failed to merge into its parent word (font-size mismatch breaks
+/// `merge_text_items`'s run) and happens to sit near a page's top margin —
+/// common for a title, header, or an equation/formula early on the page —
+/// was being swept up by that filter and vanishing from markdown output
+/// entirely, not even as a bare digit. Here: the "2" in "H2O".
+#[test]
+fn test_inline_subscript_near_margin_is_not_dropped_as_page_number() {
+    let buf = std::fs::read("tests/fixtures/inline_subscript_near_margin.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("H2O") || md.contains("H₂O"),
+        "subscript '2' in H2O must survive markdown conversion, got: {md:?}"
+    );
+}
+
+/// Sibling to the test above, guarding the fix's precision: a page number
+/// genuinely alone on its footer line (nothing tightly adjacent to it —
+/// only distant, unrelated body text sharing the general page height) must
+/// still be filtered out of markdown output, same as before the fix.
+#[test]
+fn test_isolated_page_number_footer_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/isolated_page_number_footer.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("body of the document"),
+        "real body text must survive, got: {md:?}"
+    );
+    assert!(
+        !md.split_whitespace().any(|w| w == "42"),
+        "a lone footer page number must still be filtered, got: {md:?}"
+    );
+}
