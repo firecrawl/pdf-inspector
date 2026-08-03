@@ -1243,16 +1243,28 @@ fn group_into_lines_with_thresholds_and_regions_impl(
         // superscript that failed to merge into its parent, positioned
         // near the top/bottom margin: a title-line formula, an exponent,
         // a footnote reference). Only drop a page-number candidate when
-        // it's actually isolated — no *tightly adjacent* neighbor on the
-        // same line.
+        // it's actually isolated — no *tightly adjacent* real-text
+        // neighbor on the same line.
         //
-        // The neighbor check requires near-touching X proximity, not just
-        // shared Y: a real page number commonly shares its footer row with
-        // an unrelated element (a marketing tagline, a document title) at
-        // ordinary word-gap distance, and that must still be dropped. A
-        // subscript/superscript that failed to merge into its parent sits
-        // right against it (near-zero gap) — that's the actual signal to
-        // protect, not "anything else on the page at a similar height".
+        // Two guards on what counts as a protecting neighbor, both found
+        // by review on the first pass:
+        //
+        // - Gap must be tight — 0.25x font_size, just above
+        //   `merge_subscript_items`'s own 0.2x merge-gap tolerance (see
+        //   below) so a subscript/superscript that just barely misses that
+        //   merge (still catches other decline reasons: a parent ending in
+        //   a digit, a strikeout/underline mismatch) is still protected
+        //   here — not just "less than a page-scale gap". A wider cutoff
+        //   would treat ordinary word-spacing (~0.28x font_size for a space
+        //   character in a typical proportional font) as protection,
+        //   letting real footer numbers next to unrelated text (a tagline,
+        //   a running title) at normal word-gap distance survive.
+        // - The neighbor must not itself be page-number-shaped. Otherwise
+        //   a multi-digit page number rendered as separate single-digit
+        //   Tj operators (a real PDF-generator pattern) would have each
+        //   digit "protect" its sibling — every digit sees a page-number-
+        //   like neighbor and none of them get dropped, leaking the whole
+        //   number into markdown.
         let mut items_by_page: HashMap<u32, Vec<&TextItem>> = HashMap::new();
         for item in &items {
             items_by_page.entry(item.page).or_default().push(item);
@@ -1271,6 +1283,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                 !page_items.iter().any(|other| {
                     if std::ptr::eq(*other, item)
                         || other.text.trim().is_empty()
+                        || is_page_number(other)
                         || (other.y - item.y).abs() >= y_tol
                     {
                         return false;
@@ -1281,7 +1294,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                         item.x - (other.x + other.width.max(0.0))
                     };
                     let max_font_size = item.font_size.max(other.font_size);
-                    gap < max_font_size * 1.5 && gap > -max_font_size
+                    gap < max_font_size * 0.25 && gap > -max_font_size
                 })
             })
             .collect();

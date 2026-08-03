@@ -3689,3 +3689,47 @@ fn test_isolated_page_number_footer_is_still_dropped() {
         "a lone footer page number must still be filtered, got: {md:?}"
     );
 }
+
+/// Guards against a real regression caught by review: a multi-digit page
+/// number rendered as separate single-digit `Tj` operators (a real
+/// PDF-generator pattern) must not have each digit "protect" its sibling
+/// just because the sibling is also short digits sitting nearby — that
+/// would leak the whole number into markdown. The neighbor check excludes
+/// other page-number-shaped items from counting as a protector.
+#[test]
+fn test_split_digit_page_number_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/split_digit_page_number_footer.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("body of the document"),
+        "real body text must survive, got: {md:?}"
+    );
+    assert!(
+        !md.contains('1') && !md.contains('2'),
+        "a page number split across two adjacent Tj digits must still be filtered, got: {md:?}"
+    );
+}
+
+/// Guards against the other real regression caught by review: the
+/// adjacency threshold must be tight enough to reject ordinary word-gap
+/// spacing, not just "less than a page-scale gap". A page number sitting
+/// next to unrelated text (a company name, a running title) at normal
+/// word-gap distance — not a subscript's near-zero gap — must still be
+/// filtered, even when it survives as its own item (different font size
+/// blocks `merge_text_items` from fusing it into the neighboring text).
+#[test]
+fn test_word_adjacent_page_number_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/word_adjacent_page_number_footer.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Company Name"),
+        "the real neighboring text must survive, got: {md:?}"
+    );
+    assert!(
+        !md.split_whitespace().any(|w| w == "12"),
+        "a page number at ordinary word-gap distance from unrelated text \
+         must still be filtered, got: {md:?}"
+    );
+}
