@@ -1659,7 +1659,15 @@ fn hex_val(b: u8) -> Option<u8> {
 /// Standard page: 612x792 points (US Letter) = ~485,000 sq points
 /// At 2x resolution that's ~1.9M pixels, so we use 250K pixels as threshold
 /// (accounting for varying DPI and page sizes)
-fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
+/// Returns `(has_images, total_image_area, has_template_image)` for a page.
+/// `has_template_image` means a single large (>50% page coverage)
+/// background image — the signal `classify_pdf`/`detect_pdf_type` uses to
+/// route a page to OCR regardless of any incidental native text drawn over
+/// it. Exposed at crate visibility so extraction-side per-page `needs_ocr`
+/// computation (`extract_pages_markdown_mem`) can consult the same signal
+/// instead of maintaining its own, independent notion of "needs OCR" that
+/// can silently disagree with detection — see #227.
+pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
     // Threshold: image covering roughly half a page at 150+ DPI
     // 612 * 792 / 2 * (150/72)^2 ≈ 1M pixels, but we'll be conservative
     const TEMPLATE_IMAGE_THRESHOLD: u64 = 500_000; // 500K pixels

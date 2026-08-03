@@ -486,6 +486,7 @@ pub fn extract_pages_markdown_mem(
     let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
+    let lopdf_pages = doc.get_pages();
 
     for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
@@ -518,6 +519,18 @@ pub fn extract_pages_markdown_mem(
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
 
+        // A page can extract cleanly (no decoding issues, non-empty text)
+        // while still being fundamentally a scan: a full-page raster with
+        // a little genuine native text drawn over it (a header, a stamp, a
+        // cover-sheet annotation). Text-quality signals alone can't see
+        // that — consult the same "large background image" signal
+        // classify_pdf/detect_pdf_type already uses, so the two APIs can't
+        // silently disagree on whether a page needs OCR. See #227.
+        let has_template_image = lopdf_pages
+            .get(&page_1idx)
+            .map(|&page_id| detector::analyze_page_images(&doc, page_id).2)
+            .unwrap_or(false);
+
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
             base_font_size: Some(font_stats.most_common_size),
@@ -549,10 +562,16 @@ pub fn extract_pages_markdown_mem(
                 OCR_REASON_SUSPECTED_GARBLED_TEXT,
             );
         }
+        if has_template_image {
+            add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_SCANNED);
+        }
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 
-        let needs_ocr =
-            ocr_reason.is_some() || md.trim().is_empty() || has_gid || is_garbage_text(&md);
+        let needs_ocr = ocr_reason.is_some()
+            || md.trim().is_empty()
+            || has_gid
+            || is_garbage_text(&md)
+            || has_template_image;
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);

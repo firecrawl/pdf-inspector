@@ -3652,3 +3652,37 @@ fn pdf_options_debug_redacts_password() {
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
 }
+
+/// Regression for #227: `extract_pages_markdown`'s per-page `needs_ocr`
+/// must agree with `classify_pdf`/`detect_pdf_type` on the same page. The
+/// fixture is a full-page raster "scan" with a single line of genuine
+/// native text drawn over it (a header) — the native text extracts
+/// perfectly cleanly (no decoding issues, non-empty), so a needs_ocr
+/// computation based on text-quality signals alone says `false`, while
+/// detection correctly sees a dominant background image and says the page
+/// needs OCR. Both must now agree it needs OCR, and the markdown must not
+/// be returned as if the extraction were trustworthy.
+#[test]
+fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header() {
+    let buf = std::fs::read("tests/fixtures/scan_with_native_header_text.pdf").unwrap();
+
+    let cls = pdf_inspector::detector::detect_pdf_type_mem(&buf).expect("fixture should classify");
+    assert!(
+        cls.pages_needing_ocr.contains(&1),
+        "classify_pdf should flag page 1 as needing OCR (image-dominated), got: {:?}",
+        cls.pages_needing_ocr
+    );
+
+    let ext = extract_pages_markdown_mem(&buf, None).expect("fixture should extract");
+    let page = &ext.pages[0];
+    assert!(
+        page.needs_ocr,
+        "extract_pages_markdown must agree with classify_pdf that this page needs OCR"
+    );
+    assert!(
+        page.markdown.is_empty(),
+        "a page flagged needs_ocr must not return markdown as if extraction were \
+         trustworthy, got: {:?}",
+        page.markdown
+    );
+}
