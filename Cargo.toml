@@ -29,6 +29,9 @@ crate-type = ["lib", "cdylib"]
 # Python bindings
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py38"], optional = true }
 
+# Swift Bindings
+uniffi = { version = "0.32.0", features = [ "cli" ], optional = true}
+
 # Error handling
 thiserror = "2.0"
 
@@ -56,12 +59,16 @@ env_logger = "0.11"
 lopdf = { version = "0.42.0", default-features = false, features = ["wasm_js"] }
 include_dir = "0.7"
 
+[build-dependencies]
+uniffi = { version = "0.32.0", features = [ "build" ] }
+
 [dev-dependencies]
 tempfile = "3.3"
 
 [features]
 default = []
 python = ["pyo3"]
+uniffi = ["dep:uniffi"]
 
 [[bin]]
 name = "pdf2md"
@@ -74,3 +81,8 @@ path = "src/bin/detect_pdf.rs"
 [[bin]]
 name = "dump_ops"
 path = "src/bin/dump_ops.rs"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["uniffi"]
