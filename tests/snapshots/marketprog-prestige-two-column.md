@@ -24,13 +24,7 @@ Nincs ilyen eszköz a portfólióban **Lejárat szerinti megoszlás:**
 
 ## ----- Benchmark
 
-A múltbeli hozamoknem jelentenekgaranciát az alap jövőbeli teljesítményére nézve. Jelen hirdetésnem minősül ajánlattételnek vagy befektetési tanácsadásnak. A befektetés részletes feltételeit az Alap
-
-|minősül|ajánlattételnek vagy|befektetési|tanácsadásnak.|A befektetés részletes feltételeit|||az Alap|
-|---|---|---|---|---|---|---|---|
-|Tájékoztatója forgalmazási helyeken. A befektetési alap forgalmazásával (vétel, tartás, eladás) kapcsolatos költségek az alap kezelési szabályzatában ésa forgalmazási helyeken megismerhetők.|tartalmazza,|mely a mindenkor|érvényes|kondíciós|listákkal|együtt megtalálható|a|
-
-Tájékoztatója tartalmazza, mely a mindenkor érvényes kondíciós listákkal együtt megtalálható a
+A múltbeli hozamoknem jelentenekgaranciát az alap jövőbeli teljesítményére nézve. Jelen hirdetésnem minősül ajánlattételnek vagy befektetési tanácsadásnak. A befektetés részletes feltételeit az Alap Tájékoztatója tartalmazza, mely a mindenkor érvényes kondíciós listákkal együtt megtalálható a forgalmazási helyeken. A befektetési alap forgalmazásával (vétel, tartás, eladás) kapcsolatos költségek az <u>alap kezelési szabályzatában ésa forgalmazási helyeken megismerhetők.</u>
 
 **KOCKÁZATI MUTATÓK AZ ELMÚLT 12 HÓNAPRA:** Az alap heti hozamokból számolt évesített szórása: 4,77 % A benchmark heti hozamokból számolt évesített szórása: 0,04 % **BEFEKTETÉSI HORIZONT:** A javasolt minimális befektetési idő:
 

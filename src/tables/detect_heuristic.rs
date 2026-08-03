@@ -688,7 +688,6 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         columns.len(),
         item_indices.len()
     );
-
     Some(Table::new(columns, rows, cells, item_indices))
 }
 
@@ -1357,6 +1356,36 @@ fn is_paragraph_content(cells: &[Vec<String>]) -> bool {
         return true;
     }
     if long_ratio > 0.3 {
+        return true;
+    }
+
+    // Justified paragraph text chopped across many columns. A near-full row
+    // (fills most columns) whose cells are mostly mid-sentence fragments —
+    // starting lowercase, including multi-word cells — is a wrapped prose line,
+    // not a table row. Two or more such rows means paragraph text. Real table
+    // rows are numeric or capitalized labels and seldom fill every column with
+    // lowercase word-runs, so this stays clear of legitimate wide text tables
+    // (category lists, program descriptions), whose cells are short labels.
+    let prose_rows = cells
+        .iter()
+        .filter(|row| {
+            let row_filled: Vec<&str> = row
+                .iter()
+                .map(|c| c.trim())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if row_filled.len() < 4 || row_filled.len() < num_cols.saturating_sub(2) {
+                return false;
+            }
+            let lowercase_start = row_filled
+                .iter()
+                .filter(|c| c.chars().next().is_some_and(char::is_lowercase))
+                .count();
+            let has_multiword = row_filled.iter().any(|c| c.split_whitespace().count() >= 3);
+            lowercase_start * 5 >= row_filled.len() * 3 && has_multiword
+        })
+        .count();
+    if prose_rows >= 2 {
         return true;
     }
 
@@ -2166,5 +2195,50 @@ mod tests {
             vec!["Section D".into(), "TBD".into()],
         ];
         assert!(!is_page_number_toc(&cells));
+    }
+
+    fn row(cells: &[&str]) -> Vec<String> {
+        cells.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn justified_prose_split_across_columns_is_paragraph() {
+        // A disclaimer paragraph chopped into 8 near-full rows of lowercase
+        // mid-sentence fragments must be recognized as prose, not a table.
+        let cells = vec![
+            row(&[
+                "minősül",
+                "ajánlattételnek vagy",
+                "befektetési",
+                "tanácsadásnak.",
+                "A befektetés részletes feltételeit",
+                "",
+                "",
+                "az Alap",
+            ]),
+            row(&[
+                "Tájékoztatója",
+                "tartalmazza,",
+                "mely a mindenkor",
+                "érvényes",
+                "kondíciós",
+                "listákkal",
+                "együtt megtalálható",
+                "a",
+            ]),
+        ];
+        assert!(is_paragraph_content(&cells));
+    }
+
+    #[test]
+    fn numeric_stats_table_is_not_paragraph() {
+        // A real table with numeric cells must NOT be flagged as prose — its
+        // rows are short numeric values, not lowercase word-runs.
+        let cells = vec![
+            row(&["", "6 hó", "1 év", "3 év"]),
+            row(&["Az Alap szórása", "3,76%", "4,62%", "3,77%"]),
+            row(&["Az Alap Sharpe mutatója", "-0,02", "0,64", "1,05"]),
+        ];
+        assert!(!is_paragraph_content(&cells));
     }
 }
