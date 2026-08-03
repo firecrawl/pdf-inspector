@@ -3588,7 +3588,13 @@ fn looks_like_xref_subsection_header(buf: &[u8], pos: usize) -> bool {
     if sep == after_first_digits {
         return false; // start-id and count must be whitespace-separated
     }
-    skip_digits(buf, sep) > sep // has a count
+    let after_count = skip_digits(buf, sep);
+    if after_count == sep {
+        return false; // no count
+    }
+    // The count run must end at whitespace/buffer-end, not run into trailing
+    // garbage (e.g. a coincidental "xref\n0 6garbage" in stream content).
+    buf.get(after_count).is_none_or(u8::is_ascii_whitespace)
 }
 
 fn add_repair_candidate(
@@ -6900,6 +6906,16 @@ mod tests {
         // token there (not preceded by whitespace) — must not match, even
         // though a number immediately follows it.
         let buf = b"startxref\n1234\n%%EOF";
+        assert_eq!(find_last_valid_xref_table_start(buf), None);
+    }
+
+    #[test]
+    fn find_xref_rejects_count_run_with_trailing_garbage() {
+        // "xref\n0 6garbage" has the right shape (digits, whitespace,
+        // digits) but the count run doesn't end at whitespace/EOF — it
+        // runs straight into non-digit garbage, so this must not be
+        // accepted as a real subsection header.
+        let buf = b"xref\n0 6garbage\n%%EOF";
         assert_eq!(find_last_valid_xref_table_start(buf), None);
     }
 
