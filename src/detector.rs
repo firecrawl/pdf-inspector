@@ -1759,12 +1759,17 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
 ///    low alphanumeric diversity in raw string operands (unless decodable
 ///    CID/ToUnicode fonts explain that away) — the gate used for
 ///    `pages_with_template_images` and Mixed-type per-page routing.
-/// 2. Insufficient real text volume (text_operator_count < 10, mirroring
-///    the `effective_min_ops` floor `pages_with_text` requires for
-///    image-bearing pages) — the signal that routes a page with a
-///    dominant background image and only a couple of native text calls
-///    (e.g. a scanned form's stamped header) to `PdfType::ImageBased`,
-///    independent of `looks_like_scan`'s alphanumeric-diversity check.
+/// 2. Insufficient real text volume, using `DetectionConfig::default()`'s
+///    `min_text_ops_per_page` (3) — the same threshold Mixed-type per-page
+///    routing applies via `text_operator_count < config.min_text_ops_per_page
+///    && has_images` (simplified here since a template image implies
+///    `has_images`). Deliberately *not* the higher `effective_min_ops`
+///    floor (`min_text_ops_per_page.max(10)`) that whole-document
+///    `PdfType::ImageBased`/`Scanned` classification uses for
+///    `pages_with_text` — that's a cross-page aggregate decision this
+///    per-page function has no way to replicate exactly, and the lower
+///    per-page threshold is the one a single page's own signals can
+///    actually agree with.
 ///
 /// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
 /// the same gate `has_template_image` needs elsewhere instead of treating
@@ -1778,8 +1783,22 @@ pub(crate) fn page_template_image_needs_ocr(doc: &Document, page_id: ObjectId) -
         && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
     let looks_like_scan =
         analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
-    let insufficient_text = analysis.text_operator_count < 10;
+    let insufficient_text =
+        analysis.text_operator_count < DetectionConfig::default().min_text_ops_per_page;
     looks_like_scan || insufficient_text
+}
+
+/// True when a page has vector-outlined text (glyphs drawn as paths rather
+/// than shown via text-showing operators) — massive path-op counts with
+/// minimal real text operators. `detect_from_document`'s Mixed-type
+/// per-page routing always sends these pages to OCR
+/// (`analysis.has_vector_text`, independent of any template-image check),
+/// since outlined glyphs can't be extracted as text at all.
+///
+/// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
+/// the same signal — see #231.
+pub(crate) fn page_has_vector_text(doc: &Document, page_id: ObjectId) -> bool {
+    analyze_page_content(doc, page_id).has_vector_text
 }
 
 /// Recursively collect image dimensions from XObject resources,

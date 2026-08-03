@@ -3669,6 +3669,38 @@ fn test_extract_pages_markdown_does_not_ocr_text_page_with_watermark_image() {
     );
 }
 
+/// Regression for the #231 review finding: `extract_pages_markdown` never
+/// checked `has_vector_text` at all, even though `detect_from_document`'s
+/// Mixed-type per-page routing always sends vector-outlined-text pages to
+/// OCR (outlined glyphs can't be extracted as text). A page with massive
+/// path ops (outlined decorative text) plus a short genuine caption would
+/// extract that caption cleanly — non-empty, non-garbled — so the
+/// existing empty/garbage-text checks alone couldn't catch it.
+#[test]
+fn test_extract_pages_markdown_ocrs_page_with_vector_outlined_text() {
+    let buf = std::fs::read("tests/fixtures/vector_outlined_text_with_caption.pdf").unwrap();
+
+    let cls = pdf_inspector::detector::detect_pdf_type_mem(&buf).expect("fixture should classify");
+    assert!(
+        cls.pages_needing_ocr.contains(&1),
+        "classify_pdf should flag page 1 as needing OCR (vector-outlined text), got: {:?}",
+        cls.pages_needing_ocr
+    );
+
+    let ext = extract_pages_markdown_mem(&buf, None).expect("fixture should extract");
+    let page = &ext.pages[0];
+    assert!(
+        page.needs_ocr,
+        "extract_pages_markdown must agree with classify_pdf that this page needs OCR"
+    );
+    assert!(
+        page.markdown.is_empty(),
+        "a page flagged needs_ocr must not return markdown as if extraction were \
+         trustworthy, got: {:?}",
+        page.markdown
+    );
+}
+
 #[test]
 fn pdf_options_debug_redacts_password() {
     let opts = PdfOptions::new().password("secret123");

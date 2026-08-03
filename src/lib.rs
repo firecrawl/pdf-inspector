@@ -531,6 +531,17 @@ pub fn extract_pages_markdown_mem(
             .map(|&page_id| detector::page_template_image_needs_ocr(&doc, page_id))
             .unwrap_or(false);
 
+        // Vector-outlined text (glyphs drawn as paths, not shown via a
+        // text-showing operator) can't be extracted as text at all — a
+        // hybrid page with real embedded-font body text elsewhere would
+        // otherwise still extract non-empty, non-garbled markdown and miss
+        // OCR routing entirely. detect_from_document's Mixed-type per-page
+        // routing always sends these pages to OCR; mirror that here too.
+        let has_vector_text = lopdf_pages
+            .get(&page_1idx)
+            .map(|&page_id| detector::page_has_vector_text(&doc, page_id))
+            .unwrap_or(false);
+
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
             base_font_size: Some(font_stats.most_common_size),
@@ -565,13 +576,17 @@ pub fn extract_pages_markdown_mem(
         if has_template_image {
             add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_SCANNED);
         }
+        if has_vector_text {
+            add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_VECTOR_TEXT);
+        }
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 
         let needs_ocr = ocr_reason.is_some()
             || md.trim().is_empty()
             || has_gid
             || is_garbage_text(&md)
-            || has_template_image;
+            || has_template_image
+            || has_vector_text;
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
