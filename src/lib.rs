@@ -526,21 +526,17 @@ pub fn extract_pages_markdown_mem(
         // that — consult the same "large background image" signal
         // classify_pdf/detect_pdf_type already uses, so the two APIs can't
         // silently disagree on whether a page needs OCR. See #227.
-        let has_template_image = lopdf_pages
+        // Also covers vector-outlined text (glyphs drawn as paths, not
+        // shown via a text-showing operator): a hybrid page with real
+        // embedded-font body text elsewhere would otherwise still extract
+        // non-empty, non-garbled markdown and miss OCR routing entirely.
+        // detect_from_document's Mixed-type per-page routing always sends
+        // these pages to OCR; mirror that here too. Both signals share one
+        // analyze_page_content pass — see page_ocr_signals's doc comment.
+        let (has_template_image, has_vector_text) = lopdf_pages
             .get(&page_1idx)
-            .map(|&page_id| detector::page_template_image_needs_ocr(&doc, page_id))
-            .unwrap_or(false);
-
-        // Vector-outlined text (glyphs drawn as paths, not shown via a
-        // text-showing operator) can't be extracted as text at all — a
-        // hybrid page with real embedded-font body text elsewhere would
-        // otherwise still extract non-empty, non-garbled markdown and miss
-        // OCR routing entirely. detect_from_document's Mixed-type per-page
-        // routing always sends these pages to OCR; mirror that here too.
-        let has_vector_text = lopdf_pages
-            .get(&page_1idx)
-            .map(|&page_id| detector::page_has_vector_text(&doc, page_id))
-            .unwrap_or(false);
+            .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
+            .unwrap_or((false, false));
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
