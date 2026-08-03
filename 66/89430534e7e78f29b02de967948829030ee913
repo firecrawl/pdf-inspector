@@ -1,0 +1,27 @@
+src/tables/detect_heuristic.rs
+  s_12ce94366af290::t_e0a72349b327e3 288
+  s_12ce94366af290::t_79ccc0aa74ddba 301
+  s_12ce94366af290::t_b82e0f797d2905 176-181,192,229,287,289-291,1788,1797,1807,1818,1827
+src/extractor/base14.rs
+  s_12ce94366af290::t_6ee440ea81187b 22-23
+  s_12ce94366af290::t_e4831365e77ea9 18-21,24-25,52
+src/markdown/preprocess.rs
+  s_12ce94366af290::t_89ccfec4b1ec72 215-218,220-221,229-233
+  s_12ce94366af290::t_1ba073e36c1e21 237-247
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6689430534e7e78f29b02de967948829030ee913",
+  "prompts": {},
+  "sessions": {
+    "s_12ce94366af290": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e7e6d727-0ee7-4dc7-982d-31fba9d7e842",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
