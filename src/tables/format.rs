@@ -314,7 +314,6 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
                     && c.chars().all(|ch| {
                         ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
                     })
-                    && c.chars().any(|ch| ch.is_ascii_digit())
             })
             .count();
         let looks_like_data_row = non_first_cells.len() >= 2
@@ -676,6 +675,57 @@ mod tests {
         assert_eq!(cleaned[2][5], "$482,110.40");
         assert_eq!(cleaned[3][5], "$0.00");
         assert_eq!(cleaned[4][5], "$31,905.22");
+    }
+
+    #[test]
+    fn test_clean_table_cells_dash_and_ellipsis_placeholders_still_count_as_numeric() {
+        // Dash/ellipsis placeholders ("----", "...") in numeric-shaped
+        // columns (common for "not applicable"/zero in financial and
+        // statistical tables) must still count as numeric-shaped cells,
+        // same as before the #229 currency fix — the fix only needed to
+        // strip a leading currency symbol, not require a digit be present.
+        // Same row layout as the currency test (IC-1048 at column index 2)
+        // to avoid the unrelated looks_like_hierarchical_subrow heuristic.
+        let cells = vec![
+            vec![
+                "Order Date".into(),
+                "Suffix".into(),
+                "Item Code".into(),
+                "Description".into(),
+                "Status".into(),
+                "Unit Cost".into(),
+                "Freight".into(),
+                "Tax".into(),
+                "Total Billed".into(),
+            ],
+            vec![
+                "03/14/2024".into(),
+                "".into(),
+                "IC-1048".into(),
+                "".into(),
+                "Shipped".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+            vec![
+                "".into(),
+                "".into(),
+                "IC-1048".into(),
+                "WIDGET ASSEMBLY".into(),
+                "Shipped".into(),
+                "----".into(),
+                "...".into(),
+                "$0.00".into(),
+                "$482,110.40".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        // Header + group-header row + 1 distinct detail row, none merged.
+        assert_eq!(cleaned.len(), 3);
+        assert_eq!(cleaned[2][5], "----");
+        assert_eq!(cleaned[2][6], "...");
     }
 
     #[test]
