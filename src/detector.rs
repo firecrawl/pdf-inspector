@@ -1749,6 +1749,39 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
     (has_images, total_area, has_template_image)
 }
 
+/// True when a page's template image should be treated as a scan needing
+/// OCR — a single full-page background image with little/no real text —
+/// rather than a text page that happens to carry a watermark, letterhead,
+/// or figure. Mirrors the two distinct signals classification uses to
+/// route a template-image page to OCR:
+///
+/// 1. `looks_like_scan`: image_count <= 1, few text operators (<50), and
+///    low alphanumeric diversity in raw string operands (unless decodable
+///    CID/ToUnicode fonts explain that away) — the gate used for
+///    `pages_with_template_images` and Mixed-type per-page routing.
+/// 2. Insufficient real text volume (text_operator_count < 10, mirroring
+///    the `effective_min_ops` floor `pages_with_text` requires for
+///    image-bearing pages) — the signal that routes a page with a
+///    dominant background image and only a couple of native text calls
+///    (e.g. a scanned form's stamped header) to `PdfType::ImageBased`,
+///    independent of `looks_like_scan`'s alphanumeric-diversity check.
+///
+/// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
+/// the same gate `has_template_image` needs elsewhere instead of treating
+/// the raw signal alone as sufficient — see #227/#231.
+pub(crate) fn page_template_image_needs_ocr(doc: &Document, page_id: ObjectId) -> bool {
+    let analysis = analyze_page_content(doc, page_id);
+    if !analysis.has_template_image {
+        return false;
+    }
+    let alphanum_low = analysis.unique_alphanum_chars < 10
+        && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
+    let looks_like_scan =
+        analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
+    let insufficient_text = analysis.text_operator_count < 10;
+    looks_like_scan || insufficient_text
+}
+
 /// Recursively collect image dimensions from XObject resources,
 /// including images nested inside Form XObjects.
 fn collect_images_from_resources(

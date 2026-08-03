@@ -528,7 +528,7 @@ pub fn extract_pages_markdown_mem(
         // silently disagree on whether a page needs OCR. See #227.
         let has_template_image = lopdf_pages
             .get(&page_1idx)
-            .map(|&page_id| detector::analyze_page_images(&doc, page_id).2)
+            .map(|&page_id| detector::page_template_image_needs_ocr(&doc, page_id))
             .unwrap_or(false);
 
         // Build markdown with document-wide font stats

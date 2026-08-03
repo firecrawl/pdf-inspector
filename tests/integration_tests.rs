@@ -3642,6 +3642,33 @@ fn encrypted_pdf_decrypts_with_correct_password() {
     );
 }
 
+/// Regression for the #231 review finding: `extract_pages_markdown`'s
+/// `has_template_image` check must be gated the same way
+/// `classify_pdf`/`detect_pdf_type` gates it (image_count <= 1, few text
+/// ops, low alphanumeric diversity) — not treated as sufficient on its
+/// own. The fixture is a real text page with substantial, richly varied
+/// body text (>=50 Tj ops) drawn over a full-bleed background image
+/// (e.g. letterhead/watermark). Before the fix, has_template_image alone
+/// forced needs_ocr=true and discarded the page's clean markdown; now the
+/// page must extract normally.
+#[test]
+fn test_extract_pages_markdown_does_not_ocr_text_page_with_watermark_image() {
+    let buf = std::fs::read("tests/fixtures/text_page_with_watermark_image.pdf").unwrap();
+
+    let ext = extract_pages_markdown_mem(&buf, None).expect("fixture should extract");
+    let page = &ext.pages[0];
+    assert!(
+        !page.needs_ocr,
+        "a text page with substantial real text should not be routed to OCR \
+         just because it has a background image"
+    );
+    assert!(
+        page.markdown.contains("watermark"),
+        "expected the page's real body text to be preserved, got: {:?}",
+        page.markdown
+    );
+}
+
 #[test]
 fn pdf_options_debug_redacts_password() {
     let opts = PdfOptions::new().password("secret123");
