@@ -1238,39 +1238,38 @@ fn group_into_lines_with_thresholds_and_regions_impl(
     // callers opt out because dropping extracted text violates that API.
     let items = if filter_page_numbers {
         // `is_page_number` only looks at one item's own text/position — it
-        // can't tell a lone footer digit from a short numeric item that's
-        // really part of real content near the margin: a subscript/
-        // superscript that failed to merge into its parent, or a form/
-        // version number embedded in a title line ("Form 4070 Employee's
-        // Report"). Only drop a page-number candidate when it's actually
-        // isolated. Two independent ways a neighbor can prove it isn't:
+        // can't tell a lone footer digit from a short numeric item that
+        // happens to sit inline next to other text: a subscript/
+        // superscript that failed to merge into its parent (font-size
+        // mismatch breaks `merge_text_items`'s run) and happens to land
+        // near the top/bottom margin — a title-line formula, an exponent,
+        // a footnote reference. Only drop a page-number candidate when
+        // it's actually isolated — no tightly adjacent real-text neighbor
+        // on the same line.
         //
-        // - Tight X-adjacency: gap < 0.25x font_size, just above
-        //   `merge_subscript_items`'s own 0.2x merge-gap tolerance, so a
-        //   subscript/superscript that just barely misses that merge for a
-        //   structural (non-gap) reason — a parent ending in a digit
-        //   rather than a letter, a strikeout/underline mismatch — is
-        //   still protected. Deliberately tighter than ordinary word-gap
-        //   spacing (~0.28x font_size for a space character in a typical
-        //   proportional font): a wider cutoff would treat normal spacing
-        //   as protection, letting real footer numbers next to unrelated
-        //   text (a tagline, a running title) at word-gap distance survive
-        //   uncaught.
-        // - Line membership: at least two *other* real-text items share
-        //   this Y — a genuine multi-word title/sentence line, distinct
-        //   from a footer row that pairs a page number with at most one
-        //   other decorative element (a tagline, a company name). A title
-        //   number's gap to its neighbors can be wider than word-spacing
-        //   (visual size emphasis widens it), so this check doesn't rely
-        //   on gap size at all — only on there being real surrounding
-        //   prose, which a bare footer never has.
+        // Deliberately scoped to *tight* X-adjacency only (gap < 0.25x
+        // font_size, just above `merge_subscript_items`'s own 0.2x
+        // merge-gap tolerance — close enough that a subscript/superscript
+        // which just barely misses that merge for a structural, non-gap
+        // reason is still protected here). An earlier version of this fix
+        // also protected any candidate sharing its line with >=2 other
+        // real-text items, aiming to recover numbers embedded in title
+        // lines at wider, stylistically-emphasized gaps (e.g. a form
+        // number in "Form 4070 Employee's Report"). That was reverted:
+        // building a synthetic 3-column footer ("Acme Corporation | 12 |
+        // Annual Report 2026") to regression-test it found its column-stop
+        // gaps (~107-131pt) overlap the exact range a real title-line gap
+        // needs to be protected — no contiguity threshold separates the
+        // two cases reliably. Recovering stylistically-spaced title
+        // numbers would need a different signal (column-layout awareness,
+        // sentence-level semantics) than adjacency; out of scope here.
         //
-        // Both checks share one more guard: a protecting neighbor must not
-        // itself be page-number-shaped. Otherwise a multi-digit page
-        // number rendered as separate single-digit Tj operators (a real
-        // PDF-generator pattern) would have each digit "protect" its
-        // sibling — every digit sees a page-number-like neighbor and none
-        // of them get dropped, leaking the whole number into markdown.
+        // The neighbor must also not itself be page-number-shaped.
+        // Otherwise a multi-digit page number rendered as separate
+        // single-digit Tj operators (a real PDF-generator pattern) would
+        // have each digit "protect" its sibling — every digit sees a
+        // page-number-like neighbor and none of them get dropped, leaking
+        // the whole number into markdown.
         let mut items_by_page: HashMap<u32, Vec<&TextItem>> = HashMap::new();
         for item in &items {
             items_by_page.entry(item.page).or_default().push(item);
@@ -1286,19 +1285,14 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                     .get(&item.page)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                let real_line_neighbors: Vec<&&TextItem> = page_items
-                    .iter()
-                    .filter(|other| {
-                        !std::ptr::eq(**other, item)
-                            && !other.text.trim().is_empty()
-                            && !is_page_number(other)
-                            && (other.y - item.y).abs() < y_tol
-                    })
-                    .collect();
-                if real_line_neighbors.len() >= 2 {
-                    return false; // a real multi-word line — not a footer
-                }
-                !real_line_neighbors.iter().any(|other| {
+                !page_items.iter().any(|other| {
+                    if std::ptr::eq(*other, item)
+                        || other.text.trim().is_empty()
+                        || is_page_number(other)
+                        || (other.y - item.y).abs() >= y_tol
+                    {
+                        return false;
+                    }
                     let gap = if item.x <= other.x {
                         other.x - (item.x + item.width.max(0.0))
                     } else {

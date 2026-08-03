@@ -3736,23 +3736,27 @@ fn test_word_adjacent_page_number_is_still_dropped() {
     );
 }
 
-/// Guards the fix's other real-content-recovery case, flagged by review: a
-/// form/version number embedded in a genuine multi-word title line (this
-/// fixture mirrors tests/fixtures/p1244-1996.pdf's real "Form 4070
-/// Employee's Report" line) must survive, even though its individual gaps
-/// to its neighbors are wider than the tight subscript-adjacency bound —
-/// visual size emphasis on the number widens the gap beyond ordinary
-/// word-spacing too. What distinguishes this from a footer number next to
-/// a single decorative element (a tagline, a company name) is that here
-/// there are *two* other real-text neighbors on the line, forming an
-/// actual sentence.
+/// Regression for a false positive an earlier version of this fix
+/// introduced (a "protect if the line has >=2 real neighbors" rule, since
+/// reverted — see the comment above the filter in layout.rs): a 3-column
+/// footer (a left label, a centered page number, a right label — a real,
+/// common layout) must still have its page number filtered, even though it
+/// technically has two other real-text items sharing its Y. What
+/// distinguishes this from a genuine title/sentence line is the column-stop
+/// spacing between elements; there's no adjacency-only signal (gap size or
+/// line-membership) that reliably tells the two apart, which is why the
+/// fix stays scoped to tight X-adjacency only.
 #[test]
-fn test_title_embedded_number_is_not_dropped() {
-    let buf = std::fs::read("tests/fixtures/title_embedded_number.pdf").unwrap();
+fn test_three_column_footer_page_number_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/three_column_footer.pdf").unwrap();
     let result = process_pdf_mem(&buf).expect("fixture should process");
     let md = result.markdown.unwrap_or_default();
     assert!(
-        md.contains("4070"),
-        "a form number embedded in a real title line must survive, got: {md:?}"
+        md.contains("Acme Corporation") && md.contains("Annual Report"),
+        "the real neighboring labels must survive, got: {md:?}"
+    );
+    assert!(
+        !md.split_whitespace().any(|w| w == "12"),
+        "a page number in a 3-column footer must still be filtered, got: {md:?}"
     );
 }

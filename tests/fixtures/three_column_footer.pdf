@@ -9,13 +9,14 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
 endobj
 4 0 obj
-<< /Length 209 >>
+<< /Length 179 >>
 stream
 BT
-/F1 7 Tf 1 0 0 1 72.0 751 Tm (Form) Tj
-/F1 10 Tf 1 0 0 1 90.861 751 Tm (4070) Tj
-/F1 12 Tf 1 0 0 1 116.715 750 Tm (Employee Report) Tj
-/F1 12 Tf 1 0 0 1 72 700 Tm (This document explains the process.) Tj
+/F1 12 Tf
+1 0 0 1 72 400 Tm (This is the body of the document.) Tj
+1 0 0 1 72 50 Tm (Acme Corporation) Tj
+1 0 0 1 300 50 Tm (12) Tj
+1 0 0 1 420 50 Tm (Annual Report 2026) Tj
 ET
 endstream
 endobj
@@ -29,9 +30,9 @@ xref
 0000000058 00000 n 
 0000000115 00000 n 
 0000000241 00000 n 
-0000000501 00000 n 
+0000000471 00000 n 
 trailer
 << /Size 6 /Root 1 0 R >>
 startxref
-1017
+987
 %%EOF
