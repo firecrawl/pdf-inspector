@@ -1264,12 +1264,20 @@ fn group_into_lines_with_thresholds_and_regions_impl(
         // numbers would need a different signal (column-layout awareness,
         // sentence-level semantics) than adjacency; out of scope here.
         //
-        // The neighbor must also not itself be page-number-shaped.
-        // Otherwise a multi-digit page number rendered as separate
-        // single-digit Tj operators (a real PDF-generator pattern) would
-        // have each digit "protect" its sibling — every digit sees a
-        // page-number-like neighbor and none of them get dropped, leaking
-        // the whole number into markdown.
+        // Two more guards on what counts as a protecting neighbor:
+        //
+        // - It must contain at least one alphanumeric character — not just
+        //   be non-empty. Decorative flanking glyphs ("• 12 •", "- 12 -")
+        //   are real, non-empty TextItems sitting tightly adjacent to a
+        //   footer number, but they aren't *content*; protecting the
+        //   number because a bullet happens to sit next to it would leak
+        //   exactly the footer pattern this filter exists to catch.
+        // - It must not itself be page-number-shaped. Otherwise a
+        //   multi-digit page number rendered as separate single-digit Tj
+        //   operators (a real PDF-generator pattern) would have each digit
+        //   "protect" its sibling — every digit sees a page-number-like
+        //   neighbor and none of them get dropped, leaking the whole
+        //   number into markdown.
         let mut items_by_page: HashMap<u32, Vec<&TextItem>> = HashMap::new();
         for item in &items {
             items_by_page.entry(item.page).or_default().push(item);
@@ -1287,7 +1295,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                     .unwrap_or(&[]);
                 !page_items.iter().any(|other| {
                     if std::ptr::eq(*other, item)
-                        || other.text.trim().is_empty()
+                        || !other.text.chars().any(|c| c.is_alphanumeric())
                         || is_page_number(other)
                         || (other.y - item.y).abs() >= y_tol
                     {

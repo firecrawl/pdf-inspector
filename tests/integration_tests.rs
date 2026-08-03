@@ -3760,3 +3760,25 @@ fn test_three_column_footer_page_number_is_still_dropped() {
         "a page number in a 3-column footer must still be filtered, got: {md:?}"
     );
 }
+
+/// Regression for another false positive caught by review: decorative
+/// glyphs flanking a footer page number ("• 12 •", in a different font
+/// size so they survive `merge_text_items` as separate items) are real,
+/// non-empty, tightly-adjacent TextItems — but they aren't *content*.
+/// Protecting the number because a bullet sits next to it would leak
+/// exactly the footer pattern this filter exists to catch. Protecting
+/// neighbors must contain at least one alphanumeric character.
+#[test]
+fn test_decorative_flanked_page_number_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/decorative_flanked_page_number.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("body of the document"),
+        "real body text must survive, got: {md:?}"
+    );
+    assert!(
+        !md.split_whitespace().any(|w| w == "12"),
+        "a page number flanked only by decorative glyphs must still be filtered, got: {md:?}"
+    );
+}
