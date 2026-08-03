@@ -24,7 +24,7 @@ jobs:
       changed: ${{ steps.check.outputs.changed }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
 
@@ -61,31 +61,61 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # napi-cross builds gnu targets against an old glibc sysroot for
+          # broad distro compatibility; musl targets cross-compile with
+          # zig via cargo-zigbuild (napi's -x flag).
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build-flags: --use-napi-cross
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build-flags: -x
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build-flags: -x
           - os: macos-14
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
+      - name: Install zig
+        if: contains(matrix.target, 'musl')
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: contains(matrix.target, 'musl')
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-zigbuild
+
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
+            ~/.napi-rs
             napi/target/
-          key: ${{ runner.os }}-cargo-napi-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}-cargo-napi-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-napi-
+            ${{ matrix.target }}-cargo-napi-
 
       - name: Install dependencies
         working-directory: napi
@@ -93,10 +123,10 @@ jobs:
 
       - name: Build native addon
         working-directory: napi
-        run: bunx napi build --platform --release
+        run: bunx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.build-flags }}
 
       - name: Upload native binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bindings-${{ matrix.target }}
           path: napi/*.node
@@ -104,7 +134,7 @@ jobs:
 
       - name: Upload generated JS bindings
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-bindings
           path: |
@@ -112,23 +142,68 @@ jobs:
             napi/index.d.ts
           if-no-files-found: error
 
+  smoke-test:
+    name: Smoke test ${{ matrix.target }}
+    needs: [check-version, build]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bindings-${{ matrix.target }}
+          path: napi
+
+      - name: Download generated JS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: js-bindings
+          path: napi
+
+      # musl binaries must load under a real musl libc, so run inside Alpine.
+      - name: Run smoke test (Alpine)
+        if: contains(matrix.target, 'musl')
+        run: docker run --rm -v "$PWD:/repo" -w /repo/napi node:24-alpine node test.mjs
+
+      - name: Run smoke test
+        if: ${{ !contains(matrix.target, 'musl') }}
+        working-directory: napi
+        run: node test.mjs
+
   publish:
     name: Publish to npm
-    needs: [check-version, build]
+    needs: [check-version, build, smoke-test]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: napi/artifacts
 
@@ -154,9 +229,12 @@ jobs:
             node -e '
               const [suffix, version] = process.argv.slice(1)
               const meta = {
-                "linux-x64-gnu":  { os: ["linux"],  cpu: ["x64"], libc: ["glibc"] },
-                "darwin-arm64":   { os: ["darwin"], cpu: ["arm64"] },
-                "win32-x64-msvc": { os: ["win32"],  cpu: ["x64"] },
+                "linux-x64-gnu":    { os: ["linux"],  cpu: ["x64"],   libc: ["glibc"] },
+                "linux-x64-musl":   { os: ["linux"],  cpu: ["x64"],   libc: ["musl"] },
+                "linux-arm64-gnu":  { os: ["linux"],  cpu: ["arm64"], libc: ["glibc"] },
+                "linux-arm64-musl": { os: ["linux"],  cpu: ["arm64"], libc: ["musl"] },
+                "darwin-arm64":     { os: ["darwin"], cpu: ["arm64"] },
+                "win32-x64-msvc":   { os: ["win32"],  cpu: ["x64"] },
               }[suffix]
               if (!meta) {
                 console.error(`unknown platform suffix: ${suffix} — add it to the meta map`)
