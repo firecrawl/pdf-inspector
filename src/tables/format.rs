@@ -307,9 +307,14 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let numeric_cells = non_first_cells
             .iter()
             .filter(|c| {
-                c.chars().all(|ch| {
-                    ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
-                })
+                // Strip a leading currency symbol so amounts like "$482,110.40"
+                // or "€1,200" are recognized as numeric data, not overflow text.
+                let c = c.trim_start_matches(['$', '€', '£', '¥']);
+                !c.is_empty()
+                    && c.chars().all(|ch| {
+                        ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
+                    })
+                    && c.chars().any(|ch| ch.is_ascii_digit())
             })
             .count();
         let looks_like_data_row = non_first_cells.len() >= 2
@@ -593,6 +598,69 @@ mod tests {
 
         assert_eq!(cleaned.len(), 4);
         assert_eq!(cleaned[2][0], "Mechanical");
+    }
+
+    #[test]
+    fn test_clean_table_cells_currency_data_row_not_merged() {
+        // A sparse/grouped table: the group-header row carries the order
+        // date/item code in column 0, and each detail row leaves column 0
+        // blank (row-spanning). Detail rows with dollar amounts must be
+        // recognized as real data rows and NOT merged as continuation text
+        // — the '$' prefix on numeric cells must not defeat the numeric
+        // check (see #229).
+        let cells = vec![
+            vec![
+                "Order Date".into(),
+                "Item Code".into(),
+                "Description".into(),
+                "Status".into(),
+                "Unit Cost".into(),
+                "Freight".into(),
+                "Tax".into(),
+            ],
+            vec![
+                "03/14/2024".into(),
+                "IC-1048".into(),
+                "".into(),
+                "Shipped".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+            vec![
+                "".into(),
+                "IC-1048".into(),
+                "WIDGET ASSEMBLY".into(),
+                "Shipped".into(),
+                "$482,110.40".into(),
+                "$0.00".into(),
+                "$9,215.75".into(),
+            ],
+            vec![
+                "".into(),
+                "IC-1048".into(),
+                "BRACKET SET".into(),
+                "Shipped".into(),
+                "$0.00".into(),
+                "$0.00".into(),
+                "$0.00".into(),
+            ],
+            vec![
+                "".into(),
+                "IC-1048".into(),
+                "CONTROL MODULE".into(),
+                "Shipped".into(),
+                "$31,905.22".into(),
+                "$4,100.00".into(),
+                "$0.00".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        // Header + group-header row + 3 distinct detail rows, none merged.
+        assert_eq!(cleaned.len(), 5);
+        assert_eq!(cleaned[2][4], "$482,110.40");
+        assert_eq!(cleaned[3][4], "$0.00");
+        assert_eq!(cleaned[4][4], "$31,905.22");
     }
 
     #[test]
