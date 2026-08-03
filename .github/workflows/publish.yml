@@ -24,7 +24,7 @@ jobs:
       changed: ${{ steps.check.outputs.changed }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 2
 
@@ -78,7 +78,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -104,7 +104,7 @@ jobs:
           tool: cargo-zigbuild
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -125,7 +125,7 @@ jobs:
         run: bunx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.build-flags }}
 
       - name: Upload native binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.target }}
           path: napi/*.node
@@ -133,7 +133,7 @@ jobs:
 
       - name: Upload generated JS bindings
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: js-bindings
           path: |
@@ -162,16 +162,16 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download native binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: bindings-${{ matrix.target }}
           path: napi
 
       - name: Download generated JS bindings
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: js-bindings
           path: napi
@@ -194,15 +194,15 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: napi/artifacts
 
