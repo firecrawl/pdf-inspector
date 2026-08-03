@@ -3652,3 +3652,26 @@ fn pdf_options_debug_redacts_password() {
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
 }
+
+/// Regression for #228: a `startxref` pointer corrupted to point at the
+/// wrong byte offset (a single flipped digit — a real, common writer bug)
+/// must not make the whole file unprocessable. The real classic xref table
+/// is still present and findable by scanning for the `xref` keyword; both
+/// pypdf and pdfium recover the same way. Before this fix, every entry
+/// point raised "Invalid PDF structure" on a file whose object data was
+/// otherwise completely intact.
+#[test]
+fn test_process_pdf_recovers_corrupted_startxref_pointer() {
+    let result = process_pdf_with_options(
+        "tests/fixtures/broken_startxref_pointer.pdf",
+        PdfOptions::new(),
+    )
+    .expect("a corrupted startxref pointer should be recoverable, like pypdf/pdfium");
+
+    assert_eq!(result.page_count, 1);
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Order Detail Report by Account") && md.contains("WIDGET ASSEMBLY"),
+        "recovered document should extract its real text, got: {md:?}"
+    );
+}

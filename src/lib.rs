@@ -3481,6 +3481,7 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
     let mut candidates = Vec::new();
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
+    add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
 
     let stripped = strip_leading_pdf_container_bytes(buf);
     if let Some(stripped_buf) = stripped.as_deref() {
@@ -3490,9 +3491,62 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
             append_missing_eof_marker(stripped_buf),
             buf,
         );
+        add_repair_candidate(
+            &mut candidates,
+            recover_startxref_pointer(stripped_buf),
+            buf,
+        );
     }
 
     candidates
+}
+
+/// Some PDF writers emit a `startxref` pointer that doesn't actually point
+/// at the cross-reference table — a single corrupted byte in the offset is
+/// enough. lopdf trusts that pointer outright and fails to load rather than
+/// searching for the real table, unlike pypdf/pdfium which both recover by
+/// locating it directly. This finds the real (classic, non-stream) `xref`
+/// table by scanning for the keyword and appends a corrected trailing
+/// `startxref`/`%%EOF` block — lopdf's own `get_xref_start` always uses the
+/// *last* `%%EOF` in the final 512 bytes of the buffer, so ours
+/// transparently supersedes the broken one without needing to touch
+/// anything already in the file.
+///
+/// Doesn't cover cross-reference *streams* (`N 0 obj << /Type /XRef ...`,
+/// used by some PDF 1.5+ writers instead of a classic table) — recovering
+/// those needs the containing object's number, not just a byte offset.
+fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
+    let xref_pos = find_last_standalone_keyword(buf, b"xref")?;
+
+    let mut repaired = Vec::with_capacity(buf.len() + 32);
+    repaired.extend_from_slice(buf);
+    if !repaired.ends_with(b"\n") {
+        repaired.push(b'\n');
+    }
+    repaired.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF\n").as_bytes());
+    Some(repaired)
+}
+
+/// Finds the last occurrence of `keyword` in `buf` that stands alone as a
+/// token: preceded by whitespace-or-buffer-start and followed by
+/// whitespace-or-buffer-end. Used to locate the real `xref` keyword without
+/// matching it as a substring of `startxref` or of unrelated content.
+fn find_last_standalone_keyword(buf: &[u8], keyword: &[u8]) -> Option<usize> {
+    let mut search_end = buf.len();
+    while search_end >= keyword.len() {
+        let found = buf[..search_end]
+            .windows(keyword.len())
+            .rposition(|w| w == keyword)?;
+        let before_ok = found == 0 || buf[found - 1].is_ascii_whitespace();
+        let after_ok = buf
+            .get(found + keyword.len())
+            .is_none_or(|c| c.is_ascii_whitespace());
+        if before_ok && after_ok {
+            return Some(found);
+        }
+        search_end = found;
+    }
+    None
 }
 
 fn add_repair_candidate(
