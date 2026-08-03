@@ -604,30 +604,40 @@ mod tests {
     fn test_clean_table_cells_currency_data_row_not_merged() {
         // A sparse/grouped table: the group-header row carries the order
         // date/item code in column 0, and each detail row leaves column 0
-        // blank (row-spanning). Detail rows with dollar amounts must be
-        // recognized as real data rows and NOT merged as continuation text
-        // — the '$' prefix on numeric cells must not defeat the numeric
-        // check (see #229).
+        // *and* column 1 (Suffix) blank (row-spanning) — matching the real
+        // #229 repro exactly, so `IC-1048` lands at column index 2. That
+        // matters: if `IC-1048` were at index 1 instead, the unrelated
+        // `looks_like_hierarchical_subrow` heuristic would independently
+        // keep these rows apart regardless of the numeric/currency check,
+        // and this test would pass even with the #229 fix reverted.
+        // Detail rows with dollar amounts must be recognized as real data
+        // rows and NOT merged as continuation text — the '$' prefix on
+        // numeric cells must not defeat the numeric check.
         let cells = vec![
             vec![
                 "Order Date".into(),
+                "Suffix".into(),
                 "Item Code".into(),
                 "Description".into(),
                 "Status".into(),
                 "Unit Cost".into(),
                 "Freight".into(),
                 "Tax".into(),
+                "Total Billed".into(),
             ],
             vec![
                 "03/14/2024".into(),
+                "".into(),
                 "IC-1048".into(),
                 "".into(),
                 "Shipped".into(),
                 "".into(),
                 "".into(),
                 "".into(),
+                "".into(),
             ],
             vec![
+                "".into(),
                 "".into(),
                 "IC-1048".into(),
                 "WIDGET ASSEMBLY".into(),
@@ -635,8 +645,10 @@ mod tests {
                 "$482,110.40".into(),
                 "$0.00".into(),
                 "$9,215.75".into(),
+                "$491,326.15".into(),
             ],
             vec![
+                "".into(),
                 "".into(),
                 "IC-1048".into(),
                 "BRACKET SET".into(),
@@ -644,8 +656,10 @@ mod tests {
                 "$0.00".into(),
                 "$0.00".into(),
                 "$0.00".into(),
+                "$0.00".into(),
             ],
             vec![
+                "".into(),
                 "".into(),
                 "IC-1048".into(),
                 "CONTROL MODULE".into(),
@@ -653,14 +667,15 @@ mod tests {
                 "$31,905.22".into(),
                 "$4,100.00".into(),
                 "$0.00".into(),
+                "$36,005.22".into(),
             ],
         ];
         let (cleaned, _) = clean_table_cells(&cells);
         // Header + group-header row + 3 distinct detail rows, none merged.
         assert_eq!(cleaned.len(), 5);
-        assert_eq!(cleaned[2][4], "$482,110.40");
-        assert_eq!(cleaned[3][4], "$0.00");
-        assert_eq!(cleaned[4][4], "$31,905.22");
+        assert_eq!(cleaned[2][5], "$482,110.40");
+        assert_eq!(cleaned[3][5], "$0.00");
+        assert_eq!(cleaned[4][5], "$31,905.22");
     }
 
     #[test]
