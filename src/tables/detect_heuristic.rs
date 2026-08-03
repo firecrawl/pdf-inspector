@@ -137,11 +137,56 @@ fn expand_consolidated_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<usize>) 
     (expanded, index_map)
 }
 
+/// Y-bands where multiple strikeout rows indicate a redline edit block.
+///
+/// A lone deletion can occur inside or beside a real table, so it must not
+/// globally suppress underlined table cells. Closely spaced strikeout rows are
+/// different: together with nearby underlines they form the overlapping
+/// old/new text layers used by legislative redlines, and those decorations
+/// must not become heuristic column evidence.
+fn redline_edit_bands(items: &[TextItem]) -> Vec<(f32, f32)> {
+    const ROW_DEDUP_TOLERANCE: f32 = 8.0;
+    const MAX_CLUSTER_GAP: f32 = 64.0;
+    const BAND_PADDING: f32 = 36.0;
+
+    let mut rows: Vec<f32> = items
+        .iter()
+        .filter(|item| item.is_strikeout)
+        .map(|item| item.y)
+        .collect();
+    rows.sort_by(|a, b| a.total_cmp(b));
+    rows.dedup_by(|a, b| (*a - *b).abs() <= ROW_DEDUP_TOLERANCE);
+
+    let mut bands = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start + 1;
+        while end < rows.len() && rows[end] - rows[end - 1] <= MAX_CLUSTER_GAP {
+            end += 1;
+        }
+        if end - start >= 2 {
+            bands.push((rows[start] - BAND_PADDING, rows[end - 1] + BAND_PADDING));
+        }
+        start = end;
+    }
+    bands
+}
+
+fn is_heuristic_table_evidence(item: &TextItem, redline_bands: &[(f32, f32)]) -> bool {
+    !item.is_strikeout
+        && !redline_bands
+            .iter()
+            .any(|(y_min, y_max)| item.y >= *y_min && item.y <= *y_max)
+}
+
 /// Detect tables in a set of text items from a single page
 pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bool) -> Vec<Table> {
     if items.len() < 6 {
         return vec![];
     }
+    // Compute these before consolidation: adjacent old/new text can merge and
+    // inherit only the first fragment's decoration flags.
+    let redline_bands = redline_edit_bands(items);
 
     // Step 1: Merge adjacent single-char items into words (handles per-character PDFs)
     let (merged_items, merge_map) = merge_adjacent_items(items);
@@ -159,7 +204,11 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
     let table_candidates: Vec<(usize, &TextItem)> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| item.font_size <= table_font_threshold && item.font_size >= 6.0)
+        .filter(|(_, item)| {
+            is_heuristic_table_evidence(item, &redline_bands)
+                && item.font_size <= table_font_threshold
+                && item.font_size >= 6.0
+        })
         .collect();
 
     if table_candidates.len() >= 6 {
@@ -208,6 +257,7 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             .enumerate()
             .filter(|(idx, item)| {
                 !claimed_indices.contains(idx)
+                    && is_heuristic_table_evidence(item, &redline_bands)
                     && item.font_size >= body_font_low
                     && item.font_size <= body_font_high
                     && item.font_size >= 6.0
@@ -1646,6 +1696,91 @@ fn try_add_label_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ItemType;
+
+    fn body_item(text: &str, x: f32, y: f32, strikeout: bool) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: 90.0,
+            height: 12.0,
+            font: "F1".to_string(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: strikeout,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn body_font_redline_deletions_do_not_create_a_table() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("live paragraph text", 50.0, y, false));
+            items.push(body_item("deleted wording", 220.0, y, true));
+        }
+
+        assert!(
+            detect_tables(&items, 12.0, false).is_empty(),
+            "aligned strikeout overlays are source edits, not table columns"
+        );
+    }
+
+    #[test]
+    fn underlined_body_font_table_without_deletions_is_still_detected() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "underline-only tables must keep their heuristic evidence"
+        );
+    }
+
+    #[test]
+    fn body_font_table_with_one_deletion_is_still_detected() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("row value", 220.0, y, row == 0));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "one revised cell must not suppress an otherwise complete table"
+        );
+    }
+
+    #[test]
+    fn unrelated_strikeout_does_not_remove_underlined_table_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+        items.push(body_item("deleted prose", 50.0, 300.0, true));
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "a distant deletion must not suppress underlined table columns"
+        );
+    }
 
     #[test]
     fn is_table_of_contents_rejects_toc() {

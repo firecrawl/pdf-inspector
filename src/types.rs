@@ -148,14 +148,17 @@ impl TextLine {
         self.text_with_formatting(false, false, false)
     }
 
-    /// Get text with optional bold/italic/underline markdown formatting
+    /// Get text with optional bold/italic/decorative markdown formatting.
+    ///
+    /// `format_decorations` enables both geometrically detected source
+    /// decorations: underline (`<u>`) and strikeout (`<s>`).
     pub fn text_with_formatting(
         &self,
         format_bold: bool,
         format_italic: bool,
-        format_underline: bool,
+        format_decorations: bool,
     ) -> String {
-        if !format_bold && !format_italic && !format_underline {
+        if !format_bold && !format_italic && !format_decorations {
             return self.text_plain();
         }
 
@@ -165,6 +168,7 @@ impl TextLine {
         let mut current_bold = false;
         let mut current_italic = false;
         let mut current_underline = false;
+        let mut current_strikeout = false;
 
         for (i, item) in self.items.iter().enumerate() {
             let text = item.text.as_str();
@@ -190,13 +194,16 @@ impl TextLine {
             // we push text_trimmed below (which strips it).
             let has_leading_space = text.starts_with(' ');
 
-            // Check for style changes. Underline is exclusive: `<u>` content
-            // stays free of `**`/`*` markers — consumers (and the eval
-            // harnesses this feeds) match the tag content literally, and
-            // mixed `<u>**x**</u>` nesting breaks that.
-            let item_underline = format_underline && item.is_underline;
-            let item_bold = format_bold && item.is_bold && !item_underline;
-            let item_italic = format_italic && item.is_italic && !item_underline;
+            // Check for style changes. Source decorations are exclusive:
+            // `<u>`/`<s>` content stays free of `**`/`*` markers — consumers
+            // (and the eval harnesses this feeds) match tag content literally,
+            // and mixed nesting breaks that. A struck-and-underlined item is
+            // emitted as struck text because deletion is the stronger semantic
+            // distinction in redline documents.
+            let item_strikeout = format_decorations && item.is_strikeout;
+            let item_underline = format_decorations && item.is_underline && !item_strikeout;
+            let item_bold = format_bold && item.is_bold && !item_underline && !item_strikeout;
+            let item_italic = format_italic && item.is_italic && !item_underline && !item_strikeout;
 
             // Close previous styles if they change
             if current_italic && !item_italic {
@@ -211,6 +218,10 @@ impl TextLine {
                 result.push_str("</u>");
                 current_underline = false;
             }
+            if current_strikeout && !item_strikeout {
+                result.push_str("</s>");
+                current_strikeout = false;
+            }
 
             // Add space: either from spacing logic or preserved from item text
             if needs_space || (has_leading_space && !result.is_empty() && !result.ends_with(' ')) {
@@ -221,6 +232,10 @@ impl TextLine {
             if item_underline && !current_underline {
                 result.push_str("<u>");
                 current_underline = true;
+            }
+            if item_strikeout && !current_strikeout {
+                result.push_str("<s>");
+                current_strikeout = true;
             }
             if item_bold && !current_bold {
                 result.push_str("**");
@@ -243,6 +258,9 @@ impl TextLine {
         }
         if current_underline {
             result.push_str("</u>");
+        }
+        if current_strikeout {
+            result.push_str("</s>");
         }
 
         result
@@ -307,5 +325,90 @@ impl TextLine {
             || was_sub_super
             || should_join
             || space_already_exists)
+    }
+}
+
+#[cfg(test)]
+mod formatting_tests {
+    use super::{ItemType, TextItem, TextLine};
+
+    fn item(text: &str, x: f32, width: f32, strikeout: bool) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y: 100.0,
+            width,
+            height: 12.0,
+            font: "F1".to_string(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: strikeout,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    fn line(items: Vec<TextItem>) -> TextLine {
+        TextLine {
+            items,
+            y: 100.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        }
+    }
+
+    #[test]
+    fn formatting_emits_semantic_strikeout() {
+        let line = line(vec![item("deleted", 10.0, 42.0, true)]);
+
+        assert_eq!(
+            line.text_with_formatting(true, true, true),
+            "<s>deleted</s>"
+        );
+    }
+
+    #[test]
+    fn formatting_closes_strikeout_before_live_text() {
+        let line = line(vec![
+            item("keep", 10.0, 24.0, false),
+            item("remove", 40.0, 42.0, true),
+            item("keep", 88.0, 24.0, false),
+        ]);
+
+        assert_eq!(
+            line.text_with_formatting(true, true, true),
+            "keep <s>remove</s> keep"
+        );
+    }
+
+    #[test]
+    fn formatting_coalesces_adjacent_struck_items() {
+        let line = line(vec![
+            item("deleted", 10.0, 42.0, true),
+            item("words", 58.0, 30.0, true),
+        ]);
+
+        assert_eq!(
+            line.text_with_formatting(true, true, true),
+            "<s>deleted words</s>"
+        );
+    }
+
+    #[test]
+    fn strikeout_takes_precedence_over_other_styles() {
+        let mut decorated = item("deleted", 10.0, 42.0, true);
+        decorated.is_bold = true;
+        decorated.is_italic = true;
+        decorated.is_underline = true;
+        let line = line(vec![decorated]);
+
+        assert_eq!(
+            line.text_with_formatting(true, true, true),
+            "<s>deleted</s>"
+        );
+        assert_eq!(line.text(), "deleted");
     }
 }
