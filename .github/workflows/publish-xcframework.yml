@@ -1,0 +1,110 @@
+name: Publish WebAssembly package
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FRAMEWORK_NAME: pdf_inspector
+
+jobs:
+  apple-build:
+      name: Build Apple slices
+      runs-on: macos-latest
+      env:
+
+        TARGETS: "aarch64-apple-ios,aarch64-apple-ios-macabi,aarch64-apple-ios-sim,aarch64-apple-tvos,aarch64-apple-tvos-sim,aarch64-apple-visionos,aarch64-apple-visionos-sim,aarch64-apple-watchos,aarch64-apple-watchos-sim,x86_64-apple-ios,x86_64-apple-ios-macabi"
+      steps:
+          - uses: actions/checkout@v4
+
+          - name: Install Rust
+            uses: dtolnay/rust-toolchain@stable
+            with:
+              targets: ${{ env.TARGETS }}
+
+          - name: Build host dylib for bindgen
+            run: cargo build --release --features uniffi
+
+          - name: Generate Swift bindings
+            run: |
+              mkdir -p swift
+              cargo run --release --features uniffi --bin uniffi-bindgen -- generate \
+                --library "target/release/libpdf_inspector.dylib" \
+                --language swift \
+                --out-dir swift
+
+          - name: Build Apple Rust slices
+            run: |
+              RUST_TARGETS=()
+
+              # Split by comma and populate the array safely
+              IFS=',' read -ra ADDR <<< "$TARGETS"
+              for target in "${ADDR[@]}"; do
+                  RUST_TARGETS+=("--target" "$target")
+              done
+
+              # Run your build command
+              cargo build --release --features uniffi "${RUST_TARGETS[@]}"
+
+          - name: Stage headers (Rename & Move)
+            run: |
+              mkdir -p target/apple/headers
+              cp swift/pdf_inspectorFFI.h target/apple/headers/
+              cp swift/pdf_inspectorFFI.modulemap target/apple/headers/module.modulemap
+              rm -f swift/pdf_inspectorFFI.h swift/pdf_inspectorFFI.modulemap
+
+          # Most of our targets are all for separate architectures, however the iOS Simulator and Mac Catalyst have multiple targets
+          # for a single architecture. Combine those into a single slice here.
+          - name: Fatten multi-arch slices (iOS Simulator & Mac Catalyst)
+            run: |
+              mkdir -p target/apple/fat/ios-simulator target/apple/fat/ios-macabi
+              lipo -create \
+                "target/aarch64-apple-ios-sim/release/${LIB_NAME}.a" \
+                "target/x86_64-apple-ios/release/${LIB_NAME}.a" \
+                -output "target/apple/fat/ios-simulator/${LIB_NAME}.a"
+              lipo -create \
+                "target/aarch64-apple-ios-macabi/release/${LIB_NAME}.a" \
+                "target/x86_64-apple-ios-macabi/release/${LIB_NAME}.a" \
+                -output "target/apple/fat/ios-macabi/${LIB_NAME}.a"
+
+          - name: Assemble ${{ env.FRAMEWORK_NAME }}.xcframework
+            run: |
+              SLICES=(
+                "target/aarch64-apple-ios/release/${LIB_NAME}.a"
+                "target/apple/fat/ios-simulator/${LIB_NAME}.a"
+                "target/apple/fat/ios-macabi/${LIB_NAME}.a"
+                "target/aarch64-apple-tvos/release/${LIB_NAME}.a"
+                "target/aarch64-apple-tvos-sim/release/${LIB_NAME}.a"
+                "target/aarch64-apple-visionos/release/${LIB_NAME}.a"
+                "target/aarch64-apple-visionos-sim/release/${LIB_NAME}.a"
+                "target/aarch64-apple-watchos/release/${LIB_NAME}.a"
+                "target/aarch64-apple-watchos-sim/release/${LIB_NAME}.a"
+              )
+
+              XCFRAMEWORK_ARGS=()
+              for lib in "${SLICES[@]}"; do
+                  XCFRAMEWORK_ARGS+=("-library" "$lib" "-headers" "target/apple/headers")
+              done
+
+              xcodebuild -create-xcframework "${XCFRAMEWORK_ARGS[@]}" -output swift/$FRAMEWORK_NAME.xcframework
+
+          - name: Zip xcframework for distribution
+            run: |
+              cd swift
+              zip -r -y $FRAMEWORK_NAME.xcframework.zip $FRAMEWORK_NAME.xcframework
+
+          - name: Compute checksum for Package.swift binaryTarget
+            run: swift package compute-checksum swift/$FRAMEWORK_NAME.xcframework.zip
+
+          - name: Upload Apple build artifact
+            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+            with:
+                name: apple-build
+                path: rust/target/apple-build/
+                if-no-files-found: error
