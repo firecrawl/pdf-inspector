@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(pdf_type, "TextBased");
         assert!(get_count("pagesSampled") >= 1.0);
         assert!(get_count("pagesWithText") >= 1.0);
-        assert!(get_count("pagesWithImages") >= 0.0);
+        assert_eq!(get_count("pagesWithImages"), 0.0);
         assert_eq!(get_count("pagesWithTemplateImages"), 0.0);
         assert!(!text.is_empty());
     }
