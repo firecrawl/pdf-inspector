@@ -1,4 +1,4 @@
-name: Publish Xcframework
+name: Publish XCFramework
 
 on:
   push:
@@ -19,8 +19,8 @@ jobs:
       name: Build Apple slices
       runs-on: macos-latest
       env:
-
         TARGETS: "aarch64-apple-ios,aarch64-apple-ios-macabi,aarch64-apple-ios-sim,aarch64-apple-tvos,aarch64-apple-tvos-sim,aarch64-apple-visionos,aarch64-apple-visionos-sim,aarch64-apple-watchos,aarch64-apple-watchos-sim,x86_64-apple-ios,x86_64-apple-ios-macabi"
+
       steps:
           - uses: actions/checkout@v4
 
@@ -101,11 +101,13 @@ jobs:
               zip -r -y $FRAMEWORK_NAME.xcframework.zip $FRAMEWORK_NAME.xcframework
 
           - name: Compute checksum for Package.swift binaryTarget
-            run: swift package compute-checksum swift/$FRAMEWORK_NAME.xcframework.zip
+            run: echo $(swift package compute-checksum swift/$FRAMEWORK_NAME.xcframework.zip) > ${{ env.FRAMEWORK_NAME }}.xcframework.zip.checksum
 
           - name: Upload Apple build artifact
             uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
             with:
                 name: apple-build
-                path: swift/$FRAMEWORK_NAME.xcframework.zip
+                path: |
+                    swift/${{ env.FRAMEWORK_NAME }}.xcframework.zip
+                    swift/${{ env.FRAMEWORK_NAME }}.xcframework.zip.checksum
                 if-no-files-found: error
