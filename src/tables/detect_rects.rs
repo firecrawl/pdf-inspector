@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use log::debug;
 
-use crate::types::{PdfRect, TextItem};
+use crate::types::{ItemType, PdfRect, TextItem};
 
 use super::Table;
 
@@ -286,6 +286,86 @@ pub fn detect_chart_regions(
             );
             regions.push(bbox);
         }
+    }
+    regions
+}
+
+/// A chart legend line-swatch: a short leading run of dash / horizontal-rule
+/// glyphs that stands in for the plotted line before a series name
+/// (e.g. `----- Benchmark`). It never begins a real heading or paragraph, so
+/// it is reliable corroboration that an adjacent image is a chart.
+pub fn starts_with_legend_swatch(text: &str) -> bool {
+    let run = text
+        .trim_start()
+        .chars()
+        .take_while(|c| matches!(c, '-' | '\u{2010}'..='\u{2015}' | '\u{2500}' | '\u{2501}'))
+        .count();
+    run >= 3
+}
+
+/// Chart regions backed by an image XObject (line/area charts), which leave no
+/// bar-rect cluster for [`detect_chart_regions`] to find.
+///
+/// `image_regions` are the page's image-placeholder bboxes `(x0, y0, x1, y1)`;
+/// `text_items` are the page's text items (used only for corroboration).
+///
+/// A chart-sized image is only accepted when corroborated by adjacent chart
+/// furniture — a legend line-swatch just outside the image, horizontally within
+/// its span. That keeps ordinary logos and photos (which have no such legend)
+/// from being mistaken for charts. The returned region is the image's bbox;
+/// downstream, `is_chart_adjacent_label` fences the legend and any other labels
+/// sitting just outside it.
+pub fn detect_image_chart_regions(
+    image_regions: &[(f32, f32, f32, f32)],
+    text_items: &[TextItem],
+    page: u32,
+) -> Vec<(f32, f32, f32, f32)> {
+    const MIN_CHART_IMG_WIDTH: f32 = 120.0;
+    const MIN_CHART_IMG_HEIGHT: f32 = 50.0;
+    const LEGEND_BAND: f32 = 24.0;
+
+    let mut regions = Vec::new();
+    for &(ix0, iy0, ix1, iy1) in image_regions {
+        let (mut x0, mut x1) = (ix0.min(ix1), ix0.max(ix1));
+        let (mut y0, mut y1) = (iy0.min(iy1), iy0.max(iy1));
+        if x1 - x0 < MIN_CHART_IMG_WIDTH || y1 - y0 < MIN_CHART_IMG_HEIGHT {
+            continue;
+        }
+        // Corroborating legend swatches, horizontally within the image span and
+        // within LEGEND_BAND of it vertically. Collect them so the region can be
+        // grown to include the legend — otherwise a full-width legend entry sits
+        // just outside the image bbox and escapes the chart fencing.
+        let legend: Vec<&TextItem> = text_items
+            .iter()
+            .filter(|it| {
+                if it.page != page || !matches!(it.item_type, ItemType::Text) {
+                    return false;
+                }
+                if !starts_with_legend_swatch(&it.text) {
+                    return false;
+                }
+                let cx = it.x + it.width / 2.0;
+                let within_x = cx >= x0 && cx <= x1;
+                let gap = if it.y < y0 {
+                    y0 - it.y
+                } else if it.y > y1 {
+                    it.y - y1
+                } else {
+                    0.0
+                };
+                within_x && gap <= LEGEND_BAND
+            })
+            .collect();
+        if legend.is_empty() {
+            continue;
+        }
+        for it in legend {
+            x0 = x0.min(it.x);
+            x1 = x1.max(it.x + it.width);
+            y0 = y0.min(it.y);
+            y1 = y1.max(it.y + it.height);
+        }
+        regions.push((x0, y0, x1, y1));
     }
     regions
 }
@@ -3081,6 +3161,54 @@ mod tests {
             .map(|(x, y)| make_item("42", x, y, 9.0))
             .collect();
         assert!(detect_chart_regions(&items, &rects, 1).is_empty());
+    }
+
+    // --- detect_image_chart_regions ---
+
+    #[test]
+    fn legend_swatch_recognized() {
+        assert!(starts_with_legend_swatch("----- Benchmark"));
+        assert!(starts_with_legend_swatch(
+            "\u{2014}\u{2014}\u{2014} Series A"
+        )); // em-dash swatch
+        assert!(!starts_with_legend_swatch("-- short"));
+        assert!(!starts_with_legend_swatch("Benchmark"));
+        assert!(!starts_with_legend_swatch("- bullet"));
+    }
+
+    #[test]
+    fn image_with_legend_swatch_is_a_chart_region() {
+        // A chart-sized image with a legend swatch just below it is a chart.
+        let image = (40.0, 100.0, 340.0, 220.0); // 300 x 120
+        let legend = vec![
+            make_item("----- Fund", 60.0, 92.0, 9.0),
+            make_item("----- Benchmark", 180.0, 92.0, 9.0),
+        ];
+        let regions = detect_image_chart_regions(&[image], &legend, 1);
+        assert_eq!(regions.len(), 1);
+        // Region is grown downward to include the legend (y < image bottom).
+        let (_, y0, _, _) = regions[0];
+        assert!(
+            y0 <= 92.0,
+            "region should extend to cover the legend, y0={y0}"
+        );
+    }
+
+    #[test]
+    fn plain_image_without_legend_is_not_a_chart() {
+        // A chart-sized image (logo/photo) with only ordinary caption text near
+        // it must NOT be treated as a chart.
+        let image = (40.0, 100.0, 340.0, 220.0);
+        let caption = vec![make_item("Figure 1: our logo", 60.0, 92.0, 9.0)];
+        assert!(detect_image_chart_regions(&[image], &caption, 1).is_empty());
+    }
+
+    #[test]
+    fn small_image_with_swatch_is_ignored() {
+        // Too small to be a chart even with an adjacent swatch (e.g. an inline icon).
+        let image = (40.0, 100.0, 120.0, 130.0); // 80 x 30
+        let legend = vec![make_item("----- Benchmark", 60.0, 96.0, 9.0)];
+        assert!(detect_image_chart_regions(&[image], &legend, 1).is_empty());
     }
 
     // --- detect_stacked_box_table ---
