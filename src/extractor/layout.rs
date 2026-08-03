@@ -1237,9 +1237,85 @@ fn group_into_lines_with_thresholds_and_regions_impl(
     // Markdown output omits standalone numeric headers/footers. Plain-text
     // callers opt out because dropping extracted text violates that API.
     let items = if filter_page_numbers {
+        // `is_page_number` only looks at one item's own text/position — it
+        // can't tell a lone footer digit from a short numeric item that
+        // happens to sit inline next to other text: a subscript/
+        // superscript that failed to merge into its parent (font-size
+        // mismatch breaks `merge_text_items`'s run) and happens to land
+        // near the top/bottom margin — a title-line formula, an exponent,
+        // a footnote reference. Only drop a page-number candidate when
+        // it's actually isolated — no tightly adjacent real-text neighbor
+        // on the same line.
+        //
+        // Deliberately scoped to *tight* X-adjacency only (gap < 0.25x
+        // font_size, just above `merge_subscript_items`'s own 0.2x
+        // merge-gap tolerance — close enough that a subscript/superscript
+        // which just barely misses that merge for a structural, non-gap
+        // reason is still protected here). An earlier version of this fix
+        // also protected any candidate sharing its line with >=2 other
+        // real-text items, aiming to recover numbers embedded in title
+        // lines at wider, stylistically-emphasized gaps (e.g. a form
+        // number in "Form 4070 Employee's Report"). That was reverted:
+        // building a synthetic 3-column footer ("Acme Corporation | 12 |
+        // Annual Report 2026") to regression-test it found its column-stop
+        // gaps (~107-131pt) overlap the exact range a real title-line gap
+        // needs to be protected — no contiguity threshold separates the
+        // two cases reliably. Recovering stylistically-spaced title
+        // numbers would need a different signal (column-layout awareness,
+        // sentence-level semantics) than adjacency; out of scope here.
+        //
+        // Two more guards on what counts as a protecting neighbor:
+        //
+        // - It must contain at least one alphanumeric character — not just
+        //   be non-empty. Decorative flanking glyphs ("• 12 •", "- 12 -")
+        //   are real, non-empty TextItems sitting tightly adjacent to a
+        //   footer number, but they aren't *content*; protecting the
+        //   number because a bullet happens to sit next to it would leak
+        //   exactly the footer pattern this filter exists to catch.
+        // - It must not itself be page-number-shaped. Otherwise a
+        //   multi-digit page number rendered as separate single-digit Tj
+        //   operators (a real PDF-generator pattern) would have each digit
+        //   "protect" its sibling — every digit sees a page-number-like
+        //   neighbor and none of them get dropped, leaking the whole
+        //   number into markdown.
+        let mut items_by_page: HashMap<u32, Vec<&TextItem>> = HashMap::new();
+        for item in &items {
+            items_by_page.entry(item.page).or_default().push(item);
+        }
+        let y_tol = 5.0;
+        let drop: Vec<bool> = items
+            .iter()
+            .map(|item| {
+                if !is_page_number(item) {
+                    return false;
+                }
+                let page_items = items_by_page
+                    .get(&item.page)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                !page_items.iter().any(|other| {
+                    if std::ptr::eq(*other, item)
+                        || !other.text.chars().any(|c| c.is_alphanumeric())
+                        || is_page_number(other)
+                        || (other.y - item.y).abs() >= y_tol
+                    {
+                        return false;
+                    }
+                    let gap = if item.x <= other.x {
+                        other.x - (item.x + item.width.max(0.0))
+                    } else {
+                        item.x - (other.x + other.width.max(0.0))
+                    };
+                    let max_font_size = item.font_size.max(other.font_size);
+                    gap < max_font_size * 0.25 && gap > -max_font_size
+                })
+            })
+            .collect();
         items
             .into_iter()
-            .filter(|item| !is_page_number(item))
+            .zip(drop)
+            .filter(|(_, drop)| !*drop)
+            .map(|(item, _)| item)
             .collect()
     } else {
         items

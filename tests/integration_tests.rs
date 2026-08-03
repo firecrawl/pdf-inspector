@@ -3652,3 +3652,133 @@ fn pdf_options_debug_redacts_password() {
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
 }
+/// Regression for a silent-drop bug: `is_page_number` flags any 1-4-digit
+/// item near the top/bottom margin (y > 720 or y < 100) with no check for
+/// whether it's actually isolated. A subscript/superscript digit that
+/// failed to merge into its parent word (font-size mismatch breaks
+/// `merge_text_items`'s run) and happens to sit near a page's top margin —
+/// common for a title, header, or an equation/formula early on the page —
+/// was being swept up by that filter and vanishing from markdown output
+/// entirely, not even as a bare digit. Here: the "2" in "H2O".
+#[test]
+fn test_inline_subscript_near_margin_is_not_dropped_as_page_number() {
+    let buf = std::fs::read("tests/fixtures/inline_subscript_near_margin.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("H2O") || md.contains("H₂O"),
+        "subscript '2' in H2O must survive markdown conversion, got: {md:?}"
+    );
+}
+
+/// Sibling to the test above, guarding the fix's precision: a page number
+/// genuinely alone on its footer line (nothing tightly adjacent to it —
+/// only distant, unrelated body text sharing the general page height) must
+/// still be filtered out of markdown output, same as before the fix.
+#[test]
+fn test_isolated_page_number_footer_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/isolated_page_number_footer.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("body of the document"),
+        "real body text must survive, got: {md:?}"
+    );
+    assert!(
+        !md.split_whitespace().any(|w| w == "42"),
+        "a lone footer page number must still be filtered, got: {md:?}"
+    );
+}
+
+/// Guards against a real regression caught by review: a multi-digit page
+/// number rendered as separate single-digit `Tj` operators at different
+/// font sizes (a real PDF-generator pattern; the size difference also
+/// keeps `merge_text_items` from fusing them back into one item first)
+/// must not have each digit "protect" its sibling just because the
+/// sibling is also short digits sitting nearby — that would leak the
+/// whole number into markdown. The neighbor check excludes other
+/// page-number-shaped items from counting as a protector.
+#[test]
+fn test_split_digit_page_number_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/split_digit_page_number_footer.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("body of the document"),
+        "real body text must survive, got: {md:?}"
+    );
+    assert!(
+        !md.split_whitespace().any(|w| w == "1" || w == "2"),
+        "a page number split across two adjacent Tj digits must still be filtered, got: {md:?}"
+    );
+}
+
+/// Guards against the other real regression caught by review: the
+/// adjacency threshold must be tight enough to reject ordinary word-gap
+/// spacing, not just "less than a page-scale gap". A page number sitting
+/// next to unrelated text (a company name, a running title) at normal
+/// word-gap distance — not a subscript's near-zero gap — must still be
+/// filtered, even when it survives as its own item (different font size
+/// blocks `merge_text_items` from fusing it into the neighboring text).
+#[test]
+fn test_word_adjacent_page_number_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/word_adjacent_page_number_footer.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Company Name"),
+        "the real neighboring text must survive, got: {md:?}"
+    );
+    assert!(
+        !md.split_whitespace().any(|w| w == "12"),
+        "a page number at ordinary word-gap distance from unrelated text \
+         must still be filtered, got: {md:?}"
+    );
+}
+
+/// Regression for a false positive an earlier version of this fix
+/// introduced (a "protect if the line has >=2 real neighbors" rule, since
+/// reverted — see the comment above the filter in layout.rs): a 3-column
+/// footer (a left label, a centered page number, a right label — a real,
+/// common layout) must still have its page number filtered, even though it
+/// technically has two other real-text items sharing its Y. What
+/// distinguishes this from a genuine title/sentence line is the column-stop
+/// spacing between elements; there's no adjacency-only signal (gap size or
+/// line-membership) that reliably tells the two apart, which is why the
+/// fix stays scoped to tight X-adjacency only.
+#[test]
+fn test_three_column_footer_page_number_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/three_column_footer.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Acme Corporation") && md.contains("Annual Report"),
+        "the real neighboring labels must survive, got: {md:?}"
+    );
+    assert!(
+        !md.split_whitespace().any(|w| w == "12"),
+        "a page number in a 3-column footer must still be filtered, got: {md:?}"
+    );
+}
+
+/// Regression for another false positive caught by review: decorative
+/// glyphs flanking a footer page number ("• 12 •", in a different font
+/// size so they survive `merge_text_items` as separate items) are real,
+/// non-empty, tightly-adjacent TextItems — but they aren't *content*.
+/// Protecting the number because a bullet sits next to it would leak
+/// exactly the footer pattern this filter exists to catch. Protecting
+/// neighbors must contain at least one alphanumeric character.
+#[test]
+fn test_decorative_flanked_page_number_is_still_dropped() {
+    let buf = std::fs::read("tests/fixtures/decorative_flanked_page_number.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("body of the document"),
+        "real body text must survive, got: {md:?}"
+    );
+    assert!(
+        !md.split_whitespace().any(|w| w == "12"),
+        "a page number flanked only by decorative glyphs must still be filtered, got: {md:?}"
+    );
+}
