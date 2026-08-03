@@ -1,4 +1,4 @@
-name: Publish WebAssembly package
+name: Publish Xcframework
 
 on:
   push:
