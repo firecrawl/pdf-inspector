@@ -12,6 +12,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   FRAMEWORK_NAME: pdf_inspector
+  LIB_NAME: libpdf_inspector
 
 jobs:
   apple-build:
@@ -35,7 +36,7 @@ jobs:
             run: |
               mkdir -p swift
               cargo run --release --features uniffi --bin uniffi-bindgen -- generate \
-                --library "target/release/libpdf_inspector.dylib" \
+                --library "target/release/${LIB_NAME}.dylib" \
                 --language swift \
                 --out-dir swift
 
@@ -61,24 +62,24 @@ jobs:
 
           # Most of our targets are all for separate architectures, however the iOS Simulator and Mac Catalyst have multiple targets
           # for a single architecture. Combine those into a single slice here.
-          - name: Fatten multi-arch slices (iOS Simulator & Mac Catalyst)
+          - name: Create multi-arch slices (iOS Simulator & Mac Catalyst)
             run: |
-              mkdir -p target/apple/fat/ios-simulator target/apple/fat/ios-macabi
+              mkdir -p target/apple/multi/ios-simulator target/apple/multi/ios-macabi
               lipo -create \
                 "target/aarch64-apple-ios-sim/release/${LIB_NAME}.a" \
                 "target/x86_64-apple-ios/release/${LIB_NAME}.a" \
-                -output "target/apple/fat/ios-simulator/${LIB_NAME}.a"
+                -output "target/apple/multi/ios-simulator/${LIB_NAME}.a"
               lipo -create \
                 "target/aarch64-apple-ios-macabi/release/${LIB_NAME}.a" \
                 "target/x86_64-apple-ios-macabi/release/${LIB_NAME}.a" \
-                -output "target/apple/fat/ios-macabi/${LIB_NAME}.a"
+                -output "target/apple/multi/ios-macabi/${LIB_NAME}.a"
 
           - name: Assemble ${{ env.FRAMEWORK_NAME }}.xcframework
             run: |
               SLICES=(
                 "target/aarch64-apple-ios/release/${LIB_NAME}.a"
-                "target/apple/fat/ios-simulator/${LIB_NAME}.a"
-                "target/apple/fat/ios-macabi/${LIB_NAME}.a"
+                "target/apple/multi/ios-simulator/${LIB_NAME}.a"
+                "target/apple/multi/ios-macabi/${LIB_NAME}.a"
                 "target/aarch64-apple-tvos/release/${LIB_NAME}.a"
                 "target/aarch64-apple-tvos-sim/release/${LIB_NAME}.a"
                 "target/aarch64-apple-visionos/release/${LIB_NAME}.a"
