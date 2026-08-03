@@ -295,12 +295,15 @@ pub fn detect_chart_regions(
 /// (e.g. `----- Benchmark`). It never begins a real heading or paragraph, so
 /// it is reliable corroboration that an adjacent image is a chart.
 pub fn starts_with_legend_swatch(text: &str) -> bool {
-    let run = text
-        .trim_start()
+    let trimmed = text.trim_start();
+    let run = trimmed
         .chars()
         .take_while(|c| matches!(c, '-' | '\u{2010}'..='\u{2015}' | '\u{2500}' | '\u{2501}'))
         .count();
-    run >= 3
+    // A legend entry is a swatch *plus a series name*. A bare rule of dashes
+    // ("-----") is a decorative separator, not chart furniture, so require some
+    // non-whitespace text after the run.
+    run >= 3 && trimmed.chars().skip(run).any(|c| !c.is_whitespace())
 }
 
 /// Chart regions backed by an image XObject (line/area charts), which leave no
@@ -312,9 +315,10 @@ pub fn starts_with_legend_swatch(text: &str) -> bool {
 /// A chart-sized image is only accepted when corroborated by adjacent chart
 /// furniture — a legend line-swatch just outside the image, horizontally within
 /// its span. That keeps ordinary logos and photos (which have no such legend)
-/// from being mistaken for charts. The returned region is the image's bbox;
-/// downstream, `is_chart_adjacent_label` fences the legend and any other labels
-/// sitting just outside it.
+/// from being mistaken for charts. The returned region is the image's bbox
+/// grown to enclose the matched legend entries, so downstream chart fencing
+/// covers the legend directly; `is_chart_adjacent_label` still catches any
+/// other labels sitting just outside it.
 pub fn detect_image_chart_regions(
     image_regions: &[(f32, f32, f32, f32)],
     text_items: &[TextItem],
@@ -3174,6 +3178,9 @@ mod tests {
         assert!(!starts_with_legend_swatch("-- short"));
         assert!(!starts_with_legend_swatch("Benchmark"));
         assert!(!starts_with_legend_swatch("- bullet"));
+        // A bare rule of dashes is a decorative separator, not a legend entry.
+        assert!(!starts_with_legend_swatch("-----"));
+        assert!(!starts_with_legend_swatch("--------   "));
     }
 
     #[test]
