@@ -3506,8 +3506,13 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 /// enough. lopdf trusts that pointer outright and fails to load rather than
 /// searching for the real table, unlike pypdf/pdfium which both recover by
 /// locating it directly. This finds the real (classic, non-stream) `xref`
-/// table by scanning for the keyword and appends a corrected trailing
-/// `startxref`/`%%EOF` block — lopdf's own `get_xref_start` always uses the
+/// table by scanning for the keyword — validating that a plausible
+/// subsection header follows, not just any standalone "xref" token, since
+/// this crate processes untrusted input and a coincidental match inside
+/// unrelated stream/string content must not get "repaired" against a bogus
+/// offset (lopdf would then load successfully against garbage instead of
+/// returning a clean error) — and appends a corrected trailing
+/// `startxref`/`%%EOF` block. lopdf's own `get_xref_start` always uses the
 /// *last* `%%EOF` in the final 512 bytes of the buffer, so ours
 /// transparently supersedes the broken one without needing to touch
 /// anything already in the file.
@@ -3516,7 +3521,7 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 /// used by some PDF 1.5+ writers instead of a classic table) — recovering
 /// those needs the containing object's number, not just a byte offset.
 fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
-    let xref_pos = find_last_standalone_keyword(buf, b"xref")?;
+    let xref_pos = find_last_valid_xref_table_start(buf)?;
 
     let mut repaired = Vec::with_capacity(buf.len() + 32);
     repaired.extend_from_slice(buf);
@@ -3527,26 +3532,63 @@ fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
     Some(repaired)
 }
 
-/// Finds the last occurrence of `keyword` in `buf` that stands alone as a
-/// token: preceded by whitespace-or-buffer-start and followed by
-/// whitespace-or-buffer-end. Used to locate the real `xref` keyword without
-/// matching it as a substring of `startxref` or of unrelated content.
-fn find_last_standalone_keyword(buf: &[u8], keyword: &[u8]) -> Option<usize> {
-    let mut search_end = buf.len();
-    while search_end >= keyword.len() {
-        let found = buf[..search_end]
-            .windows(keyword.len())
-            .rposition(|w| w == keyword)?;
-        let before_ok = found == 0 || buf[found - 1].is_ascii_whitespace();
-        let after_ok = buf
-            .get(found + keyword.len())
-            .is_none_or(|c| c.is_ascii_whitespace());
-        if before_ok && after_ok {
-            return Some(found);
-        }
-        search_end = found;
+/// Finds the last standalone `xref` token in `buf` that is immediately
+/// followed by a plausible classic cross-reference subsection header
+/// (`<start-id> <count>`, e.g. "0 6") — the shape every real classic xref
+/// table starts with. A single reverse byte scan: O(n) even on a
+/// pathological buffer with many non-matching or non-standalone "xref"
+/// occurrences, unlike repeatedly re-searching a shrinking prefix.
+fn find_last_valid_xref_table_start(buf: &[u8]) -> Option<usize> {
+    const KEYWORD: &[u8] = b"xref";
+    if buf.len() < KEYWORD.len() {
+        return None;
     }
-    None
+    let mut pos = buf.len() - KEYWORD.len();
+    loop {
+        if &buf[pos..pos + KEYWORD.len()] == KEYWORD {
+            let before_ok = pos == 0 || buf[pos - 1].is_ascii_whitespace();
+            let after_ok = buf
+                .get(pos + KEYWORD.len())
+                .is_none_or(|c| c.is_ascii_whitespace());
+            if before_ok && after_ok && looks_like_xref_subsection_header(buf, pos + KEYWORD.len())
+            {
+                return Some(pos);
+            }
+        }
+        if pos == 0 {
+            return None;
+        }
+        pos -= 1;
+    }
+}
+
+/// Checks that `buf[pos..]` starts (after whitespace) with two
+/// whitespace-separated runs of ASCII digits — `<start-id> <count>`, the
+/// first subsection header of a classic PDF cross-reference table.
+fn looks_like_xref_subsection_header(buf: &[u8], pos: usize) -> bool {
+    fn skip_ws(buf: &[u8], mut pos: usize) -> usize {
+        while buf.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        pos
+    }
+    fn skip_digits(buf: &[u8], mut pos: usize) -> usize {
+        while buf.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        pos
+    }
+
+    let pos = skip_ws(buf, pos);
+    let after_first_digits = skip_digits(buf, pos);
+    if after_first_digits == pos {
+        return false; // no start-id
+    }
+    let sep = skip_ws(buf, after_first_digits);
+    if sep == after_first_digits {
+        return false; // start-id and count must be whitespace-separated
+    }
+    skip_digits(buf, sep) > sep // has a count
 }
 
 fn add_repair_candidate(
@@ -6814,5 +6856,56 @@ mod tests {
         assert_eq!(cells[0].text, "");
         // Pre-filled cell was not touched.
         assert_eq!(cells[1].text, "Pre-filled");
+    }
+
+    // -- recover_startxref_pointer / find_last_valid_xref_table_start ------
+    //
+    // Direct unit tests on the byte-level scan, addressing review feedback
+    // on #230: a coincidental standalone "xref" token that isn't actually
+    // followed by a subsection header (start-id + count) must not be
+    // treated as a real table — accepting it would let lopdf "succeed"
+    // against a bogus offset and silently return garbled/empty content
+    // instead of a clean error.
+
+    #[test]
+    fn find_xref_rejects_standalone_token_without_subsection_header() {
+        // "xref" appears as a real standalone word, but nothing that looks
+        // like "<start-id> <count>" follows it.
+        let buf = b"Please refer to the xref appendix for details.";
+        assert_eq!(find_last_valid_xref_table_start(buf), None);
+    }
+
+    #[test]
+    fn find_xref_accepts_real_classic_table_header() {
+        let buf = b"garbage\nxref\n0 6\n0000000000 65535 f \n%%EOF";
+        let pos = find_last_valid_xref_table_start(buf).expect("should find the real table");
+        assert_eq!(&buf[pos..pos + 4], b"xref");
+        assert_eq!(&buf[pos..], b"xref\n0 6\n0000000000 65535 f \n%%EOF");
+    }
+
+    #[test]
+    fn find_xref_skips_coincidental_match_and_finds_real_table_before_it() {
+        // A coincidental "xref" (no subsection header) appears *after* the
+        // real table in the buffer — the scan must not stop at the first
+        // (rightmost) standalone token it finds; it must keep looking
+        // backward until one actually validates.
+        let buf = b"xref\n0 3\n0000000000 65535 f \ntrailer\nsee the xref\n";
+        let pos = find_last_valid_xref_table_start(buf).expect("should find the real table");
+        assert_eq!(pos, 0);
+    }
+
+    #[test]
+    fn find_xref_rejects_substring_of_startxref() {
+        // "xref" is a substring of "startxref" but isn't a standalone
+        // token there (not preceded by whitespace) — must not match, even
+        // though a number immediately follows it.
+        let buf = b"startxref\n1234\n%%EOF";
+        assert_eq!(find_last_valid_xref_table_start(buf), None);
+    }
+
+    #[test]
+    fn recover_startxref_pointer_returns_none_without_a_valid_table() {
+        let buf = b"Please refer to the xref appendix for details.";
+        assert!(recover_startxref_pointer(buf).is_none());
     }
 }
