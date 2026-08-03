@@ -3691,11 +3691,13 @@ fn test_isolated_page_number_footer_is_still_dropped() {
 }
 
 /// Guards against a real regression caught by review: a multi-digit page
-/// number rendered as separate single-digit `Tj` operators (a real
-/// PDF-generator pattern) must not have each digit "protect" its sibling
-/// just because the sibling is also short digits sitting nearby — that
-/// would leak the whole number into markdown. The neighbor check excludes
-/// other page-number-shaped items from counting as a protector.
+/// number rendered as separate single-digit `Tj` operators at different
+/// font sizes (a real PDF-generator pattern; the size difference also
+/// keeps `merge_text_items` from fusing them back into one item first)
+/// must not have each digit "protect" its sibling just because the
+/// sibling is also short digits sitting nearby — that would leak the
+/// whole number into markdown. The neighbor check excludes other
+/// page-number-shaped items from counting as a protector.
 #[test]
 fn test_split_digit_page_number_is_still_dropped() {
     let buf = std::fs::read("tests/fixtures/split_digit_page_number_footer.pdf").unwrap();
@@ -3706,7 +3708,7 @@ fn test_split_digit_page_number_is_still_dropped() {
         "real body text must survive, got: {md:?}"
     );
     assert!(
-        !md.contains('1') && !md.contains('2'),
+        !md.split_whitespace().any(|w| w == "1" || w == "2"),
         "a page number split across two adjacent Tj digits must still be filtered, got: {md:?}"
     );
 }
@@ -3731,5 +3733,26 @@ fn test_word_adjacent_page_number_is_still_dropped() {
         !md.split_whitespace().any(|w| w == "12"),
         "a page number at ordinary word-gap distance from unrelated text \
          must still be filtered, got: {md:?}"
+    );
+}
+
+/// Guards the fix's other real-content-recovery case, flagged by review: a
+/// form/version number embedded in a genuine multi-word title line (this
+/// fixture mirrors tests/fixtures/p1244-1996.pdf's real "Form 4070
+/// Employee's Report" line) must survive, even though its individual gaps
+/// to its neighbors are wider than the tight subscript-adjacency bound —
+/// visual size emphasis on the number widens the gap beyond ordinary
+/// word-spacing too. What distinguishes this from a footer number next to
+/// a single decorative element (a tagline, a company name) is that here
+/// there are *two* other real-text neighbors on the line, forming an
+/// actual sentence.
+#[test]
+fn test_title_embedded_number_is_not_dropped() {
+    let buf = std::fs::read("tests/fixtures/title_embedded_number.pdf").unwrap();
+    let result = process_pdf_mem(&buf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("4070"),
+        "a form number embedded in a real title line must survive, got: {md:?}"
     );
 }
