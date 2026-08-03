@@ -173,10 +173,11 @@ fn redline_edit_bands(items: &[TextItem]) -> Vec<(f32, f32)> {
 }
 
 fn is_heuristic_table_evidence(item: &TextItem, redline_bands: &[(f32, f32)]) -> bool {
-    !item.is_strikeout
-        && !redline_bands
-            .iter()
-            .any(|(y_min, y_max)| item.y >= *y_min && item.y <= *y_max)
+    !(item.is_strikeout
+        || item.is_underline
+            && redline_bands
+                .iter()
+                .any(|(y_min, y_max)| item.y >= *y_min && item.y <= *y_max))
 }
 
 /// Detect tables in a set of text items from a single page
@@ -1779,6 +1780,24 @@ mod tests {
         assert!(
             !detect_tables(&items, 12.0, false).is_empty(),
             "a distant deletion must not suppress underlined table columns"
+        );
+    }
+
+    #[test]
+    fn nearby_redline_rows_do_not_remove_plain_table_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("row value", 220.0, y, false));
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("deleted prose", 400.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "redline rows must suppress decorations, not nearby live table cells"
         );
     }
 
