@@ -86,7 +86,9 @@ fn merge_adjacent_items_preserving(
                 let decoration_changes = next_item.is_underline != first_item.is_underline
                     || next_item.is_strikeout != first_item.is_strikeout;
                 if decoration_changes
-                    && (preserved_indices.contains(&first_idx)
+                    && (indices
+                        .iter()
+                        .any(|index| preserved_indices.contains(index))
                         || preserved_indices.contains(&next_idx))
                 {
                     break;
@@ -1981,6 +1983,24 @@ mod tests {
         assert_eq!(index_map, vec![vec![0], vec![1]]);
         assert!(merged[0].is_strikeout);
         assert!(merged[1].is_underline);
+    }
+
+    #[test]
+    fn merge_adjacent_items_keeps_boundary_after_preserved_fragment() {
+        let mut prefix = body_item("prefix", 20.0, 700.0, false);
+        prefix.is_underline = true;
+        let mut replacement = body_item("replacement", 111.0, 700.0, false);
+        replacement.is_underline = true;
+        let deleted = body_item("deleted", 202.0, 700.0, true);
+        let preserved_indices = std::collections::HashSet::from([1]);
+
+        let (merged, index_map) =
+            merge_adjacent_items_preserving(&[prefix, replacement, deleted], &preserved_indices);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(index_map, vec![vec![0, 1], vec![2]]);
+        assert!(merged[0].is_underline);
+        assert!(merged[1].is_strikeout);
     }
 
     #[test]

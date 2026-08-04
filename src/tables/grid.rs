@@ -436,7 +436,8 @@ pub(crate) fn recover_header_row(
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            item.font_size > small_font_threshold
+            !item.is_strikeout
+                && item.font_size > small_font_threshold
                 && item.y > first_row_y
                 && item.y <= first_row_y + row_gap_limit
         })
@@ -802,6 +803,31 @@ mod tests {
         let rows_before = table.rows.len();
         recover_header_row(&mut table, &all_items, 9.0);
         assert_eq!(table.rows.len(), rows_before);
+    }
+
+    #[test]
+    fn test_recover_header_row_skips_strikeout_candidates() {
+        let mut old_col1 = make_item("Old Col1", 100.0, 520.0, 12.0);
+        old_col1.is_strikeout = true;
+        let mut old_col2 = make_item("Old Col2", 200.0, 520.0, 12.0);
+        old_col2.is_strikeout = true;
+        let all_items = vec![
+            old_col1,
+            old_col2,
+            make_item("A", 100.0, 500.0, 8.0),
+            make_item("B", 200.0, 500.0, 8.0),
+        ];
+        let mut table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0, 480.0],
+            cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
+            item_indices: vec![2, 3],
+            kind: TableKind::Data,
+        };
+
+        recover_header_row(&mut table, &all_items, 9.0);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.cells[0], vec!["A", "B"]);
     }
 
     #[test]
