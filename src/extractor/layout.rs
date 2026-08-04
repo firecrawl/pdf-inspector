@@ -125,9 +125,13 @@ pub(crate) fn detect_columns(
     // than the peaks on either side.
     // Only attempt this for dense pages (>=100 items) — sparse pages with shallow
     // histogram dips are likely not multi-column.
-    // Skip on pages with detected tables — table column gaps look like gutters
-    // in the histogram but the table pipeline already handles reading order.
-    if valleys.is_empty() && page_items.len() >= 100 && !page_has_table {
+    // This runs even on pages with a detected table: two-column prose and a table
+    // routinely coexist on one page (e.g. a fund factsheet whose left/right columns
+    // sit above a returns table), and gating the fallback on `page_has_table`
+    // collapses those pages to single-column, Y-interleaved reading order. The
+    // `columns_have_prose` check below is the real table defense — table column
+    // gaps produce many-items-per-line splits that it rejects.
+    if valleys.is_empty() && page_items.len() >= 100 {
         let rel_valleys = find_relative_valleys(
             &histogram,
             num_bins,
@@ -168,9 +172,13 @@ pub(crate) fn detect_columns(
                 }
             }
         }
-        // Try XY-cut fallback before giving up
-        if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
-            return columns;
+        // Try XY-cut fallback before giving up. Unlike the relative-valley path,
+        // this has no prose guard, so a table's widest column gap could be read
+        // as a page gutter — keep it off when the page has a detected table.
+        if !page_has_table {
+            if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
+                return columns;
+            }
         }
         return vec![ColumnRegion { x_min, x_max }];
     }
@@ -2646,6 +2654,27 @@ mod tests {
         assert!(
             (280.0..=310.0).contains(&gutter),
             "Gutter at {gutter}, expected ~295"
+        );
+    }
+
+    #[test]
+    fn relative_valley_detects_columns_even_with_table_on_page() {
+        // Regression: two-column justified prose and a table routinely coexist
+        // on one page (e.g. a fund factsheet whose left/right text columns sit
+        // above a returns table). Gating the relative-valley fallback on
+        // `page_has_table` collapsed such pages to a single column, producing
+        // Y-interleaved reading order. The `columns_have_prose` guard — not the
+        // page-level table flag — is what keeps genuine tables from being split.
+        let mut items = Vec::new();
+        items.extend(fill_zone_justified(1, 40.0, 290.0, 7.0, 750.0, 50.0));
+        items.extend(fill_zone_justified(1, 300.0, 550.0, 7.0, 750.0, 50.0));
+
+        let cols = detect_columns(&items, 1, /* page_has_table */ true);
+        assert_eq!(
+            cols.len(),
+            2,
+            "Two-column prose must still split when the page also has a table, got {}",
+            cols.len()
         );
     }
 
