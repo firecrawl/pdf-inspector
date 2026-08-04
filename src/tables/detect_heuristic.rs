@@ -159,10 +159,9 @@ fn expand_consolidated_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<usize>) 
     (expanded, index_map)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RedlineEditRegion {
-    x_min: f32,
-    x_max: f32,
+    x_ranges: Vec<(f32, f32)>,
     y_min: f32,
     y_max: f32,
     spans_page_width: bool,
@@ -199,20 +198,20 @@ fn redline_edit_regions(items: &[TextItem], page_width: f32) -> Vec<RedlineEditR
     const Y_PADDING: f32 = 36.0;
     const X_PADDING: f32 = 12.0;
     const PAGE_WIDTH_RATIO: f32 = 0.35;
+    const MAX_HORIZONTAL_GAP_RATIO: f32 = 0.20;
 
     let mut strikeouts: Vec<&TextItem> = items.iter().filter(|item| item.is_strikeout).collect();
     strikeouts.sort_by(|a, b| a.y.total_cmp(&b.y));
 
-    let mut rows: Vec<(f32, f32, f32)> = Vec::new();
+    let mut rows: Vec<(f32, Vec<(f32, f32)>)> = Vec::new();
     for item in strikeouts {
-        if let Some((_, x_min, x_max)) = rows
+        if let Some((_, x_ranges)) = rows
             .last_mut()
-            .filter(|(y, _, _)| (item.y - *y).abs() <= ROW_DEDUP_TOLERANCE)
+            .filter(|(y, _)| (item.y - *y).abs() <= ROW_DEDUP_TOLERANCE)
         {
-            *x_min = x_min.min(item.x);
-            *x_max = x_max.max(item.x + item.width);
+            x_ranges.push((item.x, item.x + item.width));
         } else {
-            rows.push((item.y, item.x, item.x + item.width));
+            rows.push((item.y, vec![(item.x, item.x + item.width)]));
         }
     }
 
@@ -224,23 +223,40 @@ fn redline_edit_regions(items: &[TextItem], page_width: f32) -> Vec<RedlineEditR
             end += 1;
         }
         if end - start >= 2 {
-            let x_min = rows[start..end]
+            let mut x_ranges: Vec<(f32, f32)> = rows[start..end]
                 .iter()
-                .map(|(_, x_min, _)| *x_min)
-                .fold(f32::INFINITY, f32::min);
-            let x_max = rows[start..end]
+                .flat_map(|(_, x_ranges)| x_ranges.iter().copied())
+                .collect();
+            x_ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut merged_ranges: Vec<(f32, f32)> = Vec::new();
+            for (x_min, x_max) in x_ranges {
+                // Modest inline gaps can separate fragments of one flowing
+                // edit; column-scale gaps must remain distinct spatial masks.
+                if let Some((_, merged_max)) = merged_ranges.last_mut().filter(|(_, merged_max)| {
+                    x_min - *merged_max <= page_width * MAX_HORIZONTAL_GAP_RATIO
+                }) {
+                    *merged_max = merged_max.max(x_max);
+                } else {
+                    merged_ranges.push((x_min, x_max));
+                }
+            }
+            let covered_width: f32 = merged_ranges
                 .iter()
-                .map(|(_, _, x_max)| *x_max)
-                .fold(f32::NEG_INFINITY, f32::max);
+                .map(|(x_min, x_max)| x_max - x_min)
+                .sum();
+            for (x_min, x_max) in &mut merged_ranges {
+                *x_min -= X_PADDING;
+                *x_max += X_PADDING;
+            }
             // Redlines spread across much of the text width are flowing prose,
             // so their whole Y-band is ambiguous. Compact edits can be scoped
-            // horizontally without hiding a neighboring table.
+            // to their actual horizontal spans without hiding content between
+            // unrelated edits in separate columns.
             regions.push(RedlineEditRegion {
-                x_min: x_min - X_PADDING,
-                x_max: x_max + X_PADDING,
+                x_ranges: merged_ranges,
                 y_min: rows[start].0 - Y_PADDING,
                 y_max: rows[end - 1].0 + Y_PADDING,
-                spans_page_width: x_max - x_min >= page_width * PAGE_WIDTH_RATIO,
+                spans_page_width: covered_width >= page_width * PAGE_WIDTH_RATIO,
             });
         }
         start = end;
@@ -259,6 +275,16 @@ fn redline_edit_regions(items: &[TextItem], page_width: f32) -> Vec<RedlineEditR
         }
     }
     regions
+}
+
+fn overlaps_redline_x(item: &TextItem, region: &RedlineEditRegion) -> bool {
+    let range_index = region
+        .x_ranges
+        .partition_point(|(_, x_max)| *x_max < item.x);
+    region
+        .x_ranges
+        .get(range_index)
+        .is_some_and(|(x_min, _)| item.x + item.width >= *x_min)
 }
 
 fn has_distinct_rows(
@@ -371,7 +397,7 @@ fn is_heuristic_table_evidence(
         return false;
     }
 
-    let overlaps_x = item.x + item.width >= region.x_min && item.x <= region.x_max;
+    let overlaps_x = overlaps_redline_x(item, region);
     !overlaps_x || is_revised_table_cell(item, columns)
 }
 
@@ -397,8 +423,7 @@ fn revised_table_cell_indices(
             let region_index = redline_region_at_y(redline_regions, item.y)?;
             let region = &redline_regions[region_index];
             (item.is_underline
-                && item.x + item.width >= region.x_min
-                && item.x <= region.x_max
+                && overlaps_redline_x(item, region)
                 && is_revised_table_cell(item, &underlined_table_columns[region_index]))
             .then_some(item_index)
         })
@@ -2083,6 +2108,31 @@ mod tests {
         assert!(
             !detect_tables(&items, 12.0, false).is_empty(),
             "redline rows must suppress decorations, not nearby live table cells"
+        );
+    }
+
+    #[test]
+    fn separate_strikeout_columns_do_not_suppress_content_between_them() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 160.0, y, false));
+            items.push(body_item("row value", 280.0, y, false));
+        }
+        for (row, y) in [700.0, 684.0, 668.0, 652.0].into_iter().enumerate() {
+            let x = if row % 2 == 0 { 50.0 } else { 420.0 };
+            let mut deletion = body_item("old", x, y, true);
+            deletion.width = 30.0;
+            items.push(deletion);
+        }
+
+        let regions = redline_edit_regions(&items, content_width(&items));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].x_ranges.len(), 2);
+        assert!(!regions[0].spans_page_width);
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "separate edit columns must not create a suppression bridge across the page"
         );
     }
 
