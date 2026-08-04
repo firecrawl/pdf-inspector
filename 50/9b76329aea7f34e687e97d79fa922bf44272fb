@@ -1,0 +1,20 @@
+src/tables/detect_heuristic.rs
+  s_e0bc3a40268aa0::t_62dcf060aac2b9 86-90,337-339
+  s_e0bc3a40268aa0::t_292923df117590 2037-2053,2179-2195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "509b76329aea7f34e687e97d79fa922bf44272fb",
+  "prompts": {},
+  "sessions": {
+    "s_e0bc3a40268aa0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc0f2-05c3-72d2-be98-413996646886",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
