@@ -1206,6 +1206,9 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
     let mut cmap = ToUnicodeCMap::new();
     let mut use_cmap: Option<String> = None;
 
+    // bfchar/bfrange source codes are always 2 raw bytes (ucs2DataSize=1).
+    let ucs2_data_size = 1;
+
     while let Some(b) = stream.read_byte() {
         let typ = b >> 5;
         if typ == 7 {
@@ -1228,61 +1231,127 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
         }
         let subitems = stream.read_number()? as usize;
         match typ {
+            0 | 1 => {
+                // codespacerange (0) / notdefrange (1).
+                // First start is raw bytes; every end/start after that is a
+                // varint delta added to the previous value. Type 1 reads an
+                // extra code that we discard. We only need to consume the
+                // payload — the UCS2 map's code length is fixed at 2.
+                let mut start = stream.read_hex_bytes(data_size + 1)?;
+                let mut end = start.clone();
+                let end_delta = stream.read_hex_number(data_size)?;
+                add_hex(&mut end, &end_delta);
+                if typ == 1 {
+                    stream.read_number()?;
+                }
+                for _ in 1..subitems {
+                    inc_hex(&mut end);
+                    let start_delta = stream.read_hex_number(data_size)?;
+                    start = end.clone();
+                    add_hex(&mut start, &start_delta);
+                    let end_delta = stream.read_hex_number(data_size)?;
+                    end = start.clone();
+                    add_hex(&mut end, &end_delta);
+                    if typ == 1 {
+                        stream.read_number()?;
+                    }
+                }
+            }
+            2 | 3 => {
+                // cidchar (2) / cidrange (3): CID→CID maps, irrelevant to
+                // ToUnicode. Consume the payload faithfully so the stream
+                // stays aligned.
+                let mut first = stream.read_hex_bytes(data_size + 1)?;
+                if typ == 2 {
+                    // cidchar: first char raw, first code varint.
+                    let mut _code = stream.read_number()?;
+                    for _ in 1..subitems {
+                        inc_hex(&mut first);
+                        if !sequence {
+                            let tmp = stream.read_hex_number(data_size)?;
+                            add_hex(&mut first, &tmp);
+                        }
+                        // Code is a signed delta added to (previous + 1).
+                        // The value is discarded; only the stream position matters.
+                        _code = stream
+                            .read_signed()?
+                            .checked_add(i64::from(_code) + 1)
+                            .ok_or("overflow in cidchar code")?
+                            as u32;
+                    }
+                } else {
+                    // cidrange: first start raw, first end delta, first code varint.
+                    let mut end = first.clone();
+                    let end_delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut end, &end_delta);
+                    for _ in 1..subitems {
+                        inc_hex(&mut end);
+                        if !sequence {
+                            let start_delta = stream.read_hex_number(data_size)?;
+                            first = end.clone();
+                            add_hex(&mut first, &start_delta);
+                        } else {
+                            first = end.clone();
+                        }
+                        let end_delta = stream.read_hex_number(data_size)?;
+                        end = first.clone();
+                        add_hex(&mut end, &end_delta);
+                        let _ = stream.read_number()?;
+                    }
+                }
+            }
             4 => {
-                // bfchar
-                for i in 0..subitems {
-                    let src = stream.read_hex_number(1)?;
-                    let dst = stream.read_hex_bytes(data_size + 1)?;
+                // bfchar: src is 2 raw bytes; dst is data_size+1 raw bytes
+                // (first), then prev dst + 1 + signed delta for subsequent
+                // subitems.
+                let mut src = stream.read_hex_bytes(ucs2_data_size + 1)?;
+                let mut dst = stream.read_hex_bytes(data_size + 1)?;
+                let src_code = hex_to_u32(&src) as u16;
+                if let Some(s) = bytes_to_unicode_string(&dst) {
+                    cmap.char_map.insert(src_code, s);
+                }
+                for _ in 1..subitems {
+                    inc_hex(&mut src);
+                    if !sequence {
+                        let tmp = stream.read_hex_number(ucs2_data_size)?;
+                        add_hex(&mut src, &tmp);
+                    }
+                    inc_hex(&mut dst);
+                    let tmp = stream.read_hex_signed(data_size)?;
+                    add_hex(&mut dst, &tmp);
                     let src_code = hex_to_u32(&src) as u16;
                     if let Some(s) = bytes_to_unicode_string(&dst) {
                         cmap.char_map.insert(src_code, s);
                     }
-                    if i + 1 < subitems && sequence {
-                        // sequence handled by encoded data, nothing to do
-                    }
                 }
             }
             5 => {
-                // bfrange
-                for _ in 0..subitems {
-                    let start = stream.read_hex_number(1)?;
-                    let end_delta = stream.read_hex_number(1)?;
-                    let mut end = start.clone();
+                // bfrange: start is 2 raw bytes; end = start + varint delta;
+                // dst is data_size+1 raw bytes read fresh for every subitem.
+                let mut start = stream.read_hex_bytes(ucs2_data_size + 1)?;
+                let mut end = start.clone();
+                let end_delta = stream.read_hex_number(ucs2_data_size)?;
+                add_hex(&mut end, &end_delta);
+                let dst = stream.read_hex_bytes(data_size + 1)?;
+                insert_bfrange(&mut cmap, &start, &end, &dst);
+                for _ in 1..subitems {
+                    inc_hex(&mut end);
+                    if !sequence {
+                        let start_delta = stream.read_hex_number(ucs2_data_size)?;
+                        start = end.clone();
+                        add_hex(&mut start, &start_delta);
+                    } else {
+                        start = end.clone();
+                    }
+                    let end_delta = stream.read_hex_number(ucs2_data_size)?;
+                    end = start.clone();
                     add_hex(&mut end, &end_delta);
                     let dst = stream.read_hex_bytes(data_size + 1)?;
-                    let start_code = hex_to_u32(&start) as u16;
-                    let end_code = hex_to_u32(&end) as u16;
-                    if let Some(s) = bytes_to_unicode_string(&dst) {
-                        if s.chars().count() == 1 {
-                            let base = s.chars().next().unwrap() as u32;
-                            cmap.ranges.push((start_code, end_code, base));
-                        } else {
-                            // Expand multi-char sequences
-                            let mut cid = start_code;
-                            for ch in s.chars() {
-                                cmap.char_map.insert(cid, ch.to_string());
-                                if cid == end_code {
-                                    break;
-                                }
-                                cid = cid.saturating_add(1);
-                            }
-                        }
-                    }
+                    insert_bfrange(&mut cmap, &start, &end, &dst);
                 }
             }
             _ => {
-                // Skip unsupported types by consuming their payload.
-                // We only implement bfchar/bfrange for UCS2 maps.
-                for _ in 0..subitems {
-                    // Best-effort skip: read a few fields based on type.
-                    if typ <= 3 {
-                        let _ = stream.read_hex_number(data_size)?;
-                        let _ = stream.read_hex_number(data_size)?;
-                        if typ >= 1 {
-                            let _ = stream.read_number()?;
-                        }
-                    }
-                }
+                return Err(format!("unsupported bcmap type {typ}"));
             }
         }
     }
@@ -1296,6 +1365,30 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
         }
     }
     Ok(cmap)
+}
+
+/// Insert a single bfrange entry into the CMap. Single-char destinations go
+/// into `ranges`; multi-char sequences are expanded across the CID span.
+fn insert_bfrange(cmap: &mut ToUnicodeCMap, start: &[u8], end: &[u8], dst: &[u8]) {
+    let start_code = hex_to_u32(start) as u16;
+    let end_code = hex_to_u32(end) as u16;
+    let Some(s) = bytes_to_unicode_string(dst) else {
+        return;
+    };
+    if s.chars().count() == 1 {
+        let base = s.chars().next().unwrap() as u32;
+        cmap.ranges.push((start_code, end_code, base));
+    } else {
+        // Expand multi-char sequences
+        let mut cid = start_code;
+        for ch in s.chars() {
+            cmap.char_map.insert(cid, ch.to_string());
+            if cid == end_code {
+                break;
+            }
+            cid = cid.saturating_add(1);
+        }
+    }
 }
 
 struct BinaryCMapStream<'a> {
@@ -1368,6 +1461,31 @@ impl<'a> BinaryCMapStream<'a> {
         Ok(out)
     }
 
+    /// Signed varint: pdf.js zigzag encoding `n & 1 ? ~(n >>> 1) : n >>> 1`.
+    fn read_signed(&mut self) -> Result<i64, String> {
+        let n = self.read_number()?;
+        Ok(if n & 1 != 0 {
+            !(n >> 1) as i64
+        } else {
+            (n >> 1) as i64
+        })
+    }
+
+    /// Signed big-endian field of `size + 1` bytes. The sign is packed into
+    /// the low bit of the last byte: even = non-negative (`v >> 1`), odd =
+    /// negative (`(v >> 1) ^ 0xFF`). Matches pdf.js `readHexSigned`.
+    fn read_hex_signed(&mut self, size: usize) -> Result<Vec<u8>, String> {
+        let num = self.read_hex_number(size)?;
+        let sign = if num[size] & 1 != 0 { 255 } else { 0 };
+        let mut out = vec![0u8; size + 1];
+        let mut c = 0u16;
+        for i in 0..=size {
+            c = ((c & 1) << 8) | u16::from(num[i]);
+            out[i] = ((c >> 1) as u8) ^ sign;
+        }
+        Ok(out)
+    }
+
     fn read_string(&mut self) -> Result<String, String> {
         let len = self.read_number()? as usize;
         let mut buf = Vec::with_capacity(len);
@@ -1393,6 +1511,16 @@ fn add_hex(a: &mut [u8], b: &[u8]) {
         c += a[i] as u16 + b[i] as u16;
         a[i] = (c & 0xff) as u8;
         c >>= 8;
+    }
+}
+
+/// Increment a big-endian byte array by one.
+fn inc_hex(a: &mut [u8]) {
+    for i in (0..a.len()).rev() {
+        a[i] = a[i].wrapping_add(1);
+        if a[i] != 0 {
+            break;
+        }
     }
 }
 
@@ -1916,6 +2044,43 @@ fn build_cmap_from_cid_system_info(
         "Japan1" | "GB1" | "CNS1" => build_cmap_from_builtin_cmap(&ordering),
         _ => None,
     }
+}
+
+/// Look up the predefined (builtin) ToUnicode map for a Type0/CID font's
+/// CIDSystemInfo, if the font is Identity-H/V encoded and has no ToUnicode
+/// CMap of its own. This lets GID-flagging decide whether the font's gid
+/// codes are actually decodable through the bundled Adobe bcmaps (CNS1/GB1/
+/// Japan1) rather than assuming an Identity-H font without ToUnicode is
+/// necessarily garbage.
+pub(crate) fn predefined_cmap_for_font(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+) -> Option<ToUnicodeCMap> {
+    if font_dict.get(b"ToUnicode").is_ok() {
+        return None;
+    }
+    let encoding = font_dict
+        .get(b"Encoding")
+        .ok()
+        .and_then(|o| o.as_name().ok())?;
+    if encoding != b"Identity-H" && encoding != b"Identity-V" {
+        return None;
+    }
+    let desc_fonts = font_dict.get(b"DescendantFonts").ok()?;
+    let desc_fonts = match desc_fonts {
+        Object::Array(arr) => arr.clone(),
+        Object::Reference(r) => match doc.get_object(*r) {
+            Ok(Object::Array(arr)) => arr.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let cid_font_dict = match desc_fonts.first() {
+        Some(Object::Reference(r)) => doc.get_dictionary(*r).ok()?,
+        Some(Object::Dictionary(d)) => d,
+        _ => return None,
+    };
+    build_cmap_from_cid_system_info(cid_font_dict, doc)
 }
 
 /// Collection of ToUnicode CMaps indexed by ToUnicode stream object number
@@ -2585,6 +2750,55 @@ endcmap
         assert_eq!(cmap.lookup(0x0003), Some(" ".to_string()));
         assert_eq!(cmap.lookup(0x0024), Some("A".to_string()));
         assert_eq!(cmap.lookup(0x0025), Some("B".to_string()));
+    }
+
+    #[test]
+    fn test_parse_real_ucs2_bcmaps() {
+        // The bundled Adobe UCS2 bcmaps (from pdf.js) must parse. Before the
+        // binary-CMap rewrite these all failed with "unexpected EOF", silently
+        // disabling the CIDSystemInfo fallback for Adobe-CNS1/GB1/Japan1 fonts
+        // (e.g. DFMingStd in traditional-Chinese book PDFs).
+        let cases = [
+            ("Adobe-CNS1-UCS2.bcmap", 15_000, 500),
+            ("Adobe-GB1-UCS2.bcmap", 10_000, 3_000),
+            ("Adobe-Japan1-UCS2.bcmap", 16_000, 1_000),
+            ("Adobe-Korea1-UCS2.bcmap", 6_000, 1_900),
+        ];
+        for (name, min_char, min_ranges) in cases {
+            let data = read_builtin_cmap_file(name)
+                .unwrap_or_else(|| panic!("missing bundled bcmap {}", name));
+            let cmap = parse_binary_cmap(&data)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {}", name, e));
+            assert!(
+                cmap.char_map.len() >= min_char,
+                "{} char_map too small: {}",
+                name,
+                cmap.char_map.len()
+            );
+            assert!(
+                cmap.ranges.len() >= min_ranges,
+                "{} ranges too small: {}",
+                name,
+                cmap.ranges.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_cns1_sample_mappings() {
+        // Spot-check the Adobe-CNS1 predefined map, which is what makes
+        // traditional-Chinese CID fonts (no ToUnicode) decodable.
+        let data = read_builtin_cmap_file("Adobe-CNS1-UCS2.bcmap").expect("missing CNS1 bcmap");
+        let cmap = parse_binary_cmap(&data).expect("CNS1 bcmap parse failed");
+        for (cid, expected) in [
+            (1625u16, "的"),
+            (1702u16, "信"),
+            (1972u16, "相"),
+            (610u16, "力"),
+            (5000u16, "險"),
+        ] {
+            assert_eq!(cmap.lookup(cid), Some(expected.to_string()), "CID {}", cid);
+        }
     }
 
     #[test]

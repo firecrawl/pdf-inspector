@@ -1418,55 +1418,41 @@ fn test_firecrawl_tagged_pdf_struct_tree() {
 }
 
 #[test]
-fn test_identity_h_no_tounicode_suppresses_garbage() {
+fn test_identity_h_yugothic_decoded_via_builtin_japan1() {
     // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no
-    // usable ToUnicode CMap. The raw CID bytes (e.g. 0x08 0x37, 0x0E 0x0F)
-    // contain non-ASCII high bytes and previously fell through to the
-    // per-byte Latin-1 fallback, producing high-Latin-1 mojibake that
-    // `is_cid_garbage` flagged. The Type0/CID guard in
-    // `extract_text_from_operand` now emits one U+FFFD per CID instead of
-    // mojibake; `detect_encoding_issues` trips on that and suppresses the
-    // markdown / flags the page for OCR — so we still pass this test, but
-    // via the deliberate marker path rather than by accident.
+    // ToUnicode CMap. Its CIDSystemInfo Ordering is Japan1, so the bundled
+    // Adobe-Japan1-UCS2.bcmap predefined map decodes it (poppler does the
+    // same). Before the binary-CMap fix this map failed to parse and the
+    // font fell through to U+FFFD garbage / OCR routing.
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
 
-    // Pre-suppression check: the raw text items must contain the U+FFFD
-    // markers that prove the Type0/CID fallback fired. This pins the
-    // mechanism so a future regression that re-enables Latin-1 mojibake
-    // would fail loudly here, not just silently change the suppression
-    // chain to one that depends on `is_cid_garbage` + high-Latin-1 chars.
+    // The text must decode to real Japanese, with no U+FFFD markers.
     let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
     let combined: String = items.iter().map(|i| i.text.as_str()).collect();
     assert!(
-        combined.contains('\u{FFFD}'),
-        "Type0/CID font with unparseable ToUnicode CMap should emit U+FFFD per CID; \
-         got {} chars: {:?}",
-        combined.len(),
-        &combined[..combined.len().min(100)]
+        !combined.contains('\u{FFFD}'),
+        "Japan1 Identity-H font should decode via builtin CMap, got U+FFFD: {:?}",
+        combined.chars().take(120).collect::<String>()
     );
     assert!(
-        !combined
-            .chars()
-            .any(|c| ('\u{0080}'..='\u{00FF}').contains(&c)),
-        "Latin-1 mojibake (high bytes) must not leak from Type0/CID fallback; got: {:?}",
-        &combined[..combined.len().min(100)]
+        combined.contains("羽田空港"),
+        "Should extract real Japanese title, got: {:?}",
+        combined.chars().take(120).collect::<String>()
     );
 
     let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
 
-    // Page 1 should be flagged for OCR
+    // The page is now decodable, so it should NOT be flagged for OCR and the
+    // markdown should contain real Japanese.
     assert!(
-        result.pages_needing_ocr.contains(&1),
-        "Page with Identity-H font without ToUnicode should be flagged for OCR"
+        !result.pages_needing_ocr.contains(&1),
+        "Decodable Japan1 page should not be flagged for OCR"
     );
-
-    // Markdown should be empty (garbage suppressed)
     let md = result.markdown.unwrap_or_default();
     assert!(
-        md.trim().is_empty(),
-        "Garbage CID text should be suppressed, got {} chars: {:?}",
-        md.len(),
-        &md[..md.len().min(100)]
+        md.contains("羽田空港"),
+        "Markdown should contain real Japanese, got: {:?}",
+        md.chars().take(120).collect::<String>()
     );
 }
 
@@ -3236,14 +3222,17 @@ fn test_extract_pages_markdown_invalid_buffer() {
 }
 
 #[test]
-fn test_extract_pages_markdown_gid_pages_need_ocr() {
-    // shinagawa_identity_h.pdf has GID-encoded fonts
+fn test_extract_pages_markdown_japan1_decodes_no_ocr() {
+    // shinagawa_identity_h.pdf uses Japan1 CID fonts (YuGothic). With the
+    // bundled Adobe-Japan1-UCS2.bcmap predefined map these now decode to real
+    // Japanese, so the page must NOT be flagged for OCR (poppler agrees).
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
     let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
 
     assert_eq!(result.pages.len(), 1);
-    assert!(result.pages[0].needs_ocr);
-    assert!(result.pages_needing_ocr.contains(&1)); // 1-indexed
+    assert!(!result.pages[0].needs_ocr);
+    assert!(result.pages[0].markdown.contains("羽田空港"));
+    assert!(!result.pages_needing_ocr.contains(&1)); // 1-indexed
 }
 
 #[test]
