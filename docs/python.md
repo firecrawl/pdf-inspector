@@ -111,13 +111,18 @@ class PdfResult:                     # process_pdf / detect_pdf
     markdown: str | None             # extracted Markdown (None for detect_pdf)
     page_count: int
     processing_time_ms: int
-    pages_needing_ocr: list[int]
+    pages_needing_ocr: list[int]     # 1-indexed
+    ocr_reasons_by_page: list[PageOcrReasons]
     title: str | None
     confidence: float                # 0.0 - 1.0
     is_complex_layout: bool
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool        # broken font encodings — consider OCR fallback
+
+class PageOcrReasons:                # per-page OCR diagnostics
+    page: int                        # 1-indexed
+    reasons: list[str]               # machine-readable reason identifiers
 
 class PdfClassification:             # classify_pdf
     pdf_type: str
@@ -140,14 +145,20 @@ class TextItem:                      # extract_text_with_positions
     is_strikeout: bool
     item_type: str
 
+class RegionText:                    # extract_text_in_regions
+    text: str
+    needs_ocr: bool
+    ocr_reason: str | None           # machine-readable OCR reason
+
 class PageRegionTexts:               # extract_text_in_regions
     page: int                        # 0-indexed
-    regions: list[RegionText]        # RegionText: text: str, needs_ocr: bool
+    regions: list[RegionText]
 
 class PagesExtractionResult:         # extract_pages_markdown
-    pages: list[PageMarkdown]        # PageMarkdown: page (0-indexed), markdown, needs_ocr
+    pages: list[PageMarkdown]        # PageMarkdown: page (0-indexed), markdown, needs_ocr, ocr_reason
     pages_with_tables: list[int]     # 1-indexed
     pages_with_columns: list[int]    # 1-indexed
     pages_needing_ocr: list[int]     # 1-indexed
+    ocr_reasons_by_page: list[PageOcrReasons]
     is_complex: bool                 # any page has tables or multi-column layout
 ```

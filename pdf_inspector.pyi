@@ -10,12 +10,22 @@ class PdfResult:
     page_count: int
     processing_time_ms: int
     pages_needing_ocr: list[int]
+    """1-indexed page numbers that need OCR."""
+    ocr_reasons_by_page: list["PageOcrReasons"]
+    """Machine-readable OCR reasons by 1-indexed page."""
     title: Optional[str]
     confidence: float
     is_complex_layout: bool
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool
+
+class PageOcrReasons:
+    """OCR reasons for a single 1-indexed page."""
+    page: int
+    """1-indexed page number."""
+    reasons: list[str]
+    """Machine-readable OCR reason identifiers."""
 
 class PdfClassification:
     """Lightweight PDF classification result."""
@@ -47,6 +57,8 @@ class RegionText:
     text: str
     needs_ocr: bool
     """True when the text should not be trusted."""
+    ocr_reason: Optional[str]
+    """Machine-readable OCR reason when the cause is known."""
 
 class PageRegionTexts:
     """Extracted text for one page's regions."""
@@ -62,6 +74,8 @@ class PageMarkdown:
     """Formatted markdown for this page (empty string when needs_ocr is True)."""
     needs_ocr: bool
     """True when text on this page is unreliable and OCR should be used instead."""
+    ocr_reason: Optional[str]
+    """Machine-readable OCR reason when the cause is known."""
 
 class PagesExtractionResult:
     """Per-page markdown output with document-wide layout classification."""
@@ -73,6 +87,8 @@ class PagesExtractionResult:
     """1-indexed pages where multi-column layout was detected."""
     pages_needing_ocr: list[int]
     """1-indexed pages that need OCR."""
+    ocr_reasons_by_page: list[PageOcrReasons]
+    """Machine-readable OCR reasons by 1-indexed page."""
     is_complex: bool
     """True if any page has tables or multi-column layout."""
 
