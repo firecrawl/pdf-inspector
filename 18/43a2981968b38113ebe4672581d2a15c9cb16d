@@ -1,0 +1,21 @@
+src/extractor/underline.rs
+  s_e0bc3a40268aa0::t_cb1039249ea852 816-818,820,822-823,839-858
+  s_e0bc3a40268aa0::t_864f9fc0f8bc1e 424,492-493
+  s_e0bc3a40268aa0::t_97e1130e2d9220 399,402,406-423,425-431,435-453,455-460,463-477,480-482,484-491,494-526,529-531,619-631,638-639,650,653-654
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "1843a2981968b38113ebe4672581d2a15c9cb16d",
+  "prompts": {},
+  "sessions": {
+    "s_e0bc3a40268aa0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc0f2-05c3-72d2-be98-413996646886",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
