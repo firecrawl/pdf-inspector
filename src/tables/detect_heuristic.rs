@@ -259,8 +259,36 @@ fn redline_edit_regions(items: &[TextItem], page_width: f32) -> Vec<RedlineEditR
     regions
 }
 
-/// Repeated underlined items at the same X position are table-shaped evidence
-/// in a compact redline region, where they commonly represent revised cells.
+fn has_distinct_rows(
+    items: &[&TextItem],
+    underlined_only: bool,
+    required: usize,
+    tolerance: f32,
+) -> bool {
+    debug_assert!(required <= 3);
+    let mut rows = [0.0; 3];
+    let mut row_count = 0;
+    for item in items {
+        if underlined_only && !item.is_underline {
+            continue;
+        }
+        if rows[..row_count]
+            .iter()
+            .all(|row| (item.y - row).abs() > tolerance)
+        {
+            rows[row_count] = item.y;
+            row_count += 1;
+            if row_count == required {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Aligned live items seeded by underline evidence form revised table columns.
+/// Compact edits accept one replacement backed by surrounding live rows; wide
+/// prose-like edits require replacements on at least two distinct rows.
 fn underlined_table_columns(
     items: &[TextItem],
     redline_regions: &[RedlineEditRegion],
@@ -268,77 +296,49 @@ fn underlined_table_columns(
     const X_ALIGNMENT_TOLERANCE: f32 = 4.0;
     const ROW_DEDUP_TOLERANCE: f32 = 8.0;
 
-    // Sort underlines once by Y. Because redline regions are non-overlapping,
-    // the cursor assigns each underline to at most one region.
-    let mut underlined: Vec<&TextItem> = items.iter().filter(|item| item.is_underline).collect();
-    underlined.sort_by(|a, b| a.y.total_cmp(&b.y));
+    // Sort once globally by X, then partition candidates into their unique Y
+    // regions. Each regional vector remains X-sorted without another sort.
+    let mut live_items: Vec<&TextItem> = items.iter().filter(|item| !item.is_strikeout).collect();
+    live_items.sort_by(|a, b| a.x.total_cmp(&b.x));
+    let mut candidates_by_region: Vec<Vec<&TextItem>> = vec![Vec::new(); redline_regions.len()];
+    for item in live_items {
+        if let Some(region_index) = redline_region_at_y(redline_regions, item.y) {
+            candidates_by_region[region_index].push(item);
+        }
+    }
 
     let mut columns_by_region = Vec::with_capacity(redline_regions.len());
-    let mut underline_start = 0;
-    for region in redline_regions {
-        if region.spans_page_width {
-            columns_by_region.push(Vec::new());
-            continue;
-        }
-        while underline_start < underlined.len() && underlined[underline_start].y < region.y_min {
-            underline_start += 1;
-        }
-        let mut underline_end = underline_start;
-        while underline_end < underlined.len() && underlined[underline_end].y <= region.y_max {
-            underline_end += 1;
-        }
-
-        let mut candidates = underlined[underline_start..underline_end].to_vec();
-        candidates.sort_by(|a, b| a.x.total_cmp(&b.x));
-
+    for (region, candidates) in redline_regions.iter().zip(candidates_by_region) {
         let mut columns: Vec<UnderlinedTableColumn> = Vec::new();
-        let mut left = 0;
-        let mut min_y_indices = std::collections::VecDeque::new();
-        let mut max_y_indices = std::collections::VecDeque::new();
-        for (index, item) in candidates.iter().enumerate() {
-            while left < index && item.x - candidates[left].x > X_ALIGNMENT_TOLERANCE {
-                if min_y_indices.front() == Some(&left) {
-                    min_y_indices.pop_front();
-                }
-                if max_y_indices.front() == Some(&left) {
-                    max_y_indices.pop_front();
-                }
-                left += 1;
+        let mut start = 0;
+        while start < candidates.len() {
+            let mut end = start + 1;
+            while end < candidates.len()
+                && candidates[end].x - candidates[start].x <= X_ALIGNMENT_TOLERANCE
+            {
+                end += 1;
             }
-
-            let has_aligned_peer = min_y_indices
-                .front()
-                .is_some_and(|&peer| (item.y - candidates[peer].y).abs() > ROW_DEDUP_TOLERANCE)
-                || max_y_indices
-                    .front()
-                    .is_some_and(|&peer| (item.y - candidates[peer].y).abs() > ROW_DEDUP_TOLERANCE);
-            if has_aligned_peer {
-                let x_min = item.x - X_ALIGNMENT_TOLERANCE;
-                let x_max = item.x + X_ALIGNMENT_TOLERANCE;
+            let aligned_items = &candidates[start..end];
+            let enough_live_rows = has_distinct_rows(aligned_items, false, 3, ROW_DEDUP_TOLERANCE);
+            let required_underlined_rows = if region.spans_page_width { 2 } else { 1 };
+            let enough_underlined_rows = has_distinct_rows(
+                aligned_items,
+                true,
+                required_underlined_rows,
+                ROW_DEDUP_TOLERANCE,
+            );
+            if enough_live_rows && enough_underlined_rows {
+                let x_min = candidates[start].x - X_ALIGNMENT_TOLERANCE;
+                let x_max = candidates[end - 1].x + X_ALIGNMENT_TOLERANCE;
                 if let Some(column) = columns.last_mut().filter(|column| column.x_max >= x_min) {
                     column.x_max = column.x_max.max(x_max);
                 } else {
                     columns.push(UnderlinedTableColumn { x_min, x_max });
                 }
             }
-
-            while min_y_indices
-                .back()
-                .is_some_and(|&peer| candidates[peer].y >= item.y)
-            {
-                min_y_indices.pop_back();
-            }
-            min_y_indices.push_back(index);
-            while max_y_indices
-                .back()
-                .is_some_and(|&peer| candidates[peer].y <= item.y)
-            {
-                max_y_indices.pop_back();
-            }
-            max_y_indices.push_back(index);
+            start = end;
         }
         columns_by_region.push(columns);
-        underline_start = underline_end;
     }
     columns_by_region
 }
@@ -364,21 +364,19 @@ fn is_heuristic_table_evidence(
         return true;
     };
     let region = &redline_regions[region_index];
-    if region.spans_page_width {
+    let columns = &underlined_table_columns[region_index];
+    if region.spans_page_width && columns.is_empty() {
         return false;
     }
 
     let overlaps_x = item.x + item.width >= region.x_min && item.x <= region.x_max;
-    !overlaps_x || is_revised_table_cell(item, &underlined_table_columns[region_index])
+    !overlaps_x || is_revised_table_cell(item, columns)
 }
 
 fn is_revised_table_cell(
     item: &TextItem,
     underlined_table_columns: &[UnderlinedTableColumn],
 ) -> bool {
-    if !item.is_underline {
-        return false;
-    }
     let column_index = underlined_table_columns.partition_point(|column| column.x_max < item.x);
     underlined_table_columns
         .get(column_index)
@@ -396,7 +394,7 @@ fn revised_table_cell_indices(
         .filter_map(|(item_index, item)| {
             let region_index = redline_region_at_y(redline_regions, item.y)?;
             let region = &redline_regions[region_index];
-            (!region.spans_page_width
+            (item.is_underline
                 && item.x + item.width >= region.x_min
                 && item.x <= region.x_max
                 && is_revised_table_cell(item, &underlined_table_columns[region_index]))
@@ -425,6 +423,10 @@ pub(crate) fn detect_tables_with_page_width(
     // inherit only the first fragment's decoration flags.
     let redline_regions = redline_edit_regions(items, page_width);
     let underlined_table_columns = underlined_table_columns(items, &redline_regions);
+    let source_evidence: Vec<bool> = items
+        .iter()
+        .map(|item| is_heuristic_table_evidence(item, &redline_regions, &underlined_table_columns))
+        .collect();
     let revised_table_cells =
         revised_table_cell_indices(items, &redline_regions, &underlined_table_columns);
 
@@ -433,6 +435,14 @@ pub(crate) fn detect_tables_with_page_width(
 
     // Step 2: Expand consolidated financial items (e.g. "$ 1,234 $ 5,678" → sub-items)
     let (expanded_items, expand_map) = expand_consolidated_items(&merged_items);
+    let expanded_evidence: Vec<bool> = expand_map
+        .iter()
+        .map(|&merged_index| {
+            merge_map[merged_index]
+                .iter()
+                .all(|&source_index| source_evidence[source_index])
+        })
+        .collect();
     let items = &expanded_items[..]; // shadow parameter — all detection uses processed items
 
     let mut tables = Vec::new();
@@ -444,8 +454,8 @@ pub(crate) fn detect_tables_with_page_width(
     let table_candidates: Vec<(usize, &TextItem)> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| {
-            is_heuristic_table_evidence(item, &redline_regions, &underlined_table_columns)
+        .filter(|(index, item)| {
+            expanded_evidence[*index]
                 && item.font_size <= table_font_threshold
                 && item.font_size >= 6.0
         })
@@ -497,11 +507,7 @@ pub(crate) fn detect_tables_with_page_width(
             .enumerate()
             .filter(|(idx, item)| {
                 !claimed_indices.contains(idx)
-                    && is_heuristic_table_evidence(
-                        item,
-                        &redline_regions,
-                        &underlined_table_columns,
-                    )
+                    && expanded_evidence[*idx]
                     && item.font_size >= body_font_low
                     && item.font_size <= body_font_high
                     && item.font_size >= 6.0
@@ -2115,6 +2121,66 @@ mod tests {
         assert!(
             !detect_tables(&items, 12.0, false).is_empty(),
             "aligned replacement cells must preserve a partially revised table"
+        );
+    }
+
+    #[test]
+    fn single_replacement_uses_aligned_live_table_rows() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = row == 0;
+            items.push(value);
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("old value", 220.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "one replacement cell must retain its aligned live table column"
+        );
+    }
+
+    #[test]
+    fn wide_revised_table_keeps_repeated_replacement_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = row < 2;
+            items.push(value);
+            let strikeout_x = if row % 2 == 0 { 220.0 } else { 400.0 };
+            items.push(body_item("old value", strikeout_x, y, true));
+        }
+
+        assert!(redline_edit_regions(&items, content_width(&items))[0].spans_page_width);
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "wide edits must keep a table column with repeated replacements"
+        );
+    }
+
+    #[test]
+    fn revised_financial_columns_survive_item_expansion() {
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("old value", 180.0, y, true));
+            let mut values = body_item("$ 100 $ 200 $ 300", 180.0, y, false);
+            values.width = 300.0;
+            values.is_underline = true;
+            items.push(values);
+        }
+
+        let tables = detect_tables(&items, 12.0, false);
+        assert!(
+            tables.iter().any(|table| table.columns.len() >= 4),
+            "all expanded financial columns must inherit their source evidence"
         );
     }
 
