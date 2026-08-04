@@ -50,6 +50,7 @@ class TestProcessPdf:
         assert isinstance(result.page_count, int)
         assert isinstance(result.processing_time_ms, int)
         assert isinstance(result.pages_needing_ocr, list)
+        assert isinstance(result.ocr_reasons_by_page, list)
         assert isinstance(result.confidence, float)
         assert isinstance(result.is_complex_layout, bool)
         assert isinstance(result.pages_with_tables, list)
@@ -220,6 +221,9 @@ class TestExtractTextInRegions:
         assert len(results[0].regions) == 1
         assert isinstance(results[0].regions[0].text, str)
         assert isinstance(results[0].regions[0].needs_ocr, bool)
+        assert results[0].regions[0].ocr_reason is None or isinstance(
+            results[0].regions[0].ocr_reason, str
+        )
 
     def test_bytes(self):
         data = fixture_bytes("thermo-freon12.pdf")
@@ -309,6 +313,7 @@ class TestExtractPagesMarkdown:
         assert isinstance(page.page, int)
         assert isinstance(page.markdown, str)
         assert isinstance(page.needs_ocr, bool)
+        assert page.ocr_reason is None or isinstance(page.ocr_reason, str)
         assert not page.needs_ocr  # text-based fixture
         assert len(page.markdown) > 0
 
@@ -320,6 +325,7 @@ class TestExtractPagesMarkdown:
         assert isinstance(result.pages_with_tables, list)
         assert isinstance(result.pages_with_columns, list)
         assert isinstance(result.pages_needing_ocr, list)
+        assert isinstance(result.ocr_reasons_by_page, list)
         assert isinstance(result.is_complex, bool)
 
     def test_out_of_range_page_marks_needs_ocr(self):
