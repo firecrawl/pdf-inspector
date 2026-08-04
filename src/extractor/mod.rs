@@ -354,6 +354,7 @@ fn extract_positioned_text_impl(
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
+        crate::text_utils::normalize_visual_order_arabic_items(&mut items);
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);

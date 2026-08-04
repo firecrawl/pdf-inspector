@@ -1225,6 +1225,178 @@ pub(crate) fn extract_text_from_operand(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extract_text_clusters_from_operand(
+    obj: &Object,
+    current_font: &str,
+    base_font_name: Option<&str>,
+    font_cmaps: &FontCMaps,
+    font_tounicode_refs: &std::collections::HashMap<String, u32>,
+    inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
+    font_encodings: &PageFontEncodings,
+    encoding_cache: &HashMap<String, Encoding<'_>>,
+    cmap_decisions: &mut CMapDecisionCache,
+    font_widths: &PageFontWidths,
+) -> Option<Vec<String>> {
+    let is_type0_cid_font = font_widths
+        .get(current_font)
+        .is_some_and(|info| info.is_cid);
+    let use_cp1252_fallback =
+        should_use_cp1252_single_byte_fallback(base_font_name, is_type0_cid_font);
+
+    if let Object::String(bytes, _) = obj {
+        let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<Vec<String>> {
+            if entry.primary.code_byte_length == 1 {
+                let encoding_map = font_encodings.get(current_font);
+                let decoded: Vec<String> = bytes
+                    .iter()
+                    .filter_map(|&b| {
+                        let code = b as u16;
+                        if let Some(s) = entry.primary.lookup(code) {
+                            if !s.contains('\u{FFFD}') {
+                                return Some(s);
+                            }
+                        }
+                        if let Some(fb) = entry.fallback.as_ref().and_then(|c| c.lookup(code)) {
+                            if !fb.contains('\u{FFFD}') {
+                                return Some(fb);
+                            }
+                        }
+                        if let Some(map) = encoding_map {
+                            if let Some(&ch) = map.get(&b) {
+                                return Some(ch.to_string());
+                            }
+                        }
+                        if b >= 0x20 {
+                            return Some(
+                                decode_single_byte_fallback_char(b, use_cp1252_fallback)
+                                    .to_string(),
+                            );
+                        }
+                        None
+                    })
+                    .collect();
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+                return None;
+            }
+
+            if bytes.len() % 2 == 1 {
+                let lookups = entry.primary.lookup_bytes(bytes);
+                let decoded: Vec<String> = lookups
+                    .iter()
+                    .filter_map(|&(_b, ref cmap_result)| cmap_result.clone())
+                    .collect();
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+
+            let primary_clusters = entry.primary.decode_cid_clusters(bytes);
+            let decoded_primary = primary_clusters.concat();
+            if let Some(remapped) = entry.remapped.as_ref() {
+                let remap_clusters = remapped.decode_cid_clusters(bytes);
+                let decoded_remap = remap_clusters.concat();
+                let fallback_clusters = entry
+                    .fallback
+                    .as_ref()
+                    .map(|c| c.decode_cid_clusters(bytes));
+                let decoded_fallback = fallback_clusters.as_ref().map(|clusters| clusters.concat());
+
+                if let Some(choice) = cmap_decisions
+                    .get_choice(font_tounicode_refs.get(current_font).copied().unwrap_or(0))
+                {
+                    let decoded = match choice {
+                        CMapChoice::Primary => primary_clusters.clone(),
+                        CMapChoice::Remapped => remap_clusters.clone(),
+                    };
+                    if !decoded.is_empty() {
+                        return Some(decoded);
+                    }
+                }
+
+                let choice = cmap_decisions.consider(
+                    font_tounicode_refs.get(current_font).copied().unwrap_or(0),
+                    &decoded_primary,
+                    &decoded_remap,
+                    bytes.len(),
+                );
+                let mut decoded = match choice {
+                    Some(CMapChoice::Primary) => primary_clusters,
+                    Some(CMapChoice::Remapped) => remap_clusters,
+                    None => {
+                        if score_text(&decoded_remap) > score_text(&decoded_primary) {
+                            remap_clusters
+                        } else {
+                            primary_clusters
+                        }
+                    }
+                };
+                if let (Some(fb_clusters), Some(fb)) = (fallback_clusters, decoded_fallback) {
+                    let decoded_text = decoded.concat();
+                    let decoded_len = decoded_text.chars().count();
+                    let expected = bytes.len() / 2;
+                    let prefer_fallback = (!fb.is_empty() && decoded_text.is_empty())
+                        || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                    if prefer_fallback || score_text(&fb) > score_text(&decoded_text) + 3 {
+                        decoded = fb_clusters;
+                    }
+                }
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            } else if !primary_clusters.is_empty() {
+                if let Some(fb_clusters) = entry
+                    .fallback
+                    .as_ref()
+                    .map(|c| c.decode_cid_clusters(bytes))
+                {
+                    let fb = fb_clusters.concat();
+                    let decoded_len = decoded_primary.chars().count();
+                    let expected = bytes.len() / 2;
+                    let prefer_fallback = (!fb.is_empty() && decoded_primary.is_empty())
+                        || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                    if prefer_fallback || score_text(&fb) > score_text(&decoded_primary) + 3 {
+                        return Some(fb_clusters);
+                    }
+                }
+                return Some(primary_clusters);
+            }
+
+            None
+        };
+
+        if let Some(entry) = inline_cmaps.get(current_font) {
+            if let Some(decoded) = decode_with_entry(entry) {
+                return Some(decoded);
+            }
+        }
+
+        if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
+            if let Some(entry) = font_cmaps.get_by_obj(obj_num) {
+                if let Some(decoded) = decode_with_entry(entry) {
+                    return Some(decoded);
+                }
+            }
+        }
+    }
+
+    extract_text_from_operand(
+        obj,
+        current_font,
+        base_font_name,
+        font_cmaps,
+        font_tounicode_refs,
+        inline_cmaps,
+        font_encodings,
+        encoding_cache,
+        cmap_decisions,
+        font_widths,
+    )
+    .map(|text| vec![text])
+}
+
 /// Fix a known producer bug in "TeXCMMathsSymbols" subset fonts (IntechOpen
 /// and sibling academic pipelines): the Computer Modern symbol glyphs are
 /// misnamed after Latin lookalikes (equal → /onequarter, plus → /thorn, …)

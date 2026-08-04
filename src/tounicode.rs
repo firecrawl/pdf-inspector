@@ -449,7 +449,16 @@ impl ToUnicodeCMap {
 
     /// Decode a byte slice to a Unicode string, respecting the CMap's code byte width
     pub fn decode_cids(&self, bytes: &[u8]) -> String {
-        let mut result = String::new();
+        self.decode_cid_clusters(bytes).concat()
+    }
+
+    /// Decode a byte slice to Unicode clusters, one output string per source code.
+    ///
+    /// A single glyph code may map to multiple Unicode scalar values. Keeping
+    /// those mappings as clusters lets RTL visual-order correction reverse
+    /// glyph order without transposing multi-character glyph expansions.
+    pub fn decode_cid_clusters(&self, bytes: &[u8]) -> Vec<String> {
+        let mut result = Vec::new();
         let mut unmapped_count = 0usize;
 
         if self.code_byte_length == 1 {
@@ -457,12 +466,12 @@ impl ToUnicodeCMap {
             for &b in bytes {
                 let code = b as u16;
                 match self.lookup(code) {
-                    Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
+                    Some(s) if !s.contains('\u{FFFD}') => result.push(s),
                     _ => {
                         // For single-byte unmapped codes, try as Latin-1
                         // (the byte IS the character code in most legacy encodings)
                         if b >= 0x20 {
-                            result.push(b as char);
+                            result.push((b as char).to_string());
                         }
                         unmapped_count += 1;
                     }
@@ -474,7 +483,7 @@ impl ToUnicodeCMap {
                 if chunk.len() == 2 {
                     let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
                     match self.lookup(cid) {
-                        Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
+                        Some(s) if !s.contains('\u{FFFD}') => result.push(s),
                         _ => {
                             if self.cid_passthrough {
                                 // Last-resort: treat CID as Unicode codepoint.
@@ -482,7 +491,7 @@ impl ToUnicodeCMap {
                                 // used Unicode values as CIDs but stripped the cmap.
                                 if let Some(ch) = char::from_u32(cid as u32) {
                                     if !ch.is_control() || ch == '\t' || ch == '\n' {
-                                        result.push(ch);
+                                        result.push(ch.to_string());
                                     } else {
                                         unmapped_count += 1;
                                     }
@@ -508,7 +517,7 @@ impl ToUnicodeCMap {
             bytes.len() / 2
         };
         if total > 0 && unmapped_count > total / 2 {
-            return String::new();
+            return Vec::new();
         }
 
         result
