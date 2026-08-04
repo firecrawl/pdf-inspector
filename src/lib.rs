@@ -546,6 +546,7 @@ pub fn extract_pages_markdown_mem(
         let options = MarkdownOptions {
             base_font_size: Some(font_stats.most_common_size),
             include_page_numbers: false,
+            remove_page_numbers: false,
             strip_headers_footers: false,
             ..MarkdownOptions::default()
         };

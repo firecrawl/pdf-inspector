@@ -3328,6 +3328,36 @@ fn test_extract_pages_markdown_consistency_with_process_pdf() {
 }
 
 #[test]
+fn test_extract_pages_markdown_plain_text_pages_do_not_need_ocr() {
+    let buf = make_recurring_contextual_folio_pdf();
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+
+    assert_eq!(result.pages.len(), 4);
+    assert!(result.pages_needing_ocr.is_empty());
+    assert!(result.pages.iter().all(|page| !page.needs_ocr));
+    assert!(result
+        .pages
+        .iter()
+        .all(|page| !page.markdown.trim().is_empty()));
+}
+
+#[test]
+fn test_extract_pages_markdown_keeps_body_lines_starting_with_page_label() {
+    let buf = make_text_pdf(
+        "BT /F1 12 Tf 72 700 Td (Page 1. This is body text, not a page number.) Tj 0 -18 Td (The rest of the paragraph remains available.) Tj ET",
+        "0 0 612 792",
+    );
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+
+    assert_eq!(result.pages.len(), 1);
+    assert!(!result.pages[0].needs_ocr);
+    assert!(result.pages[0]
+        .markdown
+        .contains("Page 1. This is body text"));
+    assert!(result.pages_needing_ocr.is_empty());
+}
+
+#[test]
 fn test_extract_pages_markdown_none_returns_all_pages() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
     let page_count = process_pdf_mem(&buf).unwrap().page_count;
