@@ -14,8 +14,11 @@ pub(crate) type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
 
 // ── Font types (crate-internal) ──────────────────────────────────────
 
-/// Font encoding map: maps byte codes to Unicode characters
-pub(crate) type FontEncodingMap = HashMap<u8, char>;
+/// Font encoding map: maps byte codes to Unicode text.
+///
+/// Values are strings because a single byte code can decode to a multi-character
+/// ligature (e.g. Adobe Type1 `/T_h` = "Th"); single characters map as before.
+pub(crate) type FontEncodingMap = HashMap<u8, String>;
 
 /// All font encodings for a page
 pub(crate) type PageFontEncodings = HashMap<String, FontEncodingMap>;

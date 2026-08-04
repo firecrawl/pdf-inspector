@@ -1,6 +1,6 @@
 //! Font width parsing, encoding, and text decoding.
 
-use crate::glyph_names::glyph_to_char;
+use crate::glyph_names::glyph_name_to_unicode;
 use crate::tounicode::FontCMaps;
 use crate::types::{FontEncodingMap, FontWidthInfo, PageFontEncodings, PageFontWidths};
 use log::debug;
@@ -513,7 +513,7 @@ pub(crate) fn build_font_encodings(
 
         if let Some(result) = parse_font_encoding(doc, font_dict) {
             if !result.gid_codes.is_empty()
-                && !tounicode_maps_codes(font_dict, cmaps, &result.gid_codes)
+                && !tounicode_maps_codes(font_dict, doc, cmaps, &result.gid_codes)
             {
                 has_gid_fonts = true;
             }
@@ -528,30 +528,51 @@ pub(crate) fn build_font_encodings(
 
 /// True when the font's ToUnicode CMap maps the gid-named character codes,
 /// so the Differences entries still decode through the CMap.
-fn tounicode_maps_codes(font_dict: &lopdf::Dictionary, cmaps: &FontCMaps, codes: &[u8]) -> bool {
-    let Some(obj_ref) = font_dict
+fn tounicode_maps_codes(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    cmaps: &FontCMaps,
+    codes: &[u8],
+) -> bool {
+    // The font's own ToUnicode CMap (when present) is the primary source.
+    if let Some(obj_ref) = font_dict
         .get(b"ToUnicode")
         .ok()
         .and_then(|o| o.as_reference().ok())
-    else {
-        return false;
-    };
-    let Some(entry) = cmaps.get_by_obj(obj_ref.0) else {
-        return false;
-    };
-    // At least one gid code usably mapped means the CMap addresses these
-    // codes; remaining unmapped codes are subset leftovers (e.g. the
-    // component glyphs of an emoji ZWJ sequence mapped whole on its first
-    // code). A mapping is usable only when extraction would accept it —
-    // empty or U+FFFD results are rejected there as invalid. Fonts whose
-    // CMap ignores the gid codes entirely stay flagged, and the downstream
-    // garbage/encoding checks still catch partial damage.
-    codes.iter().any(|&code| {
-        entry
-            .primary
-            .lookup(code as u16)
-            .is_some_and(|s| !s.is_empty() && !s.contains('\u{FFFD}'))
-    })
+    {
+        if let Some(entry) = cmaps.get_by_obj(obj_ref.0) {
+            // At least one gid code usably mapped means the CMap addresses these
+            // codes; remaining unmapped codes are subset leftovers (e.g. the
+            // component glyphs of an emoji ZWJ sequence mapped whole on its first
+            // code). A mapping is usable only when extraction would accept it —
+            // empty or U+FFFD results are rejected there as invalid. Fonts whose
+            // CMap ignores the gid codes entirely stay flagged, and the downstream
+            // garbage/encoding checks still catch partial damage.
+            if codes.iter().any(|&code| {
+                entry
+                    .primary
+                    .lookup(code as u16)
+                    .is_some_and(|s| !s.is_empty() && !s.contains('\u{FFFD}'))
+            }) {
+                return true;
+            }
+        }
+    }
+
+    // Fallback: an Identity-H CID font without ToUnicode may still be decoded
+    // through its CIDSystemInfo predefined map (Adobe-CNS1/GB1/Japan1 bcmap).
+    // If that map addresses the gid codes, the font is decodable — don't flag
+    // it as unresolvable GID garbage.
+    if let Some(cmap) = crate::tounicode::predefined_cmap_for_font(font_dict, doc) {
+        if codes.iter().any(|&code| {
+            cmap.lookup(code as u16)
+                .is_some_and(|s| !s.is_empty() && !s.contains('\u{FFFD}'))
+        }) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Parse font encoding from a font dictionary
@@ -630,11 +651,17 @@ pub(crate) fn parse_encoding_dictionary(
                 current_code = n as u8;
             }
             Object::Name(name) => {
-                // Map current code to glyph name -> Unicode
+                // Map current code to glyph name -> Unicode. Multi-character
+                // ligature names (e.g. `/T_h` = "Th") expand to their full
+                // string here; single characters map as before.
                 let glyph_name = String::from_utf8_lossy(&name).to_string();
-                let mapped_char = glyph_to_char(&glyph_name)
-                    .or_else(|| private_glyph_to_char(&glyph_name, base_font_name));
-                if mapped_char.is_some_and(is_ligature_char) {
+                let mapped = glyph_name_to_unicode(&glyph_name).or_else(|| {
+                    private_glyph_to_char(&glyph_name, base_font_name).map(|c| c.to_string())
+                });
+                if mapped.as_deref().is_some_and(|s| {
+                    let mut it = s.chars();
+                    it.next().is_some_and(is_ligature_char) && it.next().is_none()
+                }) {
                     debug!(
                         "  Differences: code=0x{:02X} glyph={:?} (ligature)",
                         current_code, glyph_name
@@ -649,8 +676,8 @@ pub(crate) fn parse_encoding_dictionary(
                 {
                     gid_codes.push(current_code);
                 }
-                if let Some(ch) = mapped_char {
-                    encoding_map.insert(current_code, ch);
+                if let Some(s) = mapped {
+                    encoding_map.insert(current_code, s);
                 } else {
                     debug!(
                         "  Differences: code=0x{:02X} glyph={:?} (unmapped)",
@@ -982,8 +1009,8 @@ pub(crate) fn extract_text_from_operand(
                             }
                             // 3. Differences mapped it? Use Differences result
                             if let Some(map) = encoding_map {
-                                if let Some(&ch) = map.get(&b) {
-                                    return Some(ch.to_string());
+                                if let Some(s) = map.get(&b) {
+                                    return Some(s.clone());
                                 }
                             }
                             // 4. Printable single-byte fallback
@@ -1109,16 +1136,16 @@ pub(crate) fn extract_text_from_operand(
                 if has_diff_match {
                     let decoded: String = bytes
                         .iter()
-                        .filter_map(|&b| {
-                            if let Some(&ch) = encoding_map.get(&b) {
-                                Some(ch)
+                        .flat_map(|&b| {
+                            if let Some(s) = encoding_map.get(&b) {
+                                s.chars().collect::<Vec<char>>()
                             } else if b >= 0x20 {
                                 // Base encoding fallback for printable bytes.
                                 // Most PDFs with simple fonts use WinAnsi/PDFDocEncoding
                                 // semantics, not ISO-8859-1 C1 controls.
-                                Some(decode_single_byte_fallback_char(b, use_cp1252_fallback))
+                                vec![decode_single_byte_fallback_char(b, use_cp1252_fallback)]
                             } else {
-                                None // Skip unmapped control characters
+                                Vec::new() // Skip unmapped control characters
                             }
                         })
                         .collect();
@@ -1471,6 +1498,33 @@ fn score_text(text: &str) -> i32 {
 mod tests {
 
     #[test]
+    fn differences_th_ligature_expands_to_string() {
+        // Adobe Type1 fonts can expose the Th-ligature as `/T_h` in the
+        // Differences array. It has no single Unicode codepoint (unlike
+        // fi/fl/ff), so it must expand to the two-character string "Th".
+        let doc = Document::with_version("1.4");
+        let enc_dict = dictionary! {
+            "BaseEncoding" => "WinAnsiEncoding",
+            "Differences" => vec![
+                Object::Integer(27),
+                Object::Name(b"f_f_i".to_vec()),
+                Object::Name(b"f_f".to_vec()),
+                Object::Name(b"f_l".to_vec()),
+                Object::Name(b"f_i".to_vec()),
+                Object::Name(b"T_h".to_vec()),
+            ],
+        };
+        let result =
+            parse_encoding_dictionary(&doc, &enc_dict, Some("ACaslonPro-Regular")).unwrap();
+        // Multi-char expansion.
+        assert_eq!(result.map.get(&31).map(String::as_str), Some("Th"));
+        // Single-char ligatures keep their Unicode codepoints (expanded later).
+        assert_eq!(result.map.get(&27).map(String::as_str), Some("\u{FB03}"));
+        assert_eq!(result.map.get(&30).map(String::as_str), Some("\u{FB01}"));
+        assert_eq!(result.map.get(&28).map(String::as_str), Some("\u{FB00}"));
+    }
+
+    #[test]
     fn texcm_math_symbols_remap() {
         assert_eq!(
             super::remap_texcm_math_symbols("S ¼ kB þ 1".into(), Some("EEKVNO+TeXCMMathsSymbols")),
@@ -1801,9 +1855,18 @@ mod tests {
 
         let result = parse_font_encoding(&doc, &font_dict).expect("encoding should parse");
 
-        assert_eq!(result.map.get(&0x88u8), Some(&'\u{FB00}'));
-        assert_eq!(result.map.get(&0x89u8), Some(&'\u{FB01}'));
-        assert_eq!(result.map.get(&0xADu8), Some(&'\u{FB02}'));
+        assert_eq!(
+            result.map.get(&0x88u8).map(String::as_str),
+            Some("\u{FB00}")
+        );
+        assert_eq!(
+            result.map.get(&0x89u8).map(String::as_str),
+            Some("\u{FB01}")
+        );
+        assert_eq!(
+            result.map.get(&0xADu8).map(String::as_str),
+            Some("\u{FB02}")
+        );
     }
 
     #[test]
@@ -1817,8 +1880,14 @@ mod tests {
         let result = parse_font_encoding(&doc, &font_dict).expect("encoding should parse");
 
         assert!(!result.map.contains_key(&0x88u8));
-        assert_eq!(result.map.get(&0x89u8), Some(&'\u{FB01}'));
-        assert_eq!(result.map.get(&0xADu8), Some(&'\u{FB02}'));
+        assert_eq!(
+            result.map.get(&0x89u8).map(String::as_str),
+            Some("\u{FB01}")
+        );
+        assert_eq!(
+            result.map.get(&0xADu8).map(String::as_str),
+            Some("\u{FB02}")
+        );
     }
 
     #[test]
