@@ -1,0 +1,19 @@
+[package]
+name = "pdf-inspector-go"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C ABI shim exposing pdf-inspector's classification and text extraction to Go via cgo."
+
+[lib]
+name = "pdf_inspector_go"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+pdf-inspector = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+strip = "debuginfo"
