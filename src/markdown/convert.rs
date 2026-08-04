@@ -997,8 +997,21 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         let non_heading_role = struct_role
             .as_ref()
             .is_some_and(StructRole::is_non_heading_content);
+        // A chart legend entry (line-swatch + series name, e.g. "----- Benchmark")
+        // sitting inside a chart region is figure furniture, never a heading — it
+        // otherwise trips the isolated-bold and font-rarity heuristics below. Gate
+        // narrowly on the swatch: real headings never begin with one, so ordinary
+        // titles that happen to fall inside a (possibly over-large) chart region
+        // keep their heading level.
+        let is_chart_legend_line = crate::tables::starts_with_legend_swatch(plain_trimmed)
+            && page_chart_regions.get(&line.page).is_some_and(|regions| {
+                line.items
+                    .iter()
+                    .any(|item| item_is_in_chart_region(item, regions))
+            });
         let heuristic_heading = if options.detect_headers
             && !non_heading_role
+            && !is_chart_legend_line
             && !is_code_line
             && !looks_like_list_continuation
             && plain_trimmed.len() > 3

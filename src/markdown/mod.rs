@@ -1125,7 +1125,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             .iter()
             .map(|(_, item)| (*item).clone())
             .collect();
-        let regions = crate::tables::detect_chart_regions(&page_items_ref, rects, page);
+        let mut regions = crate::tables::detect_chart_regions(&page_items_ref, rects, page);
+        // Line/area charts are emitted as an image placeholder with no bar
+        // geometry, so detect them from the image bbox plus adjacent legend.
+        if let Some(imgs) = page_image_regions.get(&page) {
+            regions.extend(crate::tables::detect_image_chart_regions(
+                imgs,
+                &page_items_ref,
+                page,
+            ));
+        }
         if !regions.is_empty() {
             page_chart_map.insert(page, regions);
         }

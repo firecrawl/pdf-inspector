@@ -1310,6 +1310,17 @@ fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
 }
 
+// Two-column fund factsheet with a returns table on the same page. Guards
+// against the regression where a detected table suppressed column detection,
+// collapsing the left (fund data) and right (market commentary) columns into
+// a single Y-interleaved stream. The snapshot reads the left column contiguously
+// (ÁLTALÁNOS INFORMÁCIÓK → BEFEKTETÉSI POLITIKA) before the right column
+// (PIACI ÖSSZEFOGLALÓ) rather than shredding one into the other.
+#[test]
+fn test_snapshot_marketprog_prestige_two_column() {
+    assert_snapshot("marketprog-prestige-two-column");
+}
+
 // ============================================================================
 // Pages Needing OCR Tests
 // ============================================================================
