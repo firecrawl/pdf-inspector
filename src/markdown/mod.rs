@@ -1035,8 +1035,8 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     context: MarkdownDocumentContext<'_>,
 ) -> String {
     use crate::tables::{
-        detect_tables, detect_tables_from_lines, detect_tables_from_rects,
-        detect_tables_from_struct_tree, try_build_rect_guided_table,
+        content_width, detect_tables_from_lines, detect_tables_from_rects,
+        detect_tables_from_struct_tree, detect_tables_with_page_width, try_build_rect_guided_table,
     };
     use crate::types::ItemType;
 
@@ -1144,6 +1144,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     for page in pages {
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
+        let page_content_width = content_width(&page_items);
 
         // Chart-bar regions: bar charts drawn as filled rects read as cell
         // rects or aligned text and get gridded into phantom tables. Their
@@ -1428,7 +1429,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     // table can share the prose anchors. Reject only candidates
                     // whose cells prove they are parallel prose fragments.
                     let reject_parallel_prose = chart_prose_columns && !was_split;
-                    let tables = detect_tables(subset_items, base_size, false);
+                    let tables = detect_tables_with_page_width(
+                        subset_items,
+                        base_size,
+                        false,
+                        page_content_width,
+                    );
                     for table in tables {
                         if reject_parallel_prose && is_parallel_prose_table(&table) {
                             log::debug!(
@@ -1609,7 +1615,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             // and reject chart-page prose candidates individually below.
             let skip_body_font =
                 merged_retry_skips_body_font(detected_columns, !chart_regions.is_empty());
-            let heuristic_tables = detect_tables(&chart_free, base_size, skip_body_font);
+            let heuristic_tables = detect_tables_with_page_width(
+                &chart_free,
+                base_size,
+                skip_body_font,
+                page_content_width,
+            );
             for table in &heuristic_tables {
                 if !chart_regions.is_empty() && is_parallel_prose_table(table) {
                     log::debug!(

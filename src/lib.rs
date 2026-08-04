@@ -1090,7 +1090,12 @@ pub fn extract_tables_in_regions_mem(
                     candidates.push(candidate);
                 }
             }
-            let detected = tables::detect_tables(&matched, base_font_size, false);
+            let detected = tables::detect_tables_with_page_width(
+                &matched,
+                base_font_size,
+                false,
+                items.map_or(1.0, |items| tables::content_width(items)),
+            );
             if let Some(candidate) = detected
                 .iter()
                 .find_map(|t| evaluate(TableCandidateSource::Heuristic, t))
@@ -5652,6 +5657,7 @@ fn compute_layout_complexity(
 
         // Check for side-by-side layout
         let owned_items: Vec<types::TextItem> = page_items.iter().map(|i| (*i).clone()).collect();
+        let page_content_width = tables::content_width(&owned_items);
         let bands = markdown::split_side_by_side(&owned_items);
 
         let band_ranges: Vec<(f32, f32)> = if bands.is_empty() {
@@ -5702,7 +5708,12 @@ fn compute_layout_complexity(
                 break;
             }
             // Heuristic fallback for borderless tables
-            let heuristic_tables = tables::detect_tables(&band_items, base_size, false);
+            let heuristic_tables = tables::detect_tables_with_page_width(
+                &band_items,
+                base_size,
+                false,
+                page_content_width,
+            );
             if has_data_table(&heuristic_tables) {
                 found_table = true;
                 break;

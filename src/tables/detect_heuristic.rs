@@ -168,9 +168,20 @@ struct RedlineEditRegion {
 
 #[derive(Clone, Copy)]
 struct UnderlinedTableColumn {
-    region_index: usize,
     x_min: f32,
     x_max: f32,
+}
+
+pub(crate) fn content_width(items: &[TextItem]) -> f32 {
+    let x_min = items
+        .iter()
+        .map(|item| item.x)
+        .fold(f32::INFINITY, f32::min);
+    let x_max = items
+        .iter()
+        .map(|item| item.x + item.width)
+        .fold(f32::NEG_INFINITY, f32::max);
+    (x_max - x_min).max(1.0)
 }
 
 /// Spatial regions where multiple strikeout rows indicate a redline edit block.
@@ -180,22 +191,12 @@ struct UnderlinedTableColumn {
 /// different: together with nearby underlines they form the overlapping
 /// old/new text layers used by legislative redlines, and those decorations
 /// must not become heuristic column evidence.
-fn redline_edit_regions(items: &[TextItem]) -> Vec<RedlineEditRegion> {
+fn redline_edit_regions(items: &[TextItem], page_width: f32) -> Vec<RedlineEditRegion> {
     const ROW_DEDUP_TOLERANCE: f32 = 8.0;
     const MAX_CLUSTER_GAP: f32 = 64.0;
     const Y_PADDING: f32 = 36.0;
     const X_PADDING: f32 = 12.0;
     const PAGE_WIDTH_RATIO: f32 = 0.35;
-
-    let page_x_min = items
-        .iter()
-        .map(|item| item.x)
-        .fold(f32::INFINITY, f32::min);
-    let page_x_max = items
-        .iter()
-        .map(|item| item.x + item.width)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let page_width = (page_x_max - page_x_min).max(1.0);
 
     let mut strikeouts: Vec<&TextItem> = items.iter().filter(|item| item.is_strikeout).collect();
     strikeouts.sort_by(|a, b| a.y.total_cmp(&b.y));
@@ -242,6 +243,19 @@ fn redline_edit_regions(items: &[TextItem]) -> Vec<RedlineEditRegion> {
         }
         start = end;
     }
+    // Padding can make neighboring clusters overlap. Partition that overlap at
+    // its midpoint so each Y position maps to one region without combining
+    // horizontally unrelated edits.
+    for index in 1..regions.len() {
+        let (previous, current) = regions.split_at_mut(index);
+        let previous = &mut previous[index - 1];
+        let current = &mut current[0];
+        if previous.y_max >= current.y_min {
+            let boundary = (previous.y_max + current.y_min) / 2.0;
+            previous.y_max = boundary;
+            current.y_min = boundary;
+        }
+    }
     regions
 }
 
@@ -250,21 +264,34 @@ fn redline_edit_regions(items: &[TextItem]) -> Vec<RedlineEditRegion> {
 fn underlined_table_columns(
     items: &[TextItem],
     redline_regions: &[RedlineEditRegion],
-) -> Vec<UnderlinedTableColumn> {
+) -> Vec<Vec<UnderlinedTableColumn>> {
     const X_ALIGNMENT_TOLERANCE: f32 = 4.0;
     const ROW_DEDUP_TOLERANCE: f32 = 8.0;
 
-    let mut columns: Vec<UnderlinedTableColumn> = Vec::new();
-    for (region_index, region) in redline_regions.iter().enumerate() {
+    // Sort underlines once by Y. Because redline regions are non-overlapping,
+    // the cursor assigns each underline to at most one region.
+    let mut underlined: Vec<&TextItem> = items.iter().filter(|item| item.is_underline).collect();
+    underlined.sort_by(|a, b| a.y.total_cmp(&b.y));
+
+    let mut columns_by_region = Vec::with_capacity(redline_regions.len());
+    let mut underline_start = 0;
+    for region in redline_regions {
         if region.spans_page_width {
+            columns_by_region.push(Vec::new());
             continue;
         }
-        let mut candidates: Vec<&TextItem> = items
-            .iter()
-            .filter(|item| item.is_underline && item.y >= region.y_min && item.y <= region.y_max)
-            .collect();
+        while underline_start < underlined.len() && underlined[underline_start].y < region.y_min {
+            underline_start += 1;
+        }
+        let mut underline_end = underline_start;
+        while underline_end < underlined.len() && underlined[underline_end].y <= region.y_max {
+            underline_end += 1;
+        }
+
+        let mut candidates = underlined[underline_start..underline_end].to_vec();
         candidates.sort_by(|a, b| a.x.total_cmp(&b.x));
 
+        let mut columns: Vec<UnderlinedTableColumn> = Vec::new();
         let mut left = 0;
         let mut min_y_indices = std::collections::VecDeque::new();
         let mut max_y_indices = std::collections::VecDeque::new();
@@ -288,17 +315,10 @@ fn underlined_table_columns(
             if has_aligned_peer {
                 let x_min = item.x - X_ALIGNMENT_TOLERANCE;
                 let x_max = item.x + X_ALIGNMENT_TOLERANCE;
-                if let Some(column) = columns
-                    .last_mut()
-                    .filter(|column| column.region_index == region_index && column.x_max >= x_min)
-                {
+                if let Some(column) = columns.last_mut().filter(|column| column.x_max >= x_min) {
                     column.x_max = column.x_max.max(x_max);
                 } else {
-                    columns.push(UnderlinedTableColumn {
-                        region_index,
-                        x_min,
-                        x_max,
-                    });
+                    columns.push(UnderlinedTableColumn { x_min, x_max });
                 }
             }
 
@@ -317,80 +337,93 @@ fn underlined_table_columns(
             }
             max_y_indices.push_back(index);
         }
+        columns_by_region.push(columns);
+        underline_start = underline_end;
     }
-    columns
+    columns_by_region
+}
+
+fn redline_region_at_y(redline_regions: &[RedlineEditRegion], y: f32) -> Option<usize> {
+    let region_index = redline_regions.partition_point(|region| region.y_max < y);
+    redline_regions
+        .get(region_index)
+        .filter(|region| y >= region.y_min)
+        .map(|_| region_index)
 }
 
 fn is_heuristic_table_evidence(
     item: &TextItem,
     redline_regions: &[RedlineEditRegion],
-    underlined_table_columns: &[UnderlinedTableColumn],
+    underlined_table_columns: &[Vec<UnderlinedTableColumn>],
 ) -> bool {
     if item.is_strikeout {
         return false;
     }
 
-    for (region_index, region) in redline_regions.iter().enumerate() {
-        if item.y < region.y_min || item.y > region.y_max {
-            continue;
-        }
-        if region.spans_page_width {
-            return false;
-        }
-
-        let overlaps_x = item.x + item.width >= region.x_min && item.x <= region.x_max;
-        if overlaps_x && !is_revised_table_cell(item, region_index, underlined_table_columns) {
-            return false;
-        }
+    let Some(region_index) = redline_region_at_y(redline_regions, item.y) else {
+        return true;
+    };
+    let region = &redline_regions[region_index];
+    if region.spans_page_width {
+        return false;
     }
 
-    true
+    let overlaps_x = item.x + item.width >= region.x_min && item.x <= region.x_max;
+    !overlaps_x || is_revised_table_cell(item, &underlined_table_columns[region_index])
 }
 
 fn is_revised_table_cell(
     item: &TextItem,
-    region_index: usize,
     underlined_table_columns: &[UnderlinedTableColumn],
 ) -> bool {
-    item.is_underline
-        && underlined_table_columns.iter().any(|column| {
-            column.region_index == region_index && item.x >= column.x_min && item.x <= column.x_max
-        })
+    if !item.is_underline {
+        return false;
+    }
+    let column_index = underlined_table_columns.partition_point(|column| column.x_max < item.x);
+    underlined_table_columns
+        .get(column_index)
+        .is_some_and(|column| item.x >= column.x_min)
 }
 
 fn revised_table_cell_indices(
     items: &[TextItem],
     redline_regions: &[RedlineEditRegion],
-    underlined_table_columns: &[UnderlinedTableColumn],
+    underlined_table_columns: &[Vec<UnderlinedTableColumn>],
 ) -> std::collections::HashSet<usize> {
     items
         .iter()
         .enumerate()
         .filter_map(|(item_index, item)| {
-            redline_regions
-                .iter()
-                .enumerate()
-                .any(|(region_index, region)| {
-                    !region.spans_page_width
-                        && item.y >= region.y_min
-                        && item.y <= region.y_max
-                        && item.x + item.width >= region.x_min
-                        && item.x <= region.x_max
-                        && is_revised_table_cell(item, region_index, underlined_table_columns)
-                })
-                .then_some(item_index)
+            let region_index = redline_region_at_y(redline_regions, item.y)?;
+            let region = &redline_regions[region_index];
+            (!region.spans_page_width
+                && item.x + item.width >= region.x_min
+                && item.x <= region.x_max
+                && is_revised_table_cell(item, &underlined_table_columns[region_index]))
+            .then_some(item_index)
         })
         .collect()
 }
 
 /// Detect tables in a set of text items from a single page
 pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bool) -> Vec<Table> {
+    detect_tables_with_page_width(items, base_font_size, skip_body_font, content_width(items))
+}
+
+/// Detect tables in a subset while using the full page's text width for
+/// page-spanning redline classification.
+pub(crate) fn detect_tables_with_page_width(
+    items: &[TextItem],
+    base_font_size: f32,
+    skip_body_font: bool,
+    page_width: f32,
+) -> Vec<Table> {
     if items.len() < 6 {
         return vec![];
     }
     // Compute these before consolidation: adjacent old/new text can merge and
     // inherit only the first fragment's decoration flags.
-    let redline_regions = redline_edit_regions(items);
+    let redline_regions = redline_edit_regions(items, page_width);
     let underlined_table_columns = underlined_table_columns(items, &redline_regions);
     let revised_table_cells =
         revised_table_cell_indices(items, &redline_regions, &underlined_table_columns);
@@ -2082,6 +2115,26 @@ mod tests {
         assert!(
             !detect_tables(&items, 12.0, false).is_empty(),
             "aligned replacement cells must preserve a partially revised table"
+        );
+    }
+
+    #[test]
+    fn narrow_layout_band_uses_full_page_width_for_redline_scope() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 190.0, y, false));
+            items.push(body_item("old value", 300.0, y, true));
+            let mut replacement = body_item("new value", 300.0, y, false);
+            replacement.is_underline = true;
+            items.push(replacement);
+        }
+
+        assert!(redline_edit_regions(&items, content_width(&items))[0].spans_page_width);
+        assert!(!redline_edit_regions(&items, 500.0)[0].spans_page_width);
+        assert!(
+            !detect_tables_with_page_width(&items, 12.0, false, 500.0).is_empty(),
+            "a narrow band must use full-page context to preserve revised table cells"
         );
     }
 
