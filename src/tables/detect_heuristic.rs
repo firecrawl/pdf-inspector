@@ -18,7 +18,15 @@ use super::{Table, TableDetectionMode};
 ///
 /// Returns `(merged_items, index_map)` where `index_map[merged_idx]` contains
 /// the original item indices that were merged into that item.
+#[cfg(test)]
 pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Vec<usize>>) {
+    merge_adjacent_items_preserving(items, &std::collections::HashSet::new())
+}
+
+fn merge_adjacent_items_preserving(
+    items: &[TextItem],
+    preserved_indices: &std::collections::HashSet<usize>,
+) -> (Vec<TextItem>, Vec<Vec<usize>>) {
     if items.is_empty() {
         return (vec![], vec![]);
     }
@@ -68,6 +76,18 @@ pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Ve
 
                 // Must be similar font size (within 20%)
                 if (next_item.font_size - first_item.font_size).abs() > first_item.font_size * 0.20
+                {
+                    break;
+                }
+
+                // Proven replacement cells must retain their own decoration.
+                // Otherwise an adjacent old/new pair inherits only the first
+                // fragment's flags and can lose the live table evidence.
+                let decoration_changes = next_item.is_underline != first_item.is_underline
+                    || next_item.is_strikeout != first_item.is_strikeout;
+                if decoration_changes
+                    && (preserved_indices.contains(&first_idx)
+                        || preserved_indices.contains(&next_idx))
                 {
                     break;
                 }
@@ -234,28 +254,68 @@ fn underlined_table_columns(
     const X_ALIGNMENT_TOLERANCE: f32 = 4.0;
     const ROW_DEDUP_TOLERANCE: f32 = 8.0;
 
-    let mut columns = Vec::new();
+    let mut columns: Vec<UnderlinedTableColumn> = Vec::new();
     for (region_index, region) in redline_regions.iter().enumerate() {
         if region.spans_page_width {
             continue;
         }
-        let candidates: Vec<&TextItem> = items
+        let mut candidates: Vec<&TextItem> = items
             .iter()
             .filter(|item| item.is_underline && item.y >= region.y_min && item.y <= region.y_max)
             .collect();
+        candidates.sort_by(|a, b| a.x.total_cmp(&b.x));
 
-        for item in &candidates {
-            let has_aligned_peer = candidates.iter().any(|other| {
-                (item.x - other.x).abs() <= X_ALIGNMENT_TOLERANCE
-                    && (item.y - other.y).abs() > ROW_DEDUP_TOLERANCE
-            });
-            if has_aligned_peer {
-                columns.push(UnderlinedTableColumn {
-                    region_index,
-                    x_min: item.x - X_ALIGNMENT_TOLERANCE,
-                    x_max: item.x + X_ALIGNMENT_TOLERANCE,
-                });
+        let mut left = 0;
+        let mut min_y_indices = std::collections::VecDeque::new();
+        let mut max_y_indices = std::collections::VecDeque::new();
+        for (index, item) in candidates.iter().enumerate() {
+            while left < index && item.x - candidates[left].x > X_ALIGNMENT_TOLERANCE {
+                if min_y_indices.front() == Some(&left) {
+                    min_y_indices.pop_front();
+                }
+                if max_y_indices.front() == Some(&left) {
+                    max_y_indices.pop_front();
+                }
+                left += 1;
             }
+
+            let has_aligned_peer = min_y_indices
+                .front()
+                .is_some_and(|&peer| (item.y - candidates[peer].y).abs() > ROW_DEDUP_TOLERANCE)
+                || max_y_indices
+                    .front()
+                    .is_some_and(|&peer| (item.y - candidates[peer].y).abs() > ROW_DEDUP_TOLERANCE);
+            if has_aligned_peer {
+                let x_min = item.x - X_ALIGNMENT_TOLERANCE;
+                let x_max = item.x + X_ALIGNMENT_TOLERANCE;
+                if let Some(column) = columns
+                    .last_mut()
+                    .filter(|column| column.region_index == region_index && column.x_max >= x_min)
+                {
+                    column.x_max = column.x_max.max(x_max);
+                } else {
+                    columns.push(UnderlinedTableColumn {
+                        region_index,
+                        x_min,
+                        x_max,
+                    });
+                }
+            }
+
+            while min_y_indices
+                .back()
+                .is_some_and(|&peer| candidates[peer].y >= item.y)
+            {
+                min_y_indices.pop_back();
+            }
+            min_y_indices.push_back(index);
+            while max_y_indices
+                .back()
+                .is_some_and(|&peer| candidates[peer].y <= item.y)
+            {
+                max_y_indices.pop_back();
+            }
+            max_y_indices.push_back(index);
         }
     }
     columns
@@ -279,20 +339,48 @@ fn is_heuristic_table_evidence(
         }
 
         let overlaps_x = item.x + item.width >= region.x_min && item.x <= region.x_max;
-        if overlaps_x {
-            let is_revised_table_cell = item.is_underline
-                && underlined_table_columns.iter().any(|column| {
-                    column.region_index == region_index
-                        && item.x >= column.x_min
-                        && item.x <= column.x_max
-                });
-            if !is_revised_table_cell {
-                return false;
-            }
+        if overlaps_x && !is_revised_table_cell(item, region_index, underlined_table_columns) {
+            return false;
         }
     }
 
     true
+}
+
+fn is_revised_table_cell(
+    item: &TextItem,
+    region_index: usize,
+    underlined_table_columns: &[UnderlinedTableColumn],
+) -> bool {
+    item.is_underline
+        && underlined_table_columns.iter().any(|column| {
+            column.region_index == region_index && item.x >= column.x_min && item.x <= column.x_max
+        })
+}
+
+fn revised_table_cell_indices(
+    items: &[TextItem],
+    redline_regions: &[RedlineEditRegion],
+    underlined_table_columns: &[UnderlinedTableColumn],
+) -> std::collections::HashSet<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(item_index, item)| {
+            redline_regions
+                .iter()
+                .enumerate()
+                .any(|(region_index, region)| {
+                    !region.spans_page_width
+                        && item.y >= region.y_min
+                        && item.y <= region.y_max
+                        && item.x + item.width >= region.x_min
+                        && item.x <= region.x_max
+                        && is_revised_table_cell(item, region_index, underlined_table_columns)
+                })
+                .then_some(item_index)
+        })
+        .collect()
 }
 
 /// Detect tables in a set of text items from a single page
@@ -304,9 +392,11 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
     // inherit only the first fragment's decoration flags.
     let redline_regions = redline_edit_regions(items);
     let underlined_table_columns = underlined_table_columns(items, &redline_regions);
+    let revised_table_cells =
+        revised_table_cell_indices(items, &redline_regions, &underlined_table_columns);
 
     // Step 1: Merge adjacent single-char items into words (handles per-character PDFs)
-    let (merged_items, merge_map) = merge_adjacent_items(items);
+    let (merged_items, merge_map) = merge_adjacent_items_preserving(items, &revised_table_cells);
 
     // Step 2: Expand consolidated financial items (e.g. "$ 1,234 $ 5,678" → sub-items)
     let (expanded_items, expand_map) = expand_consolidated_items(&merged_items);
@@ -1839,6 +1929,22 @@ mod tests {
     }
 
     #[test]
+    fn merge_adjacent_items_preserves_redline_boundaries() {
+        let old = body_item("old value", 220.0, 700.0, true);
+        let mut replacement = body_item("new value", 312.0, 700.0, false);
+        replacement.is_underline = true;
+        let preserved_indices = std::collections::HashSet::from([1]);
+
+        let (merged, index_map) =
+            merge_adjacent_items_preserving(&[old, replacement], &preserved_indices);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(index_map, vec![vec![0], vec![1]]);
+        assert!(merged[0].is_strikeout);
+        assert!(merged[1].is_underline);
+    }
+
+    #[test]
     fn body_font_redline_deletions_do_not_create_a_table() {
         let mut items = Vec::new();
         for row in 0..8 {
@@ -1976,6 +2082,24 @@ mod tests {
         assert!(
             !detect_tables(&items, 12.0, false).is_empty(),
             "aligned replacement cells must preserve a partially revised table"
+        );
+    }
+
+    #[test]
+    fn adjacent_revised_fragments_preserve_live_table_cells() {
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("old value", 220.0, y, true));
+            let mut replacement = body_item("new value", 312.0, y, false);
+            replacement.is_underline = true;
+            items.push(replacement);
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "adjacent old/new fragments must retain the live revised cells"
         );
     }
 
