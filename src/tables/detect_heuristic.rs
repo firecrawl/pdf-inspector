@@ -137,47 +137,162 @@ fn expand_consolidated_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<usize>) 
     (expanded, index_map)
 }
 
-/// Y-bands where multiple strikeout rows indicate a redline edit block.
+#[derive(Clone, Copy)]
+struct RedlineEditRegion {
+    x_min: f32,
+    x_max: f32,
+    y_min: f32,
+    y_max: f32,
+    spans_page_width: bool,
+}
+
+#[derive(Clone, Copy)]
+struct UnderlinedTableColumn {
+    region_index: usize,
+    x_min: f32,
+    x_max: f32,
+}
+
+/// Spatial regions where multiple strikeout rows indicate a redline edit block.
 ///
 /// A lone deletion can occur inside or beside a real table, so it must not
 /// globally suppress underlined table cells. Closely spaced strikeout rows are
 /// different: together with nearby underlines they form the overlapping
 /// old/new text layers used by legislative redlines, and those decorations
 /// must not become heuristic column evidence.
-fn redline_edit_bands(items: &[TextItem]) -> Vec<(f32, f32)> {
+fn redline_edit_regions(items: &[TextItem]) -> Vec<RedlineEditRegion> {
     const ROW_DEDUP_TOLERANCE: f32 = 8.0;
     const MAX_CLUSTER_GAP: f32 = 64.0;
-    const BAND_PADDING: f32 = 36.0;
+    const Y_PADDING: f32 = 36.0;
+    const X_PADDING: f32 = 12.0;
+    const PAGE_WIDTH_RATIO: f32 = 0.35;
 
-    let mut rows: Vec<f32> = items
+    let page_x_min = items
         .iter()
-        .filter(|item| item.is_strikeout)
-        .map(|item| item.y)
-        .collect();
-    rows.sort_by(|a, b| a.total_cmp(b));
-    rows.dedup_by(|a, b| (*a - *b).abs() <= ROW_DEDUP_TOLERANCE);
+        .map(|item| item.x)
+        .fold(f32::INFINITY, f32::min);
+    let page_x_max = items
+        .iter()
+        .map(|item| item.x + item.width)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let page_width = (page_x_max - page_x_min).max(1.0);
 
-    let mut bands = Vec::new();
+    let mut strikeouts: Vec<&TextItem> = items.iter().filter(|item| item.is_strikeout).collect();
+    strikeouts.sort_by(|a, b| a.y.total_cmp(&b.y));
+
+    let mut rows: Vec<(f32, f32, f32)> = Vec::new();
+    for item in strikeouts {
+        if let Some((_, x_min, x_max)) = rows
+            .last_mut()
+            .filter(|(y, _, _)| (item.y - *y).abs() <= ROW_DEDUP_TOLERANCE)
+        {
+            *x_min = x_min.min(item.x);
+            *x_max = x_max.max(item.x + item.width);
+        } else {
+            rows.push((item.y, item.x, item.x + item.width));
+        }
+    }
+
+    let mut regions = Vec::new();
     let mut start = 0;
     while start < rows.len() {
         let mut end = start + 1;
-        while end < rows.len() && rows[end] - rows[end - 1] <= MAX_CLUSTER_GAP {
+        while end < rows.len() && rows[end].0 - rows[end - 1].0 <= MAX_CLUSTER_GAP {
             end += 1;
         }
         if end - start >= 2 {
-            bands.push((rows[start] - BAND_PADDING, rows[end - 1] + BAND_PADDING));
+            let x_min = rows[start..end]
+                .iter()
+                .map(|(_, x_min, _)| *x_min)
+                .fold(f32::INFINITY, f32::min);
+            let x_max = rows[start..end]
+                .iter()
+                .map(|(_, _, x_max)| *x_max)
+                .fold(f32::NEG_INFINITY, f32::max);
+            // Redlines spread across much of the text width are flowing prose,
+            // so their whole Y-band is ambiguous. Compact edits can be scoped
+            // horizontally without hiding a neighboring table.
+            regions.push(RedlineEditRegion {
+                x_min: x_min - X_PADDING,
+                x_max: x_max + X_PADDING,
+                y_min: rows[start].0 - Y_PADDING,
+                y_max: rows[end - 1].0 + Y_PADDING,
+                spans_page_width: x_max - x_min >= page_width * PAGE_WIDTH_RATIO,
+            });
         }
         start = end;
     }
-    bands
+    regions
 }
 
-fn is_heuristic_table_evidence(item: &TextItem, redline_bands: &[(f32, f32)]) -> bool {
-    !(item.is_strikeout
-        || item.is_underline
-            && redline_bands
-                .iter()
-                .any(|(y_min, y_max)| item.y >= *y_min && item.y <= *y_max))
+/// Repeated underlined items at the same X position are table-shaped evidence
+/// in a compact redline region, where they commonly represent revised cells.
+fn underlined_table_columns(
+    items: &[TextItem],
+    redline_regions: &[RedlineEditRegion],
+) -> Vec<UnderlinedTableColumn> {
+    const X_ALIGNMENT_TOLERANCE: f32 = 4.0;
+    const ROW_DEDUP_TOLERANCE: f32 = 8.0;
+
+    let mut columns = Vec::new();
+    for (region_index, region) in redline_regions.iter().enumerate() {
+        if region.spans_page_width {
+            continue;
+        }
+        let candidates: Vec<&TextItem> = items
+            .iter()
+            .filter(|item| item.is_underline && item.y >= region.y_min && item.y <= region.y_max)
+            .collect();
+
+        for item in &candidates {
+            let has_aligned_peer = candidates.iter().any(|other| {
+                (item.x - other.x).abs() <= X_ALIGNMENT_TOLERANCE
+                    && (item.y - other.y).abs() > ROW_DEDUP_TOLERANCE
+            });
+            if has_aligned_peer {
+                columns.push(UnderlinedTableColumn {
+                    region_index,
+                    x_min: item.x - X_ALIGNMENT_TOLERANCE,
+                    x_max: item.x + X_ALIGNMENT_TOLERANCE,
+                });
+            }
+        }
+    }
+    columns
+}
+
+fn is_heuristic_table_evidence(
+    item: &TextItem,
+    redline_regions: &[RedlineEditRegion],
+    underlined_table_columns: &[UnderlinedTableColumn],
+) -> bool {
+    if item.is_strikeout {
+        return false;
+    }
+
+    for (region_index, region) in redline_regions.iter().enumerate() {
+        if item.y < region.y_min || item.y > region.y_max {
+            continue;
+        }
+        if region.spans_page_width {
+            return false;
+        }
+
+        let overlaps_x = item.x + item.width >= region.x_min && item.x <= region.x_max;
+        if overlaps_x {
+            let is_revised_table_cell = item.is_underline
+                && underlined_table_columns.iter().any(|column| {
+                    column.region_index == region_index
+                        && item.x >= column.x_min
+                        && item.x <= column.x_max
+                });
+            if !is_revised_table_cell {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 /// Detect tables in a set of text items from a single page
@@ -187,7 +302,8 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
     }
     // Compute these before consolidation: adjacent old/new text can merge and
     // inherit only the first fragment's decoration flags.
-    let redline_bands = redline_edit_bands(items);
+    let redline_regions = redline_edit_regions(items);
+    let underlined_table_columns = underlined_table_columns(items, &redline_regions);
 
     // Step 1: Merge adjacent single-char items into words (handles per-character PDFs)
     let (merged_items, merge_map) = merge_adjacent_items(items);
@@ -206,7 +322,7 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            is_heuristic_table_evidence(item, &redline_bands)
+            is_heuristic_table_evidence(item, &redline_regions, &underlined_table_columns)
                 && item.font_size <= table_font_threshold
                 && item.font_size >= 6.0
         })
@@ -258,7 +374,11 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             .enumerate()
             .filter(|(idx, item)| {
                 !claimed_indices.contains(idx)
-                    && is_heuristic_table_evidence(item, &redline_bands)
+                    && is_heuristic_table_evidence(
+                        item,
+                        &redline_regions,
+                        &underlined_table_columns,
+                    )
                     && item.font_size >= body_font_low
                     && item.font_size <= body_font_high
                     && item.font_size >= 6.0
@@ -1798,6 +1918,64 @@ mod tests {
         assert!(
             !detect_tables(&items, 12.0, false).is_empty(),
             "redline rows must suppress decorations, not nearby live table cells"
+        );
+    }
+
+    #[test]
+    fn wide_redline_rows_do_not_turn_fragmented_prose_into_a_table() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("line number", 50.0, y, false));
+            items.push(body_item("live prose fragment", 160.0, y, false));
+            let strikeout_x = if row % 2 == 0 { 280.0 } else { 430.0 };
+            items.push(body_item("deleted prose", strikeout_x, y, true));
+        }
+
+        assert!(
+            detect_tables(&items, 12.0, false).is_empty(),
+            "full-width redline prose must not retain table-shaped fragments"
+        );
+    }
+
+    #[test]
+    fn nearby_redline_rows_do_not_remove_separate_underlined_table_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("deleted prose", 400.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "redline rows must not suppress a horizontally separate underlined table"
+        );
+    }
+
+    #[test]
+    fn multiple_revised_rows_do_not_remove_underlined_table_column() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let replacement_x = 220.0 + (row % 2) as f32 * 2.0;
+            let mut value = body_item("new value", replacement_x, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("old value", 220.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "aligned replacement cells must preserve a partially revised table"
         );
     }
 
