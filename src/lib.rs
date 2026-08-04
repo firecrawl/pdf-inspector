@@ -50,7 +50,7 @@ pub use detector::{
 };
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_mem,
-    extract_text_with_positions_pages,
+    extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,

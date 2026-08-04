@@ -84,17 +84,33 @@ pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
-    let (items, _rects, _lines) = extract_text_with_positions_and_rects(path, page_filter)?;
+    let (items, _rects, _lines) =
+        extract_text_with_positions_and_rects_with_password(path, page_filter, None)?;
     Ok(items)
 }
 
-/// Extract text with positions and rectangles from a file.
-pub(crate) fn extract_text_with_positions_and_rects<P: AsRef<Path>>(
+/// Extract text with positions from a file, limited to specific pages and
+/// decrypting with `password` when the PDF is encrypted.
+///
+/// `page_filter` is an optional set of 1-indexed page numbers to process.
+/// When `None`, all pages are processed.
+pub fn extract_text_with_positions_pages_with_password<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
+    password: Option<&str>,
+) -> Result<Vec<TextItem>, PdfError> {
+    let (items, _rects, _lines) =
+        extract_text_with_positions_and_rects_with_password(path, page_filter, password)?;
+    Ok(items)
+}
+
+pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>>(
+    path: P,
+    page_filter: Option<&HashSet<u32>>,
+    password: Option<&str>,
 ) -> Result<PageExtraction, PdfError> {
     crate::validate_pdf_file(&path)?;
-    let (doc, _) = crate::load_document_from_path(&path)?;
+    let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let (extraction, _thresholds, _gid_pages) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
