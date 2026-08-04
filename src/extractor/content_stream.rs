@@ -4,7 +4,9 @@
 //! matrix, and emits `TextItem`s and `PdfRect`s.
 
 use crate::text_utils::{
-    decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
+    decode_text_string, effective_font_size, expand_ligatures,
+    expand_ligatures_in_reversed_char_clusters, expand_ligatures_in_reversed_chars,
+    expand_ligatures_preserving_order, is_bold_font, is_italic_font,
 };
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
@@ -15,8 +17,8 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, compute_string_width_ts, descriptor_style_flags,
-    extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
-    FontStyleCache,
+    extract_text_clusters_from_operand, extract_text_from_operand, get_font_file2_obj_num,
+    get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
@@ -294,6 +296,7 @@ pub(crate) fn extract_page_text_items(
     struct MarkedContentEntry {
         actual_text: Option<String>,
         mcid: Option<i64>,
+        reversed_chars: bool,
     }
     let mut marked_content_stack: Vec<MarkedContentEntry> = Vec::new();
     let mut suppress_glyph_extraction = false;
@@ -306,6 +309,18 @@ pub(crate) fn extract_page_text_items(
     /// Get the innermost MCID from the marked content stack.
     fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
         stack.iter().rev().find_map(|e| e.mcid)
+    }
+
+    fn current_reversed_chars(stack: &[MarkedContentEntry]) -> bool {
+        stack.iter().any(|e| e.reversed_chars)
+    }
+
+    fn expand_content_text(text: &str, stack: &[MarkedContentEntry]) -> String {
+        if current_reversed_chars(stack) {
+            expand_ligatures_in_reversed_chars(text)
+        } else {
+            expand_ligatures(text)
+        }
     }
 
     for op in &content.operations {
@@ -488,18 +503,36 @@ pub(crate) fn extract_page_text_items(
                         }
                         continue;
                     }
-                    if let Some(text) = extract_text_from_operand(
-                        &op.operands[0],
-                        &current_font,
-                        font_base_names.get(&current_font).map(|s| s.as_str()),
-                        font_cmaps,
-                        &font_tounicode_refs,
-                        &inline_cmaps,
-                        &font_encodings,
-                        &encoding_cache,
-                        &mut cmap_decisions,
-                        &font_widths,
-                    ) {
+                    let text = if current_reversed_chars(&marked_content_stack) {
+                        extract_text_clusters_from_operand(
+                            &op.operands[0],
+                            &current_font,
+                            font_base_names.get(&current_font).map(|s| s.as_str()),
+                            font_cmaps,
+                            &font_tounicode_refs,
+                            &inline_cmaps,
+                            &font_encodings,
+                            &encoding_cache,
+                            &mut cmap_decisions,
+                            &font_widths,
+                        )
+                        .map(|clusters| expand_ligatures_in_reversed_char_clusters(&clusters))
+                    } else {
+                        extract_text_from_operand(
+                            &op.operands[0],
+                            &current_font,
+                            font_base_names.get(&current_font).map(|s| s.as_str()),
+                            font_cmaps,
+                            &font_tounicode_refs,
+                            &inline_cmaps,
+                            &font_encodings,
+                            &encoding_cache,
+                            &mut cmap_decisions,
+                            &font_widths,
+                        )
+                        .map(|text| expand_ligatures(&text))
+                    };
+                    if let Some(text) = text {
                         let combined =
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined);
@@ -528,7 +561,7 @@ pub(crate) fn extract_page_text_items(
                                 .copied()
                                 .unwrap_or((false, false));
                             items.push(TextItem {
-                                text: expand_ligatures(&text),
+                                text,
                                 x,
                                 y,
                                 width,
@@ -574,6 +607,8 @@ pub(crate) fn extract_page_text_items(
                         // (text, start_width_ts, end_width_ts)
                         let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
                         let mut current_text = String::new();
+                        let reversed_chars = current_reversed_chars(&marked_content_stack);
+                        let mut current_clusters: Vec<String> = Vec::new();
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         for element in array {
@@ -581,26 +616,45 @@ pub(crate) fn extract_page_text_items(
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
                                     let displacement = -n_val / 1000.0 * current_font_size;
-                                    if !is_invisible
-                                        && n_val < -column_gap_threshold
-                                        && !current_text.is_empty()
+                                    let has_current = if reversed_chars {
+                                        !current_clusters.is_empty()
+                                    } else {
+                                        !current_text.is_empty()
+                                    };
+                                    if !is_invisible && n_val < -column_gap_threshold && has_current
                                     {
                                         // Column gap: flush current segment
-                                        sub_items.push((
-                                            std::mem::take(&mut current_text),
-                                            sub_start_width_ts,
-                                            total_width_ts,
-                                        ));
+                                        let text = if reversed_chars {
+                                            let text = expand_ligatures_in_reversed_char_clusters(
+                                                &current_clusters,
+                                            );
+                                            current_clusters.clear();
+                                            text
+                                        } else {
+                                            std::mem::take(&mut current_text)
+                                        };
+                                        sub_items.push((text, sub_start_width_ts, total_width_ts));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        let ends_with_space = if reversed_chars {
+                                            current_clusters
+                                                .last()
+                                                .is_some_and(|cluster| cluster.ends_with(' '))
+                                        } else {
+                                            current_text.ends_with(' ')
+                                        };
                                         if !is_invisible
                                             && n_val < -space_threshold
-                                            && !current_text.is_empty()
-                                            && !current_text.ends_with(' ')
+                                            && has_current
+                                            && !ends_with_space
                                         {
-                                            current_text.push(' ');
+                                            if reversed_chars {
+                                                current_clusters.push(" ".to_string());
+                                            } else {
+                                                current_text.push(' ');
+                                            }
                                         }
                                     }
                                     continue;
@@ -608,25 +662,44 @@ pub(crate) fn extract_page_text_items(
                                 Object::Real(n) => {
                                     let n_val = *n;
                                     let displacement = -n_val / 1000.0 * current_font_size;
-                                    if !is_invisible
-                                        && n_val < -column_gap_threshold
-                                        && !current_text.is_empty()
+                                    let has_current = if reversed_chars {
+                                        !current_clusters.is_empty()
+                                    } else {
+                                        !current_text.is_empty()
+                                    };
+                                    if !is_invisible && n_val < -column_gap_threshold && has_current
                                     {
-                                        sub_items.push((
-                                            std::mem::take(&mut current_text),
-                                            sub_start_width_ts,
-                                            total_width_ts,
-                                        ));
+                                        let text = if reversed_chars {
+                                            let text = expand_ligatures_in_reversed_char_clusters(
+                                                &current_clusters,
+                                            );
+                                            current_clusters.clear();
+                                            text
+                                        } else {
+                                            std::mem::take(&mut current_text)
+                                        };
+                                        sub_items.push((text, sub_start_width_ts, total_width_ts));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        let ends_with_space = if reversed_chars {
+                                            current_clusters
+                                                .last()
+                                                .is_some_and(|cluster| cluster.ends_with(' '))
+                                        } else {
+                                            current_text.ends_with(' ')
+                                        };
                                         if !is_invisible
                                             && n_val < -space_threshold
-                                            && !current_text.is_empty()
-                                            && !current_text.ends_with(' ')
+                                            && has_current
+                                            && !ends_with_space
                                         {
-                                            current_text.push(' ');
+                                            if reversed_chars {
+                                                current_clusters.push(" ".to_string());
+                                            } else {
+                                                current_text.push(' ');
+                                            }
                                         }
                                     }
                                     continue;
@@ -645,7 +718,22 @@ pub(crate) fn extract_page_text_items(
                                 }
                             }
                             if !is_invisible {
-                                if let Some(text) = extract_text_from_operand(
+                                if reversed_chars {
+                                    if let Some(clusters) = extract_text_clusters_from_operand(
+                                        element,
+                                        &current_font,
+                                        font_base_names.get(&current_font).map(|s| s.as_str()),
+                                        font_cmaps,
+                                        &font_tounicode_refs,
+                                        &inline_cmaps,
+                                        &font_encodings,
+                                        &encoding_cache,
+                                        &mut cmap_decisions,
+                                        &font_widths,
+                                    ) {
+                                        current_clusters.extend(clusters);
+                                    }
+                                } else if let Some(text) = extract_text_from_operand(
                                     element,
                                     &current_font,
                                     font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -662,8 +750,15 @@ pub(crate) fn extract_page_text_items(
                             }
                         }
                         // Flush remaining text
-                        if !is_invisible && !current_text.trim().is_empty() {
-                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                        if !is_invisible {
+                            let text = if reversed_chars {
+                                expand_ligatures_in_reversed_char_clusters(&current_clusters)
+                            } else {
+                                current_text
+                            };
+                            if !text.trim().is_empty() {
+                                sub_items.push((text, sub_start_width_ts, total_width_ts));
+                            }
                         }
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
@@ -701,7 +796,11 @@ pub(crate) fn extract_page_text_items(
                                     0.0
                                 };
                                 items.push(TextItem {
-                                    text: expand_ligatures(text),
+                                    text: if reversed_chars {
+                                        text.clone()
+                                    } else {
+                                        expand_content_text(text, &marked_content_stack)
+                                    },
                                     x,
                                     y,
                                     width,
@@ -760,18 +859,36 @@ pub(crate) fn extract_page_text_items(
                     || suppress_glyph_extraction
                     || op.operands.is_empty())
                 {
-                    if let Some(text) = extract_text_from_operand(
-                        &op.operands[0],
-                        &current_font,
-                        font_base_names.get(&current_font).map(|s| s.as_str()),
-                        font_cmaps,
-                        &font_tounicode_refs,
-                        &inline_cmaps,
-                        &font_encodings,
-                        &encoding_cache,
-                        &mut cmap_decisions,
-                        &font_widths,
-                    ) {
+                    let text = if current_reversed_chars(&marked_content_stack) {
+                        extract_text_clusters_from_operand(
+                            &op.operands[0],
+                            &current_font,
+                            font_base_names.get(&current_font).map(|s| s.as_str()),
+                            font_cmaps,
+                            &font_tounicode_refs,
+                            &inline_cmaps,
+                            &font_encodings,
+                            &encoding_cache,
+                            &mut cmap_decisions,
+                            &font_widths,
+                        )
+                        .map(|clusters| expand_ligatures_in_reversed_char_clusters(&clusters))
+                    } else {
+                        extract_text_from_operand(
+                            &op.operands[0],
+                            &current_font,
+                            font_base_names.get(&current_font).map(|s| s.as_str()),
+                            font_cmaps,
+                            &font_tounicode_refs,
+                            &inline_cmaps,
+                            &font_encodings,
+                            &encoding_cache,
+                            &mut cmap_decisions,
+                            &font_widths,
+                        )
+                        .map(|text| expand_ligatures(&text))
+                    };
+                    if let Some(text) = text {
                         if !text.trim().is_empty() {
                             let combined =
                                 multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
@@ -797,7 +914,7 @@ pub(crate) fn extract_page_text_items(
                                 .copied()
                                 .unwrap_or((false, false));
                             items.push(TextItem {
-                                text: expand_ligatures(&text),
+                                text,
                                 x,
                                 y,
                                 width,
@@ -877,15 +994,26 @@ pub(crate) fn extract_page_text_items(
             }
             "BMC" => {
                 // Begin Marked Content (no properties)
+                let reversed_chars = op
+                    .operands
+                    .first()
+                    .and_then(|object| object.as_name().ok())
+                    .is_some_and(|name| name == b"ReversedChars");
                 marked_content_stack.push(MarkedContentEntry {
                     actual_text: None,
                     mcid: None,
+                    reversed_chars,
                 });
             }
             "BDC" => {
                 // Begin Marked Content with properties — extract ActualText and MCID
                 let mut actual_text: Option<String> = None;
                 let mut mcid: Option<i64> = None;
+                let reversed_chars = op
+                    .operands
+                    .first()
+                    .and_then(|object| object.as_name().ok())
+                    .is_some_and(|name| name == b"ReversedChars");
                 if op.operands.len() >= 2 {
                     let dict = match &op.operands[1] {
                         Object::Dictionary(d) => Some(d.clone()),
@@ -911,7 +1039,11 @@ pub(crate) fn extract_page_text_items(
                     actual_text_glyph_tm = None; // reset — will be captured at first Tj/TJ
                     actual_text_glyph_rise = None;
                 }
-                marked_content_stack.push(MarkedContentEntry { actual_text, mcid });
+                marked_content_stack.push(MarkedContentEntry {
+                    actual_text,
+                    mcid,
+                    reversed_chars,
+                });
             }
             "EMC" => {
                 // End Marked Content — emit ActualText item with correct width
@@ -948,7 +1080,7 @@ pub(crate) fn extract_page_text_items(
                                     .copied()
                                     .unwrap_or((false, false));
                                 items.push(TextItem {
-                                    text: expand_ligatures(&at),
+                                    text: expand_ligatures_preserving_order(&at),
                                     x,
                                     y,
                                     width,

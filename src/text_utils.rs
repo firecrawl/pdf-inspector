@@ -84,6 +84,13 @@ fn is_arabic_token_char(c: char) -> bool {
     is_arabic_script_char(c) && (c.is_alphabetic() || is_arabic_combining_mark(c))
 }
 
+fn is_arabic_alef(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0622}' | '\u{0623}' | '\u{0625}' | '\u{0627}' | '\u{0671}'
+    )
+}
+
 pub(crate) fn is_rtl_text<I, S>(texts: I) -> bool
 where
     I: Iterator<Item = S>,
@@ -150,12 +157,71 @@ pub fn is_italic_font(font_name: &str) -> bool {
         || lower.contains("kursiv") // German for italic
 }
 
+#[derive(Clone, Copy)]
+enum VisualOrderMode {
+    Auto,
+    Preserve,
+    ReversedChars,
+}
+
 /// Expand Unicode ligature characters to their component characters.
 /// This makes extracted text more searchable and semantically correct.
 /// Also applies NFKC normalization (converts Arabic presentation forms to base
 /// characters, decomposes Latin ligatures, etc.) and reverses visual-order
 /// Arabic text back to logical order when presentation forms are detected.
 pub(crate) fn expand_ligatures(text: &str) -> String {
+    expand_ligatures_impl(text, VisualOrderMode::Auto)
+}
+
+/// Normalize ligatures/control characters without changing character order.
+///
+/// PDF `/ActualText` entries are replacement text supplied by the producer;
+/// inside browser-generated `/ReversedChars` spans these replacements are
+/// already logical glyph clusters and must not be reversed independently.
+pub(crate) fn expand_ligatures_preserving_order(text: &str) -> String {
+    expand_ligatures_impl(text, VisualOrderMode::Preserve)
+}
+
+/// Normalize text emitted inside a PDF `/ReversedChars` marked-content span.
+///
+/// In Chrome/Edge generated RTL PDFs, many raw glyph chunks are visual-order
+/// fragments. Chunks containing spaces need local reversal so word separators
+/// move to the logical side before line-level RTL item ordering runs.
+pub(crate) fn expand_ligatures_in_reversed_chars(text: &str) -> String {
+    expand_ligatures_impl(text, VisualOrderMode::ReversedChars)
+}
+
+pub(crate) fn expand_ligatures_in_reversed_char_clusters(clusters: &[String]) -> String {
+    if clusters.is_empty() {
+        return String::new();
+    }
+
+    let clusters: Vec<String> = clusters
+        .iter()
+        .map(|cluster| expand_ligatures_preserving_order(cluster))
+        .collect();
+
+    if clusters.len() == 1 {
+        return clusters.concat();
+    }
+
+    let has_rtl = clusters
+        .iter()
+        .flat_map(|cluster| cluster.chars())
+        .any(is_rtl_char);
+    let has_ltr_alpha = clusters
+        .iter()
+        .flat_map(|cluster| cluster.chars())
+        .any(|c| c.is_alphabetic() && !is_rtl_char(c) && !is_cjk_char(c));
+
+    if !has_rtl && has_ltr_alpha {
+        return clusters.concat();
+    }
+
+    reverse_visual_clusters(&clusters)
+}
+
+fn expand_ligatures_impl(text: &str, visual_order_mode: VisualOrderMode) -> String {
     // Strip null bytes and other control characters (except newline/tab)
     let text = if text
         .bytes()
@@ -213,11 +279,41 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
     // visual (LTR screen) order. After NFKC normalization, reverse to restore
     // logical reading order. Strong base-Arabic visual-order spans are handled
     // here; short clue-less runs are handled later with page context.
-    if had_presentation_forms || looks_like_visual_order_base_arabic(&result) {
+    let should_reverse = match visual_order_mode {
+        VisualOrderMode::Auto => {
+            had_presentation_forms || looks_like_visual_order_base_arabic(&result)
+        }
+        VisualOrderMode::Preserve => false,
+        VisualOrderMode::ReversedChars => {
+            had_presentation_forms
+                || looks_like_visual_order_base_arabic(&result)
+                || reversed_chars_fragment_needs_reversal(&result)
+        }
+    };
+
+    if should_reverse {
         result = reverse_visual_arabic(&result);
     }
 
     result
+}
+
+fn reversed_chars_fragment_needs_reversal(text: &str) -> bool {
+    if !text.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if text.trim().is_empty() {
+        return false;
+    }
+
+    let has_rtl = text.chars().any(is_rtl_char);
+    let has_ltr_alpha = text
+        .chars()
+        .any(|c| c.is_alphabetic() && !is_rtl_char(c) && !is_cjk_char(c));
+
+    // Keep embedded LTR phrases such as "Open AI" in their own order, but
+    // still flip separators around Arabic, numbers, and punctuation fragments.
+    has_rtl || !has_ltr_alpha
 }
 
 /// Reverse visual-order Arabic text to logical order.
@@ -304,6 +400,57 @@ fn is_visual_ltr_run_char(chars: &[char], idx: usize) -> bool {
 fn is_adjacent_to_ltr_base(chars: &[char], idx: usize) -> bool {
     (idx > 0 && is_visual_ltr_base_char(chars[idx - 1]))
         || (idx + 1 < chars.len() && is_visual_ltr_base_char(chars[idx + 1]))
+}
+
+fn reverse_visual_clusters(clusters: &[String]) -> String {
+    let has_ltr = clusters.iter().any(|cluster| {
+        cluster
+            .chars()
+            .any(|c| is_visual_ltr_base_char(c) || is_visual_ltr_punctuation(c))
+    });
+
+    if !has_ltr {
+        return clusters.iter().rev().cloned().collect::<Vec<_>>().concat();
+    }
+
+    let mut runs: Vec<(bool, Vec<&String>)> = Vec::new();
+    let mut i = 0;
+    while i < clusters.len() {
+        let is_ltr = is_visual_ltr_cluster(clusters, i);
+        let mut run = Vec::new();
+        while i < clusters.len() && is_visual_ltr_cluster(clusters, i) == is_ltr {
+            run.push(&clusters[i]);
+            i += 1;
+        }
+        runs.push((is_ltr, run));
+    }
+
+    runs.reverse();
+    let mut result = String::new();
+    for (is_ltr, run) in runs {
+        if is_ltr {
+            for cluster in run {
+                result.push_str(cluster);
+            }
+        } else {
+            for cluster in run.into_iter().rev() {
+                result.push_str(cluster);
+            }
+        }
+    }
+    result
+}
+
+fn is_visual_ltr_cluster(clusters: &[String], idx: usize) -> bool {
+    let cluster = &clusters[idx];
+    cluster.chars().any(is_visual_ltr_base_char)
+        || (cluster.chars().any(is_visual_ltr_punctuation)
+            && is_cluster_adjacent_to_ltr_base(clusters, idx))
+}
+
+fn is_cluster_adjacent_to_ltr_base(clusters: &[String], idx: usize) -> bool {
+    (idx > 0 && clusters[idx - 1].chars().any(is_visual_ltr_base_char))
+        || (idx + 1 < clusters.len() && clusters[idx + 1].chars().any(is_visual_ltr_base_char))
 }
 
 fn is_no_space_before_punctuation(c: char) -> bool {
@@ -899,6 +1046,31 @@ pub(crate) fn should_join_items(
             return false;
         }
 
+        // Browser-generated RTL text often alternates one-glyph ActualText
+        // spans with short raw glyph fragments. Their measured widths can be
+        // zero or slightly negative, so the generic single/multi thresholds
+        // sometimes create spaces inside Arabic words ("ع ليكم", "عر بية").
+        if let (Some(p), Some(c)) = (prev_last_char, curr_first_char) {
+            let prev_chars = prev_item.text.trim().chars().count();
+            let curr_chars = curr_item.text.trim().chars().count();
+            if is_rtl_char(p) && is_rtl_char(c) {
+                let curr_width = curr_item.width.abs();
+                let rtl_gap = if prev_item.x > curr_item.x {
+                    prev_item.x - (curr_item.x + curr_width)
+                } else {
+                    curr_item.x - (prev_item.x + prev_item.width.abs())
+                };
+                if rtl_gap > -font_size * 0.15 && rtl_gap < font_size * 0.35 {
+                    if (is_arabic_alef(p) && c == '\u{0644}') || c == '\u{0629}' {
+                        return true;
+                    }
+                    if prev_chars == 1 && (2..=3).contains(&curr_chars) {
+                        return true;
+                    }
+                }
+            }
+        }
+
         // Numeric continuity: digits, commas, periods, and percent signs that
         // are positioned close together are almost always a single number.
         // e.g., "34,20" + "8" → "34,208", "+13." + "0" + "%" → "+13.0%"
@@ -1203,6 +1375,49 @@ mod tests {
     }
 
     #[test]
+    fn reversed_chars_fragments_move_visual_spaces_to_logical_side() {
+        assert_eq!(expand_ligatures_in_reversed_chars(" م"), "م ");
+        assert_eq!(expand_ligatures_in_reversed_chars("رو م"), "م ور");
+        assert_eq!(expand_ligatures_in_reversed_chars(" ."), ". ");
+    }
+
+    #[test]
+    fn reversed_chars_clusters_reverse_glyph_order_not_cluster_text() {
+        let two_glyphs = vec!["ر".to_string(), "د".to_string()];
+        assert_eq!(
+            expand_ligatures_in_reversed_char_clusters(&two_glyphs),
+            "در"
+        );
+
+        let one_cluster = vec!["بي".to_string()];
+        assert_eq!(
+            expand_ligatures_in_reversed_char_clusters(&one_cluster),
+            "بي"
+        );
+    }
+
+    #[test]
+    fn reversed_chars_clusters_move_spaces_without_reversing_digits() {
+        let clusters = vec![" ".to_string(), "م".to_string(), "و".to_string()];
+        assert_eq!(expand_ligatures_in_reversed_char_clusters(&clusters), "وم ");
+
+        let numeric = vec![" ".to_string(), "25".to_string()];
+        assert_eq!(expand_ligatures_in_reversed_char_clusters(&numeric), "25 ");
+    }
+
+    #[test]
+    fn reversed_chars_preserves_ltr_phrases_but_moves_numeric_separators() {
+        assert_eq!(expand_ligatures_in_reversed_chars("Open AI"), "Open AI");
+        assert_eq!(expand_ligatures_in_reversed_chars(" 25"), "25 ");
+    }
+
+    #[test]
+    fn actual_text_preserving_order_keeps_arabic_ligature_expansions() {
+        assert_eq!(expand_ligatures_preserving_order("لا"), "لا");
+        assert_eq!(expand_ligatures_preserving_order("الله"), "الله");
+    }
+
+    #[test]
     fn arabic_presentation_form_detection() {
         // Presentation Forms-A range
         assert!(is_arabic_presentation_form('\u{FB50}'));
@@ -1235,6 +1450,25 @@ mod tests {
         );
         let comma = make_text_item("\u{060C}", 143.0, 3.0, 12.0);
         assert!(should_join_items(&word, &comma, 0.10));
+    }
+
+    #[test]
+    fn joins_short_rtl_fragments_without_collapsing_long_word_boundaries() {
+        let ain = make_text_item("ع", 511.70, 7.09, 13.5);
+        let lam_yeh = make_text_item("لي", 508.90, 0.0, 13.5);
+        assert!(should_join_items(&ain, &lam_yeh, 0.10));
+
+        let ta_marbuta = make_text_item("ة", 334.28, 5.06, 13.5);
+        let next_word = make_text_item("بالل", 327.25, -5.89, 13.5);
+        assert!(!should_join_items(&ta_marbuta, &next_word, 0.10));
+
+        let alef = make_text_item("ا", 518.26, 6.53, 13.5);
+        let lam = make_text_item("ل", 515.46, 2.79, 13.5);
+        assert!(should_join_items(&alef, &lam, 0.10));
+
+        let final_lam = make_text_item("ل", 405.0, 2.79, 13.5);
+        let final_ta_marbuta = make_text_item("ة", 401.0, 5.06, 13.5);
+        assert!(should_join_items(&final_lam, &final_ta_marbuta, 0.10));
     }
 
     /// Helper to create a single-char TextItem at a given x position with width.
