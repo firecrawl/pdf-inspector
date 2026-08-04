@@ -35,6 +35,11 @@ thiserror = "2.0"
 # Logging
 log = "0.4"
 
+# Optional pure-Rust PDF rasterization. Keep the embedded fallback assets so
+# OCR-routed pages also render when their fonts or CMaps are not embedded.
+hayro = { version = "0.7.1", optional = true, default-features = false, features = ["embed-fonts", "embed-cmaps"] }
+bytemuck = { version = "1.25", optional = true, default-features = false, features = ["extern_crate_alloc"] }
+
 # Text processing
 regex = "1.10"
 once_cell = "1.19"
@@ -57,11 +62,13 @@ lopdf = { version = "0.42.0", default-features = false, features = ["wasm_js"] }
 include_dir = "0.7"
 
 [dev-dependencies]
+sha2 = "0.10"
 tempfile = "3.3"
 
 [features]
 default = []
 python = ["pyo3"]
+render = ["dep:bytemuck", "dep:hayro"]
 
 [[bin]]
 name = "pdf2md"

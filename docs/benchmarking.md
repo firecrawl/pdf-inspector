@@ -39,6 +39,50 @@ warm-up run; quality scores come from the benchmark evaluator over all 200
 outputs. Raw timings, predictions, evaluations, and charts are available in the
 [results branch](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results).
 
+## Optional renderer compatibility and timing
+
+Selected-page rendering has a separate ignored test over the external
+[`py-pdf/sample-files`](https://github.com/py-pdf/sample-files) corpus. The
+files are CC-BY-SA-4.0 and are not vendored into this MIT repository. The test
+pins commit `89039b6078fd0c9f98bf3d6fcb5583fac6b0ecaf` and verifies every selected
+file's SHA-256 digest before rendering it.
+
+```bash
+git clone https://github.com/py-pdf/sample-files.git ../sample-files
+git -C ../sample-files checkout 89039b6078fd0c9f98bf3d6fcb5583fac6b0ecaf
+
+PDF_INSPECTOR_SAMPLE_FILES=../sample-files \
+  cargo test --release --features render --test render_corpus_tests \
+  renders_pinned -- --ignored --nocapture
+```
+
+The cases cover structured text, image-only pages, CMYK images, page
+crop/rotation/scaling, repeated image references, and caller-ordered page
+selection. The printed per-file durations are a smoke-test aid, not directly
+comparable benchmark results. For reportable measurements, record the corpus
+revision, compiler, target, CPU, and peak memory; discard one warm-up and report
+the median of at least five release-profile runs at each tested DPI.
+
+### Reference rasterization measurements
+
+The following reference run used the checksum-verified
+`018-base64-image/base64image.pdf` input from the pinned corpus revision above.
+`pdf-inspector` classifies its only page as needing OCR. Measurements were made
+on macOS 26.6, an Apple M3 Pro (12 cores, 18 GB), with Rust 1.95.0. Each row is
+20 release-profile process runs after one discarded warm-up. Render time covers
+PDF cloning, parsing, and rasterization; peak RSS is for the complete test
+process. Nearest-rank p95 is reported.
+
+| DPI | Output | RGBA8 bytes | Median | p95 | Min–max | Sample SD | Median peak RSS | p95 peak RSS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 150 | 1,240 x 1,753 | 8,694,880 | 7.286 ms | 7.821 ms | 6.876–9.268 ms | 0.503 ms | 30,408,704 B | 31,391,744 B |
+| 200 | 1,653 x 2,338 | 15,458,856 | 8.554 ms | 9.059 ms | 8.359–9.528 ms | 0.280 ms | 36,454,400 B | 37,404,672 B |
+| 300 | 2,480 x 3,507 | 34,789,440 | 11.985 ms | 12.723 ms | 11.817–12.942 ms | 0.370 ms | 59,817,984 B | 60,768,256 B |
+
+These figures measure rasterization only, not OCR inference. They should be
+treated as one-machine reference data, not a cross-platform performance claim.
+The returned RGBA8 buffer dominates the DPI-dependent memory increase.
+
 ## Optional backend evidence probe
 
 The evidence probe compares positioned `pdf2md` items with MuPDF structured

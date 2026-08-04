@@ -5,6 +5,10 @@ use pdf_inspector::{
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+#[cfg(all(test, target_arch = "wasm32", feature = "render"))]
+#[path = "../../tests/support/render_fixture.rs"]
+mod render_fixture;
+
 #[wasm_bindgen(typescript_custom_section)]
 const TYPESCRIPT_TYPES: &str = r#"
 export type PdfType = "TextBased" | "Scanned" | "ImageBased" | "Mixed";
@@ -391,6 +395,39 @@ mod tests {
 
         assert_eq!(pdf_type, "TextBased");
         assert!(!markdown.is_empty());
+    }
+
+    #[cfg(feature = "render")]
+    #[wasm_bindgen_test]
+    fn renders_a_selected_page_with_the_optional_core_feature() {
+        let pdf = crate::render_fixture::synthetic_image_pdf();
+        let rendered = pdf_inspector::render_pages_mem(
+            &pdf,
+            &[0],
+            pdf_inspector::RenderOptions::new().dpi(72.0),
+        )
+        .expect("render selected page");
+
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].page, 0);
+        assert_eq!((rendered[0].width, rendered[0].height), (64, 64));
+        assert!(rendered[0].warnings.is_empty());
+        assert_eq!(
+            rendered[0].pixels.len(),
+            rendered[0].width as usize * rendered[0].height as usize * 4
+        );
+        assert!(rendered[0]
+            .pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel[3] == 255));
+        assert!(rendered[0]
+            .pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] > 180 && pixel[2] < 80));
+        assert!(rendered[0]
+            .pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[2] > 180 && pixel[0] < 80));
     }
 
     #[wasm_bindgen_test]

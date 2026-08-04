@@ -1,6 +1,6 @@
 # pdf-inspector
 
-Fast PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Pure Rust, no ML models, no external services; the only PDF dependency is [lopdf](https://crates.io/crates/lopdf). Also available for [Python](https://pypi.org/project/pdf-inspector/) and [Node.js](https://www.npmjs.com/package/@firecrawl/pdf-inspector).
+Fast PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Pure Rust, no ML models, and no external services; the default feature set uses [lopdf](https://crates.io/crates/lopdf), while an opt-in feature adds selected-page rasterization. Also available for [Python](https://pypi.org/project/pdf-inspector/) and [Node.js](https://www.npmjs.com/package/@firecrawl/pdf-inspector).
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
@@ -10,7 +10,8 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **Markdown conversion** — headings, lists, code blocks, bold/italic, URL linking, and dual-mode table detection (PDF drawing ops + text-alignment heuristics).
 - **Layout-aware extraction** — multi-column reading order, position and font info per text item, RTL support.
 - **Robust text decoding** — CID/Type0 fonts via ToUnicode CMaps, plus automatic flagging of broken encodings so callers can fall back to OCR.
-- **Lightweight** — pure Rust, no ML models, no external services; single PDF dependency ([lopdf](https://crates.io/crates/lopdf)).
+- **Optional page rendering** — selected pages can be rasterized to bounded RGBA8 buffers for local OCR pipelines, including WebAssembly callers.
+- **Lightweight by default** — pure Rust, no ML models, no external services; the default feature set keeps [lopdf](https://crates.io/crates/lopdf) as its only PDF dependency.
 
 ## Benchmark
 
@@ -117,6 +118,85 @@ let bytes = std::fs::read("document.pdf")?;
 let result = process_pdf_mem(&bytes)?;
 ```
 
+### Optional selected-page rendering
+
+Enable the non-default `render` feature when an OCR pipeline needs pixels for
+pages already identified by `pages_needing_ocr`:
+
+```bash
+cargo add pdf-inspector --features render
+```
+
+```rust
+use pdf_inspector::{classify_pdf_mem, render_pages_mem, RenderOptions, RenderWarning};
+
+let bytes = std::fs::read("scan.pdf")?;
+let classification = classify_pdf_mem(&bytes)?;
+
+// PdfClassification uses the renderer's zero-based page indexes. Only pages
+// routed to OCR are rasterized, in caller-supplied order.
+if !classification.pages_needing_ocr.is_empty() {
+    let pages = render_pages_mem(
+        &bytes,
+        &classification.pages_needing_ocr,
+        RenderOptions::new().dpi(200.0),
+    )?;
+
+    for page in pages {
+        if page.warnings.contains(&RenderWarning::ImageDecodeFailure) {
+            // Do not OCR pixels from an image resource that failed to decode.
+            continue;
+        }
+        // Opaque, row-major RGBA8 pixels on a white background.
+        run_ocr(page.width, page.height, &page.pixels);
+    }
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+# fn run_ocr(_: u32, _: u32, _: &[u8]) {}
+```
+
+Do not pass `PdfProcessResult::pages_needing_ocr` directly: that high-level
+field is one-based for display, while `PdfClassification::pages_needing_ocr`,
+`PageMarkdown::page`, and `render_pages_mem` are zero-based.
+
+Even with an empty page list, `render_pages_mem` still copies and parses the
+PDF, so integrators must skip the call entirely on the no-OCR fast path.
+
+The renderer is CPU-only and byte-oriented, with no filesystem access, and
+compiles for `wasm32-unknown-unknown`. It is intentionally not enabled in the
+default feature set. The `render` feature currently requires Rust 1.92 because
+of its rendering backend; default builds keep the existing compiler behavior.
+
+Every request's output viewport and returned buffers are validated before the
+first page is rendered:
+
+| Limit | Value |
+|---|---:|
+| Default DPI | 200 |
+| Maximum DPI | 300 |
+| Maximum width or height | 16,384 px |
+| Maximum pixels per page | 25,000,000 |
+| Maximum combined RGBA8 output | 100,000,000 bytes |
+| Maximum page entries per call | 1,024 |
+
+For large scanned documents, render small batches and release each page buffer
+after OCR instead of retaining the whole document in memory. Rendering handles
+common page crops, rotations, transforms, images, and soft masks before
+returning pixels. Each page also carries typed warnings for unsupported fonts
+and failed image decoding; an image-decode warning means its pixels must not be
+silently accepted as OCR input.
+
+The optional backend is still evolving. Hayro 0.7.1 documents missing or
+incomplete support for blending and isolation, knockout groups, and color-key
+masking. Preserve a fallback for documents it cannot render faithfully, even
+when no interpreter warning is available for that unsupported construct.
+
+These limits bound output dimensions and returned RGBA memory. The current
+backend can still allocate internal image-decoder and compositing scratch
+buffers from PDF resources. Until it exposes comprehensive internal resource
+limits, isolate untrusted rendering in a process or Web Worker with its own
+memory/input limits; output preflight alone is not an adversarial-PDF sandbox.
+
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):
 
@@ -193,6 +273,7 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | `extract_pages_markdown_mem(bytes, pages)` | Per-page Markdown from bytes |
 | `extract_structure_elements(path, pages)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_mem(bytes, pages)` | Structure-tree elements from bytes |
+| `render_pages_mem(bytes, pages, options)` | Selected pages as bounded RGBA8 buffers (`render` feature) |
 
 Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
 
@@ -214,3 +295,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |
+| `RenderOptions` | DPI and optional password for selected-page rendering (`render` feature) |
+| `RenderedPage` | Zero-based source page, dimensions, and opaque RGBA8 pixels (`render` feature) |
+| `RenderError` | Typed parse, password, page-selection, and resource-limit failures (`render` feature) |
+| `RenderWarning` | Per-page unsupported-font or image-decode fidelity warning (`render` feature) |
