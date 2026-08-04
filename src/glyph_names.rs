@@ -4588,3 +4588,117 @@ pub fn glyph_to_char(name: &str) -> Option<char> {
 
     None
 }
+
+/// Map a glyph name to a Unicode string, expanding multi-character ligature
+/// names per the Adobe Glyph List naming convention (`_`-separated components).
+///
+/// Single-character glyph names (e.g. `f_i`, `f_f_i`) map to their Unicode
+/// ligature codepoint (U+FB00–U+FB04) as before; names with no single-codepoint
+/// equivalent (e.g. the `T_h` Th-ligature used by Adobe Type1 fonts) are split
+/// on `_` and each component resolved against the glyph list, yielding `"Th"`.
+/// Mirrors the AGL expansion used by [`crate::tounicode`] for CFF glyph names.
+pub fn glyph_name_to_unicode(name: &str) -> Option<String> {
+    let base = name.split('.').next().unwrap_or(name);
+
+    // Multi-codepoint `uniXXXXYYYY` glyph names (e.g. `uni00410042` → "AB")
+    // expand to several characters. `glyph_to_char` only consumes the first
+    // four-hex group, so handle the full sequence before falling back.
+    if let Some(s) = expand_uni_sequence(base) {
+        return Some(s);
+    }
+    if let Some(ch) = glyph_to_char(base) {
+        return Some(ch.to_string());
+    }
+    if base.contains('_') {
+        let mut out = String::new();
+        for part in base.split('_') {
+            if part.is_empty() {
+                return None;
+            }
+            if let Some(s) = expand_uni_sequence(part) {
+                out.push_str(&s);
+            } else if let Some(ch) = glyph_to_char(part) {
+                out.push(ch);
+            } else if part.chars().count() == 1 {
+                out.push(part.chars().next().unwrap());
+            } else {
+                return None;
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    if matches!(base, "ti" | "tt" | "tz") {
+        return Some(base.to_string());
+    }
+    None
+}
+
+/// Expand a `uniXXXXYYYY…` glyph name into its component characters, each
+/// four-hex group decoded with the same PUA F000 normalization as
+/// `glyph_to_char`. Returns `None` when the name is not a multi-codepoint
+/// uni sequence (single `uniXXXX` names are left to `glyph_to_char`).
+fn expand_uni_sequence(name: &str) -> Option<String> {
+    let hex = name.strip_prefix("uni")?;
+    if hex.len() % 4 != 0 || hex.len() == 4 {
+        return None;
+    }
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = String::new();
+    for chunk in hex.as_bytes().chunks(4) {
+        let code = u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        let code = if (0xF000..=0xF0FF).contains(&code) {
+            code - 0xF000
+        } else {
+            code
+        };
+        out.push(char::from_u32(code)?);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_char_ligature_names_expand() {
+        // Th-ligature has no single Unicode codepoint; AGL convention expands it.
+        assert_eq!(glyph_name_to_unicode("T_h"), Some("Th".to_string()));
+        // f-fixtures resolve to their single ligature codepoint as before.
+        assert_eq!(glyph_name_to_unicode("f_i"), Some("\u{FB01}".to_string()));
+        assert_eq!(glyph_name_to_unicode("f_f_i"), Some("\u{FB03}".to_string()));
+    }
+
+    #[test]
+    fn dot_suffix_and_plain_names_still_resolve() {
+        assert_eq!(glyph_name_to_unicode("a.ss01"), Some("a".to_string()));
+        assert_eq!(glyph_name_to_unicode("A"), Some("A".to_string()));
+        assert_eq!(glyph_name_to_unicode("gid00123"), None);
+        // Names with empty components are rejected rather than mis-expanded.
+        assert_eq!(glyph_name_to_unicode("T_"), None);
+    }
+
+    #[test]
+    fn uni_multi_codepoint_names_expand_all_groups() {
+        // uni00410042 has two four-hex groups → "AB"; single uniXXXX names keep
+        // their existing single-char behavior (including F000 normalization).
+        assert_eq!(glyph_name_to_unicode("uni00410042"), Some("AB".to_string()));
+        assert_eq!(glyph_name_to_unicode("uni0041"), Some("A".to_string()));
+        // F000 PUA normalization applies per group (U+F0E9 → é).
+        assert_eq!(glyph_name_to_unicode("uniF0E9"), Some("é".to_string()));
+        assert_eq!(glyph_name_to_unicode("uni0041F0E9"), Some("Aé".to_string()));
+        // Non-hex or odd-length names don't match.
+        assert_eq!(glyph_name_to_unicode("uni00G10042"), None);
+    }
+
+    #[test]
+    fn single_char_non_ascii_components_resolve() {
+        // A `_`-separated component that is a single non-ASCII char (e.g. an
+        // accented letter) must resolve by character count, not byte length.
+        assert_eq!(glyph_name_to_unicode("A_é"), Some("Aé".to_string()));
+    }
+}

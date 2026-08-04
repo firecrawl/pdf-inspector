@@ -1028,6 +1028,14 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
         }
     }
 
+    // Fallback 3: CIDSystemInfo ordering maps through a bundled Adobe
+    // predefined CMap (Adobe-CNS1/GB1/Japan1-UCS2.bcmap). A CID font whose
+    // CIDs belong to a known character collection is decodable even without
+    // ToUnicode, so it is not "undecodable Identity-H" garbage.
+    if crate::tounicode::predefined_cmap_for_font(font_dict, doc).is_some() {
+        return true;
+    }
+
     false
 }
 
