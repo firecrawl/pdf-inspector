@@ -83,8 +83,11 @@ fn merge_adjacent_items_preserving(
                 // Proven replacement cells must retain their own decoration.
                 // Otherwise an adjacent old/new pair inherits only the first
                 // fragment's flags and can lose the live table evidence.
-                let decoration_changes = next_item.is_underline != first_item.is_underline
-                    || next_item.is_strikeout != first_item.is_strikeout;
+                let decoration_changes = indices.iter().any(|index| {
+                    let merged_item = &items[*index];
+                    next_item.is_underline != merged_item.is_underline
+                        || next_item.is_strikeout != merged_item.is_strikeout
+                });
                 if decoration_changes
                     && (indices
                         .iter()
@@ -331,7 +334,9 @@ fn underlined_table_columns(
     let mut candidates_by_region: Vec<Vec<&TextItem>> = vec![Vec::new(); redline_regions.len()];
     for item in live_items {
         if let Some(region_index) = redline_region_at_y(redline_regions, item.y) {
-            candidates_by_region[region_index].push(item);
+            if overlaps_redline_x(item, &redline_regions[region_index]) {
+                candidates_by_region[region_index].push(item);
+            }
         }
     }
 
@@ -2029,6 +2034,24 @@ mod tests {
     }
 
     #[test]
+    fn merge_adjacent_items_keeps_preserved_fragment_out_of_mixed_run() {
+        let mut prefix = body_item("prefix", 20.0, 700.0, false);
+        prefix.is_underline = true;
+        let deleted = body_item("deleted", 111.0, 700.0, true);
+        let mut replacement = body_item("replacement", 202.0, 700.0, false);
+        replacement.is_underline = true;
+        let preserved_indices = std::collections::HashSet::from([2]);
+
+        let (merged, index_map) =
+            merge_adjacent_items_preserving(&[prefix, deleted, replacement], &preserved_indices);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(index_map, vec![vec![0, 1], vec![2]]);
+        assert!(merged[0].is_underline);
+        assert!(merged[1].is_underline);
+    }
+
+    #[test]
     fn body_font_redline_deletions_do_not_create_a_table() {
         let mut items = Vec::new();
         for row in 0..8 {
@@ -2150,6 +2173,26 @@ mod tests {
         assert!(
             detect_tables(&items, 12.0, false).is_empty(),
             "full-width redline prose must not retain table-shaped fragments"
+        );
+    }
+
+    #[test]
+    fn wide_redline_prose_ignores_underlines_outside_edit_span() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            let mut line_number = body_item("line number", 50.0, y, false);
+            line_number.is_underline = row < 2;
+            items.push(line_number);
+            items.push(body_item("live prose fragment", 160.0, y, false));
+            let strikeout_x = if row % 2 == 0 { 280.0 } else { 430.0 };
+            items.push(body_item("deleted prose", strikeout_x, y, true));
+        }
+
+        assert!(redline_edit_regions(&items, content_width(&items))[0].spans_page_width);
+        assert!(
+            detect_tables(&items, 12.0, false).is_empty(),
+            "underlines outside the edit span must not disable the wide-prose veto"
         );
     }
 
