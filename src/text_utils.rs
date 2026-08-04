@@ -101,6 +101,20 @@ pub(crate) fn is_cjk_char(c: char) -> bool {
     )
 }
 
+/// Thai glyphs are often emitted as separate CID text operators. In
+/// particular, dependent vowels and tone marks must remain attached to the
+/// preceding base glyph even when PDF positioning introduces a small gap.
+fn is_thai_char(c: char) -> bool {
+    matches!(c, '\u{0E00}'..='\u{0E7F}')
+}
+
+fn is_thai_combining_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0E31}' | '\u{0E34}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}'
+    )
+}
+
 pub(crate) fn is_rtl_char(c: char) -> bool {
     matches!(c,
         '\u{0590}'..='\u{05FF}'   // Hebrew
@@ -247,6 +261,23 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
             '\u{2000}'..='\u{200A}' => result.push(' '), // en/em/thin/hair spaces etc.
             _ => result.push(ch),
         }
+    }
+
+    // Some Thai PDFs emit dependent vowels and tone marks in the same text
+    // item but insert a synthetic ASCII space before the mark. A combining
+    // mark cannot begin an independent Thai cluster, so removing only that
+    // inline whitespace is safe while preserving real inter-word spaces.
+    if result.chars().any(is_thai_combining_mark) {
+        let mut normalized = String::with_capacity(result.len());
+        for ch in result.chars() {
+            if is_thai_combining_mark(ch) {
+                while matches!(normalized.chars().last(), Some(' ' | '\t' | '\u{00A0}')) {
+                    normalized.pop();
+                }
+            }
+            normalized.push(ch);
+        }
+        result = normalized;
     }
 
     // If the original text had Arabic presentation forms, the characters are in
@@ -666,6 +697,12 @@ pub(crate) fn should_join_items(
             return false;
         }
 
+        // A standalone Thai combining mark is always part of the preceding
+        // cluster. Explicit source spaces were already handled above.
+        if curr_first.is_some_and(is_thai_combining_mark) {
+            return true;
+        }
+
         // CID fonts (C2_*, C0_*) emit one word per text operator with gaps ≈ 0
         // between words. Detect these and add spaces. Only applies to CID fonts —
         // non-CID fonts (Type1/TrueType) emit phrases or fragments with small gaps
@@ -677,8 +714,15 @@ pub(crate) fn should_join_items(
         let curr_first_char = curr_item.text.trim().chars().next();
         let is_cjk =
             prev_last_char.is_some_and(is_cjk_char) || curr_first_char.is_some_and(is_cjk_char);
+        let is_thai =
+            prev_last_char.is_some_and(is_thai_char) && curr_first_char.is_some_and(is_thai_char);
 
-        if !is_cjk && gap >= 0.0 && gap < font_size * 0.01 && is_cid_font(&prev_item.font) {
+        if !is_cjk
+            && !is_thai
+            && gap >= 0.0
+            && gap < font_size * 0.01
+            && is_cid_font(&prev_item.font)
+        {
             let prev_word_count = prev_item.text.split_whitespace().count();
 
             if prev_word_count >= 3 {
@@ -800,6 +844,10 @@ pub(crate) fn should_join_items(
         return false;
     }
 
+    if curr_first.is_some_and(is_thai_combining_mark) {
+        return gap < char_width * 2.0;
+    }
+
     // CJK text: always join adjacent items — CJK languages don't use spaces between words.
     // The Latin case-based heuristics below would incorrectly insert spaces within CJK words.
     let is_cjk = prev_last.is_some_and(is_cjk_char) || curr_first.is_some_and(is_cjk_char);
@@ -851,6 +899,16 @@ mod tests {
         assert!(!is_bold_font("NimbusRomNo9L-ReguItal"));
         // Medium-Italic exclusion still holds
         assert!(!is_bold_font("Foo-MediumItalic"));
+    }
+
+    #[test]
+    fn thai_combining_marks_drop_synthetic_spaces() {
+        assert_eq!(expand_ligatures("ถ ึง กรณ ีที่ ต ้องการ"), "ถึง กรณีที่ ต้องการ");
+    }
+
+    #[test]
+    fn thai_normalization_preserves_real_spaces() {
+        assert_eq!(expand_ligatures("ข้อมูล ภาษาไทย"), "ข้อมูล ภาษาไทย");
     }
 
     #[test]
@@ -1178,6 +1236,44 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    #[test]
+    fn thai_cid_fragments_with_zero_gap_join() {
+        let fs = 12.0;
+        let mut consonant = make_text_item("ค", 100.0, 6.0, fs);
+        let mut vowel = make_text_item("า", 106.0, 6.0, fs);
+        consonant.font = "C2_1".to_string();
+        vowel.font = "C2_1".to_string();
+
+        assert!(
+            should_join_items(&consonant, &vowel, 0.10),
+            "adjacent Thai CID fragments must not receive a synthetic space"
+        );
+    }
+
+    #[test]
+    fn thai_combining_mark_joins_across_positioning_gap() {
+        let fs = 12.0;
+        let consonant = make_text_item("ถ", 100.0, 6.0, fs);
+        let mark = make_text_item("ึ", 109.0, 0.0, fs);
+
+        assert!(
+            should_join_items(&consonant, &mark, 0.10),
+            "Thai combining marks must remain attached to their base glyph"
+        );
+    }
+
+    #[test]
+    fn thai_fragments_preserve_explicit_space() {
+        let fs = 12.0;
+        let first = make_text_item("ข้อมูล", 100.0, 30.0, fs);
+        let second = make_text_item(" ภาษาไทย", 130.0, 42.0, fs);
+
+        assert!(
+            !should_join_items(&first, &second, 0.10),
+            "an explicit source space must remain a boundary"
+        );
     }
 
     #[test]

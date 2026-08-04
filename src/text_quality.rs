@@ -48,7 +48,18 @@ pub(crate) fn detect_encoding_issues(markdown: &str) -> bool {
         return true;
     }
 
-    // Heuristic 3: substitution-cipher letter statistics (broken ToUnicode)
+    // Heuristic 3: broken Thai cluster spacing. This commonly indicates a
+    // legacy ToUnicode map that lost NIKHAHIT from SARA AM (for example
+    // `ค าน า` instead of `คำนำ`).
+    if has_broken_thai_spacing(markdown) {
+        return true;
+    }
+
+    if has_thai_private_use_token(markdown) {
+        return true;
+    }
+
+    // Heuristic 4: substitution-cipher letter statistics (broken ToUnicode)
     let mut stats = CipherGarbleStats::default();
     stats.add_text(markdown);
     stats.looks_garbled()
@@ -73,6 +84,43 @@ fn has_dollar_as_space_pattern(markdown: &str) -> bool {
     }
 
     false
+}
+
+fn has_broken_thai_spacing(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if !matches!(ch, '\u{0E01}'..='\u{0E2E}') {
+            continue;
+        }
+
+        let mut next = index + 1;
+        while next < chars.len() && matches!(chars[next], ' ' | '\t' | '\u{00A0}') {
+            next += 1;
+        }
+        if next == index + 1 || next >= chars.len() {
+            continue;
+        }
+
+        if chars[next] == '\u{0E32}'
+            || matches!(
+                chars[next],
+                '\u{0E31}' | '\u{0E34}'..='\u{0E3A}' | '\u{0E47}'..='\u{0E4E}'
+            )
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_thai_private_use_token(text: &str) -> bool {
+    text.split_whitespace().any(has_thai_private_use_span)
+}
+
+fn has_thai_private_use_span(text: &str) -> bool {
+    text.chars().any(|ch| matches!(ch, '\u{0E00}'..='\u{0E7F}'))
+        && text.chars().any(is_private_use_char)
 }
 
 /// English letter frequencies (percent, a–z). Used as a natural-language
@@ -318,6 +366,8 @@ fn text_span_decoding_issue_kind(text: &str) -> Option<TextSpanIssueKind> {
     }
 
     if has_dollar_as_space_pattern(text)
+        || has_broken_thai_spacing(text)
+        || has_thai_private_use_span(text)
         || has_private_use_text_run(text)
         || is_cid_garbage(text)
         || has_cid_control_token(text)
@@ -517,4 +567,62 @@ pub(crate) fn is_cid_garbage(text: &str) -> bool {
     // page to OCR.
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
     total >= 20 && high_latin * 5 >= total * 2 && ascii_letters * 3 < total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ItemType;
+
+    fn text_item(text: &str, page: u32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 12.0,
+            font: "ThaiTest".to_string(),
+            font_size: 12.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn thai_and_private_use_in_one_span_route_page_to_ocr() {
+        let report = analyze_text_quality(&[text_item("ภาษาไทย \u{F70B}", 20)]);
+
+        assert_eq!(report.pages_needing_ocr, vec![20]);
+        assert_eq!(
+            report.reasons_by_page.get(&20),
+            Some(&vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()])
+        );
+    }
+
+    #[test]
+    fn broken_thai_sara_am_spacing_is_an_encoding_issue() {
+        assert!(detect_encoding_issues("ค าน า"));
+    }
+
+    #[test]
+    fn thai_private_use_glyph_is_an_encoding_issue() {
+        assert!(detect_encoding_issues("ไม่ได้ ได\u{F70B} สามารถ"));
+    }
+
+    #[test]
+    fn separate_private_use_icon_does_not_condemn_thai_page() {
+        assert!(!detect_encoding_issues(
+            "\u{E000} ข้อมูล ภาษาไทย สำหรับประชาชน"
+        ));
+    }
+
+    #[test]
+    fn normal_thai_spaces_are_not_an_encoding_issue() {
+        assert!(!detect_encoding_issues("ข้อมูล ภาษาไทย สำหรับประชาชน"));
+    }
 }
