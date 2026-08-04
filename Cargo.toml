@@ -23,7 +23,7 @@ include = [
 
 [lib]
 name = "pdf_inspector"
-crate-type = ["lib", "cdylib"]
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 # Python bindings
