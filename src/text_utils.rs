@@ -7,6 +7,76 @@
 use crate::types::TextItem;
 use unicode_normalization::UnicodeNormalization;
 
+/// Return whether text is an explicit page-number expression.
+///
+/// This strict form is suitable before layout, where removing one numeric item
+/// from substantive text such as `Page 42 explains the result` would lose data.
+pub(crate) fn is_explicit_page_number_expression(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let is_number = |value: &str| {
+        !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+    };
+
+    if trimmed.len() <= 4 && is_number(trimmed) {
+        return true;
+    }
+
+    if trimmed.len() >= 3 && trimmed.starts_with('-') && trimmed.ends_with('-') {
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if is_number(inner) {
+            return true;
+        }
+    }
+
+    let lowercase = trimmed.to_ascii_lowercase();
+    if let Some(rest) = lowercase.strip_prefix("page") {
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        if words.len() >= 3 && is_number(words[0]) && words[1] == "of" && is_number(words[2]) {
+            return true;
+        }
+        if words.len() >= 2 && words[0] == "of" && is_number(words[1]) {
+            return true;
+        }
+        return match words.as_slice() {
+            [] | ["of"] => true,
+            [number] => is_number(number),
+            ["of", total] => is_number(total),
+            [number, "of", total] => is_number(number) && is_number(total),
+            _ => false,
+        };
+    }
+
+    let words: Vec<&str> = lowercase.split_whitespace().collect();
+    match words.as_slice() {
+        [number, "of", total] => is_number(number) && is_number(total),
+        _ => false,
+    }
+}
+
+/// Return whether a completed Markdown line looks like a page number or a
+/// labeled running header.
+///
+/// At this stage the complete line and surrounding breaks are available, so a
+/// leading `Page N` remains compatible with the existing header cleanup even
+/// when the PDF appends a chapter or document title.
+pub(crate) fn is_page_number_line(text: &str) -> bool {
+    if is_explicit_page_number_expression(text) {
+        return true;
+    }
+
+    let lowercase = text.trim().to_ascii_lowercase();
+    lowercase.strip_prefix("page").is_some_and(|rest| {
+        rest.trim_start()
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+    })
+}
+
 /// Check if a character is CJK (Chinese, Japanese, Korean).
 /// CJK languages don't use spaces between words, so word-boundary
 /// heuristics should not apply when CJK characters are involved.

@@ -18,7 +18,15 @@ use super::{Table, TableDetectionMode};
 ///
 /// Returns `(merged_items, index_map)` where `index_map[merged_idx]` contains
 /// the original item indices that were merged into that item.
+#[cfg(test)]
 pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Vec<usize>>) {
+    merge_adjacent_items_preserving(items, &std::collections::HashSet::new())
+}
+
+fn merge_adjacent_items_preserving(
+    items: &[TextItem],
+    preserved_indices: &std::collections::HashSet<usize>,
+) -> (Vec<TextItem>, Vec<Vec<usize>>) {
     if items.is_empty() {
         return (vec![], vec![]);
     }
@@ -68,6 +76,23 @@ pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Ve
 
                 // Must be similar font size (within 20%)
                 if (next_item.font_size - first_item.font_size).abs() > first_item.font_size * 0.20
+                {
+                    break;
+                }
+
+                // Proven replacement cells must retain their own decoration.
+                // Otherwise an adjacent old/new pair inherits only the first
+                // fragment's flags and can lose the live table evidence.
+                let decoration_changes = indices.iter().any(|index| {
+                    let merged_item = &items[*index];
+                    next_item.is_underline != merged_item.is_underline
+                        || next_item.is_strikeout != merged_item.is_strikeout
+                });
+                if decoration_changes
+                    && (indices
+                        .iter()
+                        .any(|index| preserved_indices.contains(index))
+                        || preserved_indices.contains(&next_idx))
                 {
                     break;
                 }
@@ -137,17 +162,319 @@ fn expand_consolidated_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<usize>) 
     (expanded, index_map)
 }
 
+#[derive(Clone)]
+struct RedlineEditRegion {
+    x_ranges: Vec<(f32, f32)>,
+    y_min: f32,
+    y_max: f32,
+    spans_page_width: bool,
+}
+
+#[derive(Clone, Copy)]
+struct UnderlinedTableColumn {
+    x_min: f32,
+    x_max: f32,
+}
+
+pub(crate) fn content_width(items: &[TextItem]) -> f32 {
+    let x_min = items
+        .iter()
+        .map(|item| item.x)
+        .fold(f32::INFINITY, f32::min);
+    let x_max = items
+        .iter()
+        .map(|item| item.x + item.width)
+        .fold(f32::NEG_INFINITY, f32::max);
+    (x_max - x_min).max(1.0)
+}
+
+/// Spatial regions where multiple strikeout rows indicate a redline edit block.
+///
+/// A lone deletion can occur inside or beside a real table, so it must not
+/// globally suppress underlined table cells. Closely spaced strikeout rows are
+/// different: together with nearby underlines they form the overlapping
+/// old/new text layers used by legislative redlines, and those decorations
+/// must not become heuristic column evidence.
+fn redline_edit_regions(items: &[TextItem], page_width: f32) -> Vec<RedlineEditRegion> {
+    const ROW_DEDUP_TOLERANCE: f32 = 8.0;
+    const MAX_CLUSTER_GAP: f32 = 64.0;
+    const Y_PADDING: f32 = 36.0;
+    const X_PADDING: f32 = 12.0;
+    const PAGE_WIDTH_RATIO: f32 = 0.35;
+    const MAX_HORIZONTAL_GAP_RATIO: f32 = 0.20;
+
+    let mut strikeouts: Vec<&TextItem> = items.iter().filter(|item| item.is_strikeout).collect();
+    strikeouts.sort_by(|a, b| a.y.total_cmp(&b.y));
+
+    let mut rows: Vec<(f32, Vec<(f32, f32)>)> = Vec::new();
+    for item in strikeouts {
+        if let Some((_, x_ranges)) = rows
+            .last_mut()
+            .filter(|(y, _)| (item.y - *y).abs() <= ROW_DEDUP_TOLERANCE)
+        {
+            x_ranges.push((item.x, item.x + item.width));
+        } else {
+            rows.push((item.y, vec![(item.x, item.x + item.width)]));
+        }
+    }
+
+    let mut regions = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start + 1;
+        while end < rows.len() && rows[end].0 - rows[end - 1].0 <= MAX_CLUSTER_GAP {
+            end += 1;
+        }
+        if end - start >= 2 {
+            let mut x_ranges: Vec<(f32, f32)> = rows[start..end]
+                .iter()
+                .flat_map(|(_, x_ranges)| x_ranges.iter().copied())
+                .collect();
+            x_ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut merged_ranges: Vec<(f32, f32)> = Vec::new();
+            for (x_min, x_max) in x_ranges {
+                // Modest inline gaps can separate fragments of one flowing
+                // edit; column-scale gaps must remain distinct spatial masks.
+                if let Some((_, merged_max)) = merged_ranges.last_mut().filter(|(_, merged_max)| {
+                    x_min - *merged_max <= page_width * MAX_HORIZONTAL_GAP_RATIO
+                }) {
+                    *merged_max = merged_max.max(x_max);
+                } else {
+                    merged_ranges.push((x_min, x_max));
+                }
+            }
+            let covered_width: f32 = merged_ranges
+                .iter()
+                .map(|(x_min, x_max)| x_max - x_min)
+                .sum();
+            for (x_min, x_max) in &mut merged_ranges {
+                *x_min -= X_PADDING;
+                *x_max += X_PADDING;
+            }
+            // Redlines spread across much of the text width are flowing prose,
+            // so their whole Y-band is ambiguous. Compact edits can be scoped
+            // to their actual horizontal spans without hiding content between
+            // unrelated edits in separate columns.
+            regions.push(RedlineEditRegion {
+                x_ranges: merged_ranges,
+                y_min: rows[start].0 - Y_PADDING,
+                y_max: rows[end - 1].0 + Y_PADDING,
+                spans_page_width: covered_width >= page_width * PAGE_WIDTH_RATIO,
+            });
+        }
+        start = end;
+    }
+    // Padding can make neighboring clusters overlap. Partition that overlap at
+    // its midpoint so each Y position maps to one region without combining
+    // horizontally unrelated edits.
+    for index in 1..regions.len() {
+        let (previous, current) = regions.split_at_mut(index);
+        let previous = &mut previous[index - 1];
+        let current = &mut current[0];
+        if previous.y_max >= current.y_min {
+            let boundary = (previous.y_max + current.y_min) / 2.0;
+            previous.y_max = boundary;
+            current.y_min = boundary;
+        }
+    }
+    regions
+}
+
+fn overlaps_redline_x(item: &TextItem, region: &RedlineEditRegion) -> bool {
+    let range_index = region
+        .x_ranges
+        .partition_point(|(_, x_max)| *x_max < item.x);
+    region
+        .x_ranges
+        .get(range_index)
+        .is_some_and(|(x_min, _)| item.x + item.width >= *x_min)
+}
+
+fn has_distinct_rows(
+    items: &[&TextItem],
+    underlined_only: bool,
+    required: usize,
+    tolerance: f32,
+) -> bool {
+    debug_assert!(required <= 3);
+    let mut rows = [0.0; 3];
+    let mut row_count = 0;
+    for item in items {
+        if underlined_only && !item.is_underline {
+            continue;
+        }
+        if rows[..row_count]
+            .iter()
+            .all(|row| (item.y - row).abs() > tolerance)
+        {
+            rows[row_count] = item.y;
+            row_count += 1;
+            if row_count == required {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Aligned live items seeded by underline evidence form revised table columns.
+/// Compact edits accept one replacement backed by surrounding live rows; wide
+/// prose-like edits require replacements on at least two distinct rows.
+fn underlined_table_columns(
+    items: &[TextItem],
+    redline_regions: &[RedlineEditRegion],
+) -> Vec<Vec<UnderlinedTableColumn>> {
+    const X_ALIGNMENT_TOLERANCE: f32 = 4.0;
+    const ROW_DEDUP_TOLERANCE: f32 = 8.0;
+
+    // Sort once globally by X, then partition candidates into their unique Y
+    // regions. Each regional vector remains X-sorted without another sort.
+    let mut live_items: Vec<&TextItem> = items.iter().filter(|item| !item.is_strikeout).collect();
+    live_items.sort_by(|a, b| a.x.total_cmp(&b.x));
+    let mut candidates_by_region: Vec<Vec<&TextItem>> = vec![Vec::new(); redline_regions.len()];
+    for item in live_items {
+        if let Some(region_index) = redline_region_at_y(redline_regions, item.y) {
+            if overlaps_redline_x(item, &redline_regions[region_index]) {
+                candidates_by_region[region_index].push(item);
+            }
+        }
+    }
+
+    let mut columns_by_region = Vec::with_capacity(redline_regions.len());
+    for (region, candidates) in redline_regions.iter().zip(candidates_by_region) {
+        let mut columns: Vec<UnderlinedTableColumn> = Vec::new();
+        let mut start = 0;
+        while start < candidates.len() {
+            let mut end = start + 1;
+            while end < candidates.len()
+                && candidates[end].x - candidates[start].x <= X_ALIGNMENT_TOLERANCE
+            {
+                end += 1;
+            }
+            let aligned_items = &candidates[start..end];
+            let enough_live_rows = has_distinct_rows(aligned_items, false, 3, ROW_DEDUP_TOLERANCE);
+            let required_underlined_rows = if region.spans_page_width { 2 } else { 1 };
+            let enough_underlined_rows = has_distinct_rows(
+                aligned_items,
+                true,
+                required_underlined_rows,
+                ROW_DEDUP_TOLERANCE,
+            );
+            if enough_live_rows && enough_underlined_rows {
+                let x_min = candidates[start].x - X_ALIGNMENT_TOLERANCE;
+                let x_max = candidates[end - 1].x + X_ALIGNMENT_TOLERANCE;
+                if let Some(column) = columns.last_mut().filter(|column| column.x_max >= x_min) {
+                    column.x_max = column.x_max.max(x_max);
+                } else {
+                    columns.push(UnderlinedTableColumn { x_min, x_max });
+                }
+            }
+            start = end;
+        }
+        columns_by_region.push(columns);
+    }
+    columns_by_region
+}
+
+fn redline_region_at_y(redline_regions: &[RedlineEditRegion], y: f32) -> Option<usize> {
+    let region_index = redline_regions.partition_point(|region| region.y_max < y);
+    redline_regions
+        .get(region_index)
+        .filter(|region| y >= region.y_min)
+        .map(|_| region_index)
+}
+
+fn is_heuristic_table_evidence(
+    item: &TextItem,
+    redline_regions: &[RedlineEditRegion],
+    underlined_table_columns: &[Vec<UnderlinedTableColumn>],
+) -> bool {
+    if item.is_strikeout {
+        return false;
+    }
+
+    let Some(region_index) = redline_region_at_y(redline_regions, item.y) else {
+        return true;
+    };
+    let region = &redline_regions[region_index];
+    let columns = &underlined_table_columns[region_index];
+    if region.spans_page_width && columns.is_empty() {
+        return false;
+    }
+
+    let overlaps_x = overlaps_redline_x(item, region);
+    !overlaps_x || is_revised_table_cell(item, columns)
+}
+
+fn is_revised_table_cell(
+    item: &TextItem,
+    underlined_table_columns: &[UnderlinedTableColumn],
+) -> bool {
+    let column_index = underlined_table_columns.partition_point(|column| column.x_max < item.x);
+    underlined_table_columns
+        .get(column_index)
+        .is_some_and(|column| item.x >= column.x_min)
+}
+
+fn revised_table_cell_indices(
+    items: &[TextItem],
+    redline_regions: &[RedlineEditRegion],
+    underlined_table_columns: &[Vec<UnderlinedTableColumn>],
+) -> std::collections::HashSet<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(item_index, item)| {
+            let region_index = redline_region_at_y(redline_regions, item.y)?;
+            let region = &redline_regions[region_index];
+            (item.is_underline
+                && overlaps_redline_x(item, region)
+                && is_revised_table_cell(item, &underlined_table_columns[region_index]))
+            .then_some(item_index)
+        })
+        .collect()
+}
+
 /// Detect tables in a set of text items from a single page
 pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bool) -> Vec<Table> {
+    detect_tables_with_page_width(items, base_font_size, skip_body_font, content_width(items))
+}
+
+/// Detect tables in a subset while using the full page's text width for
+/// page-spanning redline classification.
+pub(crate) fn detect_tables_with_page_width(
+    items: &[TextItem],
+    base_font_size: f32,
+    skip_body_font: bool,
+    page_width: f32,
+) -> Vec<Table> {
     if items.len() < 6 {
         return vec![];
     }
+    // Compute these before consolidation: adjacent old/new text can merge and
+    // inherit only the first fragment's decoration flags.
+    let redline_regions = redline_edit_regions(items, page_width);
+    let underlined_table_columns = underlined_table_columns(items, &redline_regions);
+    let source_evidence: Vec<bool> = items
+        .iter()
+        .map(|item| is_heuristic_table_evidence(item, &redline_regions, &underlined_table_columns))
+        .collect();
+    let revised_table_cells =
+        revised_table_cell_indices(items, &redline_regions, &underlined_table_columns);
 
     // Step 1: Merge adjacent single-char items into words (handles per-character PDFs)
-    let (merged_items, merge_map) = merge_adjacent_items(items);
+    let (merged_items, merge_map) = merge_adjacent_items_preserving(items, &revised_table_cells);
 
     // Step 2: Expand consolidated financial items (e.g. "$ 1,234 $ 5,678" → sub-items)
     let (expanded_items, expand_map) = expand_consolidated_items(&merged_items);
+    let expanded_evidence: Vec<bool> = expand_map
+        .iter()
+        .map(|&merged_index| {
+            merge_map[merged_index]
+                .iter()
+                .all(|&source_index| source_evidence[source_index])
+        })
+        .collect();
     let items = &expanded_items[..]; // shadow parameter — all detection uses processed items
 
     let mut tables = Vec::new();
@@ -159,7 +486,11 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
     let table_candidates: Vec<(usize, &TextItem)> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| item.font_size <= table_font_threshold && item.font_size >= 6.0)
+        .filter(|(index, item)| {
+            expanded_evidence[*index]
+                && item.font_size <= table_font_threshold
+                && item.font_size >= 6.0
+        })
         .collect();
 
     if table_candidates.len() >= 6 {
@@ -208,6 +539,7 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             .enumerate()
             .filter(|(idx, item)| {
                 !claimed_indices.contains(idx)
+                    && expanded_evidence[*idx]
                     && item.font_size >= body_font_low
                     && item.font_size <= body_font_high
                     && item.font_size >= 6.0
@@ -1646,6 +1978,362 @@ fn try_add_label_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ItemType;
+
+    fn body_item(text: &str, x: f32, y: f32, strikeout: bool) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: 90.0,
+            height: 12.0,
+            font: "F1".to_string(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: strikeout,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn merge_adjacent_items_preserves_redline_boundaries() {
+        let old = body_item("old value", 220.0, 700.0, true);
+        let mut replacement = body_item("new value", 312.0, 700.0, false);
+        replacement.is_underline = true;
+        let preserved_indices = std::collections::HashSet::from([1]);
+
+        let (merged, index_map) =
+            merge_adjacent_items_preserving(&[old, replacement], &preserved_indices);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(index_map, vec![vec![0], vec![1]]);
+        assert!(merged[0].is_strikeout);
+        assert!(merged[1].is_underline);
+    }
+
+    #[test]
+    fn merge_adjacent_items_keeps_boundary_after_preserved_fragment() {
+        let mut prefix = body_item("prefix", 20.0, 700.0, false);
+        prefix.is_underline = true;
+        let mut replacement = body_item("replacement", 111.0, 700.0, false);
+        replacement.is_underline = true;
+        let deleted = body_item("deleted", 202.0, 700.0, true);
+        let preserved_indices = std::collections::HashSet::from([1]);
+
+        let (merged, index_map) =
+            merge_adjacent_items_preserving(&[prefix, replacement, deleted], &preserved_indices);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(index_map, vec![vec![0, 1], vec![2]]);
+        assert!(merged[0].is_underline);
+        assert!(merged[1].is_strikeout);
+    }
+
+    #[test]
+    fn merge_adjacent_items_keeps_preserved_fragment_out_of_mixed_run() {
+        let mut prefix = body_item("prefix", 20.0, 700.0, false);
+        prefix.is_underline = true;
+        let deleted = body_item("deleted", 111.0, 700.0, true);
+        let mut replacement = body_item("replacement", 202.0, 700.0, false);
+        replacement.is_underline = true;
+        let preserved_indices = std::collections::HashSet::from([2]);
+
+        let (merged, index_map) =
+            merge_adjacent_items_preserving(&[prefix, deleted, replacement], &preserved_indices);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(index_map, vec![vec![0, 1], vec![2]]);
+        assert!(merged[0].is_underline);
+        assert!(merged[1].is_underline);
+    }
+
+    #[test]
+    fn body_font_redline_deletions_do_not_create_a_table() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("live paragraph text", 50.0, y, false));
+            items.push(body_item("deleted wording", 220.0, y, true));
+        }
+
+        assert!(
+            detect_tables(&items, 12.0, false).is_empty(),
+            "aligned strikeout overlays are source edits, not table columns"
+        );
+    }
+
+    #[test]
+    fn underlined_body_font_table_without_deletions_is_still_detected() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "underline-only tables must keep their heuristic evidence"
+        );
+    }
+
+    #[test]
+    fn body_font_table_with_one_deletion_is_still_detected() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("row value", 220.0, y, row == 0));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "one revised cell must not suppress an otherwise complete table"
+        );
+    }
+
+    #[test]
+    fn unrelated_strikeout_does_not_remove_underlined_table_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+        items.push(body_item("deleted prose", 50.0, 300.0, true));
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "a distant deletion must not suppress underlined table columns"
+        );
+    }
+
+    #[test]
+    fn nearby_redline_rows_do_not_remove_plain_table_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("row value", 220.0, y, false));
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("deleted prose", 400.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "redline rows must suppress decorations, not nearby live table cells"
+        );
+    }
+
+    #[test]
+    fn separate_strikeout_columns_do_not_suppress_content_between_them() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 160.0, y, false));
+            items.push(body_item("row value", 280.0, y, false));
+        }
+        for (row, y) in [700.0, 684.0, 668.0, 652.0].into_iter().enumerate() {
+            let x = if row % 2 == 0 { 50.0 } else { 420.0 };
+            let mut deletion = body_item("old", x, y, true);
+            deletion.width = 30.0;
+            items.push(deletion);
+        }
+
+        let regions = redline_edit_regions(&items, content_width(&items));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].x_ranges.len(), 2);
+        assert!(!regions[0].spans_page_width);
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "separate edit columns must not create a suppression bridge across the page"
+        );
+    }
+
+    #[test]
+    fn wide_redline_rows_do_not_turn_fragmented_prose_into_a_table() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("line number", 50.0, y, false));
+            items.push(body_item("live prose fragment", 160.0, y, false));
+            let strikeout_x = if row % 2 == 0 { 280.0 } else { 430.0 };
+            items.push(body_item("deleted prose", strikeout_x, y, true));
+        }
+
+        assert!(
+            detect_tables(&items, 12.0, false).is_empty(),
+            "full-width redline prose must not retain table-shaped fragments"
+        );
+    }
+
+    #[test]
+    fn wide_redline_prose_ignores_underlines_outside_edit_span() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            let mut line_number = body_item("line number", 50.0, y, false);
+            line_number.is_underline = row < 2;
+            items.push(line_number);
+            items.push(body_item("live prose fragment", 160.0, y, false));
+            let strikeout_x = if row % 2 == 0 { 280.0 } else { 430.0 };
+            items.push(body_item("deleted prose", strikeout_x, y, true));
+        }
+
+        assert!(redline_edit_regions(&items, content_width(&items))[0].spans_page_width);
+        assert!(
+            detect_tables(&items, 12.0, false).is_empty(),
+            "underlines outside the edit span must not disable the wide-prose veto"
+        );
+    }
+
+    #[test]
+    fn nearby_redline_rows_do_not_remove_separate_underlined_table_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("deleted prose", 400.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "redline rows must not suppress a horizontally separate underlined table"
+        );
+    }
+
+    #[test]
+    fn multiple_revised_rows_do_not_remove_underlined_table_column() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let replacement_x = 220.0 + (row % 2) as f32 * 2.0;
+            let mut value = body_item("new value", replacement_x, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("old value", 220.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "aligned replacement cells must preserve a partially revised table"
+        );
+    }
+
+    #[test]
+    fn single_replacement_uses_aligned_live_table_rows() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = row == 0;
+            items.push(value);
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("old value", 220.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "one replacement cell must retain its aligned live table column"
+        );
+    }
+
+    #[test]
+    fn wide_revised_table_keeps_repeated_replacement_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = row < 2;
+            items.push(value);
+            let strikeout_x = if row % 2 == 0 { 220.0 } else { 400.0 };
+            items.push(body_item("old value", strikeout_x, y, true));
+        }
+
+        assert!(redline_edit_regions(&items, content_width(&items))[0].spans_page_width);
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "wide edits must keep a table column with repeated replacements"
+        );
+    }
+
+    #[test]
+    fn revised_financial_columns_survive_item_expansion() {
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("old value", 180.0, y, true));
+            let mut values = body_item("$ 100 $ 200 $ 300", 180.0, y, false);
+            values.width = 300.0;
+            values.is_underline = true;
+            items.push(values);
+        }
+
+        let tables = detect_tables(&items, 12.0, false);
+        assert!(
+            tables.iter().any(|table| table.columns.len() >= 4),
+            "all expanded financial columns must inherit their source evidence"
+        );
+    }
+
+    #[test]
+    fn narrow_layout_band_uses_full_page_width_for_redline_scope() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 190.0, y, false));
+            items.push(body_item("old value", 300.0, y, true));
+            let mut replacement = body_item("new value", 300.0, y, false);
+            replacement.is_underline = true;
+            items.push(replacement);
+        }
+
+        assert!(redline_edit_regions(&items, content_width(&items))[0].spans_page_width);
+        assert!(!redline_edit_regions(&items, 500.0)[0].spans_page_width);
+        assert!(
+            !detect_tables_with_page_width(&items, 12.0, false, 500.0).is_empty(),
+            "a narrow band must use full-page context to preserve revised table cells"
+        );
+    }
+
+    #[test]
+    fn adjacent_revised_fragments_preserve_live_table_cells() {
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("old value", 220.0, y, true));
+            let mut replacement = body_item("new value", 312.0, y, false);
+            replacement.is_underline = true;
+            items.push(replacement);
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "adjacent old/new fragments must retain the live revised cells"
+        );
+    }
 
     #[test]
     fn is_table_of_contents_rejects_toc() {

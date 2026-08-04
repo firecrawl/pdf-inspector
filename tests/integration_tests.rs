@@ -8,12 +8,13 @@ use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
-    process_pdf_mem, process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions,
+    process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
+    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
     PdfType, TextItem,
 };
 use std::collections::HashSet;
 
-fn make_minimal_text_pdf() -> Vec<u8> {
+fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
 
@@ -40,10 +41,11 @@ fn make_minimal_text_pdf() -> Vec<u8> {
         &mut pdf,
         &mut offsets,
         3,
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        &format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+        ),
     );
 
-    let content = "BT /F1 12 Tf 100 700 Td (Hello World) Tj 0 -14 Td (Second Line) Tj 0 -14 Td (Third Line) Tj ET";
     add_object(
         &mut pdf,
         &mut offsets,
@@ -77,6 +79,186 @@ fn make_minimal_text_pdf() -> Vec<u8> {
     );
 
     pdf
+}
+
+fn make_recurring_contextual_folio_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R] /Count 4 >>",
+    );
+    for page_index in 0..4 {
+        let page_id = 3 + page_index * 2;
+        let content_id = page_id + 1;
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            page_id,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 11 0 R >> >> /Contents {content_id} 0 R >>"
+            ),
+        );
+        let page_number = page_index + 1;
+        let content = format!(
+            "BT /F1 12 Tf 1 0 0 1 25 30 Tm ({page_number}) Tj 1 0 0 1 41 30 Tm (Company report footer) Tj 1 0 0 1 72 700 Tm (Body page {page_number}) Tj ET"
+        );
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            content_id,
+            &format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                content.len(),
+                content
+            ),
+        );
+    }
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        11,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+fn make_pdf_with_malformed_unselected_page() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>",
+    );
+    let content = "BT /F1 12 Tf 1 0 0 1 25 30 Tm (1) Tj 1 0 0 1 41 30 Tm (Company report footer) Tj 1 0 0 1 72 700 Tm (Selected page text) Tj 0 -16 Td (More selected text) Tj 0 -16 Td (Still selected text) Tj ET";
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        "<< /Length 3 >>\nstream\nBI \nendstream",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        7,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+fn make_minimal_text_pdf() -> Vec<u8> {
+    make_text_pdf(
+        "BT /F1 12 Tf 100 700 Td (Hello World) Tj 0 -14 Td (Second Line) Tj 0 -14 Td (Third Line) Tj ET",
+        "0 0 612 792",
+    )
+}
+
+fn make_digit_run_repro_pdf() -> Vec<u8> {
+    let content = r#"BT
+/F1 12 Tf
+1 0 0 1 72 780 Tm (A\)) Tj
+1 0 0 1 96 780 Tm (The) Tj
+1 0 0 1 126 780 Tm (total) Tj
+1 0 0 1 166 780 Tm (of) Tj
+1 0 0 1 186 780 Tm (730) Tj
+1 0 0 1 220 780 Tm (seats) Tj
+1 0 0 1 262 780 Tm (was) Tj
+1 0 0 1 296 780 Tm (approved.) Tj
+1 0 0 1 72 755 Tm (B\)) Tj
+1 0 0 1 96 755 Tm (let) Tj
+1 0 0 1 120 755 Tm (log) Tj
+1 0 0 1 150 755 Tm (2) Tj
+1 0 0 1 164 755 Tm (=) Tj
+1 0 0 1 180 755 Tm (a) Tj
+1 0 0 1 72 720 Tm (C\) Control: The total of 730 seats was approved. let log 2 = a) Tj
+ET"#;
+    make_text_pdf(content, "0 0 595 842")
 }
 
 fn truncate_eof_marker(mut pdf: Vec<u8>) -> Vec<u8> {
@@ -330,6 +512,21 @@ fn test_group_into_lines_sorting_by_x() {
     assert_eq!(lines[0].text(), "First Second Third");
 }
 
+#[test]
+fn test_digit_only_text_runs_are_preserved_in_markdown() {
+    let pdf = make_digit_run_repro_pdf();
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    assert!(items.iter().any(|item| item.text == "730"));
+    assert!(items.iter().any(|item| item.text == "2"));
+
+    let result = process_pdf_mem(&pdf).expect("convert PDF to markdown");
+    assert_eq!(
+        result.markdown.expect("markdown output").trim(),
+        "A) The total of 730 seats was approved.\nB) let log 2 = a\nC) Control: The total of 730 seats was approved. let log 2 = a"
+    );
+}
+
 // ============================================================================
 // MarkdownOptions Tests
 // ============================================================================
@@ -545,6 +742,30 @@ fn test_markdown_from_items_page_breaks() {
     assert!(!md.contains("---"));
     assert!(md.contains("Content on first page"));
     assert!(md.contains("Content on second page"));
+}
+
+#[test]
+fn test_markdown_page_count_overload_includes_trailing_blank_pages_in_folio_coverage() {
+    let mut items = Vec::new();
+    for (page, value) in [(1, "1"), (2, "2"), (3, "3"), (4, "4")] {
+        items.push(make_text_item(value, 25.0, 30.0, 12.0, page));
+        items.push(make_text_item(
+            "Company report footer",
+            41.0,
+            30.0,
+            12.0,
+            page,
+        ));
+    }
+    let options = MarkdownOptions {
+        strip_headers_footers: false,
+        ..MarkdownOptions::default()
+    };
+
+    let md = to_markdown_from_items_with_rects_and_page_count(items, options, &[], 20);
+
+    assert!(md.contains("1 Company report footer"));
+    assert!(md.contains("4 Company report footer"));
 }
 
 // ============================================================================
@@ -2913,6 +3134,57 @@ fn test_extract_pages_markdown_basic() {
     // Text-based PDF should produce non-empty markdown
     assert!(!result.pages[0].markdown.is_empty());
     assert!(!result.pages[0].needs_ocr);
+}
+
+#[test]
+fn test_extract_pages_markdown_uses_document_wide_folio_context() {
+    let pdf = make_recurring_contextual_folio_pdf();
+    let result = extract_pages_markdown_mem(&pdf, None).unwrap();
+
+    assert_eq!(result.pages.len(), 4);
+    for (index, page) in result.pages.iter().enumerate() {
+        assert!(page.markdown.contains("Company report footer"));
+        assert!(
+            !page
+                .markdown
+                .contains(&format!("{} Company report footer", index + 1)),
+            "recurring contextual folio survived on page {}: {}",
+            index + 1,
+            page.markdown
+        );
+    }
+}
+
+#[test]
+fn test_process_pdf_page_filter_uses_document_wide_folio_context() {
+    let pdf = make_recurring_contextual_folio_pdf();
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::new().pages([1])).unwrap();
+    let markdown = result.markdown.unwrap();
+
+    assert!(markdown.contains("Company report footer"));
+    assert!(!markdown.contains("1 Company report footer"), "{markdown}");
+    assert!(markdown.contains("Body page 1"));
+    assert!(!markdown.contains("Body page 2"));
+}
+
+#[test]
+fn test_selected_page_ignores_context_only_extraction_failure() {
+    let pdf = make_pdf_with_malformed_unselected_page();
+
+    let pages = extract_pages_markdown_mem(&pdf, Some(&[0])).unwrap();
+    assert_eq!(pages.pages.len(), 1);
+    assert!(pages.pages[0].markdown.contains("Selected page text"));
+
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::new().pages([1])).unwrap();
+    let markdown = result.markdown.unwrap();
+    assert!(markdown.contains("Selected page text"));
+}
+
+#[test]
+fn test_requested_page_extraction_failure_remains_fatal() {
+    let pdf = make_pdf_with_malformed_unselected_page();
+
+    assert!(extract_pages_markdown_mem(&pdf, Some(&[1])).is_err());
 }
 
 #[test]

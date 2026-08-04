@@ -976,15 +976,51 @@ pub fn to_markdown_from_items_with_rects(
     options: MarkdownOptions,
     rects: &[crate::types::PdfRect],
 ) -> String {
+    let document_page_count = items.iter().map(|item| item.page).max().unwrap_or(0);
+    to_markdown_from_items_with_rects_and_page_count(items, options, rects, document_page_count)
+}
+
+/// Convert positioned text items to Markdown with an authoritative PDF page count.
+///
+/// Use this overload when the owning PDF is available so trailing blank or
+/// unextracted pages are included in document-level header and folio coverage.
+/// Item-only callers can continue using [`to_markdown_from_items_with_rects`],
+/// which falls back to the highest observed item page.
+pub fn to_markdown_from_items_with_rects_and_page_count(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    document_page_count: u32,
+) -> String {
     to_markdown_from_items_with_rects_and_lines(
         items,
         options,
         rects,
         &[],
-        &HashMap::new(),
-        None,
-        &[],
+        MarkdownDocumentContext {
+            page_thresholds: &HashMap::new(),
+            struct_roles: None,
+            struct_tables: &[],
+            page_count: document_page_count,
+            prefiltered_page_number_pages: None,
+            prefiltered_page_number_mask: None,
+        },
     )
+}
+
+pub(crate) struct MarkdownDocumentContext<'a> {
+    pub(crate) page_thresholds: &'a HashMap<u32, f32>,
+    pub(crate) struct_roles:
+        Option<&'a HashMap<u32, HashMap<i64, crate::structure_tree::StructRole>>>,
+    pub(crate) struct_tables: &'a [crate::structure_tree::StructTable],
+    pub(crate) page_count: u32,
+    /// Pages where an upstream document-level pass removed folios. This keeps
+    /// table-continuation classification consistent after masked items drop.
+    pub(crate) prefiltered_page_number_pages: Option<&'a HashSet<u32>>,
+    /// Document-level removal decisions aligned with this call's input items.
+    /// Table detection consumes the original items; the mask is applied only
+    /// after table claims have been established.
+    pub(crate) prefiltered_page_number_mask: Option<&'a [bool]>,
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -996,27 +1032,43 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     options: MarkdownOptions,
     rects: &[crate::types::PdfRect],
     pdf_lines: &[crate::types::PdfLine],
-    page_thresholds: &HashMap<u32, f32>,
-    struct_roles: Option<&HashMap<u32, HashMap<i64, crate::structure_tree::StructRole>>>,
-    struct_tables: &[crate::structure_tree::StructTable],
+    context: MarkdownDocumentContext<'_>,
 ) -> String {
     use crate::tables::{
-        detect_tables, detect_tables_from_lines, detect_tables_from_rects,
-        detect_tables_from_struct_tree, try_build_rect_guided_table,
+        content_width, detect_tables_from_lines, detect_tables_from_rects,
+        detect_tables_from_struct_tree, detect_tables_with_page_width, try_build_rect_guided_table,
     };
     use crate::types::ItemType;
+
+    let MarkdownDocumentContext {
+        page_thresholds,
+        struct_roles,
+        struct_tables,
+        page_count: document_page_count,
+        prefiltered_page_number_pages,
+        prefiltered_page_number_mask,
+    } = context;
 
     if items.is_empty() {
         return String::new();
     }
+
+    // Table detection must retain the original collection because short
+    // numeric table cells can be indistinguishable from folios until
+    // structural context is available. A precomputed mask carries the
+    // document-wide decision without removing items before table claims.
+    debug_assert!(prefiltered_page_number_mask.is_none_or(|mask| mask.len() == items.len()));
+    let has_precomputed_page_number_mask = prefiltered_page_number_mask.is_some();
+    let removed_page_number_pages = prefiltered_page_number_pages.cloned().unwrap_or_default();
 
     // Separate images and links from text items
     let mut images: Vec<TextItem> = Vec::new();
     let mut page_image_regions: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
     let mut links: Vec<TextItem> = Vec::new();
     let mut text_items: Vec<TextItem> = Vec::new();
+    let mut text_item_page_number_mask: Vec<bool> = Vec::new();
 
-    for item in items {
+    for (input_index, item) in items.into_iter().enumerate() {
         match &item.item_type {
             ItemType::Image => {
                 page_image_regions.entry(item.page).or_default().push((
@@ -1035,6 +1087,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 }
             }
             ItemType::Text | ItemType::FormField => {
+                text_item_page_number_mask.push(
+                    prefiltered_page_number_mask
+                        .and_then(|mask| mask.get(input_index))
+                        .copied()
+                        .unwrap_or(false),
+                );
                 text_items.push(item);
             }
         }
@@ -1075,7 +1133,6 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     let mut pages: Vec<u32> = page_groups.keys().copied().collect();
     pages.sort();
-    let page_count = pages.last().copied().unwrap_or(0) + 1;
 
     // Track band splits per page so we can split non-table items later
     let mut page_band_splits: HashMap<u32, Vec<(f32, f32)>> = HashMap::new();
@@ -1087,6 +1144,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     for page in pages {
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
+        let page_content_width = content_width(&page_items);
 
         // Chart-bar regions: bar charts drawn as filled rects read as cell
         // rects or aligned text and get gridded into phantom tables. Their
@@ -1128,7 +1186,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         });
         let chart_prose_columns = chart_prose_split.is_some();
 
-        // Check for side-by-side layout (e.g. two tables placed left and right)
+        // Check for side-by-side table layout using the original items. Sparse
+        // numeric cells need table context before they can be distinguished
+        // safely from folios; cleaned evidence is reserved for column and
+        // final non-table layout decisions.
         let mut bands = split_side_by_side(&page_items);
         // A rect table crossing a proposed split boundary means the "gutter"
         // is really the gap between ruled and borderless table columns —
@@ -1368,7 +1429,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     // table can share the prose anchors. Reject only candidates
                     // whose cells prove they are parallel prose fragments.
                     let reject_parallel_prose = chart_prose_columns && !was_split;
-                    let tables = detect_tables(subset_items, base_size, false);
+                    let tables = detect_tables_with_page_width(
+                        subset_items,
+                        base_size,
+                        false,
+                        page_content_width,
+                    );
                     for table in tables {
                         if reject_parallel_prose && is_parallel_prose_table(&table) {
                             log::debug!(
@@ -1549,7 +1615,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             // and reject chart-page prose candidates individually below.
             let skip_body_font =
                 merged_retry_skips_body_font(detected_columns, !chart_regions.is_empty());
-            let heuristic_tables = detect_tables(&chart_free, base_size, skip_body_font);
+            let heuristic_tables = detect_tables_with_page_width(
+                &chart_free,
+                base_size,
+                skip_body_font,
+                page_content_width,
+            );
             for table in &heuristic_tables {
                 if !chart_regions.is_empty() && is_parallel_prose_table(table) {
                     log::debug!(
@@ -1634,16 +1705,20 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     };
 
     // Filter out table items and process the rest
-    let non_table_items: Vec<TextItem> = text_items
+    let non_table_items: Vec<(usize, TextItem)> = text_items
         .into_iter()
         .enumerate()
         .filter(|(idx, _)| !table_items.contains(idx))
-        .map(|(_, item)| item)
         .collect();
 
     // Find pages that are table-only (no remaining non-table text)
     let table_only_pages: HashSet<u32> = {
-        let pages_with_text: HashSet<u32> = non_table_items.iter().map(|i| i.page).collect();
+        let mut pages_with_text: HashSet<u32> =
+            non_table_items.iter().map(|(_, item)| item.page).collect();
+        // Preserve the pre-filter continuation classification: a page that
+        // originally also contained a folio does not become table-only merely
+        // because an upstream document-level pass removed it.
+        pages_with_text.extend(removed_page_number_pages);
         page_tables
             .keys()
             .filter(|p| !pages_with_text.contains(p))
@@ -1658,11 +1733,25 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // column detection on pages where table column gaps would be misidentified.
     let table_page_set: HashSet<u32> = page_tables.keys().copied().collect();
 
+    let non_table_items = if has_precomputed_page_number_mask {
+        non_table_items
+            .into_iter()
+            .filter(|(index, _)| !text_item_page_number_mask[*index])
+            .map(|(_, item)| item)
+            .collect()
+    } else {
+        crate::extractor::filter_markdown_page_numbers_with_removed_pages(
+            non_table_items.into_iter().map(|(_, item)| item).collect(),
+            document_page_count,
+        )
+        .0
+    };
+
     // Split non-table items by band boundaries before line grouping so that
     // items from different side-by-side zones (e.g. left/right month columns
     // in a calendar) don't merge into the same line.
     let lines = if page_band_splits.is_empty() && page_chart_prose_splits.is_empty() {
-        crate::extractor::group_into_lines_with_thresholds_and_regions(
+        crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_regions(
             non_table_items,
             page_thresholds,
             &table_page_set,
@@ -1690,13 +1779,14 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             }
         }
         // Process unsplit pages normally
-        let mut all_lines = crate::extractor::group_into_lines_with_thresholds_and_regions(
-            unsplit_items,
-            page_thresholds,
-            &table_page_set,
-            &page_chart_map,
-            &page_image_regions,
-        );
+        let mut all_lines =
+            crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_regions(
+                unsplit_items,
+                page_thresholds,
+                &table_page_set,
+                &page_chart_map,
+                &page_image_regions,
+            );
         // Process each split page's bands independently, then interleave
         // by Y position so paired zones (e.g. left/right months) appear together.
         let mut split_pages: Vec<u32> = split_page_items.keys().copied().collect();
@@ -1714,7 +1804,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     .collect();
                 if !band_items.is_empty() {
                     page_lines.extend(
-                        crate::extractor::group_into_lines_with_thresholds_and_charts(
+                        crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
                             band_items,
                             page_thresholds,
                             &table_page_set,
@@ -1748,7 +1838,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         .collect();
                     if !column_items.is_empty() {
                         zone_lines.extend(
-                            crate::extractor::group_into_lines_with_thresholds_and_charts(
+                            crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
                                 column_items,
                                 page_thresholds,
                                 &table_page_set,
@@ -1789,7 +1879,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         item.y >= low || item_is_in_chart_region(item, chart_regions)
                     });
                 all_lines.extend(
-                    crate::extractor::group_into_lines_with_thresholds_and_charts(
+                    crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
                         chart_zone,
                         page_thresholds,
                         &table_page_set,
@@ -1808,7 +1898,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
-        preprocess::strip_repeated_lines(lines, page_count)
+        preprocess::strip_repeated_lines(lines, document_page_count)
     } else {
         lines
     };
@@ -1919,6 +2009,53 @@ mod tests {
         let mut it = make_item(x, y, page);
         it.width = width;
         it
+    }
+
+    #[test]
+    fn precomputed_folio_mask_preserves_numeric_table_cells() {
+        let mut items = Vec::new();
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            for column in 0..2 {
+                let mut item = make_item_w(
+                    110.0 + column as f32 * 100.0,
+                    30.0 + row as f32 * 20.0,
+                    20.0,
+                    1,
+                );
+                item.text = (row * 2 + column + 1).to_string();
+                items.push(item);
+                rects.push(PdfRect {
+                    x: 100.0 + column as f32 * 100.0,
+                    y: 20.0 + row as f32 * 20.0,
+                    width: 100.0,
+                    height: 20.0,
+                    page: 1,
+                });
+            }
+        }
+
+        // Simulate document-level folio decisions that would remove every
+        // short numeric item if applied before structural table detection.
+        let removal_mask = vec![true; items.len()];
+        let removed_pages = HashSet::from([1]);
+        let markdown = to_markdown_from_items_with_rects_and_lines(
+            items,
+            MarkdownOptions::default(),
+            &rects,
+            &[],
+            MarkdownDocumentContext {
+                page_thresholds: &HashMap::new(),
+                struct_roles: None,
+                struct_tables: &[],
+                page_count: 1,
+                prefiltered_page_number_pages: Some(&removed_pages),
+                prefiltered_page_number_mask: Some(&removal_mask),
+            },
+        );
+
+        assert!(markdown.contains("|1|2|"), "{markdown}");
+        assert!(markdown.contains("|7|8|"), "{markdown}");
     }
 
     #[test]

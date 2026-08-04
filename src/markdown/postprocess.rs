@@ -3,6 +3,7 @@
 use regex::Regex;
 
 use super::{MarkdownOptions, MarkdownProfile};
+use crate::text_utils::is_page_number_line;
 
 /// Clean up markdown output with post-processing
 pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> String {
@@ -145,7 +146,7 @@ fn fix_hyphenation(text: &str) -> String {
     result
 }
 
-/// Remove standalone page numbers (lines that are just 1-4 digit numbers)
+/// Remove isolated page-number expressions from Markdown.
 fn remove_page_numbers(text: &str) -> String {
     let mut result = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
@@ -181,69 +182,6 @@ fn remove_page_numbers(text: &str) -> String {
     }
 
     result.join("\n")
-}
-
-/// Check if a line looks like a page number
-fn is_page_number_line(trimmed: &str) -> bool {
-    // Empty lines are not page numbers
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    // Pattern 1: Just a number (1-4 digits)
-    if trimmed.len() <= 4 && trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-
-    // Pattern 2: "Page X of Y" or "Page X" or "Page   of" (placeholder)
-    let lower = trimmed.to_lowercase();
-    if let Some(rest) = lower.strip_prefix("page") {
-        let rest = rest.trim();
-        // "Page   of" (empty page numbers)
-        if rest == "of" || rest.starts_with("of ") {
-            return true;
-        }
-        // "Page X" or "Page X of Y"
-        if rest
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        // Just "Page" followed by whitespace and maybe "of"
-        if rest.is_empty()
-            || rest
-                .split_whitespace()
-                .all(|w| w == "of" || w.chars().all(|c| c.is_ascii_digit()))
-        {
-            return true;
-        }
-    }
-
-    // Pattern 3: "X of Y" where X and Y are numbers
-    if let Some(of_idx) = trimmed.find(" of ") {
-        let before = trimmed[..of_idx].trim();
-        let after = trimmed[of_idx + 4..].trim();
-        if before.chars().all(|c| c.is_ascii_digit())
-            && after.chars().all(|c| c.is_ascii_digit())
-            && !before.is_empty()
-            && !after.is_empty()
-        {
-            return true;
-        }
-    }
-
-    // Pattern 4: "- X -" centered page number
-    if trimmed.len() >= 3 && trimmed.starts_with('-') && trimmed.ends_with('-') {
-        let inner = trimmed[1..trimmed.len() - 1].trim();
-        if inner.chars().all(|c| c.is_ascii_digit()) && !inner.is_empty() {
-            return true;
-        }
-    }
-
-    false
 }
 
 /// Convert URLs to markdown links
@@ -489,12 +427,14 @@ mod tests {
     fn test_is_page_number_page_x() {
         assert!(is_page_number_line("Page 5"));
         assert!(is_page_number_line("page 12"));
+        assert!(is_page_number_line("Page123"));
     }
 
     #[test]
     fn test_is_page_number_page_x_of_y() {
         assert!(is_page_number_line("Page 3 of 10"));
         assert!(is_page_number_line("page 1 of 5"));
+        assert!(is_page_number_line("Page 3 of 10 Report header"));
     }
 
     #[test]
@@ -526,6 +466,12 @@ mod tests {
         assert!(!is_page_number_line("Total: 500"));
     }
 
+    #[test]
+    fn test_is_page_number_labeled_running_header() {
+        assert!(is_page_number_line("Page 42 Chapter 5"));
+        assert!(is_page_number_line("Page 42 explains the result"));
+    }
+
     // --- remove_page_numbers ---
 
     #[test]
@@ -549,6 +495,16 @@ mod tests {
         let input = "Line A\nLine B\n42\nLine C\nLine D";
         let result = remove_page_numbers(input);
         assert!(result.contains("42"));
+    }
+
+    #[test]
+    fn test_remove_page_numbers_labeled_header_with_content() {
+        let input = "Content\n\nPage 42 explains the result\n---\nEnd";
+        let result = remove_page_numbers(input);
+
+        assert!(!result.contains("Page 42 explains the result"));
+        assert!(result.contains("Content"));
+        assert!(result.contains("End"));
     }
 
     #[test]

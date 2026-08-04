@@ -27,9 +27,12 @@ pub use crate::text_utils::{is_bold_font, is_italic_font};
 pub use crate::types::{ItemType, TextLine};
 pub(crate) use fonts::FontStyleCache;
 pub(crate) use layout::detect_columns;
+#[cfg(test)]
+use layout::filter_markdown_page_numbers;
+pub(crate) use layout::filter_markdown_page_numbers_with_removed_pages;
 pub(crate) use layout::group_into_lines_with_thresholds;
-pub(crate) use layout::group_into_lines_with_thresholds_and_charts;
-pub(crate) use layout::group_into_lines_with_thresholds_and_regions;
+pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_charts;
+pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_regions;
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
@@ -140,17 +143,92 @@ pub(crate) fn extract_positioned_text_from_doc(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, false)
+    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None)
 }
 
-/// Extract with option to include invisible (Tr=3) text.
-/// Used for Mixed/template PDFs where the OCR text layer is invisible.
-pub(crate) fn extract_positioned_text_include_invisible(
+/// Extract selected pages and gather document-wide folio evidence only when a
+/// selected page contains an ambiguous contextual page-edge number. Errors on
+/// selected pages remain fatal; errors on context-only pages are skipped.
+pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, true)
+    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
+}
+
+/// Invisible-text variant of [`extract_positioned_text_with_folio_context`].
+pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
+}
+
+fn extract_positioned_text_with_folio_context_impl(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+    include_invisible: bool,
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    let Some(required_pages) = page_filter else {
+        return extract_positioned_text_impl(doc, font_cmaps, None, include_invisible, None);
+    };
+
+    let (
+        (mut selected_items, mut selected_rects, mut selected_lines),
+        mut page_thresholds,
+        mut gid_encoded_pages,
+    ) = extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        Some(required_pages),
+        include_invisible,
+        None,
+    )?;
+    if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
+        return Ok((
+            (selected_items, selected_rects, selected_lines),
+            page_thresholds,
+            gid_encoded_pages,
+        ));
+    }
+
+    let context_pages: HashSet<u32> = doc
+        .get_pages()
+        .keys()
+        .copied()
+        .filter(|page| !required_pages.contains(page))
+        .collect();
+    let ((context_items, context_rects, context_lines), context_thresholds, context_gid_pages) =
+        extract_positioned_text_impl(
+            doc,
+            font_cmaps,
+            Some(&context_pages),
+            include_invisible,
+            Some(required_pages),
+        )?;
+    selected_items.extend(context_items);
+    selected_rects.extend(context_rects);
+    selected_lines.extend(context_lines);
+    page_thresholds.extend(context_thresholds);
+    gid_encoded_pages.extend(context_gid_pages);
+    Ok((
+        (selected_items, selected_rects, selected_lines),
+        page_thresholds,
+        gid_encoded_pages,
+    ))
+}
+
+/// Extract all pages for document-wide analysis while allowing malformed
+/// unselected pages to be skipped. Any requested page still fails normally.
+pub(crate) fn extract_positioned_text_for_document_analysis(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    required_pages: &HashSet<u32>,
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
 }
 
 fn extract_positioned_text_impl(
@@ -158,6 +236,7 @@ fn extract_positioned_text_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
+    required_pages: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
@@ -179,15 +258,25 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated) =
-            extract_page_text_items(
-                doc,
-                page_id,
-                *page_num,
-                font_cmaps,
-                include_invisible,
-                &mut style_cache,
-            )?;
+        let page_result = extract_page_text_items(
+            doc,
+            page_id,
+            *page_num,
+            font_cmaps,
+            include_invisible,
+            &mut style_cache,
+        );
+        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated) = match page_result {
+            Ok(extraction) => extraction,
+            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
+                debug!(
+                    "page {}: skipping context-only extraction error: {}",
+                    page_num, error
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
@@ -317,7 +406,9 @@ fn extract_positioned_text_impl(
     }
 
     // Extract AcroForm field values
-    let form_items = extract_form_fields(doc, &page_id_to_num);
+    let form_items = extract_form_fields(doc, &page_id_to_num)
+        .into_iter()
+        .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)));
     all_items.extend(form_items);
 
     Ok((
@@ -1529,6 +1620,724 @@ mod tests {
         let lines = group_into_lines_preserving_all_text(vec![page_number]);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text(), "42");
+    }
+
+    #[test]
+    fn inline_numeric_run_near_page_edge_is_not_removed() {
+        let mut items = vec![
+            make_merge_item("Total", 100.0, 30.0),
+            make_merge_item("730", 136.0, 18.0),
+            make_merge_item("seats", 160.0, 30.0),
+        ];
+        for item in &mut items {
+            item.y = 780.0;
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "Total 730 seats");
+    }
+
+    #[test]
+    fn numeric_page_footer_separated_from_label_is_removed() {
+        let mut page_number = make_merge_item("42", 25.0, 12.0);
+        page_number.y = 50.0;
+        let mut footer_label = make_merge_item("DOCUMENT FOOTER", 60.0, 100.0);
+        footer_label.y = 50.0;
+
+        let lines = group_into_lines(vec![page_number, footer_label]);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "DOCUMENT FOOTER");
+    }
+
+    #[test]
+    fn decorative_marker_does_not_contextualize_numeric_page_footer() {
+        let mut marker = make_merge_item("•", 19.0, 6.0);
+        marker.y = 30.0;
+        let mut page_number = make_merge_item("42", 37.0, 10.0);
+        page_number.y = 30.0;
+        let mut footer_label = make_merge_item("Company report footer", 68.0, 120.0);
+        footer_label.y = 30.0;
+
+        let lines = group_into_lines(vec![marker, page_number, footer_label]);
+
+        assert!(lines.iter().all(|line| !line.text().contains("42")));
+        assert!(lines
+            .iter()
+            .any(|line| line.text().contains("Company report footer")));
+    }
+
+    #[test]
+    fn labeled_page_number_is_removed_in_a_short_document() {
+        let mut label = make_merge_item("Page", 25.0, 28.0);
+        label.y = 50.0;
+        let mut page_number = make_merge_item("42", 57.0, 12.0);
+        page_number.y = 50.0;
+
+        let lines = group_into_lines(vec![label, page_number]);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "Page");
+    }
+
+    #[test]
+    fn labeled_page_number_with_running_header_suffix_is_removed() {
+        let mut items = vec![
+            make_merge_item("Page", 25.0, 28.0),
+            make_merge_item("42", 57.0, 12.0),
+            make_merge_item("of", 73.0, 12.0),
+            make_merge_item("100", 89.0, 18.0),
+            make_merge_item("Report header", 111.0, 78.0),
+        ];
+        for item in &mut items {
+            item.y = 50.0;
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "Report header");
+    }
+
+    #[test]
+    fn page_of_total_expression_is_removed_without_leaving_fragments() {
+        let mut items = vec![
+            make_merge_item("Page", 482.0, 27.0),
+            make_merge_item("1", 513.0, 6.0),
+            make_merge_item("of", 523.0, 10.0),
+            make_merge_item("15", 537.0, 12.0),
+        ];
+        for item in &mut items {
+            item.y = 46.0;
+        }
+
+        let lines = group_into_lines(items);
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn document_folio_filter_survives_per_page_layout_splitting() {
+        let mut items = Vec::new();
+        for (page, value) in [(1, "42"), (2, "43"), (3, "44")] {
+            let mut label = make_merge_item("Page", 25.0, 28.0);
+            label.page = page;
+            label.y = 50.0;
+            let mut page_number = make_merge_item(value, 57.0, 12.0);
+            page_number.page = page;
+            page_number.y = 50.0;
+            items.extend([label, page_number]);
+        }
+
+        let filtered = filter_markdown_page_numbers(items, 3);
+        assert!(filtered
+            .iter()
+            .all(|item| !matches!(item.text.as_str(), "42" | "43" | "44")));
+        let mut lines = Vec::new();
+        for page in 1..=3 {
+            let page_items = filtered
+                .iter()
+                .filter(|item| item.page == page)
+                .cloned()
+                .collect();
+            lines.extend(
+                group_prefiltered_items_into_lines_with_thresholds_and_charts(
+                    page_items,
+                    &HashMap::new(),
+                    &HashSet::new(),
+                    &HashMap::new(),
+                ),
+            );
+        }
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| line.text() == "Page"));
+    }
+
+    #[test]
+    fn numeric_only_page_edge_runs_do_not_contextualize_folios() {
+        let mut page_number = make_merge_item("42", 25.0, 12.0);
+        page_number.y = 50.0;
+        let mut long_number = make_merge_item("12345", 43.0, 30.0);
+        long_number.y = 50.0;
+
+        let lines = group_into_lines(vec![page_number, long_number]);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "12345");
+    }
+
+    #[test]
+    fn structured_and_dense_numeric_page_edge_runs_are_preserved() {
+        let mut list_marker = make_merge_item("11)", 25.0, 18.0);
+        list_marker.y = 50.0;
+        let mut chapter = make_merge_item("13", 47.0, 12.0);
+        chapter.y = 50.0;
+
+        let mut isbn_prefix = make_merge_item("9", 25.0, 6.0);
+        isbn_prefix.page = 2;
+        isbn_prefix.y = 50.0;
+        let mut isbn_mid = make_merge_item("780113", 35.0, 36.0);
+        isbn_mid.page = 2;
+        isbn_mid.y = 50.0;
+        let mut isbn_end = make_merge_item("227426", 75.0, 36.0);
+        isbn_end.page = 2;
+        isbn_end.y = 50.0;
+
+        let lines = group_into_lines(vec![list_marker, chapter, isbn_prefix, isbn_mid, isbn_end]);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text(), "11) 13");
+        assert_eq!(lines[1].text(), "9 780113 227426");
+    }
+
+    #[test]
+    fn incrementing_numeric_body_column_is_not_treated_as_a_folio() {
+        let mut items = Vec::new();
+        for (page, value) in [(1, "13"), (2, "14"), (3, "15")] {
+            let mut row_number = make_merge_item(value, 72.0, 12.0);
+            row_number.page = page;
+            row_number.y = 730.0;
+            let mut name = make_merge_item("Person", 90.0, 42.0);
+            name.page = page;
+            name.y = 730.0;
+            items.extend([row_number, name]);
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].text(), "13 Person");
+        assert_eq!(lines[1].text(), "14 Person");
+        assert_eq!(lines[2].text(), "15 Person");
+    }
+
+    #[test]
+    fn advancing_number_in_repeated_deep_margin_footer_is_removed() {
+        let mut items = Vec::new();
+        for (page, value) in [(1, "2"), (2, "4"), (3, "6"), (4, "8")] {
+            let mut page_number = make_merge_item(value, 25.0, 12.0);
+            page_number.page = page;
+            page_number.y = 30.0;
+            let mut footer = make_merge_item("Company report footer", 41.0, 120.0);
+            footer.page = page;
+            footer.y = 30.0;
+            items.extend([page_number, footer]);
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines
+            .iter()
+            .all(|line| line.text() == "Company report footer"));
+    }
+
+    #[test]
+    fn repeated_substantive_page_number_prose_is_preserved() {
+        let mut items = Vec::new();
+        for (page, value) in [(1, "42"), (2, "43"), (3, "44"), (4, "45")] {
+            let mut page_label = make_merge_item("Page", 25.0, 28.0);
+            page_label.page = page;
+            page_label.y = 30.0;
+            let mut number = make_merge_item(value, 57.0, 12.0);
+            number.page = page;
+            number.y = 30.0;
+            let mut explanation = make_merge_item("explains the result", 73.0, 108.0);
+            explanation.page = page;
+            explanation.y = 30.0;
+            items.extend([page_label, number, explanation]);
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 4);
+        for (line, value) in lines.iter().zip(["42", "43", "44", "45"]) {
+            assert_eq!(line.text(), format!("Page {value} explains the result"));
+        }
+    }
+
+    #[test]
+    fn numeric_candidates_do_not_bridge_lexical_context() {
+        let mut report = make_merge_item("Report", 25.0, 40.0);
+        report.y = 30.0;
+        let mut year = make_merge_item("2026", 69.0, 24.0);
+        year.y = 30.0;
+        let mut folio = make_merge_item("42", 97.0, 12.0);
+        folio.y = 30.0;
+
+        let lines = group_into_lines(vec![report, year, folio]);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "Report 2026");
+    }
+
+    #[test]
+    fn centered_folio_delimiters_are_removed_with_the_number() {
+        let mut left = make_merge_item("-", 270.0, 6.0);
+        left.y = 30.0;
+        let mut number = make_merge_item("42", 280.0, 12.0);
+        number.y = 30.0;
+        let mut right = make_merge_item("-", 296.0, 6.0);
+        right.y = 30.0;
+
+        let lines = group_into_lines(vec![left, number, right]);
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn centered_delimiters_inside_substantive_text_are_preserved() {
+        let mut items = vec![
+            make_merge_item("Result", 240.0, 36.0),
+            make_merge_item("-", 280.0, 6.0),
+            make_merge_item("42", 290.0, 12.0),
+            make_merge_item("-", 306.0, 6.0),
+            make_merge_item("approved", 316.0, 48.0),
+        ];
+        for item in &mut items {
+            item.y = 30.0;
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "Result-42-approved");
+    }
+
+    #[test]
+    fn changing_year_in_repeated_deep_margin_header_is_preserved() {
+        let mut items = Vec::new();
+        for (page, year) in [(1, "2020"), (2, "2021"), (3, "2022"), (4, "2023")] {
+            let mut year = make_merge_item(year, 25.0, 24.0);
+            year.page = page;
+            year.y = 780.0;
+            let mut header = make_merge_item("Annual report", 53.0, 78.0);
+            header.page = page;
+            header.y = 780.0;
+            items.extend([year, header]);
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].text(), "2020 Annual report");
+        assert_eq!(lines[3].text(), "2023 Annual report");
+    }
+
+    #[test]
+    fn sparse_repeated_margin_numbers_do_not_meet_the_folio_evidence_floor() {
+        let mut items = Vec::new();
+        for page in 1..=4 {
+            if page <= 2 {
+                let value = if page == 1 { "2" } else { "4" };
+                let mut number = make_merge_item(value, 25.0, 12.0);
+                number.page = page;
+                number.y = 30.0;
+                let mut footer = make_merge_item("Company report footer", 41.0, 120.0);
+                footer.page = page;
+                footer.y = 30.0;
+                items.extend([number, footer]);
+            } else {
+                let mut body = make_merge_item("Body text", 72.0, 54.0);
+                body.page = page;
+                body.y = 400.0;
+                items.push(body);
+            }
+        }
+
+        let lines = group_into_lines(items);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.text() == "2 Company report footer"));
+        assert!(lines
+            .iter()
+            .any(|line| line.text() == "4 Company report footer"));
+    }
+
+    #[test]
+    fn sparse_document_pages_count_toward_repeated_folio_coverage() {
+        let mut items = Vec::new();
+        for (page, value) in [(1, "1"), (10, "10"), (19, "19"), (28, "28")] {
+            let mut number = make_merge_item(value, 25.0, 12.0);
+            number.page = page;
+            number.y = 30.0;
+            let mut footer = make_merge_item("Company report footer", 41.0, 120.0);
+            footer.page = page;
+            footer.y = 30.0;
+            items.extend([number, footer]);
+        }
+
+        let lines = group_into_lines(items);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.text() == "1 Company report footer"));
+        assert!(lines
+            .iter()
+            .any(|line| line.text() == "28 Company report footer"));
+    }
+
+    #[test]
+    fn trailing_blank_pages_count_toward_repeated_folio_coverage() {
+        let mut items = Vec::new();
+        for (page, value) in [(1, "1"), (2, "2"), (3, "3"), (4, "4")] {
+            let mut number = make_merge_item(value, 25.0, 12.0);
+            number.page = page;
+            number.y = 30.0;
+            let mut footer = make_merge_item("Company report footer", 41.0, 120.0);
+            footer.page = page;
+            footer.y = 30.0;
+            items.extend([number, footer]);
+        }
+
+        let filtered = filter_markdown_page_numbers(items, 20);
+
+        assert!(filtered.iter().any(|item| item.text == "1"));
+        assert!(filtered.iter().any(|item| item.text == "4"));
+    }
+
+    #[test]
+    fn prefiltered_contextual_number_survives_layout_partitioning() {
+        let mut items = vec![
+            make_merge_item("Total", 100.0, 30.0),
+            make_merge_item("730", 136.0, 18.0),
+            make_merge_item("seats", 160.0, 30.0),
+        ];
+        for item in &mut items {
+            item.y = 780.0;
+        }
+
+        let filtered = filter_markdown_page_numbers(items, 1);
+        let partitioned_number: Vec<TextItem> = filtered
+            .into_iter()
+            .filter(|item| item.text == "730")
+            .collect();
+        let lines = group_prefiltered_items_into_lines_with_thresholds_and_charts(
+            partitioned_number,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "730");
+    }
+
+    #[test]
+    fn numeric_only_partition_does_not_define_columns() {
+        let mut items = Vec::new();
+        for row in 0..20 {
+            let y = 90.0 - row as f32 * 4.0;
+            let mut left = make_merge_item(&(row + 1).to_string(), 50.0, 20.0);
+            left.y = y;
+            let mut right = make_merge_item(&(row + 101).to_string(), 350.0, 20.0);
+            right.y = y;
+            items.extend([left, right]);
+        }
+        assert_eq!(detect_columns(&items, 1, false).len(), 2);
+
+        let lines = group_prefiltered_items_into_lines_with_thresholds_and_charts(
+            items,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(lines.len(), 20);
+        assert!(lines.iter().all(|line| line.items.len() == 2));
+    }
+
+    #[test]
+    fn separated_content_is_not_treated_as_a_spread_folio_pair() {
+        let mut value = make_merge_item("12", 100.0, 12.0);
+        value.y = 30.0;
+        let mut label = make_merge_item("Total", 116.0, 30.0);
+        label.y = 30.0;
+        let mut unrelated_number = make_merge_item("13", 300.0, 12.0);
+        unrelated_number.y = 30.0;
+
+        let lines = group_into_lines(vec![value, label, unrelated_number]);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "12 Total");
+    }
+
+    #[test]
+    fn repeated_folio_uses_the_full_page_edge_band() {
+        let mut items = Vec::new();
+        for (page, value) in [(1, "2"), (2, "4"), (3, "6"), (4, "8")] {
+            let mut page_number = make_merge_item(value, 25.0, 12.0);
+            page_number.page = page;
+            page_number.y = 80.0;
+            let mut footer = make_merge_item("Company report footer", 41.0, 120.0);
+            footer.page = page;
+            footer.y = 80.0;
+            items.extend([page_number, footer]);
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines
+            .iter()
+            .all(|line| line.text() == "Company report footer"));
+    }
+
+    #[test]
+    fn contextual_folio_on_facing_page_spread_is_removed() {
+        let mut marker = make_merge_item("•", 19.0, 6.0);
+        marker.y = 30.0;
+        let mut left_folio = make_merge_item("326", 35.0, 17.0);
+        left_folio.y = 30.0;
+        let mut footer = make_merge_item("Company report footer", 61.0, 120.0);
+        footer.y = 30.0;
+        let mut right_folio = make_merge_item("327", 1148.0, 17.0);
+        right_folio.y = 30.0;
+
+        let lines = group_into_lines(vec![marker, left_folio, footer, right_folio]);
+
+        assert!(lines
+            .iter()
+            .all(|line| !line.text().contains("326") && !line.text().contains("327")));
+        assert!(lines
+            .iter()
+            .any(|line| line.text().contains("Company report footer")));
+    }
+
+    #[test]
+    fn contextual_folios_alternating_across_pages_are_removed() {
+        let headers = [
+            "Letter to shareholders",
+            "Corporate governance report",
+            "Business environment overview",
+            "Consolidated financial statements",
+        ];
+        let mut items = Vec::new();
+        for page in 1..=8 {
+            let mut body = make_merge_item("Body text", 50.0, 500.0);
+            body.page = page;
+            body.y = 400.0;
+            items.push(body);
+
+            let mut folio = make_merge_item(&(page + 22).to_string(), 0.0, 14.0);
+            folio.page = page;
+            folio.y = 780.0;
+            if page % 2 == 0 {
+                folio.x = 50.0;
+                items.push(folio);
+            } else {
+                let mut header = make_merge_item(headers[(page / 2) as usize], 350.0, 180.0);
+                header.page = page;
+                header.y = 780.0;
+                folio.x = 536.0;
+                items.extend([header, folio]);
+            }
+        }
+
+        let filtered = filter_markdown_page_numbers(items, 8);
+
+        assert!(filtered.iter().all(|item| {
+            !matches!(
+                item.text.as_str(),
+                "23" | "24" | "25" | "26" | "27" | "28" | "29" | "30"
+            )
+        }));
+        assert!(headers
+            .iter()
+            .all(|header| filtered.iter().any(|item| item.text == *header)));
+    }
+
+    #[test]
+    fn one_isolated_neighbor_does_not_remove_contextual_number() {
+        let mut body_one = make_merge_item("Body text", 50.0, 500.0);
+        body_one.y = 400.0;
+        let mut label = make_merge_item("Report", 450.0, 70.0);
+        label.y = 780.0;
+        let mut contextual = make_merge_item("1", 526.0, 7.0);
+        contextual.y = 780.0;
+
+        let mut body_two = body_one.clone();
+        body_two.page = 2;
+        let mut isolated = make_merge_item("2", 50.0, 7.0);
+        isolated.page = 2;
+        isolated.y = 780.0;
+
+        let filtered =
+            filter_markdown_page_numbers(vec![body_one, label, contextual, body_two, isolated], 2);
+
+        assert!(filtered.iter().any(|item| item.text == "Report"));
+        assert!(filtered.iter().any(|item| item.text == "1"));
+        assert!(filtered.iter().all(|item| item.text != "2"));
+    }
+
+    #[test]
+    fn narrow_content_span_does_not_establish_adjacent_page_edges() {
+        let mut body_one = make_merge_item("Body text", 100.0, 120.0);
+        body_one.y = 400.0;
+        let mut label = make_merge_item("Report", 170.0, 60.0);
+        label.y = 780.0;
+        let mut contextual = make_merge_item("1", 235.0, 7.0);
+        contextual.y = 780.0;
+
+        let mut body_two = body_one.clone();
+        body_two.page = 2;
+        let mut isolated_two = make_merge_item("2", 100.0, 7.0);
+        isolated_two.page = 2;
+        isolated_two.y = 780.0;
+
+        let mut body_four = body_one.clone();
+        body_four.page = 4;
+        let mut isolated_four = make_merge_item("4", 100.0, 7.0);
+        isolated_four.page = 4;
+        isolated_four.y = 780.0;
+
+        let filtered = filter_markdown_page_numbers(
+            vec![
+                body_one,
+                label,
+                contextual,
+                body_two,
+                isolated_two,
+                body_four,
+                isolated_four,
+            ],
+            4,
+        );
+
+        assert!(filtered.iter().any(|item| item.text == "Report"));
+        assert!(filtered.iter().any(|item| item.text == "1"));
+    }
+
+    #[test]
+    fn same_edge_number_on_an_adjacent_page_is_not_folio_evidence() {
+        let mut body_one = make_merge_item("Body text", 50.0, 500.0);
+        body_one.y = 400.0;
+        let mut isolated = make_merge_item("42", 50.0, 14.0);
+        isolated.y = 780.0;
+
+        let mut body_two = body_one.clone();
+        body_two.page = 2;
+        let mut contextual = make_merge_item("43", 50.0, 14.0);
+        contextual.page = 2;
+        contextual.y = 780.0;
+        let mut label = make_merge_item("cases reviewed", 70.0, 90.0);
+        label.page = 2;
+        label.y = 780.0;
+
+        let filtered =
+            filter_markdown_page_numbers(vec![body_one, isolated, body_two, contextual, label], 2);
+
+        assert!(filtered.iter().any(|item| item.text == "43"));
+        assert!(filtered.iter().any(|item| item.text == "cases reviewed"));
+    }
+
+    #[test]
+    fn constant_number_in_repeated_deep_margin_header_is_preserved() {
+        let mut items = Vec::new();
+        for page in 1..=4 {
+            let mut year = make_merge_item("2026", 25.0, 24.0);
+            year.page = page;
+            year.y = 780.0;
+            let mut header = make_merge_item("Annual report", 53.0, 78.0);
+            header.page = page;
+            header.y = 780.0;
+            items.extend([year, header]);
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines.iter().all(|line| line.text() == "2026 Annual report"));
+    }
+
+    #[test]
+    fn page_number_prefix_does_not_remove_substantive_text_during_layout() {
+        let mut items = vec![
+            make_merge_item("Page", 25.0, 28.0),
+            make_merge_item("42", 57.0, 12.0),
+            make_merge_item("explains", 73.0, 44.0),
+            make_merge_item("the result", 121.0, 55.0),
+        ];
+        for item in &mut items {
+            item.y = 50.0;
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "Page 42 explains the result");
+    }
+
+    #[test]
+    fn repeated_page_number_prefix_with_substantive_text_is_preserved_during_layout() {
+        let mut items = Vec::new();
+        for (page, value, chapter) in [(1, "42", "Chapter 1"), (2, "43", "Chapter 2")] {
+            let mut label = make_merge_item("Page", 25.0, 28.0);
+            label.page = page;
+            label.y = 50.0;
+            let mut page_number = make_merge_item(value, 57.0, 12.0);
+            page_number.page = page;
+            page_number.y = 50.0;
+            let mut suffix = make_merge_item(chapter, 73.0, 58.0);
+            suffix.page = page;
+            suffix.y = 50.0;
+            items.extend([label, page_number, suffix]);
+        }
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text(), "Page 42 Chapter 1");
+        assert_eq!(lines[1].text(), "Page 43 Chapter 2");
+    }
+
+    #[test]
+    fn page_number_phrase_in_the_page_body_is_preserved() {
+        let items = vec![
+            make_merge_item("Page", 25.0, 28.0),
+            make_merge_item("42", 57.0, 12.0),
+        ];
+
+        let lines = group_into_lines(items);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "Page 42");
+    }
+
+    #[test]
+    fn short_numeric_context_near_page_edge_is_preserved() {
+        let mut chapter = make_merge_item("Chapter", 100.0, 45.0);
+        chapter.y = 760.0;
+        let mut chapter_number = make_merge_item("1", 151.0, 6.0);
+        chapter_number.y = 760.0;
+
+        let chapter_lines = group_into_lines(vec![chapter, chapter_number]);
+        assert_eq!(chapter_lines.len(), 1);
+        assert_eq!(chapter_lines[0].text(), "Chapter 1");
+
+        let mut year = make_merge_item("2026", 100.0, 24.0);
+        year.y = 760.0;
+        let mut report = make_merge_item("Report", 130.0, 36.0);
+        report.y = 760.0;
+
+        let report_lines = group_into_lines(vec![year, report]);
+        assert_eq!(report_lines.len(), 1);
+        assert_eq!(report_lines[0].text(), "2026 Report");
+
+        let mut chapter = make_merge_item("Chapter", 100.0, 45.0);
+        chapter.y = 760.0;
+        let mut chapter_number = make_merge_item("1", 151.0, 6.0);
+        chapter_number.y = 760.0;
+        let mut edition_year = make_merge_item("2026", 163.0, 24.0);
+        edition_year.y = 760.0;
+
+        let chained_lines = group_into_lines(vec![chapter, chapter_number, edition_year]);
+        assert_eq!(chained_lines.len(), 1);
+        assert_eq!(chained_lines[0].text(), "Chapter 1 2026");
     }
 
     #[test]

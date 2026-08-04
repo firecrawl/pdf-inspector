@@ -960,22 +960,713 @@ fn spans_multiple_columns(item: &TextItem, columns: &[ColumnRegion]) -> bool {
     overlap_count >= 2
 }
 
-/// Check if a text item is likely a page number
-fn is_page_number(item: &TextItem) -> bool {
+const PAGE_NUMBER_Y_TOLERANCE: f32 = 3.0;
+const PAGE_NUMBER_CONTEXT_GAP_EM: f32 = 1.5;
+const PAGE_NUMBER_BOTTOM_Y: f32 = 100.0;
+const PAGE_NUMBER_TOP_Y: f32 = 720.0;
+const SPREAD_MIN_CONTENT_WIDTH_EM: f32 = 40.0;
+const SPREAD_EDGE_FRACTION: f32 = 0.25;
+const ADJACENT_PAGE_MIN_CONTENT_WIDTH_EM: f32 = 26.0;
+
+type ContextualCandidateOccurrence = (u32, f32, Vec<(usize, u32)>);
+
+fn page_number_value(item: &TextItem) -> Option<u32> {
+    if !matches!(
+        item.item_type,
+        crate::types::ItemType::Text | crate::types::ItemType::FormField
+    ) {
+        return None;
+    }
+
     let text = item.text.trim();
 
-    // Must be 1-4 digits only
-    if text.is_empty() || text.len() > 4 {
-        return false;
-    }
-    if !text.chars().all(|c| c.is_ascii_digit()) {
-        return false;
+    if text.is_empty() || text.len() > 4 || !text.chars().all(|c| c.is_ascii_digit()) {
+        return None;
     }
 
     // Must be at top or bottom of page.
     // US Letter = 792pt, A4 = 841pt. Page numbers are typically in the
     // top ~5% or bottom ~12% of the page.
-    item.y > 720.0 || item.y < 100.0
+    if item.y <= PAGE_NUMBER_TOP_Y && item.y >= PAGE_NUMBER_BOTTOM_Y {
+        return None;
+    }
+
+    text.parse().ok()
+}
+
+/// Mark numeric slots that advance inside a repeated deep-margin line.
+///
+/// A folio can be emitted as part of a footer text run (for example,
+/// `42 Company report`) and therefore look contextual on a single page. Across
+/// the document, however, the surrounding text and Y position repeat while the
+/// numeric slot advances. Require that full signal before treating the slot as
+/// a folio so constant metadata and substantive rows near the page edge remain
+/// untouched.
+fn mark_repeated_folio_candidates(
+    occurrences_by_signature: HashMap<String, Vec<ContextualCandidateOccurrence>>,
+    document_page_count: usize,
+    explicit_folio: &mut [bool],
+) {
+    // Both thresholds are evidence floors: short documents still need four
+    // occurrences, while long documents also need meaningful coverage. Using
+    // `min` here would make one occurrence sufficient in a one-page document.
+    let min_pages = 4usize.max((document_page_count * 30).div_ceil(100));
+
+    for occurrences in occurrences_by_signature.into_values() {
+        if occurrences.len() < min_pages {
+            continue;
+        }
+
+        let distinct_pages: HashSet<u32> = occurrences.iter().map(|(page, _, _)| *page).collect();
+        // Repeated table rows or duplicated drawing labels can share a
+        // signature multiple times on one page. They are not running folios.
+        if distinct_pages.len() != occurrences.len() || distinct_pages.len() < min_pages {
+            continue;
+        }
+
+        let min_y = occurrences
+            .iter()
+            .map(|(_, y, _)| *y)
+            .fold(f32::INFINITY, f32::min);
+        let max_y = occurrences
+            .iter()
+            .map(|(_, y, _)| *y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if max_y - min_y >= PAGE_NUMBER_Y_TOLERANCE {
+            continue;
+        }
+
+        let slot_count = occurrences[0].2.len();
+        if slot_count == 0
+            || occurrences
+                .iter()
+                .any(|(_, _, candidates)| candidates.len() != slot_count)
+        {
+            continue;
+        }
+
+        for slot in 0..slot_count {
+            let mut values: Vec<(u32, u32, usize)> = occurrences
+                .iter()
+                .map(|(page, _, candidates)| {
+                    let (index, value) = candidates[slot];
+                    (*page, value, index)
+                })
+                .collect();
+            values.sort_by_key(|(page, _, _)| *page);
+
+            let unique_values: HashSet<u32> = values.iter().map(|(_, value, _)| *value).collect();
+            let mostly_unique = unique_values.len() * 5 >= values.len() * 4;
+            let page_tracking_pairs = values
+                .windows(2)
+                .filter(|pair| {
+                    let page_delta = pair[1].0 - pair[0].0;
+                    let value_delta = pair[1].1.saturating_sub(pair[0].1);
+                    value_delta == page_delta || value_delta == page_delta.saturating_mul(2)
+                })
+                .count();
+            let mostly_tracks_page_order = page_tracking_pairs * 5 >= (values.len() - 1) * 4;
+            // A running folio can be offset by front matter or advance twice per
+            // PDF page in a two-page spread, but its magnitude should still be
+            // plausible for the document. This keeps changing metadata such as
+            // a sequence of years from becoming a deletion signal.
+            let max_plausible_folio = (document_page_count as u32).saturating_mul(4).max(100);
+            let plausible_magnitude = values
+                .iter()
+                .all(|(_, value, _)| *value <= max_plausible_folio);
+
+            if mostly_unique && mostly_tracks_page_order && plausible_magnitude {
+                for (_, _, index) in values {
+                    explicit_folio[index] = true;
+                }
+            }
+        }
+    }
+}
+
+/// Mark the contextual half of a facing-page folio pair.
+///
+/// A landscape PDF can contain two printed pages per PDF page. One folio may be
+/// isolated while the other touches footer text; they remain a pair because
+/// they are consecutive, share a deep-margin baseline, and sit on opposite
+/// sides of the spread. The isolated half is strong evidence that the touching
+/// half is also a folio.
+fn mark_spread_folio_pairs(
+    items: &[TextItem],
+    candidate_values: &[Option<u32>],
+    contextual: &[bool],
+    explicit_folio: &mut [bool],
+) {
+    let mut candidates_by_page: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut page_bounds: HashMap<u32, (f32, f32)> = HashMap::new();
+    for (index, value) in candidate_values.iter().enumerate() {
+        if value.is_some() {
+            candidates_by_page
+                .entry(items[index].page)
+                .or_default()
+                .push(index);
+        }
+    }
+    for item in items.iter().filter(|item| !item.text.trim().is_empty()) {
+        let bounds = page_bounds
+            .entry(item.page)
+            .or_insert((f32::INFINITY, f32::NEG_INFINITY));
+        bounds.0 = bounds.0.min(item.x);
+        bounds.1 = bounds.1.max(item.x + effective_width(item));
+    }
+
+    for (page, page_candidates) in candidates_by_page {
+        let Some(&(page_left, page_right)) = page_bounds.get(&page) else {
+            continue;
+        };
+        let page_width = page_right - page_left;
+        if page_width <= 0.0 {
+            continue;
+        }
+        let left_edge = page_left + page_width * SPREAD_EDGE_FRACTION;
+        let right_edge = page_right - page_width * SPREAD_EDGE_FRACTION;
+        let max_pair_font_size = page_width / SPREAD_MIN_CONTENT_WIDTH_EM;
+        let edge_side = |index: usize| {
+            let center = items[index].x + effective_width(&items[index]) / 2.0;
+            if center <= left_edge {
+                Some(false)
+            } else if center >= right_edge {
+                Some(true)
+            } else {
+                None
+            }
+        };
+
+        // Index strong folio evidence by value and spread edge. Sorted
+        // baselines let each contextual candidate query only the two adjacent
+        // values on the opposite edge in O(log n), rather than comparing every
+        // candidate pair on numeric-heavy pages.
+        let mut known_baselines: HashMap<(u32, bool), Vec<f32>> = HashMap::new();
+        for &index in &page_candidates {
+            if (contextual[index] && !explicit_folio[index])
+                || items[index].font_size >= max_pair_font_size
+            {
+                continue;
+            }
+            let Some(side) = edge_side(index) else {
+                continue;
+            };
+            let value = candidate_values[index].unwrap();
+            known_baselines
+                .entry((value, side))
+                .or_default()
+                .push(items[index].y);
+        }
+        for baselines in known_baselines.values_mut() {
+            baselines.sort_by(f32::total_cmp);
+        }
+
+        for index in page_candidates {
+            if !contextual[index]
+                || explicit_folio[index]
+                || items[index].font_size >= max_pair_font_size
+            {
+                continue;
+            }
+            let Some(value) = candidate_values[index] else {
+                continue;
+            };
+            let Some(side) = edge_side(index) else {
+                continue;
+            };
+            let y = items[index].y;
+            let paired = [value.checked_sub(1), value.checked_add(1)]
+                .into_iter()
+                .flatten()
+                .filter_map(|other_value| known_baselines.get(&(other_value, !side)))
+                .any(|baselines| {
+                    let first = baselines
+                        .partition_point(|baseline| *baseline <= y - PAGE_NUMBER_Y_TOLERANCE);
+                    baselines
+                        .get(first)
+                        .is_some_and(|baseline| *baseline < y + PAGE_NUMBER_Y_TOLERANCE)
+                });
+            if paired {
+                explicit_folio[index] = true;
+            }
+        }
+    }
+}
+
+/// Mark a contextual folio that alternates with an isolated folio on the
+/// neighboring PDF page.
+///
+/// Facing pages commonly put folios on opposite outer edges. A running header
+/// can touch the right-hand folio while the next left-hand folio is isolated.
+/// A single isolated candidate is not enough to remove nearby contextual text.
+/// Require a second pre-existing anchor in the same advancing sequence, along
+/// with a genuinely wide content span, stable baselines/font sizes, and
+/// alternating outer edges.
+fn mark_adjacent_page_folio_pairs(
+    items: &[TextItem],
+    candidate_values: &[Option<u32>],
+    contextual: &[bool],
+    document_page_count: usize,
+    explicit_folio: &mut [bool],
+) {
+    let max_plausible_folio = (document_page_count as u32).saturating_mul(4).max(100);
+    // Do not let newly inferred candidates recursively become evidence for
+    // later candidates; every match must be anchored by evidence established
+    // before this cross-page pass.
+    let strong_folio_evidence = explicit_folio.to_vec();
+    let mut page_bounds: HashMap<u32, (f32, f32)> = HashMap::new();
+    for item in items.iter().filter(|item| !item.text.trim().is_empty()) {
+        let bounds = page_bounds
+            .entry(item.page)
+            .or_insert((f32::INFINITY, f32::NEG_INFINITY));
+        bounds.0 = bounds.0.min(item.x);
+        bounds.1 = bounds.1.max(item.x + effective_width(item));
+    }
+
+    let edge_side = |index: usize| {
+        let &(page_left, page_right) = page_bounds.get(&items[index].page)?;
+        let page_width = page_right - page_left;
+        if page_width < items[index].font_size * ADJACENT_PAGE_MIN_CONTENT_WIDTH_EM {
+            return None;
+        }
+        let center = items[index].x + effective_width(&items[index]) / 2.0;
+        let left_edge = page_left + page_width * SPREAD_EDGE_FRACTION;
+        let right_edge = page_right - page_width * SPREAD_EDGE_FRACTION;
+        if center <= left_edge {
+            Some(false)
+        } else if center >= right_edge {
+            Some(true)
+        } else {
+            None
+        }
+    };
+
+    // Anchor sequences by outer edge and the value/page offset. This enforces
+    // forward page tracking and lets candidates query adjacent pages directly,
+    // while a baseline-sorted index finds a second independent anchor without
+    // a document-wide quadratic scan.
+    let mut anchors_by_page: HashMap<(u32, bool, i64), Vec<usize>> = HashMap::new();
+    let mut anchors_by_sequence: HashMap<(bool, i64), Vec<usize>> = HashMap::new();
+    for (index, value) in candidate_values.iter().enumerate() {
+        let Some(value) = value else {
+            continue;
+        };
+        if *value > max_plausible_folio || (contextual[index] && !strong_folio_evidence[index]) {
+            continue;
+        }
+        let Some(side) = edge_side(index) else {
+            continue;
+        };
+        let page = items[index].page;
+        let offset = i64::from(*value) - i64::from(page);
+        anchors_by_page
+            .entry((page, side, offset))
+            .or_default()
+            .push(index);
+        anchors_by_sequence
+            .entry((side, offset))
+            .or_default()
+            .push(index);
+    }
+    for anchors in anchors_by_sequence.values_mut() {
+        anchors.sort_by(|&left, &right| items[left].y.total_cmp(&items[right].y));
+    }
+
+    for (index, value) in candidate_values.iter().enumerate() {
+        let Some(value) = value else {
+            continue;
+        };
+        if !contextual[index] || explicit_folio[index] || *value > max_plausible_folio {
+            continue;
+        }
+        let Some(side) = edge_side(index) else {
+            continue;
+        };
+
+        let page = items[index].page;
+        let offset = i64::from(*value) - i64::from(page);
+        let Some(sequence_anchors) = anchors_by_sequence.get(&(!side, offset)) else {
+            continue;
+        };
+        let neighbor = [page.checked_sub(1), page.checked_add(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|neighbor_page| anchors_by_page.get(&(neighbor_page, !side, offset)))
+            .flatten()
+            .copied()
+            .find(|&neighbor_index| {
+                (items[index].y - items[neighbor_index].y).abs() < PAGE_NUMBER_Y_TOLERANCE
+                    && (items[index].font_size - items[neighbor_index].font_size).abs() < 1.0
+            });
+        let Some(neighbor_index) = neighbor else {
+            continue;
+        };
+
+        let first = sequence_anchors.partition_point(|&anchor_index| {
+            items[anchor_index].y <= items[index].y - PAGE_NUMBER_Y_TOLERANCE
+        });
+        let has_second_anchor = sequence_anchors[first..]
+            .iter()
+            .take_while(|&&anchor_index| {
+                items[anchor_index].y < items[index].y + PAGE_NUMBER_Y_TOLERANCE
+            })
+            .any(|&anchor_index| {
+                items[anchor_index].page != page
+                    && items[anchor_index].page != items[neighbor_index].page
+                    && (items[index].font_size - items[anchor_index].font_size).abs() < 1.0
+            });
+        if has_second_anchor {
+            explicit_folio[index] = true;
+        }
+    }
+}
+
+/// Identify page-edge numeric items that belong to a nearby content run.
+///
+/// Numeric candidates on their own do not establish context for one another.
+/// A connected same-baseline run is contextual only when it also contains a
+/// non-candidate item, preserving lines such as `Chapter 1 2026` while still
+/// removing isolated numeric footer clusters.
+fn page_number_context_masks(
+    items: &[TextItem],
+    candidate_values: &[Option<u32>],
+    document_page_count: usize,
+) -> (Vec<bool>, Vec<bool>) {
+    let mut contextual = vec![false; items.len()];
+    let mut explicit_folio = vec![false; items.len()];
+    let mut occurrences_by_signature: HashMap<String, Vec<ContextualCandidateOccurrence>> =
+        HashMap::new();
+    let mut indices_by_page: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        if matches!(
+            item.item_type,
+            crate::types::ItemType::Text | crate::types::ItemType::FormField
+        ) && !item.text.trim().is_empty()
+        {
+            indices_by_page.entry(item.page).or_default().push(index);
+        }
+    }
+    for mut page_indices in indices_by_page.into_values() {
+        page_indices.sort_by(|&left, &right| {
+            items[right]
+                .y
+                .total_cmp(&items[left].y)
+                .then(items[left].x.total_cmp(&items[right].x))
+        });
+
+        let mut rows: Vec<Vec<usize>> = Vec::new();
+        for index in page_indices {
+            if rows.last().is_some_and(|row| {
+                (items[row[0]].y - items[index].y).abs() < PAGE_NUMBER_Y_TOLERANCE
+            }) {
+                rows.last_mut().unwrap().push(index);
+            } else {
+                rows.push(vec![index]);
+            }
+        }
+
+        for mut row in rows {
+            row.sort_by(|&left, &right| items[left].x.total_cmp(&items[right].x));
+            let mut start = 0;
+            while start < row.len() {
+                let mut end = start + 1;
+                let first = &items[row[start]];
+                let mut group_right = first.x + effective_width(first);
+                let mut group_font_size = first.font_size;
+
+                while end < row.len() {
+                    let item = &items[row[end]];
+                    let gap = item.x - group_right;
+                    if gap > group_font_size.max(item.font_size) * PAGE_NUMBER_CONTEXT_GAP_EM {
+                        break;
+                    }
+                    group_right = group_right.max(item.x + effective_width(item));
+                    group_font_size = group_font_size.max(item.font_size);
+                    end += 1;
+                }
+
+                let group = &row[start..end];
+                let has_lexical_context = group.iter().any(|&index| {
+                    candidate_values[index].is_none()
+                        && items[index]
+                            .text
+                            .chars()
+                            .any(|character| character.is_alphabetic())
+                });
+                // Numeric data near a page edge also needs protection, but a
+                // lone long integer beside a short candidate is not enough to
+                // establish context. Preserve explicit numeric structures
+                // (list markers, ranges, comma-formatted values, dotted index
+                // entries) and dense runs with at least one long integer.
+                let numeric_like = |text: &str| {
+                    text.chars().any(|character| character.is_numeric())
+                        && !text.chars().any(|character| character.is_alphabetic())
+                };
+                let is_structured_numeric_context = |index: usize| {
+                    if candidate_values[index].is_some() {
+                        return false;
+                    }
+                    let text = items[index].text.trim();
+                    numeric_like(text)
+                        && text
+                            .chars()
+                            .any(|character| !character.is_numeric() && !character.is_whitespace())
+                };
+                let has_structured_numeric_context = group
+                    .iter()
+                    .any(|&index| is_structured_numeric_context(index));
+                let numeric_item_count = group
+                    .iter()
+                    .filter(|&&index| numeric_like(items[index].text.trim()))
+                    .count();
+                let has_long_integer = group.iter().any(|&index| {
+                    candidate_values[index].is_none()
+                        && items[index]
+                            .text
+                            .trim()
+                            .chars()
+                            .all(|character| character.is_numeric())
+                });
+                let has_dense_numeric_context = numeric_item_count >= 3 && has_long_integer;
+                let has_context = has_lexical_context
+                    || has_structured_numeric_context
+                    || has_dense_numeric_context;
+                let has_candidate = row[start..end]
+                    .iter()
+                    .any(|&index| candidate_values[index].is_some());
+                // Decorative centered folios have no lexical context, so
+                // recognize the complete delimiter-number-delimiter triplet
+                // before the contextual-content gate. This prevents `- 42 -`
+                // from leaving a malformed `- -` line.
+                if group.len() == 3
+                    && items[group[0]].text.trim() == "-"
+                    && candidate_values[group[1]].is_some()
+                    && items[group[2]].text.trim() == "-"
+                {
+                    for &index in group {
+                        explicit_folio[index] = true;
+                    }
+                }
+                if has_context && has_candidate {
+                    let group = &row[start..end];
+                    let group_text = group
+                        .iter()
+                        .map(|&index| items[index].text.trim())
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let group_is_folio =
+                        crate::text_utils::is_explicit_page_number_expression(&group_text);
+                    let context_text = group
+                        .iter()
+                        .filter(|&&index| candidate_values[index].is_none())
+                        .map(|&index| items[index].text.trim())
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let candidates: Vec<(usize, u32)> = group
+                        .iter()
+                        .filter_map(|&index| candidate_values[index].map(|value| (index, value)))
+                        .collect();
+                    // Recurrence is only evidence for numeric slots at the
+                    // outer boundary of a contextual run. An embedded number
+                    // in repeated prose such as `Page 42 explains the result`
+                    // is substantive content, not a running folio.
+                    let recurrence_candidates: Vec<(usize, u32)> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|(index, _)| {
+                            group.first() == Some(index) || group.last() == Some(index)
+                        })
+                        .collect();
+                    let in_deep_margin = candidates.iter().all(|(index, _)| {
+                        items[*index].y < PAGE_NUMBER_BOTTOM_Y
+                            || items[*index].y > PAGE_NUMBER_TOP_Y
+                    });
+                    if in_deep_margin
+                        && !recurrence_candidates.is_empty()
+                        && context_text
+                            .chars()
+                            .filter(|character| character.is_alphanumeric())
+                            .count()
+                            >= 8
+                    {
+                        let signature = group
+                            .iter()
+                            .map(|&index| {
+                                if candidate_values[index].is_some() {
+                                    "{number}".to_string()
+                                } else {
+                                    items[index]
+                                        .text
+                                        .split_whitespace()
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                        .to_lowercase()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        occurrences_by_signature
+                            .entry(signature)
+                            .or_default()
+                            .push((
+                                items[group[0]].page,
+                                items[group[0]].y,
+                                recurrence_candidates,
+                            ));
+                    }
+                    for (position, &index) in group.iter().enumerate() {
+                        if let Some(value) = candidate_values[index] {
+                            let adjacent_context = [position.checked_sub(1), Some(position + 1)]
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|position| group.get(position).copied())
+                                .any(|adjacent| {
+                                    candidate_values[adjacent].is_none()
+                                        && items[adjacent].text.chars().any(|character| {
+                                            !character.is_numeric() && !character.is_whitespace()
+                                        })
+                                });
+                            let max_plausible_folio =
+                                (document_page_count as u32).saturating_mul(4).max(100);
+                            // Large year/identifier-like values stay attached
+                            // to their lexical run even when a smaller numeric
+                            // candidate sits between them and the text.
+                            let implausible_folio_with_lexical_context =
+                                value > max_plausible_folio && has_lexical_context;
+                            contextual[index] = adjacent_context
+                                || has_dense_numeric_context
+                                || implausible_folio_with_lexical_context;
+                            let previous = position
+                                .checked_sub(1)
+                                .map(|position| items[group[position]].text.trim());
+                            let next = group
+                                .get(position + 1)
+                                .map(|&index| items[index].text.trim());
+                            let follows_page_label =
+                                previous.is_some_and(|text| text.eq_ignore_ascii_case("page"));
+                            let starts_of_expression =
+                                next.is_some_and(|text| text.eq_ignore_ascii_case("of"));
+                            let is_centered_folio = previous == Some("-") && next == Some("-");
+                            explicit_folio[index] |= group_is_folio
+                                && (follows_page_label
+                                    || starts_of_expression
+                                    || is_centered_folio);
+                        }
+                    }
+                    // Remove the complete labeled expression rather than
+                    // leaving fragments such as `Page of 15`. A trailing
+                    // running-header suffix remains untouched.
+                    if group_is_folio
+                        && group.len() >= 4
+                        && items[group[0]].text.trim().eq_ignore_ascii_case("page")
+                        && candidate_values[group[1]].is_some()
+                        && items[group[2]].text.trim().eq_ignore_ascii_case("of")
+                        && items[group[3]]
+                            .text
+                            .trim()
+                            .chars()
+                            .all(|character| character.is_ascii_digit())
+                    {
+                        for &index in &group[..4] {
+                            explicit_folio[index] = true;
+                        }
+                    }
+                }
+                start = end;
+            }
+        }
+    }
+
+    mark_repeated_folio_candidates(
+        occurrences_by_signature,
+        document_page_count,
+        &mut explicit_folio,
+    );
+    mark_spread_folio_pairs(items, candidate_values, &contextual, &mut explicit_folio);
+    mark_adjacent_page_folio_pairs(
+        items,
+        candidate_values,
+        &contextual,
+        document_page_count,
+        &mut explicit_folio,
+    );
+
+    (contextual, explicit_folio)
+}
+
+/// Decide which digit-only page-edge items can be removed before layout.
+///
+/// PDF producers commonly emit one text-showing operation per word. A numeric
+/// item attached to neighboring content on the same baseline is therefore kept.
+/// Complete page-number expressions such as `Page 42` remain removable even
+/// though their numeric item has lexical context.
+fn page_number_removal_mask(items: &[TextItem], document_page_count: usize) -> Vec<bool> {
+    let candidate_values: Vec<Option<u32>> = items.iter().map(page_number_value).collect();
+    let (contextual, explicit_folio) =
+        page_number_context_masks(items, &candidate_values, document_page_count);
+
+    candidate_values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| explicit_folio[index] || (value.is_some() && !contextual[index]))
+        .collect()
+}
+
+/// Return whether selected-page extraction contains a page-edge number whose
+/// folio status depends on evidence from other pages. Isolated and explicitly
+/// labeled folios can be decided locally; only contextual candidates require
+/// a document-wide extraction pass.
+pub(super) fn needs_document_page_number_context(
+    items: &[TextItem],
+    document_page_count: usize,
+) -> bool {
+    let candidate_values: Vec<Option<u32>> = items.iter().map(page_number_value).collect();
+    let (contextual, explicit_folio) =
+        page_number_context_masks(items, &candidate_values, document_page_count);
+
+    candidate_values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| value.is_some() && contextual[index] && !explicit_folio[index])
+}
+
+/// Remove numeric folios using complete document context before downstream
+/// non-table layout partitions could separate the evidence needed to recognize
+/// them.
+#[cfg(test)]
+pub(crate) fn filter_markdown_page_numbers(
+    items: Vec<TextItem>,
+    document_page_count: u32,
+) -> Vec<TextItem> {
+    filter_markdown_page_numbers_with_removed_pages(items, document_page_count).0
+}
+
+/// Filter Markdown folios while retaining the pages where items were removed.
+///
+/// The page set lets downstream table-continuation classification preserve its
+/// pre-filter semantics even though structural layout consumes the cleaned
+/// item collection.
+pub(crate) fn filter_markdown_page_numbers_with_removed_pages(
+    items: Vec<TextItem>,
+    document_page_count: u32,
+) -> (Vec<TextItem>, HashSet<u32>, Vec<bool>) {
+    let remove = page_number_removal_mask(&items, document_page_count as usize);
+    let mut removed_pages = HashSet::new();
+    let items = items
+        .into_iter()
+        .zip(remove.iter().copied())
+        .filter_map(|(item, remove)| {
+            if remove {
+                removed_pages.insert(item.page);
+                None
+            } else {
+                Some(item)
+            }
+        })
+        .collect();
+    (items, removed_pages, remove)
 }
 
 /// Group text items into lines, with multi-column support
@@ -1205,6 +1896,27 @@ pub(crate) fn group_into_lines_with_thresholds_and_charts(
     )
 }
 
+/// Group items after document-level page-number filtering has already run.
+///
+/// Partitioned Markdown layout uses this path so a contextual candidate that
+/// was preserved with its complete baseline context is not reconsidered after
+/// its neighboring text lands in another band or chart/prose zone.
+pub(crate) fn group_prefiltered_items_into_lines_with_thresholds_and_charts(
+    items: Vec<TextItem>,
+    page_thresholds: &HashMap<u32, f32>,
+    table_pages: &HashSet<u32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+) -> Vec<TextLine> {
+    group_into_lines_with_thresholds_and_regions_impl(
+        items,
+        page_thresholds,
+        table_pages,
+        chart_regions,
+        &HashMap::new(),
+        false,
+    )
+}
+
 pub(crate) fn group_into_lines_with_thresholds_and_regions(
     items: Vec<TextItem>,
     page_thresholds: &HashMap<u32, f32>,
@@ -1222,6 +1934,23 @@ pub(crate) fn group_into_lines_with_thresholds_and_regions(
     )
 }
 
+pub(crate) fn group_prefiltered_items_into_lines_with_thresholds_and_regions(
+    items: Vec<TextItem>,
+    page_thresholds: &HashMap<u32, f32>,
+    table_pages: &HashSet<u32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    image_regions: &HashMap<u32, Vec<super::reading_order::ImageRegion>>,
+) -> Vec<TextLine> {
+    group_into_lines_with_thresholds_and_regions_impl(
+        items,
+        page_thresholds,
+        table_pages,
+        chart_regions,
+        image_regions,
+        false,
+    )
+}
+
 fn group_into_lines_with_thresholds_and_regions_impl(
     items: Vec<TextItem>,
     page_thresholds: &HashMap<u32, f32>,
@@ -1234,12 +1963,25 @@ fn group_into_lines_with_thresholds_and_regions_impl(
         return Vec::new();
     }
 
-    // Markdown output omits standalone numeric headers/footers. Plain-text
-    // callers opt out because dropping extracted text violates that API.
+    // Markdown output omits standalone numeric headers/footers. Determine
+    // standalone status from rough baseline context before layout analysis so
+    // removed page numbers cannot affect column detection. Plain-text callers
+    // opt out because dropping extracted text violates that API.
     let items = if filter_page_numbers {
+        // Item-only grouping has no document metadata, so use the highest
+        // observed 1-based page as its best available coverage denominator.
+        // The Markdown document path passes the authoritative PDF page count
+        // through `filter_markdown_page_numbers` before reaching this helper.
+        let observed_page_count = items
+            .iter()
+            .map(|item| item.page as usize)
+            .max()
+            .unwrap_or(0);
+        let remove = page_number_removal_mask(&items, observed_page_count);
         items
             .into_iter()
-            .filter(|item| !is_page_number(item))
+            .zip(remove)
+            .filter_map(|(item, remove)| (!remove).then_some(item))
             .collect()
     } else {
         items
@@ -1254,6 +1996,15 @@ fn group_into_lines_with_thresholds_and_regions_impl(
 
     for page in pages {
         let page_items: Vec<TextItem> = items.iter().filter(|i| i.page == page).cloned().collect();
+        // Page-edge numeric runs are weak evidence for column geometry. Keep
+        // contextual values for line assembly, but prevent their preservation
+        // from changing the page's inferred layout.
+        let column_detection_items: Vec<TextItem> = page_items
+            .iter()
+            .filter(|item| page_number_value(item).is_none())
+            .cloned()
+            .collect();
+        let column_detection_items = column_detection_items.as_slice();
 
         // Use pre-computed threshold from fix_letterspaced_items if available
         // (computed before embedded-space removal, with full signal).
@@ -1265,9 +2016,9 @@ fn group_into_lines_with_thresholds_and_regions_impl(
         // their own positioned-region ordering and therefore stay on that path.
         if !chart_regions.contains_key(&page) {
             let preliminary_columns =
-                detect_columns(&page_items, page, table_pages.contains(&page));
+                detect_columns(column_detection_items, page, table_pages.contains(&page));
             let detected_split =
-                (preliminary_columns.len() == 2).then_some(preliminary_columns[0].x_max);
+                (preliminary_columns.len() == 2).then(|| preliminary_columns[0].x_max);
             if let Some(band) = image_regions.get(&page).and_then(|regions| {
                 super::reading_order::infer_image_anchored_flow(
                     &page_items,
@@ -1307,6 +2058,9 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                 let col_input: Vec<TextItem> = page_items
                     .iter()
                     .filter(|it| {
+                        if page_number_value(it).is_some() {
+                            return false;
+                        }
                         let cx = it.x + it.width / 2.0;
                         // Tight bounds: this only blinds the histogram to
                         // chart-internal text; rows adjacent to the chart
@@ -1319,7 +2073,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                     .collect();
                 detect_columns(&col_input, page, table_pages.contains(&page))
             }
-            None => detect_columns(&page_items, page, table_pages.contains(&page)),
+            None => detect_columns(column_detection_items, page, table_pages.contains(&page)),
         };
 
         if columns.len() <= 1 {

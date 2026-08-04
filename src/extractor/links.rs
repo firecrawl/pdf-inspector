@@ -153,14 +153,52 @@ pub(crate) fn extract_form_fields(
         },
         Err(_) => return items,
     };
+    if fields.is_empty() {
+        return items;
+    }
+    let annotation_pages = annotation_page_map(doc, page_map);
 
     for field_obj in &fields {
         if let Ok(field_ref) = field_obj.as_reference() {
-            walk_form_fields(doc, field_ref, None, "", page_map, &mut items);
+            walk_form_fields(
+                doc,
+                field_ref,
+                None,
+                "",
+                page_map,
+                &annotation_pages,
+                &mut items,
+            );
         }
     }
 
     items
+}
+
+/// Map widget annotation objects back to the page whose `/Annots` array owns
+/// them. Some valid widgets omit `/P`, so the page tree is the only reliable
+/// ownership signal available for page-filtered extraction.
+fn annotation_page_map(
+    doc: &Document,
+    page_map: &HashMap<ObjectId, u32>,
+) -> HashMap<ObjectId, u32> {
+    let mut annotation_pages = HashMap::new();
+    for (&page_id, &page_num) in page_map {
+        let Some(annotations) = doc
+            .get_dictionary(page_id)
+            .ok()
+            .and_then(|page| page.get(b"Annots").ok())
+            .and_then(|annotations| resolve_array(doc, annotations))
+        else {
+            continue;
+        };
+        for annotation in annotations {
+            if let Ok(annotation_id) = annotation.as_reference() {
+                annotation_pages.insert(annotation_id, page_num);
+            }
+        }
+    }
+    annotation_pages
 }
 
 /// Recursively walk the form field tree, extracting leaf field values.
@@ -170,6 +208,7 @@ pub(crate) fn walk_form_fields(
     parent_ft: Option<&[u8]>,
     parent_name: &str,
     page_map: &HashMap<ObjectId, u32>,
+    annotation_pages: &HashMap<ObjectId, u32>,
     items: &mut Vec<TextItem>,
 ) {
     let field_dict = match doc.get_dictionary(field_id) {
@@ -206,7 +245,15 @@ pub(crate) fn walk_form_fields(
             let kids = kids.clone();
             for kid in &kids {
                 if let Ok(kid_ref) = kid.as_reference() {
-                    walk_form_fields(doc, kid_ref, ft, &full_name, page_map, items);
+                    walk_form_fields(
+                        doc,
+                        kid_ref,
+                        ft,
+                        &full_name,
+                        page_map,
+                        annotation_pages,
+                        items,
+                    );
                 }
             }
             return;
@@ -299,6 +346,7 @@ pub(crate) fn walk_form_fields(
         .ok()
         .and_then(|o| o.as_reference().ok())
         .and_then(|p| page_map.get(&p).copied())
+        .or_else(|| annotation_pages.get(&field_id).copied())
         .unwrap_or(1);
 
     let text = if full_name.is_empty() {
@@ -323,4 +371,44 @@ pub(crate) fn walk_form_fields(
         item_type: ItemType::FormField,
         mcid: None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::{dictionary, Object};
+
+    #[test]
+    fn widget_without_page_reference_uses_owning_page_annotation() {
+        let mut doc = Document::new();
+        let widget_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => "Tx",
+            "T" => Object::string_literal("customer"),
+            "V" => Object::string_literal("Alice"),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        });
+        let page_one_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+        });
+        let page_two_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Annots" => vec![Object::Reference(widget_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(widget_id)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let page_map = HashMap::from([(page_one_id, 1), (page_two_id, 2)]);
+        let items = extract_form_fields(&doc, &page_map);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].page, 2);
+        assert_eq!(items[0].text, "customer: Alice");
+    }
 }

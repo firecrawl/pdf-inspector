@@ -12,7 +12,9 @@ mod grid;
 pub mod structured;
 
 pub use detect_heuristic::detect_tables;
-pub(crate) use detect_heuristic::is_table_of_contents;
+pub(crate) use detect_heuristic::{
+    content_width, detect_tables_with_page_width, is_table_of_contents,
+};
 pub use detect_lines::detect_tables_from_lines;
 pub(crate) use detect_lines::detect_vector_grid_tables_from_lines;
 pub(crate) use detect_rects::cluster_rects;
