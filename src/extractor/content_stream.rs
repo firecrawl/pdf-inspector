@@ -41,6 +41,17 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     while i < data.len() {
         let b = data[i];
         match b {
+            // Inside a string literal, a backslash escapes the next byte —
+            // `\(`, `\)`, and `\\` must not touch the nesting depth, or a
+            // later `%` glyph inside a string gets stripped as a comment,
+            // corrupting the stream.
+            b'\\' if in_string > 0 => {
+                result.push(b);
+                if let Some(&next) = data.get(i + 1) {
+                    result.push(next);
+                    i += 1;
+                }
+            }
             b'(' if !in_hex_string => {
                 in_string += 1;
                 result.push(b);
@@ -1848,5 +1859,27 @@ BT 30 700 Tm <41> Tj ET";
             output_str.contains("ET"),
             "ET should be preserved after comment stripping"
         );
+    }
+
+    #[test]
+    fn test_strip_pdf_comments_escaped_parens() {
+        // An escaped `\)` must not close the string: the `%` after it is
+        // still string content, not a comment (subset fonts routinely map
+        // glyphs to `%` and to escaped parens in the same TJ array).
+        let input = b"[ (a\\)b) 1 (%) 1 (c) ] TJ\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, input.to_vec());
+
+        // Same for an escaped `\(` — must not open a phantom string that
+        // shields a real comment.
+        let input = b"(x\\(y) Tj % real comment\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"(x\\(y) Tj  \nET\n");
+
+        // Escaped backslash before a real close-paren: `\\` ends the escape,
+        // the `)` does close the string, and the comment is stripped.
+        let input = b"(x\\\\) Tj % comment\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"(x\\\\) Tj  \nET\n");
     }
 }
