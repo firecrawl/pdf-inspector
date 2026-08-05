@@ -173,13 +173,73 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PdfOptions` | Builder for processing configuration (mode, detection, markdown, page filter) |
 | `ProcessMode` | `DetectOnly`, `Analyze`, `Full` |
 | `PdfType` | `TextBased`, `Scanned`, `ImageBased`, `Mixed` |
-| `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, timing |
+| `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, timing, page_signals (per-page direction + confidence, 1-indexed) |
+| `PageSignals` | Per-page direction + text-confidence: page (1-indexed), direction, confidence |
 | `PdfTypeResult` | Low-level detection result: type, confidence, page count, pages needing OCR |
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
 | `TextItem` | Text with position, font info, and page number |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
-| `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
+| `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr, ocr_reason, direction, confidence |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |
+
+## Per-page signals and OCR reasons
+
+### Reading direction and per-page confidence
+
+`PageMarkdown` (from `extract_pages_markdown`) and `PdfProcessResult.page_signals`
+(from Full-mode `process_pdf`) expose, per page:
+
+- **`direction`** — `"ltr"`, `"rtl"`, or `"mixed"`. `"mixed"` means RTL ordering
+  was applied on some lines; callers keying on RTL must test `direction != "ltr"`.
+  Direction is computed over the same items that produce the emitted markdown
+  (page-number footers are removed first), so it matches the output a caller
+  can inspect. It is only meaningful when the text layer is reliable
+  (`needs_ocr == false`).
+- **`confidence`** — per-page text-confidence in `0.0..=1.0`:
+  - `1.0` — clean, fully extractable text layer
+  - `0.5` — replacement-character density at the 500-bps OCR threshold
+  - `0.15` — binary garbled evidence (substitution-cipher text or strong
+    span-level decoding issues: private-use runs, dollar-as-space, C1 controls)
+  - `0.0` — no usable text layer
+
+  Known divergence: pages flagged only by GID-font or markdown-level checks can
+  show `needs_ocr == true` with high confidence — the field measures per-page
+  text-quality evidence, not the final `needs_ocr` decision.
+
+### Indexing conventions
+
+| Surface / field | Indexing |
+|---|---|
+| `PageMarkdown.page`, `direction`, `confidence` | 0-indexed |
+| `PageSignals.page` (`page_signals`) | 1-indexed (matches `pages_needing_ocr`) |
+| `PdfProcessResult.pages_needing_ocr`, `ocr_reasons_by_page` | 1-indexed |
+| `PdfClassification.pages_needing_ocr` | 0-indexed |
+| `process_pdf` page filter | 1-indexed |
+| `extract_pages_markdown` page list | 0-indexed |
+| `TextItem.page` | 1-indexed |
+
+### OCR reason vocabulary
+
+`ocr_reasons_by_page` and `PageMarkdown.ocr_reason` carry machine-readable
+reason identifiers. The vocabulary is four literals (constants in `src/lib.rs`):
+
+| Reason | Meaning |
+|---|---|
+| `suspected_garbled_text` | Text layer decodes to garbage (broken ToUnicode, cipher-shifted, PUA/C1 runs) |
+| `scanned` | Image-backed page with no usable text layer |
+| `no_text` | No extractable text and no image to OCR |
+| `vector_text` | Text drawn as vector outlines (path operators), not real text operators |
+
+Semantics:
+
+- Reasons are **multi-valued per page** (`ocr_reasons_by_page` entries hold a
+  list). On the `extract_pages_markdown` surface, `PageMarkdown.ocr_reason`
+  only ever carries `suspected_garbled_text` or `None`.
+- The merged list is **insertion-ordered**: detector reasons first
+  (priority: garbled > vector_text > no_text/scanned), then text-quality
+  garbled detection appended, deduplicated.
+- `phantom_empty_row`, `detection_error`, and `multi_row_in_cell` are TSR
+  table-fallback labels, **not** OCR reasons — do not route OCR on them.

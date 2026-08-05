@@ -179,3 +179,22 @@ page.direction      # "ltr" | "rtl" | "mixed" — RTL ordering was applied when 
 page.confidence     # 0.0 - 1.0: 1.0 clean text layer, 0.15 binary garbled
                     # evidence, 0.0 when the page has no usable text
 ```
+
+### OCR reason vocabulary
+
+`ocr_reasons_by_page` entries and `PageMarkdown.ocr_reason` carry
+machine-readable reason identifiers. The vocabulary is four literals:
+
+| Reason | Meaning |
+|---|---|
+| `suspected_garbled_text` | Text layer decodes to garbage (broken ToUnicode, cipher-shifted, PUA/C1 runs) |
+| `scanned` | Image-backed page with no usable text layer |
+| `no_text` | No extractable text and no image to OCR |
+| `vector_text` | Text drawn as vector outlines, not real text operators |
+
+Reasons are multi-valued per page. On `extract_pages_markdown`,
+`PageMarkdown.ocr_reason` only ever carries `suspected_garbled_text` or
+`None`. `phantom_empty_row`, `detection_error`, and `multi_row_in_cell` are
+TSR table-fallback labels, not OCR reasons. `PageMarkdown` direction +
+confidence follow the 0-indexed page number; `PdfResult.page_signals`
+entries are 1-indexed. See `docs/rust-api.md` for the full contract.

@@ -162,3 +162,14 @@ Prebuilt binaries ship as platform-specific packages installed automatically via
 ## License
 
 MIT
+
+### OCR reason vocabulary
+
+`ocrReasonsByPage` entries and `PageMarkdownResult.ocrReason` carry
+machine-readable reason identifiers: `suspected_garbled_text`, `scanned`,
+`no_text`, `vector_text`. Reasons are multi-valued per page; on
+`extractPagesMarkdown`, `ocrReason` only ever carries
+`suspected_garbled_text` or `undefined`. `phantom_empty_row`,
+`detection_error`, and `multi_row_in_cell` are TSR table-fallback labels,
+not OCR reasons. `PageSignals.page` is 1-indexed; `PageMarkdownResult.page`
+is 0-indexed. See `docs/rust-api.md` for the full contract.
