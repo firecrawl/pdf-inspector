@@ -4,7 +4,8 @@
 //! No PDF parsing happens here — these are shared across the extraction
 //! and markdown pipelines.
 
-use crate::types::TextItem;
+use crate::types::{ItemType, TextItem};
+use crate::PageDirection;
 use unicode_normalization::UnicodeNormalization;
 
 /// Return whether text is an explicit page-number expression.
@@ -141,6 +142,71 @@ pub(crate) fn sort_line_items(items: &mut [TextItem]) {
         items.sort_by(|a, b| b.x.total_cmp(&a.x));
     } else {
         items.sort_by(|a, b| a.x.total_cmp(&b.x));
+    }
+}
+
+/// Reading direction of a page's text layer (plan KTD2 semantics).
+///
+/// Groups items into lines with the same 5pt Y-tolerance the extractor's line
+/// merging uses, then classifies each line with the same RTL/LTR counters as
+/// [`is_rtl_text`]: RTL-dominant when `rtl > 0 && rtl > ltr`, LTR-dominant when
+/// `ltr > 0 && ltr >= rtl`, neutral otherwise (digits/punctuation-only,
+/// CJK-only, empty). The page is `Rtl` when at least one line is RTL-dominant
+/// and none is LTR-dominant, `Mixed` when both occur, `Ltr` otherwise.
+pub(crate) fn page_direction<'a, I>(items: I) -> PageDirection
+where
+    I: IntoIterator<Item = &'a TextItem>,
+{
+    let mut items: Vec<&TextItem> = items
+        .into_iter()
+        .filter(|item| matches!(item.item_type, ItemType::Text))
+        .collect();
+    if items.is_empty() {
+        return PageDirection::Ltr;
+    }
+    items.sort_by(|a, b| a.y.total_cmp(&b.y));
+
+    // Group into lines by Y with the extractor's 5pt tolerance (items are
+    // sorted by Y, so clusters are contiguous).
+    const Y_TOLERANCE: f32 = 5.0;
+    let mut lines: Vec<(u32, u32)> = Vec::new(); // (rtl, ltr) counts per line
+    let mut current_y: Option<f32> = None;
+    let mut rtl = 0u32;
+    let mut ltr = 0u32;
+    for item in items {
+        let same_line = current_y.is_some_and(|y| (item.y - y).abs() <= Y_TOLERANCE);
+        if !same_line {
+            if current_y.is_some() {
+                lines.push((rtl, ltr));
+            }
+            rtl = 0;
+            ltr = 0;
+            current_y = Some(item.y);
+        }
+        for c in item.text.chars() {
+            if is_rtl_char(c) {
+                rtl += 1;
+            } else if c.is_alphabetic() && !is_cjk_char(c) {
+                ltr += 1;
+            }
+        }
+    }
+    if current_y.is_some() {
+        lines.push((rtl, ltr));
+    }
+
+    let (mut has_rtl, mut has_ltr) = (false, false);
+    for (line_rtl, line_ltr) in lines {
+        if line_rtl > 0 && line_rtl > line_ltr {
+            has_rtl = true;
+        } else if line_ltr > 0 && line_ltr >= line_rtl {
+            has_ltr = true;
+        }
+    }
+    match (has_rtl, has_ltr) {
+        (true, false) => PageDirection::Rtl,
+        (true, true) => PageDirection::Mixed,
+        _ => PageDirection::Ltr,
     }
 }
 
@@ -834,6 +900,98 @@ pub(crate) fn should_join_items(
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    fn text_item(text: &str, x: f32, y: f32, page: u32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: 10.0,
+            height: 10.0,
+            font: "Helvetica".to_string(),
+            font_size: 10.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn page_direction_latin_only_is_ltr() {
+        let items = vec![text_item("Hello world", 10.0, 100.0, 1)];
+        assert_eq!(page_direction(items.iter()), PageDirection::Ltr);
+    }
+
+    #[test]
+    fn page_direction_hebrew_only_is_rtl() {
+        let items = vec![
+            text_item("\u{05D0}\u{05D1}\u{05D2} \u{05D3}\u{05D4}", 10.0, 100.0, 1),
+            text_item("\u{05D5}\u{05D6} \u{05D7}\u{05D8}", 10.0, 90.0, 1),
+        ];
+        assert_eq!(page_direction(items.iter()), PageDirection::Rtl);
+    }
+
+    #[test]
+    fn page_direction_mixed_hebrew_and_latin_lines() {
+        let items = vec![
+            text_item("Introduction", 10.0, 100.0, 1),
+            text_item("\u{05D0}\u{05D1}\u{05D2} \u{05D3}\u{05D4}", 10.0, 90.0, 1),
+        ];
+        assert_eq!(page_direction(items.iter()), PageDirection::Mixed);
+    }
+
+    #[test]
+    fn page_direction_digits_and_punctuation_only_is_ltr() {
+        let items = vec![text_item("1234 (5) - 6789", 10.0, 100.0, 1)];
+        assert_eq!(page_direction(items.iter()), PageDirection::Ltr);
+    }
+
+    #[test]
+    fn page_direction_cjk_only_is_ltr() {
+        let items = vec![text_item(
+            "\u{4E2D}\u{6587}\u{6D4B}\u{8BD5}",
+            10.0,
+            100.0,
+            1,
+        )];
+        assert_eq!(page_direction(items.iter()), PageDirection::Ltr);
+    }
+
+    #[test]
+    fn page_direction_cjk_with_one_arabic_word_is_rtl() {
+        let items = vec![text_item(
+            "\u{4E2D}\u{6587} \u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064A}",
+            10.0,
+            100.0,
+            1,
+        )];
+        assert_eq!(page_direction(items.iter()), PageDirection::Rtl);
+    }
+
+    #[test]
+    fn page_direction_tie_line_counts_as_ltr() {
+        // One Hebrew char + one Latin char on the same line: rtl == ltr == 1,
+        // so the line is LTR-dominant (ltr >= rtl) and the page is LTR.
+        let items = vec![text_item("\u{05D0}A", 10.0, 100.0, 1)];
+        assert_eq!(page_direction(items.iter()), PageDirection::Ltr);
+    }
+
+    #[test]
+    fn page_direction_empty_items_is_ltr() {
+        let items: Vec<TextItem> = Vec::new();
+        assert_eq!(page_direction(items.iter()), PageDirection::Ltr);
+    }
+
+    #[test]
+    fn page_direction_ignores_link_items() {
+        let mut link = text_item("https://example.com", 10.0, 100.0, 1);
+        link.item_type = ItemType::Link("https://example.com".to_string());
+        assert_eq!(page_direction([&link].into_iter()), PageDirection::Ltr);
+    }
 
     #[test]
     fn bold_font_urw_medi_abbreviation() {

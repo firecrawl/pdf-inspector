@@ -118,6 +118,36 @@ pub const OCR_REASON_NO_TEXT: &str = "no_text";
 /// rather than real text operators, so it cannot be extracted as characters.
 pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
 
+/// Reading direction of a page's text layer, as determined by the RTL
+/// detection that drives reading-order logic (`is_rtl_text`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageDirection {
+    /// Left-to-right text (the default).
+    Ltr,
+    /// Right-to-left text (Hebrew, Arabic, ...); RTL ordering was applied.
+    Rtl,
+    /// Both LTR and RTL text on the page; RTL ordering was applied on some
+    /// lines. Callers keying on RTL must test `direction != "ltr"`.
+    Mixed,
+}
+
+impl PageDirection {
+    /// Machine-readable serialization: `"ltr"`, `"rtl"`, or `"mixed"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PageDirection::Ltr => "ltr",
+            PageDirection::Rtl => "rtl",
+            PageDirection::Mixed => "mixed",
+        }
+    }
+}
+
+impl std::fmt::Display for PageDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // =========================================================================
 // Result type
 // =========================================================================
@@ -417,6 +447,11 @@ pub struct PageMarkdown {
     pub needs_ocr: bool,
     /// Machine-readable OCR reason when the cause is known.
     pub ocr_reason: Option<String>,
+    /// Reading direction of this page's text layer (`"ltr"`, `"rtl"`, `"mixed"`).
+    pub direction: PageDirection,
+    /// Per-page text-confidence (0.0–1.0): 1.0 for a clean text layer, 0.0 when
+    /// the page has no usable text. Derived from per-page text-quality evidence.
+    pub confidence: f32,
 }
 
 /// Combined per-page markdown extraction and layout classification result.
@@ -526,6 +561,8 @@ pub fn extract_pages_markdown_mem(
                 markdown: String::new(),
                 needs_ocr: true,
                 ocr_reason: None,
+                direction: PageDirection::Ltr,
+                confidence: 0.0,
             });
             continue;
         }
@@ -548,6 +585,22 @@ pub fn extract_pages_markdown_mem(
 
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
+
+        // Direction + per-page confidence are computed over the same items that
+        // feed the emitted markdown (page-number removal applied), so the signal
+        // matches the output a caller can inspect (KTD2).
+        let direction = crate::text_utils::page_direction(
+            page_items
+                .iter()
+                .zip(&page_number_removal_mask)
+                .filter(|(_, remove)| !**remove)
+                .map(|(item, _)| item),
+        );
+        let confidence = text_quality
+            .confidence_by_page
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(0.0);
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -600,6 +653,8 @@ pub fn extract_pages_markdown_mem(
             markdown: if needs_ocr { String::new() } else { md },
             needs_ocr,
             ocr_reason,
+            direction,
+            confidence,
         });
     }
 
