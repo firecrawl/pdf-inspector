@@ -70,10 +70,19 @@ pub(crate) fn is_page_number_line(text: &str) -> bool {
 
     let lowercase = text.trim().to_ascii_lowercase();
     lowercase.strip_prefix("page").is_some_and(|rest| {
-        rest.trim_start()
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_digit())
+        let rest = rest.trim_start();
+        if !rest.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            return false;
+        }
+        let digit_end = rest
+            .char_indices()
+            .find(|(_, character)| !character.is_ascii_digit())
+            .map(|(index, _)| index)
+            .unwrap_or(rest.len());
+        let suffix = rest[digit_end..].trim_start();
+        // A period followed by a word is sentence-like body text (for example,
+        // `Page 1. This is the first paragraph`), not a running page header.
+        !suffix.starts_with(". ")
     })
 }
 

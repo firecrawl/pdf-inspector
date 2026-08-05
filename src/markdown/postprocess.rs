@@ -472,6 +472,13 @@ mod tests {
         assert!(is_page_number_line("Page 42 explains the result"));
     }
 
+    #[test]
+    fn test_is_page_number_sentence_like_body_label() {
+        assert!(!is_page_number_line("Page 1. This is the first paragraph"));
+        assert!(is_page_number_line("Page 1"));
+        assert!(is_page_number_line("Page 1 of 10"));
+    }
+
     // --- remove_page_numbers ---
 
     #[test]
@@ -505,6 +512,17 @@ mod tests {
         assert!(!result.contains("Page 42 explains the result"));
         assert!(result.contains("Content"));
         assert!(result.contains("End"));
+    }
+
+    #[test]
+    fn test_remove_page_numbers_keeps_sentence_like_body_label() {
+        let input = "Page 1\n\nPage 1 of 3\n\nPage 1 Chapter 1\n\nPage 1. Body text";
+        let result = remove_page_numbers(input);
+
+        assert!(!result.contains("Page 1\n"));
+        assert!(!result.contains("Page 1 of 3"));
+        assert!(!result.contains("Page 1 Chapter 1"));
+        assert!(result.contains("Page 1. Body text"));
     }
 
     #[test]
