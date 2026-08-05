@@ -4168,6 +4168,16 @@ fn test_process_pdf_mem_page_filter_out_of_range() {
 }
 
 #[test]
+fn test_extract_pages_mem_hebrew_page_with_latin_page_number_footer_is_rtl() {
+    // A Hebrew body with a standalone Latin numeric footer: the footer is
+    // removed as a page number before direction is computed, so the page is
+    // rtl (KTD2 post-removal semantics).
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0), ("1", 30.0)]);
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(result.pages[0].direction, PageDirection::Rtl);
+}
+
+#[test]
 fn test_process_pdf_mem_full_blank_page_signals() {
     // A blank page inside a text-based document gets a default entry.
     let buf = make_text_pdf_pages(&[vec![(HEBREW_A, 700.0)], vec![]]);
