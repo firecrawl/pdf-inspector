@@ -1,0 +1,24 @@
+src/tables/detect_rects.rs
+  s_445161c5f6e19f::t_8cc9aa31128f18 2098,2100-2104,2134,2144,2155-2156,2170-2215,2218-2219,2334-2342,3344,3375-3376,3395-3402,3405-3406,3411-3413,3415-3416,3418-3428
+  s_445161c5f6e19f::t_49a1e9abdfebde 3403
+  s_445161c5f6e19f::t_3252ec7756192a 3404,3407-3410,3414,3417,3429-3430
+src/tables/detect_lines.rs
+  s_445161c5f6e19f::t_8cc9aa31128f18 1283-1287,1298-1325,1380,1388-1398,1403-1404,1424-1429,1919-1944,1954
+  s_445161c5f6e19f::t_7c0eddedabe545 1326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2935097095f8c173aa2238f05de8fd155b7a1d9e",
+  "prompts": {},
+  "sessions": {
+    "s_445161c5f6e19f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc8c2-c14f-7122-b05b-1db7eaf7f16c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
