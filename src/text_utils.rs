@@ -80,9 +80,26 @@ pub(crate) fn is_page_number_line(text: &str) -> bool {
             .map(|(index, _)| index)
             .unwrap_or(rest.len());
         let suffix = rest[digit_end..].trim_start();
-        // A period followed by a word is sentence-like body text (for example,
-        // `Page 1. This is the first paragraph`), not a running page header.
-        !suffix.starts_with(". ")
+        if suffix.is_empty() || suffix == "." {
+            return true;
+        }
+        if let Some(after_period) = suffix.strip_prefix('.') {
+            let after_period = after_period.trim_start();
+            if after_period.is_empty() {
+                return true;
+            }
+            // A period followed by a sentence-like body is not a running page
+            // header. Short labels such as `Page 1. Introduction` remain
+            // removable as likely headers.
+            return after_period.split_whitespace().count() <= 1;
+        }
+        // Punctuation after the page label usually introduces body text rather
+        // than a running header. Keep it, including Unicode dash/whitespace.
+        if suffix.starts_with(':') || suffix.starts_with('-') || suffix.starts_with('—') {
+            return false;
+        }
+        // `Page N of M` and labels such as `Page N Chapter ...` remain headers.
+        true
     })
 }
 
