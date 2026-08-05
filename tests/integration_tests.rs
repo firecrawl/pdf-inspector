@@ -1310,6 +1310,18 @@ fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
 }
 
+/// First two pages of Shannon's "A Mathematical Theory of Communication"
+/// (1998 dvips 5.58 → Distiller 3 retypesetting). Canonical legacy-TeX PDF:
+/// non-embedded base-14 fonts with no /Widths (exercises the built-in AFM
+/// metrics fallback), Type3 PK bitmap math fonts with FontMatrix
+/// [1 0 0 -1 0 0] (exercises visual-size scaling), a two-line embedded drop
+/// cap, indent-only paragraph breaks, and display math that must not be
+/// detected as tables or headings.
+#[test]
+fn test_snapshot_shannon_entropy() {
+    assert_snapshot("shannon-entropy-p1-2");
+}
+
 // ============================================================================
 // Pages Needing OCR Tests
 // ============================================================================

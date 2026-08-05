@@ -14,9 +14,9 @@ use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
 use super::fonts::{
-    build_font_encodings, build_font_widths, compute_string_width_ts, descriptor_style_flags,
-    extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
-    FontStyleCache,
+    build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
+    descriptor_style_flags, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
+    CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
@@ -177,6 +177,7 @@ pub(crate) fn extract_page_text_items(
 
     // Build font width info for accurate text positioning
     let font_widths = build_font_widths(doc, &fonts);
+    let type3_scales = build_type3_scales(doc, &fonts);
 
     // Build maps of font resource names to their base font names and ToUnicode object refs
     let mut font_base_names: std::collections::HashMap<String, String> =
@@ -513,7 +514,8 @@ pub(crate) fn extract_page_text_items(
                     ) {
                         let combined =
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
-                        let rendered_size = effective_font_size(current_font_size, &combined);
+                        let rendered_size = effective_font_size(current_font_size, &combined)
+                            * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                         let (x, y) = (combined[4], combined[5]);
                         if combined[0].abs() >= combined[1].abs() {
                             rotation_votes.horizontal += 1;
@@ -684,7 +686,8 @@ pub(crate) fn extract_page_text_items(
                             } else {
                                 rotation_votes.rotated += 1;
                             }
-                            let rendered_size = effective_font_size(current_font_size, &combined);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -791,7 +794,8 @@ pub(crate) fn extract_page_text_items(
                             } else {
                                 rotation_votes.rotated += 1;
                             }
-                            let rendered_size = effective_font_size(current_font_size, &combined);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let (x, y) = (combined[4], combined[5]);
                             let width = w_ts_opt
                                 .map(|w_ts| {
@@ -943,7 +947,8 @@ pub(crate) fn extract_page_text_items(
                             } else {
                                 rotation_votes.rotated += 1;
                             }
-                            let rendered_size = effective_font_size(current_font_size, &combined);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let (x, y) = (combined[4], combined[5]);
                             // Width in device space from text matrix delta
                             let delta_ts = text_matrix[4] - start_tm[4];
