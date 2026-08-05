@@ -3936,3 +3936,32 @@ fn pdf_options_debug_redacts_password() {
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
 }
+
+#[test]
+fn sparse_grouped_table_rows_stay_separate() {
+    // #229: a table with a row-spanning first column (group header carries
+    // the order date/item code, detail rows leave it blank) was collapsing
+    // all detail rows into one, concatenating their cell values, because
+    // dollar-prefixed numeric cells ("$482,110.40") failed the row's
+    // numeric-data check and were treated as continuation/overflow text.
+    let result = process_pdf_with_options(
+        "tests/fixtures/sparse_grouped_table_rows.pdf",
+        PdfOptions::new(),
+    )
+    .expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+
+    assert!(
+        md.contains("$482,110.40"),
+        "expected distinct WIDGET ASSEMBLY row, got:\n{md}"
+    );
+    // The three detail rows' Unit Cost values must appear as separate
+    // cells, not concatenated into one merged cell.
+    assert!(
+        !md.contains("$482,110.40 $0.00 $31,905.22"),
+        "detail rows were collapsed into one concatenated row:\n{md}"
+    );
+    assert!(md.contains("WIDGET ASSEMBLY"), "missing row content:\n{md}");
+    assert!(md.contains("BRACKET SET"), "missing row content:\n{md}");
+    assert!(md.contains("CONTROL MODULE"), "missing row content:\n{md}");
+}

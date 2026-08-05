@@ -307,9 +307,13 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let numeric_cells = non_first_cells
             .iter()
             .filter(|c| {
-                c.chars().all(|ch| {
-                    ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
-                })
+                // Strip a leading currency symbol so amounts like "$482,110.40"
+                // or "€1,200" are recognized as numeric data, not overflow text.
+                let c = c.trim_start_matches(['$', '€', '£', '¥']);
+                !c.is_empty()
+                    && c.chars().all(|ch| {
+                        ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
+                    })
             })
             .count();
         let looks_like_data_row = non_first_cells.len() >= 2
@@ -593,6 +597,135 @@ mod tests {
 
         assert_eq!(cleaned.len(), 4);
         assert_eq!(cleaned[2][0], "Mechanical");
+    }
+
+    #[test]
+    fn test_clean_table_cells_currency_data_row_not_merged() {
+        // A sparse/grouped table: the group-header row carries the order
+        // date/item code in column 0, and each detail row leaves column 0
+        // *and* column 1 (Suffix) blank (row-spanning) — matching the real
+        // #229 repro exactly, so `IC-1048` lands at column index 2. That
+        // matters: if `IC-1048` were at index 1 instead, the unrelated
+        // `looks_like_hierarchical_subrow` heuristic would independently
+        // keep these rows apart regardless of the numeric/currency check,
+        // and this test would pass even with the #229 fix reverted.
+        // Detail rows with dollar amounts must be recognized as real data
+        // rows and NOT merged as continuation text — the '$' prefix on
+        // numeric cells must not defeat the numeric check.
+        let cells = vec![
+            vec![
+                "Order Date".into(),
+                "Suffix".into(),
+                "Item Code".into(),
+                "Description".into(),
+                "Status".into(),
+                "Unit Cost".into(),
+                "Freight".into(),
+                "Tax".into(),
+                "Total Billed".into(),
+            ],
+            vec![
+                "03/14/2024".into(),
+                "".into(),
+                "IC-1048".into(),
+                "".into(),
+                "Shipped".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+            vec![
+                "".into(),
+                "".into(),
+                "IC-1048".into(),
+                "WIDGET ASSEMBLY".into(),
+                "Shipped".into(),
+                "$482,110.40".into(),
+                "$0.00".into(),
+                "$9,215.75".into(),
+                "$491,326.15".into(),
+            ],
+            vec![
+                "".into(),
+                "".into(),
+                "IC-1048".into(),
+                "BRACKET SET".into(),
+                "Shipped".into(),
+                "$0.00".into(),
+                "$0.00".into(),
+                "$0.00".into(),
+                "$0.00".into(),
+            ],
+            vec![
+                "".into(),
+                "".into(),
+                "IC-1048".into(),
+                "CONTROL MODULE".into(),
+                "Shipped".into(),
+                "$31,905.22".into(),
+                "$4,100.00".into(),
+                "$0.00".into(),
+                "$36,005.22".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        // Header + group-header row + 3 distinct detail rows, none merged.
+        assert_eq!(cleaned.len(), 5);
+        assert_eq!(cleaned[2][5], "$482,110.40");
+        assert_eq!(cleaned[3][5], "$0.00");
+        assert_eq!(cleaned[4][5], "$31,905.22");
+    }
+
+    #[test]
+    fn test_clean_table_cells_dash_and_ellipsis_placeholders_still_count_as_numeric() {
+        // Dash/ellipsis placeholders ("----", "...") in numeric-shaped
+        // columns (common for "not applicable"/zero in financial and
+        // statistical tables) must still count as numeric-shaped cells,
+        // same as before the #229 currency fix — the fix only needed to
+        // strip a leading currency symbol, not require a digit be present.
+        // Same row layout as the currency test (IC-1048 at column index 2)
+        // to avoid the unrelated looks_like_hierarchical_subrow heuristic.
+        let cells = vec![
+            vec![
+                "Order Date".into(),
+                "Suffix".into(),
+                "Item Code".into(),
+                "Description".into(),
+                "Status".into(),
+                "Unit Cost".into(),
+                "Freight".into(),
+                "Tax".into(),
+                "Total Billed".into(),
+            ],
+            vec![
+                "03/14/2024".into(),
+                "".into(),
+                "IC-1048".into(),
+                "".into(),
+                "Shipped".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+            vec![
+                "".into(),
+                "".into(),
+                "IC-1048".into(),
+                "WIDGET ASSEMBLY".into(),
+                "Shipped".into(),
+                "----".into(),
+                "...".into(),
+                "$0.00".into(),
+                "$482,110.40".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        // Header + group-header row + 1 distinct detail row, none merged.
+        assert_eq!(cleaned.len(), 3);
+        assert_eq!(cleaned[2][5], "----");
+        assert_eq!(cleaned[2][6], "...");
     }
 
     #[test]
