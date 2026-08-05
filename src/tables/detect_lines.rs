@@ -1280,10 +1280,11 @@ pub(crate) fn detect_dense_line_chart_regions(
             continue;
         }
 
-        // A horizontal rule must support the same contiguous subset of dense
-        // vertical coordinates. Keying by the covered X-index range isolates
-        // a nearby ruled table and also lets multiple chart panels sharing the
-        // same Y extents produce independent regions.
+        // A horizontal rule must support the same contiguous dense run of
+        // vertical coordinates. Splitting at sparse X gaps prevents a shared
+        // rule from joining a chart to a neighboring ruled table. Keying by
+        // the covered X-index range also lets multiple chart panels sharing
+        // the same Y extents produce independent regions.
         let mut supported_spans: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
         for &(y, line_left, line_right) in &horizontals {
             if y < grid_bottom - EXTENT_TOLERANCE || y > grid_top + EXTENT_TOLERANCE {
@@ -1294,9 +1295,35 @@ pub(crate) fn detect_dense_line_chart_regions(
             if end - start < DENSE_CHART_MIN_VERTICAL_EDGES {
                 continue;
             }
-            let width = xs[end - 1] - xs[start];
-            if width >= 120.0 {
-                supported_spans.entry((start, end)).or_default().push(y);
+
+            let mut gaps: Vec<f32> = xs[start..end]
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect();
+            gaps.sort_by(f32::total_cmp);
+            let dense_gap = gaps[gaps.len() / 4];
+            let run_break = (dense_gap * 3.0).max(12.0);
+
+            let mut run_start = start;
+            for index in start..end - 1 {
+                if xs[index + 1] - xs[index] <= run_break {
+                    continue;
+                }
+                let run_end = index + 1;
+                if run_end - run_start >= DENSE_CHART_MIN_VERTICAL_EDGES
+                    && xs[run_end - 1] - xs[run_start] >= 120.0
+                {
+                    supported_spans
+                        .entry((run_start, run_end))
+                        .or_default()
+                        .push(y);
+                }
+                run_start = run_end;
+            }
+            if end - run_start >= DENSE_CHART_MIN_VERTICAL_EDGES
+                && xs[end - 1] - xs[run_start] >= 120.0
+            {
+                supported_spans.entry((run_start, end)).or_default().push(y);
             }
         }
 
@@ -1334,8 +1361,6 @@ pub(crate) fn detect_dense_line_chart_regions(
         .into_iter()
         .map(|grid_region| {
             let (grid_left, grid_bottom, grid_right, grid_top) = grid_region;
-            let grid_width = grid_right - grid_left;
-            let grid_height = grid_top - grid_bottom;
             let enclosing_panel = rects
                 .iter()
                 .filter(|rect| rect.page == page)
@@ -1352,7 +1377,7 @@ pub(crate) fn detect_dense_line_chart_regions(
                     };
                     let right = left + width;
                     let top = bottom + height;
-                    let enclosed_grids = all_grid_regions
+                    let enclosed_grid_bounds = all_grid_regions
                         .iter()
                         .filter(|&&(other_left, other_bottom, other_right, other_top)| {
                             left <= other_left + EXTENT_TOLERANCE
@@ -1360,14 +1385,23 @@ pub(crate) fn detect_dense_line_chart_regions(
                                 && bottom <= other_bottom + EXTENT_TOLERANCE
                                 && top >= other_top - EXTENT_TOLERANCE
                         })
-                        .count();
+                        .copied()
+                        .reduce(|bounds, other| {
+                            (
+                                bounds.0.min(other.0),
+                                bounds.1.min(other.1),
+                                bounds.2.max(other.2),
+                                bounds.3.max(other.3),
+                            )
+                        })?;
+                    let enclosed_width = enclosed_grid_bounds.2 - enclosed_grid_bounds.0;
+                    let enclosed_height = enclosed_grid_bounds.3 - enclosed_grid_bounds.1;
                     (left <= grid_left + EXTENT_TOLERANCE
                         && right >= grid_right - EXTENT_TOLERANCE
                         && bottom <= grid_bottom + EXTENT_TOLERANCE
                         && top >= grid_top - EXTENT_TOLERANCE
-                        && width <= grid_width * 3.0
-                        && height <= grid_height * 4.0
-                        && enclosed_grids == 1
+                        && width <= enclosed_width * 2.0
+                        && height <= enclosed_height * 4.0
                         && !(left < 5.0 && bottom < 5.0))
                         .then_some(((left, bottom, right, top), width * height))
                 })
@@ -1386,6 +1420,12 @@ pub(crate) fn detect_dense_line_chart_regions(
         left.0
             .total_cmp(&right.0)
             .then_with(|| left.1.total_cmp(&right.1))
+    });
+    regions.dedup_by(|left, right| {
+        (left.0 - right.0).abs() <= EXTENT_TOLERANCE
+            && (left.1 - right.1).abs() <= EXTENT_TOLERANCE
+            && (left.2 - right.2).abs() <= EXTENT_TOLERANCE
+            && (left.3 - right.3).abs() <= EXTENT_TOLERANCE
     });
     regions
 }
@@ -1876,18 +1916,42 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_ruled_table_is_not_claimed_by_dense_chart() {
+    fn multiple_dense_vector_panels_use_shared_enclosing_panel() {
+        let mut lines = Vec::new();
+        for panel_left in [60.0, 380.0] {
+            lines.extend(
+                (0..30).map(|column| make_vline(panel_left + column as f32 * 8.0, 400.0, 550.0, 1)),
+            );
+            lines.extend((0..6).map(|row| {
+                make_hline(400.0 + row as f32 * 30.0, panel_left, panel_left + 232.0, 1)
+            }));
+        }
+        let rects = vec![PdfRect {
+            x: 40.0,
+            y: 350.0,
+            width: 592.0,
+            height: 240.0,
+            page: 1,
+        }];
+
+        assert_eq!(
+            detect_dense_line_chart_regions(&lines, &rects, 1),
+            vec![(40.0, 350.0, 632.0, 590.0)]
+        );
+    }
+
+    #[test]
+    fn shared_rules_do_not_join_dense_chart_to_adjacent_table() {
         let mut lines: Vec<PdfLine> = (0..30)
             .map(|column| make_vline(60.0 + column as f32 * 8.0, 400.0, 550.0, 1))
             .collect();
-        lines.extend((0..6).map(|row| make_hline(400.0 + row as f32 * 30.0, 60.0, 292.0, 1)));
 
         lines.extend(
             [330.0, 390.0, 450.0, 510.0, 570.0, 630.0]
                 .into_iter()
                 .map(|x| make_vline(x, 400.0, 550.0, 1)),
         );
-        lines.extend((0..6).map(|row| make_hline(400.0 + row as f32 * 30.0, 330.0, 630.0, 1)));
+        lines.extend((0..6).map(|row| make_hline(400.0 + row as f32 * 30.0, 60.0, 630.0, 1)));
 
         assert_eq!(
             detect_dense_line_chart_regions(&lines, &[], 1),

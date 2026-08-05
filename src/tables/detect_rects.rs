@@ -2095,17 +2095,13 @@ fn repeated_cell_grid_overrides_bar_hypothesis(group_rects: &[(f32, f32, f32, f3
         && without_dominant_page_backgrounds(group_rects).len() == group_rects.len()
 }
 
-/// Detect a table from cell-background rects that failed grid detection.
+/// Detect horizontal segmented stacks from aligned rows of touching rects.
 ///
-/// Uses rect Y-edges for row boundaries and text X-position clustering for
-/// columns.  Handles tables with cell backgrounds that don't form a clean
-/// X-edge grid (variable column widths, decorative fills).
-/// Chart-bar signature: ≥3 rects sharing an aligned bottom edge (the axis),
-/// with similar widths (bars) but strongly varying heights (data-driven),
-/// holding at most a single numeric data label each. Bar charts drawn as
-/// filled rects otherwise read as cell rects and grid their axis labels
-/// into a phantom table. The mirrored check catches horizontal bar charts.
-fn is_segmented_stacked_bar_cluster(group_rects: &[(f32, f32, f32, f32)]) -> bool {
+/// Category rows must have visible gutters and data-varying internal segment
+/// boundaries, unlike the stable boundaries of a ruled table.
+fn segmented_stacked_bar_bounds(
+    group_rects: &[(f32, f32, f32, f32)],
+) -> Option<(f32, f32, f32, f32)> {
     type BarRow = (f32, f32, Vec<(f32, f32)>);
 
     const EDGE_TOLERANCE: f32 = 3.0;
@@ -2135,7 +2131,7 @@ fn is_segmented_stacked_bar_cluster(group_rects: &[(f32, f32, f32, f32)]) -> boo
                 .all(|pair| (pair[1].0 - pair[0].1).abs() <= EDGE_TOLERANCE)
     });
     if rows.len() < MIN_ROWS {
-        return false;
+        return None;
     }
     rows.sort_by(|left, right| left.0.total_cmp(&right.0));
 
@@ -2145,7 +2141,7 @@ fn is_segmented_stacked_bar_cluster(group_rects: &[(f32, f32, f32, f32)]) -> boo
         let shorter_height = (pair[0].1 - pair[0].0).min(pair[1].1 - pair[1].0);
         pair[1].0 - pair[0].1 < (shorter_height * 0.25).max(2.0)
     }) {
-        return false;
+        return None;
     }
 
     // At least two rows must move an internal segment boundary. Stable
@@ -2156,7 +2152,8 @@ fn is_segmented_stacked_bar_cluster(group_rects: &[(f32, f32, f32, f32)]) -> boo
         .take(rows[0].2.len() - 1)
         .map(|segment| segment.1)
         .collect();
-    rows.iter()
+    let drifting_rows = rows
+        .iter()
         .skip(1)
         .filter(|(_, _, segments)| {
             let edges: Vec<f32> = segments
@@ -2170,10 +2167,56 @@ fn is_segmented_stacked_bar_cluster(group_rects: &[(f32, f32, f32, f32)]) -> boo
                     .zip(&reference_edges)
                     .any(|(edge, reference)| (edge - reference).abs() > EDGE_TOLERANCE)
         })
-        .count()
-        >= 2
+        .count();
+    if drifting_rows < 2 {
+        return None;
+    }
+
+    let left = rows
+        .iter()
+        .flat_map(|row| &row.2)
+        .map(|segment| segment.0)
+        .reduce(f32::min)?;
+    let right = rows
+        .iter()
+        .flat_map(|row| &row.2)
+        .map(|segment| segment.1)
+        .reduce(f32::max)?;
+    let bottom = rows.iter().map(|row| row.0).reduce(f32::min)?;
+    let top = rows.iter().map(|row| row.1).reduce(f32::max)?;
+    Some((left, bottom, right, top))
 }
 
+/// Require a separate, padded plot boundary before a segmented stack may
+/// override an otherwise valid repeated-cell grid.
+fn has_padded_enclosing_plot_frame(
+    group_rects: &[(f32, f32, f32, f32)],
+    (content_left, content_bottom, content_right, content_top): (f32, f32, f32, f32),
+) -> bool {
+    const MIN_FRAME_PAD: f32 = 4.0;
+
+    let content_width = content_right - content_left;
+    let content_height = content_top - content_bottom;
+    group_rects.iter().any(|&(x, y, width, height)| {
+        let left = x.min(x + width);
+        let right = x.max(x + width);
+        let bottom = y.min(y + height);
+        let top = y.max(y + height);
+        let frame_width = right - left;
+        let frame_height = top - bottom;
+
+        left <= content_left - MIN_FRAME_PAD
+            && right >= content_right + MIN_FRAME_PAD
+            && bottom <= content_bottom - MIN_FRAME_PAD
+            && top >= content_top + MIN_FRAME_PAD
+            && frame_width <= content_width * 2.0
+            && frame_height <= content_height * 2.5
+            && !(left < 5.0 && bottom < 5.0)
+    })
+}
+
+/// Recognize filled vertical or horizontal bars whose geometry and labels are
+/// data-driven rather than uniform table cells.
 fn has_chart_bar_signature(
     items: &[TextItem],
     group_rects: &[(f32, f32, f32, f32)],
@@ -2288,10 +2331,15 @@ fn is_chart_bar_cluster(
 ) -> bool {
     let has_bar_signature = has_chart_bar_signature(items, group_rects, page);
 
-    // A segmented horizontal chart can share most of its edges across rows,
-    // so recognize its spaced, data-varying stacks before the grid override.
-    if has_bar_signature && is_segmented_stacked_bar_cluster(group_rects) {
-        return true;
+    // A segmented horizontal chart can share most of its edges across rows.
+    // Only let it bypass the grid safeguard when a separate plot frame
+    // confirms that the rows belong to a chart rather than a gapped table.
+    if has_bar_signature {
+        if let Some(bounds) = segmented_stacked_bar_bounds(group_rects) {
+            if has_padded_enclosing_plot_frame(group_rects, bounds) {
+                return true;
+            }
+        }
     }
     if repeated_cell_grid_overrides_bar_hypothesis(group_rects) {
         return false;
@@ -3293,7 +3341,7 @@ mod tests {
         assert!(is_repeated_cell_grid(&rects));
         assert!(has_chart_bar_signature(&[], &rects, 1));
         assert!(repeated_cell_grid_overrides_bar_hypothesis(&rects));
-        assert!(!is_segmented_stacked_bar_cluster(&rects));
+        assert!(segmented_stacked_bar_bounds(&rects).is_none());
         assert!(!is_chart_bar_cluster(&[], &rects, 1));
 
         let mut with_page_fills =
@@ -3324,7 +3372,8 @@ mod tests {
 
         assert!(is_repeated_cell_grid(&raw_rects));
         assert!(has_chart_bar_signature(&[], &raw_rects, 1));
-        assert!(is_segmented_stacked_bar_cluster(&raw_rects));
+        let bounds = segmented_stacked_bar_bounds(&raw_rects).expect("segmented stack");
+        assert!(has_padded_enclosing_plot_frame(&raw_rects, bounds));
         assert!(is_chart_bar_cluster(&[], &raw_rects, 1));
 
         let rects: Vec<PdfRect> = raw_rects
@@ -3341,6 +3390,44 @@ mod tests {
         let (tables, hints) = detect_tables_from_rects(&[], &rects, 1);
         assert!(tables.is_empty());
         assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn gapped_numeric_grid_without_plot_frame_remains_a_table_hypothesis() {
+        let row_edges = [
+            [100.0, 140.0, 180.0, 220.0, 260.0],
+            [100.0, 140.0, 180.0, 228.0, 260.0],
+            [100.0, 140.0, 180.0, 214.0, 260.0],
+            [100.0, 140.0, 180.0, 232.0, 260.0],
+        ];
+        let mut raw_rects = vec![(100.0, 536.0, 160.0, 80.0)];
+        let mut items = Vec::new();
+        for (row, edges) in row_edges.into_iter().enumerate() {
+            let y = 540.0 + row as f32 * 20.0;
+            for edge in edges.windows(2) {
+                raw_rects.push((edge[0], y, edge[1] - edge[0], 12.0));
+                items.push(make_item("42", edge[0] + 8.0, y + 1.0, 9.0));
+            }
+        }
+
+        assert!(is_repeated_cell_grid(&raw_rects));
+        assert!(has_chart_bar_signature(&items, &raw_rects, 1));
+        let bounds = segmented_stacked_bar_bounds(&raw_rects).expect("segmented rows");
+        assert!(!has_padded_enclosing_plot_frame(&raw_rects, bounds));
+        assert!(!is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let rects: Vec<PdfRect> = raw_rects
+            .into_iter()
+            .map(|(x, y, width, height)| PdfRect {
+                x,
+                y,
+                width,
+                height,
+                page: 1,
+            })
+            .collect();
+        assert!(detect_chart_regions(&items, &rects, 1).is_empty());
+        assert!(!detect_tables_from_rects(&items, &rects, 1).0.is_empty());
     }
 
     // --- detect_stacked_box_table ---
