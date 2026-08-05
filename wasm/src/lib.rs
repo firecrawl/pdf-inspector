@@ -35,7 +35,7 @@ export interface PageSignals {
   /** 1-indexed page number. */
   page: number;
   /** Reading direction: "ltr" | "rtl" | "mixed". */
-  direction: string;
+  direction: "ltr" | "rtl" | "mixed";
   /** Per-page text-confidence (0.0-1.0); 1.0 clean text, 0.0 no usable text. */
   confidence: number;
 }

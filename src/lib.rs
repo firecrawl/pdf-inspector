@@ -608,18 +608,15 @@ pub fn extract_pages_markdown_mem(
         // Direction + per-page confidence are computed over the same items that
         // feed the emitted markdown (page-number removal applied), so the signal
         // matches the output a caller can inspect.
-        let direction = crate::text_utils::page_direction(
+        let (direction, confidence) = page_signal(
             page_items
                 .iter()
                 .zip(&page_number_removal_mask)
                 .filter(|(_, remove)| !**remove)
                 .map(|(item, _)| item),
+            &text_quality.confidence_by_page,
+            page_1idx,
         );
-        let confidence = text_quality
-            .confidence_by_page
-            .get(&page_1idx)
-            .copied()
-            .unwrap_or(0.0);
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -3937,12 +3934,11 @@ fn process_document(
                     .get(&page)
                     .map(|v| v.as_slice())
                     .unwrap_or_default();
-                let direction = crate::text_utils::page_direction(bucket.iter().copied());
-                let confidence = text_quality
-                    .confidence_by_page
-                    .get(&page)
-                    .copied()
-                    .unwrap_or(0.0);
+                let (direction, confidence) = page_signal(
+                    bucket.iter().copied(),
+                    &text_quality.confidence_by_page,
+                    page,
+                );
                 page_signals.push(PageSignals {
                     page,
                     direction,
@@ -4104,6 +4100,23 @@ fn process_document(
 
 fn suspected_garbled_reason() -> String {
     OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()
+}
+
+/// Per-page direction + text-confidence for a page's text items (post
+/// page-number removal), defaulting to `ltr` / 0.0 when the page has no text
+/// items or no confidence evidence. Shared by the extraction and Full-mode
+/// process paths so the signal contract stays in sync.
+pub(crate) fn page_signal<'a, I>(
+    page_items: I,
+    confidence_by_page: &BTreeMap<u32, f32>,
+    page_1idx: u32,
+) -> (PageDirection, f32)
+where
+    I: IntoIterator<Item = &'a TextItem>,
+{
+    let direction = crate::text_utils::page_direction(page_items);
+    let confidence = confidence_by_page.get(&page_1idx).copied().unwrap_or(0.0);
+    (direction, confidence)
 }
 
 pub(crate) fn add_ocr_reason(
