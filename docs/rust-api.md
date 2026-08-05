@@ -225,6 +225,10 @@ Low-level detection functions are also available via the `detector` module (`det
     "replacement saturation"; disambiguate with `ocr_reason`. `direction ==
     "ltr"` means "no RTL-dominant line", not "the page uses a left-to-right
     script".
+  - **Run-length rule.** Short pages (`chars <= 80` with a `>= 2`-char
+    replacement run) are flagged `needs_ocr` by the run-length rule while
+    their density-graded confidence stays above 0.5 (up to ~0.75); the value
+    bands describe replacement *density*, not every `needs_ocr` trigger.
 
 ### Indexing conventions
 

@@ -1602,6 +1602,29 @@ fn test_extract_regions_mem_identity_h_needs_ocr() {
 /// resulting ciphertext is 100% printable ASCII, so it must be caught by the
 /// substitution-cipher statistics and routed to OCR instead of served silently.
 #[test]
+/// Locks the documented cross-surface confidence basis divergence: the extract
+/// path scores a GID-garbled page at the 0.15 binary-garbled anchor, while
+/// Full-mode process_pdf scores the same page 0.0 because its items were
+/// garbage-stripped before text-quality analysis (docs/rust-api.md).
+#[test]
+fn test_cross_surface_confidence_divergence_on_gid_page() {
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let extraction = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(extraction.pages[0].confidence, 0.15);
+    let full = process_pdf_mem(&buf).unwrap();
+    assert_eq!(full.page_signals[0].confidence, 0.0);
+}
+
+#[test]
+fn test_process_pdf_mem_page_filter_skips_zero() {
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0)]);
+    let opts = PdfOptions::new().pages([0, 1]);
+    let result = process_pdf_mem_with_options(&buf, opts).unwrap();
+    assert_eq!(result.page_signals.len(), 1);
+    assert_eq!(result.page_signals[0].page, 1);
+}
+
+#[test]
 fn test_extract_pages_mem_shifted_cipher_tounicode_needs_ocr() {
     let buf = std::fs::read("tests/fixtures/shifted_cipher_tounicode.pdf").unwrap();
     let result = extract_pages_markdown_mem(&buf, None).unwrap();

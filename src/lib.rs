@@ -3923,7 +3923,7 @@ fn process_document(
             let mut page_signals = Vec::with_capacity(page_count as usize);
             let signal_pages: Vec<u32> = match &options.page_filter {
                 Some(filter) => {
-                    let mut pages: Vec<u32> = filter.iter().copied().collect();
+                    let mut pages: Vec<u32> = filter.iter().copied().filter(|&p| p >= 1).collect();
                     pages.sort_unstable();
                     pages
                 }
