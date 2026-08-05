@@ -209,6 +209,23 @@ Low-level detection functions are also available via the `detector` module (`det
   show `needs_ocr == true` with high confidence — the field measures per-page
   text-quality evidence, not the final `needs_ocr` decision.
 
+  Two further contract notes:
+
+  - **Basis divergence between APIs.** `extract_pages_markdown` computes
+    text-quality over all extracted items; Full-mode `process_pdf` computes it
+    over the post-folio/post-garbage-strip items. On pages whose text was
+    garbage-stripped in Full mode, the extraction API can report a higher
+    confidence than `process_pdf` for the same page. Prefer one API per
+    document when comparing values.
+  - **Floating-point widening.** `0.15` is not exactly representable after the
+    core `f32` value widens to `f64` on the Python, napi, and wasm surfaces
+    (reported as `0.15000000596046448`); compare with a small tolerance
+    (`abs(diff) < 1e-3`) there. `0.0`, `0.5`, and `1.0` are exact.
+  - **Sentinel semantics.** `confidence == 0.0` means "no usable text" *or*
+    "replacement saturation"; disambiguate with `ocr_reason`. `direction ==
+    "ltr"` means "no RTL-dominant line", not "the page uses a left-to-right
+    script".
+
 ### Indexing conventions
 
 | Surface / field | Indexing |
