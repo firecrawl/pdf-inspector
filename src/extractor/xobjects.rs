@@ -8,8 +8,9 @@ use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
 use super::fonts::{
-    build_font_encodings, build_font_widths, compute_string_width_ts, extract_text_from_operand,
-    get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
+    build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
+    extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
+    FontStyleCache,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -166,6 +167,7 @@ fn extract_form_xobject_text_inner(
 
     // Build font width info for the form
     let font_widths = build_font_widths(doc, &form_fonts);
+    let type3_scales = build_type3_scales(doc, &form_fonts);
 
     // Build font base names and ToUnicode refs for the form
     let mut font_base_names: HashMap<String, String> = HashMap::new();
@@ -413,7 +415,8 @@ fn extract_form_xobject_text_inner(
                         &font_widths,
                     ) {
                         let combined = multiply_matrices(&text_matrix, &ctm);
-                        let rendered_size = effective_font_size(current_font_size, &combined);
+                        let rendered_size = effective_font_size(current_font_size, &combined)
+                            * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                         let (x, y) = (combined[4], combined[5]);
                         let width = if let Some(font_info) = font_widths.get(&current_font) {
                             if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
@@ -572,7 +575,8 @@ fn extract_form_xobject_text_inner(
                         }
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
-                            let rendered_size = effective_font_size(current_font_size, &combined);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())

@@ -2,8 +2,8 @@
 
 use pdf_inspector::extractor::ItemType;
 use pdf_inspector::{
-    extract_text_with_positions_pages, process_pdf_with_options, LayoutComplexity, PdfOptions,
-    PdfType, ProcessMode, TextItem,
+    extract_text_with_positions_pages_with_password, process_pdf_with_options, LayoutComplexity,
+    PdfOptions, PdfType, ProcessMode, TextItem,
 };
 use std::collections::HashSet;
 use std::env;
@@ -103,9 +103,18 @@ fn format_items_json(items: &[TextItem]) -> String {
     )
 }
 
+fn extract_items_json(
+    pdf_path: &str,
+    page_filter: Option<&HashSet<u32>>,
+    password: Option<&str>,
+) -> Result<String, pdf_inspector::PdfError> {
+    extract_text_with_positions_pages_with_password(pdf_path, page_filter, password)
+        .map(|items| format_items_json(&items))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_items_json;
+    use super::{extract_items_json, format_items_json};
     use pdf_inspector::extractor::ItemType;
     use pdf_inspector::TextItem;
 
@@ -136,6 +145,24 @@ mod tests {
         assert!(json.contains(r#""is_underline":true"#));
         assert!(json.contains(r#""item_type":"text""#));
         assert!(json.contains(r#""mcid":7"#));
+    }
+
+    #[test]
+    fn items_json_uses_supplied_pdf_password() {
+        let path = "tests/fixtures/encrypted-secret123.pdf";
+
+        let without_password = extract_items_json(path, None, None);
+        assert!(
+            without_password.is_err(),
+            "encrypted fixture unexpectedly extracted without a password"
+        );
+
+        let json = extract_items_json(path, None, Some("secret123"))
+            .expect("correct password should decrypt positioned text");
+        assert!(
+            json.contains("Procurement"),
+            "decrypted item JSON should contain fixture text, got {json}"
+        );
     }
 }
 
@@ -257,8 +284,8 @@ fn main() {
         });
 
     if items_json_output {
-        match extract_text_with_positions_pages(pdf_path, page_filter.as_ref()) {
-            Ok(items) => println!("{}", format_items_json(&items)),
+        match extract_items_json(pdf_path, page_filter.as_ref(), password.as_deref()) {
+            Ok(json) => println!("{}", json),
             Err(e) => {
                 println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));
                 process::exit(1);

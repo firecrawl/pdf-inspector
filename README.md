@@ -238,7 +238,7 @@ The converter handles:
 |---|---|
 | Headings (H1-H4) | Font size tiers relative to body text, with 0.5pt clustering |
 | Bold/italic | Font name patterns (Bold, Italic, Oblique) |
-| Bullet lists | `*`, `-`, `*`, `○`, `●`, `◦` prefixes |
+| Bullet lists | `•`, `-`, `*`, `○`, `●`, `◦` prefixes |
 | Numbered lists | `1.`, `1)`, `(1)` patterns |
 | Letter lists | `a.`, `a)`, `(a)` patterns |
 | Code blocks | Monospace fonts (Courier, Consolas, Monaco, Menlo, Fira Code, JetBrains Mono) and keyword detection |
