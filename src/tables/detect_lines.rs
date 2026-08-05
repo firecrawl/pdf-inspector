@@ -1323,6 +1323,11 @@ pub(crate) fn detect_dense_line_chart_regions(
             gaps.sort_by(f32::total_cmp);
             let dense_gap = gaps[gaps.len() / 4];
             let run_break = (dense_gap * 3.0).max(12.0);
+            let locally_dense_gap_limit = (dense_gap * 1.5).max(6.0);
+            let locally_dense_gaps = gaps
+                .iter()
+                .filter(|&&gap| gap <= locally_dense_gap_limit)
+                .count();
 
             let mut run_start = start;
             let mut retained_dense_run = false;
@@ -1357,7 +1362,8 @@ pub(crate) fn detect_dense_line_chart_regions(
             let expected_dense_width = dense_gap * (end - start - 1) as f32;
             if !retained_dense_run
                 && span_width >= 120.0
-                && span_width <= expected_dense_width * 1.75
+                && span_width <= expected_dense_width * 1.35
+                && locally_dense_gaps * 4 >= gaps.len() * 3
             {
                 supported_spans.entry((start, end)).or_default().push(y);
             }
@@ -2016,6 +2022,16 @@ mod tests {
             detect_dense_line_chart_regions(&lines, &[], 1),
             vec![(40.0, 380.0, 344.0, 570.0)]
         );
+    }
+
+    #[test]
+    fn subthreshold_dense_run_does_not_absorb_adjacent_sparse_grid() {
+        let mut xs: Vec<f32> = (0..20).map(|column| 60.0 + column as f32 * 8.0).collect();
+        xs.extend((0..8).map(|column| 240.0 + column as f32 * 16.0));
+        let mut lines: Vec<PdfLine> = xs.iter().map(|&x| make_vline(x, 400.0, 550.0, 1)).collect();
+        lines.extend((0..6).map(|row| make_hline(400.0 + row as f32 * 30.0, 60.0, 352.0, 1)));
+
+        assert!(detect_dense_line_chart_regions(&lines, &[], 1).is_empty());
     }
 
     #[test]

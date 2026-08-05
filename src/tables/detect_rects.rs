@@ -2205,7 +2205,7 @@ fn has_external_segmented_bar_labels(
     geometry: &SegmentedBarGeometry,
 ) -> bool {
     const LABEL_EDGE_TOLERANCE: f32 = 3.0;
-    const LABEL_SEARCH_DISTANCE: f32 = 120.0;
+    const LABEL_CLAIM_PAD: f32 = 20.0;
 
     let (content_left, _, content_right, _) = geometry.bounds;
     let labeled_rows = geometry
@@ -2218,11 +2218,12 @@ fn has_external_segmented_bar_labels(
                 }
                 let item_left = item.x.min(item.x + item.width);
                 let item_right = item.x.max(item.x + item.width);
+                let item_center_x = (item_left + item_right) / 2.0;
                 let item_center_y = item.y + item.height / 2.0;
-                let beside_stack = (item_right <= content_left + LABEL_EDGE_TOLERANCE
-                    && item_right >= content_left - LABEL_SEARCH_DISTANCE)
-                    || (item_left >= content_right - LABEL_EDGE_TOLERANCE
-                        && item_left <= content_right + LABEL_SEARCH_DISTANCE);
+                let beside_stack = (item_center_x <= content_left + LABEL_EDGE_TOLERANCE
+                    && item_center_x >= content_left - LABEL_CLAIM_PAD)
+                    || (item_center_x >= content_right - LABEL_EDGE_TOLERANCE
+                        && item_center_x <= content_right + LABEL_CLAIM_PAD);
                 beside_stack
                     && item_center_y >= row_bottom - LABEL_EDGE_TOLERANCE
                     && item_center_y <= row_top + LABEL_EDGE_TOLERANCE
@@ -3396,6 +3397,12 @@ mod tests {
         let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented stack");
         assert!(has_external_segmented_bar_labels(&items, 1, &geometry));
         assert!(is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let far_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("Category", 20.0, 541.0 + row as f32 * 18.0, 9.0))
+            .collect();
+        assert!(!has_external_segmented_bar_labels(&far_items, 1, &geometry));
+        assert!(!is_chart_bar_cluster(&far_items, &raw_rects, 1));
 
         let rects: Vec<PdfRect> = raw_rects
             .into_iter()
