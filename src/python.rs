@@ -349,7 +349,7 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
             .into_iter()
             .map(|s| PyPageSignals {
                 page: s.page,
-                direction: s.direction.as_str().to_string(),
+                direction: s.direction.to_string(),
                 confidence: s.confidence,
             })
             .collect(),
@@ -448,7 +448,7 @@ fn to_py_pages_result(r: crate::PagesExtractionResult) -> PyPagesExtractionResul
                 markdown: p.markdown,
                 needs_ocr: p.needs_ocr,
                 ocr_reason: p.ocr_reason,
-                direction: p.direction.as_str().to_string(),
+                direction: p.direction.to_string(),
                 confidence: p.confidence,
             })
             .collect(),

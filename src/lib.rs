@@ -605,7 +605,7 @@ pub fn extract_pages_markdown_mem(
 
         // Direction + per-page confidence are computed over the same items that
         // feed the emitted markdown (page-number removal applied), so the signal
-        // matches the output a caller can inspect (KTD2).
+        // matches the output a caller can inspect.
         let direction = crate::text_utils::page_direction(
             page_items
                 .iter()
@@ -3910,7 +3910,17 @@ fn process_document(
 
             // Per-page signals (direction + text-confidence) for Full-mode
             // process results. Computed before `items` is consumed by markdown
-            // generation; pages with no text items default to ltr / 0.0 (A2).
+            // generation; page-number footers are removed first (matching the
+            // `extract_pages_markdown` signal), and pages with no text items
+            // default to ltr / 0.0. One O(items) pass buckets by page instead
+            // of re-scanning the full item list per page.
+            let mut items_by_page: std::collections::HashMap<u32, Vec<&TextItem>> =
+                std::collections::HashMap::new();
+            for (item, remove) in items.iter().zip(&removal_mask) {
+                if !*remove {
+                    items_by_page.entry(item.page).or_default().push(item);
+                }
+            }
             let mut page_signals = Vec::with_capacity(page_count as usize);
             let signal_pages: Vec<u32> = match &options.page_filter {
                 Some(filter) => {
@@ -3921,8 +3931,11 @@ fn process_document(
                 None => (1..=page_count).collect(),
             };
             for page in signal_pages {
-                let direction =
-                    crate::text_utils::page_direction(items.iter().filter(|i| i.page == page));
+                let bucket = items_by_page
+                    .get(&page)
+                    .map(|v| v.as_slice())
+                    .unwrap_or_default();
+                let direction = crate::text_utils::page_direction(bucket.iter().copied());
                 let confidence = text_quality
                     .confidence_by_page
                     .get(&page)

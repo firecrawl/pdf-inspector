@@ -163,7 +163,7 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
             .into_iter()
             .map(|s| PageSignals {
                 page: s.page,
-                direction: s.direction.as_str().to_string(),
+                direction: s.direction.to_string(),
                 confidence: s.confidence as f64,
             })
             .collect(),
@@ -671,7 +671,7 @@ pub fn extract_pages_markdown(
                     markdown: r.markdown,
                     needs_ocr: r.needs_ocr,
                     ocr_reason: r.ocr_reason,
-                    direction: r.direction.as_str().to_string(),
+                    direction: r.direction.to_string(),
                     confidence: r.confidence as f64,
                 })
                 .collect(),

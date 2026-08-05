@@ -124,7 +124,7 @@ impl From<PageSignals> for WasmPageSignals {
     fn from(value: PageSignals) -> Self {
         Self {
             page: value.page,
-            direction: value.direction.as_str().to_string(),
+            direction: value.direction.to_string(),
             confidence: value.confidence as f64,
         }
     }

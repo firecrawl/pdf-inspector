@@ -4030,7 +4030,7 @@ const HEBREW_B: &str = "\u{05D9}\u{05DB}\u{05DC} \u{05DE}\u{05E0}\u{05E1} \u{05E
 
 #[test]
 fn test_extract_pages_mem_hebrew_direction_and_confidence() {
-    // Hebrew-only page (AE1): rtl, confidence 1.0, no OCR needed.
+    // Hebrew-only page: rtl, confidence 1.0, no OCR needed.
     let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0), (HEBREW_B, 680.0)]);
     let result = extract_pages_markdown_mem(&buf, None).unwrap();
     assert_eq!(result.pages.len(), 1);
@@ -4055,7 +4055,7 @@ fn test_extract_pages_mem_mixed_direction() {
 
 #[test]
 fn test_extract_pages_mem_blank_page_defaults() {
-    // Blank page (AE2): ltr / 0.0 / needs_ocr.
+    // Blank page: ltr / 0.0 / needs_ocr.
     let buf = make_text_pdf_pages(&[vec![]]);
     let result = extract_pages_markdown_mem(&buf, None).unwrap();
     assert_eq!(result.pages.len(), 1);
@@ -4066,7 +4066,7 @@ fn test_extract_pages_mem_blank_page_defaults() {
 
 #[test]
 fn test_process_pdf_mem_full_page_signals() {
-    // Full mode (AE3): page_signals populated with rtl / 1.0.
+    // Full mode: page_signals populated with rtl / 1.0.
     let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0)]);
     let result = process_pdf_mem(&buf).unwrap();
     assert_eq!(result.page_signals.len(), 1);

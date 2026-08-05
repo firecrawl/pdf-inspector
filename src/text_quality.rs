@@ -230,7 +230,7 @@ pub(crate) struct TextQualityReport {
     pub(crate) pages_needing_ocr: Vec<u32>,
     pub(crate) has_encoding_issues: bool,
     pub(crate) reasons_by_page: BTreeMap<u32, Vec<String>>,
-    /// Per-page text-confidence (0.0–1.0) per plan KTD4: 0.0 when the page has
+    /// Per-page text-confidence (0.0–1.0) per the confidence contract: 0.0 when the page has
     /// no extractable text, 0.15 for binary garbled evidence (cipher-garble or
     /// Strong-span flags), otherwise density-graded by replacement density.
     pub(crate) confidence_by_page: BTreeMap<u32, f32>,
@@ -314,7 +314,7 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
     }
 }
 
-/// Per-page text-confidence (0.0–1.0) per plan KTD4:
+/// Per-page text-confidence (0.0–1.0) per the confidence contract:
 /// - no extractable text → 0.0
 /// - binary garbled evidence (cipher-garble or a Strong-span flag) → 0.15
 /// - otherwise density-graded by replacement chars per 10,000 non-whitespace
@@ -597,13 +597,13 @@ mod tests {
 
     #[test]
     fn confidence_clean_page_is_one() {
-        let items = vec![item("The quick brown fox jumps over the lazy dog.", 1)];
+        let items = [item("The quick brown fox jumps over the lazy dog.", 1)];
         assert_eq!(page_1_confidence(&items), 1.0);
     }
 
     #[test]
     fn confidence_whitespace_only_page_is_zero() {
-        let items = vec![item("   \n\t  ", 1)];
+        let items = [item("   \n\t  ", 1)];
         assert_eq!(page_1_confidence(&items), 0.0);
     }
 
@@ -618,7 +618,7 @@ mod tests {
         // 5 replacement chars in 100 non-whitespace chars = 500 bps → 0.5.
         let text: String =
             "hello\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}".to_string() + &"a".repeat(90);
-        let items = vec![item(&text, 1)];
+        let items = [item(&text, 1)];
         assert_eq!(page_1_confidence(&items), 0.5);
     }
 
@@ -626,7 +626,7 @@ mod tests {
     fn confidence_replacement_saturated_is_zero() {
         // 20 replacement chars in 100 non-whitespace chars = 2000 bps → 0.0.
         let text: String = "\u{FFFD}".repeat(20) + &"a".repeat(80);
-        let items = vec![item(&text, 1)];
+        let items = [item(&text, 1)];
         assert_eq!(page_1_confidence(&items), 0.0);
     }
 
@@ -637,20 +637,20 @@ mod tests {
                      toward its busy underground colony hidden beneath the ancient \
                      oak tree near the quiet brook that winds gently through the \
                      verdant meadow and into the dense forest of tall pines";
-        let items = vec![item(&substitution_cipher(clean), 1)];
+        let items = [item(&substitution_cipher(clean), 1)];
         assert_eq!(page_1_confidence(&items), 0.15);
     }
 
     #[test]
     fn confidence_private_use_span_is_015() {
         // PUA runs are a Strong span-level issue (dollar-as-space / PUA / C1).
-        let items = vec![item("\u{E000}\u{E001}\u{E002}\u{E003}\u{E004}\u{E005}", 1)];
+        let items = [item("\u{E000}\u{E001}\u{E002}\u{E003}\u{E004}\u{E005}", 1)];
         assert_eq!(page_1_confidence(&items), 0.15);
     }
 
     #[test]
     fn confidence_multi_page_is_per_page() {
-        let items = vec![item("Clean text on page one.", 1), item("   ", 2)];
+        let items = [item("Clean text on page one.", 1), item("   ", 2)];
         let report = analyze_text_quality(&items);
         assert_eq!(report.confidence_by_page[&1], 1.0);
         assert_eq!(report.confidence_by_page[&2], 0.0);
