@@ -161,6 +161,19 @@ pub struct PageOcrReasons {
     pub reasons: Vec<String>,
 }
 
+/// Per-page reading direction and text-confidence for Full-mode process
+/// results.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageSignals {
+    /// 1-indexed page number (matching `pages_needing_ocr`).
+    pub page: u32,
+    /// Reading direction of this page's text layer.
+    pub direction: PageDirection,
+    /// Per-page text-confidence (0.0–1.0); see the confidence formula
+    /// contract. 0.0 when the page has no usable text layer.
+    pub confidence: f32,
+}
+
 /// High-level PDF processing result.
 #[derive(Debug)]
 pub struct PdfProcessResult {
@@ -176,6 +189,10 @@ pub struct PdfProcessResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// Per-page reading direction + text-confidence signals, one entry per
+    /// processed page (1-indexed). Populated when extraction ran (Full or
+    /// Analyze mode); empty for DetectOnly and Scanned/ImageBased results.
+    pub page_signals: Vec<PageSignals>,
     /// Title from PDF metadata (if available).
     pub title: Option<String>,
     /// Detection confidence score (0.0–1.0).
@@ -3676,6 +3693,7 @@ fn process_document(
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
+            page_signals: Vec::new(),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3692,6 +3710,7 @@ fn process_document(
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
+            page_signals: Vec::new(),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3782,6 +3801,7 @@ fn process_document(
         gid_pages,
         text_quality_pages,
         text_quality_reasons_by_page,
+        page_signals,
     ) = match extracted {
         Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
@@ -3888,6 +3908,33 @@ fn process_document(
                 &chart_regions,
             );
 
+            // Per-page signals (direction + text-confidence) for Full-mode
+            // process results. Computed before `items` is consumed by markdown
+            // generation; pages with no text items default to ltr / 0.0 (A2).
+            let mut page_signals = Vec::with_capacity(page_count as usize);
+            let signal_pages: Vec<u32> = match &options.page_filter {
+                Some(filter) => {
+                    let mut pages: Vec<u32> = filter.iter().copied().collect();
+                    pages.sort_unstable();
+                    pages
+                }
+                None => (1..=page_count).collect(),
+            };
+            for page in signal_pages {
+                let direction =
+                    crate::text_utils::page_direction(items.iter().filter(|i| i.page == page));
+                let confidence = text_quality
+                    .confidence_by_page
+                    .get(&page)
+                    .copied()
+                    .unwrap_or(0.0);
+                page_signals.push(PageSignals {
+                    page,
+                    direction,
+                    confidence,
+                });
+            }
+
             let md = if options.mode == ProcessMode::Analyze {
                 None
             } else {
@@ -3918,6 +3965,7 @@ fn process_document(
                 gid_encoded_pages,
                 text_quality.pages_needing_ocr,
                 ocr_reasons_by_page,
+                page_signals,
             )
         }
         None => (
@@ -3927,6 +3975,7 @@ fn process_document(
             std::collections::HashSet::new(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
         ),
     };
 
@@ -4029,6 +4078,7 @@ fn process_document(
         title,
         confidence,
         layout,
+        page_signals,
         has_encoding_issues,
     })
 }
