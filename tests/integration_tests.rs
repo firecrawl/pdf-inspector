@@ -3936,3 +3936,51 @@ fn pdf_options_debug_redacts_password() {
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
 }
+
+/// Regression test for #205: a scanned form where every page is one
+/// near-full-page raster image plus a real digitally-generated header and
+/// footer. Real text on every page pushes `text_ratio` to 1.0, but the
+/// pages are still scans — the fixture's incidental text has 50+ Tj ops
+/// per page, which clears the narrow single-image/<50-op
+/// `has_template_images` filter, so before the fix this misrouted straight
+/// to `TextBased` with `ocr_recommended = false` and silently dropped the
+/// scan content instead of reaching the `Mixed` classification.
+#[test]
+fn test_detect_pdf_type_scanned_form_with_real_header_footer_is_mixed() {
+    let result = detect_pdf_type("tests/fixtures/scanned_form_real_header_footer.pdf")
+        .expect("fixture should parse");
+
+    assert_eq!(
+        result.pdf_type,
+        PdfType::Mixed,
+        "a near-full-page scan on every page must not classify as TextBased just because \
+         each page also carries real incidental header/footer text"
+    );
+    assert!(
+        result.ocr_recommended,
+        "scan content must still route to OCR even though real text is present"
+    );
+}
+
+/// Boundary regression for the #205 fix's own review: a document where
+/// exactly half of the text pages carry a near-full-page image and half
+/// are plain text with no image at all. `has_template_image` is the broad
+/// per-page "has a large image" flag, not a scan-specific one, so a
+/// legitimate report with some image-heavy pages and some plain pages must
+/// not flip to Mixed at an exact 50/50 split — only a real majority should.
+#[test]
+fn test_detect_pdf_type_half_pages_with_large_image_stays_text_based() {
+    let result = detect_pdf_type("tests/fixtures/half_pages_with_large_image.pdf")
+        .expect("fixture should parse");
+
+    assert_eq!(
+        result.pdf_type,
+        PdfType::TextBased,
+        "an exact 50/50 split of image-bearing vs. plain text pages is not \
+         \"most\" pages, so this must stay TextBased, not flip to Mixed"
+    );
+    assert!(
+        !result.ocr_recommended,
+        "should not be routed to OCR just because half its pages have an incidental large image"
+    );
+}

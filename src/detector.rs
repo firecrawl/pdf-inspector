@@ -214,6 +214,9 @@ pub(crate) fn detect_from_document(
     let mut pages_with_template_images = 0u32;
     let mut pages_with_vector_text = 0u32;
     let mut total_text_ops = 0u32;
+    // Text pages that also carry a near-full-page background image (>50%
+    // coverage) — see `pages_with_text_and_template_image` usage below.
+    let mut pages_with_text_and_template_image = 0u32;
     // Cache Phase 1 results to avoid re-analyzing sampled pages in Phase 2
     let mut analysis_cache: HashMap<u32, PageAnalysis> = HashMap::new();
     let mut pages_actually_sampled = 0u32;
@@ -246,6 +249,9 @@ pub(crate) fn detect_from_document(
                 && !analysis.has_only_type3_fonts
             {
                 pages_with_text += 1;
+                if analysis.has_template_image {
+                    pages_with_text_and_template_image += 1;
+                }
             }
             if analysis.has_images {
                 pages_with_images += 1;
@@ -301,6 +307,29 @@ pub(crate) fn detect_from_document(
         0.0
     };
 
+    // Share of counted text pages that also carry a near-full-page
+    // background image (>50% coverage). `has_template_images` above only
+    // flags the narrow scan-with-OCR-overlay shape (single image,
+    // text_operator_count < 50, low alphanumeric diversity), so it misses
+    // scans whose incidental real text (a digitally-generated header or
+    // footer) clears that bound. When *most* "text" pages are actually
+    // near-full-page scans, the text_ratio short-circuit below must not
+    // fire — see #205.
+    //
+    // `has_template_image` here is the broad per-page "has a large image"
+    // flag, not the narrow scan-with-overlay filter — a legitimate text
+    // document can incidentally have large images (a diagram, a cover
+    // photo) on some pages without being a scan. The gate below is
+    // deliberately a strict majority (`> 0.5`, not `>= 0.5`): an exact
+    // 50/50 split isn't "most" pages, so it stays TextBased. Only a real
+    // majority of text pages doubling as near-full-page images routes to
+    // Mixed.
+    let template_overlap_in_text_pages = if pages_with_text > 0 {
+        pages_with_text_and_template_image as f32 / pages_with_text as f32
+    } else {
+        0.0
+    };
+
     // OCR is recommended when:
     // 1. Template images are present (text alone is insufficient), OR
     // 2. PDF is scanned/image-based
@@ -311,7 +340,9 @@ pub(crate) fn detect_from_document(
         ocr_recommended = true;
         // Template-based PDF: has text but images provide essential context
         (PdfType::Mixed, 0.5 + (0.3 * (1.0 - template_ratio)))
-    } else if text_ratio >= config.text_page_ratio_threshold {
+    } else if text_ratio >= config.text_page_ratio_threshold
+        && template_overlap_in_text_pages <= 0.5
+    {
         ocr_recommended = false;
         (PdfType::TextBased, text_ratio)
     } else if pages_with_text == 0 && (pages_with_images > 0 || pages_with_vector_text > 0) {
