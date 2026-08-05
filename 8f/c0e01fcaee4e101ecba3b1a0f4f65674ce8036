@@ -1,0 +1,35 @@
+src/tables/detect_rects.rs
+  s_445161c5f6e19f::t_68cceaf5eddc41 2108-2121,2123-2177,2284-2300
+  s_445161c5f6e19f::t_eb2734c00e1347 3294,3296,3307-3343
+  s_445161c5f6e19f::t_0e75431de07be2 3275-3278,3283,3285-3289
+  s_445161c5f6e19f::t_17f357e530363f 3280,3284
+  s_445161c5f6e19f::t_398d6a318f5956 2122
+src/markdown/mod.rs
+  s_445161c5f6e19f::t_b086e70d56f337 127-138,145-151,155-160,1082,1100-1102,1129,1202-1204
+  s_445161c5f6e19f::t_8f2feb22138479 2126
+  s_445161c5f6e19f::t_cbeb5235cd6284 139-144
+  s_445161c5f6e19f::t_398d6a318f5956 152-154
+src/tables/detect_lines.rs
+  s_445161c5f6e19f::t_56ed448014ed90 1848-1863,1867,1869-1873,1875-1897
+  s_445161c5f6e19f::t_1c466ee74a66f3 7,19,1235-1251,1256-1270,1272,1275,1278-1279,1282-1306,1310-1330,1332-1390
+  s_445161c5f6e19f::t_398d6a318f5956 1252-1255,1276-1277,1864-1866,1868,1874
+src/lib.rs
+  s_445161c5f6e19f::t_2fcdd0abb716c1 5652
+  s_445161c5f6e19f::t_636eac75f49cb7 494-501,575,3827-3834,3851,5658-5674
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8fc0e01fcaee4e101ecba3b1a0f4f65674ce8036",
+  "prompts": {},
+  "sessions": {
+    "s_445161c5f6e19f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc8c2-c14f-7122-b05b-1db7eaf7f16c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
