@@ -113,12 +113,18 @@ class PdfResult:                     # process_pdf / detect_pdf
     processing_time_ms: int
     pages_needing_ocr: list[int]     # 1-indexed
     ocr_reasons_by_page: list[PageOcrReasons]
+    page_signals: list[PageSignals]  # per-page direction + confidence (present when extraction ran)
     title: str | None
     confidence: float                # 0.0 - 1.0
     is_complex_layout: bool
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool        # broken font encodings — consider OCR fallback
+
+class PageSignals:                   # per-page direction + text-confidence (process_pdf Full mode)
+    page: int                        # 1-indexed
+    direction: str                   # "ltr" | "rtl" | "mixed"
+    confidence: float                # 0.0 - 1.0 (1.0 clean text, 0.0 no usable text)
 
 class PageOcrReasons:                # per-page OCR diagnostics
     page: int                        # 1-indexed
@@ -155,10 +161,21 @@ class PageRegionTexts:               # extract_text_in_regions
     regions: list[RegionText]
 
 class PagesExtractionResult:         # extract_pages_markdown
-    pages: list[PageMarkdown]        # PageMarkdown: page (0-indexed), markdown, needs_ocr, ocr_reason
+    pages: list[PageMarkdown]        # PageMarkdown: page (0-indexed), markdown, needs_ocr, ocr_reason, direction, confidence
     pages_with_tables: list[int]     # 1-indexed
     pages_with_columns: list[int]    # 1-indexed
     pages_needing_ocr: list[int]     # 1-indexed
     ocr_reasons_by_page: list[PageOcrReasons]
     is_complex: bool                 # any page has tables or multi-column layout
+```
+
+Per-page markdown entries expose the reading direction and a per-page
+text-confidence score:
+
+```python
+result = pdf_inspector.extract_pages_markdown_bytes(data)
+page = result.pages[0]
+page.direction      # "ltr" | "rtl" | "mixed" — RTL ordering was applied when != "ltr"
+page.confidence     # 0.0 - 1.0: 1.0 clean text layer, 0.15 binary garbled
+                    # evidence, 0.0 when the page has no usable text
 ```

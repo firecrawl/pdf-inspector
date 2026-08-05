@@ -57,6 +57,13 @@ class TestProcessPdf:
         assert isinstance(result.has_encoding_issues, bool)
         # title can be None or str
         assert result.title is None or isinstance(result.title, str)
+        # per-page signals (Full mode extracts every page of the text fixture)
+        assert isinstance(result.page_signals, list)
+        assert len(result.page_signals) == result.page_count
+        for signal in result.page_signals:
+            assert isinstance(signal.page, int)
+            assert signal.direction in ("ltr", "rtl", "mixed")
+            assert 0.0 <= signal.confidence <= 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +318,14 @@ class TestExtractPagesMarkdown:
         assert isinstance(page.needs_ocr, bool)
         assert not page.needs_ocr  # text-based fixture
         assert len(page.markdown) > 0
+        # new per-page signals
+        assert page.direction in ("ltr", "rtl", "mixed")
+        assert 0.0 <= page.confidence <= 1.0
+
+    def test_page_signals_present_on_detect_only_result(self):
+        # DetectOnly mode returns no per-page signals.
+        result = pdf_inspector.detect_pdf(fixture_path("thermo-freon12.pdf"))
+        assert result.page_signals == []
 
     def test_result_fields(self):
         result = pdf_inspector.extract_pages_markdown(
