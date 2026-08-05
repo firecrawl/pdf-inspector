@@ -42,6 +42,9 @@ pub struct PdfResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// Per-page direction + text-confidence signals, one entry per processed
+    /// page (1-indexed). Present when extraction ran.
+    pub page_signals: Vec<PageSignals>,
     pub title: Option<String>,
     pub confidence: f64,
     pub is_complex_layout: bool,
@@ -55,6 +58,17 @@ pub struct PdfResult {
 pub struct PageOcrReasons {
     pub page: u32,
     pub reasons: Vec<String>,
+}
+
+/// Per-page reading direction and text-confidence for Full-mode results.
+#[napi(object)]
+pub struct PageSignals {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// Reading direction: "ltr", "rtl", or "mixed".
+    pub direction: String,
+    /// Per-page text-confidence (0.0-1.0).
+    pub confidence: f64,
 }
 
 /// Lightweight PDF classification result.
@@ -144,6 +158,15 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         processing_time_ms: r.processing_time_ms as u32,
         pages_needing_ocr: r.pages_needing_ocr,
         ocr_reasons_by_page: to_napi_page_ocr_reasons(r.ocr_reasons_by_page),
+        page_signals: r
+            .page_signals
+            .into_iter()
+            .map(|s| PageSignals {
+                page: s.page,
+                direction: s.direction.as_str().to_string(),
+                confidence: s.confidence as f64,
+            })
+            .collect(),
         title: r.title,
         confidence: r.confidence as f64,
         is_complex_layout: r.layout.is_complex,
@@ -597,6 +620,10 @@ pub struct PageMarkdownResult {
     pub needs_ocr: bool,
     /// Machine-readable OCR reason when the cause is known.
     pub ocr_reason: Option<String>,
+    /// Reading direction: "ltr", "rtl", or "mixed".
+    pub direction: String,
+    /// Per-page text-confidence (0.0-1.0).
+    pub confidence: f64,
 }
 
 /// Combined per-page markdown extraction and layout classification result.
@@ -644,6 +671,8 @@ pub fn extract_pages_markdown(
                     markdown: r.markdown,
                     needs_ocr: r.needs_ocr,
                     ocr_reason: r.ocr_reason,
+                    direction: r.direction.as_str().to_string(),
+                    confidence: r.confidence as f64,
                 })
                 .collect(),
             pages_with_tables: result.pages_with_tables,
