@@ -2220,10 +2220,12 @@ fn has_external_segmented_bar_labels(
                 let item_right = item.x.max(item.x + item.width);
                 let item_center_x = (item_left + item_right) / 2.0;
                 let item_center_y = item.y + item.height / 2.0;
-                let beside_stack = (item_center_x < content_left
-                    && item_center_x >= content_left - LABEL_CLAIM_PAD)
-                    || (item_center_x > content_right
-                        && item_center_x <= content_right + LABEL_CLAIM_PAD);
+                let beside_stack = (item_center_x <= content_left + LABEL_EDGE_TOLERANCE
+                    && item_center_x >= content_left - LABEL_CLAIM_PAD
+                    && item_left <= content_left)
+                    || (item_center_x >= content_right - LABEL_EDGE_TOLERANCE
+                        && item_center_x <= content_right + LABEL_CLAIM_PAD
+                        && item_right >= content_right);
                 beside_stack
                     && item_center_y >= row_bottom - LABEL_EDGE_TOLERANCE
                     && item_center_y <= row_top + LABEL_EDGE_TOLERANCE
@@ -3407,6 +3409,16 @@ mod tests {
             &geometry
         ));
         assert!(is_chart_bar_cluster(&numeric_items, &raw_rects, 1));
+
+        let edge_adjacent_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("2024", 92.0, 541.0 + row as f32 * 18.0, 9.0))
+            .collect();
+        assert!(has_external_segmented_bar_labels(
+            &edge_adjacent_items,
+            1,
+            &geometry
+        ));
+        assert!(is_chart_bar_cluster(&edge_adjacent_items, &raw_rects, 1));
 
         let far_items: Vec<TextItem> = (0..4)
             .map(|row| make_item("Category", 20.0, 541.0 + row as f32 * 18.0, 9.0))
