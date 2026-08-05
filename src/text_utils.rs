@@ -158,12 +158,14 @@ pub(crate) fn sort_line_items(items: &mut [TextItem]) {
 
 /// Reading direction of a page's text layer.
 ///
-/// Groups items into lines with the extractor's 5pt Y-tolerance, then
-/// classifies each line with the same RTL/LTR counters as [`is_rtl_text`]:
-/// RTL-dominant when `rtl > 0 && rtl > ltr`, LTR-dominant when
-/// `ltr > 0 && ltr >= rtl`, neutral otherwise (digits/punctuation-only,
-/// CJK-only, empty). The page is `Rtl` when at least one line is RTL-dominant
-/// and none is LTR-dominant, `Mixed` when both occur, `Ltr` otherwise.
+/// Groups items into lines with the same 5pt Y-tolerance and comparator as the
+/// extractor's per-line RTL ordering (`merge_text_items` in `extractor/mod.rs`,
+/// which X-sorts each line direction-aware), then classifies each line with the
+/// same RTL/LTR counters as [`is_rtl_text`]: RTL-dominant when
+/// `rtl > 0 && rtl > ltr`, LTR-dominant when `ltr > 0 && ltr >= rtl`, neutral
+/// otherwise (digits/punctuation-only, CJK-only, empty). The page is `Rtl` when
+/// at least one line is RTL-dominant and none is LTR-dominant, `Mixed` when
+/// both occur, `Ltr` otherwise.
 pub(crate) fn page_direction<'a, I>(items: I) -> PageDirection
 where
     I: IntoIterator<Item = &'a TextItem>,
@@ -990,6 +992,18 @@ mod tests {
     #[test]
     fn page_direction_empty_items_is_ltr() {
         let items: [TextItem; 0] = [];
+        assert_eq!(page_direction(items.iter()), PageDirection::Ltr);
+    }
+
+    #[test]
+    fn page_direction_merges_items_within_line_tolerance() {
+        // Two items 4pt apart in Y land on the same line (extractor's 5pt
+        // tolerance): one Latin char + one Hebrew char merge into a tie,
+        // which classifies the line as LTR-dominant and the page as LTR.
+        let items = [
+            text_item("A", 10.0, 100.0, 1),
+            text_item("\u{05D0}", 20.0, 103.0, 1),
+        ];
         assert_eq!(page_direction(items.iter()), PageDirection::Ltr);
     }
 

@@ -192,6 +192,8 @@ pub struct PdfProcessResult {
     /// Per-page reading direction + text-confidence signals, one entry per
     /// processed page (1-indexed). Populated when extraction ran (Full or
     /// Analyze mode); empty for DetectOnly and Scanned/ImageBased results.
+    /// A page filter naming pages beyond `page_count` yields default entries
+    /// (`ltr` / 0.0), mirroring the extraction path's out-of-range convention.
     pub page_signals: Vec<PageSignals>,
     /// Title from PDF metadata (if available).
     pub title: Option<String>,

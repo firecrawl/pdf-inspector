@@ -4107,3 +4107,52 @@ fn test_extract_pages_mem_requested_pages_subset_signals() {
     assert_eq!(result.pages[1].page, 0);
     assert_eq!(result.pages[1].direction, PageDirection::Ltr);
 }
+
+#[test]
+fn test_extract_pages_mem_replacement_confidence_half() {
+    // 5 U+FFFD among 100 non-whitespace chars = 500 bps replacement density
+    // → per-page confidence 0.5 through the public extraction API.
+    let text: String =
+        "hello\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}".to_string() + &"a".repeat(90);
+    let buf = make_text_pdf_lines(&[(&text, 700.0)]);
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(result.pages[0].confidence, 0.5);
+}
+
+#[test]
+fn test_process_pdf_mem_analyze_mode_page_signals() {
+    // Analyze mode extracts items (page_signals populated) but skips markdown.
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0)]);
+    let result =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().mode(ProcessMode::Analyze)).unwrap();
+    assert!(result.markdown.is_none());
+    assert_eq!(result.page_signals.len(), 1);
+    assert_eq!(result.page_signals[0].page, 1);
+    assert_eq!(result.page_signals[0].direction, PageDirection::Rtl);
+}
+
+#[test]
+fn test_process_pdf_mem_page_filter_out_of_range() {
+    // A page filter naming a page beyond page_count yields a default entry
+    // (ltr / 0.0), mirroring the extraction path's out-of-range convention.
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0)]);
+    let opts = PdfOptions::new().pages([9999]);
+    let result = process_pdf_mem_with_options(&buf, opts).unwrap();
+    assert_eq!(result.page_signals.len(), 1);
+    assert_eq!(result.page_signals[0].page, 9999);
+    assert_eq!(result.page_signals[0].direction, PageDirection::Ltr);
+    assert_eq!(result.page_signals[0].confidence, 0.0);
+}
+
+#[test]
+fn test_process_pdf_mem_full_blank_page_signals() {
+    // A blank page inside a text-based document gets a default entry.
+    let buf = make_text_pdf_pages(&[vec![(HEBREW_A, 700.0)], vec![]]);
+    let result = process_pdf_mem(&buf).unwrap();
+    assert_eq!(result.page_signals.len(), 2);
+    assert_eq!(result.page_signals[0].direction, PageDirection::Rtl);
+    assert_eq!(result.page_signals[0].confidence, 1.0);
+    assert_eq!(result.page_signals[1].page, 2);
+    assert_eq!(result.page_signals[1].direction, PageDirection::Ltr);
+    assert_eq!(result.page_signals[1].confidence, 0.0);
+}

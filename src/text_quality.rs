@@ -623,6 +623,14 @@ mod tests {
     }
 
     #[test]
+    fn confidence_moderate_replacement_band() {
+        // 2 replacement chars in 100 non-whitespace chars = 200 bps → 0.8.
+        let text: String = "a".repeat(98) + "\u{FFFD}\u{FFFD}";
+        let items = [item(&text, 1)];
+        assert_eq!(page_1_confidence(&items), 0.8);
+    }
+
+    #[test]
     fn confidence_replacement_saturated_is_zero() {
         // 20 replacement chars in 100 non-whitespace chars = 2000 bps → 0.0.
         let text: String = "\u{FFFD}".repeat(20) + &"a".repeat(80);
