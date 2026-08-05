@@ -2222,10 +2222,10 @@ fn has_external_segmented_bar_labels(
                 let item_center_y = item.y + item.height / 2.0;
                 let beside_stack = (item_center_x <= content_left + LABEL_EDGE_TOLERANCE
                     && item_center_x >= content_left - LABEL_CLAIM_PAD
-                    && item_left <= content_left)
+                    && item_left < content_left)
                     || (item_center_x >= content_right - LABEL_EDGE_TOLERANCE
                         && item_center_x <= content_right + LABEL_CLAIM_PAD
-                        && item_right >= content_right);
+                        && item_right > content_right);
                 beside_stack
                     && item_center_y >= row_bottom - LABEL_EDGE_TOLERANCE
                     && item_center_y <= row_top + LABEL_EDGE_TOLERANCE
@@ -3465,6 +3465,16 @@ mod tests {
         let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented rows");
         assert!(!has_external_segmented_bar_labels(&items, 1, &geometry));
         assert!(!is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let flush_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("1", 100.0, 541.0 + row as f32 * 20.0, 9.0))
+            .collect();
+        assert!(!has_external_segmented_bar_labels(
+            &flush_items,
+            1,
+            &geometry
+        ));
+        assert!(!is_chart_bar_cluster(&flush_items, &raw_rects, 1));
 
         let rects: Vec<PdfRect> = raw_rects
             .into_iter()
