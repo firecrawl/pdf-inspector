@@ -1688,56 +1688,58 @@ pub(crate) fn is_newspaper_layout(
         return false;
     }
 
-    if min_lines < 15 {
-        // Sidebar detection: a narrow annotation column beside a wide body column.
-        // Guards:
-        //   - Only 2 columns (sidebars are body+sidebar, not 3+ columns)
-        //   - width_ratio < 0.50: sidebar is much narrower than body
-        //   - line_balance < 0.35: sidebar has significantly fewer lines
-        //   - max_lines >= 20: body column has substantial prose content
-        //   - narrower column has fewer lines (not a dense reference column)
-        if columns.len() == 2 && per_column_lines.len() == 2 {
-            let w0 = columns[0].x_max - columns[0].x_min;
-            let w1 = columns[1].x_max - columns[1].x_min;
-            let width_ratio = w0.min(w1) / w0.max(w1);
-            let line_balance = if max_lines > 0 {
-                min_lines as f32 / max_lines as f32
+    // Sidebar detection: a narrow annotation column beside a wide body column.
+    // Guards:
+    //   - Only 2 columns (sidebars are body+sidebar, not 3+ columns)
+    //   - width_ratio < 0.50: sidebar is much narrower than body
+    //   - line_balance < 0.35: sidebar has significantly fewer lines
+    //   - max_lines >= 20: body column has substantial prose content
+    //   - narrower column has fewer lines (not a dense reference column)
+    if columns.len() == 2 && per_column_lines.len() == 2 {
+        let w0 = columns[0].x_max - columns[0].x_min;
+        let w1 = columns[1].x_max - columns[1].x_min;
+        let width_ratio = w0.min(w1) / w0.max(w1);
+        let line_balance = if max_lines > 0 {
+            min_lines as f32 / max_lines as f32
+        } else {
+            1.0
+        };
+        let narrow_width = w0.min(w1);
+        if width_ratio < 0.50 && line_balance < 0.35 && max_lines >= 20 && narrow_width >= 160.0 {
+            let narrower_idx = if w0 < w1 { 0 } else { 1 };
+            let fewest_idx = if per_column_lines[0].len() <= per_column_lines[1].len() {
+                0
             } else {
-                1.0
+                1
             };
-            let narrow_width = w0.min(w1);
-            if width_ratio < 0.50 && line_balance < 0.35 && max_lines >= 20 && narrow_width >= 160.0
-            {
-                let narrower_idx = if w0 < w1 { 0 } else { 1 };
-                let fewest_idx = if per_column_lines[0].len() <= per_column_lines[1].len() {
-                    0
-                } else {
-                    1
-                };
-                if narrower_idx == fewest_idx {
-                    // Sparse density check: sidebar annotations are spread thinly
-                    // across the page height while regular two-column text is dense.
-                    // Compare average Y-gap between successive lines in each column.
-                    let narrow = &per_column_lines[narrower_idx];
-                    let wide = &per_column_lines[1 - narrower_idx];
-                    let avg_gap = |lines: &[TextLine]| -> f32 {
-                        if lines.len() < 2 {
-                            return 0.0;
-                        }
-                        let mut ys: Vec<f32> = lines.iter().map(|l| l.y).collect();
-                        ys.sort_by(|a, b| a.total_cmp(b));
-                        let span = ys.last().unwrap() - ys.first().unwrap();
-                        span / (lines.len() as f32 - 1.0)
-                    };
-                    let narrow_gap = avg_gap(narrow);
-                    let wide_gap = avg_gap(wide);
-                    // Sidebar annotations have >2.5x the average gap of body text
-                    if wide_gap > 0.0 && narrow_gap / wide_gap >= 2.5 {
-                        return true;
+            if narrower_idx == fewest_idx {
+                // Sparse density check: sidebar annotations are spread thinly
+                // across the page height while regular two-column text is dense.
+                // Compare average Y-gap between successive lines in each column.
+                let narrow = &per_column_lines[narrower_idx];
+                let wide = &per_column_lines[1 - narrower_idx];
+                let avg_gap = |lines: &[TextLine]| -> f32 {
+                    if lines.len() < 2 {
+                        return 0.0;
                     }
+                    let mut ys: Vec<f32> = lines.iter().map(|l| l.y).collect();
+                    ys.sort_by(|a, b| a.total_cmp(b));
+                    let span = ys.last().unwrap() - ys.first().unwrap();
+                    span / (lines.len() as f32 - 1.0)
+                };
+                let narrow_gap = avg_gap(narrow);
+                let wide_gap = avg_gap(wide);
+                // Sidebar annotations have >2.5x the average gap of body text
+                if wide_gap > 0.0 && narrow_gap / wide_gap >= 2.5 {
+                    return true;
                 }
             }
         }
+    }
+
+    // For 4+ column layouts (e.g. 4, 5, 6 columns), require dense columns (≥15 lines)
+    // to distinguish multi-column newspapers (WSJ/NYT) from borderless data tables.
+    if columns.len() >= 4 && min_lines < 15 {
         return false;
     }
 
@@ -2716,9 +2718,9 @@ mod tests {
     }
 
     #[test]
-    fn borderless_table_not_misclassified() {
-        // Two columns of similar width and equal line counts → borderless table, not newspaper.
-        // width_ratio = 250/300 = 0.83 (> 0.50), so sidebar guard fails → false.
+    fn short_two_column_page_detected_as_newspaper() {
+        // Two columns of similar width and balanced line counts (e.g. 10 lines each)
+        // should be recognized as newspaper layout for sequential reading order.
         let col1 = make_lines(10, 50.0);
         let col2 = make_lines(10, 350.0);
         let cols = vec![
@@ -2732,8 +2734,8 @@ mod tests {
             },
         ];
         assert!(
-            !is_newspaper_layout(&[col1, col2], &cols),
-            "Equal-width equal-row columns should NOT be newspaper (borderless table)"
+            is_newspaper_layout(&[col1, col2], &cols),
+            "Equal-width balanced short columns should be detected as newspaper layout"
         );
     }
 
@@ -2903,5 +2905,27 @@ mod tests {
         let mask = identify_spanning_lines(&items, &cols);
         let spanning_count = mask.iter().filter(|&&m| m).count();
         assert_eq!(spanning_count, 0, "Narrow header should NOT be pre-masked");
+    }
+
+    #[test]
+    fn two_column_exam_layout_retained_sequentially() {
+        // Two columns with 10 lines each (e.g., 2-column exam questions)
+        let cols = vec![
+            ColumnRegion {
+                x_min: 15.0,
+                x_max: 100.0,
+            },
+            ColumnRegion {
+                x_min: 110.0,
+                x_max: 195.0,
+            },
+        ];
+        let col1 = make_lines(10, 20.0);
+        let col2 = make_lines(10, 115.0);
+
+        assert!(
+            is_newspaper_layout(&[col1, col2], &cols),
+            "Two-column page with 10 lines per column should be classified as newspaper layout"
+        );
     }
 }
