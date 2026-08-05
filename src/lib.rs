@@ -570,6 +570,7 @@ pub fn extract_pages_markdown_mem(
     let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
+    let lopdf_pages = doc.get_pages();
 
     for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
@@ -618,6 +619,25 @@ pub fn extract_pages_markdown_mem(
             page_1idx,
         );
 
+        // A page can extract cleanly (no decoding issues, non-empty text)
+        // while still being fundamentally a scan: a full-page raster with
+        // a little genuine native text drawn over it (a header, a stamp, a
+        // cover-sheet annotation). Text-quality signals alone can't see
+        // that — consult the same "large background image" signal
+        // classify_pdf/detect_pdf_type already uses, so the two APIs can't
+        // silently disagree on whether a page needs OCR. See #227.
+        // Also covers vector-outlined text (glyphs drawn as paths, not
+        // shown via a text-showing operator): a hybrid page with real
+        // embedded-font body text elsewhere would otherwise still extract
+        // non-empty, non-garbled markdown and miss OCR routing entirely.
+        // detect_from_document's Mixed-type per-page routing always sends
+        // these pages to OCR; mirror that here too. Both signals share one
+        // analyze_page_content pass — see page_ocr_signals's doc comment.
+        let (has_template_image, has_vector_text) = lopdf_pages
+            .get(&page_1idx)
+            .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
+            .unwrap_or((false, false));
+
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
             base_font_size: Some(font_stats.most_common_size),
@@ -655,10 +675,20 @@ pub fn extract_pages_markdown_mem(
                 OCR_REASON_SUSPECTED_GARBLED_TEXT,
             );
         }
+        if has_template_image {
+            add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_SCANNED);
+        }
+        if has_vector_text {
+            add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_VECTOR_TEXT);
+        }
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 
-        let needs_ocr =
-            ocr_reason.is_some() || md.trim().is_empty() || has_gid || is_garbage_text(&md);
+        let needs_ocr = ocr_reason.is_some()
+            || md.trim().is_empty()
+            || has_gid
+            || is_garbage_text(&md)
+            || has_template_image
+            || has_vector_text;
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
