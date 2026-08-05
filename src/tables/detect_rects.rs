@@ -2099,9 +2099,14 @@ fn repeated_cell_grid_overrides_bar_hypothesis(group_rects: &[(f32, f32, f32, f3
 ///
 /// Category rows must have visible gutters and data-varying internal segment
 /// boundaries, unlike the stable boundaries of a ruled table.
-fn segmented_stacked_bar_bounds(
+struct SegmentedBarGeometry {
+    bounds: (f32, f32, f32, f32),
+    row_bands: Vec<(f32, f32)>,
+}
+
+fn segmented_stacked_bar_geometry(
     group_rects: &[(f32, f32, f32, f32)],
-) -> Option<(f32, f32, f32, f32)> {
+) -> Option<SegmentedBarGeometry> {
     type BarRow = (f32, f32, Vec<(f32, f32)>);
 
     const EDGE_TOLERANCE: f32 = 3.0;
@@ -2184,35 +2189,48 @@ fn segmented_stacked_bar_bounds(
         .reduce(f32::max)?;
     let bottom = rows.iter().map(|row| row.0).reduce(f32::min)?;
     let top = rows.iter().map(|row| row.1).reduce(f32::max)?;
-    Some((left, bottom, right, top))
+    let row_bands = rows.iter().map(|row| (row.0, row.1)).collect();
+    Some(SegmentedBarGeometry {
+        bounds: (left, bottom, right, top),
+        row_bands,
+    })
 }
 
-/// Require a separate, padded plot boundary before a segmented stack may
-/// override an otherwise valid repeated-cell grid.
-fn has_padded_enclosing_plot_frame(
-    group_rects: &[(f32, f32, f32, f32)],
-    (content_left, content_bottom, content_right, content_top): (f32, f32, f32, f32),
+/// Category labels beside multiple bar rows are independent chart evidence:
+/// numeric table text stays inside its cells, regardless of whether the table
+/// has an outer border or extra padding.
+fn has_external_segmented_bar_labels(
+    items: &[TextItem],
+    page: u32,
+    geometry: &SegmentedBarGeometry,
 ) -> bool {
-    const MIN_FRAME_PAD: f32 = 4.0;
+    const LABEL_EDGE_TOLERANCE: f32 = 3.0;
+    const LABEL_SEARCH_DISTANCE: f32 = 120.0;
 
-    let content_width = content_right - content_left;
-    let content_height = content_top - content_bottom;
-    group_rects.iter().any(|&(x, y, width, height)| {
-        let left = x.min(x + width);
-        let right = x.max(x + width);
-        let bottom = y.min(y + height);
-        let top = y.max(y + height);
-        let frame_width = right - left;
-        let frame_height = top - bottom;
+    let (content_left, _, content_right, _) = geometry.bounds;
+    let labeled_rows = geometry
+        .row_bands
+        .iter()
+        .filter(|&&(row_bottom, row_top)| {
+            items.iter().any(|item| {
+                if item.page != page || !item.text.chars().any(char::is_alphabetic) {
+                    return false;
+                }
+                let item_left = item.x.min(item.x + item.width);
+                let item_right = item.x.max(item.x + item.width);
+                let item_center_y = item.y + item.height / 2.0;
+                let beside_stack = (item_right <= content_left + LABEL_EDGE_TOLERANCE
+                    && item_right >= content_left - LABEL_SEARCH_DISTANCE)
+                    || (item_left >= content_right - LABEL_EDGE_TOLERANCE
+                        && item_left <= content_right + LABEL_SEARCH_DISTANCE);
+                beside_stack
+                    && item_center_y >= row_bottom - LABEL_EDGE_TOLERANCE
+                    && item_center_y <= row_top + LABEL_EDGE_TOLERANCE
+            })
+        })
+        .count();
 
-        left <= content_left - MIN_FRAME_PAD
-            && right >= content_right + MIN_FRAME_PAD
-            && bottom <= content_bottom - MIN_FRAME_PAD
-            && top >= content_top + MIN_FRAME_PAD
-            && frame_width <= content_width * 2.0
-            && frame_height <= content_height * 2.5
-            && !(left < 5.0 && bottom < 5.0)
-    })
+    labeled_rows >= 2 && labeled_rows * 2 >= geometry.row_bands.len()
 }
 
 /// Recognize filled vertical or horizontal bars whose geometry and labels are
@@ -2332,11 +2350,11 @@ fn is_chart_bar_cluster(
     let has_bar_signature = has_chart_bar_signature(items, group_rects, page);
 
     // A segmented horizontal chart can share most of its edges across rows.
-    // Only let it bypass the grid safeguard when a separate plot frame
-    // confirms that the rows belong to a chart rather than a gapped table.
+    // Row-aligned category labels outside the stack distinguish it from a
+    // numeric table without depending on whether either shape has a frame.
     if has_bar_signature {
-        if let Some(bounds) = segmented_stacked_bar_bounds(group_rects) {
-            if has_padded_enclosing_plot_frame(group_rects, bounds) {
+        if let Some(geometry) = segmented_stacked_bar_geometry(group_rects) {
+            if has_external_segmented_bar_labels(items, page, &geometry) {
                 return true;
             }
         }
@@ -3341,7 +3359,7 @@ mod tests {
         assert!(is_repeated_cell_grid(&rects));
         assert!(has_chart_bar_signature(&[], &rects, 1));
         assert!(repeated_cell_grid_overrides_bar_hypothesis(&rects));
-        assert!(segmented_stacked_bar_bounds(&rects).is_none());
+        assert!(segmented_stacked_bar_geometry(&rects).is_none());
         assert!(!is_chart_bar_cluster(&[], &rects, 1));
 
         let mut with_page_fills =
@@ -3369,12 +3387,15 @@ mod tests {
                     .map(|edge| (edge[0], y, edge[1] - edge[0], 12.0)),
             );
         }
+        let items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("Category", 62.0, 541.0 + row as f32 * 20.0, 9.0))
+            .collect();
 
         assert!(is_repeated_cell_grid(&raw_rects));
-        assert!(has_chart_bar_signature(&[], &raw_rects, 1));
-        let bounds = segmented_stacked_bar_bounds(&raw_rects).expect("segmented stack");
-        assert!(has_padded_enclosing_plot_frame(&raw_rects, bounds));
-        assert!(is_chart_bar_cluster(&[], &raw_rects, 1));
+        assert!(has_chart_bar_signature(&items, &raw_rects, 1));
+        let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented stack");
+        assert!(has_external_segmented_bar_labels(&items, 1, &geometry));
+        assert!(is_chart_bar_cluster(&items, &raw_rects, 1));
 
         let rects: Vec<PdfRect> = raw_rects
             .into_iter()
@@ -3386,21 +3407,21 @@ mod tests {
                 page: 1,
             })
             .collect();
-        assert_eq!(detect_chart_regions(&[], &rects, 1).len(), 1);
-        let (tables, hints) = detect_tables_from_rects(&[], &rects, 1);
+        assert_eq!(detect_chart_regions(&items, &rects, 1).len(), 1);
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
         assert!(tables.is_empty());
         assert!(hints.is_empty());
     }
 
     #[test]
-    fn gapped_numeric_grid_without_plot_frame_remains_a_table_hypothesis() {
+    fn padded_numeric_grid_frame_remains_a_table() {
         let row_edges = [
             [100.0, 140.0, 180.0, 220.0, 260.0],
             [100.0, 140.0, 180.0, 228.0, 260.0],
             [100.0, 140.0, 180.0, 214.0, 260.0],
             [100.0, 140.0, 180.0, 232.0, 260.0],
         ];
-        let mut raw_rects = vec![(100.0, 536.0, 160.0, 80.0)];
+        let mut raw_rects = vec![(96.0, 536.0, 168.0, 80.0)];
         let mut items = Vec::new();
         for (row, edges) in row_edges.into_iter().enumerate() {
             let y = 540.0 + row as f32 * 20.0;
@@ -3412,8 +3433,8 @@ mod tests {
 
         assert!(is_repeated_cell_grid(&raw_rects));
         assert!(has_chart_bar_signature(&items, &raw_rects, 1));
-        let bounds = segmented_stacked_bar_bounds(&raw_rects).expect("segmented rows");
-        assert!(!has_padded_enclosing_plot_frame(&raw_rects, bounds));
+        let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented rows");
+        assert!(!has_external_segmented_bar_labels(&items, 1, &geometry));
         assert!(!is_chart_bar_cluster(&items, &raw_rects, 1));
 
         let rects: Vec<PdfRect> = raw_rects
@@ -3428,6 +3449,43 @@ mod tests {
             .collect();
         assert!(detect_chart_regions(&items, &rects, 1).is_empty());
         assert!(!detect_tables_from_rects(&items, &rects, 1).0.is_empty());
+    }
+
+    #[test]
+    fn frameless_segmented_chart_with_category_labels_remains_a_chart() {
+        let row_edges = [
+            [100.0, 140.0, 180.0, 220.0, 260.0],
+            [100.0, 140.0, 180.0, 228.0, 260.0],
+            [100.0, 140.0, 180.0, 214.0, 260.0],
+            [100.0, 140.0, 180.0, 232.0, 260.0],
+        ];
+        let mut raw_rects = Vec::new();
+        let mut items = Vec::new();
+        for (row, edges) in row_edges.into_iter().enumerate() {
+            let y = 540.0 + row as f32 * 18.0;
+            raw_rects.extend(
+                edges
+                    .windows(2)
+                    .map(|edge| (edge[0], y, edge[1] - edge[0], 12.0)),
+            );
+            items.push(make_item("Category", 62.0, y + 1.0, 9.0));
+        }
+
+        let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented stack");
+        assert!(has_external_segmented_bar_labels(&items, 1, &geometry));
+        assert!(is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let rects: Vec<PdfRect> = raw_rects
+            .into_iter()
+            .map(|(x, y, width, height)| PdfRect {
+                x,
+                y,
+                width,
+                height,
+                page: 1,
+            })
+            .collect();
+        assert_eq!(detect_chart_regions(&items, &rects, 1).len(), 1);
     }
 
     // --- detect_stacked_box_table ---
