@@ -58,3 +58,14 @@ wasm-pack build wasm --target web --scope firecrawl --release
 ## License
 
 MIT
+
+### Per-page signals and OCR reasons
+
+`processPdf` results include `pageSignals` (per-page reading direction and
+text-confidence, 1-indexed, present when extraction ran) and
+`ocrReasonsByPage` with the typed `OcrReason` vocabulary:
+`suspected_garbled_text` | `scanned` | `no_text` | `vector_text`. Direction
+is `"ltr"` | `"rtl"` | `"mixed"` — RTL ordering was applied when it is not
+`"ltr"`. `phantom_empty_row`, `detection_error`, and `multi_row_in_cell`
+are TSR table-fallback labels, not OCR reasons. See `docs/rust-api.md` for
+the full contract.

@@ -1,6 +1,6 @@
 use pdf_inspector::{
-    LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions, PdfProcessResult, PdfType,
-    ProcessMode,
+    LayoutComplexity, MarkdownProfile, PageOcrReasons, PageSignals, PdfOptions, PdfProcessResult,
+    PdfType, ProcessMode,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -9,6 +9,8 @@ use wasm_bindgen::prelude::*;
 const TYPESCRIPT_TYPES: &str = r#"
 export type PdfType = "TextBased" | "Scanned" | "ImageBased" | "Mixed";
 export type MarkdownProfile = "fidelity" | "compact";
+/** OCR reason identifiers — keep in sync with the Rust constants in src/lib.rs. */
+export type OcrReason = "suspected_garbled_text" | "scanned" | "no_text" | "vector_text";
 
 export interface ProcessOptions {
   /** Restrict extraction to these 1-indexed page numbers. */
@@ -26,7 +28,16 @@ export interface ProcessOptions {
 export interface PageOcrReasons {
   /** 1-indexed page number. */
   page: number;
-  reasons: string[];
+  reasons: OcrReason[];
+}
+
+export interface PageSignals {
+  /** 1-indexed page number. */
+  page: number;
+  /** Reading direction: "ltr" | "rtl" | "mixed". */
+  direction: string;
+  /** Per-page text-confidence (0.0-1.0); 1.0 clean text, 0.0 no usable text. */
+  confidence: number;
 }
 
 export interface LayoutComplexity {
@@ -45,6 +56,8 @@ export interface PdfProcessResult {
   /** 1-indexed page numbers. */
   pagesNeedingOcr: number[];
   ocrReasonsByPage: PageOcrReasons[];
+  /** Per-page direction + confidence; present when extraction ran. */
+  pageSignals: PageSignals[];
   title?: string;
   confidence: number;
   layout: LayoutComplexity;
@@ -101,6 +114,24 @@ impl From<PageOcrReasons> for WasmPageOcrReasons {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct WasmPageSignals {
+    page: u32,
+    direction: String,
+    confidence: f64,
+}
+
+impl From<PageSignals> for WasmPageSignals {
+    fn from(value: PageSignals) -> Self {
+        Self {
+            page: value.page,
+            direction: value.direction.as_str().to_string(),
+            confidence: value.confidence as f64,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WasmLayoutComplexity {
     is_complex: bool,
     pages_with_tables: Vec<u32>,
@@ -126,6 +157,7 @@ struct WasmPdfProcessResult {
     processing_time_ms: f64,
     pages_needing_ocr: Vec<u32>,
     ocr_reasons_by_page: Vec<WasmPageOcrReasons>,
+    page_signals: Vec<WasmPageSignals>,
     title: Option<String>,
     confidence: f64,
     layout: WasmLayoutComplexity,
@@ -145,6 +177,7 @@ impl From<PdfProcessResult> for WasmPdfProcessResult {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            page_signals: value.page_signals.into_iter().map(Into::into).collect(),
             title: value.title,
             confidence: value.confidence as f64,
             layout: value.layout.into(),
@@ -391,6 +424,24 @@ mod tests {
 
         assert_eq!(pdf_type, "TextBased");
         assert!(!markdown.is_empty());
+
+        // pageSignals: one entry per processed page with direction + confidence.
+        let page_signals = Reflect::get(&result, &JsValue::from_str("pageSignals"))
+            .expect("pageSignals")
+            .dyn_into::<js_sys::Array>()
+            .expect("pageSignals array");
+        assert_eq!(page_signals.length(), 3);
+        let first = page_signals.get(0);
+        let direction = Reflect::get(&first, &JsValue::from_str("direction"))
+            .expect("direction")
+            .as_string()
+            .expect("direction string");
+        assert!(["ltr", "rtl", "mixed"].contains(&direction.as_str()));
+        let confidence = Reflect::get(&first, &JsValue::from_str("confidence"))
+            .expect("confidence")
+            .as_f64()
+            .expect("confidence number");
+        assert!((0.0..=1.0).contains(&confidence));
     }
 
     #[wasm_bindgen_test]
