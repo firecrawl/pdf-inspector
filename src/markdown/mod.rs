@@ -808,6 +808,32 @@ fn rect_cluster_spans_band_boundary(
     })
 }
 
+/// True when explicit vector-grid geometry proves that a proposed text gutter
+/// cuts through one ruled table. Physical cell boundaries outrank the
+/// text-only side-by-side guess; independent tables remain in separate bands.
+fn line_grid_spans_band_boundary(
+    items: &[TextItem],
+    lines: &[PdfLine],
+    page: u32,
+    bands: &[(f32, f32)],
+) -> bool {
+    if bands.len() < 2 {
+        return false;
+    }
+    let boundaries: Vec<f32> = bands[..bands.len() - 1].iter().map(|&(_, hi)| hi).collect();
+    crate::tables::detect_vector_grid_tables_from_lines(items, lines, page)
+        .iter()
+        .any(|table| {
+            let Some((&left, &right)) = table.columns.first().zip(table.columns.last()) else {
+                return false;
+            };
+            table.rows.len() >= 2
+                && boundaries
+                    .iter()
+                    .any(|&boundary| left < boundary && right > boundary)
+        })
+}
+
 fn split_from_hint_regions(items: &[TextItem], rects: &[PdfRect], page: u32) -> Vec<(f32, f32)> {
     use crate::tables::{cluster_rects, RectHintRegion};
 
@@ -1381,12 +1407,15 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // safely from folios; cleaned evidence is reserved for column and
         // final non-table layout decisions.
         let mut bands = split_side_by_side(&page_items);
-        // A rect table crossing a proposed split boundary means the "gutter"
-        // is really the gap between ruled and borderless table columns —
-        // splitting there cleaves the table in half. Veto the split.
-        if !bands.is_empty() && rect_cluster_spans_band_boundary(&page_items, rects, page, &bands) {
+        // Explicit table geometry crossing a proposed split boundary means the
+        // "gutter" is really a cell gap. Veto before band-local detection can
+        // accept plausible partial tables and discard the remaining columns.
+        if !bands.is_empty()
+            && (rect_cluster_spans_band_boundary(&page_items, rects, page, &bands)
+                || line_grid_spans_band_boundary(&page_items, pdf_lines, page, &bands))
+        {
             log::debug!(
-                "page {}: side-by-side split vetoed by spanning rect cluster",
+                "page {}: side-by-side split vetoed by spanning table geometry",
                 page
             );
             bands.clear();
