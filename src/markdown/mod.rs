@@ -69,7 +69,7 @@ fn is_chart_adjacent_label(item: &TextItem, region: (f32, f32, f32, f32)) -> boo
             || (mostly_inside_chart_width && close_to_chart_edge && category_sized))
 }
 
-fn item_is_in_chart_region(item: &TextItem, regions: &[(f32, f32, f32, f32)]) -> bool {
+pub(crate) fn item_is_in_chart_region(item: &TextItem, regions: &[(f32, f32, f32, f32)]) -> bool {
     regions.iter().any(|&(x0, y0, x1, y1)| {
         let cx = item.x + item.width / 2.0;
         let within_padded_x = cx >= x0 - CHART_REGION_PAD && cx <= x1 + CHART_REGION_PAD;
@@ -90,6 +90,38 @@ fn items_outside_chart_regions(
         .filter(|item| !item_is_in_chart_region(item, regions))
         .cloned()
         .collect()
+}
+
+pub(crate) fn merge_chart_regions(
+    regions: impl IntoIterator<Item = (f32, f32, f32, f32)>,
+) -> Vec<(f32, f32, f32, f32)> {
+    const MERGE_TOLERANCE: f32 = 3.0;
+
+    let mut merged: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for (x0, y0, x1, y1) in regions {
+        let mut current = (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1));
+        let mut index = 0;
+        while index < merged.len() {
+            let candidate = merged[index];
+            let overlaps = current.2 + MERGE_TOLERANCE >= candidate.0
+                && candidate.2 + MERGE_TOLERANCE >= current.0
+                && current.3 + MERGE_TOLERANCE >= candidate.1
+                && candidate.3 + MERGE_TOLERANCE >= current.1;
+            if overlaps {
+                current = (
+                    current.0.min(candidate.0),
+                    current.1.min(candidate.1),
+                    current.2.max(candidate.2),
+                    current.3.max(candidate.3),
+                );
+                merged.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        merged.push(current);
+    }
+    merged
 }
 
 /// Detect side-by-side table layout by finding a significant X-position gap.
@@ -327,6 +359,15 @@ fn chart_spans_prose_split(region: (f32, f32, f32, f32), split_x: f32) -> bool {
     let left = x0.min(x1);
     let right = x0.max(x1);
     split_x - left >= MIN_CHART_WIDTH_PER_SIDE && right - split_x >= MIN_CHART_WIDTH_PER_SIDE
+}
+
+pub(crate) fn chart_region_separates_prose_columns(
+    items: &[TextItem],
+    region: (f32, f32, f32, f32),
+) -> bool {
+    let outside = items_outside_chart_regions(items, &[region]);
+    chart_page_prose_column_split(&outside)
+        .is_some_and(|split_x| chart_spans_prose_split(region, split_x))
 }
 
 /// True when adjacent physical rows form an unterminated, lowercase prose
@@ -1125,7 +1166,11 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             .iter()
             .map(|(_, item)| (*item).clone())
             .collect();
-        let regions = crate::tables::detect_chart_regions(&page_items_ref, rects, page);
+        let rect_regions = crate::tables::detect_chart_regions(&page_items_ref, rects, page);
+        let line_regions = crate::tables::detect_dense_line_chart_regions(pdf_lines, rects, page)
+            .into_iter()
+            .filter(|&region| chart_region_separates_prose_columns(&page_items_ref, region));
+        let regions = merge_chart_regions(rect_regions.into_iter().chain(line_regions));
         if !regions.is_empty() {
             page_chart_map.insert(page, regions);
         }

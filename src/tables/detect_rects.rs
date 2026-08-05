@@ -1996,6 +1996,105 @@ fn without_dominant_page_backgrounds(rects: &[(f32, f32, f32, f32)]) -> Vec<(f32
         .collect()
 }
 
+/// Repeated rows of touching cell rectangles are stronger table evidence
+/// than the bar-length variation used by the chart detector.
+///
+/// Ruled tables with wrapped labels naturally have variable row heights, and
+/// numeric-heavy cells can otherwise resemble horizontal or vertical bars.
+/// Require several rows to repeat a shared edge schema before overriding the
+/// chart hypothesis so sparse plots and independent bars remain unaffected.
+fn is_repeated_cell_grid(group_rects: &[(f32, f32, f32, f32)]) -> bool {
+    type RowGroup = (f32, f32, Vec<(f32, f32)>);
+
+    const ROW_EDGE_TOLERANCE: f32 = 3.0;
+    const MIN_GRID_ROWS: usize = 4;
+    const MIN_CELLS_PER_ROW: usize = 3;
+
+    if group_rects.len() < MIN_GRID_ROWS * MIN_CELLS_PER_ROW {
+        return false;
+    }
+
+    let mut row_groups: Vec<RowGroup> = Vec::new();
+    for &(x, y, width, height) in group_rects {
+        if width < 5.0 || height < 5.0 {
+            continue;
+        }
+        let top = y + height;
+        if let Some((_, _, cells)) = row_groups.iter_mut().find(|(bottom, row_top, _)| {
+            (y - *bottom).abs() <= ROW_EDGE_TOLERANCE
+                && (top - *row_top).abs() <= ROW_EDGE_TOLERANCE
+        }) {
+            cells.push((x, x + width));
+        } else {
+            row_groups.push((y, top, vec![(x, x + width)]));
+        }
+    }
+
+    let mut row_schemas = Vec::new();
+    for (_, _, mut cells) in row_groups {
+        if cells.len() < MIN_CELLS_PER_ROW {
+            continue;
+        }
+        let mut widths: Vec<f32> = cells.iter().map(|&(left, right)| right - left).collect();
+        widths.sort_by(f32::total_cmp);
+        let median_width = widths[widths.len() / 2];
+        cells.retain(|&(left, right)| right - left <= median_width * 2.5);
+        cells.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+        });
+        cells.dedup_by(|left, right| {
+            (left.0 - right.0).abs() <= ROW_EDGE_TOLERANCE
+                && (left.1 - right.1).abs() <= ROW_EDGE_TOLERANCE
+        });
+        if cells.len() < MIN_CELLS_PER_ROW
+            || cells
+                .windows(2)
+                .any(|pair| pair[1].0 > pair[0].1 + ROW_EDGE_TOLERANCE)
+        {
+            continue;
+        }
+        let edges: Vec<f32> = cells
+            .iter()
+            .flat_map(|&(left, right)| [left, right])
+            .collect();
+        let schema = snap_edges(&edges, ROW_EDGE_TOLERANCE);
+        if schema.len() > MIN_CELLS_PER_ROW {
+            row_schemas.push(schema);
+        }
+    }
+    if row_schemas.len() < MIN_GRID_ROWS {
+        return false;
+    }
+
+    let reference = row_schemas
+        .iter()
+        .max_by_key(|schema| schema.len())
+        .expect("grid rows are non-empty");
+    row_schemas
+        .iter()
+        .filter(|schema| {
+            let comparable_edges = reference.len().min(schema.len());
+            let matched_edges = schema
+                .iter()
+                .filter(|edge| {
+                    reference
+                        .iter()
+                        .any(|reference_edge| (*edge - *reference_edge).abs() <= ROW_EDGE_TOLERANCE)
+                })
+                .count();
+            matched_edges > MIN_CELLS_PER_ROW && matched_edges * 4 >= comparable_edges * 3
+        })
+        .count()
+        >= MIN_GRID_ROWS
+}
+
+fn repeated_cell_grid_overrides_bar_hypothesis(group_rects: &[(f32, f32, f32, f32)]) -> bool {
+    is_repeated_cell_grid(group_rects)
+        && without_dominant_page_backgrounds(group_rects).len() == group_rects.len()
+}
+
 /// Detect a table from cell-background rects that failed grid detection.
 ///
 /// Uses rect Y-edges for row boundaries and text X-position clustering for
@@ -2011,6 +2110,10 @@ fn is_chart_bar_cluster(
     group_rects: &[(f32, f32, f32, f32)],
     page: u32,
 ) -> bool {
+    if repeated_cell_grid_overrides_bar_hypothesis(group_rects) {
+        return false;
+    }
+
     let numeric_or_empty = |(rx, ry, rw, rh): (f32, f32, f32, f32)| {
         let inside: Vec<&TextItem> = items
             .iter()
@@ -3081,6 +3184,33 @@ mod tests {
             .map(|(x, y)| make_item("42", x, y, 9.0))
             .collect();
         assert!(detect_chart_regions(&items, &rects, 1).is_empty());
+    }
+
+    #[test]
+    fn variable_height_ruled_grid_overrides_bar_hypothesis() {
+        let widths = [160.0, 70.0, 72.0, 75.0, 80.0];
+        let heights = [20.0, 34.0, 26.0, 42.0, 20.0, 34.0];
+        let mut rects = Vec::new();
+        let mut y = 650.0;
+        for height in heights {
+            let mut x = 80.0;
+            for width in widths {
+                rects.push((x, y, width, height));
+                x += width;
+            }
+            y -= height;
+        }
+
+        assert!(is_repeated_cell_grid(&rects));
+        assert!(repeated_cell_grid_overrides_bar_hypothesis(&rects));
+        assert!(!is_chart_bar_cluster(&[], &rects, 1));
+
+        let mut with_page_fills =
+            vec![(0.0, 0.0, 600.0, 800.0); DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        with_page_fills.extend(rects);
+        assert!(!repeated_cell_grid_overrides_bar_hypothesis(
+            &with_page_fills
+        ));
     }
 
     // --- detect_stacked_box_table ---
