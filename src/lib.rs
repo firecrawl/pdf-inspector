@@ -491,7 +491,14 @@ pub fn extract_pages_markdown_mem(
 
     // Tables need the original numeric cells; columns use folio-cleaned
     // evidence so removed page numbers cannot create false layout metadata.
-    let complexity = compute_layout_complexity(&all_items, &filtered_items, &all_rects, &all_lines);
+    let chart_regions = markdown::chart_regions_by_page(&all_items, &all_rects, &all_lines);
+    let complexity = compute_layout_complexity_with_chart_regions(
+        &all_items,
+        &filtered_items,
+        &all_rects,
+        &all_lines,
+        &chart_regions,
+    );
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
@@ -565,6 +572,7 @@ pub fn extract_pages_markdown_mem(
                     page_count,
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
                     prefiltered_page_number_mask: Some(&page_number_removal_mask),
+                    precomputed_chart_regions: Some(&chart_regions),
                 },
             )
         };
@@ -3816,7 +3824,14 @@ fn process_document(
 
             let text_quality = analyze_text_quality(&items);
             merge_ocr_reasons(&mut ocr_reasons_by_page, text_quality.reasons_by_page);
-            let layout = compute_layout_complexity(&items, &layout_items, &rects, &lines);
+            let chart_regions = markdown::chart_regions_by_page(&items, &rects, &lines);
+            let layout = compute_layout_complexity_with_chart_regions(
+                &items,
+                &layout_items,
+                &rects,
+                &lines,
+                &chart_regions,
+            );
 
             let md = if options.mode == ProcessMode::Analyze {
                 None
@@ -3833,6 +3848,7 @@ fn process_document(
                         page_count,
                         prefiltered_page_number_pages: Some(&removed_pages),
                         prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                        precomputed_chart_regions: Some(&chart_regions),
                     },
                 ))
             };
@@ -5633,11 +5649,29 @@ fn select_items_with_document_folio_context(
 }
 
 /// Analyse extracted items and rects for layout complexity.
+#[cfg(test)]
 fn compute_layout_complexity(
     items: &[types::TextItem],
     column_items: &[types::TextItem],
     rects: &[types::PdfRect],
     lines: &[types::PdfLine],
+) -> LayoutComplexity {
+    let page_chart_regions = markdown::chart_regions_by_page(items, rects, lines);
+    compute_layout_complexity_with_chart_regions(
+        items,
+        column_items,
+        rects,
+        lines,
+        &page_chart_regions,
+    )
+}
+
+fn compute_layout_complexity_with_chart_regions(
+    items: &[types::TextItem],
+    column_items: &[types::TextItem],
+    rects: &[types::PdfRect],
+    lines: &[types::PdfLine],
+    page_chart_regions: &markdown::PageChartRegions,
 ) -> LayoutComplexity {
     use markdown::analysis::calculate_font_stats_from_items;
 
@@ -5648,26 +5682,6 @@ fn compute_layout_complexity(
 
     let font_stats = calculate_font_stats_from_items(items);
     let base_size = font_stats.most_common_size;
-
-    let page_chart_regions: HashMap<u32, Vec<(f32, f32, f32, f32)>> = seen_pages
-        .iter()
-        .map(|&page| {
-            let page_items: Vec<types::TextItem> = items
-                .iter()
-                .filter(|item| item.page == page)
-                .cloned()
-                .collect();
-            let rect_regions = tables::detect_chart_regions(&page_items, rects, page);
-            let line_regions = tables::detect_dense_line_chart_regions(lines, rects, page)
-                .into_iter()
-                .filter(|&region| {
-                    markdown::chart_region_separates_prose_columns(&page_items, region)
-                });
-            let regions =
-                markdown::merge_chart_regions(rect_regions.into_iter().chain(line_regions));
-            (page, regions)
-        })
-        .collect();
 
     // --- Tables: use rect-based → line-based → heuristic detectors per page,
     //     with side-by-side band splitting ---

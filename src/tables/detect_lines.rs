@@ -4,7 +4,7 @@
 //! gridlines.  Many IRS forms and government PDFs use these instead of
 //! `re` (rectangle) operators.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::tables::Table;
 use crate::types::{PdfLine, PdfRect, TextItem};
@@ -16,6 +16,7 @@ const RULE_JOIN_GAP: f32 = 6.0;
 const RULE_SPAN_TOLERANCE: f32 = 8.0;
 const TEXT_ROW_TOLERANCE: f32 = 2.5;
 const DENSE_CHART_MIN_VERTICAL_EDGES: usize = 27;
+const DENSE_CHART_LABEL_PAD: f32 = 20.0;
 
 type HorizontalRule = (f32, f32, f32); // (y, x_min, x_max)
 type VerticalRule = (f32, f32, f32); // (x, y_min, y_max)
@@ -1231,79 +1232,162 @@ pub(crate) fn detect_dense_line_chart_regions(
         return Vec::new();
     }
 
-    let mut best_region = None;
-    let mut best_edge_count = 0;
-    for &(_, anchor_bottom, anchor_top) in &verticals {
-        let family: Vec<_> = verticals
-            .iter()
-            .copied()
-            .filter(|&(_, bottom, top)| {
-                (bottom - anchor_bottom).abs() <= EXTENT_TOLERANCE
-                    && (top - anchor_top).abs() <= EXTENT_TOLERANCE
-            })
-            .collect();
-        let xs = snap_edges(&family.iter().map(|&(x, _, _)| x).collect::<Vec<_>>(), 3.0);
-        if xs.len() < DENSE_CHART_MIN_VERTICAL_EDGES || xs.len() <= best_edge_count {
-            continue;
-        }
-        let x_left = *xs.first().expect("dense family has x edges");
-        let x_right = *xs.last().expect("dense family has x edges");
-        let width = x_right - x_left;
-        let height = anchor_top - anchor_bottom;
-        if width < 120.0 || height < 60.0 {
-            continue;
-        }
-        let horizontal_ys: Vec<f32> = horizontals
-            .iter()
-            .filter(|&&(y, line_left, line_right)| {
-                y >= anchor_bottom - EXTENT_TOLERANCE
-                    && y <= anchor_top + EXTENT_TOLERANCE
-                    && (line_right.min(x_right) - line_left.max(x_left)).max(0.0) >= width * 0.5
-            })
-            .map(|&(y, _, _)| y)
-            .collect();
-        if snap_edges(&horizontal_ys, 3.0).len() < 3 {
-            continue;
-        }
-        best_edge_count = xs.len();
-        best_region = Some((x_left, anchor_bottom, x_right, anchor_top));
+    // Group similar vertical extents once. Neighboring buckets are consulted
+    // below so coordinates that straddle a bucket boundary still form one
+    // family, while each line participates in only a constant number of
+    // candidates instead of being re-scanned for every vertical anchor.
+    let extent_key = |value: f32| (value / EXTENT_TOLERANCE).round() as i32;
+    let mut extent_buckets: HashMap<(i32, i32), Vec<VerticalRule>> = HashMap::new();
+    for vertical in verticals {
+        extent_buckets
+            .entry((extent_key(vertical.1), extent_key(vertical.2)))
+            .or_default()
+            .push(vertical);
     }
 
-    let Some(grid_region) = best_region else {
-        return Vec::new();
-    };
-    let (grid_left, grid_bottom, grid_right, grid_top) = grid_region;
-    let grid_width = grid_right - grid_left;
-    let grid_height = grid_top - grid_bottom;
-    let enclosing_panel = rects
-        .iter()
-        .filter(|rect| rect.page == page)
-        .filter_map(|rect| {
-            let (left, width) = if rect.width < 0.0 {
-                (rect.x + rect.width, -rect.width)
-            } else {
-                (rect.x, rect.width)
-            };
-            let (bottom, height) = if rect.height < 0.0 {
-                (rect.y + rect.height, -rect.height)
-            } else {
-                (rect.y, rect.height)
-            };
-            let right = left + width;
-            let top = bottom + height;
-            (left <= grid_left + EXTENT_TOLERANCE
-                && right >= grid_right - EXTENT_TOLERANCE
-                && bottom <= grid_bottom + EXTENT_TOLERANCE
-                && top >= grid_top - EXTENT_TOLERANCE
-                && width <= grid_width * 3.0
-                && height <= grid_height * 4.0
-                && !(left < 5.0 && bottom < 5.0))
-                .then_some(((left, bottom, right, top), width * height))
-        })
-        .min_by(|left, right| left.1.total_cmp(&right.1))
-        .map(|(region, _)| region);
+    let mut grid_regions = Vec::new();
+    let extent_keys: Vec<(i32, i32)> = extent_buckets.keys().copied().collect();
+    for key in extent_keys {
+        let anchor_family = &extent_buckets[&key];
+        let anchor_bottom = anchor_family.iter().map(|vertical| vertical.1).sum::<f32>()
+            / anchor_family.len() as f32;
+        let anchor_top = anchor_family.iter().map(|vertical| vertical.2).sum::<f32>()
+            / anchor_family.len() as f32;
 
-    vec![enclosing_panel.unwrap_or(grid_region)]
+        let mut family = Vec::new();
+        for bottom_offset in -1..=1 {
+            for top_offset in -1..=1 {
+                if let Some(bucket) =
+                    extent_buckets.get(&(key.0 + bottom_offset, key.1 + top_offset))
+                {
+                    family.extend(bucket.iter().copied().filter(|vertical| {
+                        (vertical.1 - anchor_bottom).abs() <= EXTENT_TOLERANCE
+                            && (vertical.2 - anchor_top).abs() <= EXTENT_TOLERANCE
+                    }));
+                }
+            }
+        }
+
+        let xs = snap_edges(&family.iter().map(|&(x, _, _)| x).collect::<Vec<_>>(), 3.0);
+        if xs.len() < DENSE_CHART_MIN_VERTICAL_EDGES {
+            continue;
+        }
+
+        let grid_bottom =
+            family.iter().map(|vertical| vertical.1).sum::<f32>() / family.len() as f32;
+        let grid_top = family.iter().map(|vertical| vertical.2).sum::<f32>() / family.len() as f32;
+        if grid_top - grid_bottom < 60.0 {
+            continue;
+        }
+
+        // A horizontal rule must support the same contiguous subset of dense
+        // vertical coordinates. Keying by the covered X-index range isolates
+        // a nearby ruled table and also lets multiple chart panels sharing the
+        // same Y extents produce independent regions.
+        let mut supported_spans: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+        for &(y, line_left, line_right) in &horizontals {
+            if y < grid_bottom - EXTENT_TOLERANCE || y > grid_top + EXTENT_TOLERANCE {
+                continue;
+            }
+            let start = xs.partition_point(|&x| x < line_left - EXTENT_TOLERANCE);
+            let end = xs.partition_point(|&x| x <= line_right + EXTENT_TOLERANCE);
+            if end - start < DENSE_CHART_MIN_VERTICAL_EDGES {
+                continue;
+            }
+            let width = xs[end - 1] - xs[start];
+            if width >= 120.0 {
+                supported_spans.entry((start, end)).or_default().push(y);
+            }
+        }
+
+        for ((start, end), ys) in supported_spans {
+            if snap_edges(&ys, 3.0).len() >= 3 {
+                grid_regions.push((xs[start], grid_bottom, xs[end - 1], grid_top));
+            }
+        }
+    }
+
+    // Prefer the smallest qualifying region when a broad rule happens to
+    // cover a denser nested panel, and retain every non-overlapping panel.
+    grid_regions.sort_by(|left, right| {
+        let left_area = (left.2 - left.0) * (left.3 - left.1);
+        let right_area = (right.2 - right.0) * (right.3 - right.1);
+        left_area.total_cmp(&right_area)
+    });
+    let mut selected_regions: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for region in grid_regions {
+        let area = (region.2 - region.0) * (region.3 - region.1);
+        let duplicates_existing = selected_regions.iter().any(|existing| {
+            let overlap_width = (region.2.min(existing.2) - region.0.max(existing.0)).max(0.0);
+            let overlap_height = (region.3.min(existing.3) - region.1.max(existing.1)).max(0.0);
+            let overlap_area = overlap_width * overlap_height;
+            let existing_area = (existing.2 - existing.0) * (existing.3 - existing.1);
+            overlap_area >= area.min(existing_area) * 0.8
+        });
+        if !duplicates_existing {
+            selected_regions.push(region);
+        }
+    }
+
+    let all_grid_regions = selected_regions.clone();
+    let mut regions: Vec<_> = selected_regions
+        .into_iter()
+        .map(|grid_region| {
+            let (grid_left, grid_bottom, grid_right, grid_top) = grid_region;
+            let grid_width = grid_right - grid_left;
+            let grid_height = grid_top - grid_bottom;
+            let enclosing_panel = rects
+                .iter()
+                .filter(|rect| rect.page == page)
+                .filter_map(|rect| {
+                    let (left, width) = if rect.width < 0.0 {
+                        (rect.x + rect.width, -rect.width)
+                    } else {
+                        (rect.x, rect.width)
+                    };
+                    let (bottom, height) = if rect.height < 0.0 {
+                        (rect.y + rect.height, -rect.height)
+                    } else {
+                        (rect.y, rect.height)
+                    };
+                    let right = left + width;
+                    let top = bottom + height;
+                    let enclosed_grids = all_grid_regions
+                        .iter()
+                        .filter(|&&(other_left, other_bottom, other_right, other_top)| {
+                            left <= other_left + EXTENT_TOLERANCE
+                                && right >= other_right - EXTENT_TOLERANCE
+                                && bottom <= other_bottom + EXTENT_TOLERANCE
+                                && top >= other_top - EXTENT_TOLERANCE
+                        })
+                        .count();
+                    (left <= grid_left + EXTENT_TOLERANCE
+                        && right >= grid_right - EXTENT_TOLERANCE
+                        && bottom <= grid_bottom + EXTENT_TOLERANCE
+                        && top >= grid_top - EXTENT_TOLERANCE
+                        && width <= grid_width * 3.0
+                        && height <= grid_height * 4.0
+                        && enclosed_grids == 1
+                        && !(left < 5.0 && bottom < 5.0))
+                        .then_some(((left, bottom, right, top), width * height))
+                })
+                .min_by(|left, right| left.1.total_cmp(&right.1))
+                .map(|(region, _)| region);
+
+            enclosing_panel.unwrap_or((
+                grid_left - DENSE_CHART_LABEL_PAD,
+                grid_bottom - DENSE_CHART_LABEL_PAD,
+                grid_right + DENSE_CHART_LABEL_PAD,
+                grid_top + DENSE_CHART_LABEL_PAD,
+            ))
+        })
+        .collect();
+    regions.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.total_cmp(&right.1))
+    });
+    regions
 }
 
 /// Detect only tables whose cell grid is backed by explicit vector geometry.
@@ -1757,6 +1841,57 @@ mod tests {
         assert_eq!(
             detect_dense_line_chart_regions(&lines, &rects, 1),
             vec![(80.0, 350.0, 360.0, 590.0)]
+        );
+    }
+
+    #[test]
+    fn frameless_dense_vector_grid_includes_label_padding() {
+        let mut lines: Vec<PdfLine> = (0..30)
+            .map(|column| make_vline(100.0 + column as f32 * 8.0, 400.0, 550.0, 1))
+            .collect();
+        lines.extend((0..6).map(|row| make_hline(400.0 + row as f32 * 30.0, 100.0, 332.0, 1)));
+
+        assert_eq!(
+            detect_dense_line_chart_regions(&lines, &[], 1),
+            vec![(80.0, 380.0, 352.0, 570.0)]
+        );
+    }
+
+    #[test]
+    fn multiple_dense_vector_panels_are_retained() {
+        let mut lines = Vec::new();
+        for panel_left in [60.0, 380.0] {
+            lines.extend(
+                (0..30).map(|column| make_vline(panel_left + column as f32 * 8.0, 400.0, 550.0, 1)),
+            );
+            lines.extend((0..6).map(|row| {
+                make_hline(400.0 + row as f32 * 30.0, panel_left, panel_left + 232.0, 1)
+            }));
+        }
+
+        assert_eq!(
+            detect_dense_line_chart_regions(&lines, &[], 1),
+            vec![(40.0, 380.0, 312.0, 570.0), (360.0, 380.0, 632.0, 570.0),]
+        );
+    }
+
+    #[test]
+    fn adjacent_ruled_table_is_not_claimed_by_dense_chart() {
+        let mut lines: Vec<PdfLine> = (0..30)
+            .map(|column| make_vline(60.0 + column as f32 * 8.0, 400.0, 550.0, 1))
+            .collect();
+        lines.extend((0..6).map(|row| make_hline(400.0 + row as f32 * 30.0, 60.0, 292.0, 1)));
+
+        lines.extend(
+            [330.0, 390.0, 450.0, 510.0, 570.0, 630.0]
+                .into_iter()
+                .map(|x| make_vline(x, 400.0, 550.0, 1)),
+        );
+        lines.extend((0..6).map(|row| make_hline(400.0 + row as f32 * 30.0, 330.0, 630.0, 1)));
+
+        assert_eq!(
+            detect_dense_line_chart_regions(&lines, &[], 1),
+            vec![(40.0, 380.0, 312.0, 570.0)]
         );
     }
 

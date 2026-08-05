@@ -124,6 +124,40 @@ pub(crate) fn merge_chart_regions(
     merged
 }
 
+pub(crate) type PageChartRegions = HashMap<u32, Vec<(f32, f32, f32, f32)>>;
+
+/// Compute the chart masks used by both layout analysis and Markdown output.
+///
+/// Keeping the rect-backed and dense-line heuristics behind one entry point
+/// ensures metadata and extraction cannot drift when either detector changes.
+pub(crate) fn chart_regions_by_page(
+    items: &[TextItem],
+    rects: &[PdfRect],
+    lines: &[PdfLine],
+) -> PageChartRegions {
+    let mut page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    for item in items.iter().filter(|item| {
+        matches!(
+            &item.item_type,
+            crate::types::ItemType::Text | crate::types::ItemType::FormField
+        )
+    }) {
+        page_items.entry(item.page).or_default().push(item.clone());
+    }
+
+    page_items
+        .into_iter()
+        .filter_map(|(page, items)| {
+            let rect_regions = crate::tables::detect_chart_regions(&items, rects, page);
+            let line_regions = crate::tables::detect_dense_line_chart_regions(lines, rects, page)
+                .into_iter()
+                .filter(|&region| chart_region_separates_prose_columns(&items, region));
+            let regions = merge_chart_regions(rect_regions.into_iter().chain(line_regions));
+            (!regions.is_empty()).then_some((page, regions))
+        })
+        .collect()
+}
+
 /// Detect side-by-side table layout by finding a significant X-position gap.
 ///
 /// Returns X-band boundaries `[(x_min, split_x), (split_x, x_max)]` when a
@@ -1045,6 +1079,7 @@ pub fn to_markdown_from_items_with_rects_and_page_count(
             page_count: document_page_count,
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
+            precomputed_chart_regions: None,
         },
     )
 }
@@ -1062,6 +1097,9 @@ pub(crate) struct MarkdownDocumentContext<'a> {
     /// Table detection consumes the original items; the mask is applied only
     /// after table claims have been established.
     pub(crate) prefiltered_page_number_mask: Option<&'a [bool]>,
+    /// Optional chart masks shared with layout analysis so the geometry is
+    /// detected once and interpreted identically by both pipelines.
+    pub(crate) precomputed_chart_regions: Option<&'a PageChartRegions>,
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -1088,6 +1126,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         page_count: document_page_count,
         prefiltered_page_number_pages,
         prefiltered_page_number_mask,
+        precomputed_chart_regions,
     } = context;
 
     if items.is_empty() {
@@ -1160,21 +1199,9 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Chart regions per page: their text must not steer column detection
     // during line grouping (it fills the gutter and fuses two-column lines).
-    let mut page_chart_map: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
-    for &page in page_groups.keys() {
-        let page_items_ref: Vec<TextItem> = page_groups[&page]
-            .iter()
-            .map(|(_, item)| (*item).clone())
-            .collect();
-        let rect_regions = crate::tables::detect_chart_regions(&page_items_ref, rects, page);
-        let line_regions = crate::tables::detect_dense_line_chart_regions(pdf_lines, rects, page)
-            .into_iter()
-            .filter(|&region| chart_region_separates_prose_columns(&page_items_ref, region));
-        let regions = merge_chart_regions(rect_regions.into_iter().chain(line_regions));
-        if !regions.is_empty() {
-            page_chart_map.insert(page, regions);
-        }
-    }
+    let page_chart_map = precomputed_chart_regions
+        .cloned()
+        .unwrap_or_else(|| chart_regions_by_page(&text_items, rects, pdf_lines));
 
     let mut pages: Vec<u32> = page_groups.keys().copied().collect();
     pages.sort();
@@ -2096,6 +2123,7 @@ mod tests {
                 page_count: 1,
                 prefiltered_page_number_pages: Some(&removed_pages),
                 prefiltered_page_number_mask: Some(&removal_mask),
+                precomputed_chart_regions: None,
             },
         );
 
