@@ -347,8 +347,13 @@ pub(crate) fn detect_from_document(
     } else {
         0.0
     };
+    let mixed_pages = analysis_cache
+        .values()
+        .filter(|analysis| analysis.has_images || analysis.has_vector_text)
+        .count();
+
     let mixed_ratio = if pages_sampled > 0 {
-        (pages_with_images + pages_with_vector_text) as f32 / pages_sampled as f32
+        mixed_pages as f32 / pages_sampled as f32
     } else {
         0.0
     };
@@ -376,6 +381,7 @@ pub(crate) fn detect_from_document(
         }
     } else if pages_with_text > 0 && mixed_ratio >= config.ocr_thresholds.mixed_page_threshold {
         ocr_recommended = true;
+        // Mixed confidence represents classifier confidence, not the mixed page ratio threshold.
         (PdfType::Mixed, 0.7)
     } else if total_text_ops == 0 {
         ocr_recommended = true;
