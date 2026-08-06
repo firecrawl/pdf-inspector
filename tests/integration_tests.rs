@@ -1239,13 +1239,15 @@ fn assert_snapshot(fixture: &str) {
 
     let result = pdf_inspector::process_pdf(&fixture_path)
         .unwrap_or_else(|e| panic!("Failed to process {}: {}", fixture_path, e));
-    let actual = result.markdown.unwrap_or_default();
-    let actual = actual.trim_end();
+    let actual = result.markdown.unwrap_or_default()
+    .trim_end()
+    .replace("\r\n", "\n");
 
-    let expected = std::fs::read_to_string(&snapshot_path)
-        .unwrap_or_else(|e| panic!("Failed to read snapshot {}: {}", snapshot_path, e));
-    let expected = expected.trim_end();
-
+let expected = std::fs::read_to_string(&snapshot_path)
+    .unwrap_or_else(|e| panic!("Failed to read snapshot {}: {}", snapshot_path, e))
+    .trim_end()
+    .replace("\r\n", "\n");
+    
     if actual != expected {
         // Show a helpful diff summary
         let actual_lines: Vec<&str> = actual.lines().collect();
@@ -1279,7 +1281,6 @@ fn assert_snapshot(fixture: &str) {
         );
     }
 }
-
 #[test]
 fn test_snapshot_nexo_price_en() {
     assert_snapshot("nexo-price-en");
