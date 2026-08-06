@@ -259,6 +259,21 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
     let mut cleaned: Vec<Vec<String>> = Vec::new();
     let mut footnotes: Vec<String> = Vec::new();
 
+    // Columns holding only one- or two-character markers (bullets, ticks,
+    // single-letter flags) never carry wrapped prose, so a row missing one is
+    // a complete record whose flag happens to be absent — not overflow from
+    // the row above. The continuation test below discounts them.
+    let marker_columns = marker_column_flags(cells);
+    let has_marker_columns = marker_columns.iter().any(|is_marker| *is_marker);
+    let substantive_filled = |row: &[String]| {
+        row.iter()
+            .enumerate()
+            .filter(|(idx, cell)| {
+                !cell.trim().is_empty() && !marker_columns.get(*idx).copied().unwrap_or(false)
+            })
+            .count()
+    };
+
     for row in cells {
         // Check if this row is empty
         if row.iter().all(|c| c.trim().is_empty()) {
@@ -403,10 +418,21 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let continues_wrapped_first_column_label = !first_cell.is_empty()
             && starts_with_lowercase_alpha(first_cell)
             && ends_like_incomplete_phrase(prev_first_cell);
+        // Overflow text always brings less prose than the row it wrapped from.
+        // When the row carries just as much once marker columns are discounted,
+        // nothing wrapped: it is a full record missing only a flag glyph.
+        // A row starting mid-phrase is wrapped text on its own evidence, so the
+        // marker test only speaks for rows without that signal.
+        let loses_only_markers = has_marker_columns
+            && !continues_wrapped_first_column_label
+            && cleaned
+                .last()
+                .is_some_and(|prev| substantive_filled(prev) <= substantive_filled(row));
         let is_wrapped_continuation = cleaned.len() > 1
             && filled_cells <= max_filled_for_merge
             && (prev_filled > filled_cells
                 || (continues_wrapped_first_column_label && prev_filled >= filled_cells))
+            && !loses_only_markers
             && !looks_like_data_row
             && !looks_like_spanning_first_column_row
             && !looks_like_hierarchical_subrow
@@ -436,6 +462,32 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
     }
 
     (cleaned, footnotes)
+}
+
+/// Flag columns whose non-empty values are all at most two characters.
+///
+/// Statement-style tables carry flag columns (a purchase indicator bullet, a
+/// tick, a one-letter code) that some rows leave blank. Those columns hold no
+/// prose, so their absence is not evidence that a row wrapped.
+fn marker_column_flags(cells: &[Vec<String>]) -> Vec<bool> {
+    let width = cells.iter().map(|row| row.len()).max().unwrap_or(0);
+    (0..width)
+        .map(|col| {
+            let mut populated = 0usize;
+            for row in cells {
+                let Some(cell) = row.get(col) else { continue };
+                let trimmed = cell.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.chars().count() > 2 {
+                    return false;
+                }
+                populated += 1;
+            }
+            populated > 0
+        })
+        .collect()
 }
 
 /// Check if a cell value indicates a footnote row
@@ -702,6 +754,46 @@ mod tests {
         assert_eq!(cleaned[2][1], "Storage setup");
         assert_eq!(cleaned[3][1], "Label workspace");
         assert_eq!(cleaned[4][1], "Model training");
+    }
+
+    #[test]
+    fn test_clean_table_cells_missing_marker_glyph_keeps_row_separate() {
+        // A bank statement whose purchase-indicator column is a single bullet
+        // glyph, drawn invisibly (Tr 3) on some rows and so absent from the
+        // extracted text. Those rows are complete transactions, not text
+        // wrapped from the row above, and must not be merged away.
+        let cells = vec![
+            vec![
+                "DATE & TIME".into(),
+                "TRANSACTION DESCRIPTION".into(),
+                "AMOUNT".into(),
+                "PI".into(),
+            ],
+            vec![
+                "26/06/2026 00:00".into(),
+                "10% Swiggy CashBack".into(),
+                "+ C 26.20".into(),
+                "l".into(),
+            ],
+            vec![
+                "06/07/2026 14:16".into(),
+                "BPPY CC PAYMENT DP016187141619hpYGk".into(),
+                "+ C 8,889.00".into(),
+                String::new(),
+            ],
+            vec![
+                "13/07/2026 12:04".into(),
+                "PYU*Instamart GroceryBangalore".into(),
+                "C 479.00".into(),
+                "l".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 4, "no transaction row may be merged away");
+        assert_eq!(cleaned[2][0], "06/07/2026 14:16");
+        assert_eq!(cleaned[2][2], "+ C 8,889.00");
+        assert_eq!(cleaned[2][3], "", "the absent marker stays absent");
     }
 
     #[test]
