@@ -120,14 +120,14 @@ impl OcrRoutingThresholds {
             || !(0.0..=1.0).contains(&self.mixed_page_threshold)
         {
             return Err(PdfError::Parse(
-    "OCR thresholds must be between 0.0 and 1.0".into(),
-));
+                "OCR thresholds must be between 0.0 and 1.0".into(),
+            ));
         }
 
         if self.needs_ocr_max_confidence >= self.text_based_min_confidence {
             return Err(PdfError::Parse(
-    "needs_ocr_max_confidence must be lower than text_based_min_confidence".into(),
-));
+                "needs_ocr_max_confidence must be lower than text_based_min_confidence".into(),
+            ));
         }
 
         Ok(())
@@ -232,6 +232,7 @@ pub(crate) fn detect_from_document(
     page_count: u32,
     config: &DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    config.ocr_thresholds.validate()?;
     let pages = doc.get_pages();
     let total_pages = pages.len() as u32;
 
@@ -357,7 +358,7 @@ pub(crate) fn detect_from_document(
         ocr_recommended = true;
         // Template-based PDF: has text but images provide essential context
         (PdfType::Mixed, 0.5 + (0.3 * (1.0 - template_ratio)))
-    } else if text_ratio >= config.text_page_ratio_threshold {
+    } else if text_ratio >= config.ocr_thresholds.text_based_min_confidence {
         ocr_recommended = false;
         (PdfType::TextBased, text_ratio)
     } else if pages_with_text == 0 && (pages_with_images > 0 || pages_with_vector_text > 0) {
@@ -370,7 +371,7 @@ pub(crate) fn detect_from_document(
         }
     } else if pages_with_text > 0 && (pages_with_images > 0 || pages_with_vector_text > 0) {
         ocr_recommended = true;
-        (PdfType::Mixed, 0.7)
+        (PdfType::Mixed, config.ocr_thresholds.mixed_page_threshold)
     } else if total_text_ops == 0 {
         ocr_recommended = true;
         (
@@ -1119,7 +1120,6 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
 ///
 /// NOTE: Resource-based check. Superseded by `used_fonts_are_only_type3`.
 /// Kept for existing unit tests.
-
 
 /// Check if the page has at least one font that can produce decodable Unicode text.
 ///
