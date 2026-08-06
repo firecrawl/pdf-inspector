@@ -347,6 +347,11 @@ pub(crate) fn detect_from_document(
     } else {
         0.0
     };
+    let mixed_ratio = if pages_sampled > 0 {
+        (pages_with_images + pages_with_vector_text) as f32 / pages_sampled as f32
+    } else {
+        0.0
+    };
 
     // OCR is recommended when:
     // 1. Template images are present (text alone is insufficient), OR
@@ -369,9 +374,9 @@ pub(crate) fn detect_from_document(
         } else {
             (PdfType::ImageBased, 0.8)
         }
-    } else if pages_with_text > 0 && (pages_with_images > 0 || pages_with_vector_text > 0) {
+    } else if pages_with_text > 0 && mixed_ratio >= config.ocr_thresholds.mixed_page_threshold {
         ocr_recommended = true;
-        (PdfType::Mixed, config.ocr_thresholds.mixed_page_threshold)
+        (PdfType::Mixed, 0.7)
     } else if total_text_ops == 0 {
         ocr_recommended = true;
         (
