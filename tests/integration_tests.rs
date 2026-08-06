@@ -1648,6 +1648,7 @@ fn test_process_pdf_mem_page_filter_skips_zero() {
     assert_eq!(result.page_signals[0].page, 1);
 }
 
+#[test]
 fn test_extract_regions_mem_multiple_regions_per_page() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
     let regions = extract_text_in_regions_mem(

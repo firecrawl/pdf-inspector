@@ -4154,8 +4154,14 @@ where
     I: IntoIterator<Item = &'a TextItem>,
 {
     let items: Vec<&TextItem> = page_items.into_iter().collect();
-    if items.is_empty() {
-        // No text survives page-number removal: nothing usable to grade.
+    let has_text = items.iter().any(|item| {
+        matches!(
+            item.item_type,
+            crate::types::ItemType::Text | crate::types::ItemType::FormField
+        )
+    });
+    if !has_text {
+        // No usable text survives page-number removal: nothing to grade.
         return (PageDirection::Ltr, 0.0);
     }
     let direction = crate::text_utils::page_direction(items);
@@ -6139,6 +6145,29 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    #[test]
+    fn page_signal_grades_zero_when_only_non_text_remains() {
+        // A page whose only remaining item after page-number removal is an
+        // image must not inherit the removed text's confidence.
+        let mut img = test_item("", 0.0, 0.0, 100.0, 100.0);
+        img.item_type = ItemType::Image;
+        let mut conf = BTreeMap::new();
+        conf.insert(1, 1.0); // stale entry from removed page-number text
+        let (direction, confidence) = page_signal([&img].into_iter(), &conf, 1);
+        assert_eq!(direction, PageDirection::Ltr);
+        assert_eq!(confidence, 0.0);
+    }
+
+    #[test]
+    fn page_signal_grades_form_field_text() {
+        let mut field = test_item("Name: John", 0.0, 0.0, 100.0, 10.0);
+        field.item_type = ItemType::FormField;
+        let mut conf = BTreeMap::new();
+        conf.insert(1, 1.0);
+        let (_, confidence) = page_signal([&field].into_iter(), &conf, 1);
+        assert_eq!(confidence, 1.0);
+    }
 
     fn test_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
         TextItem {
