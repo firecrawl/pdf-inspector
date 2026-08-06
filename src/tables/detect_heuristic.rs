@@ -1334,8 +1334,8 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
     // 100,101,102,…). Accept anything with page gaps; for a dense run — which a
     // one-page-per-entry TOC can also produce — fall back to a title signal:
     // real contents entries are multi-word headings, rank labels are short.
-    let min = *page_vals.iter().min().unwrap();
-    let max = *page_vals.iter().max().unwrap();
+    let min = *page_vals.iter().min().unwrap_or(&0);
+    let max = *page_vals.iter().max().unwrap_or(&0);
     let span = max.saturating_sub(min);
     if span > page_vals.len() as u32 {
         return true;
