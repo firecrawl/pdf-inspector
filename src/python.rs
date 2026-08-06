@@ -666,6 +666,7 @@ fn extract_pages_markdown_bytes(
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfResult>()?;
     m.add_class::<PyPageOcrReasons>()?;
+    m.add_class::<PyPageSignals>()?;
     m.add_class::<PyPdfClassification>()?;
     m.add_class::<PyTextItem>()?;
     m.add_class::<PyRegionText>()?;

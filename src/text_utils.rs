@@ -173,7 +173,7 @@ where
 {
     let mut items: Vec<&TextItem> = items
         .into_iter()
-        .filter(|item| matches!(item.item_type, ItemType::Text))
+        .filter(|item| matches!(item.item_type, ItemType::Text | ItemType::FormField))
         .collect();
     if items.is_empty() {
         return PageDirection::Ltr;

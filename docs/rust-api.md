@@ -197,7 +197,10 @@ Low-level detection functions are also available via the `detector` module (`det
   Direction is computed over the same items that produce the emitted markdown
   (page-number footers are removed first), so it matches the output a caller
   can inspect. It is only meaningful when the text layer is reliable
-  (`needs_ocr == false`).
+  (`needs_ocr == false`). The line grouping is an approximation: it uses the
+  markdown line-grouping Y-tolerance but does not model the extractor's
+  column/x-position line splits, so on dense multi-column pages the signal can
+  differ from the exact lines RTL ordering was applied to.
 - **`confidence`** — per-page text-confidence in `0.0..=1.0`:
   - `1.0` — clean, fully extractable text layer
   - `0.5` — replacement-character density at the 500-bps OCR threshold

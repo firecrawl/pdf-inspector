@@ -4030,6 +4030,15 @@ fn process_document(
             (pdf_type, markdown, confidence)
         };
 
+    // The documented contract says Scanned/ImageBased results carry no per-page
+    // signals. A Mixed PDF upgraded to Scanned above extracted normally, so its
+    // page_signals were populated — clear them to honor the invariant.
+    let page_signals = if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
+        Vec::new()
+    } else {
+        page_signals
+    };
+
     // If a TextBased PDF produces garbage text, the fonts are undecodable
     // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
     // Drop the useless markdown and flag all pages for OCR.
@@ -4144,7 +4153,12 @@ pub(crate) fn page_signal<'a, I>(
 where
     I: IntoIterator<Item = &'a TextItem>,
 {
-    let direction = crate::text_utils::page_direction(page_items);
+    let items: Vec<&TextItem> = page_items.into_iter().collect();
+    if items.is_empty() {
+        // No text survives page-number removal: nothing usable to grade.
+        return (PageDirection::Ltr, 0.0);
+    }
+    let direction = crate::text_utils::page_direction(items);
     let confidence = confidence_by_page.get(&page_1idx).copied().unwrap_or(0.0);
     (direction, confidence)
 }

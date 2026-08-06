@@ -121,7 +121,7 @@ class PdfResult:                     # process_pdf / detect_pdf
     pages_with_columns: list[int]
     has_encoding_issues: bool        # broken font encodings — consider OCR fallback
 
-class PageSignals:                   # per-page direction + text-confidence (process_pdf Full mode)
+class PageSignals:                   # per-page direction + text-confidence (process_pdf, present whenever extraction ran)
     page: int                        # 1-indexed
     direction: str                   # "ltr" | "rtl" | "mixed"
     confidence: float                # 0.0 - 1.0 (1.0 clean text, 0.0 no usable text)

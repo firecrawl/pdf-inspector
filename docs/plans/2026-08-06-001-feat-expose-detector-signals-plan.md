@@ -201,7 +201,7 @@ flowchart LR
   1. Add `direction: String` and `confidence: f64` to the `#[napi(object)]` `PageMarkdownResult` (napi auto-converts to camelCase; both names are already single words). The core `f32` value is widened to `f64`.
   2. Add a `PageSignals` `#[napi(object)]` struct (`page: u32`, `direction: String`, `confidence: f64`) and `PdfResult.page_signals`, populated in `to_napi_result` (empty when extraction did not run).
   3. Populate them in the `extract_pages_markdown` and `process_pdf` mappings (mirroring the existing `needs_ocr`/`ocr_reason` mapping).
-  4. Assert the fields in `napi/test.mjs` (field presence + expected anchor values 0.0, 0.15, 0.5, 1.0 on the shared fixtures).
+  4. Assert the fields in `napi/test.mjs` (field presence + anchor values on the shared fixtures; compare 0.0/0.5/1.0 exactly and 0.15 with a small tolerance, since the core f32 value widens to f64 where 0.15 is inexact).
   5. Document in `napi/README.md` with the indexing notes (A1).
 - **Patterns to follow:** the `needs_ocr`/`ocr_reason` mapping in `extract_pages_markdown`; the `ocr_reasons_by_page` conversion in `to_napi_result`.
 - **Test scenarios:**

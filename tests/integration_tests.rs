@@ -1602,6 +1602,30 @@ fn test_extract_regions_mem_identity_h_needs_ocr() {
 /// resulting ciphertext is 100% printable ASCII, so it must be caught by the
 /// substitution-cipher statistics and routed to OCR instead of served silently.
 #[test]
+fn test_extract_pages_mem_shifted_cipher_tounicode_needs_ocr() {
+    let buf = std::fs::read("tests/fixtures/shifted_cipher_tounicode.pdf").unwrap();
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+
+    assert_eq!(result.pages.len(), 1);
+    assert!(
+        result.pages[0].needs_ocr,
+        "shifted-cipher garbled page should be flagged needs_ocr"
+    );
+    assert!(
+        result.pages[0].markdown.is_empty(),
+        "garbled markdown should be suppressed"
+    );
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        result.pages[0].ocr_reason.as_deref(),
+        Some("suspected_garbled_text")
+    );
+    assert_eq!(
+        result.pages[0].confidence, 0.15,
+        "cipher-garbled page should carry the 0.15 binary-garbled confidence"
+    );
+}
+
 /// Locks the documented cross-surface confidence basis divergence: the extract
 /// path scores a GID-garbled page at the 0.15 binary-garbled anchor, while
 /// Full-mode process_pdf scores the same page 0.0 because its items were
@@ -1624,28 +1648,6 @@ fn test_process_pdf_mem_page_filter_skips_zero() {
     assert_eq!(result.page_signals[0].page, 1);
 }
 
-#[test]
-fn test_extract_pages_mem_shifted_cipher_tounicode_needs_ocr() {
-    let buf = std::fs::read("tests/fixtures/shifted_cipher_tounicode.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, None).unwrap();
-
-    assert_eq!(result.pages.len(), 1);
-    assert!(
-        result.pages[0].needs_ocr,
-        "shifted-cipher garbled page should be flagged needs_ocr"
-    );
-    assert!(
-        result.pages[0].markdown.is_empty(),
-        "garbled markdown should be suppressed"
-    );
-    assert_eq!(result.pages_needing_ocr, vec![1]);
-    assert_eq!(
-        result.pages[0].ocr_reason.as_deref(),
-        Some("suspected_garbled_text")
-    );
-}
-
-#[test]
 fn test_extract_regions_mem_multiple_regions_per_page() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
     let regions = extract_text_in_regions_mem(
