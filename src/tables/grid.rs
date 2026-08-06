@@ -20,7 +20,7 @@ pub(crate) fn find_column_boundaries(
     // dominated by the many items *within* each column.  Use a gap-histogram
     // on consecutive position gaps to detect when columns are densely packed,
     // and only then lower the threshold below 25pt.
-    let x_range = x_positions.last().unwrap() - x_positions.first().unwrap();
+    let x_range = x_positions.last().unwrap_or(&0.0) - x_positions.first().unwrap_or(&0.0);
     let avg_gap = if x_positions.len() > 1 {
         x_range / (x_positions.len() - 1) as f32
     } else {

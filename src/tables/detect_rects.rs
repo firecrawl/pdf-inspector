@@ -661,18 +661,18 @@ pub fn detect_tables_from_rects(
                 if group_rects.len() < 30 {
                     continue;
                 }
-                let x_left = group_rects.iter().map(|r| r.0).reduce(f32::min).unwrap();
+                let x_left = group_rects.iter().map(|r| r.0).reduce(f32::min).unwrap_or(0.0);
                 let x_right = group_rects
                     .iter()
                     .map(|r| r.0 + r.2)
                     .reduce(f32::max)
-                    .unwrap();
-                let y_bottom = group_rects.iter().map(|r| r.1).reduce(f32::min).unwrap();
+                    .unwrap_or(0.0);
+                let y_bottom = group_rects.iter().map(|r| r.1).reduce(f32::min).unwrap_or(0.0);
                 let y_top = group_rects
                     .iter()
                     .map(|r| r.1 + r.3)
                     .reduce(f32::max)
-                    .unwrap();
+                    .unwrap_or(0.0);
                 let w = x_right - x_left;
                 let h = y_top - y_bottom;
                 if (30.0..=400.0).contains(&w) && (10.0..=400.0).contains(&h) {
@@ -698,10 +698,10 @@ pub fn detect_tables_from_rects(
                 if fc_rects.len() < 6 {
                     continue;
                 }
-                let x_left = fc_rects.iter().map(|r| r.0).reduce(f32::min).unwrap();
-                let x_right = fc_rects.iter().map(|r| r.0 + r.2).reduce(f32::max).unwrap();
-                let y_bottom = fc_rects.iter().map(|r| r.1).reduce(f32::min).unwrap();
-                let y_top = fc_rects.iter().map(|r| r.1 + r.3).reduce(f32::max).unwrap();
+                let x_left = fc_rects.iter().map(|r| r.0).reduce(f32::min).unwrap_or(0.0);
+                let x_right = fc_rects.iter().map(|r| r.0 + r.2).reduce(f32::max).unwrap_or(0.0);
+                let y_bottom = fc_rects.iter().map(|r| r.1).reduce(f32::min).unwrap_or(0.0);
+                let y_top = fc_rects.iter().map(|r| r.1 + r.3).reduce(f32::max).unwrap_or(0.0);
                 let h = y_top - y_bottom;
                 // Require reasonable height and text items inside the region
                 let padding = 15.0;
@@ -1688,17 +1688,17 @@ fn detect_row_stripe_table(
 
     // Compute the bounding box of the stripe region for filtering items
     let y_top = row_edges[0];
-    let y_bottom = *row_edges.last().unwrap();
+    let y_bottom = *row_edges.last().unwrap_or(&0.0);
     let x_left = group_rects
         .iter()
         .map(|&(x, _, _, _)| x)
         .reduce(f32::min)
-        .unwrap();
+        .unwrap_or(0.0);
     let x_right = group_rects
         .iter()
         .map(|&(x, _, w, _)| x + w)
         .reduce(f32::max)
-        .unwrap();
+        .unwrap_or(0.0);
 
     // Gather page items within the stripe region
     let page_items: Vec<(usize, &TextItem)> = items
@@ -2951,7 +2951,7 @@ fn collapse_multiline_description_rows(
         }
     }
 
-    new_edges.push(*row_edges.last().unwrap());
+    new_edges.push(*row_edges.last().unwrap_or(&0.0));
 
     if merged_rows == 0 || new_cells.len() < 2 || new_edges.len() != new_cells.len() + 1 {
         return (new_cells, row_edges, 0);
@@ -2989,17 +2989,17 @@ fn detect_merged_cluster_table(
 
     // Bounding box of all rects
     let y_top = row_edges[0];
-    let y_bottom = *row_edges.last().unwrap();
+    let y_bottom = *row_edges.last().unwrap_or(&0.0);
     let x_left = all_rects
         .iter()
         .map(|&(x, _, _, _)| x)
         .reduce(f32::min)
-        .unwrap();
+        .unwrap_or(0.0);
     let x_right = all_rects
         .iter()
         .map(|&(x, _, w, _)| x + w)
         .reduce(f32::max)
-        .unwrap();
+        .unwrap_or(0.0);
 
     // Gather page items within the bounding box
     let page_items: Vec<(usize, &TextItem)> = items
@@ -3035,7 +3035,7 @@ fn detect_merged_cluster_table(
         .iter()
         .map(|(_, i)| i.x)
         .reduce(f32::min)
-        .unwrap();
+        .unwrap_or(0.0);
     col_edges.push(min_x - 5.0);
     for pair in columns.windows(2) {
         col_edges.push((pair[0] + pair[1]) / 2.0);
@@ -3044,7 +3044,7 @@ fn detect_merged_cluster_table(
         .iter()
         .map(|(_, i)| i.x + i.width)
         .reduce(f32::max)
-        .unwrap();
+        .unwrap_or(0.0);
     col_edges.push(max_x_right + 5.0);
 
     let num_cols = col_edges.len() - 1;
