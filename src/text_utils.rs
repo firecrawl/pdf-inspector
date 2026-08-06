@@ -70,10 +70,17 @@ pub(crate) fn is_page_number_line(text: &str) -> bool {
 
     let lowercase = text.trim().to_ascii_lowercase();
     lowercase.strip_prefix("page").is_some_and(|rest| {
-        rest.trim_start()
-            .chars()
-            .next()
+        let mut characters = rest.trim_start().chars().peekable();
+        let mut has_page_number = false;
+        while characters
+            .peek()
             .is_some_and(|character| character.is_ascii_digit())
+        {
+            has_page_number = true;
+            characters.next();
+        }
+
+        has_page_number && characters.next().is_none_or(char::is_whitespace)
     })
 }
 

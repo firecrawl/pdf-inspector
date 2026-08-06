@@ -464,6 +464,7 @@ mod tests {
         assert!(!is_page_number_line("Hello World"));
         assert!(!is_page_number_line("Chapter 1"));
         assert!(!is_page_number_line("Total: 500"));
+        assert!(!is_page_number_line("PAGE0-PARA2-END-MARKER-0"));
     }
 
     #[test]
@@ -505,6 +506,14 @@ mod tests {
         assert!(!result.contains("Page 42 explains the result"));
         assert!(result.contains("Content"));
         assert!(result.contains("End"));
+    }
+
+    #[test]
+    fn test_remove_page_numbers_preserves_page_prefixed_content() {
+        let input = "PAGE0-PARA2-START substantive report text PAGE0-PARA2-END-MARKER-0";
+        let result = remove_page_numbers(input);
+
+        assert_eq!(result, input);
     }
 
     #[test]
