@@ -75,6 +75,8 @@ pub struct DetectionConfig {
     pub min_text_ops_per_page: u32,
     /// Threshold ratio of text pages to total pages for classification
     pub text_page_ratio_threshold: f32,
+    /// Thresholds controlling OCR routing decisions.
+    pub ocr_thresholds: OcrRoutingThresholds,
 }
 
 impl Default for DetectionConfig {
@@ -85,10 +87,52 @@ impl Default for DetectionConfig {
             strategy: ScanStrategy::Sample(8),
             min_text_ops_per_page: 3,
             text_page_ratio_threshold: 0.6,
+            ocr_thresholds: OcrRoutingThresholds::default(),
         }
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct OcrRoutingThresholds {
+    /// Minimum confidence to classify as TextBased.
+    pub text_based_min_confidence: f32,
+
+    /// Below this confidence OCR is preferred.
+    pub needs_ocr_max_confidence: f32,
+
+    /// Fraction of pages needed to classify as Mixed.
+    pub mixed_page_threshold: f32,
+}
+
+impl Default for OcrRoutingThresholds {
+    fn default() -> Self {
+        Self {
+            text_based_min_confidence: 0.85,
+            needs_ocr_max_confidence: 0.35,
+            mixed_page_threshold: 0.25,
+        }
+    }
+}
+impl OcrRoutingThresholds {
+    pub fn validate(&self) -> Result<(), PdfError> {
+        if !(0.0..=1.0).contains(&self.needs_ocr_max_confidence)
+            || !(0.0..=1.0).contains(&self.text_based_min_confidence)
+            || !(0.0..=1.0).contains(&self.mixed_page_threshold)
+        {
+            return Err(PdfError::Parse(
+    "OCR thresholds must be between 0.0 and 1.0".into(),
+));
+        }
+
+        if self.needs_ocr_max_confidence >= self.text_based_min_confidence {
+            return Err(PdfError::Parse(
+    "needs_ocr_max_confidence must be lower than text_based_min_confidence".into(),
+));
+        }
+
+        Ok(())
+    }
+}
 /// Detect PDF type from file path
 pub fn detect_pdf_type<P: AsRef<Path>>(path: P) -> Result<PdfTypeResult, PdfError> {
     detect_pdf_type_with_config(path, DetectionConfig::default())
@@ -99,6 +143,7 @@ pub fn detect_pdf_type_with_config<P: AsRef<Path>>(
     path: P,
     config: DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    config.ocr_thresholds.validate()?;
     crate::validate_pdf_file(&path)?;
 
     let (doc, page_count) = crate::load_document_from_path(&path)?;
@@ -116,6 +161,7 @@ pub fn detect_pdf_type_mem_with_config(
     buffer: &[u8],
     config: DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    config.ocr_thresholds.validate()?;
     crate::validate_pdf_bytes(buffer)?;
 
     let (doc, page_count) = crate::load_document_from_mem(buffer)?;
@@ -327,7 +373,10 @@ pub(crate) fn detect_from_document(
         (PdfType::Mixed, 0.7)
     } else if total_text_ops == 0 {
         ocr_recommended = true;
-        (PdfType::Scanned, 0.9)
+        (
+            PdfType::Scanned,
+            config.ocr_thresholds.needs_ocr_max_confidence,
+        )
     } else {
         ocr_recommended = false;
         (PdfType::TextBased, text_ratio.max(0.5))
@@ -1070,37 +1119,7 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
 ///
 /// NOTE: Resource-based check. Superseded by `used_fonts_are_only_type3`.
 /// Kept for existing unit tests.
-#[cfg(test)]
-fn page_has_only_type3_fonts(doc: &Document, page_id: ObjectId) -> bool {
-    let fonts = match doc.get_page_fonts(page_id) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    if fonts.is_empty() {
-        return false;
-    }
-    let mut has_type3 = false;
-    for font_dict in fonts.values() {
-        let subtype = font_dict
-            .get(b"Subtype")
-            .ok()
-            .and_then(|o| o.as_name().ok());
-        if subtype == Some(b"Type3") {
-            // Type3 with a ToUnicode CMap can still produce usable text
-            if font_dict.get(b"ToUnicode").is_ok() {
-                return false;
-            }
-            has_type3 = true;
-        } else {
-            // Has a non-Type3 font — page has real text fonts
-            return false;
-        }
-    }
-    if has_type3 {
-        log::debug!("page has only Type3 fonts without ToUnicode — text is undecodable");
-    }
-    has_type3
-}
+
 
 /// Check if the page has at least one font that can produce decodable Unicode text.
 ///
@@ -2052,6 +2071,7 @@ mod tests {
 
         let config = DetectionConfig {
             strategy: ScanStrategy::Full,
+            ocr_thresholds: OcrRoutingThresholds::default(),
             ..DetectionConfig::default()
         };
         let result = detect_pdf_type_with_config(&path, config).unwrap();
@@ -2331,7 +2351,6 @@ mod tests {
 
         // Normal doc: low text ops — doesn't qualify at all
         let text_ops = 300u32;
-        let font_changes = 50u32;
         assert!(text_ops < 1500);
     }
 

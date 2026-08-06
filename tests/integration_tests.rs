@@ -1,6 +1,11 @@
 //! Integration tests for pdf-to-markdown library
 
-use pdf_inspector::detector::{estimate_page_count_from_bytes, DetectionConfig, ScanStrategy};
+use pdf_inspector::detector::{
+    estimate_page_count_from_bytes,
+    DetectionConfig,
+    OcrRoutingThresholds,
+    ScanStrategy
+};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::ItemType;
 use pdf_inspector::types::TextLine;
@@ -338,6 +343,7 @@ fn test_detection_config_custom() {
         strategy: ScanStrategy::Sample(10),
         min_text_ops_per_page: 5,
         text_page_ratio_threshold: 0.8,
+        ocr_thresholds: OcrRoutingThresholds::default(),
     };
     assert!(matches!(config.strategy, ScanStrategy::Sample(10)));
     assert_eq!(config.min_text_ops_per_page, 5);
@@ -3936,4 +3942,35 @@ fn pdf_options_debug_redacts_password() {
         "password leaked in Debug: {dbg}"
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
+}
+
+#[test]
+fn test_default_ocr_thresholds() {
+    let thresholds = OcrRoutingThresholds::default();
+
+    assert_eq!(thresholds.text_based_min_confidence, 0.85);
+    assert_eq!(thresholds.needs_ocr_max_confidence, 0.35);
+    assert_eq!(thresholds.mixed_page_threshold, 0.25);
+}
+
+#[test]
+fn test_invalid_ocr_thresholds() {
+    let thresholds = OcrRoutingThresholds {
+        text_based_min_confidence: 0.2,
+        needs_ocr_max_confidence: 0.5,
+        mixed_page_threshold: 0.25,
+    };
+
+    assert!(thresholds.validate().is_err());
+}
+
+#[test]
+fn test_valid_custom_ocr_thresholds() {
+    let thresholds = OcrRoutingThresholds {
+        text_based_min_confidence: 0.9,
+        needs_ocr_max_confidence: 0.3,
+        mixed_page_threshold: 0.25,
+    };
+
+    assert!(thresholds.validate().is_ok());
 }
