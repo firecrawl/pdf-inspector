@@ -1354,6 +1354,7 @@ fn page_number_context_masks(
     items: &[TextItem],
     candidate_values: &[Option<u32>],
     document_page_count: usize,
+    page_bounds: &HashMap<u32, (f32, f32)>,
 ) -> (Vec<bool>, Vec<bool>) {
     let mut contextual = vec![false; items.len()];
     let mut explicit_folio = vec![false; items.len()];
@@ -1502,9 +1503,12 @@ fn page_number_context_masks(
                             group.first() == Some(index) || group.last() == Some(index)
                         })
                         .collect();
+                    // The deep-margin gate uses the same scaled bands as
+                    // candidacy, so contextual folios on tall pages are
+                    // judged against their page's real margins.
                     let in_deep_margin = candidates.iter().all(|(index, _)| {
-                        items[*index].y < PAGE_NUMBER_BOTTOM_Y
-                            || items[*index].y > PAGE_NUMBER_TOP_Y
+                        let (bottom, top) = page_number_bands(page_bounds.get(&items[*index].page));
+                        items[*index].y < bottom || items[*index].y > top
                     });
                     if in_deep_margin
                         && !recurrence_candidates.is_empty()
@@ -1635,7 +1639,7 @@ fn page_number_removal_mask(
         .map(|item| page_number_value(item, page_bounds))
         .collect();
     let (contextual, explicit_folio) =
-        page_number_context_masks(items, &candidate_values, document_page_count);
+        page_number_context_masks(items, &candidate_values, document_page_count, page_bounds);
 
     candidate_values
         .iter()
@@ -1658,7 +1662,7 @@ pub(super) fn needs_document_page_number_context(
         .map(|item| page_number_value(item, page_bounds))
         .collect();
     let (contextual, explicit_folio) =
-        page_number_context_masks(items, &candidate_values, document_page_count);
+        page_number_context_masks(items, &candidate_values, document_page_count, page_bounds);
 
     candidate_values
         .iter()
@@ -2552,6 +2556,41 @@ mod tests {
         // scaled bottom band (106.3), so it stays a candidate.
         let bottom = make_item(1, 297.0, 103.0, "9");
         assert_eq!(page_number_value(&bottom, &a4), Some(9));
+    }
+
+    #[test]
+    fn contextual_deep_margin_gate_uses_the_scaled_bands() {
+        // A recurring "42 Company report" footer at A4 y=103 sits inside the
+        // scaled bottom band (106.3) but outside the Letter constant (100).
+        // The repeated-folio gate must judge it with the same scaled bands
+        // as candidacy, so the advancing footer number is still recognized.
+        let a4: HashMap<u32, (f32, f32)> = HashMap::from([
+            (1, (0.0, 841.89)),
+            (2, (0.0, 841.89)),
+            (3, (0.0, 841.89)),
+            (4, (0.0, 841.89)),
+            (5, (0.0, 841.89)),
+        ]);
+        let mut items = Vec::new();
+        for page in 1..=5u32 {
+            items.push(make_item(page, 72.0, 103.0, &format!("{}", 41 + page)));
+            items.push(make_item(page, 90.0, 103.0, "Company report"));
+            items.push(make_item(page, 72.0, 500.0, "Body content that stays"));
+        }
+        let mask = page_number_removal_mask(&items, 5, &a4);
+        for page in 0..5usize {
+            assert!(
+                mask[page * 3],
+                "advancing footer folio on page {} strips",
+                page + 1
+            );
+            assert!(!mask[page * 3 + 2], "body content survives");
+        }
+        // Without geometry the y=103 candidates are body (above the absolute
+        // 100pt band), so nothing strips - the gate stays consistent with
+        // candidacy in both modes.
+        let mask = page_number_removal_mask(&items, 5, &HashMap::new());
+        assert!(mask.iter().all(|&removed| !removed));
     }
 
     #[test]
