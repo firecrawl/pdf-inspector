@@ -464,20 +464,27 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
     (cleaned, footnotes)
 }
 
-/// Flag columns whose non-empty values are all at most two characters.
+/// Flag columns that hold a one- or two-character marker on some rows and
+/// nothing on others.
 ///
 /// Statement-style tables carry flag columns (a purchase indicator bullet, a
 /// tick, a one-letter code) that some rows leave blank. Those columns hold no
 /// prose, so their absence is not evidence that a row wrapped.
+///
+/// The header is skipped when classifying: a column labelled `Indicator` or
+/// `Status` still holds markers, and only its values decide. A column every
+/// row fills cannot be what makes a row look short, so requiring a blank keeps
+/// the exemption off tables where it has nothing to say.
 fn marker_column_flags(cells: &[Vec<String>]) -> Vec<bool> {
     let width = cells.iter().map(|row| row.len()).max().unwrap_or(0);
     (0..width)
         .map(|col| {
             let mut populated = 0usize;
-            for row in cells {
-                let Some(cell) = row.get(col) else { continue };
-                let trimmed = cell.trim();
+            let mut blank = 0usize;
+            for row in cells.iter().skip(1) {
+                let trimmed = row.get(col).map(|cell| cell.trim()).unwrap_or("");
                 if trimmed.is_empty() {
+                    blank += 1;
                     continue;
                 }
                 if trimmed.chars().count() > 2 {
@@ -485,7 +492,7 @@ fn marker_column_flags(cells: &[Vec<String>]) -> Vec<bool> {
                 }
                 populated += 1;
             }
-            populated > 0
+            populated > 0 && blank > 0
         })
         .collect()
 }
@@ -794,6 +801,64 @@ mod tests {
         assert_eq!(cleaned[2][0], "06/07/2026 14:16");
         assert_eq!(cleaned[2][2], "+ C 8,889.00");
         assert_eq!(cleaned[2][3], "", "the absent marker stays absent");
+    }
+
+    #[test]
+    fn test_clean_table_cells_marker_column_detected_under_descriptive_header() {
+        // The column label says nothing about what the column holds; only the
+        // values do. A spelled-out header must not hide a marker column.
+        let cells = vec![
+            vec![
+                "DATE & TIME".into(),
+                "TRANSACTION DESCRIPTION".into(),
+                "AMOUNT".into(),
+                "Indicator".into(),
+            ],
+            vec![
+                "26/06/2026 00:00".into(),
+                "10% Swiggy CashBack".into(),
+                "+ C 26.20".into(),
+                "l".into(),
+            ],
+            vec![
+                "06/07/2026 14:16".into(),
+                "BPPY CC PAYMENT DP016187141619hpYGk".into(),
+                "+ C 8,889.00".into(),
+                String::new(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 3, "no transaction row may be merged away");
+        assert_eq!(cleaned[2][0], "06/07/2026 14:16");
+    }
+
+    #[test]
+    fn test_clean_table_cells_wrapped_overflow_still_merges_beside_marker_column() {
+        // The exemption must not blanket-disable continuation merging for any
+        // table that happens to contain a short column. Real overflow carries
+        // less prose than the row it wrapped from, and still merges.
+        let cells = vec![
+            vec!["Ref".into(), "Description".into(), "Amount".into()],
+            vec![
+                "A1".into(),
+                "Delivery charge for the northern".into(),
+                "120.00".into(),
+            ],
+            vec![
+                String::new(),
+                "region raised in transit".into(),
+                String::new(),
+            ],
+            vec!["B2".into(), "Handling fee".into(), "80.00".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 3, "wrapped overflow should still merge");
+        assert_eq!(
+            cleaned[1][1],
+            "Delivery charge for the northern region raised in transit"
+        );
     }
 
     #[test]
