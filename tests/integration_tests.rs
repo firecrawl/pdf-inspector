@@ -4251,6 +4251,29 @@ fn test_process_pdf_mem_full_blank_page_signals() {
     assert_eq!(result.page_signals[1].direction, PageDirection::Ltr);
     assert_eq!(result.page_signals[1].confidence, 0.0);
 }
+/// Regression for #228: a `startxref` pointer corrupted to point at the
+/// wrong byte offset (a single flipped digit — a real, common writer bug)
+/// must not make the whole file unprocessable. The real classic xref table
+/// is still present and findable by scanning for the `xref` keyword; both
+/// pypdf and pdfium recover the same way. Before this fix, every entry
+/// point raised "Invalid PDF structure" on a file whose object data was
+/// otherwise completely intact.
+#[test]
+fn test_process_pdf_recovers_corrupted_startxref_pointer() {
+    let result = process_pdf_with_options(
+        "tests/fixtures/broken_startxref_pointer.pdf",
+        PdfOptions::new(),
+    )
+    .expect("a corrupted startxref pointer should be recoverable, like pypdf/pdfium");
+
+    assert_eq!(result.page_count, 1);
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Order Detail Report by Account") && md.contains("WIDGET ASSEMBLY"),
+        "recovered document should extract its real text, got: {md:?}"
+    );
+}
+
 /// Regression for #227: `extract_pages_markdown`'s per-page `needs_ocr`
 /// must agree with `classify_pdf`/`detect_pdf_type` on the same page. The
 /// fixture is a full-page raster "scan" with a single line of genuine
