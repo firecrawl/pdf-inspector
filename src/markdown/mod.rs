@@ -1815,6 +1815,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         crate::extractor::filter_markdown_page_numbers_with_removed_pages(
             non_table_items.into_iter().map(|(_, item)| item).collect(),
             document_page_count,
+            &std::collections::HashMap::new(),
         )
         .0
     };

@@ -204,7 +204,11 @@ fn extract_positioned_text_with_folio_context_impl(
         include_invisible,
         None,
     )?;
-    if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
+    if !layout::needs_document_page_number_context(
+        &selected_items,
+        doc.get_pages().len(),
+        &page_vertical_bounds(doc),
+    ) {
         return Ok((
             (selected_items, selected_rects, selected_lines),
             page_thresholds,
@@ -1162,6 +1166,18 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
         Object::Real(r) => Some(*r),
         _ => None,
     }
+}
+
+/// Vertical extent (y0, y1) of each page's visible box, for scaling the
+/// page-number bands to the page's real height. Pages without a resolvable
+/// box are absent, which keeps the calibrated absolute bands for them.
+pub(crate) fn page_vertical_bounds(doc: &Document) -> HashMap<u32, (f32, f32)> {
+    doc.get_pages()
+        .into_iter()
+        .filter_map(|(page_num, page_id)| {
+            get_page_box(doc, page_id).map(|(_, y0, _, y1)| (page_num, (y0, y1)))
+        })
+        .collect()
 }
 
 /// Visible page box: CropBox if present, else MediaBox, walking page-tree

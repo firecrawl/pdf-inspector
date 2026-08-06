@@ -964,13 +964,35 @@ const PAGE_NUMBER_Y_TOLERANCE: f32 = 3.0;
 const PAGE_NUMBER_CONTEXT_GAP_EM: f32 = 1.5;
 const PAGE_NUMBER_BOTTOM_Y: f32 = 100.0;
 const PAGE_NUMBER_TOP_Y: f32 = 720.0;
+/// The page height the absolute band constants above were calibrated for
+/// (US Letter). Pages whose visible box differs scale the bands by their
+/// real height, so an A4 page (841.89pt) does not treat the top ~122pt —
+/// eight lines of body text — as the folio zone (issue #283).
+const PAGE_NUMBER_BAND_REFERENCE_HEIGHT: f32 = 792.0;
+
+/// Vertical folio bands for a page: y above `top` or below `bottom` counts
+/// as page-edge. Derived from the page's visible box when known, keeping
+/// the exact historical thresholds on US-Letter-sized pages; without
+/// geometry the absolute constants apply unchanged.
+fn page_number_bands(bounds: Option<&(f32, f32)>) -> (f32, f32) {
+    match bounds {
+        Some(&(y0, y1)) if y1 - y0 > 72.0 => {
+            let scale = (y1 - y0) / PAGE_NUMBER_BAND_REFERENCE_HEIGHT;
+            (
+                y0 + PAGE_NUMBER_BOTTOM_Y * scale,
+                y0 + PAGE_NUMBER_TOP_Y * scale,
+            )
+        }
+        _ => (PAGE_NUMBER_BOTTOM_Y, PAGE_NUMBER_TOP_Y),
+    }
+}
 const SPREAD_MIN_CONTENT_WIDTH_EM: f32 = 40.0;
 const SPREAD_EDGE_FRACTION: f32 = 0.25;
 const ADJACENT_PAGE_MIN_CONTENT_WIDTH_EM: f32 = 26.0;
 
 type ContextualCandidateOccurrence = (u32, f32, Vec<(usize, u32)>);
 
-fn page_number_value(item: &TextItem) -> Option<u32> {
+fn page_number_value(item: &TextItem, page_bounds: &HashMap<u32, (f32, f32)>) -> Option<u32> {
     if !matches!(
         item.item_type,
         crate::types::ItemType::Text | crate::types::ItemType::FormField
@@ -984,10 +1006,11 @@ fn page_number_value(item: &TextItem) -> Option<u32> {
         return None;
     }
 
-    // Must be at top or bottom of page.
-    // US Letter = 792pt, A4 = 841pt. Page numbers are typically in the
-    // top ~5% or bottom ~12% of the page.
-    if item.y <= PAGE_NUMBER_TOP_Y && item.y >= PAGE_NUMBER_BOTTOM_Y {
+    // Must be at the top or bottom of the page. The bands scale with the
+    // page's real height so taller pages (A4 and up) keep the same physical
+    // margins as US Letter instead of swallowing body text.
+    let (bottom, top) = page_number_bands(page_bounds.get(&item.page));
+    if item.y <= top && item.y >= bottom {
         return None;
     }
 
@@ -1602,8 +1625,15 @@ fn page_number_context_masks(
 /// item attached to neighboring content on the same baseline is therefore kept.
 /// Complete page-number expressions such as `Page 42` remain removable even
 /// though their numeric item has lexical context.
-fn page_number_removal_mask(items: &[TextItem], document_page_count: usize) -> Vec<bool> {
-    let candidate_values: Vec<Option<u32>> = items.iter().map(page_number_value).collect();
+fn page_number_removal_mask(
+    items: &[TextItem],
+    document_page_count: usize,
+    page_bounds: &HashMap<u32, (f32, f32)>,
+) -> Vec<bool> {
+    let candidate_values: Vec<Option<u32>> = items
+        .iter()
+        .map(|item| page_number_value(item, page_bounds))
+        .collect();
     let (contextual, explicit_folio) =
         page_number_context_masks(items, &candidate_values, document_page_count);
 
@@ -1621,8 +1651,12 @@ fn page_number_removal_mask(items: &[TextItem], document_page_count: usize) -> V
 pub(super) fn needs_document_page_number_context(
     items: &[TextItem],
     document_page_count: usize,
+    page_bounds: &HashMap<u32, (f32, f32)>,
 ) -> bool {
-    let candidate_values: Vec<Option<u32>> = items.iter().map(page_number_value).collect();
+    let candidate_values: Vec<Option<u32>> = items
+        .iter()
+        .map(|item| page_number_value(item, page_bounds))
+        .collect();
     let (contextual, explicit_folio) =
         page_number_context_masks(items, &candidate_values, document_page_count);
 
@@ -1640,7 +1674,7 @@ pub(crate) fn filter_markdown_page_numbers(
     items: Vec<TextItem>,
     document_page_count: u32,
 ) -> Vec<TextItem> {
-    filter_markdown_page_numbers_with_removed_pages(items, document_page_count).0
+    filter_markdown_page_numbers_with_removed_pages(items, document_page_count, &HashMap::new()).0
 }
 
 /// Filter Markdown folios while retaining the pages where items were removed.
@@ -1651,8 +1685,9 @@ pub(crate) fn filter_markdown_page_numbers(
 pub(crate) fn filter_markdown_page_numbers_with_removed_pages(
     items: Vec<TextItem>,
     document_page_count: u32,
+    page_bounds: &HashMap<u32, (f32, f32)>,
 ) -> (Vec<TextItem>, HashSet<u32>, Vec<bool>) {
-    let remove = page_number_removal_mask(&items, document_page_count as usize);
+    let remove = page_number_removal_mask(&items, document_page_count as usize, page_bounds);
     let mut removed_pages = HashSet::new();
     let items = items
         .into_iter()
@@ -1977,7 +2012,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
             .map(|item| item.page as usize)
             .max()
             .unwrap_or(0);
-        let remove = page_number_removal_mask(&items, observed_page_count);
+        let remove = page_number_removal_mask(&items, observed_page_count, &HashMap::new());
         items
             .into_iter()
             .zip(remove)
@@ -2001,7 +2036,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
         // from changing the page's inferred layout.
         let column_detection_items: Vec<TextItem> = page_items
             .iter()
-            .filter(|item| page_number_value(item).is_none())
+            .filter(|item| page_number_value(item, &HashMap::new()).is_none())
             .cloned()
             .collect();
         let column_detection_items = column_detection_items.as_slice();
@@ -2058,7 +2093,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                 let col_input: Vec<TextItem> = page_items
                     .iter()
                     .filter(|it| {
-                        if page_number_value(it).is_some() {
+                        if page_number_value(it, &HashMap::new()).is_some() {
                             return false;
                         }
                         let cx = it.x + it.width / 2.0;
@@ -2481,6 +2516,61 @@ mod tests {
             y -= 14.0;
         }
         items
+    }
+
+    #[test]
+    fn page_number_bands_scale_with_page_height() {
+        // US Letter keeps the exact historical thresholds.
+        assert_eq!(page_number_bands(Some(&(0.0, 792.0))), (100.0, 720.0));
+        // A4 scales both bands so the physical margins match Letter's.
+        let (bottom, top) = page_number_bands(Some(&(0.0, 841.89)));
+        assert!((bottom - 106.3).abs() < 0.1, "bottom band: {bottom}");
+        assert!((top - 765.35).abs() < 0.1, "top band: {top}");
+        // A box with a nonzero origin shifts the bands with it.
+        let (bottom, top) = page_number_bands(Some(&(100.0, 892.0)));
+        assert!((bottom - 200.0).abs() < 0.1, "offset bottom: {bottom}");
+        assert!((top - 820.0).abs() < 0.1, "offset top: {top}");
+        // Missing or degenerate geometry keeps the absolute constants.
+        assert_eq!(page_number_bands(None), (100.0, 720.0));
+        assert_eq!(page_number_bands(Some(&(0.0, 10.0))), (100.0, 720.0));
+    }
+
+    #[test]
+    fn a4_body_digits_above_the_letter_band_are_not_candidates() {
+        // Issue #283: on A4 (841.89pt) y=740 is body territory (~12% from
+        // the top), but the US-Letter constant treated it as the folio zone
+        // and deleted table row indices.
+        let a4: HashMap<u32, (f32, f32)> = HashMap::from([(1, (0.0, 841.89))]);
+        let index = make_item(1, 208.0, 740.0, "14");
+        assert_eq!(page_number_value(&index, &a4), None, "A4 y=740 is body");
+        // The same item without geometry keeps today's behavior.
+        assert_eq!(page_number_value(&index, &HashMap::new()), Some(14));
+        // A digit in A4's real top margin is still a candidate.
+        let folio = make_item(1, 297.0, 810.0, "7");
+        assert_eq!(page_number_value(&folio, &a4), Some(7));
+        // And the bottom band scales the same way: A4 y=103 is inside the
+        // scaled bottom band (106.3), so it stays a candidate.
+        let bottom = make_item(1, 297.0, 103.0, "9");
+        assert_eq!(page_number_value(&bottom, &a4), Some(9));
+    }
+
+    #[test]
+    fn letter_pages_keep_their_historical_bands() {
+        let letter: HashMap<u32, (f32, f32)> = HashMap::from([(1, (0.0, 792.0))]);
+        for (y, expect) in [
+            (740.0, Some(14)),
+            (719.0, None),
+            (99.0, Some(14)),
+            (101.0, None),
+        ] {
+            let item = make_item(1, 208.0, y, "14");
+            assert_eq!(page_number_value(&item, &letter), expect, "y={y}");
+            assert_eq!(
+                page_number_value(&item, &HashMap::new()),
+                expect,
+                "no-geometry y={y}"
+            );
+        }
     }
 
     #[test]
