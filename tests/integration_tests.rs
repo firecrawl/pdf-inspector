@@ -4065,18 +4065,21 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
 /// matching Unicode codepoint, so these tests exercise ordering only, not glyph
 /// decoding.
 fn synthetic_rtl_pdf(stored_lines: &[&str]) -> Vec<u8> {
+    synthetic_rtl_pdf_pages(&[stored_lines])
+}
+
+/// Multi-page variant: one entry per page.
+fn synthetic_rtl_pdf_pages(pages: &[&[&str]]) -> Vec<u8> {
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Document, Object, Stream};
 
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
-    let page_id = doc.new_object_id();
     let font_id = doc.new_object_id();
     let cid_font_id = doc.new_object_id();
     let descriptor_id = doc.new_object_id();
     let tounicode_id = doc.new_object_id();
     let cid_system_info_id = doc.new_object_id();
-    let content_id = doc.new_object_id();
 
     doc.objects.insert(
         font_id,
@@ -4140,39 +4143,38 @@ endcmap\nend\nend"
     doc.objects
         .insert(tounicode_id, Stream::new(dictionary! {}, cmap).into());
 
-    let mut operations = vec![Operation::new("BT", vec![])];
-    for (index, line) in stored_lines.iter().enumerate() {
-        let mut bytes = Vec::new();
-        for ch in line.chars() {
-            bytes.extend_from_slice(&(ch as u32 as u16).to_be_bytes());
+    let mut page_ids = Vec::new();
+    for stored_lines in pages {
+        let mut operations = vec![Operation::new("BT", vec![])];
+        for (index, line) in stored_lines.iter().enumerate() {
+            let mut bytes = Vec::new();
+            for ch in line.chars() {
+                bytes.extend_from_slice(&(ch as u32 as u16).to_be_bytes());
+            }
+            operations.push(Operation::new("Tf", vec!["F0".into(), 12.into()]));
+            // Tm, not Td: Td is relative to the current line start and would
+            // accumulate across lines.
+            operations.push(Operation::new(
+                "Tm",
+                vec![
+                    1.into(),
+                    0.into(),
+                    0.into(),
+                    1.into(),
+                    50.into(),
+                    Object::Integer(700 - 20 * index as i64),
+                ],
+            ));
+            operations.push(Operation::new(
+                "Tj",
+                vec![Object::String(bytes, lopdf::StringFormat::Hexadecimal)],
+            ));
         }
-        operations.push(Operation::new("Tf", vec!["F0".into(), 12.into()]));
-        // Tm, not Td: Td is relative to the current line start and would
-        // accumulate across lines.
-        operations.push(Operation::new(
-            "Tm",
-            vec![
-                1.into(),
-                0.into(),
-                0.into(),
-                1.into(),
-                50.into(),
-                Object::Integer(700 - 20 * index as i64),
-            ],
-        ));
-        operations.push(Operation::new(
-            "Tj",
-            vec![Object::String(bytes, lopdf::StringFormat::Hexadecimal)],
-        ));
-    }
-    operations.push(Operation::new("ET", vec![]));
+        operations.push(Operation::new("ET", vec![]));
 
-    let content = Content { operations }.encode().unwrap();
-    doc.objects
-        .insert(content_id, Stream::new(dictionary! {}, content).into());
-    doc.objects.insert(
-        page_id,
-        dictionary! {
+        let content = Content { operations }.encode().unwrap();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+        let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => pages_id,
             "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
@@ -4180,15 +4182,16 @@ endcmap\nend\nend"
                 "Font" => dictionary! { "F0" => font_id },
             },
             "Contents" => content_id,
-        }
-        .into(),
-    );
+        });
+        page_ids.push(page_id);
+    }
+
     doc.objects.insert(
         pages_id,
         dictionary! {
             "Type" => "Pages",
-            "Kids" => vec![page_id.into()],
-            "Count" => 1,
+            "Kids" => page_ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>(),
+            "Count" => page_ids.len() as i64,
         }
         .into(),
     );
@@ -4339,5 +4342,47 @@ fn fixture_visual_order_rtl_pdf_extracts_in_logical_order() {
     assert!(
         !md.contains("םולש"),
         "visual-order text survived extraction: {md:?}"
+    );
+}
+
+#[test]
+fn evidence_from_one_page_corrects_a_page_that_could_not_decide_alone() {
+    // The centrepiece of the fix: the verdict is document-wide. Page 1 carries
+    // enough misplaced final forms to clear the floor; page 2 holds visual-order
+    // Hebrew with no final letters at all, so on its own it would be left
+    // reversed. Both must come out logical.
+    let evidence_page = visually_stored(LOGICAL_LINES);
+    let evidence_refs: Vec<&str> = evidence_page.iter().map(String::as_str).collect();
+
+    // "בית ספר" / "אבא" carry no word-final letters — zero evidence alone.
+    let quiet_page = visually_stored(&["בית ספר", "אבא"]);
+    let quiet_refs: Vec<&str> = quiet_page.iter().map(String::as_str).collect();
+
+    // Guard the premise: the quiet page really is undecidable by itself.
+    let alone = extracted_text(&synthetic_rtl_pdf(&quiet_refs));
+    assert!(
+        alone.contains("רפס תיב"),
+        "premise broken - the quiet page decided on its own: {alone:?}"
+    );
+
+    let text = extracted_text(&synthetic_rtl_pdf_pages(&[&evidence_refs, &quiet_refs]));
+    assert_reads_logically(&text);
+    assert!(
+        text.contains("בית ספר") && text.contains("אבא"),
+        "page 2 was not corrected by page 1's evidence: {text:?}"
+    );
+}
+
+#[test]
+fn vocalized_rtl_text_still_yields_a_verdict() {
+    // Combining marks (niqqud) must not shatter words into unscorable single
+    // letters, or a vocalized document would carry no evidence at all.
+    let vocalized = visually_stored(&["שָׁלוֹם עוֹלָם", "עוֹרֵךְ דִּין", "אֶרֶץ", "כֶּסֶף", "זְמַן"]);
+    let refs: Vec<&str> = vocalized.iter().map(String::as_str).collect();
+    let text = extracted_text(&synthetic_rtl_pdf(&refs));
+
+    assert!(
+        text.contains("שָׁלוֹם") && text.contains("אֶרֶץ"),
+        "vocalized visual-order text was not restored: {text:?}"
     );
 }

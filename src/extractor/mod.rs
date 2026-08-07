@@ -263,6 +263,11 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
 /// runs — before a document-wide view exists. So the first pass only gathers
 /// evidence, and the rare visual-order document is extracted once more with the
 /// verdict known.
+///
+/// Evidence comes from the pages actually extracted, so a `page_filter` narrows
+/// it: a selected page can fall below the floor that the whole document would
+/// clear. Widening it would mean extracting every page just to judge a one-page
+/// request, which costs more than the inconsistency is worth.
 fn extract_positioned_text_impl(
     doc: &Document,
     font_cmaps: &FontCMaps,

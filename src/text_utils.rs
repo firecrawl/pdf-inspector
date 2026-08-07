@@ -133,13 +133,26 @@ struct WordFinalFormScript {
     letters: (char, char),
     /// Letters spellable only as the last letter of a word.
     word_final_only: &'static [char],
+    /// Marks that attach to a letter without ending the word. Vocalized text
+    /// interleaves these with letters, and treating them as separators would
+    /// shatter every word into unscorable single letters.
+    combining: &'static [(char, char)],
 }
 
 const WORD_FINAL_FORM_SCRIPTS: &[WordFinalFormScript] = &[
-    // Hebrew: final kaf, mem, nun, pe, tsadi.
+    // Hebrew: final kaf, mem, nun, pe, tsadi; combining ranges are the
+    // cantillation marks and niqqud, excluding the punctuation interleaved
+    // with them (maqaf, paseq, sof pasuq, nun hafukha).
     WordFinalFormScript {
         letters: ('\u{05D0}', '\u{05EA}'),
         word_final_only: &['\u{05DA}', '\u{05DD}', '\u{05DF}', '\u{05E3}', '\u{05E5}'],
+        combining: &[
+            ('\u{0591}', '\u{05BD}'),
+            ('\u{05BF}', '\u{05BF}'),
+            ('\u{05C1}', '\u{05C2}'),
+            ('\u{05C4}', '\u{05C5}'),
+            ('\u{05C7}', '\u{05C7}'),
+        ],
     },
 ];
 
@@ -147,6 +160,14 @@ fn word_final_form_script(c: char) -> Option<usize> {
     WORD_FINAL_FORM_SCRIPTS
         .iter()
         .position(|script| c >= script.letters.0 && c <= script.letters.1)
+}
+
+/// Whether `c` attaches to a preceding letter rather than ending its word.
+fn is_word_continuing_mark(c: char) -> bool {
+    WORD_FINAL_FORM_SCRIPTS
+        .iter()
+        .flat_map(|script| script.combining)
+        .any(|&(lo, hi)| c >= lo && c <= hi)
 }
 
 /// Scripts [`expand_ligatures`] already restored from presentation forms;
@@ -184,11 +205,16 @@ pub(crate) struct VisualOrderEvidence {
 
 impl VisualOrderEvidence {
     pub(crate) fn observe(&mut self, text: &str) {
-        for word in text.split(|c: char| word_final_form_script(c).is_none()) {
-            let mut chars = word.chars();
+        let boundary = |c: char| word_final_form_script(c).is_none() && !is_word_continuing_mark(c);
+        for word in text.split(boundary) {
+            // Score the letters only: vocalized words carry combining marks,
+            // and a word may legitimately end in one.
+            let mut letters = word
+                .chars()
+                .filter(|&c| word_final_form_script(c).is_some());
             // `next_back` yields None for a single letter, skipping it: a lone
             // final form is a legitimate abbreviation.
-            let (Some(first), Some(last)) = (chars.next(), chars.next_back()) else {
+            let (Some(first), Some(last)) = (letters.next(), letters.next_back()) else {
                 continue;
             };
             let Some(script) = word_final_form_script(first) else {
@@ -212,6 +238,12 @@ impl VisualOrderEvidence {
 /// right-to-left by the time a line exists, so reversing a merged line would
 /// re-emit the visual order. Runs with no RTL text are skipped —
 /// [`reverse_visual_rtl`] reorders LTR runs.
+///
+/// Reversal is by scalar, which restores producers that stored the run scalar-
+/// reversed. A producer that instead reversed grapheme clusters — keeping each
+/// base letter with its combining marks together — would need cluster-aware
+/// reversal, since scalar reversal detaches those marks. No such producer has
+/// been observed in testing.
 pub(crate) fn restore_logical_order(items: &mut [TextItem]) {
     for item in items.iter_mut() {
         if item.text.chars().any(is_contextual_form_script_char) {
