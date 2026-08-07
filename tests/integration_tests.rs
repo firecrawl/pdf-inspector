@@ -4354,8 +4354,10 @@ fn evidence_from_one_page_corrects_a_page_that_could_not_decide_alone() {
     let evidence_page = visually_stored(LOGICAL_LINES);
     let evidence_refs: Vec<&str> = evidence_page.iter().map(String::as_str).collect();
 
-    // "בית ספר" / "אבא" carry no word-final letters — zero evidence alone.
-    let quiet_page = visually_stored(&["בית ספר", "אבא"]);
+    // "בית ספר" / "משה" carry no word-final letters — zero evidence alone.
+    // Both must be non-palindromes, or the assertion below would hold whether
+    // or not the page was corrected.
+    let quiet_page = visually_stored(&["בית ספר", "משה"]);
     let quiet_refs: Vec<&str> = quiet_page.iter().map(String::as_str).collect();
 
     // Guard the premise: the quiet page really is undecidable by itself.
@@ -4368,7 +4370,7 @@ fn evidence_from_one_page_corrects_a_page_that_could_not_decide_alone() {
     let text = extracted_text(&synthetic_rtl_pdf_pages(&[&evidence_refs, &quiet_refs]));
     assert_reads_logically(&text);
     assert!(
-        text.contains("בית ספר") && text.contains("אבא"),
+        text.contains("בית ספר") && text.contains("משה"),
         "page 2 was not corrected by page 1's evidence: {text:?}"
     );
 }
