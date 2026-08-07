@@ -1,0 +1,22 @@
+src/markdown/preprocess.rs
+  s_12ce94366af290::t_94e818ca31e8a9 225,237-239
+  s_12ce94366af290::t_19ececb800a9cd 278-282,284-285
+  s_12ce94366af290::t_1a85a7b000a515 257-277,289
+  s_12ce94366af290::t_7a929c6cec7b82 283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b0b42c49491416ccc57c7b0faf3ecee568882d28",
+  "prompts": {},
+  "sessions": {
+    "s_12ce94366af290": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e7e6d727-0ee7-4dc7-982d-31fba9d7e842",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
