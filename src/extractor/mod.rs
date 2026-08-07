@@ -568,6 +568,18 @@ pub(crate) fn image_bbox_from_ctm(ctm: &[f32; 6]) -> (f32, f32, f32, f32) {
     (x_min, y_min, x_max - x_min, y_max - y_min)
 }
 
+/// Whether a text-showing operator's output becomes a [`TextItem`].
+///
+/// Whitespace-only runs are normally dropped: the text matrix has already
+/// advanced, so horizontal gap detection recreates the space. A rotated run has
+/// no such fallback — it is rebuilt glyph by glyph by `merge_rotated_runs`, and
+/// under the letter-spacing rotated labels use, a space advance is smaller than
+/// an ordinary letter's, so no gap threshold can recover the word break. Blanks
+/// that pass here and go unconsumed are dropped by that same pass.
+pub(crate) fn emits_text_item(text: &str, combined: &[f32; 6]) -> bool {
+    !text.is_empty() && (!text.trim().is_empty() || combined[0].abs() < combined[1].abs())
+}
+
 /// Multiply two 2D transformation matrices
 /// Matrix format: [a, b, c, d, e, f] representing:
 /// | a  b  0 |
@@ -1210,6 +1222,22 @@ mod tests {
     use crate::text_utils::{is_cjk_char, is_rtl_char, is_rtl_text, sort_line_items};
     use crate::types::{ItemType, PdfLine, TextLine};
     use layout::{detect_columns, is_newspaper_layout, ColumnRegion};
+
+    #[test]
+    fn test_emits_text_item() {
+        let horizontal = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let rotated_ccw = [0.0, 1.0, -1.0, 0.0, 0.0, 0.0];
+        let rotated_cw = [0.0, -1.0, 1.0, 0.0, 0.0, 0.0];
+
+        assert!(emits_text_item("A", &horizontal));
+        assert!(emits_text_item("A", &rotated_ccw));
+        assert!(!emits_text_item("", &horizontal));
+        assert!(!emits_text_item("", &rotated_ccw));
+        // The whole point: a blank survives only where the run is rotated.
+        assert!(!emits_text_item(" ", &horizontal));
+        assert!(emits_text_item(" ", &rotated_ccw));
+        assert!(emits_text_item(" ", &rotated_cw));
+    }
 
     /// Glyph-per-item run at `fs`=12 with the given inter-glyph gap (pt).
     fn glyph_run(chars: &str, start_x: f32, glyph_w: f32, gap: f32) -> Vec<TextItem> {

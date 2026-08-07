@@ -20,7 +20,7 @@ use super::fonts::{
 };
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
-use super::{get_number, image_bbox_from_ctm, multiply_matrices};
+use super::{emits_text_item, get_number, image_bbox_from_ctm, multiply_matrices};
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
 ///
@@ -529,9 +529,7 @@ pub(crate) fn extract_page_text_items(
                         } else {
                             0.0
                         };
-                        // Only create text item for non-whitespace; whitespace
-                        // still advances the text matrix above so gap detection works
-                        if !text.trim().is_empty() {
+                        if emits_text_item(&text, &combined) {
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -675,12 +673,12 @@ pub(crate) fn extract_page_text_items(
                             }
                         }
                         // Flush remaining text
-                        if !is_invisible && !current_text.trim().is_empty() {
+                        let combined = multiply_matrices(&text_matrix, &ctm);
+                        if !is_invisible && emits_text_item(&current_text, &combined) {
                             sub_items.push((current_text, sub_start_width_ts, total_width_ts));
                         }
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
-                            let combined = multiply_matrices(&text_matrix, &ctm);
                             if combined[0].abs() >= combined[1].abs() {
                                 rotation_votes.horizontal += 1;
                             } else {
@@ -786,9 +784,9 @@ pub(crate) fn extract_page_text_items(
                         &mut cmap_decisions,
                         &font_widths,
                     ) {
-                        if !text.trim().is_empty() {
-                            let combined =
-                                multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                        let combined =
+                            multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                        if emits_text_item(&text, &combined) {
                             if combined[0].abs() >= combined[1].abs() {
                                 rotation_votes.horizontal += 1;
                             } else {
@@ -1286,8 +1284,12 @@ pub(crate) fn extract_page_text_items(
     // Some PDFs embed landscape content in portrait pages using a rotated text
     // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
     // assumes x=horizontal, y=vertical — so we swap coordinates to match.
-    let (mut items, rects, lines, coords_rotated) =
+    let (items, rects, lines, coords_rotated) =
         correct_rotated_page(items, rects, lines, &rotation_votes);
+    // Before any line grouping or item joining: a scattered rotated run must be
+    // whole again or `merge_text_items` steals its glyphs into neighbouring
+    // horizontal text.
+    let mut items = merge_rotated_runs(items);
     if coords_rotated {
         rotate_underline_graphics(&mut underline_rects, &mut underline_lines);
     }
@@ -1380,6 +1382,122 @@ fn correct_rotated_page(
     }
 
     (items, rects, lines, true)
+}
+
+/// Rotated glyphs come out zero-width: the advance is measured along the text
+/// x-axis, which a 90° matrix maps entirely onto device y.
+const ROTATED_MAX_WIDTH: f32 = 0.5;
+/// Glyphs of one rotated line share a baseline x exactly; this absorbs float noise.
+const ROTATED_X_TOLERANCE: f32 = 0.6;
+/// Largest advance between consecutive glyphs of a run, in font sizes. Wide
+/// enough for the heavy letter-spacing these headers use, tight enough to keep
+/// two labels stacked in one column apart.
+const ROTATED_MAX_ADVANCE: f32 = 3.0;
+/// Below this, a column of narrow items is likelier bullets or rule artifacts
+/// than a rotated label.
+const ROTATED_MIN_GLYPHS: usize = 3;
+
+/// Merge each 90°-rotated text run into one horizontal-looking item.
+///
+/// A rotated run advances along device y at a fixed x, so line grouping drops
+/// one glyph into every row band and parallel runs interleave — `Raw material`
+/// beside `supply` comes out smeared across a dozen cells as
+/// `e t a y l m p w p a u R s`. [`correct_rotated_page`] only rescues pages that
+/// are *entirely* rotated; a few rotated headers on an otherwise horizontal page
+/// sit far below its vote threshold.
+///
+/// Reading order is y-ascending and the glyph bodies hang left of the baseline,
+/// both of which assume 90° CCW — the same assumption `correct_rotated_page`
+/// already encodes.
+///
+/// Extraction keeps whitespace-only items for rotated matrices so word breaks
+/// survive into the merge; this pass owns them, and drops any it does not
+/// consume so the rest of the pipeline still never sees a blank item.
+fn merge_rotated_runs(items: Vec<TextItem>) -> Vec<TextItem> {
+    let mut candidates: Vec<usize> = (0..items.len())
+        .filter(|&i| {
+            let item = &items[i];
+            item.width < ROTATED_MAX_WIDTH
+                && item.font_size > 0.0
+                && !item.text.is_empty()
+                // One glyph per item is the pathology. Multi-character items at
+                // one x are ordinary lines on a page whose fonts carry no widths.
+                && item.text.chars().count() <= 2
+        })
+        .collect();
+    if candidates.len() < ROTATED_MIN_GLYPHS {
+        return drop_blank_items(items);
+    }
+    candidates.sort_by(|&a, &b| {
+        items[a]
+            .x
+            .total_cmp(&items[b].x)
+            .then(items[a].y.total_cmp(&items[b].y))
+            .then(a.cmp(&b))
+    });
+
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+    for &idx in &candidates {
+        // x against the run's start, not its previous glyph, so tolerance cannot
+        // accumulate into a walk across columns.
+        let continues = match (run.first(), run.last()) {
+            (Some(&start), Some(&previous)) => {
+                (items[idx].x - items[start].x).abs() <= ROTATED_X_TOLERANCE
+                    && items[idx].y - items[previous].y
+                        <= ROTATED_MAX_ADVANCE * items[previous].font_size
+            }
+            _ => false,
+        };
+        if !continues {
+            let finished = std::mem::take(&mut run);
+            if finished.len() >= ROTATED_MIN_GLYPHS {
+                runs.push(finished);
+            }
+        }
+        run.push(idx);
+    }
+    if run.len() >= ROTATED_MIN_GLYPHS {
+        runs.push(run);
+    }
+    if runs.is_empty() {
+        return drop_blank_items(items);
+    }
+
+    let mut merged: HashMap<usize, TextItem> = HashMap::new();
+    let mut absorbed = vec![false; items.len()];
+    for run in &runs {
+        let first = &items[run[0]];
+        let font_size = first.font_size;
+        let text: String = run.iter().map(|&i| items[i].text.as_str()).collect();
+        merged.insert(
+            run[0],
+            TextItem {
+                text: text.trim().to_string(),
+                x: first.x - font_size,
+                width: font_size,
+                ..first.clone()
+            },
+        );
+        for &i in &run[1..] {
+            absorbed[i] = true;
+        }
+    }
+
+    let rebuilt: Vec<TextItem> = items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !absorbed[*i])
+        .map(|(i, item)| merged.remove(&i).unwrap_or(item))
+        .collect();
+    drop_blank_items(rebuilt)
+}
+
+/// Whitespace-only items exist only to carry word breaks into
+/// [`merge_rotated_runs`]; nothing downstream expects them.
+fn drop_blank_items(mut items: Vec<TextItem>) -> Vec<TextItem> {
+    items.retain(|item| !item.text.trim().is_empty());
+    items
 }
 
 fn rotate_underline_graphics(rects: &mut [PdfRect], lines: &mut [UnderlineLine]) {
@@ -1508,6 +1626,75 @@ mod tests {
         )
         .unwrap();
         items
+    }
+
+    /// Two 90°-CCW column headers side by side, each glyph placed by its own
+    /// `Tm` — the shape every rotated table header has. The horizontal module
+    /// row is not decoration: it keeps the page under `correct_rotated_page`'s
+    /// two-thirds vote threshold, which is the case this merge exists for.
+    fn rotated_header_content() -> Vec<u8> {
+        let mut content = String::from("BT\n/F1 9 Tf\n");
+        for (x, glyphs) in [(164.25_f32, "Use phase"), (300.0, "Total")] {
+            for (i, glyph) in glyphs.chars().enumerate() {
+                let y = 300.0 + i as f32 * 6.0;
+                content.push_str(&format!("0 1 -1 0 {x} {y} Tm ({glyph}) Tj\n"));
+            }
+        }
+        for (i, label) in ["A1", "A2", "A3", "A4", "A5", "B1", "B2", "C1", "C2", "D"]
+            .iter()
+            .enumerate()
+        {
+            let y = 200.0 - i as f32 * 20.0;
+            content.push_str(&format!("1 0 0 1 100 {y} Tm ({label}) Tj\n"));
+        }
+        // A horizontal blank still gets dropped.
+        content.push_str("1 0 0 1 140 200 Tm ( ) Tj\nET\n");
+        content.into_bytes()
+    }
+
+    #[test]
+    fn test_rotated_column_headers_merge_into_one_item() {
+        let items = extract_simple_items(&rotated_header_content());
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+
+        assert!(texts.contains(&"Use phase"), "got {texts:?}");
+        assert!(texts.contains(&"Total"), "got {texts:?}");
+        // No glyph left scattered and no blank leaked past the merge.
+        assert_eq!(items.len(), 12, "got {texts:?}");
+
+        let header = items.iter().find(|i| i.text == "Use phase").unwrap();
+        // 90° CCW hangs the glyph bodies left of the baseline.
+        assert!((header.x - (164.25 - 9.0)).abs() < 0.01, "x = {}", header.x);
+        assert!((header.width - 9.0).abs() < 0.01, "width = {}", header.width);
+        assert!((header.y - 300.0).abs() < 0.01, "y = {}", header.y);
+    }
+
+    #[test]
+    fn test_merge_rotated_runs_keeps_multi_char_column() {
+        // Zero width also means "font carries no widths". Such a page is whole
+        // lines stacked at one x, not glyphs — merging it would fuse paragraphs.
+        let line = |text: &str, y: f32| TextItem {
+            text: text.to_string(),
+            x: 72.0,
+            y,
+            width: 0.0,
+            height: 10.0,
+            font: "F1".to_string(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        };
+        let items = vec![line("first", 100.0), line("second", 112.0), line("third", 124.0)];
+
+        let merged = merge_rotated_runs(items);
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].text, "first");
     }
 
     #[test]
