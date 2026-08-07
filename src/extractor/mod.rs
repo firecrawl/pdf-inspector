@@ -1034,6 +1034,9 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     merged
 }
 
+/// How much smaller than its line's text a glyph must be to read as a script.
+const SCRIPT_SIZE_RATIO: f32 = 0.75;
+
 /// Merge subscript/superscript items into their adjacent parent items.
 ///
 /// Subscripts (e.g. "2" in H₂O) are rendered as separate text items with a
@@ -1066,25 +1069,52 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     }
     line_groups.extend(anchors.iter().map(|&(page, y)| (page, y, Vec::new())));
 
+    let first_in_range = |groups: &[(u32, f32, Vec<TextItem>)], item: &TextItem| {
+        groups
+            .iter()
+            .position(|(page, y, _)| *page == item.page && (item.y - *y).abs() < y_tolerance)
+    };
+
+    // Ordinary items first, on first-match — exactly what the single-pass version
+    // did. Anything that could be a script glyph waits, because the test for one
+    // needs the line it would join to already carry its body text.
+    let mut deferred: Vec<TextItem> = Vec::new();
     for item in items {
-        // Nearest line, but only for a glyph that could be a script: a short
-        // numeric token. Ordinary text keeps first-match, which is what the
-        // single-pass version did — reassigning it would reshuffle emission
-        // order for dense multi-line layouts, and only the raised glyph is at
-        // risk of being claimed by the wrong row.
-        let script_candidate = item.text.len() <= 4 && is_script_token(&item.text);
-        let found = if script_candidate {
-            line_groups
-                .iter_mut()
-                .filter(|(page, y, _)| *page == item.page && (item.y - *y).abs() < y_tolerance)
-                .min_by(|a, b| (item.y - a.1).abs().total_cmp(&(item.y - b.1).abs()))
+        if item.text.len() <= 4 && is_script_token(&item.text) {
+            deferred.push(item);
+            continue;
+        }
+        match first_in_range(&line_groups, &item) {
+            Some(index) => line_groups[index].2.push(item),
+            None => line_groups.push((item.page, item.y, vec![item])),
+        }
+    }
+
+    for item in deferred {
+        let nearest = line_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, (page, y, _))| *page == item.page && (item.y - *y).abs() < y_tolerance)
+            .min_by(|(_, a), (_, b)| (item.y - a.1).abs().total_cmp(&(item.y - b.1).abs()))
+            .map(|(index, _)| index);
+        // Nearest line, but only for a glyph genuinely smaller than the text on
+        // that line. A body-sized numeric cell is a value, not a script: moving one
+        // to a different row group trades cells between rows in a dense table.
+        let raised = nearest.is_some_and(|index| {
+            let line_size = line_groups[index]
+                .2
+                .iter()
+                .map(|other| other.font_size)
+                .fold(0.0_f32, f32::max);
+            line_size > 0.0 && item.font_size < line_size * SCRIPT_SIZE_RATIO
+        });
+        let target = if raised {
+            nearest
         } else {
-            line_groups
-                .iter_mut()
-                .find(|(page, y, _)| *page == item.page && (item.y - *y).abs() < y_tolerance)
+            first_in_range(&line_groups, &item)
         };
-        match found {
-            Some((_, _, group)) => group.push(item),
+        match target {
+            Some(index) => line_groups[index].2.push(item),
             None => line_groups.push((item.page, item.y, vec![item])),
         }
     }
@@ -1103,7 +1133,7 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
             continue;
         }
 
-        let sub_threshold = max_fs * 0.75;
+        let sub_threshold = max_fs * SCRIPT_SIZE_RATIO;
 
         // Walk through items and merge subscripts into their preceding parent
         let mut merged: Vec<TextItem> = Vec::new();
