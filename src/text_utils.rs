@@ -124,6 +124,105 @@ fn is_arabic_presentation_form(c: char) -> bool {
     matches!(c, '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFE}')
 }
 
+/// A script that reserves some letters for the end of a word. A word *starting*
+/// with one is unspellable, so it can only come from visual-order text — the
+/// base-character equivalent of the presentation forms that betray Arabic.
+/// Adding a script is a data change; the logic below is script-agnostic.
+struct WordFinalFormScript {
+    /// Inclusive letter range, used to split runs into words.
+    letters: (char, char),
+    /// Letters spellable only as the last letter of a word.
+    word_final_only: &'static [char],
+}
+
+const WORD_FINAL_FORM_SCRIPTS: &[WordFinalFormScript] = &[
+    // Hebrew: final kaf, mem, nun, pe, tsadi.
+    WordFinalFormScript {
+        letters: ('\u{05D0}', '\u{05EA}'),
+        word_final_only: &['\u{05DA}', '\u{05DD}', '\u{05DF}', '\u{05E3}', '\u{05E5}'],
+    },
+];
+
+fn word_final_form_script(c: char) -> Option<usize> {
+    WORD_FINAL_FORM_SCRIPTS
+        .iter()
+        .position(|script| c >= script.letters.0 && c <= script.letters.1)
+}
+
+/// Scripts [`expand_ligatures`] already restored from presentation forms;
+/// reversing those runs again would undo that.
+fn is_contextual_form_script_char(c: char) -> bool {
+    matches!(c,
+        '\u{0600}'..='\u{06FF}'   // Arabic
+        | '\u{0750}'..='\u{077F}' // Arabic Supplement
+        | '\u{08A0}'..='\u{08FF}' // Arabic Extended-A
+        | '\u{FB50}'..='\u{FDFF}' // Arabic Presentation Forms-A
+        | '\u{FE70}'..='\u{FEFE}' // Arabic Presentation Forms-B
+    )
+}
+
+/// Guards a document with very little RTL text against a lone mis-split run.
+const MIN_VISUAL_ORDER_EVIDENCE: u32 = 4;
+
+/// How far misplaced final forms must outnumber correctly placed ones.
+const VISUAL_ORDER_EVIDENCE_MARGIN: u32 = 3;
+
+/// Evidence that a document stores RTL text in visual rather than logical order.
+///
+/// Visual vs logical is a property of the *producer*, not of any one show-text
+/// run, and unlike Arabic's presentation forms the signal is sparse — whole
+/// pages can carry no word-final letter. Evidence is therefore pooled across the
+/// document and applied uniformly, so no document is corrected in one place and
+/// left reversed in another.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct VisualOrderEvidence {
+    /// Words starting with a word-final-only letter — visual order only.
+    misplaced_finals: u32,
+    /// Words ending with a word-final-only letter — ordinary spelling.
+    correct_finals: u32,
+}
+
+impl VisualOrderEvidence {
+    pub(crate) fn observe(&mut self, text: &str) {
+        for word in text.split(|c: char| word_final_form_script(c).is_none()) {
+            let mut chars = word.chars();
+            // `next_back` yields None for a single letter, skipping it: a lone
+            // final form is a legitimate abbreviation.
+            let (Some(first), Some(last)) = (chars.next(), chars.next_back()) else {
+                continue;
+            };
+            let Some(script) = word_final_form_script(first) else {
+                continue;
+            };
+            let finals = WORD_FINAL_FORM_SCRIPTS[script].word_final_only;
+            self.misplaced_finals += u32::from(finals.contains(&first));
+            self.correct_finals += u32::from(finals.contains(&last));
+        }
+    }
+
+    pub(crate) fn is_visual_order(&self) -> bool {
+        self.misplaced_finals >= MIN_VISUAL_ORDER_EVIDENCE
+            && self.misplaced_finals > self.correct_finals * VISUAL_ORDER_EVIDENCE_MARGIN
+    }
+}
+
+/// Rewrite visual-order RTL runs in `items` to logical order.
+///
+/// Must run on **unmerged** items: `merge_text_items` has already ordered runs
+/// right-to-left by the time a line exists, so reversing a merged line would
+/// re-emit the visual order. Runs with no RTL text are skipped —
+/// [`reverse_visual_rtl`] reorders LTR runs.
+pub(crate) fn restore_logical_order(items: &mut [TextItem]) {
+    for item in items.iter_mut() {
+        if item.text.chars().any(is_contextual_form_script_char) {
+            continue;
+        }
+        if item.text.chars().any(is_rtl_char) {
+            item.text = reverse_visual_rtl(&item.text);
+        }
+    }
+}
+
 pub(crate) fn is_rtl_text<I, S>(texts: I) -> bool
 where
     I: Iterator<Item = S>,
@@ -195,6 +294,9 @@ pub fn is_italic_font(font_name: &str) -> bool {
 /// Also applies NFKC normalization (converts Arabic presentation forms to base
 /// characters, decomposes Latin ligatures, etc.) and reverses visual-order
 /// Arabic text back to logical order when presentation forms are detected.
+///
+/// Scripts without presentation forms carry no per-run signal, and are handled
+/// document-wide instead — see [`VisualOrderEvidence`].
 pub(crate) fn expand_ligatures(text: &str) -> String {
     // Strip null bytes and other control characters (except newline/tab)
     let text = if text
@@ -253,18 +355,18 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
     // visual (LTR screen) order. After NFKC normalization, reverse to restore
     // logical reading order.
     if had_presentation_forms {
-        result = reverse_visual_arabic(&result);
+        result = reverse_visual_rtl(&result);
     }
 
     result
 }
 
-/// Reverse visual-order Arabic text to logical order.
+/// Reverse visual-order RTL text (Arabic or Hebrew) to logical order.
 ///
 /// Pure RTL text (no ASCII alphanumerics) gets a simple character reversal.
 /// Mixed content (embedded numbers or Latin words) splits into LTR and non-LTR
 /// runs: run order is reversed, and only non-LTR runs are reversed internally.
-fn reverse_visual_arabic(text: &str) -> String {
+fn reverse_visual_rtl(text: &str) -> String {
     // Check if there are any LTR runs (ASCII letters or digits)
     let has_ltr = text.chars().any(|c| c.is_ascii_alphanumeric());
 
@@ -928,21 +1030,21 @@ mod tests {
     }
 
     #[test]
-    fn reverse_visual_arabic_pure_rtl() {
+    fn reverse_visual_rtl_pure_rtl() {
         // Pure RTL: simple reversal
         let input = "\u{0628}\u{0627}"; // ba (visual order)
-        let result = reverse_visual_arabic(input);
+        let result = reverse_visual_rtl(input);
         assert_eq!(result, "\u{0627}\u{0628}"); // ab (logical order)
     }
 
     #[test]
-    fn reverse_visual_arabic_with_ltr_run() {
+    fn reverse_visual_rtl_with_ltr_run() {
         // Mixed: Arabic + embedded number "123" + Arabic
         // Visual order: أ 123 ب  → runs: [أ], [123], [ب]
         // Reversed runs: [ب], [123], [أ]
         // Non-LTR reversed internally: ب, 123, أ
         let input = "\u{0623}123\u{0628}";
-        let result = reverse_visual_arabic(input);
+        let result = reverse_visual_rtl(input);
         assert_eq!(result, "\u{0628}123\u{0623}");
     }
 
@@ -959,6 +1061,75 @@ mod tests {
         assert!(!is_arabic_presentation_form('\u{0645}'));
         // Latin
         assert!(!is_arabic_presentation_form('A'));
+    }
+
+    /// Reversed spelling of "מספר זהות" (ID number), as a visual-order
+    /// producer stores it.
+    const VISUAL_ID_NUMBER: &str = "תוהז רפסמ";
+    const LOGICAL_ID_NUMBER: &str = "מספר זהות";
+
+    fn evidence_for(texts: &[&str]) -> VisualOrderEvidence {
+        let mut evidence = VisualOrderEvidence::default();
+        for text in texts {
+            evidence.observe(text);
+        }
+        evidence
+    }
+
+    #[test]
+    fn visual_order_detected_from_misplaced_word_final_letters() {
+        // Every word here starts with a final form — impossible to spell.
+        let evidence = evidence_for(&[VISUAL_ID_NUMBER, "םולש", "ןיד ךרוע", "ץרא"]);
+        assert!(evidence.is_visual_order());
+    }
+
+    #[test]
+    fn logical_order_left_alone() {
+        // The same words spelled correctly: final forms end words, never start.
+        let evidence = evidence_for(&[LOGICAL_ID_NUMBER, "שלום", "עורך דין", "ארץ"]);
+        assert!(!evidence.is_visual_order());
+    }
+
+    #[test]
+    fn sparse_evidence_is_not_enough_to_flip_a_document() {
+        // A single misplaced fragment must not flip a whole document.
+        let evidence = evidence_for(&["םו", "בית ספר", "שלום"]);
+        assert!(!evidence.is_visual_order());
+    }
+
+    #[test]
+    fn latin_and_base_arabic_yield_no_visual_order_evidence() {
+        let evidence = evidence_for(&["Hello World", "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"]);
+        assert!(!evidence.is_visual_order());
+    }
+
+    #[test]
+    fn restore_logical_order_reverses_rtl_runs_only() {
+        let mut items = vec![
+            make_char_item_with_text(VISUAL_ID_NUMBER),
+            make_char_item_with_text("Hello, World"),
+        ];
+        restore_logical_order(&mut items);
+        assert_eq!(items[0].text, LOGICAL_ID_NUMBER);
+        // LTR runs must survive untouched: reversing them would reorder words.
+        assert_eq!(items[1].text, "Hello, World");
+    }
+
+    #[test]
+    fn restore_logical_order_skips_runs_already_restored_from_presentation_forms() {
+        // expand_ligatures already flipped this run when it saw presentation
+        // forms; flipping again would put it back into visual order.
+        let arabic = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}";
+        let mut items = vec![make_char_item_with_text(arabic)];
+        restore_logical_order(&mut items);
+        assert_eq!(items[0].text, arabic);
+    }
+
+    fn make_char_item_with_text(text: &str) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            ..make_char_item('x', 0.0, 10.0, 10.0)
+        }
     }
 
     /// Helper to create a single-char TextItem at a given x position with width.

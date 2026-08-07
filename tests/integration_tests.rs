@@ -4052,3 +4052,292 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         page.markdown
     );
 }
+
+// ---------------------------------------------------------------------------
+// Visual-order RTL text
+// ---------------------------------------------------------------------------
+
+/// Build a Type0/Identity-H PDF whose show-text runs hold `stored_lines`
+/// verbatim, one Tj per line.
+///
+/// Lines are stored exactly as given so each test can state the byte order a
+/// real producer would have written. The font maps every CID straight to the
+/// matching Unicode codepoint, so these tests exercise ordering only, not glyph
+/// decoding.
+fn synthetic_rtl_pdf(stored_lines: &[&str]) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let cid_font_id = doc.new_object_id();
+    let descriptor_id = doc.new_object_id();
+    let tounicode_id = doc.new_object_id();
+    let cid_system_info_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "AAAAAA+SyntheticRTL",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![cid_font_id.into()],
+            "ToUnicode" => tounicode_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        cid_system_info_id,
+        dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        cid_font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "AAAAAA+SyntheticRTL",
+            "CIDSystemInfo" => cid_system_info_id,
+            "FontDescriptor" => descriptor_id,
+            "DW" => 600,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        descriptor_id,
+        dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "AAAAAA+SyntheticRTL",
+            "Flags" => 4,
+            "FontBBox" => vec![Object::Integer(-100), Object::Integer(-100), 1000.into(), 1000.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 800,
+            "Descent" => Object::Integer(-200),
+            "CapHeight" => 700,
+            "StemV" => 80,
+        }
+        .into(),
+    );
+
+    // Identity ToUnicode over ASCII, the RTL blocks, and the Arabic
+    // presentation forms: CID == Unicode codepoint. ASCII must be mapped too —
+    // without spaces the extracted text has no word boundaries to score.
+    let cmap = b"/CIDInit /ProcSet findresource begin\n\
+12 dict begin\nbegincmap\n/CMapType 2 def\n\
+1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+4 beginbfrange\n<0020> <007E> <0020>\n<0590> <05FF> <0590>\n\
+<FB50> <FDFF> <FB50>\n<FE70> <FEFE> <FE70>\nendbfrange\n\
+endcmap\nend\nend"
+        .to_vec();
+    doc.objects
+        .insert(tounicode_id, Stream::new(dictionary! {}, cmap).into());
+
+    let mut operations = vec![Operation::new("BT", vec![])];
+    for (index, line) in stored_lines.iter().enumerate() {
+        let mut bytes = Vec::new();
+        for ch in line.chars() {
+            bytes.extend_from_slice(&(ch as u32 as u16).to_be_bytes());
+        }
+        operations.push(Operation::new("Tf", vec!["F0".into(), 12.into()]));
+        // Tm, not Td: Td is relative to the current line start and would
+        // accumulate across lines.
+        operations.push(Operation::new(
+            "Tm",
+            vec![
+                1.into(),
+                0.into(),
+                0.into(),
+                1.into(),
+                50.into(),
+                Object::Integer(700 - 20 * index as i64),
+            ],
+        ));
+        operations.push(Operation::new(
+            "Tj",
+            vec![Object::String(bytes, lopdf::StringFormat::Hexadecimal)],
+        ));
+    }
+    operations.push(Operation::new("ET", vec![]));
+
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F0" => font_id },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Hebrew words carrying enough word-final letters for a document-wide verdict,
+/// in correct logical spelling. Final forms end these words, never start them.
+const LOGICAL_LINES: &[&str] = &[
+    "שלום עולם",
+    "עורך דין",
+    "ארץ ישראל",
+    "כסף רב",
+    "זמן קצר",
+    "מספר זהות",
+];
+
+/// The same lines as a producer that pre-applies bidi stores them: pure-RTL
+/// lines come out as a straight character reversal.
+fn visually_stored(lines: &[&str]) -> Vec<String> {
+    lines.iter().map(|l| l.chars().rev().collect()).collect()
+}
+
+fn extracted_text(buf: &[u8]) -> String {
+    extract_text_with_positions_mem(buf)
+        .unwrap()
+        .iter()
+        .map(|i| i.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn assert_reads_logically(text: &str) {
+    for line in LOGICAL_LINES {
+        for word in line.split(' ') {
+            assert!(
+                text.contains(word),
+                "expected logical-order word {word:?} in extracted text: {text:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn visual_order_rtl_document_extracts_in_logical_order() {
+    let stored = visually_stored(LOGICAL_LINES);
+    let refs: Vec<&str> = stored.iter().map(String::as_str).collect();
+    let text = extracted_text(&synthetic_rtl_pdf(&refs));
+
+    assert_reads_logically(&text);
+    assert!(
+        !text.contains("םולש"),
+        "visual-order text survived extraction: {text:?}"
+    );
+}
+
+#[test]
+fn logical_order_rtl_document_is_left_untouched() {
+    // Already-logical Hebrew must never be flipped: this is the majority case
+    // and the one a blanket reversal would destroy.
+    let text = extracted_text(&synthetic_rtl_pdf(LOGICAL_LINES));
+
+    assert_reads_logically(&text);
+    assert!(
+        !text.contains("םולש"),
+        "logical-order text was reversed: {text:?}"
+    );
+}
+
+#[test]
+fn visual_order_document_keeps_embedded_ltr_runs_in_reading_order() {
+    // A visual-order producer lays the line out left-to-right but leaves
+    // embedded digits running LTR, so "שלום 123 עולם" is stored with the words
+    // reversed and "123" intact. Reversing the line wholesale would yield "321".
+    let text = extracted_text(&synthetic_rtl_pdf(&[
+        "םלוע 123 םולש",
+        "ןיד ךרוע",
+        "ץרא בר ףסכ",
+        "רצק ןמז",
+    ]));
+
+    assert!(
+        text.contains("שלום 123 עולם"),
+        "embedded LTR run was not preserved in reading order: {text:?}"
+    );
+}
+
+#[test]
+fn visual_order_verdict_does_not_double_reverse_arabic_presentation_forms() {
+    // Arabic stored as presentation forms is already restored per run by
+    // expand_ligatures. A Hebrew-driven document verdict must not flip it a
+    // second time, which would put it back into visual order.
+    // U+FEE3/U+FEAE are the initial/final forms of meem and reh; NFKC maps them
+    // to U+0645/U+0631.
+    let mut stored = visually_stored(LOGICAL_LINES);
+    stored.push("\u{FEAE}\u{FEE3}".to_string()); // visual order: reh then meem
+    let refs: Vec<&str> = stored.iter().map(String::as_str).collect();
+    let text = extracted_text(&synthetic_rtl_pdf(&refs));
+
+    assert_reads_logically(&text);
+    assert!(
+        text.contains("\u{0645}\u{0631}"),
+        "Arabic presentation forms were double-reversed: {text:?}"
+    );
+}
+
+#[test]
+fn too_little_evidence_leaves_the_document_alone() {
+    // One misplaced final form is not proof of anything — a mis-split run can
+    // produce it. Documents below the evidence floor are deliberately left as
+    // they are rather than flipped on a guess.
+    let text = extracted_text(&synthetic_rtl_pdf(&["םולש", "בית ספר", "מים רבים"]));
+
+    assert!(
+        text.contains("םולש"),
+        "document was flipped on a single misplaced final form: {text:?}"
+    );
+    assert!(
+        text.contains("בית ספר"),
+        "logical text was altered below the evidence floor: {text:?}"
+    );
+}
+
+/// End-to-end guard on a committed fixture: a one-page PDF whose content
+/// stream holds `LOGICAL_LINES` with every character reversed, exactly as a
+/// producer that pre-applies bidi writes them. Generated by
+/// `synthetic_rtl_pdf`, kept on disk so the regression can be reproduced
+/// straight from the CLI:
+///
+///   cargo run --bin pdf2md -- tests/fixtures/rtl_visual_order.pdf
+///
+/// Before this fix it emitted "םלוע םולש …" — every word spelled backwards.
+#[test]
+fn fixture_visual_order_rtl_pdf_extracts_in_logical_order() {
+    let result = process_pdf_with_options("tests/fixtures/rtl_visual_order.pdf", PdfOptions::new())
+        .expect("fixture should extract");
+
+    let md = result.markdown.unwrap_or_default();
+    assert_reads_logically(&md);
+    assert!(
+        !md.contains("םולש"),
+        "visual-order text survived extraction: {md:?}"
+    );
+}
