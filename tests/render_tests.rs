@@ -19,47 +19,22 @@ fn make_solid_page_pdf_with_page_options(
     colors: &[[u8; 3]],
     page_options: &str,
 ) -> Vec<u8> {
-    let mut pdf = b"%PDF-1.4\n".to_vec();
-    let mut offsets = vec![0_usize];
+    let mut object_bodies = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), {
+        let kids = (0..colors.len())
+            .map(|index| format!("{} 0 R", 3 + index * 2))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", colors.len()).into_bytes()
+    }];
 
-    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &[u8]) {
-        assert_eq!(id, offsets.len());
-        offsets.push(pdf.len());
-        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
-        pdf.extend_from_slice(body);
-        pdf.extend_from_slice(b"\nendobj\n");
-    }
-
-    add_object(
-        &mut pdf,
-        &mut offsets,
-        1,
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-    );
-
-    let kids = (0..colors.len())
-        .map(|index| format!("{} 0 R", 3 + index * 2))
-        .collect::<Vec<_>>()
-        .join(" ");
-    add_object(
-        &mut pdf,
-        &mut offsets,
-        2,
-        format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", colors.len()).as_bytes(),
-    );
-
-    for (index, [red, green, blue]) in colors.iter().copied().enumerate() {
-        let page_id = 3 + index * 2;
-        let content_id = page_id + 1;
-        add_object(
-            &mut pdf,
-            &mut offsets,
-            page_id,
+    for [red, green, blue] in colors.iter().copied() {
+        let content_id = object_bodies.len() + 2;
+        object_bodies.push(
             format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] \
                  {page_options} /Resources << >> /Contents {content_id} 0 R >>"
             )
-            .as_bytes(),
+            .into_bytes(),
         );
 
         let content = format!(
@@ -68,32 +43,16 @@ fn make_solid_page_pdf_with_page_options(
             f32::from(green) / 255.0,
             f32::from(blue) / 255.0
         );
-        add_object(
-            &mut pdf,
-            &mut offsets,
-            content_id,
+        object_bodies.push(
             format!(
                 "<< /Length {} >>\nstream\n{content}\nendstream",
                 content.len()
             )
-            .as_bytes(),
+            .into_bytes(),
         );
     }
 
-    let xref_start = pdf.len();
-    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
-    pdf.extend_from_slice(b"0000000000 65535 f \n");
-    for offset in offsets.iter().skip(1) {
-        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-    }
-    pdf.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF",
-            offsets.len()
-        )
-        .as_bytes(),
-    );
-    pdf
+    render_fixture::build_pdf_from_objects(&object_bodies)
 }
 
 fn center_pixel(pixels: &[u8], width: u32, height: u32) -> [u8; 4] {
