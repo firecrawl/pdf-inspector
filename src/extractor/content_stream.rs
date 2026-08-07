@@ -1396,14 +1396,7 @@ const ROTATED_MAX_ADVANCE: f32 = 3.0;
 /// Below this, a column of narrow items is likelier bullets or rule artifacts
 /// than a rotated label.
 const ROTATED_MIN_GLYPHS: usize = 3;
-/// Largest share of a page's items that may be zero-width and still be read as
-/// rotation. A page whose fonts carry no width data reports *everything* as
-/// zero-width, and there a column of short items is ordinary content — a list,
-/// a column of single-letter marks — that must not be fused. Two-thirds mirrors
-/// [`correct_rotated_page`]'s own threshold: a page past that point is a rotated
-/// page and was already corrected, so anything reaching here is a minority of
-/// rotated text on an otherwise horizontal page.
-const ROTATED_MAX_SHARE: f32 = 2.0 / 3.0;
+
 
 /// Merge each 90°-rotated text run into one horizontal-looking item.
 ///
@@ -1433,10 +1426,14 @@ fn merge_rotated_runs(items: Vec<TextItem>) -> Vec<TextItem> {
                 && item.text.chars().count() <= 2
         })
         .collect();
-    let visible = items.iter().filter(|i| !i.text.trim().is_empty()).count();
-    if candidates.len() < ROTATED_MIN_GLYPHS
-        || candidates.len() as f32 > visible as f32 * ROTATED_MAX_SHARE
-    {
+    // Zero width means "rotated" only on a page that reports widths at all. A
+    // page whose fonts carry none reports *everything* as zero-width, and there a
+    // column of short items is ordinary content — a list, a column of
+    // single-letter marks — that must not be fused. One sized item is enough
+    // evidence, so a page with a single line of body text beside its rotated
+    // headers still qualifies.
+    let has_width_data = items.iter().any(|item| item.width >= ROTATED_MAX_WIDTH);
+    if candidates.len() < ROTATED_MIN_GLYPHS || !has_width_data {
         return drop_blank_items(items);
     }
     candidates.sort_by(|&a, &b| {
@@ -1687,16 +1684,12 @@ mod tests {
         assert!((header.y - 300.0).abs() < 0.01, "y = {}", header.y);
     }
 
-    #[test]
-    fn test_merge_rotated_runs_skips_page_without_font_widths() {
-        // No font widths means *every* item is zero-width, rotated or not. A
-        // column of short items on such a page is ordinary content — here a list
-        // — and fusing it would destroy the page.
-        let marker = |text: &str, y: f32| TextItem {
+    fn page_item(text: &str, x: f32, y: f32, width: f32) -> TextItem {
+        TextItem {
             text: text.to_string(),
-            x: 72.0,
+            x,
             y,
-            width: 0.0,
+            width,
             height: 10.0,
             font: "F1".to_string(),
             font_size: 10.0,
@@ -1707,8 +1700,19 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
-        };
-        let items = vec![marker("1.", 100.0), marker("2.", 115.0), marker("3.", 130.0)];
+        }
+    }
+
+    #[test]
+    fn test_merge_rotated_runs_skips_page_without_font_widths() {
+        // No font widths means *every* item is zero-width, rotated or not. A
+        // column of short items on such a page is ordinary content — here a list
+        // — and fusing it would destroy the page.
+        let items = vec![
+            page_item("1.", 72.0, 100.0, 0.0),
+            page_item("2.", 72.0, 115.0, 0.0),
+            page_item("3.", 72.0, 130.0, 0.0),
+        ];
 
         let merged = merge_rotated_runs(items);
 
@@ -1717,31 +1721,39 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_rotated_runs_keeps_multi_char_column() {
-        // Zero width also means "font carries no widths". Such a page is whole
-        // lines stacked at one x, not glyphs — merging it would fuse paragraphs.
-        let line = |text: &str, y: f32| TextItem {
-            text: text.to_string(),
-            x: 72.0,
-            y,
-            width: 0.0,
-            height: 10.0,
-            font: "F1".to_string(),
-            font_size: 10.0,
-            page: 1,
-            is_bold: false,
-            is_italic: false,
-            is_underline: false,
-            is_strikeout: false,
-            item_type: ItemType::Text,
-            mcid: None,
-        };
-        let items = vec![line("first", 100.0), line("second", 112.0), line("third", 124.0)];
+    fn test_merge_rotated_runs_handles_a_nearly_empty_page() {
+        // One sized item is enough evidence that widths exist, so a minimal
+        // rotated run still collates even where it outnumbers the rest of the page.
+        let items = vec![
+            page_item("Total", 300.0, 400.0, 26.0),
+            page_item("k", 72.0, 100.0, 0.0),
+            page_item("g", 72.0, 106.0, 0.0),
+            page_item("/", 72.0, 112.0, 0.0),
+        ];
 
         let merged = merge_rotated_runs(items);
 
-        assert_eq!(merged.len(), 3);
-        assert_eq!(merged[0].text, "first");
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert!(texts.contains(&"kg/"), "got {texts:?}");
+        assert_eq!(merged.len(), 2, "got {texts:?}");
+    }
+
+    #[test]
+    fn test_merge_rotated_runs_keeps_multi_char_column() {
+        // One font on the page carries no widths while another does, so the
+        // page-level width evidence does not save us: whole lines stacked at one
+        // x are not glyphs, and merging them would fuse paragraphs.
+        let items = vec![
+            page_item("Heading", 72.0, 200.0, 40.0),
+            page_item("first", 72.0, 100.0, 0.0),
+            page_item("second", 72.0, 112.0, 0.0),
+            page_item("third", 72.0, 124.0, 0.0),
+        ];
+
+        let merged = merge_rotated_runs(items);
+
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[1].text, "first");
     }
 
     #[test]
