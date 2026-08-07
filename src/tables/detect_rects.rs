@@ -2361,11 +2361,12 @@ fn is_chart_bar_cluster(
     // can't run it directly. Rather than assuming "oversized => not a
     // chart" — which was wrong for genuinely huge multi-series/stacked bar
     // charts, routing them into expensive table-grid detection as garbage
-    // tables instead of being excluded — evaluate the same signature on an
-    // evenly-strided sample bounded to the cap. A real bar chart's repeated
-    // structure (spacing, height variation) survives subsampling; this
-    // keeps the worst case bounded at MAX_CHART_CLUSTER_RECTS^3 regardless
-    // of how large the cluster actually is.
+    // tables instead of being excluded — evaluate the same signature on a
+    // bucketed sample bounded to (at most) twice the cap. A real bar
+    // chart's repeated structure (spacing, height variation) survives
+    // subsampling; this keeps the worst case bounded at
+    // (2 * MAX_CHART_CLUSTER_RECTS)^3 — a fixed constant, not scaling with
+    // adversarial input size — regardless of how large the cluster is.
     let sampled_owned: Vec<(f32, f32, f32, f32)>;
     let group_rects = if group_rects.len() > MAX_CHART_CLUSTER_RECTS {
         // Rects aren't guaranteed to be stored in spatial order, so a
@@ -2408,10 +2409,22 @@ fn is_chart_bar_cluster(
             buckets.into_iter().flatten().collect()
         }
 
-        let half_cap = MAX_CHART_CLUSTER_RECTS / 2;
-        sampled_owned = bucket_by_axis(group_rects, |r| r.0, half_cap)
+        // Give each axis the full cap rather than splitting the budget —
+        // halving it under-resolves whichever orientation the cluster
+        // actually is (a multi-series chart can need close to the full
+        // cap's worth of x-buckets just to keep each series distinct),
+        // and the *other* axis' pass contributes nothing useful when that
+        // axis is near-constant (e.g. y for a standard, non-stacked
+        // vertical chart). The union is still a hard, cluster-size-
+        // independent bound — at most 2x MAX_CHART_CLUSTER_RECTS, fixed
+        // regardless of how large the adversarial input is.
+        sampled_owned = bucket_by_axis(group_rects, |r| r.0, MAX_CHART_CLUSTER_RECTS)
             .into_iter()
-            .chain(bucket_by_axis(group_rects, |r| r.1, half_cap))
+            .chain(bucket_by_axis(
+                group_rects,
+                |r| r.1,
+                MAX_CHART_CLUSTER_RECTS,
+            ))
             .collect();
         &sampled_owned
     } else {
