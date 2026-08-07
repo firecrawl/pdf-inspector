@@ -2368,16 +2368,31 @@ fn is_chart_bar_cluster(
     // of how large the cluster actually is.
     let sampled_owned: Vec<(f32, f32, f32, f32)>;
     let group_rects = if group_rects.len() > MAX_CHART_CLUSTER_RECTS {
-        // Rects aren't guaranteed to be stored in spatial (x) order — a
-        // stride over raw encounter order could, in principle, land
-        // disproportionately within one region of the chart rather than
-        // spanning it evenly. Sort by x first so the stride always
-        // samples evenly across the chart's actual layout, regardless of
-        // storage order.
-        let mut sorted = group_rects.to_vec();
-        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let stride = sorted.len().div_ceil(MAX_CHART_CLUSTER_RECTS);
-        sampled_owned = sorted.into_iter().step_by(stride).collect();
+        // Rects aren't guaranteed to be stored in spatial (x) order, so a
+        // stride over raw encounter order could land disproportionately
+        // within one region of the chart. Copying and sorting the whole
+        // cluster first would fix that, but reintroduces input-sized
+        // allocation and O(n log n) work — not truly bounded against an
+        // adversarial cluster. Instead, bucket by x-position in a single
+        // O(n) pass with O(cap) memory (no full-size copy, no sort): find
+        // the x-range in one pass, then keep one representative rect per
+        // bucket across MAX_CHART_CLUSTER_RECTS evenly-spaced buckets.
+        let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+        for r in group_rects {
+            min_x = min_x.min(r.0);
+            max_x = max_x.max(r.0);
+        }
+        let span = max_x - min_x;
+        let mut buckets: Vec<Option<(f32, f32, f32, f32)>> = vec![None; MAX_CHART_CLUSTER_RECTS];
+        for &r in group_rects {
+            let bucket = if span > 0.0 {
+                (((r.0 - min_x) / span) * (MAX_CHART_CLUSTER_RECTS - 1) as f32) as usize
+            } else {
+                0
+            };
+            buckets[bucket.min(MAX_CHART_CLUSTER_RECTS - 1)].get_or_insert(r);
+        }
+        sampled_owned = buckets.into_iter().flatten().collect();
         &sampled_owned
     } else {
         group_rects
@@ -5186,23 +5201,14 @@ mod tests {
     fn is_chart_bar_cluster_detects_genuine_chart_above_max_size_out_of_spatial_order() {
         // Real rect lists aren't guaranteed to be stored in x-sorted
         // (spatial) order — `chart_shaped_cluster`'s own output happens to
-        // already be x-sorted, which wouldn't exercise a code path that
-        // sorts before sampling. Re-store as two blocks (all even-indexed
-        // bars, then all odd-indexed bars) rather than left-to-right,
-        // simulating two chart series stored series-by-series instead of
-        // position-by-position, so the sort-before-stride path is
-        // actually exercised on non-spatially-ordered input. (bar_family's
-        // spacing/height-variation signal turned out robust enough that
-        // this reordering alone doesn't defeat a naive raw-order stride
-        // either — sorting first is still the strictly safer, more
-        // representative approach the review comment asked for, and
-        // doesn't reintroduce the cubic cost this cap exists to avoid.)
+        // already be x-sorted, which wouldn't exercise the sampling path
+        // on non-spatially-ordered input. Re-store as two blocks (all
+        // even-indexed bars, then all odd-indexed bars) rather than
+        // left-to-right, simulating two chart series stored
+        // series-by-series. The bucket-by-x-value sampling below depends
+        // only on each rect's own x, not on storage order, so this should
+        // be detected correctly regardless.
         let (items, sorted_rects) = chart_shaped_cluster(MAX_CHART_CLUSTER_RECTS + 1);
-        // Re-store as two blocks (all even-indexed bars, then all
-        // odd-indexed bars) rather than left-to-right — simulating two
-        // chart series stored series-by-series. A fixed-stride sample
-        // over this encounter order lands disproportionately within each
-        // block instead of spanning the chart's true x-range evenly.
         let mut oversized: Vec<(f32, f32, f32, f32)> =
             sorted_rects.iter().step_by(2).copied().collect();
         oversized.extend(sorted_rects.iter().skip(1).step_by(2).copied());
@@ -5256,6 +5262,31 @@ mod tests {
         assert!(
             !is_chart_bar_cluster(&items, &oversized, 1),
             "a dense uniform grid must not be classified as a chart"
+        );
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_sampling_does_not_allocate_input_sized_buffers() {
+        // Review feedback on the sort-based sample: copying and sorting
+        // the whole cluster reintroduces input-sized allocation and
+        // O(n log n) work, defeating the point of bounding cost against an
+        // adversarial cluster size. The bucket-by-x-value approach must
+        // stay correct and complete promptly even at a cluster size far
+        // beyond anything a real chart would have (a few hundred thousand
+        // rects) — there's no strict timing assertion (flaky in CI), but a
+        // single-pass, O(cap)-memory implementation resolves this near
+        // instantly, while an O(n log n) full-copy-and-sort implementation
+        // would still complete but with meaningfully higher allocation.
+        // Uses the dense-grid shape (not chart_shaped_cluster): that
+        // helper's height formula grows without bound as n increases,
+        // which at this scale exceeds bar_family's own height-vs-width
+        // sanity threshold — a property of that test helper's geometry at
+        // an unrealistic size, unrelated to what this test verifies.
+        let n = MAX_CHART_CLUSTER_RECTS * 400;
+        let (items, oversized) = dense_uniform_grid_cluster(n);
+        assert!(
+            !is_chart_bar_cluster(&items, &oversized, 1),
+            "a dense uniform grid must not be classified as a chart, even at {n} rects"
         );
     }
 }
