@@ -183,6 +183,8 @@ jobs:
       - name: Install WebAssembly test tools
         run: |
           cargo install wasm-pack --version 0.15.0 --locked
+          # Keep in sync with wasm-bindgen in wasm/Cargo.lock: the test
+          # runner's protocol matches that exact version.
           cargo install wasm-bindgen-cli --version 0.2.126 --locked
 
       - name: Test WebAssembly package
