@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	pdfinspector "github.com/firecrawl/pdf-inspector"
+	pdfinspector "github.com/Raina-Hardik/pdf-inspector"
 )
 
 func TestVersion(t *testing.T) {
@@ -149,42 +149,52 @@ func TestValidationAndMetrics(t *testing.T) {
 		t.Fatalf("Failed to read fixture: %v", err)
 	}
 
-	// 1. ProcessingTimeMs check
+	// 1. ProcessingTimeMs check (logged rather than strictly > 0 to avoid test flakiness on fast sub-ms runs)
 	res, err := pdfinspector.ProcessPdf(pdfData, nil)
 	if err != nil {
 		t.Fatalf("ProcessPdf failed: %v", err)
 	}
-	if res.ProcessingTimeMs == 0 {
-		t.Errorf("Expected ProcessingTimeMs > 0, got %d", res.ProcessingTimeMs)
-	}
+	t.Logf("ProcessPdf ProcessingTimeMs: %d", res.ProcessingTimeMs)
 
 	detRes, err := pdfinspector.DetectPdf(pdfData, "")
 	if err != nil {
 		t.Fatalf("DetectPdf failed: %v", err)
 	}
-	if detRes.ProcessingTimeMs == 0 {
-		t.Errorf("Expected DetectPdf ProcessingTimeMs > 0, got %d", detRes.ProcessingTimeMs)
-	}
+	t.Logf("DetectPdf ProcessingTimeMs: %d", detRes.ProcessingTimeMs)
 
-	// 2. Zero-page validation
+	// 2. Zero-page validation in both ProcessPdf and ExtractPagesMarkdown
 	_, err = pdfinspector.ProcessPdf(pdfData, &pdfinspector.ProcessOptions{Pages: []uint32{0}})
 	if err == nil || !strings.Contains(err.Error(), "1-indexed") {
-		t.Errorf("Expected error for page index 0, got: %v", err)
+		t.Errorf("Expected error for page index 0 in ProcessPdf, got: %v", err)
 	}
 
-	// 3. Invalid profile validation
+	_, err = pdfinspector.ExtractPagesMarkdown(pdfData, []uint32{0})
+	if err == nil || !strings.Contains(err.Error(), "1-indexed") {
+		t.Errorf("Expected error for page index 0 in ExtractPagesMarkdown, got: %v", err)
+	}
+
+	// 3. 1-indexed page selection consistency (page 1 = first page)
+	page1Res, err := pdfinspector.ExtractPagesMarkdown(pdfData, []uint32{1})
+	if err != nil {
+		t.Fatalf("ExtractPagesMarkdown for page 1 failed: %v", err)
+	}
+	if len(page1Res.Pages) != 1 || page1Res.Pages[0].Page != 1 {
+		t.Errorf("Expected 1-indexed page 1 result, got: %+v", page1Res.Pages)
+	}
+
+	// 4. Invalid profile validation
 	_, err = pdfinspector.ProcessPdf(pdfData, &pdfinspector.ProcessOptions{Profile: "invalid_profile"})
 	if err == nil || !strings.Contains(err.Error(), "Invalid markdown profile") {
 		t.Errorf("Expected error for invalid profile, got: %v", err)
 	}
 
-	// 4. Empty non-nil pages slice
+	// 5. Empty slice/nil page selection consistency across APIs
 	pagesRes, err := pdfinspector.ExtractPagesMarkdown(pdfData, []uint32{})
 	if err != nil {
 		t.Fatalf("ExtractPagesMarkdown with empty slice failed: %v", err)
 	}
-	if len(pagesRes.Pages) != 0 {
-		t.Errorf("Expected 0 pages for empty pages slice, got %d", len(pagesRes.Pages))
+	if len(pagesRes.Pages) == 0 {
+		t.Errorf("Expected empty pages slice to process all pages, got 0 pages")
 	}
 }
 

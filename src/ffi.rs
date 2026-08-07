@@ -177,7 +177,7 @@ struct FfiPageMarkdown {
 impl From<PageMarkdown> for FfiPageMarkdown {
     fn from(v: PageMarkdown) -> Self {
         Self {
-            page: v.page,
+            page: v.page + 1,
             markdown: v.markdown,
             needs_ocr: v.needs_ocr,
             ocr_reason: v.ocr_reason,
@@ -374,7 +374,14 @@ pub extern "C" fn ffi_extract_pages_markdown(
 
         let pages: Option<Vec<u32>> = if !pages_ptr.is_null() && pages_len > 0 {
             let slice = unsafe { slice::from_raw_parts(pages_ptr, pages_len) };
-            serde_json::from_slice(slice).ok()
+            if let Ok(parsed) = serde_json::from_slice::<Vec<u32>>(slice) {
+                if parsed.contains(&0) {
+                    return return_error("Invalid page index: pages must be 1-indexed (>= 1)");
+                }
+                Some(parsed.into_iter().map(|p| p - 1).collect())
+            } else {
+                None
+            }
         } else {
             None
         };

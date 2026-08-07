@@ -21,6 +21,7 @@ var wasmBytes []byte
 
 // ProcessOptions represents parameters for PDF processing.
 type ProcessOptions struct {
+	// Pages specifies 1-indexed page numbers (1 = first page). Passing nil or an empty slice processes all pages.
 	Pages              []uint32 `json:"pages,omitempty"`
 	Password           string   `json:"password,omitempty"`
 	Profile            string   `json:"profile,omitempty"` // "fidelity" | "compact"
@@ -334,15 +335,17 @@ func ExtractTextWithContext(ctx context.Context, pdfBytes []byte) (string, error
 	return wrapper.Text, nil
 }
 
-// ExtractPagesMarkdown extracts formatted markdown per page.
+// ExtractPagesMarkdown extracts formatted markdown for specific 1-indexed pages (1 = first page).
+// Passing nil or an empty slice extracts all pages.
 func ExtractPagesMarkdown(pdfBytes []byte, pages []uint32) (*PagesExtractionResult, error) {
 	return ExtractPagesMarkdownWithContext(context.Background(), pdfBytes, pages)
 }
 
-// ExtractPagesMarkdownWithContext extracts formatted markdown per page with context.
+// ExtractPagesMarkdownWithContext extracts formatted markdown for specific 1-indexed pages with context.
+// Passing nil or an empty slice extracts all pages.
 func ExtractPagesMarkdownWithContext(ctx context.Context, pdfBytes []byte, pages []uint32) (*PagesExtractionResult, error) {
 	var pagesBytes []byte
-	if pages != nil {
+	if len(pages) > 0 {
 		var err error
 		pagesBytes, err = json.Marshal(pages)
 		if err != nil {

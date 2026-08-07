@@ -54,8 +54,8 @@ lopdf = { version = "0.42.0", features = ["rayon"] }
 rayon = "1.10"
 env_logger = "0.11"
 
-# Browser builds (wasm32-unknown-unknown) use JavaScript randomness for encrypted PDFs.
-[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# Browser builds (wasm32-unknown-unknown / emscripten) use JavaScript randomness for encrypted PDFs.
+[target.'cfg(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "emscripten")))'.dependencies]
 lopdf = { version = "0.42.0", default-features = false, features = ["wasm_js"] }
 
 # Standalone/Go WASI builds (wasm32-wasip1) use standard WASI randomness without JS bindings.
