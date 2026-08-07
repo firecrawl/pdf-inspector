@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	pdfinspector "github.com/Raina-Hardik/pdf-inspector"
+	pdfinspector "github.com/firecrawl/pdf-inspector"
 )
 
 func TestVersion(t *testing.T) {

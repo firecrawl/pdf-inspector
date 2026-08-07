@@ -1,4 +1,4 @@
-module github.com/Raina-Hardik/pdf-inspector
+module github.com/firecrawl/pdf-inspector
 
 go 1.21
 
