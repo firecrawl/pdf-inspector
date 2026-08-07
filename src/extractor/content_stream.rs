@@ -1396,6 +1396,14 @@ const ROTATED_MAX_ADVANCE: f32 = 3.0;
 /// Below this, a column of narrow items is likelier bullets or rule artifacts
 /// than a rotated label.
 const ROTATED_MIN_GLYPHS: usize = 3;
+/// Largest share of a page's items that may be zero-width and still be read as
+/// rotation. A page whose fonts carry no width data reports *everything* as
+/// zero-width, and there a column of short items is ordinary content — a list,
+/// a column of single-letter marks — that must not be fused. Two-thirds mirrors
+/// [`correct_rotated_page`]'s own threshold: a page past that point is a rotated
+/// page and was already corrected, so anything reaching here is a minority of
+/// rotated text on an otherwise horizontal page.
+const ROTATED_MAX_SHARE: f32 = 2.0 / 3.0;
 
 /// Merge each 90°-rotated text run into one horizontal-looking item.
 ///
@@ -1425,7 +1433,10 @@ fn merge_rotated_runs(items: Vec<TextItem>) -> Vec<TextItem> {
                 && item.text.chars().count() <= 2
         })
         .collect();
-    if candidates.len() < ROTATED_MIN_GLYPHS {
+    let visible = items.iter().filter(|i| !i.text.trim().is_empty()).count();
+    if candidates.len() < ROTATED_MIN_GLYPHS
+        || candidates.len() as f32 > visible as f32 * ROTATED_MAX_SHARE
+    {
         return drop_blank_items(items);
     }
     candidates.sort_by(|&a, &b| {
@@ -1440,7 +1451,12 @@ fn merge_rotated_runs(items: Vec<TextItem>) -> Vec<TextItem> {
     let mut run: Vec<usize> = Vec::new();
     for &idx in &candidates {
         // x against the run's start, not its previous glyph, so tolerance cannot
-        // accumulate into a walk across columns.
+        // accumulate into a walk across columns. Emphasis must hold too: the
+        // merged item carries one set of metadata, so a run spanning a bold or
+        // italic boundary would flatten it. Font resource and exact size are
+        // deliberately *not* compared — real runs switch subset fonts mid-label
+        // and their rendered size differs in the last float bit, and splitting
+        // on either shatters the run into pieces too short to merge at all.
         let continues = match (run.first(), run.last()) {
             (Some(&start), Some(&previous)) => {
                 (items[idx].x - items[start].x).abs() <= ROTATED_X_TOLERANCE
@@ -1470,12 +1486,14 @@ fn merge_rotated_runs(items: Vec<TextItem>) -> Vec<TextItem> {
         let first = &items[run[0]];
         let font_size = first.font_size;
         let text: String = run.iter().map(|&i| items[i].text.as_str()).collect();
+        let last = &items[run[run.len() - 1]];
         merged.insert(
             run[0],
             TextItem {
                 text: text.trim().to_string(),
                 x: first.x - font_size,
                 width: font_size,
+                height: (last.y - first.y).abs() + font_size,
                 ..first.clone()
             },
         );
@@ -1667,6 +1685,35 @@ mod tests {
         assert!((header.x - (164.25 - 9.0)).abs() < 0.01, "x = {}", header.x);
         assert!((header.width - 9.0).abs() < 0.01, "width = {}", header.width);
         assert!((header.y - 300.0).abs() < 0.01, "y = {}", header.y);
+    }
+
+    #[test]
+    fn test_merge_rotated_runs_skips_page_without_font_widths() {
+        // No font widths means *every* item is zero-width, rotated or not. A
+        // column of short items on such a page is ordinary content — here a list
+        // — and fusing it would destroy the page.
+        let marker = |text: &str, y: f32| TextItem {
+            text: text.to_string(),
+            x: 72.0,
+            y,
+            width: 0.0,
+            height: 10.0,
+            font: "F1".to_string(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        };
+        let items = vec![marker("1.", 100.0), marker("2.", 115.0), marker("3.", 130.0)];
+
+        let merged = merge_rotated_runs(items);
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].text, "1.");
     }
 
     #[test]
