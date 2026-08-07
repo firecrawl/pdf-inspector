@@ -2356,9 +2356,24 @@ fn is_chart_bar_cluster(
     group_rects: &[(f32, f32, f32, f32)],
     page: u32,
 ) -> bool {
-    if group_rects.len() > MAX_CHART_CLUSTER_RECTS {
-        return false;
-    }
+    // has_chart_bar_signature is roughly cubic in cluster size (nested
+    // family/matched-pair scans per anchor rect), so a cluster past the cap
+    // can't run it directly. Rather than assuming "oversized => not a
+    // chart" — which was wrong for genuinely huge multi-series/stacked bar
+    // charts, routing them into expensive table-grid detection as garbage
+    // tables instead of being excluded — evaluate the same signature on an
+    // evenly-strided sample bounded to the cap. A real bar chart's repeated
+    // structure (spacing, height variation) survives subsampling; this
+    // keeps the worst case bounded at MAX_CHART_CLUSTER_RECTS^3 regardless
+    // of how large the cluster actually is.
+    let sampled_owned: Vec<(f32, f32, f32, f32)>;
+    let group_rects = if group_rects.len() > MAX_CHART_CLUSTER_RECTS {
+        let stride = group_rects.len().div_ceil(MAX_CHART_CLUSTER_RECTS);
+        sampled_owned = group_rects.iter().step_by(stride).copied().collect();
+        &sampled_owned
+    } else {
+        group_rects
+    };
 
     let has_bar_signature = has_chart_bar_signature(items, group_rects, page);
 
@@ -5160,17 +5175,47 @@ mod tests {
     }
 
     #[test]
-    fn is_chart_bar_cluster_bails_out_above_max_size() {
-        // A cluster larger than MAX_CHART_CLUSTER_RECTS must short-circuit
-        // before running the expensive chart checks. This uses the same
-        // genuinely chart-shaped geometry the sibling test proves succeeds
-        // below the cap, so the false result specifically exercises the
-        // size bailout.
+    fn is_chart_bar_cluster_detects_genuine_chart_above_max_size() {
+        // A cluster larger than MAX_CHART_CLUSTER_RECTS can't run the full
+        // (roughly cubic) chart-signature check directly, but a genuinely
+        // chart-shaped oversized cluster (e.g. a large multi-series/stacked
+        // bar chart) must still be recognized as a chart via the bounded
+        // strided sample — not blindly treated as "not a chart" and routed
+        // into table-grid detection as a garbage table. Same chart-shaped
+        // geometry the below-cap sibling test proves succeeds on its own
+        // merits, just past the cap.
         let (items, oversized) = chart_shaped_cluster(MAX_CHART_CLUSTER_RECTS + 1);
 
         assert!(
+            is_chart_bar_cluster(&items, &oversized, 1),
+            "an oversized but genuinely chart-shaped cluster should still be detected as a chart"
+        );
+    }
+
+    /// Builds `n` uniform, touching/near-touching rects with constant
+    /// height and no numeric labels — a dense checkbox/form grid, the
+    /// pathological case `MAX_CHART_CLUSTER_RECTS` exists to bound the cost
+    /// of, and genuinely not a chart (no data-driven height variation).
+    #[allow(clippy::type_complexity)]
+    fn dense_uniform_grid_cluster(n: usize) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+        let bw = 10.0;
+        let mut rects = Vec::with_capacity(n);
+        for i in 0..n {
+            rects.push((i as f32 * bw, 0.0, bw, bw)); // touching, uniform height
+        }
+        (Vec::new(), rects)
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_still_bounded_and_correct_on_oversized_dense_grid() {
+        // An oversized dense, uniform grid (no height variation, touching
+        // rects) must still resolve quickly (bounded by the strided sample,
+        // not the full cluster size) and correctly classify as not a chart.
+        let (items, oversized) = dense_uniform_grid_cluster(MAX_CHART_CLUSTER_RECTS * 4);
+
+        assert!(
             !is_chart_bar_cluster(&items, &oversized, 1),
-            "oversized cluster must not be classified as a chart"
+            "a dense uniform grid must not be classified as a chart"
         );
     }
 }

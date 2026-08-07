@@ -130,26 +130,61 @@ pub(crate) fn get_page_content_capped(doc: &Document, page_id: ObjectId) -> Vec<
     let mut content = Vec::new();
     for object_id in doc.get_page_contents(page_id) {
         if let Ok(Object::Stream(stream)) = doc.get_object(object_id) {
-            match decompressed_content_capped(stream) {
-                Ok(data) => content.extend_from_slice(&data),
+            let data: std::borrow::Cow<[u8]> = match decompressed_content_capped(stream) {
+                Ok(data) => data.into(),
                 Err(DecompressError::ExceedsCap) => {
                     log::debug!(
                         "content stream {object_id:?} exceeds {MAX_DECOMPRESSED_STREAM_BYTES}-byte cap, skipping"
                     );
+                    continue;
                 }
                 Err(DecompressError::Failed(msg)) => {
                     log::debug!(
                         "content stream {object_id:?} decode failed ({msg}), using raw bytes"
                     );
-                    content.extend_from_slice(&stream.content);
+                    stream.content.as_slice().into()
                 }
+            };
+            // Append only up to the remaining page budget instead of
+            // extending in full and truncating afterward — extending first
+            // lets a single near-cap-sized stream push the allocation up
+            // to MAX_DECOMPRESSED_STREAM_BYTES past the intended cap, and
+            // Vec::truncate doesn't release that over-allocated capacity.
+            let remaining = MAX_PAGE_CONTENT_BYTES.saturating_sub(content.len());
+            if remaining == 0 {
+                log::debug!(
+                    "page {page_id:?} content already at {MAX_PAGE_CONTENT_BYTES}-byte aggregate cap, stopping"
+                );
+                break;
             }
-            if content.len() > MAX_PAGE_CONTENT_BYTES {
+            let take = data.len().min(remaining);
+            // Whether there's still room for the join separator after this
+            // stream's data is appended in full (irrelevant when the
+            // stream itself doesn't fit — that path breaks before reaching
+            // the separator push below).
+            let fits_with_separator = content.len() + take < MAX_PAGE_CONTENT_BYTES;
+            // Reserve exactly what this iteration needs (data plus, when
+            // applicable, the separator byte below) in one call — reserving
+            // per-push instead would leave `push`'s own amortized-doubling
+            // growth policy free to double the whole allocation just to fit
+            // one more byte, which is what actually caused the retained
+            // capacity to balloon past the cap here.
+            content.reserve_exact(take + usize::from(fits_with_separator));
+            content.extend_from_slice(&data[..take]);
+            if take < data.len() {
                 log::debug!(
                     "page {page_id:?} content exceeds {MAX_PAGE_CONTENT_BYTES}-byte aggregate cap, truncating"
                 );
-                content.truncate(MAX_PAGE_CONTENT_BYTES);
                 break;
+            }
+            // Mirror lopdf::Document::get_page_content, which joins
+            // multiple /Contents streams with a newline — content streams
+            // can end/begin mid-token, and concatenating them bare can
+            // merge adjacent operators into one invalid token. Only when
+            // the stream fit in full and there's still budget left, so
+            // this separator itself never pushes past the aggregate cap.
+            if fits_with_separator {
+                content.push(b'\n');
             }
         }
     }
@@ -306,6 +341,15 @@ fn decode_ascii85(input: &[u8]) -> Result<Vec<u8>, DecompressError> {
             continue;
         }
         if byte == b'z' && group_len == 0 {
+            // The 'z' shorthand expands one input byte to four output
+            // bytes — ASCII85's only sub-linear expansion path, and the
+            // only place in this decoder that can grow `out` faster than
+            // one byte in roughly matches one byte out. A stream of
+            // millions of 'z's would otherwise build an arbitrarily large
+            // `out` before the caller's post-decode cap check ever runs.
+            if out.len() > MAX_DECOMPRESSED_STREAM_BYTES.saturating_sub(4) {
+                return Err(DecompressError::ExceedsCap);
+            }
             out.extend_from_slice(&[0, 0, 0, 0]);
             continue;
         }
@@ -445,6 +489,23 @@ mod tests {
     }
 
     #[test]
+    fn ascii85_z_shorthand_respects_the_decompressed_size_cap() {
+        // 'z' is ASCII85's only sub-linear-input expansion path: one input
+        // byte becomes four output bytes. Enough of them must still hit
+        // ExceedsCap during decoding rather than growing `out` past the
+        // cap before the caller's post-decode length check ever runs.
+        let mut raw = vec![b'z'; (MAX_DECOMPRESSED_STREAM_BYTES / 4) + 1];
+        raw.extend_from_slice(b"~>");
+        let mut dict = Dictionary::new();
+        dict.set("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+        let stream = Stream::new(dict, raw);
+        assert!(matches!(
+            decompressed_content_capped(&stream),
+            Err(DecompressError::ExceedsCap)
+        ));
+    }
+
+    #[test]
     fn rejects_ascii85_group_overflowing_u32() {
         // "uuuuu" is the maximum possible 5-digit group (all digits = 84),
         // which decodes to 85^5 - 1 = 4_437_053_124 — past u32::MAX. A real
@@ -521,5 +582,63 @@ mod tests {
             decompressed_content_capped(&stream),
             Err(DecompressError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn get_page_content_capped_never_exceeds_aggregate_cap() {
+        // Five streams, each individually well under
+        // MAX_DECOMPRESSED_STREAM_BYTES (64 MiB) so none is rejected on its
+        // own, but summing to well past MAX_PAGE_CONTENT_BYTES (256 MiB).
+        // Appending each stream in full before truncating would let the
+        // final append and the capacity growth it triggers retain memory
+        // well past the cap even after truncate(); the fix appends only up
+        // to the remaining budget, so both the length AND the retained
+        // capacity must stay bounded.
+        use lopdf::dictionary;
+        const STREAM_RAW_BYTES: usize = 55 * 1024 * 1024;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let content_ids: Vec<Object> = (0..5)
+            .map(|_| {
+                let raw = vec![0u8; STREAM_RAW_BYTES];
+                Object::Reference(doc.add_object(Object::Stream(flate_stream(&raw))))
+            })
+            .collect();
+
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Contents" => Object::Array(content_ids),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let content = get_page_content_capped(&doc, page_id);
+        assert!(
+            content.len() <= MAX_PAGE_CONTENT_BYTES,
+            "aggregate content ({} bytes) exceeded the {MAX_PAGE_CONTENT_BYTES}-byte cap",
+            content.len()
+        );
+        // Extending in full before truncating would retain capacity for a
+        // whole extra stream (55 MiB) beyond the cap; capacity should stay
+        // close to the cap instead, not balloon toward the pre-truncation
+        // 275 MiB five-stream total.
+        assert!(
+            content.capacity() < MAX_PAGE_CONTENT_BYTES + STREAM_RAW_BYTES,
+            "retained capacity ({} bytes) suggests a stream was appended in \
+             full before truncating, rather than only up to the remaining budget",
+            content.capacity()
+        );
     }
 }

@@ -3985,6 +3985,29 @@ fn test_extract_pages_markdown_ocrs_page_with_vector_outlined_text() {
     );
 }
 
+/// Regression for a PR #221 review finding: `get_page_content_capped`
+/// concatenated a page's multiple `/Contents` streams with no separator,
+/// unlike `lopdf::Document::get_page_content` (which it replaces), which
+/// joins them with a newline. A page split at an arbitrary token boundary
+/// can then have adjacent operators merge into one invalid token — this
+/// fixture's first content stream ends exactly at "Tj" and the second
+/// begins exactly at "ET", so without a joining newline they merge into
+/// the invalid operator "TjET", dropping the shown text.
+#[test]
+fn split_content_stream_without_separator_does_not_drop_text() {
+    let result = process_pdf_with_options(
+        "tests/fixtures/split_content_stream_no_separator.pdf",
+        PdfOptions::new(),
+    )
+    .expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Hello"),
+        "text split across two /Contents streams at a token boundary should \
+         still extract, got: {md:?}"
+    );
+}
+
 #[test]
 fn pdf_options_debug_redacts_password() {
     let opts = PdfOptions::new().password("secret123");
