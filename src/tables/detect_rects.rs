@@ -2368,31 +2368,51 @@ fn is_chart_bar_cluster(
     // of how large the cluster actually is.
     let sampled_owned: Vec<(f32, f32, f32, f32)>;
     let group_rects = if group_rects.len() > MAX_CHART_CLUSTER_RECTS {
-        // Rects aren't guaranteed to be stored in spatial (x) order, so a
+        // Rects aren't guaranteed to be stored in spatial order, so a
         // stride over raw encounter order could land disproportionately
         // within one region of the chart. Copying and sorting the whole
         // cluster first would fix that, but reintroduces input-sized
         // allocation and O(n log n) work — not truly bounded against an
-        // adversarial cluster. Instead, bucket by x-position in a single
-        // O(n) pass with O(cap) memory (no full-size copy, no sort): find
-        // the x-range in one pass, then keep one representative rect per
-        // bucket across MAX_CHART_CLUSTER_RECTS evenly-spaced buckets.
-        let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
-        for r in group_rects {
-            min_x = min_x.min(r.0);
-            max_x = max_x.max(r.0);
+        // adversarial cluster. Instead, bucket by position in a single
+        // O(n) pass with O(cap) memory (no full-size copy, no sort).
+        //
+        // has_chart_bar_signature checks both orientations — vertical
+        // bars (position axis x) and horizontal bars (position axis y).
+        // Horizontal bars share a common left edge (near-constant x,
+        // varying y), so bucketing by x alone would collapse them all
+        // into one bucket and lose the row signal entirely (and
+        // symmetrically for x-varying vertical bars if bucketed by y
+        // alone). Bucket by both axes, each into half the cap, and use
+        // their union — whichever orientation the cluster actually is
+        // keeps a representative spread along its real position axis.
+        fn bucket_by_axis(
+            rects: &[(f32, f32, f32, f32)],
+            axis: fn(&(f32, f32, f32, f32)) -> f32,
+            n_buckets: usize,
+        ) -> Vec<(f32, f32, f32, f32)> {
+            let (mut min_v, mut max_v) = (f32::INFINITY, f32::NEG_INFINITY);
+            for r in rects {
+                min_v = min_v.min(axis(r));
+                max_v = max_v.max(axis(r));
+            }
+            let span = max_v - min_v;
+            let mut buckets: Vec<Option<(f32, f32, f32, f32)>> = vec![None; n_buckets];
+            for &r in rects {
+                let bucket = if span > 0.0 {
+                    (((axis(&r) - min_v) / span) * (n_buckets - 1) as f32) as usize
+                } else {
+                    0
+                };
+                buckets[bucket.min(n_buckets - 1)].get_or_insert(r);
+            }
+            buckets.into_iter().flatten().collect()
         }
-        let span = max_x - min_x;
-        let mut buckets: Vec<Option<(f32, f32, f32, f32)>> = vec![None; MAX_CHART_CLUSTER_RECTS];
-        for &r in group_rects {
-            let bucket = if span > 0.0 {
-                (((r.0 - min_x) / span) * (MAX_CHART_CLUSTER_RECTS - 1) as f32) as usize
-            } else {
-                0
-            };
-            buckets[bucket.min(MAX_CHART_CLUSTER_RECTS - 1)].get_or_insert(r);
-        }
-        sampled_owned = buckets.into_iter().flatten().collect();
+
+        let half_cap = MAX_CHART_CLUSTER_RECTS / 2;
+        sampled_owned = bucket_by_axis(group_rects, |r| r.0, half_cap)
+            .into_iter()
+            .chain(bucket_by_axis(group_rects, |r| r.1, half_cap))
+            .collect();
         &sampled_owned
     } else {
         group_rects
@@ -5181,6 +5201,39 @@ mod tests {
             items.push(make_item("5", x + 1.0, 5.0, 6.0)); // numeric data label inside the bar
         }
         (items, rects)
+    }
+
+    /// Mirrors `chart_shaped_cluster` but for horizontal bars: a common
+    /// left edge (x = 0 for every bar — the shared-x-position signature
+    /// this PR's bucket-sampling fix needs to handle), varying y
+    /// (position axis for horizontal bars), constant height (breadth),
+    /// and increasing width (length).
+    #[allow(clippy::type_complexity)]
+    fn horizontal_chart_shaped_cluster(n: usize) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+        let bh = 10.0;
+        let mut rects = Vec::with_capacity(n);
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            let y = i as f32 * (bh * 2.0); // gap = bh, well past the bh*0.5 touching threshold
+            let width = 20.0 + i as f32 * 5.0; // strictly increasing: no two bars match within tolerance 3
+            rects.push((0.0, y, width, bh));
+            items.push(make_item("5", width / 2.0, y + 1.0, 6.0)); // numeric data label inside the bar
+        }
+        (items, rects)
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_detects_genuine_horizontal_chart_above_max_size() {
+        // Horizontal bars share a common left edge (near-constant x,
+        // varying y) — bucketing the oversized-cluster sample by x alone
+        // would collapse every bar into one bucket and lose the row
+        // signal entirely. Bucketing by both x and y (and using the
+        // union) must still detect this as a chart.
+        let (items, oversized) = horizontal_chart_shaped_cluster(MAX_CHART_CLUSTER_RECTS + 1);
+        assert!(
+            is_chart_bar_cluster(&items, &oversized, 1),
+            "an oversized horizontal bar chart (common left edge) should still be detected as a chart"
+        );
     }
 
     #[test]
