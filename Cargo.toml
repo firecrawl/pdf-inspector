@@ -54,10 +54,15 @@ lopdf = { version = "0.42.0", features = ["rayon"] }
 rayon = "1.10"
 env_logger = "0.11"
 
-# Browser builds use JavaScript randomness for encrypted PDFs and embed the
-# bundled CMaps because there is no filesystem at runtime.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Browser builds (wasm32-unknown-unknown) use JavaScript randomness for encrypted PDFs.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+lopdf = { version = "0.42.0", default-features = false, features = ["wasm_js"] }
+
+# Standalone/Go WASI builds (wasm32-wasip1) use standard WASI randomness without JS bindings.
+[target.'cfg(all(target_arch = "wasm32", target_os = "wasi"))'.dependencies]
 lopdf = { version = "0.42.0", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 include_dir = "0.7"
 
 [dev-dependencies]

@@ -34,7 +34,7 @@ pub mod python;
 pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
-pub mod ffi;
+pub(crate) mod ffi;
 pub mod glyph_names;
 pub mod markdown;
 pub mod process_mode;

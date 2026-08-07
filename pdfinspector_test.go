@@ -95,7 +95,11 @@ func TestExtractText(t *testing.T) {
 	if len(strings.TrimSpace(text)) == 0 {
 		t.Fatalf("ExtractText returned empty string")
 	}
-	t.Logf("Extracted text snippet: %s", text[:min(100, len(text))])
+	runes := []rune(text)
+	if len(runes) > 100 {
+		runes = runes[:100]
+	}
+	t.Logf("Extracted text snippet: %s", string(runes))
 }
 
 func TestEncryptedPdfWithPassword(t *testing.T) {
@@ -137,6 +141,51 @@ func TestExtractPagesMarkdown(t *testing.T) {
 		t.Fatal("Expected pages in result")
 	}
 	t.Logf("Extracted %d pages markdown", len(res.Pages))
+}
+
+func TestValidationAndMetrics(t *testing.T) {
+	pdfData, err := os.ReadFile("tests/fixtures/thermo-freon12.pdf")
+	if err != nil {
+		t.Fatalf("Failed to read fixture: %v", err)
+	}
+
+	// 1. ProcessingTimeMs check
+	res, err := pdfinspector.ProcessPdf(pdfData, nil)
+	if err != nil {
+		t.Fatalf("ProcessPdf failed: %v", err)
+	}
+	if res.ProcessingTimeMs == 0 {
+		t.Errorf("Expected ProcessingTimeMs > 0, got %d", res.ProcessingTimeMs)
+	}
+
+	detRes, err := pdfinspector.DetectPdf(pdfData, "")
+	if err != nil {
+		t.Fatalf("DetectPdf failed: %v", err)
+	}
+	if detRes.ProcessingTimeMs == 0 {
+		t.Errorf("Expected DetectPdf ProcessingTimeMs > 0, got %d", detRes.ProcessingTimeMs)
+	}
+
+	// 2. Zero-page validation
+	_, err = pdfinspector.ProcessPdf(pdfData, &pdfinspector.ProcessOptions{Pages: []uint32{0}})
+	if err == nil || !strings.Contains(err.Error(), "1-indexed") {
+		t.Errorf("Expected error for page index 0, got: %v", err)
+	}
+
+	// 3. Invalid profile validation
+	_, err = pdfinspector.ProcessPdf(pdfData, &pdfinspector.ProcessOptions{Profile: "invalid_profile"})
+	if err == nil || !strings.Contains(err.Error(), "Invalid markdown profile") {
+		t.Errorf("Expected error for invalid profile, got: %v", err)
+	}
+
+	// 4. Empty non-nil pages slice
+	pagesRes, err := pdfinspector.ExtractPagesMarkdown(pdfData, []uint32{})
+	if err != nil {
+		t.Fatalf("ExtractPagesMarkdown with empty slice failed: %v", err)
+	}
+	if len(pagesRes.Pages) != 0 {
+		t.Errorf("Expected 0 pages for empty pages slice, got %d", len(pagesRes.Pages))
+	}
 }
 
 func min(a, b int) int {

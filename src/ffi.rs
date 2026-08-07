@@ -227,16 +227,19 @@ pub extern "C" fn ffi_process_pdf(
             let opts_slice = unsafe { slice::from_raw_parts(opts_ptr, opts_len) };
             if let Ok(parsed) = serde_json::from_slice::<FfiProcessOptions>(opts_slice) {
                 if let Some(pages) = parsed.pages {
+                    if pages.contains(&0) {
+                        return return_error("Invalid page index: pages must be 1-indexed (>= 1)");
+                    }
                     opts = opts.pages(pages);
                 }
                 if let Some(password) = parsed.password {
                     opts = opts.password(password);
                 }
                 if let Some(profile) = parsed.profile {
-                    if profile == "compact" {
-                        opts.markdown.profile = MarkdownProfile::Compact;
-                    } else if profile == "fidelity" {
-                        opts.markdown.profile = MarkdownProfile::Fidelity;
+                    match profile.as_str() {
+                        "compact" => opts.markdown.profile = MarkdownProfile::Compact,
+                        "fidelity" => opts.markdown.profile = MarkdownProfile::Fidelity,
+                        _ => return return_error("Invalid markdown profile: expected 'fidelity' or 'compact'"),
                     }
                 }
                 if let Some(inc) = parsed.include_page_markers {
@@ -248,8 +251,10 @@ pub extern "C" fn ffi_process_pdf(
             }
         }
 
+        let start_time = std::time::Instant::now();
         match process_pdf_mem_with_options(pdf_bytes, opts) {
-            Ok(res) => {
+            Ok(mut res) => {
+                res.processing_time_ms = start_time.elapsed().as_millis() as u64;
                 let ffi_res = FfiPdfProcessResult::from(res);
                 match serde_json::to_string(&ffi_res) {
                     Ok(json) => return_string(json),
@@ -282,8 +287,10 @@ pub extern "C" fn ffi_detect_pdf(
             }
         }
 
+        let start_time = std::time::Instant::now();
         match process_pdf_mem_with_options(pdf_bytes, opts) {
-            Ok(res) => {
+            Ok(mut res) => {
+                res.processing_time_ms = start_time.elapsed().as_millis() as u64;
                 let ffi_res = FfiPdfProcessResult::from(res);
                 match serde_json::to_string(&ffi_res) {
                     Ok(json) => return_string(json),

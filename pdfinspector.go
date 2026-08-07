@@ -14,8 +14,10 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
+//go:generate cargo build --target wasm32-wasip1 --release
+
 //go:embed target/wasm32-wasip1/release/pdf_inspector.wasm
-var WASMBytes []byte
+var wasmBytes []byte
 
 // ProcessOptions represents parameters for PDF processing.
 type ProcessOptions struct {
@@ -85,23 +87,41 @@ type PagesExtractionResult struct {
 var (
 	compiledModule wazero.CompiledModule
 	wazeroRuntime  wazero.Runtime
-	initOnce       sync.Once
-	initErr        error
+	runtimeMu      sync.RWMutex
 )
 
 func initRuntime(ctx context.Context) (wazero.Runtime, wazero.CompiledModule, error) {
-	initOnce.Do(func() {
-		r := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigInterpreter())
-		wasi_snapshot_preview1.MustInstantiate(ctx, r)
-		compiled, err := r.CompileModule(ctx, WASMBytes)
-		if err != nil {
-			initErr = fmt.Errorf("failed to compile pdf-inspector WASM module: %w", err)
-			return
-		}
-		wazeroRuntime = r
-		compiledModule = compiled
-	})
-	return wazeroRuntime, compiledModule, initErr
+	runtimeMu.RLock()
+	if wazeroRuntime != nil && compiledModule != nil {
+		r, c := wazeroRuntime, compiledModule
+		runtimeMu.RUnlock()
+		return r, c, nil
+	}
+	runtimeMu.RUnlock()
+
+	runtimeMu.Lock()
+	defer runtimeMu.Unlock()
+
+	if wazeroRuntime != nil && compiledModule != nil {
+		return wazeroRuntime, compiledModule, nil
+	}
+
+	initCtx := context.Background()
+	r := wazero.NewRuntimeWithConfig(initCtx, wazero.NewRuntimeConfigInterpreter())
+	if _, err := wasi_snapshot_preview1.Instantiate(initCtx, r); err != nil {
+		r.Close(initCtx)
+		return nil, nil, fmt.Errorf("failed to instantiate WASI snapshot preview1: %w", err)
+	}
+
+	compiled, err := r.CompileModule(initCtx, wasmBytes)
+	if err != nil {
+		r.Close(initCtx)
+		return nil, nil, fmt.Errorf("failed to compile pdf-inspector WASM module: %w", err)
+	}
+
+	wazeroRuntime = r
+	compiledModule = compiled
+	return wazeroRuntime, compiledModule, nil
 }
 
 func newModuleConfig() wazero.ModuleConfig {
@@ -322,7 +342,7 @@ func ExtractPagesMarkdown(pdfBytes []byte, pages []uint32) (*PagesExtractionResu
 // ExtractPagesMarkdownWithContext extracts formatted markdown per page with context.
 func ExtractPagesMarkdownWithContext(ctx context.Context, pdfBytes []byte, pages []uint32) (*PagesExtractionResult, error) {
 	var pagesBytes []byte
-	if len(pages) > 0 {
+	if pages != nil {
 		var err error
 		pagesBytes, err = json.Marshal(pages)
 		if err != nil {
@@ -388,6 +408,10 @@ func VersionWithContext(ctx context.Context) (string, error) {
 	}
 	if err := json.Unmarshal(outBytes, &wrapper); err != nil {
 		return "", err
+	}
+
+	if wrapper.Error != "" {
+		return "", errors.New(wrapper.Error)
 	}
 
 	return wrapper.Version, nil
