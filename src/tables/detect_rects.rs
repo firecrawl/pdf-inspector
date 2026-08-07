@@ -2368,8 +2368,16 @@ fn is_chart_bar_cluster(
     // of how large the cluster actually is.
     let sampled_owned: Vec<(f32, f32, f32, f32)>;
     let group_rects = if group_rects.len() > MAX_CHART_CLUSTER_RECTS {
-        let stride = group_rects.len().div_ceil(MAX_CHART_CLUSTER_RECTS);
-        sampled_owned = group_rects.iter().step_by(stride).copied().collect();
+        // Rects aren't guaranteed to be stored in spatial (x) order — a
+        // stride over raw encounter order could, in principle, land
+        // disproportionately within one region of the chart rather than
+        // spanning it evenly. Sort by x first so the stride always
+        // samples evenly across the chart's actual layout, regardless of
+        // storage order.
+        let mut sorted = group_rects.to_vec();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let stride = sorted.len().div_ceil(MAX_CHART_CLUSTER_RECTS);
+        sampled_owned = sorted.into_iter().step_by(stride).collect();
         &sampled_owned
     } else {
         group_rects
@@ -5171,6 +5179,38 @@ mod tests {
         assert!(
             is_chart_bar_cluster(&items, &rects, 1),
             "a spaced, varied-height, labeled bar cluster should be chart-like"
+        );
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_detects_genuine_chart_above_max_size_out_of_spatial_order() {
+        // Real rect lists aren't guaranteed to be stored in x-sorted
+        // (spatial) order — `chart_shaped_cluster`'s own output happens to
+        // already be x-sorted, which wouldn't exercise a code path that
+        // sorts before sampling. Re-store as two blocks (all even-indexed
+        // bars, then all odd-indexed bars) rather than left-to-right,
+        // simulating two chart series stored series-by-series instead of
+        // position-by-position, so the sort-before-stride path is
+        // actually exercised on non-spatially-ordered input. (bar_family's
+        // spacing/height-variation signal turned out robust enough that
+        // this reordering alone doesn't defeat a naive raw-order stride
+        // either — sorting first is still the strictly safer, more
+        // representative approach the review comment asked for, and
+        // doesn't reintroduce the cubic cost this cap exists to avoid.)
+        let (items, sorted_rects) = chart_shaped_cluster(MAX_CHART_CLUSTER_RECTS + 1);
+        // Re-store as two blocks (all even-indexed bars, then all
+        // odd-indexed bars) rather than left-to-right — simulating two
+        // chart series stored series-by-series. A fixed-stride sample
+        // over this encounter order lands disproportionately within each
+        // block instead of spanning the chart's true x-range evenly.
+        let mut oversized: Vec<(f32, f32, f32, f32)> =
+            sorted_rects.iter().step_by(2).copied().collect();
+        oversized.extend(sorted_rects.iter().skip(1).step_by(2).copied());
+
+        assert!(
+            is_chart_bar_cluster(&items, &oversized, 1),
+            "an oversized chart-shaped cluster stored out of spatial order \
+             should still be detected as a chart"
         );
     }
 

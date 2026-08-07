@@ -14,10 +14,12 @@
 //! expand data — FlateDecode and LZWDecode, including PNG/TIFF predictor
 //! post-processing and, for Flate, `lopdf`'s corrupt-header raw-deflate
 //! recovery — with a hard output cap enforced *during* decoding rather than
-//! after. ASCII85Decode (which can only shrink data, ~4:5) is decoded with a
-//! small local implementation so a multi-filter chain never has to fall back
-//! to `lopdf`'s unbounded path; uncompressed streams pass through as-is,
-//! since they can't expand. Unsupported filters return an error rather than
+//! after. ASCII85Decode (mostly ~4:5 shrinkage, but the `z` shorthand
+//! expands one input byte to four output bytes) is decoded with a small
+//! local implementation, enforcing the same cap internally during `z`
+//! expansion, so a multi-filter chain never has to fall back to `lopdf`'s
+//! unbounded path; uncompressed streams pass through as-is, since they
+//! can't expand. Unsupported filters return an error rather than
 //! delegating to `lopdf`, since any future expanding filter added there would
 //! otherwise silently bypass the cap.
 //!
@@ -130,6 +132,17 @@ pub(crate) fn get_page_content_capped(doc: &Document, page_id: ObjectId) -> Vec<
     let mut content = Vec::new();
     for object_id in doc.get_page_contents(page_id) {
         if let Ok(Object::Stream(stream)) = doc.get_object(object_id) {
+            // Check the remaining budget before decompressing, not after —
+            // otherwise an already-exhausted page still pays the cost of
+            // fully decompressing (allocating up to the 64 MiB per-stream
+            // cap for) a stream whose result would just get discarded.
+            let remaining = MAX_PAGE_CONTENT_BYTES.saturating_sub(content.len());
+            if remaining == 0 {
+                log::debug!(
+                    "page {page_id:?} content already at {MAX_PAGE_CONTENT_BYTES}-byte aggregate cap, stopping"
+                );
+                break;
+            }
             let data: std::borrow::Cow<[u8]> = match decompressed_content_capped(stream) {
                 Ok(data) => data.into(),
                 Err(DecompressError::ExceedsCap) => {
@@ -150,13 +163,6 @@ pub(crate) fn get_page_content_capped(doc: &Document, page_id: ObjectId) -> Vec<
             // lets a single near-cap-sized stream push the allocation up
             // to MAX_DECOMPRESSED_STREAM_BYTES past the intended cap, and
             // Vec::truncate doesn't release that over-allocated capacity.
-            let remaining = MAX_PAGE_CONTENT_BYTES.saturating_sub(content.len());
-            if remaining == 0 {
-                log::debug!(
-                    "page {page_id:?} content already at {MAX_PAGE_CONTENT_BYTES}-byte aggregate cap, stopping"
-                );
-                break;
-            }
             let take = data.len().min(remaining);
             // Whether there's still room for the join separator after this
             // stream's data is appended in full (irrelevant when the
@@ -305,13 +311,6 @@ fn bounded_lzw_with_predictor(
     apply_predictor(output, params)
 }
 
-/// Minimal Adobe/PDF-variant ASCII85 decoder. Reimplemented locally because
-/// `lopdf::Stream::decode_ascii85` is private; kept in the same filter chain
-/// as the bounded Flate/LZW paths above so a chain like
-/// `[ASCII85Decode, FlateDecode]` never has to fall back to `lopdf`'s
-/// unbounded `decompressed_content`. Decoding can only shrink data (5 ASCII
-/// chars -> 4 bytes, or the `z` shorthand for 4 zero bytes), so no cap is
-/// needed here — output is always <= input length.
 /// Decodes one base-85 group into a big-endian u32, via checked arithmetic.
 /// Valid ASCII85 groups always encode a value that fits (they come from
 /// encoding a real `u32`), but 85^5 - 1 exceeds `u32::MAX`, so a malformed or
@@ -328,6 +327,17 @@ fn decode_ascii85_group(group: &[u8]) -> Result<u32, DecompressError> {
     })
 }
 
+/// Minimal Adobe/PDF-variant ASCII85 decoder. Reimplemented locally because
+/// `lopdf::Stream::decode_ascii85` is private; kept in the same filter chain
+/// as the bounded Flate/LZW paths above so a chain like
+/// `[ASCII85Decode, FlateDecode]` never has to fall back to `lopdf`'s
+/// unbounded `decompressed_content`. Almost every group shrinks data (5
+/// ASCII chars -> 4 bytes), but the `z` shorthand is the exception: one
+/// input byte expands to four zero output bytes, so output is *not*
+/// bounded by input length in general — the caller's post-decode
+/// `MAX_DECOMPRESSED_STREAM_BYTES` check alone wouldn't be enough (a long
+/// run of `z`s could grow `out` well past it before that check ever runs),
+/// which is why the `z` branch below enforces the cap during decoding too.
 fn decode_ascii85(input: &[u8]) -> Result<Vec<u8>, DecompressError> {
     let mut out = Vec::with_capacity(input.len());
     let mut group = [0u8; 5];
