@@ -5,7 +5,7 @@ use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
@@ -16,6 +16,7 @@ use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
 
+#[derive(Clone, Copy)]
 pub(crate) enum XObjectType {
     Image,
     Form(ObjectId),
@@ -53,9 +54,8 @@ pub(crate) fn get_page_xobjects(
 fn get_form_xobjects(
     doc: &Document,
     form_dict: &lopdf::Dictionary,
+    parent_xobjects: &HashMap<String, XObjectType>,
 ) -> HashMap<String, XObjectType> {
-    let mut xobject_types = HashMap::new();
-
     let resources = if let Ok(res_ref) = form_dict.get(b"Resources") {
         if let Ok(obj_ref) = res_ref.as_reference() {
             doc.get_dictionary(obj_ref).ok()
@@ -63,9 +63,13 @@ fn get_form_xobjects(
             res_ref.as_dict().ok()
         }
     } else {
-        return xobject_types;
+        // PDF permits a Form that omits /Resources to inherit the caller's
+        // resource dictionary. A present /Resources begins a new resource
+        // scope, even when it does not contain an /XObject dictionary.
+        return parent_xobjects.clone();
     };
 
+    let mut xobject_types = HashMap::new();
     if let Some(resources) = resources {
         collect_xobjects_from_dict(doc, resources, &mut xobject_types);
     }
@@ -109,24 +113,31 @@ fn collect_xobjects_from_dict(
 }
 
 /// Extract text items from a Form XObject
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_form_xobject_text(
     doc: &Document,
     form_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    parent_fonts: &BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    parent_xobjects: &HashMap<String, XObjectType>,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
 ) -> Vec<TextItem> {
+    let mut active_forms = HashSet::new();
     extract_form_xobject_text_inner(
         doc,
         form_id,
         page_num,
         font_cmaps,
         parent_ctm,
+        parent_fonts,
+        parent_xobjects,
         cmap_decisions,
         style_cache,
         0,
+        &mut active_forms,
     )
 }
 
@@ -137,16 +148,23 @@ fn extract_form_xobject_text_inner(
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    parent_fonts: &BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    parent_xobjects: &HashMap<String, XObjectType>,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
+    active_forms: &mut HashSet<ObjectId>,
 ) -> Vec<TextItem> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
+    if depth > MAX_FORM_XOBJECT_DEPTH || !active_forms.insert(form_id) {
+        return items;
+    }
 
     // Get the Form XObject stream
     let Ok(Object::Stream(stream)) = doc.get_object(form_id) else {
+        active_forms.remove(&form_id);
         return items;
     };
 
@@ -158,11 +176,12 @@ fn extract_form_xobject_text_inner(
 
     // Decode the content stream
     let Ok(content) = Content::decode(&content_data) else {
+        active_forms.remove(&form_id);
         return items;
     };
 
     // Get fonts from the Form's Resources
-    let form_fonts = get_form_fonts(doc, &stream.dict);
+    let form_fonts = get_form_fonts(doc, &stream.dict, parent_fonts);
     let (font_encodings, _has_gid_fonts) = build_font_encodings(doc, &form_fonts, font_cmaps);
 
     // Build font width info for the form
@@ -220,7 +239,7 @@ fn extract_form_xobject_text_inner(
     }
 
     // Build XObject map from the Form's own Resources for nested Do
-    let form_xobjects = get_form_xobjects(doc, &stream.dict);
+    let form_xobjects = get_form_xobjects(doc, &stream.dict, parent_xobjects);
 
     // Apply the Form XObject's own Matrix (if any) to the parent CTM
     let form_matrix = if let Ok(matrix_obj) = stream.dict.get(b"Matrix") {
@@ -276,19 +295,20 @@ fn extract_form_xobject_text_inner(
                         let xobj_name = String::from_utf8_lossy(name).to_string();
                         match form_xobjects.get(&xobj_name) {
                             Some(XObjectType::Form(nested_id)) => {
-                                if depth < MAX_FORM_XOBJECT_DEPTH {
-                                    let nested_items = extract_form_xobject_text_inner(
-                                        doc,
-                                        *nested_id,
-                                        page_num,
-                                        font_cmaps,
-                                        &ctm,
-                                        cmap_decisions,
-                                        style_cache,
-                                        depth + 1,
-                                    );
-                                    items.extend(nested_items);
-                                }
+                                let nested_items = extract_form_xobject_text_inner(
+                                    doc,
+                                    *nested_id,
+                                    page_num,
+                                    font_cmaps,
+                                    &ctm,
+                                    &form_fonts,
+                                    &form_xobjects,
+                                    cmap_decisions,
+                                    style_cache,
+                                    depth + 1,
+                                    active_forms,
+                                );
+                                items.extend(nested_items);
                             }
                             Some(XObjectType::Image) => {
                                 // Mirror the top-level Image-XObject emission
@@ -632,6 +652,7 @@ fn extract_form_xobject_text_inner(
         }
     }
 
+    active_forms.remove(&form_id);
     items
 }
 
@@ -639,10 +660,11 @@ fn extract_form_xobject_text_inner(
 pub(crate) fn get_form_fonts<'a>(
     doc: &'a Document,
     form_dict: &lopdf::Dictionary,
-) -> std::collections::BTreeMap<Vec<u8>, &'a lopdf::Dictionary> {
-    let mut fonts = std::collections::BTreeMap::new();
-
-    // Get Resources from Form dictionary
+    parent_fonts: &BTreeMap<Vec<u8>, &'a lopdf::Dictionary>,
+) -> BTreeMap<Vec<u8>, &'a lopdf::Dictionary> {
+    // A Form without /Resources inherits the caller's resources. Once
+    // /Resources is present, its dictionary is the complete resource scope;
+    // missing names must not fall back to the parent.
     let resources = if let Ok(res_ref) = form_dict.get(b"Resources") {
         if let Ok(obj_ref) = res_ref.as_reference() {
             doc.get_dictionary(obj_ref).ok()
@@ -650,12 +672,14 @@ pub(crate) fn get_form_fonts<'a>(
             res_ref.as_dict().ok()
         }
     } else {
-        return fonts;
+        return parent_fonts.clone();
     };
 
     let Some(resources) = resources else {
-        return fonts;
+        return BTreeMap::new();
     };
+
+    let mut fonts = BTreeMap::new();
 
     // Get Font dictionary
     let font_dict = if let Ok(font_ref) = resources.get(b"Font") {
@@ -682,4 +706,213 @@ pub(crate) fn get_form_fonts<'a>(
     }
 
     fonts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::{dictionary, Dictionary, Stream};
+
+    fn form_stream(content: &[u8], resources: Option<Dictionary>) -> Stream {
+        let mut dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        };
+        if let Some(resources) = resources {
+            dict.set("Resources", Object::Dictionary(resources));
+        }
+        Stream::new(dict, content.to_vec())
+    }
+
+    fn simple_font(doc: &mut Document) -> ObjectId {
+        doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        })
+    }
+
+    fn font_with_a_mapping(doc: &mut Document, mapped_hex: &str) -> ObjectId {
+        let cmap = format!(
+            r#"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Test-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+1 beginbfchar
+<41> <{mapped_hex}>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end"#,
+        );
+        let cmap_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            cmap.into_bytes(),
+        )));
+        doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "ToUnicode" => Object::Reference(cmap_id),
+        })
+    }
+
+    fn parent_fonts<'a>(
+        doc: &'a Document,
+        entries: &[(&[u8], ObjectId)],
+    ) -> BTreeMap<Vec<u8>, &'a Dictionary> {
+        entries
+            .iter()
+            .map(|(name, id)| (name.to_vec(), doc.get_dictionary(*id).unwrap()))
+            .collect()
+    }
+
+    fn extract_items(
+        doc: &Document,
+        form_id: ObjectId,
+        fonts: &BTreeMap<Vec<u8>, &Dictionary>,
+        xobjects: &HashMap<String, XObjectType>,
+    ) -> Vec<TextItem> {
+        let font_cmaps = FontCMaps::from_doc(doc);
+        extract_form_xobject_text(
+            doc,
+            form_id,
+            1,
+            &font_cmaps,
+            &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            fonts,
+            xobjects,
+            &mut CMapDecisionCache::new(),
+            &mut FontStyleCache::new(),
+        )
+    }
+
+    #[test]
+    fn form_without_resources_inherits_caller_font() {
+        let mut doc = Document::new();
+        let font_id = simple_font(&mut doc);
+        let form_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /F1 12 Tf (Inherited font) Tj ET",
+            None,
+        )));
+        let fonts = parent_fonts(&doc, &[(b"F1", font_id)]);
+
+        let items = extract_items(&doc, form_id, &fonts, &HashMap::new());
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            "Inherited font"
+        );
+    }
+
+    #[test]
+    fn nested_forms_without_resources_inherit_caller_xobject_and_font() {
+        let mut doc = Document::new();
+        let font_id = simple_font(&mut doc);
+        let inner_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /F1 12 Tf (Nested inherited text) Tj ET",
+            None,
+        )));
+        let outer_id = doc.add_object(Object::Stream(form_stream(b"/Inner Do", None)));
+        let fonts = parent_fonts(&doc, &[(b"F1", font_id)]);
+        let xobjects = HashMap::from([(String::from("Inner"), XObjectType::Form(inner_id))]);
+
+        let items = extract_items(&doc, outer_id, &fonts, &xobjects);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            "Nested inherited text"
+        );
+    }
+
+    #[test]
+    fn form_with_resources_does_not_resolve_missing_parent_font() {
+        let mut doc = Document::new();
+        let parent_font_id = font_with_a_mapping(&mut doc, "0050"); // P
+        let local_font_id = simple_font(&mut doc);
+        let form_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /F1 12 Tf <41> Tj ET",
+            Some(dictionary! {
+                "Font" => dictionary! {
+                    "Local" => Object::Reference(local_font_id),
+                },
+            }),
+        )));
+        let fonts = parent_fonts(&doc, &[(b"F1", parent_font_id)]);
+
+        let items = extract_items(&doc, form_id, &fonts, &HashMap::new());
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            "A"
+        );
+    }
+
+    #[test]
+    fn form_with_resources_does_not_resolve_missing_parent_xobject() {
+        let mut doc = Document::new();
+        let font_id = simple_font(&mut doc);
+        let inner_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /F1 12 Tf (Should stay unreachable) Tj ET",
+            Some(dictionary! {
+                "Font" => dictionary! {
+                    "F1" => Object::Reference(font_id),
+                },
+            }),
+        )));
+        let outer_id = doc.add_object(Object::Stream(form_stream(
+            b"/Inner Do",
+            Some(dictionary! {
+                "XObject" => dictionary! {},
+            }),
+        )));
+        let xobjects = HashMap::from([(String::from("Inner"), XObjectType::Form(inner_id))]);
+
+        let items = extract_items(&doc, outer_id, &BTreeMap::new(), &xobjects);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn form_type3_font_scaling_applies_to_tj_and_tj_array() {
+        let mut doc = Document::new();
+        let type3_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontMatrix" => vec![1.into(), 0.into(), 0.into(), (-1).into(), 0.into(), 0.into()],
+            "FontBBox" => vec![0.into(), (-156).into(), 0.into(), 3.into()],
+        });
+        let form_id = doc.add_object(Object::Stream(form_stream(
+            b"BT /T3 0.12 Tf (A) Tj 0 -20 Td [(B)] TJ ET",
+            Some(dictionary! {
+                "Font" => dictionary! {
+                    "T3" => Object::Reference(type3_font_id),
+                },
+            }),
+        )));
+
+        let items = extract_items(&doc, form_id, &BTreeMap::new(), &HashMap::new());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "A");
+        assert_eq!(items[1].text, "B");
+        for item in items {
+            assert!(
+                (item.font_size - 19.08).abs() < 0.01,
+                "got {}",
+                item.font_size
+            );
+        }
+    }
 }
