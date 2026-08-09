@@ -1151,6 +1151,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         is_italic: bool,
         is_underline: bool,
         is_strikeout: bool,
+        mcid: Option<i64>,
     }
 
     let mut seen_overlays = HashSet::new();
@@ -1171,6 +1172,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 is_italic: item.is_italic,
                 is_underline: item.is_underline,
                 is_strikeout: item.is_strikeout,
+                mcid: item.mcid,
             }),
             _ => true,
         })
@@ -2136,6 +2138,42 @@ mod tests {
         let mut it = make_item(x, y, page);
         it.width = width;
         it
+    }
+
+    #[test]
+    fn exact_overlays_with_distinct_mcids_are_not_collapsed() {
+        let mut first = make_item(100.0, 700.0, 1);
+        first.text = "Tagged overlay".into();
+        first.width = 80.0;
+        first.mcid = Some(10);
+
+        let mut second = first.clone();
+        second.mcid = Some(11);
+
+        let struct_roles = HashMap::from([(
+            1,
+            HashMap::from([
+                (10, crate::structure_tree::StructRole::H1),
+                (11, crate::structure_tree::StructRole::H2),
+            ]),
+        )]);
+        let markdown = to_markdown_from_items_with_rects_and_lines(
+            vec![first, second],
+            MarkdownOptions::default(),
+            &[],
+            &[],
+            MarkdownDocumentContext {
+                page_thresholds: &HashMap::new(),
+                struct_roles: Some(&struct_roles),
+                struct_tables: &[],
+                page_count: 1,
+                prefiltered_page_number_pages: None,
+                prefiltered_page_number_mask: None,
+                precomputed_chart_regions: None,
+            },
+        );
+
+        assert_eq!(markdown.matches("Tagged overlay").count(), 2, "{markdown}");
     }
 
     #[test]
