@@ -38,6 +38,7 @@ The package also exports:
 - `detectPdf(pdf, options?)` for detection without extraction.
 - `classifyPdf(pdf)` for the lightweight result shape shared with the native Node.js API.
 - `extractText(pdf)` for plain text.
+- `extractTextInRegions(pdf, pageRegions)` for text within layout bounding boxes (hybrid OCR pipelines).
 - `version()` for the WASM package version.
 
 ## Browser behavior
