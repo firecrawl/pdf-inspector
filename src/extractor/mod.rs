@@ -1153,8 +1153,11 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     // as often follows a closing bracket or quote, as in
                     // `POCP (“smog”)` + `3)`. Digits stay excluded either way:
                     // appending to one corrupts the value ("33" + "1" in "33 1/3%").
+                    // `%` closes a value the way a bracket closes a phrase, so a
+                    // marker after a rate absorbs without the digit hazard above.
                     let ends_absorbable = parent.text.chars().last().is_some_and(|c| {
-                        c.is_alphabetic() || matches!(c, ')' | ']' | '}' | '”' | '"' | '\'' | '»')
+                        c.is_alphabetic()
+                            || matches!(c, ')' | ']' | '}' | '”' | '"' | '\'' | '»' | '%')
                     });
                     // Strikeout boundaries block the merge (a struck word
                     // must not extend its strike over a live footnote digit,
@@ -1457,6 +1460,18 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "POCP (“smog”)³)");
+    }
+
+    #[test]
+    fn test_marker_after_percentage_is_absorbed() {
+        // A rate carries its marker the same way a phrase carries one. `%` closes
+        // the value, so absorbing cannot corrupt the number the way appending to a
+        // bare digit would — which the parent-ends-with-digit test still pins.
+        let parent = make_merge_item("24.99%", 100.0, 34.0);
+        let merged = merge_subscript_items(vec![parent, make_script_item("1)", 134.0, 702.0)]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "24.99%¹)");
     }
 
     #[test]
