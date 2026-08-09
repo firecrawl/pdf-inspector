@@ -1133,6 +1133,61 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         return String::new();
     }
 
+    // Keep positioned extraction faithful to the source operations. Semantic
+    // Markdown needs only one copy of the same text painted at identical
+    // coordinates.
+    #[derive(Eq, Hash, PartialEq)]
+    struct OverlayKey {
+        page: u32,
+        is_form_field: bool,
+        text: String,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        font: String,
+        font_size: u32,
+        is_bold: bool,
+        is_italic: bool,
+        is_underline: bool,
+        is_strikeout: bool,
+    }
+
+    let mut seen_overlays = HashSet::new();
+    let overlay_keep_mask: Vec<bool> = items
+        .iter()
+        .map(|item| match item.item_type {
+            ItemType::Text | ItemType::FormField => seen_overlays.insert(OverlayKey {
+                page: item.page,
+                is_form_field: matches!(item.item_type, ItemType::FormField),
+                text: item.text.clone(),
+                x: item.x.to_bits(),
+                y: item.y.to_bits(),
+                width: item.width.to_bits(),
+                height: item.height.to_bits(),
+                font: item.font.clone(),
+                font_size: item.font_size.to_bits(),
+                is_bold: item.is_bold,
+                is_italic: item.is_italic,
+                is_underline: item.is_underline,
+                is_strikeout: item.is_strikeout,
+            }),
+            _ => true,
+        })
+        .collect();
+    let deduplicated_page_number_mask = prefiltered_page_number_mask.map(|mask| {
+        mask.iter()
+            .zip(&overlay_keep_mask)
+            .filter_map(|(remove, keep)| keep.then_some(*remove))
+            .collect::<Vec<_>>()
+    });
+    let items = items
+        .into_iter()
+        .zip(&overlay_keep_mask)
+        .filter_map(|(item, keep)| keep.then_some(item))
+        .collect::<Vec<_>>();
+    let prefiltered_page_number_mask = deduplicated_page_number_mask.as_deref();
+
     // Table detection must retain the original collection because short
     // numeric table cells can be indistinguishable from folios until
     // structural context is available. A precomputed mask carries the

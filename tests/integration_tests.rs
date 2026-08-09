@@ -239,6 +239,31 @@ fn make_minimal_text_pdf() -> Vec<u8> {
     )
 }
 
+#[test]
+fn exact_duplicate_overlay_is_emitted_once_in_markdown() {
+    let content = "BT /F1 10 Tf 1 0 0 1 40 692 Tm (Purchase $19.95) Tj 1 0 0 1 40 692 Tm (Purchase $19.95) Tj 1 0 0 1 40 650 Tm (Purchase $19.95) Tj ET";
+    let pdf = make_text_pdf(content, "0 0 612 792");
+
+    let result = extract_pages_markdown_mem(&pdf, None).expect("overlay PDF should parse");
+    let markdown = &result.pages[0].markdown;
+    assert_eq!(
+        markdown.matches("Purchase $19.95").count(),
+        2,
+        "an exact overlay must collapse without removing text at another position: {markdown}"
+    );
+
+    let positioned = extract_text_with_positions_mem(&pdf)
+        .expect("positioned extraction should keep source operations");
+    assert_eq!(
+        positioned
+            .iter()
+            .filter(|item| item.text.contains("Purchase $19.95"))
+            .count(),
+        3,
+        "the positioned API must keep all source paint operations"
+    );
+}
+
 fn make_digit_run_repro_pdf() -> Vec<u8> {
     let content = r#"BT
 /F1 12 Tf
