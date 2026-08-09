@@ -25,7 +25,7 @@ pub enum PdfType {
 /// Strategy for which pages to scan during detection
 #[derive(Debug, Clone)]
 pub enum ScanStrategy {
-    /// Scan all pages, stop on first non-text page (current default).
+    /// Scan all pages, stop on first non-text page.
     /// Best for pipelines that route TextBased PDFs to fast extraction.
     EarlyExit,
     /// Scan all pages, no early exit.
@@ -205,6 +205,11 @@ pub(crate) fn detect_from_document(
                 .collect();
             valid.sort();
             valid.dedup();
+            if valid.is_empty() {
+                return Err(PdfError::InvalidOptions(format!(
+                    "ScanStrategy::Pages contains no in-range page numbers for a {total_pages}-page PDF"
+                )));
+            }
             (valid, false)
         }
     };

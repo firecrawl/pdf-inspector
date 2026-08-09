@@ -11,7 +11,7 @@ npm install @firecrawl/pdf-inspector-wasm
 ## Usage
 
 ```ts
-import init, { processPdf } from "@firecrawl/pdf-inspector-wasm";
+import init, { detectPdf, processPdf } from "@firecrawl/pdf-inspector-wasm";
 
 await init();
 
@@ -33,10 +33,24 @@ const result = processPdf(pdf, {
 });
 ```
 
+Detection can scan every page, stop early, sample a fixed number of pages, or
+inspect a caller-selected set of 1-indexed pages:
+
+```ts
+const full = detectPdf(pdf, { strategy: "full" });
+const earlyExit = detectPdf(pdf, { strategy: "earlyExit" });
+const sampled = detectPdf(pdf, { strategy: { sample: 12 } });
+const selected = detectPdf(pdf, { strategy: { pages: [1, 50, 100] } });
+```
+
+The same `strategy`, `minTextOpsPerPage`, and `textPageRatioThreshold` options
+are accepted by `processPdf` and `classifyPdf`. Unknown or unsupported option
+fields throw an error instead of being ignored.
+
 The package also exports:
 
 - `detectPdf(pdf, options?)` for detection without extraction.
-- `classifyPdf(pdf)` for the lightweight result shape shared with the native Node.js API.
+- `classifyPdf(pdf, options?)` for the lightweight result shape shared with the native Node.js API.
 - `extractText(pdf)` for plain text.
 - `version()` for the WASM package version.
 

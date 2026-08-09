@@ -215,7 +215,7 @@ wasm/                   — Browser bindings (wasm-bindgen)
 ## How classification works
 
 1. Parse the xref table and page tree (no full object load)
-2. Select pages based on `ScanStrategy` (default: all pages with early exit)
+2. Select pages based on `ScanStrategy` (default: sample up to 8 evenly distributed pages)
 3. Look for `Tj`/`TJ` (text operators) and `Do` (image operators) in content streams
 4. Classify based on text operator presence across sampled pages
 
@@ -225,9 +225,9 @@ This detects 300+ page PDFs in milliseconds. The result includes `pages_needing_
 
 | Strategy | Behavior | Best for |
 |---|---|---|
-| `EarlyExit` (default) | Scan all pages, stop on first non-text page | Pipelines routing TextBased PDFs to fast extraction |
+| `EarlyExit` | Scan all pages, stop on first non-text page | Pipelines routing TextBased PDFs to fast extraction |
 | `Full` | Scan all pages, no early exit | Accurate Mixed vs Scanned classification |
-| `Sample(n)` | Sample `n` evenly distributed pages (first, last, middle) | Very large PDFs where speed matters more than precision |
+| `Sample(n)` (default: `n = 8`) | Sample `n` evenly distributed pages (first, last, middle) | Very large PDFs where speed matters more than precision |
 | `Pages(vec)` | Only scan specific 1-indexed page numbers | When the caller knows which pages to check |
 
 ## Markdown output

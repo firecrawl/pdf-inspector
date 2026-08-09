@@ -344,6 +344,28 @@ fn test_detection_config_custom() {
     assert!((config.text_page_ratio_threshold - 0.8).abs() < 0.001);
 }
 
+#[test]
+fn test_detection_pages_rejects_no_in_range_pages() {
+    let buffer = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let error = pdf_inspector::detect_pdf_type_mem_with_config(
+        &buffer,
+        DetectionConfig {
+            strategy: ScanStrategy::Pages(vec![9999]),
+            ..DetectionConfig::default()
+        },
+    )
+    .expect_err("out-of-range page selection must fail");
+
+    assert!(
+        matches!(
+            error,
+            PdfError::InvalidOptions(ref message)
+                if message.contains("contains no in-range page numbers")
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
 // ============================================================================
 // PdfType Tests
 // ============================================================================

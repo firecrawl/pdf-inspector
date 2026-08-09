@@ -1,6 +1,6 @@
 use pdf_inspector::{
-    LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions, PdfProcessResult, PdfType,
-    ProcessMode,
+    DetectionConfig, LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions,
+    PdfProcessResult, PdfType, ProcessMode, ScanStrategy,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -10,11 +10,29 @@ const TYPESCRIPT_TYPES: &str = r#"
 export type PdfType = "TextBased" | "Scanned" | "ImageBased" | "Mixed";
 export type MarkdownProfile = "fidelity" | "compact";
 
-export interface ProcessOptions {
-  /** Restrict extraction to these 1-indexed page numbers. */
-  pages?: number[];
+export type ScanStrategy =
+  | "earlyExit"
+  | "full"
+  | { sample: number }
+  | { pages: number[] };
+
+export interface DetectionOptions {
+  /** Which pages detection inspects. Defaults to `{ sample: 8 }`. */
+  strategy?: ScanStrategy;
+  /** Minimum text operators required for a page to count as text-based. */
+  minTextOpsPerPage?: number;
+  /** Text-page ratio required for TextBased classification (0.0–1.0). */
+  textPageRatioThreshold?: number;
+}
+
+export interface DetectOptions extends DetectionOptions {
   /** Password for an encrypted PDF. */
   password?: string;
+}
+
+export interface ProcessOptions extends DetectOptions {
+  /** Restrict extraction to these 1-indexed page numbers. */
+  pages?: number[];
   /** Source-faithful output by default, or compact output for fewer tokens. */
   profile?: MarkdownProfile;
   /** Insert `<!-- Page N -->` markers between pages. */
@@ -60,8 +78,8 @@ export interface PdfClassification {
 }
 
 export function processPdf(data: Uint8Array, options?: ProcessOptions): PdfProcessResult;
-export function detectPdf(data: Uint8Array, options?: Pick<ProcessOptions, "password">): PdfProcessResult;
-export function classifyPdf(data: Uint8Array): PdfClassification;
+export function detectPdf(data: Uint8Array, options?: DetectOptions): PdfProcessResult;
+export function classifyPdf(data: Uint8Array, options?: DetectOptions): PdfClassification;
 export function extractText(data: Uint8Array): string;
 export function version(): string;
 "#;
@@ -69,11 +87,39 @@ export function version(): string;
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct WasmProcessOptions {
+    strategy: Option<WasmScanStrategy>,
+    min_text_ops_per_page: Option<u32>,
+    text_page_ratio_threshold: Option<f32>,
     pages: Option<Vec<u32>>,
     password: Option<String>,
     profile: Option<WasmMarkdownProfile>,
     include_page_markers: Option<bool>,
     include_images: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WasmScanStrategy {
+    Named(WasmNamedScanStrategy),
+    Sample(WasmSampleStrategy),
+    Pages(WasmPagesStrategy),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum WasmNamedScanStrategy {
+    EarlyExit,
+    Full,
+}
+
+#[derive(Debug, Deserialize)]
+struct WasmSampleStrategy {
+    sample: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct WasmPagesStrategy {
+    pages: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,16 +221,120 @@ fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     js_sys::Error::new(&format!("{context}: {error}")).into()
 }
 
-fn deserialize_options(value: JsValue) -> Result<WasmProcessOptions, JsValue> {
+fn validate_object_fields(
+    value: &JsValue,
+    allowed_fields: &[&str],
+    object_name: &str,
+) -> Result<(), JsValue> {
+    // serde-wasm-bindgen reads the fields named by the Rust struct but does
+    // not enumerate other JavaScript object keys, so Serde's
+    // deny_unknown_fields cannot catch them by itself.
+    value.dyn_ref::<js_sys::Object>().ok_or_else(|| {
+        js_error(
+            "invalid options",
+            format!("{object_name} must be an object"),
+        )
+    })?;
+
+    let keys = js_sys::Reflect::own_keys(value).map_err(|_| {
+        js_error(
+            "invalid options",
+            format!("could not inspect {object_name} fields"),
+        )
+    })?;
+    for key in keys.iter() {
+        let Some(key) = key.as_string() else {
+            return Err(js_error(
+                "invalid options",
+                format!("{object_name} fields must use string keys"),
+            ));
+        };
+        if !allowed_fields.contains(&key.as_str()) {
+            return Err(js_error(
+                "invalid options",
+                format!("unknown {object_name} field `{key}`"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_strategy_fields(value: &JsValue) -> Result<(), JsValue> {
+    if value.is_undefined() || value.is_null() || value.as_string().is_some() {
+        return Ok(());
+    }
+
+    value.dyn_ref::<js_sys::Object>().ok_or_else(|| {
+        js_error(
+            "invalid options",
+            "strategy must be \"earlyExit\", \"full\", { sample: number }, or { pages: number[] }",
+        )
+    })?;
+    let keys = js_sys::Reflect::own_keys(value)
+        .map_err(|_| js_error("invalid options", "could not inspect strategy fields"))?;
+    if keys.length() != 1 {
+        return Err(js_error(
+            "invalid options",
+            "strategy objects must contain exactly one of `sample` or `pages`",
+        ));
+    }
+
+    let key = keys
+        .get(0)
+        .as_string()
+        .ok_or_else(|| js_error("invalid options", "strategy fields must use string keys"))?;
+    if key != "sample" && key != "pages" {
+        return Err(js_error(
+            "invalid options",
+            format!("unknown strategy field `{key}`"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_option_fields(value: &JsValue, mode: &ProcessMode) -> Result<(), JsValue> {
+    const DETECTION_FIELDS: &[&str] = &[
+        "strategy",
+        "minTextOpsPerPage",
+        "textPageRatioThreshold",
+        "password",
+    ];
+    const PROCESS_FIELDS: &[&str] = &[
+        "strategy",
+        "minTextOpsPerPage",
+        "textPageRatioThreshold",
+        "password",
+        "pages",
+        "profile",
+        "includePageMarkers",
+        "includeImages",
+    ];
+
+    let allowed_fields = match mode {
+        ProcessMode::Full => PROCESS_FIELDS,
+        ProcessMode::DetectOnly => DETECTION_FIELDS,
+        ProcessMode::Analyze => PROCESS_FIELDS,
+    };
+    validate_object_fields(value, allowed_fields, "option")?;
+
+    let strategy = js_sys::Reflect::get(value, &JsValue::from_str("strategy"))
+        .map_err(|_| js_error("invalid options", "could not read `strategy`"))?;
+    validate_strategy_fields(&strategy)
+}
+
+fn deserialize_options(value: JsValue, mode: &ProcessMode) -> Result<WasmProcessOptions, JsValue> {
     if value.is_undefined() || value.is_null() {
         return Ok(WasmProcessOptions::default());
     }
 
+    validate_option_fields(&value, mode)?;
     serde_wasm_bindgen::from_value(value).map_err(|error| js_error("invalid options", error))
 }
 
 fn build_options(value: JsValue, mode: ProcessMode) -> Result<PdfOptions, JsValue> {
-    let options = deserialize_options(value)?;
+    let options = deserialize_options(value, &mode)?;
     if options
         .pages
         .as_ref()
@@ -196,7 +346,60 @@ fn build_options(value: JsValue, mode: ProcessMode) -> Result<PdfOptions, JsValu
         ));
     }
 
+    let mut detection = DetectionConfig::default();
+    if let Some(strategy) = options.strategy {
+        detection.strategy = match strategy {
+            WasmScanStrategy::Named(WasmNamedScanStrategy::EarlyExit) => ScanStrategy::EarlyExit,
+            WasmScanStrategy::Named(WasmNamedScanStrategy::Full) => ScanStrategy::Full,
+            WasmScanStrategy::Sample(WasmSampleStrategy { sample }) => {
+                if sample == 0 {
+                    return Err(js_error(
+                        "invalid options",
+                        "strategy.sample must be at least 1",
+                    ));
+                }
+                ScanStrategy::Sample(sample)
+            }
+            WasmScanStrategy::Pages(WasmPagesStrategy { pages }) => {
+                if pages.is_empty() {
+                    return Err(js_error(
+                        "invalid options",
+                        "strategy.pages must not be empty",
+                    ));
+                }
+                if pages.contains(&0) {
+                    return Err(js_error(
+                        "invalid options",
+                        "strategy.pages are 1-indexed; page 0 is invalid",
+                    ));
+                }
+                ScanStrategy::Pages(pages)
+            }
+        };
+    }
+    if let Some(min_text_ops_per_page) = options.min_text_ops_per_page {
+        if min_text_ops_per_page == 0 {
+            return Err(js_error(
+                "invalid options",
+                "minTextOpsPerPage must be at least 1",
+            ));
+        }
+        detection.min_text_ops_per_page = min_text_ops_per_page;
+    }
+    if let Some(text_page_ratio_threshold) = options.text_page_ratio_threshold {
+        if !text_page_ratio_threshold.is_finite()
+            || !(0.0..=1.0).contains(&text_page_ratio_threshold)
+        {
+            return Err(js_error(
+                "invalid options",
+                "textPageRatioThreshold must be between 0.0 and 1.0",
+            ));
+        }
+        detection.text_page_ratio_threshold = text_page_ratio_threshold;
+    }
+
     let mut result = PdfOptions::new().mode(mode);
+    result = result.detection(detection);
     if let Some(pages) = options.pages {
         result = result.pages(pages);
     }
@@ -252,14 +455,19 @@ pub fn detect_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
 
 /// Return the lightweight classification shape used by the native Node API.
 #[wasm_bindgen(js_name = classifyPdf, skip_typescript)]
-pub fn classify_pdf(data: &[u8]) -> Result<JsValue, JsValue> {
+pub fn classify_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
     initialize();
-    let result =
-        pdf_inspector::classify_pdf_mem(data).map_err(|error| js_error("classify PDF", error))?;
+    let options = build_options(options, ProcessMode::DetectOnly)?;
+    let result = pdf_inspector::process_pdf_mem_with_options(data, options)
+        .map_err(|error| js_error("classify PDF", error))?;
     serialize(&WasmPdfClassification {
         pdf_type: pdf_type_name(result.pdf_type),
         page_count: result.page_count,
-        pages_needing_ocr: result.pages_needing_ocr,
+        pages_needing_ocr: result
+            .pages_needing_ocr
+            .into_iter()
+            .map(|page| page - 1)
+            .collect(),
         confidence: result.confidence as f64,
     })
 }
@@ -294,6 +502,33 @@ mod tests {
 
     const TEXT_PDF: &[u8] = include_bytes!("../../tests/fixtures/thermo-freon12.pdf");
     const ENCRYPTED_PDF: &[u8] = include_bytes!("../../tests/fixtures/encrypted-secret123.pdf");
+
+    fn string_property(value: &JsValue, name: &str) -> String {
+        Reflect::get(value, &JsValue::from_str(name))
+            .unwrap_or_else(|_| panic!("read {name}"))
+            .as_string()
+            .unwrap_or_else(|| panic!("{name} string"))
+    }
+
+    fn error_message(error: &JsValue) -> String {
+        Reflect::get(error, &JsValue::from_str("message"))
+            .expect("read error message")
+            .as_string()
+            .expect("error message string")
+    }
+
+    fn define_non_enumerable_property(object: &js_sys::Object, name: &str, value: &JsValue) {
+        let descriptor = js_sys::Object::new();
+        Reflect::set(&descriptor, &JsValue::from_str("value"), value)
+            .expect("set descriptor value");
+        Reflect::set(
+            &descriptor,
+            &JsValue::from_str("enumerable"),
+            &JsValue::FALSE,
+        )
+        .expect("set descriptor enumerable");
+        js_sys::Object::define_property(object, &JsValue::from_str(name), &descriptor);
+    }
 
     fn synthetic_korea1_pdf() -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
@@ -377,13 +612,120 @@ mod tests {
         pdf
     }
 
+    /// A 20-page document where the eight pages selected by the default
+    /// Sample(8) strategy are text, while every other page is image-backed.
+    fn synthetic_heterogeneous_pdf() -> Vec<u8> {
+        const PAGE_COUNT: usize = 20;
+        const TEXT_CONTENT_ID: usize = 23;
+        const IMAGE_CONTENT_ID: usize = 24;
+        const FONT_ID: usize = 25;
+        const IMAGE_ID: usize = 26;
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = vec![0usize];
+
+        fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body.as_bytes());
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            1,
+            "<< /Type /Catalog /Pages 2 0 R >>",
+        );
+        let kids = (3..3 + PAGE_COUNT)
+            .map(|id| format!("{id} 0 R"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            2,
+            &format!("<< /Type /Pages /Kids [{kids}] /Count {PAGE_COUNT} >>"),
+        );
+
+        // distribute_pages(8, 20) selects exactly these page numbers.
+        let default_sample = [1usize, 3, 5, 7, 9, 11, 13, 20];
+        for page in 1..=PAGE_COUNT {
+            let page_id = page + 2;
+            let body = if default_sample.contains(&page) {
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                     /Resources << /Font << /F1 {FONT_ID} 0 R >> >> \
+                     /Contents {TEXT_CONTENT_ID} 0 R >>"
+                )
+            } else {
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                     /Resources << /XObject << /Im0 {IMAGE_ID} 0 R >> >> \
+                     /Contents {IMAGE_CONTENT_ID} 0 R >>"
+                )
+            };
+            add_object(&mut pdf, &mut offsets, page_id, &body);
+        }
+
+        let text_content =
+            "BT /F1 12 Tf 10 100 Td (Hello World) Tj (More Text) Tj (Sample Page) Tj ET";
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            TEXT_CONTENT_ID,
+            &format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                text_content.len(),
+                text_content
+            ),
+        );
+        let image_content = "/Im0 Do";
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            IMAGE_CONTENT_ID,
+            &format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                image_content.len(),
+                image_content
+            ),
+        );
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            FONT_ID,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        );
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            IMAGE_ID,
+            "<< /Type /XObject /Subtype /Image /Width 1000 /Height 1000 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n0\nendstream",
+        );
+
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+                offsets.len(),
+                xref_start
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
     #[wasm_bindgen_test]
     fn processes_pdf_to_markdown() {
         let result = process_pdf(TEXT_PDF, JsValue::UNDEFINED).expect("process PDF");
-        let pdf_type = Reflect::get(&result, &JsValue::from_str("pdfType"))
-            .expect("pdfType")
-            .as_string()
-            .expect("pdfType string");
+        let pdf_type = string_property(&result, "pdfType");
         let markdown = Reflect::get(&result, &JsValue::from_str("markdown"))
             .expect("markdown")
             .as_string()
@@ -400,11 +742,8 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn classifies_and_extracts_plain_text() {
-        let classification = classify_pdf(TEXT_PDF).expect("classify PDF");
-        let pdf_type = Reflect::get(&classification, &JsValue::from_str("pdfType"))
-            .expect("pdfType")
-            .as_string()
-            .expect("pdfType string");
+        let classification = classify_pdf(TEXT_PDF, JsValue::UNDEFINED).expect("classify PDF");
+        let pdf_type = string_property(&classification, "pdfType");
         let text = extract_text(TEXT_PDF).expect("extract text");
 
         assert_eq!(pdf_type, "TextBased");
@@ -436,5 +775,135 @@ mod tests {
             .expect("markdown string");
 
         assert!(!markdown.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn full_strategy_scans_pages_missed_by_default_sample() {
+        let pdf = synthetic_heterogeneous_pdf();
+        let sampled = detect_pdf(&pdf, JsValue::UNDEFINED).expect("sampled detection");
+        assert_eq!(string_property(&sampled, "pdfType"), "TextBased");
+
+        let options = js_sys::Object::new();
+        Reflect::set(
+            &options,
+            &JsValue::from_str("strategy"),
+            &JsValue::from_str("full"),
+        )
+        .expect("set full strategy");
+
+        let full = detect_pdf(&pdf, options.clone().into()).expect("full detection");
+        assert_eq!(string_property(&full, "pdfType"), "Mixed");
+
+        let classification = classify_pdf(&pdf, options.into()).expect("full classification");
+        assert_eq!(string_property(&classification, "pdfType"), "Mixed");
+        let pages = js_sys::Array::from(
+            &Reflect::get(&classification, &JsValue::from_str("pagesNeedingOcr"))
+                .expect("pagesNeedingOcr"),
+        );
+        assert!(
+            pages.includes(&JsValue::from_f64(1.0), 0),
+            "classifyPdf should report image-backed page 2 as zero-indexed page 1"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn accepts_every_scan_strategy_variant() {
+        let sample = js_sys::Object::new();
+        Reflect::set(
+            &sample,
+            &JsValue::from_str("sample"),
+            &JsValue::from_f64(1.0),
+        )
+        .expect("set sample count");
+
+        let pages = js_sys::Object::new();
+        Reflect::set(
+            &pages,
+            &JsValue::from_str("pages"),
+            &js_sys::Array::of1(&JsValue::from_f64(1.0)),
+        )
+        .expect("set strategy pages");
+
+        for strategy in [
+            JsValue::from_str("earlyExit"),
+            JsValue::from_str("full"),
+            sample.into(),
+            pages.into(),
+        ] {
+            let options = js_sys::Object::new();
+            Reflect::set(&options, &JsValue::from_str("strategy"), &strategy)
+                .expect("set strategy");
+            detect_pdf(TEXT_PDF, options.into()).expect("supported strategy");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn rejects_unknown_and_unsupported_detection_options() {
+        let unknown = js_sys::Object::new();
+        Reflect::set(&unknown, &JsValue::from_str("fullScan"), &JsValue::TRUE)
+            .expect("set unknown option");
+        let error = detect_pdf(TEXT_PDF, unknown.into()).expect_err("unknown option must fail");
+        assert!(error_message(&error).contains("unknown option field `fullScan`"));
+
+        let hidden = js_sys::Object::new();
+        define_non_enumerable_property(&hidden, "hiddenOption", &JsValue::TRUE);
+        let error =
+            detect_pdf(TEXT_PDF, hidden.into()).expect_err("non-enumerable option must fail");
+        assert!(error_message(&error).contains("unknown option field `hiddenOption`"));
+
+        let symbol_keyed = js_sys::Object::new();
+        Reflect::set(
+            &symbol_keyed,
+            &js_sys::Symbol::for_("unsupportedOption").into(),
+            &JsValue::TRUE,
+        )
+        .expect("set symbol option");
+        let error = detect_pdf(TEXT_PDF, symbol_keyed.into()).expect_err("symbol option must fail");
+        assert!(error_message(&error).contains("option fields must use string keys"));
+
+        let process_only = js_sys::Object::new();
+        Reflect::set(
+            &process_only,
+            &JsValue::from_str("profile"),
+            &JsValue::from_str("compact"),
+        )
+        .expect("set process-only option");
+        let error = detect_pdf(TEXT_PDF, process_only.into())
+            .expect_err("unsupported detection option must fail");
+        assert!(error_message(&error).contains("unknown option field `profile`"));
+
+        let malformed_strategy = js_sys::Object::new();
+        Reflect::set(
+            &malformed_strategy,
+            &JsValue::from_str("sample"),
+            &JsValue::from_f64(8.0),
+        )
+        .expect("set sample");
+        define_non_enumerable_property(&malformed_strategy, "hiddenTypo", &JsValue::TRUE);
+        let options = js_sys::Object::new();
+        Reflect::set(
+            &options,
+            &JsValue::from_str("strategy"),
+            &malformed_strategy,
+        )
+        .expect("set malformed strategy");
+        let error = detect_pdf(TEXT_PDF, options.into()).expect_err("malformed strategy must fail");
+        assert!(error_message(&error).contains("exactly one of `sample` or `pages`"));
+    }
+
+    #[wasm_bindgen_test]
+    fn rejects_strategy_pages_when_none_are_in_range() {
+        let pages = js_sys::Object::new();
+        Reflect::set(
+            &pages,
+            &JsValue::from_str("pages"),
+            &js_sys::Array::of1(&JsValue::from_f64(9999.0)),
+        )
+        .expect("set out-of-range pages");
+        let options = js_sys::Object::new();
+        Reflect::set(&options, &JsValue::from_str("strategy"), &pages).expect("set pages strategy");
+
+        let error = detect_pdf(TEXT_PDF, options.into()).expect_err("out-of-range pages must fail");
+        assert!(error_message(&error).contains("contains no in-range page numbers"));
     }
 }

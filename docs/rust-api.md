@@ -182,4 +182,4 @@ Low-level detection functions are also available via the `detector` module (`det
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
-| `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |
+| `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidOptions`, `InvalidStructure`, `NotAPdf` |
