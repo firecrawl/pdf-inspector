@@ -3553,6 +3553,7 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
     let mut candidates = Vec::new();
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
+    add_repair_candidate(&mut candidates, truncate_after_last_eof_marker(buf), buf);
     add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
 
     let stripped = strip_leading_pdf_container_bytes(buf);
@@ -3561,6 +3562,11 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
         add_repair_candidate(
             &mut candidates,
             append_missing_eof_marker(stripped_buf),
+            buf,
+        );
+        add_repair_candidate(
+            &mut candidates,
+            truncate_after_last_eof_marker(stripped_buf),
             buf,
         );
         add_repair_candidate(
@@ -3709,6 +3715,32 @@ fn append_missing_eof_marker(buf: &[u8]) -> Option<Vec<u8>> {
 fn contains_recent_eof_marker(buf: &[u8]) -> bool {
     let start = buf.len().saturating_sub(1024);
     buf[start..].windows(b"%%EOF".len()).any(|w| w == b"%%EOF")
+}
+
+/// Some producers pad the file after the final `%%EOF` — iTextSharp 4.1.2
+/// emits tens of kilobytes of NULs (issue #301). lopdf only scans the last
+/// 512 bytes for the marker, so past ~506 bytes of padding it never finds
+/// the trailer and the load fails outright, while pypdf/pdfium read the
+/// same file fine. Dropping everything after the last `%%EOF` line restores
+/// the tail the producer wrote, whatever the cross-reference flavor —
+/// unlike `recover_startxref_pointer`, which can re-point classic tables
+/// but has no way to recover a PDF 1.5+ cross-reference *stream*.
+fn truncate_after_last_eof_marker(buf: &[u8]) -> Option<Vec<u8>> {
+    const MARKER: &[u8] = b"%%EOF";
+    let eof = buf.windows(MARKER.len()).rposition(|w| w == MARKER)?;
+    let mut end = eof + MARKER.len();
+    // Keep the marker's own end-of-line so the file still terminates with a
+    // conventional `%%EOF` line.
+    if buf.get(end) == Some(&b'\r') {
+        end += 1;
+    }
+    if buf.get(end) == Some(&b'\n') {
+        end += 1;
+    }
+    if end == buf.len() {
+        return None;
+    }
+    Some(buf[..end].to_vec())
 }
 
 fn strip_leading_pdf_container_bytes(buf: &[u8]) -> Option<Vec<u8>> {
@@ -7261,5 +7293,40 @@ mod tests {
     fn recover_startxref_pointer_returns_none_without_a_valid_table() {
         let buf = b"Please refer to the xref appendix for details.";
         assert!(recover_startxref_pointer(buf).is_none());
+    }
+
+    #[test]
+    fn truncate_after_eof_drops_trailing_padding() {
+        // NUL padding (the iTextSharp shape from #301) and space padding
+        // both truncate back to the `%%EOF` line, keeping its newline.
+        for pad in [&b"\x00"[..], b" "] {
+            let buf = [b"body\nstartxref\n9\n%%EOF\n".as_slice(), &pad.repeat(507)].concat();
+            let repaired = truncate_after_last_eof_marker(&buf).expect("padding should truncate");
+            assert_eq!(repaired, b"body\nstartxref\n9\n%%EOF\n");
+        }
+    }
+
+    #[test]
+    fn truncate_after_eof_keeps_crlf_and_marker_without_eol() {
+        let repaired = truncate_after_last_eof_marker(b"%%EOF\r\n\x00\x00").unwrap();
+        assert_eq!(repaired, b"%%EOF\r\n");
+        // A marker with no end-of-line at all still anchors the cut.
+        let repaired = truncate_after_last_eof_marker(b"%%EOF\x00\x00").unwrap();
+        assert_eq!(repaired, b"%%EOF");
+    }
+
+    #[test]
+    fn truncate_after_eof_cuts_at_the_last_marker() {
+        // Incremental updates carry earlier `%%EOF` lines; only bytes after
+        // the final one are padding.
+        let buf = b"rev1\n%%EOF\nrev2\n%%EOF\n\x00\x00\x00";
+        let repaired = truncate_after_last_eof_marker(buf).unwrap();
+        assert_eq!(repaired, b"rev1\n%%EOF\nrev2\n%%EOF\n");
+    }
+
+    #[test]
+    fn truncate_after_eof_is_a_noop_on_clean_or_markerless_buffers() {
+        assert!(truncate_after_last_eof_marker(b"body\n%%EOF\n").is_none());
+        assert!(truncate_after_last_eof_marker(b"no marker here\x00\x00").is_none());
     }
 }

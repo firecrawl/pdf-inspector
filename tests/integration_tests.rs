@@ -267,6 +267,68 @@ fn truncate_eof_marker(mut pdf: Vec<u8>) -> Vec<u8> {
     pdf
 }
 
+/// Like `make_text_pdf`, but indexed by a PDF 1.5 cross-reference *stream*
+/// (uncompressed, `/W [1 2 2]`) instead of a classic `xref` table — the
+/// shape `recover_startxref_pointer` explicitly cannot rebuild.
+fn make_xref_stream_pdf(content: &str) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets: Vec<usize> = Vec::new();
+
+    let mut add_object = |pdf: &mut Vec<u8>, id: usize, body: &[u8]| {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    };
+
+    add_object(&mut pdf, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+    add_object(&mut pdf, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    add_object(
+        &mut pdf,
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        4,
+        format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        )
+        .as_bytes(),
+    );
+    add_object(
+        &mut pdf,
+        5,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_pos = pdf.len();
+    // One entry per object 0..=6: type byte, 2-byte offset, 2-byte gen.
+    let mut entries: Vec<u8> = vec![0, 0, 0, 0xFF, 0xFF];
+    for &off in &offsets {
+        entries.push(1);
+        entries.extend_from_slice(&u16::try_from(off).unwrap().to_be_bytes());
+        entries.extend_from_slice(&[0, 0]);
+    }
+    entries.push(1);
+    entries.extend_from_slice(&u16::try_from(xref_pos).unwrap().to_be_bytes());
+    entries.extend_from_slice(&[0, 0]);
+
+    pdf.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 7 /W [1 2 2] /Root 1 0 R /Length {} >>\nstream\n",
+            entries.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&entries);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    pdf.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF\n").as_bytes());
+    pdf
+}
+
 fn add_leading_tab(mut pdf: Vec<u8>) -> Vec<u8> {
     pdf.insert(0, b'\t');
     pdf
@@ -4017,6 +4079,37 @@ fn test_process_pdf_recovers_corrupted_startxref_pointer() {
         md.contains("Order Detail Report by Account") && md.contains("WIDGET ASSEMBLY"),
         "recovered document should extract its real text, got: {md:?}"
     );
+}
+
+/// Regression for #301 case A: some producers pad the file after `%%EOF`
+/// (the reported file carried 80,508 NULs from iTextSharp 4.1.2). lopdf
+/// scans only the last 512 bytes for the marker, so the load fails outright
+/// while pypdf, pdftotext and browsers all read the file. The container
+/// repair must drop the padding — including for PDFs indexed by a
+/// cross-reference stream, which `recover_startxref_pointer` cannot rebuild.
+#[test]
+fn test_process_pdf_recovers_trailing_bytes_after_eof() {
+    let classic = make_minimal_text_pdf();
+    let xref_stream = make_xref_stream_pdf("BT /F1 12 Tf 100 700 Td (Hello World) Tj ET");
+    // Unpadded control: the cross-reference-stream fixture must be valid.
+    let control = process_pdf_mem(&xref_stream).expect("xref-stream fixture should parse as-is");
+    assert!(control.markdown.unwrap_or_default().contains("Hello World"));
+
+    for (label, base) in [("classic xref", &classic), ("xref stream", &xref_stream)] {
+        for (padding, len) in [("NULs", 80_508), ("spaces", 507)] {
+            let byte = if padding == "NULs" { 0x00 } else { b' ' };
+            let padded = [base.as_slice(), &vec![byte; len]].concat();
+            let result = process_pdf_mem(&padded).unwrap_or_else(|e| {
+                panic!("{label} + {len} trailing {padding} should be recoverable: {e:?}")
+            });
+            assert_eq!(result.page_count, 1, "{label} + {padding}");
+            let md = result.markdown.unwrap_or_default();
+            assert!(
+                md.contains("Hello World"),
+                "{label} + {padding}: recovered document should extract its text, got: {md:?}"
+            );
+        }
+    }
 }
 
 /// Regression for #227: `extract_pages_markdown`'s per-page `needs_ocr`
