@@ -241,7 +241,7 @@ pub(crate) fn extract_page_text_items(
     let xobjects = get_page_xobjects(doc, page_id);
 
     // Get content
-    let content_data = crate::safe_decompress::get_page_content_capped(doc, page_id);
+    let content_data = crate::safe_decompress::get_page_content_capped(doc, page_id, page_num)?;
 
     // Strip PDF comments (% to end of line) from the content stream.
     // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's

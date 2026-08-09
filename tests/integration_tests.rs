@@ -4075,3 +4075,26 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         page.markdown
     );
 }
+
+/// Regression for a maintainer review finding on PR #221: a content stream
+/// that exceeds the decompression-bomb cap must fail closed with a typed
+/// `PdfError::ResourceLimit`, not silently degrade to empty/partial
+/// markdown that looks like a successful extraction. Fixture is a page
+/// whose single content stream decompresses to ~70 MiB (past the 64 MiB
+/// per-stream cap) but compresses to ~70 KiB on disk (all zero bytes).
+#[test]
+fn oversized_content_stream_fails_closed_with_resource_limit_error() {
+    let result = process_pdf_with_options(
+        "tests/fixtures/oversized_content_stream.pdf",
+        PdfOptions::new(),
+    );
+    match result {
+        Err(PdfError::ResourceLimit { page, .. }) => {
+            assert_eq!(page, 1, "expected the error to name page 1");
+        }
+        other => panic!(
+            "expected Err(PdfError::ResourceLimit), got {other:?} — an oversized \
+             content stream must not silently succeed with partial/empty markdown"
+        ),
+    }
+}

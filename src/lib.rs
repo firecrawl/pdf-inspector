@@ -5937,6 +5937,21 @@ pub enum PdfError {
     InvalidStructure,
     #[error("Not a PDF: {0}")]
     NotAPdf(String),
+    /// A decompressed stream (or a page's combined content streams)
+    /// exceeded the bounded-decompression size limit — see
+    /// `safe_decompress::MAX_DECOMPRESSED_STREAM_BYTES` /
+    /// `MAX_PAGE_CONTENT_BYTES`. Surfaced instead of silently returning
+    /// partial/truncated content, so a caller can't mistake an
+    /// incomplete result for a successful extraction.
+    #[error(
+        "resource limit exceeded on page {page}, object {object_id:?}: {resource} exceeds {limit_bytes} bytes"
+    )]
+    ResourceLimit {
+        page: u32,
+        object_id: lopdf::ObjectId,
+        resource: String,
+        limit_bytes: usize,
+    },
 }
 
 impl From<lopdf::Error> for PdfError {
