@@ -1153,11 +1153,15 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     // as often follows a closing bracket or quote, as in
                     // `POCP (“smog”)` + `3)`. Digits stay excluded either way:
                     // appending to one corrupts the value ("33" + "1" in "33 1/3%").
-                    // `%` closes a value the way a bracket closes a phrase, so a
-                    // marker after a rate absorbs without the digit hazard above.
+                    // `%` closes a value the way a bracket closes a phrase, but it
+                    // only anchors a *raised* glyph: nothing subscripts onto a rate,
+                    // so a level neighbour is a separate small numeric cell and
+                    // absorbing it would eat that value.
+                    let raised = item.y > parent.y + parent.font_size * 0.1;
                     let ends_absorbable = parent.text.chars().last().is_some_and(|c| {
                         c.is_alphabetic()
-                            || matches!(c, ')' | ']' | '}' | '”' | '"' | '\'' | '»' | '%')
+                            || matches!(c, ')' | ']' | '}' | '”' | '"' | '\'' | '»')
+                            || (c == '%' && raised)
                     });
                     // Strikeout boundaries block the merge (a struck word
                     // must not extend its strike over a live footnote digit,
@@ -1186,7 +1190,6 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                             // unaffected. Direction from the baseline offset
                             // (y-up here): raised → superscript (footnote
                             // refs), lowered/level → subscript (chemistry).
-                            let raised = item.y > parent.y + parent.font_size * 0.1;
                             parent.text.push_str(&map_script_digits(&item.text, raised));
                             parent.width = (item.x + item.width) - parent.x;
                             continue;
@@ -1200,7 +1203,6 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                         // corrupts the value there.
                         if item.x > parent.x && item.x < parent_right {
                             if let Some(offset) = skipped_glyph_blank(parent, item.x) {
-                                let raised = item.y > parent.y + parent.font_size * 0.1;
                                 parent
                                     .text
                                     .replace_range(offset..offset + 1, &map_script_digits(&item.text, raised));
@@ -1472,6 +1474,20 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "24.99%¹)");
+    }
+
+    #[test]
+    fn test_level_number_after_percentage_stays_separate() {
+        // Nothing subscripts onto a rate, so a small number sharing the baseline is
+        // a neighbouring cell rather than a marker. Absorbing it would eat a value.
+        let parent = make_merge_item("24.99%", 100.0, 34.0);
+        let mut level = make_script_item("2", 134.0, 700.0);
+        level.y = 700.0;
+        let merged = merge_subscript_items(vec![parent, level]);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "24.99%");
+        assert_eq!(merged[1].text, "2");
     }
 
     #[test]
