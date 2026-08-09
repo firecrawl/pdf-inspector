@@ -4098,3 +4098,37 @@ fn oversized_content_stream_fails_closed_with_resource_limit_error() {
         ),
     }
 }
+
+/// Regression for a bot review finding on PR #221: `process_document`'s
+/// "Mixed PDFs: extraction failure is non-fatal" fallback (`extracted.ok()`)
+/// discarded any error from extraction — including `PdfError::ResourceLimit`
+/// — treating a decompression-bomb-cap trip the same as a soft failure like
+/// garbled text. That let a Mixed-type page (real text + a large template
+/// image) with an oversized content stream silently succeed with partial
+/// markdown instead of failing closed. Fixture has real text (so it's not
+/// Scanned) plus a large declared-only image (so it classifies as Mixed)
+/// plus an oversized third content stream.
+#[test]
+fn mixed_pdf_with_oversized_content_stream_fails_closed() {
+    let cls = pdf_inspector::detector::detect_pdf_type_mem(
+        &std::fs::read("tests/fixtures/mixed_oversized_content_stream.pdf").unwrap(),
+    )
+    .expect("fixture should classify");
+    assert_eq!(
+        cls.pdf_type,
+        PdfType::Mixed,
+        "fixture must classify as Mixed to exercise the code path this test targets"
+    );
+
+    let result = process_pdf_with_options(
+        "tests/fixtures/mixed_oversized_content_stream.pdf",
+        PdfOptions::new(),
+    );
+    match result {
+        Err(PdfError::ResourceLimit { .. }) => {}
+        other => panic!(
+            "expected Err(PdfError::ResourceLimit), got {other:?} — a Mixed-type page's \
+             resource-limit failure must not be swallowed by the non-fatal-extraction fallback"
+        ),
+    }
+}
