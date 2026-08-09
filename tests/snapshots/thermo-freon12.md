@@ -34,10 +34,8 @@ kilograms per cubic meter
 |Boiling Point At one atmosphere|-29.75°C|
 |Critical Temperature|111.97°C|
 |Critical Pressure|4136 kPa|
-|Critical Density|565.0 kg/m|
-|Critical Volume|0.0018 m|
-
-/kg
+|Critical Density|565.0 kg/m³|
+|Critical Volume|0.0018 m³/kg|
 
 l
 
