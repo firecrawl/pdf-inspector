@@ -51,6 +51,9 @@ pub struct PyPdfResult {
     /// Whether encoding issues were detected.
     #[pyo3(get)]
     pub has_encoding_issues: bool,
+    /// Uniqueness ratio of line n-grams (0.0-1.0), or None if not computed.
+    #[pyo3(get)]
+    pub distinct_n: Option<f32>,
 }
 
 #[pymethods]
@@ -313,6 +316,7 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        distinct_n: r.distinct_n,
     }
 }
 

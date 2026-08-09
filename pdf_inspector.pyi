@@ -19,6 +19,7 @@ class PdfResult:
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool
+    distinct_n: Optional[float]
 
 class PageOcrReasons:
     """OCR reasons for a single 1-indexed page."""

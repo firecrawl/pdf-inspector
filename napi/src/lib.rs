@@ -48,6 +48,7 @@ pub struct PdfResult {
     pub pages_with_tables: Vec<u32>,
     pub pages_with_columns: Vec<u32>,
     pub has_encoding_issues: bool,
+    pub distinct_n: Option<f64>,
 }
 
 /// OCR reasons for a single 1-indexed page.
@@ -150,6 +151,7 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        distinct_n: r.distinct_n.map(|v| v as f64),
     }
 }
 
