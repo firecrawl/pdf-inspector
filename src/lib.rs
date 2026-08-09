@@ -3725,9 +3725,20 @@ fn contains_recent_eof_marker(buf: &[u8]) -> bool {
 /// the tail the producer wrote, whatever the cross-reference flavor —
 /// unlike `recover_startxref_pointer`, which can re-point classic tables
 /// but has no way to recover a PDF 1.5+ cross-reference *stream*.
+///
+/// Only markers that begin a line count — the shape the real trailer line
+/// always takes — so a stray `%%EOF` inside the padding cannot anchor the
+/// cut and hide the producer's actual trailer.
 fn truncate_after_last_eof_marker(buf: &[u8]) -> Option<Vec<u8>> {
     const MARKER: &[u8] = b"%%EOF";
-    let eof = buf.windows(MARKER.len()).rposition(|w| w == MARKER)?;
+    let eof = buf
+        .windows(MARKER.len())
+        .enumerate()
+        .rev()
+        .find_map(|(offset, w)| {
+            (w == MARKER && (offset == 0 || matches!(buf[offset - 1], b'\r' | b'\n')))
+                .then_some(offset)
+        })?;
     let mut end = eof + MARKER.len();
     // Keep the marker's own end-of-line so the file still terminates with a
     // conventional `%%EOF` line.
@@ -7322,6 +7333,20 @@ mod tests {
         let buf = b"rev1\n%%EOF\nrev2\n%%EOF\n\x00\x00\x00";
         let repaired = truncate_after_last_eof_marker(buf).unwrap();
         assert_eq!(repaired, b"rev1\n%%EOF\nrev2\n%%EOF\n");
+    }
+
+    #[test]
+    fn truncate_after_eof_ignores_markers_that_do_not_begin_a_line() {
+        // A stray `%%EOF` inside the padding must not anchor the cut; the
+        // producer's real trailer line is the last marker at a line start.
+        let buf = b"body\nstartxref\n9\n%%EOF\njunk %%EOF junk\x00\x00";
+        let repaired = truncate_after_last_eof_marker(buf).unwrap();
+        assert_eq!(repaired, b"body\nstartxref\n9\n%%EOF\n");
+        // Padding made entirely of mid-line markers leaves no valid anchor
+        // beyond the real one.
+        let buf = b"%%EOF\r\nsee %%EOF for details";
+        let repaired = truncate_after_last_eof_marker(buf).unwrap();
+        assert_eq!(repaired, b"%%EOF\r\n");
     }
 
     #[test]
