@@ -60,7 +60,7 @@ result = PdfInspector.extract_text_in_regions("document.pdf", [
   { page: 0, regions: [[0, 0, 300, 400], [300, 0, 612, 400]] } # [x1, y1, x2, y2] in PDF points, top-left origin
 ])
 result[0].regions.each do |region|
-  region.needs_ocr ? nil : puts(region.text)
+  puts(region.text) unless region.needs_ocr
 end
 
 # Per-page markdown, plus layout metadata
