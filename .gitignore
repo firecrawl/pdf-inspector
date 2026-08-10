@@ -46,5 +46,5 @@ __pycache__/
 
 # Ruby
 /ruby/ext/pdf_inspector_native/target
-/ruby/tmp/arm64-darwin25
+/ruby/tmp/
 /ruby/Gemfile.lock
