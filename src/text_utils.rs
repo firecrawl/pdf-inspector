@@ -139,7 +139,13 @@ where
             }
         }
     }
-    rtl > 0 && rtl > ltr
+    // A plain majority let one embedded Latin token decide the line. On a CV
+    // contact line — Hebrew role and city next to `israel@example.com` — the
+    // address alone matched the Hebrew letter for letter, the tie fell to LTR,
+    // and the whole line was ordered backwards. Latin now has to outweigh the
+    // RTL text twice over before the line counts as left-to-right, which is
+    // what an actually Latin line does.
+    rtl > 0 && rtl.saturating_mul(2) >= ltr
 }
 
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
@@ -193,8 +199,8 @@ pub fn is_italic_font(font_name: &str) -> bool {
 /// Expand Unicode ligature characters to their component characters.
 /// This makes extracted text more searchable and semantically correct.
 /// Also applies NFKC normalization (converts Arabic presentation forms to base
-/// characters, decomposes Latin ligatures, etc.) and reverses visual-order
-/// Arabic text back to logical order when presentation forms are detected.
+/// characters, decomposes Latin ligatures, etc.) and restores logical order for
+/// RTL text, which a single text-showing operator has to store visually.
 pub(crate) fn expand_ligatures(text: &str) -> String {
     // Strip null bytes and other control characters (except newline/tab)
     let text = if text
@@ -249,22 +255,46 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
         }
     }
 
-    // If the original text had Arabic presentation forms, the characters are in
-    // visual (LTR screen) order. After NFKC normalization, reverse to restore
-    // logical reading order.
-    if had_presentation_forms {
-        result = reverse_visual_arabic(&result);
+    // Restore logical reading order for RTL text stored visually.
+    //
+    // This function only ever sees the text of a single text-showing operator
+    // (Tj/TJ/'/"), and within one such run the pen advances left to right by
+    // each glyph's width. A multi-glyph RTL run therefore has to be stored in
+    // visual order for the page to render correctly — there is no other way to
+    // lay it out with a single advancing run. So the order is not a guess about
+    // the producer: it follows from how PDF places text.
+    //
+    // The exception is a producer that emits logical order in one run; such a
+    // file renders mirrored in every viewer, and matching it would mean
+    // breaking the files that render correctly.
+    //
+    // Arabic presentation forms took this path already; Hebrew never has them,
+    // which is why it came out reversed word by word.
+    if had_presentation_forms || is_visual_rtl_run(&result) {
+        result = reverse_visual_rtl(&result);
     }
 
     result
 }
 
-/// Reverse visual-order Arabic text to logical order.
+/// Whether this run is RTL text that needs reordering.
+///
+/// Two or more RTL characters: a single one reverses to itself, and demanding
+/// a pair keeps stray marks — a lone maqaf or geresh between Latin words — from
+/// dragging the whole run through the reordering.
+fn is_visual_rtl_run(text: &str) -> bool {
+    text.chars().filter(|&c| is_rtl_char(c)).nth(1).is_some()
+}
+
+/// Reverse visual-order RTL text to logical order.
 ///
 /// Pure RTL text (no ASCII alphanumerics) gets a simple character reversal.
 /// Mixed content (embedded numbers or Latin words) splits into LTR and non-LTR
 /// runs: run order is reversed, and only non-LTR runs are reversed internally.
-fn reverse_visual_arabic(text: &str) -> String {
+///
+/// Script-agnostic: the split is on ASCII alphanumerics, so Hebrew, Arabic,
+/// Syriac and the rest all take the same path.
+fn reverse_visual_rtl(text: &str) -> String {
     // Check if there are any LTR runs (ASCII letters or digits)
     let has_ltr = text.chars().any(|c| c.is_ascii_alphanumeric());
 
@@ -915,11 +945,36 @@ mod tests {
     }
 
     #[test]
-    fn no_reversal_for_base_arabic() {
-        // Base Arabic already in logical order — no presentation forms means no reversal
-        let input = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"; // مرحبا
-        let result = expand_ligatures(input);
-        assert_eq!(result, input, "base Arabic should pass through unchanged");
+    fn base_arabic_is_reordered_from_visual_order() {
+        // Superseded `no_reversal_for_base_arabic`, which assumed base Arabic
+        // arrives in logical order. It does not: absence of presentation forms
+        // says nothing about order, only that the producer wrote base
+        // codepoints. LibreOffice, mPDF and iTextSharp all do exactly that.
+        let logical = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"; // مرحبا
+        let visual: String = logical.chars().rev().collect();
+        assert_eq!(expand_ligatures(&visual), logical);
+    }
+
+    #[test]
+    fn hebrew_is_reordered_from_visual_order() {
+        // Hebrew never carries presentation forms, so it took no reordering
+        // path at all and every word came out backwards.
+        let logical = "שלום עולם";
+        let visual: String = logical.chars().rev().collect();
+        assert_eq!(expand_ligatures(&visual), logical);
+    }
+
+    #[test]
+    fn hebrew_keeps_embedded_latin_and_digits_forward() {
+        // A CV line: Hebrew around an untouched Latin run and a phone number.
+        let logical = "מהנדס תוכנה Senior 050-1234567";
+        let visual = super::reverse_visual_rtl(logical);
+        assert_eq!(expand_ligatures(&visual), logical);
+    }
+
+    #[test]
+    fn single_rtl_character_is_left_alone() {
+        assert_eq!(expand_ligatures("a \u{05D0} b"), "a \u{05D0} b");
     }
 
     #[test]
@@ -928,21 +983,21 @@ mod tests {
     }
 
     #[test]
-    fn reverse_visual_arabic_pure_rtl() {
+    fn reverse_visual_rtl_pure_rtl() {
         // Pure RTL: simple reversal
         let input = "\u{0628}\u{0627}"; // ba (visual order)
-        let result = reverse_visual_arabic(input);
+        let result = reverse_visual_rtl(input);
         assert_eq!(result, "\u{0627}\u{0628}"); // ab (logical order)
     }
 
     #[test]
-    fn reverse_visual_arabic_with_ltr_run() {
+    fn reverse_visual_rtl_with_ltr_run() {
         // Mixed: Arabic + embedded number "123" + Arabic
         // Visual order: أ 123 ب  → runs: [أ], [123], [ب]
         // Reversed runs: [ب], [123], [أ]
         // Non-LTR reversed internally: ب, 123, أ
         let input = "\u{0623}123\u{0628}";
-        let result = reverse_visual_arabic(input);
+        let result = reverse_visual_rtl(input);
         assert_eq!(result, "\u{0628}123\u{0623}");
     }
 
