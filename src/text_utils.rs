@@ -115,6 +115,61 @@ fn is_thai_combining_mark(c: char) -> bool {
     )
 }
 
+/// Map positional Thai glyphs from the legacy Microsoft Windows and Apple
+/// MacOS PUA extensions back to their semantic Unicode characters.
+///
+/// Mapping source: https://linux.thai.net/~thep/th-otf/shaping.html
+pub(crate) fn normalize_legacy_thai_pua_char(c: char) -> char {
+    match c {
+        // Microsoft Windows Thai PUA extension (U+F700-U+F71A).
+        '\u{F700}' => '\u{0E10}',
+        '\u{F701}' => '\u{0E34}',
+        '\u{F702}' => '\u{0E35}',
+        '\u{F703}' => '\u{0E36}',
+        '\u{F704}' => '\u{0E37}',
+        '\u{F705}' | '\u{F70A}' | '\u{F713}' => '\u{0E48}',
+        '\u{F706}' | '\u{F70B}' | '\u{F714}' => '\u{0E49}',
+        '\u{F707}' | '\u{F70C}' | '\u{F715}' => '\u{0E4A}',
+        '\u{F708}' | '\u{F70D}' | '\u{F716}' => '\u{0E4B}',
+        '\u{F709}' | '\u{F70E}' | '\u{F717}' => '\u{0E4C}',
+        '\u{F70F}' => '\u{0E0D}',
+        '\u{F710}' => '\u{0E31}',
+        '\u{F711}' => '\u{0E4D}',
+        '\u{F712}' => '\u{0E47}',
+        '\u{F718}' => '\u{0E38}',
+        '\u{F719}' => '\u{0E39}',
+        '\u{F71A}' => '\u{0E3A}',
+
+        // Apple MacOS Thai PUA extension (U+F884-U+F89E).
+        '\u{F884}' => '\u{0E31}',
+        '\u{F885}' => '\u{0E34}',
+        '\u{F886}' => '\u{0E35}',
+        '\u{F887}' => '\u{0E36}',
+        '\u{F888}' => '\u{0E37}',
+        '\u{F889}' => '\u{0E47}',
+        '\u{F88A}' | '\u{F88B}' | '\u{F88C}' => '\u{0E48}',
+        '\u{F88D}' | '\u{F88E}' | '\u{F88F}' => '\u{0E49}',
+        '\u{F890}' | '\u{F891}' | '\u{F892}' => '\u{0E4A}',
+        '\u{F893}' | '\u{F894}' | '\u{F895}' => '\u{0E4B}',
+        '\u{F896}' | '\u{F897}' | '\u{F898}' => '\u{0E4C}',
+        '\u{F899}' => '\u{0E4D}',
+        '\u{F89A}' => '\u{0E0D}',
+        '\u{F89B}' => '\u{0E38}',
+        '\u{F89C}' => '\u{0E39}',
+        '\u{F89D}' => '\u{0E3A}',
+        '\u{F89E}' => '\u{0E10}',
+        _ => c,
+    }
+}
+
+pub(crate) fn is_legacy_thai_pua_char(c: char) -> bool {
+    normalize_legacy_thai_pua_char(c) != c
+}
+
+pub(crate) fn normalize_legacy_thai_pua(text: &str) -> String {
+    text.chars().map(normalize_legacy_thai_pua_char).collect()
+}
+
 pub(crate) fn is_rtl_char(c: char) -> bool {
     matches!(c,
         '\u{0590}'..='\u{05FF}'   // Hebrew
@@ -259,7 +314,7 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
             // Excludes NBSP (U+00A0) which is common in PDFs and handled
             // correctly by existing coordinate-based spacing.
             '\u{2000}'..='\u{200A}' => result.push(' '), // en/em/thin/hair spaces etc.
-            _ => result.push(ch),
+            _ => result.push(normalize_legacy_thai_pua_char(ch)),
         }
     }
 
@@ -271,7 +326,10 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
         let mut normalized = String::with_capacity(result.len());
         for ch in result.chars() {
             if is_thai_combining_mark(ch) {
-                while matches!(normalized.chars().last(), Some(' ' | '\t' | '\u{00A0}')) {
+                while matches!(
+                    normalized.chars().next_back(),
+                    Some(' ' | '\t' | '\u{00A0}')
+                ) {
                     normalized.pop();
                 }
             }
@@ -904,6 +962,11 @@ mod tests {
     #[test]
     fn thai_combining_marks_drop_synthetic_spaces() {
         assert_eq!(expand_ligatures("ถ ึง กรณ ีที่ ต ้องการ"), "ถึง กรณีที่ ต้องการ");
+    }
+
+    #[test]
+    fn legacy_thai_pua_is_normalized_outside_tounicode_path() {
+        assert_eq!(expand_ligatures("ก\u{F70B} \u{F89E}\u{F89B}"), "ก้ ฐุ");
     }
 
     #[test]

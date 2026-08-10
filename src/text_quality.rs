@@ -24,6 +24,7 @@
 //! - **Substitution-cipher letter statistics**: pure-ASCII output whose letter
 //!   distribution is a permutation of natural language ([`CipherGarbleStats`]).
 
+use crate::text_utils::is_legacy_thai_pua_char;
 use crate::types::TextItem;
 use crate::{add_ocr_reason, OCR_REASON_SUSPECTED_GARBLED_TEXT};
 use std::collections::BTreeMap;
@@ -472,10 +473,11 @@ fn token_has_cid_control(token: &str) -> bool {
 }
 
 fn is_private_use_char(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
-    )
+    !is_legacy_thai_pua_char(ch)
+        && matches!(
+            ch as u32,
+            0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
+        )
 }
 
 /// Check if extracted text is predominantly garbage (non-alphanumeric).
@@ -594,8 +596,8 @@ mod tests {
     }
 
     #[test]
-    fn thai_and_private_use_in_one_span_route_page_to_ocr() {
-        let report = analyze_text_quality(&[text_item("ภาษาไทย \u{F70B}", 20)]);
+    fn thai_and_unknown_private_use_in_one_span_route_page_to_ocr() {
+        let report = analyze_text_quality(&[text_item("ภาษาไทย \u{E123}", 20)]);
 
         assert_eq!(report.pages_needing_ocr, vec![20]);
         assert_eq!(
@@ -610,8 +612,13 @@ mod tests {
     }
 
     #[test]
-    fn thai_private_use_glyph_is_an_encoding_issue() {
-        assert!(detect_encoding_issues("ไม่ได้ ได\u{F70B} สามารถ"));
+    fn unknown_thai_private_use_glyph_is_an_encoding_issue() {
+        assert!(detect_encoding_issues("ไม่ได้ ได\u{E123} สามารถ"));
+    }
+
+    #[test]
+    fn known_legacy_thai_pua_does_not_force_ocr_fallback() {
+        assert!(!detect_encoding_issues("ไม่ได้ ได\u{F70B} \u{F88E} สามารถ"));
     }
 
     #[test]

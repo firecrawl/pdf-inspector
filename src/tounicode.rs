@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::glyph_names::glyph_to_char;
+use crate::text_utils::{normalize_legacy_thai_pua, normalize_legacy_thai_pua_char};
 
 #[cfg(target_arch = "wasm32")]
 static BUILTIN_CMAPS: include_dir::Dir<'_> =
@@ -399,7 +400,7 @@ impl ToUnicodeCMap {
     pub fn lookup(&self, cid: u16) -> Option<String> {
         // First check direct mappings
         if let Some(s) = self.char_map.get(&cid) {
-            return Some(s.clone());
+            return Some(normalize_legacy_thai_pua(s));
         }
 
         // Binary search through sorted ranges
@@ -414,7 +415,7 @@ impl ToUnicodeCMap {
             if cid >= start && cid <= end {
                 let unicode = base + (cid - start) as u32;
                 if let Some(c) = char::from_u32(unicode) {
-                    return Some(c.to_string());
+                    return Some(normalize_legacy_thai_pua_char(c).to_string());
                 }
             }
         }
@@ -425,7 +426,7 @@ impl ToUnicodeCMap {
             if cid >= start && cid <= end {
                 let unicode = base + (cid - start) as u32;
                 if let Some(c) = char::from_u32(unicode) {
-                    return Some(c.to_string());
+                    return Some(normalize_legacy_thai_pua_char(c).to_string());
                 }
             }
         }
@@ -2645,6 +2646,88 @@ endbfchar
         // "AB " in 2-byte CID encoding
         let cids = [0x00, 0x24, 0x00, 0x25, 0x00, 0x03];
         assert_eq!(cmap.decode_cids(&cids), "AB ");
+    }
+
+    #[test]
+    fn legacy_windows_thai_pua_is_normalized_during_lookup() {
+        let expected = [
+            '\u{0E10}', '\u{0E34}', '\u{0E35}', '\u{0E36}', '\u{0E37}', '\u{0E48}', '\u{0E49}',
+            '\u{0E4A}', '\u{0E4B}', '\u{0E4C}', '\u{0E48}', '\u{0E49}', '\u{0E4A}', '\u{0E4B}',
+            '\u{0E4C}', '\u{0E0D}', '\u{0E31}', '\u{0E4D}', '\u{0E47}', '\u{0E48}', '\u{0E49}',
+            '\u{0E4A}', '\u{0E4B}', '\u{0E4C}', '\u{0E38}', '\u{0E39}', '\u{0E3A}',
+        ];
+        let mut cmap = ToUnicodeCMap::new();
+        for (index, pua) in ('\u{F700}'..='\u{F71A}').enumerate() {
+            cmap.char_map.insert(index as u16, pua.to_string());
+            assert_eq!(cmap.lookup(index as u16), Some(expected[index].to_string()));
+        }
+    }
+
+    #[test]
+    fn legacy_mac_thai_pua_is_normalized_during_lookup() {
+        let mappings = [
+            ('\u{F884}', '\u{0E31}'),
+            ('\u{F885}', '\u{0E34}'),
+            ('\u{F886}', '\u{0E35}'),
+            ('\u{F887}', '\u{0E36}'),
+            ('\u{F888}', '\u{0E37}'),
+            ('\u{F889}', '\u{0E47}'),
+            ('\u{F88A}', '\u{0E48}'),
+            ('\u{F88B}', '\u{0E48}'),
+            ('\u{F88C}', '\u{0E48}'),
+            ('\u{F88D}', '\u{0E49}'),
+            ('\u{F88E}', '\u{0E49}'),
+            ('\u{F88F}', '\u{0E49}'),
+            ('\u{F890}', '\u{0E4A}'),
+            ('\u{F891}', '\u{0E4A}'),
+            ('\u{F892}', '\u{0E4A}'),
+            ('\u{F893}', '\u{0E4B}'),
+            ('\u{F894}', '\u{0E4B}'),
+            ('\u{F895}', '\u{0E4B}'),
+            ('\u{F896}', '\u{0E4C}'),
+            ('\u{F897}', '\u{0E4C}'),
+            ('\u{F898}', '\u{0E4C}'),
+            ('\u{F899}', '\u{0E4D}'),
+            ('\u{F89A}', '\u{0E0D}'),
+            ('\u{F89B}', '\u{0E38}'),
+            ('\u{F89C}', '\u{0E39}'),
+            ('\u{F89D}', '\u{0E3A}'),
+            ('\u{F89E}', '\u{0E10}'),
+        ];
+        let mut cmap = ToUnicodeCMap::new();
+        for (index, (pua, thai)) in mappings.into_iter().enumerate() {
+            cmap.char_map.insert(index as u16, pua.to_string());
+            assert_eq!(cmap.lookup(index as u16), Some(thai.to_string()));
+        }
+    }
+
+    #[test]
+    fn legacy_thai_pua_in_bfrange_and_multiscalar_bfchar_is_normalized() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfchar
+<0001> <0E01F70B>
+endbfchar
+1 beginbfrange
+<0002> <0004> <F700>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        assert_eq!(cmap.lookup(0x0001), Some("ก้".to_string()));
+        assert_eq!(cmap.lookup(0x0002), Some("ฐ".to_string()));
+        assert_eq!(cmap.lookup(0x0003), Some("ิ".to_string()));
+        assert_eq!(cmap.lookup(0x0004), Some("ี".to_string()));
+    }
+
+    #[test]
+    fn unknown_private_use_codepoint_is_preserved() {
+        let mut cmap = ToUnicodeCMap::new();
+        cmap.char_map.insert(1, "\u{E123}".to_string());
+
+        assert_eq!(cmap.lookup(1), Some("\u{E123}".to_string()));
     }
 
     #[test]
