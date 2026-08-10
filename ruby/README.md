@@ -51,9 +51,11 @@ Extract text within bounding-box regions from a PDF. Designed for hybrid OCR pip
 
 Each region result includes a `needs_ocr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues).
 
+`page` here is 0-indexed, unlike the 1-indexed `pages:` used elsewhere in this API — see [Page numbering](../docs/ruby.md#usage).
+
 ```ruby
 result = PdfInspector.extract_text_in_regions("document.pdf", [
-  { page: 0, regions: [[0, 0, 300, 400], [300, 0, 612, 400]] } # [x1, y1, x2, y2] in PDF points, top-left origin
+  { page: 0, regions: [[0, 0, 300, 400], [300, 0, 612, 400]] } # 0-indexed page; [x1, y1, x2, y2] in PDF points, top-left origin
 ])
 
 result[0].regions.each do |region|

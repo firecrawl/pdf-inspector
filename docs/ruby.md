@@ -31,6 +31,11 @@ This ships today as a **source-only gem**: `extconf.rb` + `rb_sys` compile the e
 
 ## Usage
 
+Page numbering follows the underlying Rust API, which is not uniform — this mirrors the napi and Python bindings rather than normalizing to one convention:
+
+- **1-indexed**: `process`/`extract_text_with_positions`'s `pages:` argument, `pages_needing_ocr` from `process`/`detect`, `pages_with_tables`, `pages_with_columns`, `ocr_reasons_by_page`, and `TextItem#page`.
+- **0-indexed**: `extract_text_in_regions`'s `page:` region key and returned `page`, `extract_pages_markdown`'s `pages:` argument and each `PageMarkdown#page`, and `pages_needing_ocr` from `classify` (unlike the same field from `process`/`detect`).
+
 ```ruby
 require "pdf_inspector"
 
@@ -57,7 +62,7 @@ items = PdfInspector.extract_text_with_positions("document.pdf")
 
 # Extract text within bounding-box regions (skips OCR for text-based pages)
 result = PdfInspector.extract_text_in_regions("document.pdf", [
-  { page: 0, regions: [[0, 0, 300, 400], [300, 0, 612, 400]] } # [x1, y1, x2, y2] in PDF points, top-left origin
+  { page: 0, regions: [[0, 0, 300, 400], [300, 0, 612, 400]] } # 0-indexed page; [x1, y1, x2, y2] in PDF points, top-left origin
 ])
 result[0].regions.each do |region|
   puts(region.text) unless region.needs_ocr
@@ -65,7 +70,7 @@ end
 
 # Per-page markdown, plus layout metadata
 result = PdfInspector.extract_pages_markdown("document.pdf")
-result.pages.each { |page| puts "page #{page.page}: #{page.markdown.length} chars" }
+result.pages.each { |page| puts "page #{page.page}: #{page.markdown.length} chars" } # page.page is 0-indexed
 
 # Errors are exceptions
 begin

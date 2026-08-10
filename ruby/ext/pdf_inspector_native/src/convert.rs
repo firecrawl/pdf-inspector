@@ -144,13 +144,16 @@ pub(crate) fn text_item_to_hash(
     }))
 }
 
-/// One page's worth of region bounding boxes: `(1-based page, [x0,y0,x1,y1]
+/// One page's worth of region bounding boxes: `(0-indexed page, [x0,y0,x1,y1]
 /// boxes)`. Matches the tuple shape `pdf_inspector::extract_text_in_regions_mem`
 /// takes directly, so no intermediate named type is introduced here.
 pub(crate) type PageRegions = Vec<(u32, Vec<[f32; 4]>)>;
 
 /// Parses a Ruby array of `{ page:, regions: }` hashes into `PageRegions`,
-/// where each region is a 4-element `[x0, y0, x1, y1]` bounding box.
+/// where `page` is a 0-indexed page number (matching
+/// `pdf_inspector::extract_text_in_regions_mem`, unlike the 1-indexed `pages:`
+/// used by `process`/`extract_text_with_positions`) and each region is a
+/// 4-element `[x0, y0, x1, y1]` bounding box.
 pub(crate) fn parse_page_regions(ruby: &Ruby, page_regions: RArray) -> Result<PageRegions, Error> {
     page_regions
         .into_iter()
@@ -194,6 +197,9 @@ pub(crate) fn region_text_to_hash(
 
 /// Converts a single `PageMarkdown` (per-page markdown plus OCR status) into
 /// a Ruby hash with `:page`, `:markdown`, `:needs_ocr`, and `:ocr_reason`.
+/// `:page` is 0-indexed (matching `pdf_inspector::PageMarkdown`), unlike the
+/// 1-indexed `pages_with_tables`/`pages_with_columns`/`pages_needing_ocr` in
+/// the same `extract_pages_markdown` result.
 pub(crate) fn page_markdown_to_hash(
     ruby: &Ruby,
     page: pdf_inspector::PageMarkdown,

@@ -86,6 +86,10 @@ fn detect_bytes(ruby: &Ruby, bytes: RString) -> Result<RHash, Error> {
 /// page count, OCR-needed page count, and confidence, without extracting
 /// markdown.
 ///
+/// Note: `pages_needing_ocr` here is 0-indexed (matching `classify_pdf_mem`),
+/// unlike the same-named field returned by `process_bytes`/`detect_bytes`,
+/// which is 1-indexed.
+///
 /// # Arguments
 /// * `ruby` - Ruby VM handle used to build the result hash and map errors.
 /// * `bytes` - Raw PDF file contents.
@@ -152,8 +156,10 @@ fn extract_text_with_positions_bytes(
 /// # Arguments
 /// * `ruby` - Ruby VM handle used to build the result array and map errors.
 /// * `bytes` - Raw PDF file contents.
-/// * `page_regions` - Array of `{ page:, regions: }` hashes; `page` is a 1-based
-///   page number and `regions` is an array of `[x0, y0, x1, y1]` bounding boxes.
+/// * `page_regions` - Array of `{ page:, regions: }` hashes; `page` is a 0-indexed
+///   page number (matching `pdf_inspector::extract_text_in_regions_mem`, unlike
+///   the 1-indexed `pages:` used by `process`/`extract_text_with_positions`)
+///   and `regions` is an array of `[x0, y0, x1, y1]` bounding boxes.
 fn extract_text_in_regions_bytes(
     ruby: &Ruby,
     bytes: RString,
@@ -181,10 +187,15 @@ fn extract_text_in_regions_bytes(
 /// PDF bytes, optionally restricted to `pages`, along with table/column/OCR
 /// metadata for the extracted set.
 ///
+/// Note: `pages` and the returned `PageMarkdown#page` are 0-indexed (matching
+/// `extract_pages_markdown_mem`), unlike the 1-indexed `pages_with_tables`,
+/// `pages_with_columns`, `pages_needing_ocr`, and `ocr_reasons_by_page` in the
+/// same result hash.
+///
 /// # Arguments
 /// * `ruby` - Ruby VM handle used to build the result hash and map errors.
 /// * `bytes` - Raw PDF file contents.
-/// * `pages` - Optional 1-based page numbers to restrict extraction to; `None` processes all pages.
+/// * `pages` - Optional 0-indexed page numbers to restrict extraction to; `None` processes all pages.
 fn extract_pages_markdown_bytes(
     ruby: &Ruby,
     bytes: RString,
