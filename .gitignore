@@ -48,3 +48,6 @@ __pycache__/
 /ruby/ext/pdf_inspector_native/target
 /ruby/tmp/
 /ruby/Gemfile.lock
+/ruby/lib/pdf_inspector/pdf_inspector_native.bundle
+/ruby/lib/pdf_inspector/pdf_inspector_native.so
+/ruby/lib/pdf_inspector/pdf_inspector_native.dll
