@@ -43,3 +43,10 @@ test_output/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Local env (never commit secrets)
+.env
+.env.*
+!.env.example
+!**/.env.example
+
