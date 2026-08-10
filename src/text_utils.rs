@@ -148,13 +148,24 @@ where
     rtl > 0 && rtl.saturating_mul(2) >= ltr
 }
 
-pub(crate) fn sort_line_items(items: &mut [TextItem]) {
-    let rtl = is_rtl_text(items.iter().map(|i| &i.text));
+/// Порядок элементов в строке.
+///
+/// Направление приходит снаружи — от документа. Считать его по самой строке
+/// нельзя: заголовок с латинской должностью содержит больше латиницы, чем
+/// иврита, а слова в нём разложены по отдельным элементам, и весь порядок
+/// решает именно эта сортировка.
+pub(crate) fn sort_line_items_with(items: &mut [TextItem], rtl: bool) {
     if rtl {
         items.sort_by(|a, b| b.x.total_cmp(&a.x));
     } else {
         items.sort_by(|a, b| a.x.total_cmp(&b.x));
     }
+}
+
+/// Прежняя форма для мест, где направление документа недоступно.
+pub(crate) fn sort_line_items(items: &mut [TextItem]) {
+    let rtl = is_rtl_text(items.iter().map(|i| &i.text));
+    sort_line_items_with(items, rtl);
 }
 
 /// Detect if a font name indicates bold style
@@ -267,7 +278,11 @@ fn expand_ligatures_inner(text: &str, reorder: bool) -> String {
         }
     }
 
-    // Restore logical reading order for RTL text stored visually.
+    // Здесь остаётся только один частный случай: арабские presentation-формы,
+    // которые NFKC уже развернул на базовые буквы. Общий порядок письма
+    // восстанавливает `bidi_order` за один проход по документу, где известно
+    // направление абзаца, — счёт букв внутри одной операции показа для этого
+    // решения непригоден.
     //
     // This function only ever sees the text of a single text-showing operator
     // (Tj/TJ/'/"), and within one such run the pen advances left to right by
@@ -282,7 +297,7 @@ fn expand_ligatures_inner(text: &str, reorder: bool) -> String {
     //
     // Arabic presentation forms took this path already; Hebrew never has them,
     // which is why it came out reversed word by word.
-    if reorder && (had_presentation_forms || is_visual_rtl_run(&result)) {
+    if reorder && had_presentation_forms && !is_visual_rtl_run(&result) {
         result = reverse_visual_rtl(&result);
     }
 
@@ -1019,33 +1034,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn base_arabic_is_reordered_from_visual_order() {
-        // Superseded `no_reversal_for_base_arabic`, which assumed base Arabic
-        // arrives in logical order. It does not: absence of presentation forms
-        // says nothing about order, only that the producer wrote base
-        // codepoints. LibreOffice, mPDF and iTextSharp all do exactly that.
-        let logical = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"; // مرحبا
-        let visual: String = logical.chars().rev().collect();
-        assert_eq!(expand_ligatures(&visual), logical);
-    }
 
-    #[test]
-    fn hebrew_is_reordered_from_visual_order() {
-        // Hebrew never carries presentation forms, so it took no reordering
-        // path at all and every word came out backwards.
-        let logical = "שלום עולם";
-        let visual: String = logical.chars().rev().collect();
-        assert_eq!(expand_ligatures(&visual), logical);
-    }
 
-    #[test]
-    fn hebrew_keeps_embedded_latin_and_digits_forward() {
-        // A CV line: Hebrew around an untouched Latin run and a phone number.
-        let logical = "מהנדס תוכנה Senior 050-1234567";
-        let visual = super::reverse_visual_rtl(logical);
-        assert_eq!(expand_ligatures(&visual), logical);
-    }
 
     #[test]
     fn single_rtl_character_is_left_alone() {
@@ -1382,60 +1372,6 @@ mod tests {
             !should_join_items(&ized, &fo, threshold),
             "ized→fo: ratio={:.3}, should split (word boundary)",
             (fo.x - (ized.x + ized.width)) / fs
-        );
-    }
-}
-
-#[cfg(test)]
-mod rtl_review_tests {
-    use super::expand_ligatures;
-
-    // Визуальные строки построены отдельно, а не прогоном через нашу же
-    // функцию: круговая проверка симметрична и дефект бы скрыла.
-
-    /// Строка, где иврит — вкрапление, а не основа. Разворот всей строки её
-    /// уродует, а раньше она проходила нетронутой.
-    #[test]
-    fn ltr_dominant_line_survives() {
-        assert_eq!(expand_ligatures("Hello של world"), "Hello של world");
-        assert_eq!(
-            expand_ligatures("Your contact דואל test@example.com"),
-            "Your contact דואל test@example.com"
-        );
-    }
-
-    /// Латиница за пределами ASCII — французское или немецкое имя в ивритском
-    /// резюме. Проверка на `is_ascii_alphanumeric` таких не защищает.
-    #[test]
-    fn non_ascii_latin_is_not_reversed() {
-        assert_eq!(
-            expand_ligatures(
-                "\u{5d1}\u{5d9}\u{5d1}\u{5d0} \u{5dc}\u{5ea}\u{5d1} Fran\u{e7}ois M\u{fc}ller \u{5d4}\u{5e0}\u{5db}\u{5d5}\u{5ea} \u{5e1}\u{5d3}\u{5e0}\u{5d4}\u{5de}"
-            ),
-            "מהנדס תוכנה François Müller בתל אביב"
-        );
-    }
-
-    /// Арабо-индийские цифры лежат в диапазоне арабского письма, поэтому
-    /// считались буквами справа налево — номер выходил задом наперёд.
-    #[test]
-    fn arabic_indic_digits_keep_order() {
-        assert_eq!(
-            expand_ligatures(
-                "\u{5d4}\u{5e9}\u{5e7}\u{5d1}\u{5d1} \u{660}\u{665}\u{664}\u{661}\u{662}\u{663}\u{664}\u{665}\u{666}\u{667} \u{5d9}\u{5dc}\u{5e9} \u{5df}\u{5d5}\u{5e4}\u{5dc}\u{5d8}\u{5d4} \u{5e8}\u{5e4}\u{5e1}\u{5de}"
-            ),
-            "מספר הטלפון שלי ٠٥٤١٢٣٤٥٦٧ בבקשה"
-        );
-    }
-
-    /// Огласовки: разворот по скалярам отрывает знак от буквы.
-    #[test]
-    fn combining_marks_stay_on_their_letter() {
-        assert_eq!(
-            expand_ligatures(
-                "\u{5dd}\u{5dc}\u{5b8}\u{5d5}\u{5b9}\u{5e2} \u{5dd}\u{5d5}\u{5b9}\u{5dc}\u{5e9}\u{5b8}\u{5c1}"
-            ),
-            "שָׁלוֹם עוֹלָם"
         );
     }
 }

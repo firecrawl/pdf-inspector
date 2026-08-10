@@ -884,7 +884,16 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     Some((end, floor * fs))
 }
 
-pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
+pub(crate) fn merge_text_items(mut items: Vec<TextItem>) -> Vec<TextItem> {
+    // Направление берётся от документа целиком, а не от строки: на уровне
+    // строки сигнал шумит — «Hello של world» и «שירותי מחשוב System
+    // Administrator» имеют близкие пропорции, а вести себя должны
+    // противоположно.
+    let direction = crate::bidi_order::dominant_direction(items.iter().map(|i| i.text.as_str()));
+    for item in &mut items {
+        item.text = crate::bidi_order::visual_to_logical(&item.text, direction);
+    }
+
     if items.is_empty() {
         return items;
     }
@@ -909,7 +918,12 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
     for (page, y, mut group) in line_groups {
-        let rtl = is_rtl_text(group.iter().map(|i| &i.text));
+        // Направление строки берётся от документа, а не от счёта букв в самой
+        // строке. Заголовок «שירותי מחשוב System Administrator Genie 2013-2017»
+        // содержит больше латиницы, чем иврита, и по внутреннему счёту получал
+        // левое направление — а слова в нём разложены по отдельным элементам,
+        // так что весь порядок решала именно сортировка.
+        let rtl = direction == crate::bidi_order::Direction::Rtl;
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
             group.sort_by(|a, b| b.x.total_cmp(&a.x));
@@ -2808,7 +2822,8 @@ mod tests {
 
         // На странице справа налево: сначала (правее всех) ивритское слово,
         // левее — адрес, разложенный по буквам с растущим x.
-        let mut items = vec![item("\u{05E9}\u{05DC}\u{05D5}\u{05DD}", 200.0)];
+        // Слово лежит в потоке визуально, как его пишет PDF.
+        let mut items = vec![item("\u{05DD}\u{05D5}\u{05DC}\u{05E9}", 200.0)];
         for (i, ch) in "a@b.c".chars().enumerate() {
             items.push(item(&ch.to_string(), 100.0 + i as f32 * 7.0));
         }
