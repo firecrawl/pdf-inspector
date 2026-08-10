@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 path = "./src/lib.rs"
 
 [dependencies]
-pdf-inspector = { path = "../../.." }
+pdf-inspector = "0.1.7"
 magnus = "0.8"
 rb-sys = { version = "0.9", default-features = false, features = ["stable-api-compiled-fallback"] }
 
