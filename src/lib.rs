@@ -388,9 +388,25 @@ pub struct PdfClassification {
 
 /// Classify a PDF from a memory buffer without extracting text.
 /// Returns the PDF type and which pages need OCR (~10-50ms).
+///
+/// Equivalent to `classify_pdf_mem_with_password(buffer, None)`.
 pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
+    classify_pdf_mem_with_password(buffer, None)
+}
+
+/// Classify a PDF from a memory buffer, decrypting with `password` if the
+/// file is encrypted.
+///
+/// `process_pdf_mem_with_options` already accepts a password via
+/// [`PdfOptions::password`]; this is the equivalent for the lightweight
+/// classification path, so a caller routing encrypted PDFs through OCR
+/// doesn't have to pay for a full parse just to reach the password.
+pub fn classify_pdf_mem_with_password(
+    buffer: &[u8],
+    password: Option<&str>,
+) -> Result<PdfClassification, PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
     let detection = detector::detect_from_document(&doc, page_count, &DetectionConfig::default())?;
     Ok(PdfClassification {
         pdf_type: detection.pdf_type,

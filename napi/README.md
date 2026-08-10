@@ -38,7 +38,7 @@ Prebuilt binaries for **Linux x64/ARM64** (glibc and musl/Alpine), **macOS ARM64
 
 ## API
 
-### `classifyPdf(buffer: Buffer): PdfClassification`
+### `classifyPdf(buffer: Buffer, password?: string): PdfClassification`
 
 Classify a PDF as TextBased, Scanned, Mixed, or ImageBased (~10-50ms). Returns which pages need OCR.
 
@@ -53,6 +53,19 @@ console.log(result.pdfType)        // "TextBased" | "Scanned" | "Mixed" | "Image
 console.log(result.pageCount)      // 42
 console.log(result.pagesNeedingOcr) // [5, 12, 15] (0-indexed)
 console.log(result.confidence)     // 0.875
+```
+
+### Encrypted PDFs
+
+`classifyPdf`, `detectPdf`, and `processPdf` take an optional `password` for
+encrypted files. Without it — or with the wrong one — they throw
+`PDF is encrypted`.
+
+```typescript
+import { classifyPdf, processPdf } from '@firecrawl/pdf-inspector'
+
+const result = classifyPdf(encryptedPdf, 'secret123')
+const full = processPdf(encryptedPdf, undefined, 'secret123')
 ```
 
 ### `extractTextInRegions(buffer: Buffer, pageRegions: PageRegions[]): PageRegionTexts[]`
