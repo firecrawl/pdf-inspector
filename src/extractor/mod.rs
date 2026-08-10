@@ -1045,7 +1045,11 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
 ///
 /// So each maximal run of items carrying no RTL character is flipped back.
 fn restore_ltr_runs(items: &mut [&TextItem]) {
-    let is_rtl_item = |it: &&TextItem| it.text.chars().any(is_rtl_char);
+    // Цифры не считаются письмом справа налево: арабо-индийские лежат в
+    // диапазоне арабского, но читаются слева направо, и телефон из них,
+    // набранный по глифу на элемент, иначе останется вывернутым.
+    let is_rtl_item =
+        |it: &&TextItem| it.text.chars().any(|c| is_rtl_char(c) && !c.is_numeric());
     let mut i = 0;
     while i < items.len() {
         if is_rtl_item(&items[i]) {
@@ -2775,6 +2779,51 @@ mod tests {
         assert!(!is_rtl_text(["Hello world"].iter()));
         // Empty → not RTL
         assert!(!is_rtl_text(std::iter::empty::<&str>()));
+    }
+
+    /// Ивритская строка, внутри которой латинский адрес набран по одному
+    /// глифу на элемент — ровно тот случай, из-за которого почта выходила как
+    /// `moc.liamg@nairaog.leira`. Сортировка строки справа налево выворачивает
+    /// такие глифы, и `restore_ltr_runs` обязан вернуть им порядок чтения.
+    #[test]
+    fn ltr_glyph_run_inside_rtl_line_keeps_reading_order() {
+        fn item(text: &str, x: f32) -> TextItem {
+            TextItem {
+                text: text.into(),
+                x,
+                y: 700.0,
+                width: 7.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            }
+        }
+
+        // На странице справа налево: сначала (правее всех) ивритское слово,
+        // левее — адрес, разложенный по буквам с растущим x.
+        let mut items = vec![item("\u{05E9}\u{05DC}\u{05D5}\u{05DD}", 200.0)];
+        for (i, ch) in "a@b.c".chars().enumerate() {
+            items.push(item(&ch.to_string(), 100.0 + i as f32 * 7.0));
+        }
+
+        let merged = merge_text_items(items);
+        let line: String = merged.iter().map(|i| i.text.as_str()).collect();
+
+        assert!(
+            line.contains("a@b.c"),
+            "латинский участок должен читаться слева направо, получено: {line:?}"
+        );
+        assert!(
+            line.contains("\u{05E9}\u{05DC}\u{05D5}\u{05DD}"),
+            "ивритское слово должно уцелеть, получено: {line:?}"
+        );
     }
 
     #[test]
