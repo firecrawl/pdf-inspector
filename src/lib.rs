@@ -380,6 +380,15 @@ pub struct PdfClassification {
     pub pdf_type: PdfType,
     /// Total page count.
     pub page_count: u32,
+    /// Number of pages sampled for detection.
+    pub pages_sampled: u32,
+    /// Number of sampled pages with extractable text.
+    pub pages_with_text: u32,
+    /// Number of sampled pages containing images.
+    pub pages_with_images: u32,
+    /// Number of sampled pages that look like a scan (single full-page
+    /// template image with little real text).
+    pub pages_with_template_images: u32,
     /// 0-indexed page numbers that need OCR (scanned/image pages).
     pub pages_needing_ocr: Vec<u32>,
     /// Detection confidence score (0.0–1.0).
@@ -395,6 +404,10 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     Ok(PdfClassification {
         pdf_type: detection.pdf_type,
         page_count,
+        pages_sampled: detection.pages_sampled,
+        pages_with_text: detection.pages_with_text,
+        pages_with_images: detection.pages_with_images,
+        pages_with_template_images: detection.pages_with_template_images,
         // Convert from 1-indexed to 0-indexed for caller convenience
         pages_needing_ocr: detection.pages_needing_ocr.iter().map(|&p| p - 1).collect(),
         confidence: detection.confidence,

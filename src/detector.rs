@@ -50,6 +50,11 @@ pub struct PdfTypeResult {
     pub pages_sampled: u32,
     /// Number of pages with text operators found
     pub pages_with_text: u32,
+    /// Number of sampled pages containing images
+    pub pages_with_images: u32,
+    /// Number of sampled pages that look like a scan (single full-page
+    /// template image with little real text)
+    pub pages_with_template_images: u32,
     /// Confidence score (0.0 - 1.0)
     pub confidence: f32,
     /// Title from metadata (if available)
@@ -469,6 +474,8 @@ pub(crate) fn detect_from_document(
         page_count,
         pages_sampled,
         pages_with_text,
+        pages_with_images,
+        pages_with_template_images,
         confidence,
         title,
         ocr_recommended,

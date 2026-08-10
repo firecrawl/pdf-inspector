@@ -127,6 +127,10 @@ class PageOcrReasons:                # per-page OCR diagnostics
 class PdfClassification:             # classify_pdf
     pdf_type: str
     page_count: int
+    pages_sampled: int
+    pages_with_text: int
+    pages_with_images: int
+    pages_with_template_images: int  # sampled pages that look like a scan (full-page template image)
     pages_needing_ocr: list[int]     # 0-indexed
     confidence: float
 

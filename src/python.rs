@@ -99,6 +99,19 @@ pub struct PyPdfClassification {
     /// Total number of pages.
     #[pyo3(get)]
     pub page_count: u32,
+    /// Number of pages sampled for detection.
+    #[pyo3(get)]
+    pub pages_sampled: u32,
+    /// Number of sampled pages with extractable text.
+    #[pyo3(get)]
+    pub pages_with_text: u32,
+    /// Number of sampled pages containing images.
+    #[pyo3(get)]
+    pub pages_with_images: u32,
+    /// Number of sampled pages that look like a scan (single full-page
+    /// template image with little real text).
+    #[pyo3(get)]
+    pub pages_with_template_images: u32,
     /// 0-indexed page numbers that need OCR.
     #[pyo3(get)]
     pub pages_needing_ocr: Vec<u32>,
@@ -489,6 +502,10 @@ fn classify_pdf_bytes(data: &[u8]) -> PyResult<PyPdfClassification> {
     Ok(PyPdfClassification {
         pdf_type: pdf_type_str(result.pdf_type),
         page_count: result.page_count,
+        pages_sampled: result.pages_sampled,
+        pages_with_text: result.pages_with_text,
+        pages_with_images: result.pages_with_images,
+        pages_with_template_images: result.pages_with_template_images,
         pages_needing_ocr: result.pages_needing_ocr,
         confidence: result.confidence,
     })
