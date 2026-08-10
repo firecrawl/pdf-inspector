@@ -5,6 +5,7 @@
 
 use crate::text_utils::{
     decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
+    normalize_show_text,
 };
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
@@ -541,7 +542,7 @@ pub(crate) fn extract_page_text_items(
                                 .copied()
                                 .unwrap_or((false, false));
                             items.push(TextItem {
-                                text: expand_ligatures(&text),
+                                text: normalize_show_text(&text),
                                 x,
                                 y,
                                 width,
@@ -715,7 +716,7 @@ pub(crate) fn extract_page_text_items(
                                     0.0
                                 };
                                 items.push(TextItem {
-                                    text: expand_ligatures(text),
+                                    text: normalize_show_text(text),
                                     x,
                                     y,
                                     width,
@@ -812,7 +813,7 @@ pub(crate) fn extract_page_text_items(
                                 .copied()
                                 .unwrap_or((false, false));
                             items.push(TextItem {
-                                text: expand_ligatures(&text),
+                                text: normalize_show_text(&text),
                                 x,
                                 y,
                                 width,

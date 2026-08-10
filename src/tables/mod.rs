@@ -140,11 +140,7 @@ pub(crate) fn try_build_rect_guided_table(
         let col = col_boundaries.iter().rposition(|&cx| item.x >= cx - 4.0);
 
         if let (Some(r), Some(c)) = (row, col) {
-            let cell = &mut cells[r][c];
-            if !cell.is_empty() {
-                cell.push(' ');
-            }
-            cell.push_str(item.text.trim());
+            crate::rtl::append_cell_text(&mut cells[r][c], item.text.trim());
             used_indices.push(*orig_idx);
         }
     }
@@ -516,10 +512,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         // Find row
         let row = row_ys.iter().position(|&ry| (ry - item.y).abs() < y_tol);
         if let Some(row) = row {
-            if !cells[row][col].is_empty() {
-                cells[row][col].push(' ');
-            }
-            cells[row][col].push_str(&item.text);
+            crate::rtl::append_cell_text(&mut cells[row][col], &item.text);
             item_indices.push(item_idx);
         }
     }

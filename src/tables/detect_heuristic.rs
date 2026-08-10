@@ -109,10 +109,24 @@ fn merge_adjacent_items_preserving(
 
                 // Insert space at word boundaries: within a word characters
                 // touch (gap ≈ 0), between words there's a visible gap.
-                if gap > first_item.font_size * 0.08 {
-                    text.push(' ');
+                // RTL fragments read right-to-left, so in this ascending-X
+                // scan they prepend; sub-word fragments (gap ≈ 0) reassemble
+                // in the same way.
+                let word_gap = gap > first_item.font_size * 0.08;
+                if crate::rtl::joins_right_to_left(&next_item.text) {
+                    let mut swapped = String::with_capacity(next_item.text.len() + text.len() + 1);
+                    swapped.push_str(&next_item.text);
+                    if word_gap {
+                        swapped.push(' ');
+                    }
+                    swapped.push_str(&text);
+                    text = swapped;
+                } else {
+                    if word_gap {
+                        text.push(' ');
+                    }
+                    text.push_str(&next_item.text);
                 }
-                text.push_str(&next_item.text);
                 end_x = next_item.x + next_item.width;
                 indices.push(next_idx);
                 j += 1;

@@ -190,6 +190,22 @@ pub fn is_italic_font(font_name: &str) -> bool {
         || lower.contains("kursiv") // German for italic
 }
 
+/// Normalize show-operation text: ligature expansion plus visual→logical
+/// RTL restoration. Text that went through the Arabic presentation-forms
+/// path is already reversed to logical order by `expand_ligatures` and is
+/// not restored again. Must not be used for `ActualText` replacements,
+/// which the PDF spec defines in logical content order.
+pub(crate) fn normalize_show_text(text: &str) -> String {
+    let expanded = expand_ligatures(text);
+    if expanded.is_ascii() {
+        return expanded;
+    }
+    if text.chars().any(is_arabic_presentation_form) {
+        return expanded;
+    }
+    crate::rtl::restore_item_text(expanded)
+}
+
 /// Expand Unicode ligature characters to their component characters.
 /// This makes extracted text more searchable and semantically correct.
 /// Also applies NFKC normalization (converts Arabic presentation forms to base

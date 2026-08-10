@@ -463,16 +463,22 @@ pub fn detect_tables_from_struct_tree(
                     matched_cells += 1;
                 }
 
-                // Sort by Y (descending = top-to-bottom) then X
+                // Sort by Y (descending = top-to-bottom) then X (descending
+                // for RTL cells, whose reading order is right-to-left)
+                let rtl =
+                    crate::text_utils::is_rtl_text(cell_items.iter().map(|(_, item)| &item.text));
                 cell_items.sort_by(|a, b| {
                     b.1.y
                         .partial_cmp(&a.1.y)
                         .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(
-                            a.1.x
-                                .partial_cmp(&b.1.x)
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
+                        .then_with(|| {
+                            let (first, second) = if rtl { (b, a) } else { (a, b) };
+                            first
+                                .1
+                                .x
+                                .partial_cmp(&second.1.x)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
                 });
 
                 let text: String = cell_items

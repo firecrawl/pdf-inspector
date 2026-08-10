@@ -1978,7 +1978,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // Convert to markdown, inserting tables and images at appropriate positions
     let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
     band_split_page_set.extend(page_chart_prose_splits.keys().copied());
-    to_markdown_from_lines_with_tables_and_images(
+    // Majority-RTL tables need their column order flipped to match logical
+    // reading order (cell text is already logical, restored per item at
+    // extraction). Returns the string unchanged for LTR-only documents.
+    crate::rtl::restore_visual_order(to_markdown_from_lines_with_tables_and_images(
         lines,
         options,
         page_tables,
@@ -1986,7 +1989,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         &page_chart_map,
         &band_split_page_set,
         effective_struct_roles,
-    )
+    ))
 }
 
 #[cfg(test)]

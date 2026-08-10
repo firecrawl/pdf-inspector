@@ -1,7 +1,7 @@
 //! Form XObject and image XObject extraction.
 
 use super::fonts::descriptor_style_flags;
-use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_italic_font};
+use crate::text_utils::{effective_font_size, is_bold_font, is_italic_font, normalize_show_text};
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -448,7 +448,7 @@ fn extract_form_xobject_text_inner(
                                 .copied()
                                 .unwrap_or((false, false));
                             items.push(TextItem {
-                                text: expand_ligatures(&text),
+                                text: normalize_show_text(&text),
                                 x,
                                 y,
                                 width,
@@ -603,7 +603,7 @@ fn extract_form_xobject_text_inner(
                                     0.0
                                 };
                                 items.push(TextItem {
-                                    text: expand_ligatures(text),
+                                    text: normalize_show_text(text),
                                     x,
                                     y,
                                     width,

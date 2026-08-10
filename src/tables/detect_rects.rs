@@ -1497,18 +1497,24 @@ pub(crate) fn assign_items_to_grid(
         }
     }
 
-    // Build cell strings: sort items within each cell by Y descending then X ascending
+    // Build cell strings: sort items within each cell by Y descending then X
+    // ascending (X descending for RTL cells, whose reading order is
+    // right-to-left).
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(num_rows);
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(num_cols);
         for col_items in row_items.iter_mut() {
+            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|(_, item)| &item.text));
             col_items.sort_by(|a, b| {
                 b.1.y
                     .partial_cmp(&a.1.y)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| {
-                        a.1.x
-                            .partial_cmp(&b.1.x)
+                        let (first, second) = if rtl { (b, a) } else { (a, b) };
+                        first
+                            .1
+                            .x
+                            .partial_cmp(&second.1.x)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
             });

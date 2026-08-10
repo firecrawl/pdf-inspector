@@ -456,10 +456,7 @@ fn build_text_anchor_table(
                     wide_items += 1;
                 }
             }
-            if !cells[row_index][column].is_empty() {
-                cells[row_index][column].push(' ');
-            }
-            cells[row_index][column].push_str(item.text.trim());
+            crate::rtl::append_cell_text(&mut cells[row_index][column], item.text.trim());
             item_indices.push(*item_index);
         }
     }
@@ -863,10 +860,7 @@ fn build_dense_row_anchor_table(
     for (row_index, (_, row)) in rows.iter().enumerate() {
         for (item_index, item) in row {
             let column = nearest_anchor_column(item, &anchors)?;
-            if !cells[row_index][column].is_empty() {
-                cells[row_index][column].push(' ');
-            }
-            cells[row_index][column].push_str(item.text.trim());
+            crate::rtl::append_cell_text(&mut cells[row_index][column], item.text.trim());
             item_indices.push(*item_index);
         }
     }
@@ -982,10 +976,7 @@ fn build_open_edge_grid_table_for_rules(
             let center_x = item.x + item.width / 2.0;
             let column = (0..column_count)
                 .find(|&index| center_x >= col_edges[index] && center_x <= col_edges[index + 1])?;
-            if !header_cells[column].is_empty() {
-                header_cells[column].push(' ');
-            }
-            header_cells[column].push_str(item.text.trim());
+            crate::rtl::append_cell_text(&mut header_cells[column], item.text.trim());
             header_indices.push(*item_index);
         }
     }

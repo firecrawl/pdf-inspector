@@ -1,5 +1,7 @@
 //! Column/row boundary detection and cell assignment for heuristic tables.
 
+use std::borrow::Cow;
+
 use crate::types::TextItem;
 
 use super::{Table, TableDetectionMode};
@@ -470,6 +472,17 @@ pub(crate) fn recover_header_row(
     // Take the row closest to the table (lowest Y above first_row_y)
     // header_y_groups is sorted by descending Y, so take the last one
     let (header_y, header_items) = header_y_groups.last().unwrap();
+    // RTL header rows read right-to-left: fill cells in descending-X order
+    // so multi-item cells join in logical order. LTR rows keep the original
+    // stream order and borrow the group unchanged.
+    let header_items: Cow<[(usize, &TextItem)]> =
+        if crate::text_utils::is_rtl_text(header_items.iter().map(|(_, item)| &item.text)) {
+            let mut sorted = header_items.clone();
+            sorted.sort_by(|a, b| b.1.x.total_cmp(&a.1.x));
+            Cow::Owned(sorted)
+        } else {
+            Cow::Borrowed(header_items.as_slice())
+        };
 
     // Map header items to table columns
     let num_cols = table.columns.len();
@@ -477,7 +490,7 @@ pub(crate) fn recover_header_row(
     let mut mapped_count = 0;
     let mut header_indices = Vec::new();
 
-    for (idx, item) in header_items {
+    for (idx, item) in header_items.iter() {
         if let Some(col) = find_column_index(&table.columns, item.x) {
             let text = item.text.trim();
             if !text.is_empty() {
