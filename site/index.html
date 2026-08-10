@@ -858,22 +858,22 @@
           <p>Evaluated on the <a class="text-link" href="https://github.com/opendataloader-project/opendataloader-bench">opendataloader-bench</a> corpus of 200 PDFs. This comparison covers local engines without model-based PDF parsing, with OCR disabled. Higher scores are better.</p>
         </div>
         <div class="benchmark-card">
-          <div class="benchmark-top"><span><strong>200 PDFs</strong> · OpenDataLoader benchmark</span><span>Apple M4 Pro · median of 3 runs</span></div>
+          <div class="benchmark-top"><span><strong>200 PDFs</strong> · OpenDataLoader benchmark</span><span>Apple M4 Pro · median of 5 runs</span></div>
           <div class="table-scroll">
             <table aria-label="PDF extraction benchmark results">
               <thead>
                 <tr><th>Engine</th><th>Overall</th><th>Reading order</th><th>Tables</th><th>Headings</th><th>Complete run</th></tr>
               </thead>
               <tbody>
-                <tr class="highlight"><td>pdf-inspector</td><td>0.875</td><td>0.915</td><td>0.814</td><td>0.788</td><td>2.8s</td></tr>
-                <tr><td>LiteParse</td><td>0.870</td><td>0.908</td><td>0.693</td><td>0.811</td><td>13.9s</td></tr>
-                <tr><td>OpenDataLoader</td><td>0.843</td><td>0.912</td><td>0.489</td><td>0.760</td><td>9.8s</td></tr>
-                <tr><td>PyMuPDF4LLM</td><td>0.735</td><td>0.886</td><td>0.401</td><td>0.424</td><td>15.5s</td></tr>
-                <tr><td>MarkItDown</td><td>0.583</td><td>0.879</td><td>0.000</td><td>0.000</td><td>6.7s</td></tr>
+                <tr class="highlight"><td>pdf-inspector</td><td>0.875</td><td>0.915</td><td>0.814</td><td>0.788</td><td>0.470s</td></tr>
+                <tr><td>LiteParse</td><td>0.873</td><td>0.913</td><td>0.693</td><td>0.811</td><td>0.750s</td></tr>
+                <tr><td>OpenDataLoader</td><td>0.831</td><td>0.902</td><td>0.489</td><td>0.739</td><td>2.569s</td></tr>
+                <tr><td>PyMuPDF4LLM</td><td>0.735</td><td>0.886</td><td>0.401</td><td>0.424</td><td>17.117s</td></tr>
+                <tr><td>MarkItDown</td><td>0.589</td><td>0.844</td><td>0.273</td><td>0.000</td><td>16.165s</td></tr>
               </tbody>
             </table>
           </div>
-          <div class="benchmark-note">Refreshed July 16, 2026. Scores use the benchmark’s NID, TEDS, and MHS evaluators.</div>
+          <div class="benchmark-note">Refreshed July 31, 2026. Scores use the benchmark’s NID, TEDS, and MHS evaluators; speed is the median of five alternating or rotating complete corpus runs after an excluded warm-up. <a class="text-link" href="https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results">Versions and raw artifacts</a>.</div>
         </div>
         <div class="best-fit">
           <strong>Best fit</strong>

@@ -1659,7 +1659,15 @@ fn hex_val(b: u8) -> Option<u8> {
 /// Standard page: 612x792 points (US Letter) = ~485,000 sq points
 /// At 2x resolution that's ~1.9M pixels, so we use 250K pixels as threshold
 /// (accounting for varying DPI and page sizes)
-fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
+/// Returns `(has_images, total_image_area, has_template_image)` for a page.
+/// `has_template_image` means a single large (>50% page coverage)
+/// background image — the signal `classify_pdf`/`detect_pdf_type` uses to
+/// route a page to OCR regardless of any incidental native text drawn over
+/// it. Exposed at crate visibility so extraction-side per-page `needs_ocr`
+/// computation (`extract_pages_markdown_mem`) can consult the same signal
+/// instead of maintaining its own, independent notion of "needs OCR" that
+/// can silently disagree with detection — see #227.
+pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
     // Threshold: image covering roughly half a page at 150+ DPI
     // 612 * 792 / 2 * (150/72)^2 ≈ 1M pixels, but we'll be conservative
     const TEMPLATE_IMAGE_THRESHOLD: u64 = 500_000; // 500K pixels
@@ -1739,6 +1747,62 @@ fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
     }
 
     (has_images, total_area, has_template_image)
+}
+
+/// Computes both `(needs_ocr_for_template_image, has_vector_text)` for a
+/// page from a single shared `analyze_page_content` pass — that call
+/// decompresses and scans every content stream (page + XObjects) plus
+/// image coverage, so `extract_pages_markdown_mem` must not invoke it
+/// twice per page (once per signal) the way `detect_from_document` avoids
+/// by caching its per-page `PageAnalysis`.
+///
+/// `needs_ocr_for_template_image` is true when a page's template image
+/// should be treated as a scan needing OCR — a single full-page background
+/// image with little/no real text — rather than a text page that happens
+/// to carry a watermark, letterhead, or figure. Mirrors the two distinct
+/// signals classification uses to route a template-image page to OCR:
+///
+/// 1. `looks_like_scan`: image_count <= 1, few text operators (<50), and
+///    low alphanumeric diversity in raw string operands (unless decodable
+///    CID/ToUnicode fonts explain that away) — the gate used for
+///    `pages_with_template_images` and Mixed-type per-page routing.
+/// 2. Insufficient real text volume, using `DetectionConfig::default()`'s
+///    `min_text_ops_per_page` (3) — the same threshold Mixed-type per-page
+///    routing applies via `text_operator_count < config.min_text_ops_per_page
+///    && has_images` (simplified here since a template image implies
+///    `has_images`). Deliberately *not* the higher `effective_min_ops`
+///    floor (`min_text_ops_per_page.max(10)`) that whole-document
+///    `PdfType::ImageBased`/`Scanned` classification uses for
+///    `pages_with_text` — that's a cross-page aggregate decision this
+///    per-page function has no way to replicate exactly, and the lower
+///    per-page threshold is the one a single page's own signals can
+///    actually agree with.
+///
+/// `has_vector_text` is true when a page has vector-outlined text (glyphs
+/// drawn as paths rather than shown via text-showing operators) —
+/// `detect_from_document`'s Mixed-type per-page routing always sends
+/// these pages to OCR, independent of any template-image check, since
+/// outlined glyphs can't be extracted as text at all.
+///
+/// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
+/// the same gates classification needs elsewhere instead of treating the
+/// raw signals alone as sufficient — see #227/#231.
+pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool) {
+    let analysis = analyze_page_content(doc, page_id);
+
+    let needs_ocr_for_template_image = if !analysis.has_template_image {
+        false
+    } else {
+        let alphanum_low = analysis.unique_alphanum_chars < 10
+            && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
+        let looks_like_scan =
+            analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
+        let insufficient_text =
+            analysis.text_operator_count < DetectionConfig::default().min_text_ops_per_page;
+        looks_like_scan || insufficient_text
+    };
+
+    (needs_ocr_for_template_image, analysis.has_vector_text)
 }
 
 /// Recursively collect image dimensions from XObject resources,

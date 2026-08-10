@@ -44,6 +44,16 @@ const MIN_TABULAR_RULE_ITEMS: usize = 3;
 const MIN_TABULAR_RULE_GAPS: usize = 2;
 const TABULAR_RULE_GAP_EM: f32 = 2.0;
 
+/// Strikeout decorations are text-sized. Diagram connectors, signature
+/// lines, and chart rules often cross glyphs too, but extend well beyond the
+/// text they happen to intersect.
+const STRIKE_OWNER_PAD_EM: f32 = 0.75;
+const STRIKE_OWNER_MIN_PAD: f32 = 4.0;
+const STRIKE_ROW_Y_TOLERANCE_EM: f32 = 0.15;
+const STRIKE_ROW_Y_TOLERANCE_MIN: f32 = 5.0;
+const GRAPHIC_CONNECTION_EPS: f32 = 2.0;
+const GRAPHIC_CONNECTOR_MAX_THICKNESS: f32 = 4.0;
+
 #[derive(Clone)]
 pub(crate) struct UnderlineLine {
     pub(crate) x1: f32,
@@ -387,6 +397,206 @@ fn rule_strikes_item(rule: &Rule, item: &TextItem) -> bool {
     overlap >= min_overlap
 }
 
+fn is_bare_list_marker(text: &str) -> bool {
+    matches!(
+        text.trim(),
+        "•" | "◦" | "▪" | "▫" | "‣" | "⁃" | "●" | "○" | "■" | "□" | "-" | "*"
+    )
+}
+
+fn same_strike_row(left: &TextItem, right: &TextItem) -> bool {
+    let font_size = left.font_size.max(right.font_size);
+    let tolerance = (font_size * STRIKE_ROW_Y_TOLERANCE_EM).max(STRIKE_ROW_Y_TOLERANCE_MIN);
+    (left.y - right.y).abs() <= tolerance
+}
+
+fn is_inline_script(rule: &Rule, candidate: &TextItem, parent: &TextItem) -> bool {
+    if !is_underline_candidate(candidate)
+        || is_bare_list_marker(&candidate.text)
+        || candidate.font_size <= 0.0
+        || candidate.font_size >= parent.font_size * 0.75
+        || candidate.text.len() > 4
+        || !candidate.text.chars().all(|c| c.is_ascii_digit())
+        || (candidate.y - parent.y).abs() > 5.0
+    {
+        return false;
+    }
+
+    let parent_ends_with_letter = parent.text.chars().last().is_some_and(char::is_alphabetic);
+    if !parent_ends_with_letter {
+        return false;
+    }
+
+    let parent_right = parent.x + parent.width;
+    let gap = candidate.x - parent_right;
+    if gap >= parent.font_size * 0.2 || gap <= -parent.font_size * 0.3 {
+        return false;
+    }
+
+    let overlap = rule.x2.min(candidate.x + candidate.width) - rule.x1.max(candidate.x);
+    overlap >= candidate.width * MIN_X_OVERLAP
+}
+
+/// Return the items owned by a snug mid-glyph rule.
+///
+/// Real strikeout decorations track the width of the deleted text, including
+/// runs split by font/style changes and adjacent numeric super/subscripts.
+/// Non-text graphics can cross the same vertical window, but arrow shafts,
+/// signature lines, fraction bars, and chart rules extend materially beyond
+/// the intersected glyphs. Requiring the rule to stay within a small em-sized
+/// pad of a contiguous matched row separates those cases without relying on
+/// document-specific fonts or coordinates.
+///
+/// Ownership is computed once per rule. This keeps the strikeout pass at the
+/// same rule-by-item scale as underline detection instead of rescanning the
+/// whole page for every matching item.
+fn snug_strike_owner_indices(rule: &Rule, items: &[TextItem]) -> Vec<usize> {
+    let mut struck_indices: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            (is_underline_candidate(candidate)
+                && !is_bare_list_marker(&candidate.text)
+                && rule_strikes_item(rule, candidate))
+            .then_some(index)
+        })
+        .collect();
+    if struck_indices.is_empty() {
+        return Vec::new();
+    }
+    struck_indices.sort_by(|&left, &right| items[left].y.total_cmp(&items[right].y));
+
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    for index in struck_indices {
+        if let Some(row) = rows
+            .last_mut()
+            .filter(|row| same_strike_row(&items[row[0]], &items[index]))
+        {
+            row.push(index);
+        } else {
+            rows.push(vec![index]);
+        }
+    }
+
+    let mut owned_indices = Vec::new();
+    for mut row in rows {
+        row.sort_by(|&left, &right| items[left].x.total_cmp(&items[right].x));
+
+        // Underline detection runs before the extractor's script-merging
+        // pass. Include the same tightly adjacent numeric script shape here
+        // when the rule spans it, so the owner width and semantic mark both
+        // survive that later merge.
+        let scripts: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                let parent_pos =
+                    row.partition_point(|&row_index| items[row_index].x <= candidate.x);
+                let parent_index = parent_pos.checked_sub(1).map(|pos| row[pos])?;
+                is_inline_script(rule, candidate, &items[parent_index]).then_some(index)
+            })
+            .collect();
+        row.extend(scripts);
+        row.sort_by(|&left, &right| items[left].x.total_cmp(&items[right].x));
+        row.dedup();
+
+        let x1 = row
+            .iter()
+            .map(|&index| items[index].x)
+            .fold(f32::INFINITY, f32::min);
+        let x2 = row
+            .iter()
+            .map(|&index| items[index].x + items[index].width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let max_font_size = row
+            .iter()
+            .map(|&index| items[index].font_size)
+            .fold(0.0, f32::max);
+        let pad = (max_font_size * STRIKE_OWNER_PAD_EM).max(STRIKE_OWNER_MIN_PAD);
+
+        if rule.x1 < x1 - pad || rule.x2 > x2 + pad {
+            continue;
+        }
+
+        let contiguous = row.windows(2).all(|pair| {
+            let gap = items[pair[1]].x - (items[pair[0]].x + items[pair[0]].width);
+            gap <= (max_font_size * 2.0).max(12.0)
+        });
+        if contiguous {
+            owned_indices.extend(row);
+        }
+    }
+
+    owned_indices.sort_unstable();
+    owned_indices.dedup();
+    owned_indices
+}
+
+/// Diagram and table rules participate in larger path geometry. A vertical
+/// or diagonal segment meeting the candidate rule is strong evidence that
+/// the horizontal segment is a connector, border, arrow, or symbol rather
+/// than an isolated text decoration.
+fn has_connected_nonhorizontal_segment(rule: &Rule, lines: &[UnderlineLine], page: u32) -> bool {
+    lines.iter().any(|line| {
+        if line.page != page {
+            return false;
+        }
+
+        let dx = line.x2 - line.x1;
+        let dy = line.y2 - line.y1;
+        if dy.abs() <= MAX_RULE_THICKNESS {
+            return false;
+        }
+
+        let y_min = line.y1.min(line.y2) - GRAPHIC_CONNECTION_EPS;
+        let y_max = line.y1.max(line.y2) + GRAPHIC_CONNECTION_EPS;
+        if rule.y < y_min || rule.y > y_max {
+            return false;
+        }
+
+        let t = (rule.y - line.y1) / dy;
+        if !(-0.05..=1.05).contains(&t) {
+            return false;
+        }
+        let intersection_x = line.x1 + t * dx;
+        intersection_x >= rule.x1 - GRAPHIC_CONNECTION_EPS
+            && intersection_x <= rule.x2 + GRAPHIC_CONNECTION_EPS
+    })
+}
+
+/// Filled diagrams often build connectors from intersecting thin rectangles
+/// instead of stroked path segments. Treat only narrow, vertically elongated
+/// rectangles as connector geometry; broad fills can legitimately sit behind
+/// struck text and must not veto its decoration.
+fn has_connected_nonhorizontal_rect(rule: &Rule, rects: &[PdfRect], page: u32) -> bool {
+    rects.iter().any(|rect| {
+        if rect.page != page {
+            return false;
+        }
+
+        let (x1, x2) = if rect.width >= 0.0 {
+            (rect.x, rect.x + rect.width)
+        } else {
+            (rect.x + rect.width, rect.x)
+        };
+        let (y1, y2) = if rect.height >= 0.0 {
+            (rect.y, rect.y + rect.height)
+        } else {
+            (rect.y + rect.height, rect.y)
+        };
+        let width = x2 - x1;
+        let height = y2 - y1;
+
+        width > 0.0
+            && width <= GRAPHIC_CONNECTOR_MAX_THICKNESS
+            && height > width * 2.0
+            && rule.y >= y1 - GRAPHIC_CONNECTION_EPS
+            && rule.y <= y2 + GRAPHIC_CONNECTION_EPS
+            && x2 >= rule.x1 - GRAPHIC_CONNECTION_EPS
+            && x1 <= rule.x2 + GRAPHIC_CONNECTION_EPS
+    })
+}
+
 /// Mark `is_underline` on text items that have a horizontal rule just
 /// below their baseline, and `is_strikeout` on items whose glyphs a rule
 /// crosses at mid x-height. `items`, `rects`, and `lines` are a single
@@ -440,27 +650,43 @@ pub(crate) fn mark_underlined_items(
         .map(|(i, _)| i)
         .collect();
 
-    for item in items.iter_mut() {
+    let mut strikeout_items = vec![false; items.len()];
+    for (rule_idx, rule) in rules.iter().enumerate() {
+        if tabular_rules.contains(&rule_idx)
+            || has_connected_nonhorizontal_segment(rule, lines, page)
+            || has_connected_nonhorizontal_rect(rule, rects, page)
+        {
+            continue;
+        }
+        for item_idx in snug_strike_owner_indices(rule, items) {
+            strikeout_items[item_idx] = true;
+        }
+    }
+
+    let underlined_items: HashSet<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            is_underline_candidate(item)
+                && rules.iter().enumerate().any(|(rule_idx, rule)| {
+                    !tabular_rules.contains(&rule_idx)
+                        && !fraction_rules.contains(&rule_idx)
+                        && rule_matches_item(rule, item)
+                })
+        })
+        .map(|(item_idx, _)| item_idx)
+        .collect();
+
+    for (item_idx, item) in items.iter_mut().enumerate() {
         if !is_underline_candidate(item) {
             continue;
         }
 
-        for (rule_idx, rule) in rules.iter().enumerate() {
-            if tabular_rules.contains(&rule_idx) {
-                continue;
-            }
-            // The fraction guard only gates UNDERLINE marking — a rule that
-            // reads as a fraction bar from below can still legitimately
-            // strike through a line above it.
-            if !fraction_rules.contains(&rule_idx) && rule_matches_item(rule, item) {
-                item.is_underline = true;
-            }
-            if rule_strikes_item(rule, item) {
-                item.is_strikeout = true;
-            }
-            if item.is_underline && item.is_strikeout {
-                break;
-            }
+        if strikeout_items[item_idx] {
+            item.is_strikeout = true;
+        }
+        if underlined_items.contains(&item_idx) {
+            item.is_underline = true;
         }
     }
 }
@@ -578,6 +804,148 @@ mod tests {
         mark_underlined_items(&mut items, &[], &lines, 1);
         assert!(items[0].is_strikeout);
         assert!(!items[0].is_underline);
+    }
+
+    #[test]
+    fn long_connector_crossing_text_is_not_a_strikeout() {
+        let mut items = vec![item("diagram label", 160.0, 500.0, 60.0, 10.0)];
+        let lines = vec![hline(100.0, 280.0, 503.0)];
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(!items[0].is_strikeout);
+    }
+
+    #[test]
+    fn chart_rule_ending_inside_short_label_is_not_a_strikeout() {
+        let mut items = vec![item("T 18", 300.0, 500.0, 20.0, 10.0)];
+        let lines = vec![hline(100.0, 315.0, 503.0)];
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(!items[0].is_strikeout);
+    }
+
+    #[test]
+    fn connected_diagram_segment_is_not_a_strikeout() {
+        let mut items = vec![item("V8", 100.0, 500.0, 12.0, 10.0)];
+        let lines = vec![
+            hline(99.0, 113.0, 503.0),
+            UnderlineLine {
+                x1: 106.0,
+                y1: 496.0,
+                x2: 109.0,
+                y2: 510.0,
+                stroke_width: 1.0,
+                page: 1,
+            },
+        ];
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(!items[0].is_strikeout);
+    }
+
+    #[test]
+    fn connected_filled_rect_is_not_a_strikeout() {
+        let mut items = vec![item("V8", 100.0, 500.0, 12.0, 10.0)];
+        let rects = vec![
+            thin_rect(99.0, 502.6, 14.0),
+            PdfRect {
+                x: 106.0,
+                y: 496.0,
+                width: 2.0,
+                height: 14.0,
+                page: 1,
+            },
+        ];
+
+        mark_underlined_items(&mut items, &rects, &[], 1);
+
+        assert!(!items[0].is_strikeout);
+    }
+
+    #[test]
+    fn broad_fill_behind_text_does_not_block_strikeout() {
+        let mut items = vec![item("deleted", 100.0, 500.0, 40.0, 10.0)];
+        let rects = vec![
+            thin_rect(99.0, 502.6, 42.0),
+            PdfRect {
+                x: 90.0,
+                y: 490.0,
+                width: 100.0,
+                height: 20.0,
+                page: 1,
+            },
+        ];
+
+        mark_underlined_items(&mut items, &rects, &[], 1);
+
+        assert!(items[0].is_strikeout);
+    }
+
+    #[test]
+    fn list_bullet_is_not_a_strikeout() {
+        for marker in ["•", "-", "*"] {
+            let mut items = vec![item(marker, 100.0, 500.0, 6.0, 10.0)];
+            let lines = vec![hline(99.0, 107.0, 503.0)];
+
+            mark_underlined_items(&mut items, &[], &lines, 1);
+
+            assert!(!items[0].is_strikeout, "marker {marker:?}");
+        }
+    }
+
+    #[test]
+    fn snug_rule_marks_adjacent_split_runs_as_strikeout() {
+        let mut items = vec![
+            item("deleted", 100.0, 500.0, 40.0, 10.0),
+            item("text", 142.0, 500.0, 25.0, 10.0),
+        ];
+        let lines = vec![hline(99.0, 168.0, 503.0)];
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(items.iter().all(|item| item.is_strikeout));
+    }
+
+    #[test]
+    fn snug_rule_groups_split_runs_with_baseline_drift() {
+        let mut items = vec![
+            item("deleted", 100.0, 500.0, 40.0, 10.0),
+            item("text", 142.0, 498.0, 25.0, 10.0),
+        ];
+        let lines = vec![hline(99.0, 168.0, 503.0)];
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(items.iter().all(|item| item.is_strikeout));
+    }
+
+    #[test]
+    fn snug_rule_keeps_inline_superscript_in_strike_owner() {
+        let mut items = vec![
+            item("deleted", 100.0, 500.0, 40.0, 10.0),
+            item("2", 140.5, 503.0, 4.0, 6.0),
+        ];
+        let lines = vec![hline(99.0, 145.0, 503.0)];
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(items.iter().all(|item| item.is_strikeout));
+    }
+
+    #[test]
+    fn snug_rule_keeps_inline_subscript_in_strike_owner() {
+        let mut items = vec![
+            item("deleted", 100.0, 500.0, 40.0, 10.0),
+            item("2", 140.5, 497.0, 4.0, 6.0),
+        ];
+        let lines = vec![hline(99.0, 145.0, 503.0)];
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(items.iter().all(|item| item.is_strikeout));
     }
 
     #[test]

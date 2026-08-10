@@ -1310,6 +1310,18 @@ fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
 }
 
+/// First two pages of Shannon's "A Mathematical Theory of Communication"
+/// (1998 dvips 5.58 → Distiller 3 retypesetting). Canonical legacy-TeX PDF:
+/// non-embedded base-14 fonts with no /Widths (exercises the built-in AFM
+/// metrics fallback), Type3 PK bitmap math fonts with FontMatrix
+/// [1 0 0 -1 0 0] (exercises visual-size scaling), a two-line embedded drop
+/// cap, indent-only paragraph breaks, and display math that must not be
+/// detected as tables or headings.
+#[test]
+fn test_snapshot_shannon_entropy() {
+    assert_snapshot("shannon-entropy-p1-2");
+}
+
 // ============================================================================
 // Pages Needing OCR Tests
 // ============================================================================
@@ -3914,6 +3926,65 @@ fn encrypted_pdf_decrypts_with_correct_password() {
     );
 }
 
+/// Regression for the #231 review finding: `extract_pages_markdown`'s
+/// `has_template_image` check must be gated the same way
+/// `classify_pdf`/`detect_pdf_type` gates it (image_count <= 1, few text
+/// ops, low alphanumeric diversity) — not treated as sufficient on its
+/// own. The fixture is a real text page with substantial, richly varied
+/// body text (>=50 Tj ops) drawn over a full-bleed background image
+/// (e.g. letterhead/watermark). Before the fix, has_template_image alone
+/// forced needs_ocr=true and discarded the page's clean markdown; now the
+/// page must extract normally.
+#[test]
+fn test_extract_pages_markdown_does_not_ocr_text_page_with_watermark_image() {
+    let buf = std::fs::read("tests/fixtures/text_page_with_watermark_image.pdf").unwrap();
+
+    let ext = extract_pages_markdown_mem(&buf, None).expect("fixture should extract");
+    let page = &ext.pages[0];
+    assert!(
+        !page.needs_ocr,
+        "a text page with substantial real text should not be routed to OCR \
+         just because it has a background image"
+    );
+    assert!(
+        page.markdown.contains("watermark"),
+        "expected the page's real body text to be preserved, got: {:?}",
+        page.markdown
+    );
+}
+
+/// Regression for the #231 review finding: `extract_pages_markdown` never
+/// checked `has_vector_text` at all, even though `detect_from_document`'s
+/// Mixed-type per-page routing always sends vector-outlined-text pages to
+/// OCR (outlined glyphs can't be extracted as text). A page with massive
+/// path ops (outlined decorative text) plus a short genuine caption would
+/// extract that caption cleanly — non-empty, non-garbled — so the
+/// existing empty/garbage-text checks alone couldn't catch it.
+#[test]
+fn test_extract_pages_markdown_ocrs_page_with_vector_outlined_text() {
+    let buf = std::fs::read("tests/fixtures/vector_outlined_text_with_caption.pdf").unwrap();
+
+    let cls = pdf_inspector::detector::detect_pdf_type_mem(&buf).expect("fixture should classify");
+    assert!(
+        cls.pages_needing_ocr.contains(&1),
+        "classify_pdf should flag page 1 as needing OCR (vector-outlined text), got: {:?}",
+        cls.pages_needing_ocr
+    );
+
+    let ext = extract_pages_markdown_mem(&buf, None).expect("fixture should extract");
+    let page = &ext.pages[0];
+    assert!(
+        page.needs_ocr,
+        "extract_pages_markdown must agree with classify_pdf that this page needs OCR"
+    );
+    assert!(
+        page.markdown.is_empty(),
+        "a page flagged needs_ocr must not return markdown as if extraction were \
+         trustworthy, got: {:?}",
+        page.markdown
+    );
+}
+
 #[test]
 fn pdf_options_debug_redacts_password() {
     let opts = PdfOptions::new().password("secret123");
@@ -3923,4 +3994,61 @@ fn pdf_options_debug_redacts_password() {
         "password leaked in Debug: {dbg}"
     );
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
+}
+
+/// Regression for #228: a `startxref` pointer corrupted to point at the
+/// wrong byte offset (a single flipped digit — a real, common writer bug)
+/// must not make the whole file unprocessable. The real classic xref table
+/// is still present and findable by scanning for the `xref` keyword; both
+/// pypdf and pdfium recover the same way. Before this fix, every entry
+/// point raised "Invalid PDF structure" on a file whose object data was
+/// otherwise completely intact.
+#[test]
+fn test_process_pdf_recovers_corrupted_startxref_pointer() {
+    let result = process_pdf_with_options(
+        "tests/fixtures/broken_startxref_pointer.pdf",
+        PdfOptions::new(),
+    )
+    .expect("a corrupted startxref pointer should be recoverable, like pypdf/pdfium");
+
+    assert_eq!(result.page_count, 1);
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Order Detail Report by Account") && md.contains("WIDGET ASSEMBLY"),
+        "recovered document should extract its real text, got: {md:?}"
+    );
+}
+
+/// Regression for #227: `extract_pages_markdown`'s per-page `needs_ocr`
+/// must agree with `classify_pdf`/`detect_pdf_type` on the same page. The
+/// fixture is a full-page raster "scan" with a single line of genuine
+/// native text drawn over it (a header) — the native text extracts
+/// perfectly cleanly (no decoding issues, non-empty), so a needs_ocr
+/// computation based on text-quality signals alone says `false`, while
+/// detection correctly sees a dominant background image and says the page
+/// needs OCR. Both must now agree it needs OCR, and the markdown must not
+/// be returned as if the extraction were trustworthy.
+#[test]
+fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header() {
+    let buf = std::fs::read("tests/fixtures/scan_with_native_header_text.pdf").unwrap();
+
+    let cls = pdf_inspector::detector::detect_pdf_type_mem(&buf).expect("fixture should classify");
+    assert!(
+        cls.pages_needing_ocr.contains(&1),
+        "classify_pdf should flag page 1 as needing OCR (image-dominated), got: {:?}",
+        cls.pages_needing_ocr
+    );
+
+    let ext = extract_pages_markdown_mem(&buf, None).expect("fixture should extract");
+    let page = &ext.pages[0];
+    assert!(
+        page.needs_ocr,
+        "extract_pages_markdown must agree with classify_pdf that this page needs OCR"
+    );
+    assert!(
+        page.markdown.is_empty(),
+        "a page flagged needs_ocr must not return markdown as if extraction were \
+         trustworthy, got: {:?}",
+        page.markdown
+    );
 }

@@ -37,6 +37,7 @@ scripts/
 
 # Test output
 test_output/
+.firecrawl/
 
 # Python
 __pycache__/
