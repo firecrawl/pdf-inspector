@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "stringio"
+
 RSpec.describe PdfInspector do
   let(:fixture_path) { File.join(PdfInspector::FIXTURES, "thermo-freon12.pdf") }
   let(:encrypted_path) { File.join(PdfInspector::FIXTURES, "encrypted-secret123.pdf") }

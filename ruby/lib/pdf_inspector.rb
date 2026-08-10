@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "pathname"
+
 require_relative "pdf_inspector/version"
 require_relative "pdf_inspector/errors"
 require_relative "pdf_inspector/types"
