@@ -11,7 +11,7 @@ mod reading_order;
 pub(crate) mod underline;
 mod xobjects;
 
-use crate::text_utils::{is_cjk_char, is_rtl_text};
+use crate::text_utils::{is_cjk_char, is_rtl_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
 use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
@@ -913,6 +913,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
             group.sort_by(|a, b| b.x.total_cmp(&a.x));
+            restore_ltr_runs(&mut group);
         } else if !preserve_stream_order {
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
         }
@@ -1032,6 +1033,33 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     }
 
     merged
+}
+
+/// Put embedded left-to-right sequences back into reading order.
+///
+/// An RTL line is ordered right to left, which is right for its words and wrong
+/// for anything Latin inside it. Where such a run is one item the ordering never
+/// touches it, but producers routinely emit an email or a phone number one glyph
+/// per item — and then the line sort reverses the glyphs themselves, turning
+/// `ariel.goarian@gmail.com` into `moc.liamg@nairaog.leira`.
+///
+/// So each maximal run of items carrying no RTL character is flipped back.
+fn restore_ltr_runs(items: &mut [&TextItem]) {
+    let is_rtl_item = |it: &&TextItem| it.text.chars().any(is_rtl_char);
+    let mut i = 0;
+    while i < items.len() {
+        if is_rtl_item(&items[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < items.len() && !is_rtl_item(&items[i]) {
+            i += 1;
+        }
+        if i - start > 1 {
+            items[start..i].reverse();
+        }
+    }
 }
 
 /// Merge subscript/superscript items into their adjacent parent items.
