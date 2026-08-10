@@ -43,3 +43,8 @@ test_output/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Ruby
+/ruby/ext/pdf_inspector_native/target
+/ruby/tmp/arm64-darwin25
+/ruby/Gemfile.lock

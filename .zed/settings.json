@@ -1,0 +1,17 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "settings": {
+        "rust-analyzer.linkedProjects": [
+          "Cargo.toml",
+          "ruby/ext/pdf_inspector_native/Cargo.toml"
+        ]
+      }
+    },
+    "rubocop": {
+      "settings": {
+        "use_bundler": false
+      }
+    }
+  }
+}

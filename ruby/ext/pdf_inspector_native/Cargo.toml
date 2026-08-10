@@ -1,0 +1,17 @@
+[package]
+name = "pdf_inspector_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+path = "./src/lib.rs"
+
+[dependencies]
+pdf-inspector = { path = "../../.." }
+magnus = "0.8"
+rb-sys = { version = "0.9", default-features = false, features = ["stable-api-compiled-fallback"] }
+
+[profile.release]
+lto = true
+strip = "debuginfo"

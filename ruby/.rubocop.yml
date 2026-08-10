@@ -1,0 +1,13 @@
+plugins:
+  - rubocop-performance
+  - rubocop-rspec
+  - rubocop-thread_safety
+
+AllCops:
+  NewCops: enable
+  TargetRubyVersion: 3.2
+  UseProjectIndex: true
+
+Style/StringLiterals:
+  Enabled: false
+  EnforcedStyle: double_quotes
