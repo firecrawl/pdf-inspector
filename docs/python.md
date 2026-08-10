@@ -113,12 +113,18 @@ class PdfResult:                     # process_pdf / detect_pdf
     processing_time_ms: int
     pages_needing_ocr: list[int]     # 1-indexed
     ocr_reasons_by_page: list[PageOcrReasons]
+    page_signals: list[PageSignals]  # per-page direction + confidence (present when extraction ran)
     title: str | None
     confidence: float                # 0.0 - 1.0
     is_complex_layout: bool
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool        # broken font encodings — consider OCR fallback
+
+class PageSignals:                   # per-page direction + text-confidence (process_pdf, present whenever extraction ran)
+    page: int                        # 1-indexed
+    direction: str                   # "ltr" | "rtl" | "mixed"
+    confidence: float                # 0.0 - 1.0 (1.0 clean text, 0.0 no usable text)
 
 class PageOcrReasons:                # per-page OCR diagnostics
     page: int                        # 1-indexed
@@ -155,10 +161,40 @@ class PageRegionTexts:               # extract_text_in_regions
     regions: list[RegionText]
 
 class PagesExtractionResult:         # extract_pages_markdown
-    pages: list[PageMarkdown]        # PageMarkdown: page (0-indexed), markdown, needs_ocr, ocr_reason
+    pages: list[PageMarkdown]        # PageMarkdown: page (0-indexed), markdown, needs_ocr, ocr_reason, direction, confidence
     pages_with_tables: list[int]     # 1-indexed
     pages_with_columns: list[int]    # 1-indexed
     pages_needing_ocr: list[int]     # 1-indexed
     ocr_reasons_by_page: list[PageOcrReasons]
     is_complex: bool                 # any page has tables or multi-column layout
 ```
+
+Per-page markdown entries expose the reading direction and a per-page
+text-confidence score:
+
+```python
+result = pdf_inspector.extract_pages_markdown_bytes(data)
+page = result.pages[0]
+page.direction      # "ltr" | "rtl" | "mixed" — RTL ordering was applied when != "ltr"
+page.confidence     # 0.0 - 1.0: 1.0 clean text layer, 0.15 binary garbled
+                    # evidence, 0.0 when the page has no usable text
+```
+
+### OCR reason vocabulary
+
+`ocr_reasons_by_page` entries and `PageMarkdown.ocr_reason` carry
+machine-readable reason identifiers. The vocabulary is four literals:
+
+| Reason | Meaning |
+|---|---|
+| `suspected_garbled_text` | Text layer decodes to garbage (broken ToUnicode, cipher-shifted, PUA/C1 runs) |
+| `scanned` | Image-backed page with no usable text layer |
+| `no_text` | No extractable text and no image to OCR |
+| `vector_text` | Text drawn as vector outlines, not real text operators |
+
+Reasons are multi-valued per page. On `extract_pages_markdown`,
+`PageMarkdown.ocr_reason` only ever carries `suspected_garbled_text` or
+`None`. `phantom_empty_row`, `detection_error`, and `multi_row_in_cell` are
+TSR table-fallback labels, not OCR reasons. `PageMarkdown` direction +
+confidence follow the 0-indexed page number; `PdfResult.page_signals`
+entries are 1-indexed. See `docs/rust-api.md` for the full contract.

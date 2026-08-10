@@ -230,6 +230,10 @@ pub(crate) struct TextQualityReport {
     pub(crate) pages_needing_ocr: Vec<u32>,
     pub(crate) has_encoding_issues: bool,
     pub(crate) reasons_by_page: BTreeMap<u32, Vec<String>>,
+    /// Per-page text-confidence (0.0–1.0) per the confidence contract: 0.0 when the page has
+    /// no extractable text, 0.15 for binary garbled evidence (cipher-garble or
+    /// Strong-span flags), otherwise density-graded by replacement density.
+    pub(crate) confidence_by_page: BTreeMap<u32, f32>,
 }
 
 #[derive(Debug, Default)]
@@ -239,6 +243,9 @@ struct PageTextQualityEvidence {
     replacement_spans: usize,
     longest_replacement_run: usize,
     cipher_garble: CipherGarbleStats,
+    /// Set when a Strong span-level decoding issue (dollar-as-space, PUA
+    /// runs, C1 controls, item-level CID garbage) was observed.
+    strong_flag: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +269,7 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
 
         match text_span_decoding_issue_kind(&item.text) {
             Some(TextSpanIssueKind::Strong) => {
+                evidence.strong_flag = true;
                 add_ocr_reason(
                     &mut reasons_by_page,
                     item.page,
@@ -276,6 +284,11 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
             }
             None => {}
         }
+    }
+
+    let mut confidence_by_page = BTreeMap::new();
+    for (page, evidence) in evidence_by_page.iter() {
+        confidence_by_page.insert(*page, page_confidence(evidence));
     }
 
     for (page, evidence) in evidence_by_page {
@@ -297,7 +310,24 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         has_encoding_issues: !pages_needing_ocr.is_empty(),
         pages_needing_ocr,
         reasons_by_page,
+        confidence_by_page,
     }
+}
+
+/// Per-page text-confidence (0.0–1.0) per the confidence contract:
+/// - no extractable text → 0.0
+/// - binary garbled evidence (cipher-garble or a Strong-span flag) → 0.15
+/// - otherwise density-graded by replacement chars per 10,000 non-whitespace
+///   chars: 1.0 clean, 0.5 at 500 bps, 0.0 at ≥ 1000 bps.
+fn page_confidence(evidence: &PageTextQualityEvidence) -> f32 {
+    if evidence.chars == 0 {
+        return 0.0;
+    }
+    if evidence.cipher_garble.looks_garbled() || evidence.strong_flag {
+        return 0.15;
+    }
+    let bps = evidence.replacement_chars as f64 / evidence.chars as f64 * 10_000.0;
+    (1.0 - (bps / 1000.0).min(1.0)).max(0.0) as f32
 }
 
 pub(crate) fn region_items_have_decoding_issue(items: &[TextItem]) -> bool {
@@ -517,4 +547,120 @@ pub(crate) fn is_cid_garbage(text: &str) -> bool {
     // page to OCR.
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
     total >= 20 && high_latin * 5 >= total * 2 && ascii_letters * 3 < total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ItemType, TextItem};
+
+    fn item(text: &str, page: u32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            font: "Helvetica".to_string(),
+            font_size: 10.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    /// Apply a fixed random substitution cipher to lowercase ASCII letters.
+    /// The resulting histogram is a permutation of natural English (sorted
+    /// shape cosine high) with letters in the wrong positions (unsorted
+    /// position cosine low) — the substitution-cipher signature `looks_garbled`
+    /// detects (key = seed-0 shuffle, verified: pos_cos 0.48, shape 0.99).
+    fn substitution_cipher(text: &str) -> String {
+        let key: Vec<char> = "oaxsgfhkwuecvdrltjzpqibnym".chars().collect();
+        text.chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() {
+                    key[(c as u8 - b'a') as usize]
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    fn page_1_confidence(items: &[TextItem]) -> f32 {
+        analyze_text_quality(items).confidence_by_page[&1]
+    }
+
+    #[test]
+    fn confidence_clean_page_is_one() {
+        let items = [item("The quick brown fox jumps over the lazy dog.", 1)];
+        assert_eq!(page_1_confidence(&items), 1.0);
+    }
+
+    #[test]
+    fn confidence_whitespace_only_page_is_zero() {
+        let items = [item("   \n\t  ", 1)];
+        assert_eq!(page_1_confidence(&items), 0.0);
+    }
+
+    #[test]
+    fn confidence_no_items_page_absent() {
+        let report = analyze_text_quality(&[]);
+        assert!(report.confidence_by_page.is_empty());
+    }
+
+    #[test]
+    fn confidence_replacement_at_threshold_is_half() {
+        // 5 replacement chars in 100 non-whitespace chars = 500 bps → 0.5.
+        let text: String =
+            "hello\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}".to_string() + &"a".repeat(90);
+        let items = [item(&text, 1)];
+        assert_eq!(page_1_confidence(&items), 0.5);
+    }
+
+    #[test]
+    fn confidence_moderate_replacement_band() {
+        // 2 replacement chars in 100 non-whitespace chars = 200 bps → 0.8.
+        let text: String = "a".repeat(98) + "\u{FFFD}\u{FFFD}";
+        let items = [item(&text, 1)];
+        assert_eq!(page_1_confidence(&items), 0.8);
+    }
+
+    #[test]
+    fn confidence_replacement_saturated_is_zero() {
+        // 20 replacement chars in 100 non-whitespace chars = 2000 bps → 0.0.
+        let text: String = "\u{FFFD}".repeat(20) + &"a".repeat(80);
+        let items = [item(&text, 1)];
+        assert_eq!(page_1_confidence(&items), 0.0);
+    }
+
+    #[test]
+    fn confidence_cipher_garbled_is_015() {
+        let clean = "The quick brown fox jumps over the lazy dog while the industrious \
+                     ant carries a grain of rice across the warm sunlit garden path \
+                     toward its busy underground colony hidden beneath the ancient \
+                     oak tree near the quiet brook that winds gently through the \
+                     verdant meadow and into the dense forest of tall pines";
+        let items = [item(&substitution_cipher(clean), 1)];
+        assert_eq!(page_1_confidence(&items), 0.15);
+    }
+
+    #[test]
+    fn confidence_private_use_span_is_015() {
+        // PUA runs are a Strong span-level issue (dollar-as-space / PUA / C1).
+        let items = [item("\u{E000}\u{E001}\u{E002}\u{E003}\u{E004}\u{E005}", 1)];
+        assert_eq!(page_1_confidence(&items), 0.15);
+    }
+
+    #[test]
+    fn confidence_multi_page_is_per_page() {
+        let items = [item("Clean text on page one.", 1), item("   ", 2)];
+        let report = analyze_text_quality(&items);
+        assert_eq!(report.confidence_by_page[&1], 1.0);
+        assert_eq!(report.confidence_by_page[&2], 0.0);
+    }
 }

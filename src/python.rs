@@ -33,6 +33,10 @@ pub struct PyPdfResult {
     /// Machine-readable OCR reasons by 1-indexed page.
     #[pyo3(get)]
     pub ocr_reasons_by_page: Vec<PyPageOcrReasons>,
+    /// Per-page reading direction + text-confidence signals, one entry per
+    /// processed page (1-indexed). Present when extraction ran.
+    #[pyo3(get)]
+    pub page_signals: Vec<PyPageSignals>,
     /// Title from PDF metadata.
     #[pyo3(get)]
     pub title: Option<String>,
@@ -81,6 +85,31 @@ impl PyPageOcrReasons {
         format!(
             "PageOcrReasons(page={}, reasons={:?})",
             self.page, self.reasons
+        )
+    }
+}
+
+/// Per-page reading direction and text-confidence for Full-mode results.
+#[pyclass(name = "PageSignals")]
+#[derive(Clone)]
+pub struct PyPageSignals {
+    /// 1-indexed page number.
+    #[pyo3(get)]
+    pub page: u32,
+    /// Reading direction of this page's text layer: "ltr", "rtl", or "mixed".
+    #[pyo3(get)]
+    pub direction: String,
+    /// Per-page text-confidence (0.0-1.0).
+    #[pyo3(get)]
+    pub confidence: f32,
+}
+
+#[pymethods]
+impl PyPageSignals {
+    fn __repr__(&self) -> String {
+        format!(
+            "PageSignals(page={}, direction='{}', confidence={:.2})",
+            self.page, self.direction, self.confidence
         )
     }
 }
@@ -191,16 +220,24 @@ pub struct PyPageMarkdown {
     /// Machine-readable OCR reason when the cause is known.
     #[pyo3(get)]
     pub ocr_reason: Option<String>,
+    /// Reading direction of this page's text layer: "ltr", "rtl", or "mixed".
+    #[pyo3(get)]
+    pub direction: String,
+    /// Per-page text-confidence (0.0-1.0): 1.0 clean text, 0.0 no usable text.
+    #[pyo3(get)]
+    pub confidence: f32,
 }
 
 #[pymethods]
 impl PyPageMarkdown {
     fn __repr__(&self) -> String {
         format!(
-            "PageMarkdown(page={}, markdown='{}', needs_ocr={})",
+            "PageMarkdown(page={}, markdown='{}', needs_ocr={}, direction='{}', confidence={:.2})",
             self.page,
             self.markdown.chars().take(40).collect::<String>(),
-            self.needs_ocr
+            self.needs_ocr,
+            self.direction,
+            self.confidence
         )
     }
 }
@@ -307,6 +344,15 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         processing_time_ms: r.processing_time_ms,
         pages_needing_ocr: r.pages_needing_ocr,
         ocr_reasons_by_page: to_py_page_ocr_reasons(r.ocr_reasons_by_page),
+        page_signals: r
+            .page_signals
+            .into_iter()
+            .map(|s| PyPageSignals {
+                page: s.page,
+                direction: s.direction.to_string(),
+                confidence: s.confidence,
+            })
+            .collect(),
         title: r.title,
         confidence: r.confidence,
         is_complex_layout: r.layout.is_complex,
@@ -402,6 +448,8 @@ fn to_py_pages_result(r: crate::PagesExtractionResult) -> PyPagesExtractionResul
                 markdown: p.markdown,
                 needs_ocr: p.needs_ocr,
                 ocr_reason: p.ocr_reason,
+                direction: p.direction.to_string(),
+                confidence: p.confidence,
             })
             .collect(),
         pages_with_tables: r.pages_with_tables,
@@ -618,6 +666,7 @@ fn extract_pages_markdown_bytes(
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfResult>()?;
     m.add_class::<PyPageOcrReasons>()?;
+    m.add_class::<PyPageSignals>()?;
     m.add_class::<PyPdfClassification>()?;
     m.add_class::<PyTextItem>()?;
     m.add_class::<PyRegionText>()?;

@@ -24,6 +24,13 @@ assert.equal(typeof result.isComplexLayout, 'boolean');
 assert.ok(Array.isArray(result.pagesWithTables));
 assert.ok(Array.isArray(result.pagesWithColumns));
 assert.equal(typeof result.hasEncodingIssues, 'boolean');
+assert.ok(Array.isArray(result.pageSignals));
+assert.equal(result.pageSignals.length, 3);
+for (const s of result.pageSignals) {
+  assert.ok(Number.isInteger(s.page) && s.page >= 1);
+  assert.ok(['ltr', 'rtl', 'mixed'].includes(s.direction));
+  assert.ok(typeof s.confidence === 'number' && s.confidence >= 0 && s.confidence <= 1);
+}
 console.log('  processPdf: OK');
 
 // processPdf with pages
@@ -37,6 +44,7 @@ const detected = detectPdf(fixture);
 assert.equal(detected.pdfType, 'TextBased');
 assert.equal(detected.pageCount, 3);
 assert.equal(detected.markdown, undefined);
+assert.deepEqual(detected.pageSignals, []);
 console.log('  detectPdf: OK');
 
 // --- classifyPdf ---
@@ -111,6 +119,8 @@ assert.equal(allPages.pages.length, 3);
 assert.deepEqual(allPages.pages.map(p => p.page), [0, 1, 2]);
 assert.ok(typeof allPages.pages[0].markdown === 'string');
 assert.equal(typeof allPages.pages[0].needsOcr, 'boolean');
+assert.ok(['ltr', 'rtl', 'mixed'].includes(allPages.pages[0].direction));
+assert.ok(typeof allPages.pages[0].confidence === 'number' && allPages.pages[0].confidence >= 0 && allPages.pages[0].confidence <= 1);
 assert.ok(Array.isArray(allPages.pagesWithTables));
 assert.ok(Array.isArray(allPages.pagesWithColumns));
 assert.ok(Array.isArray(allPages.pagesNeedingOcr));

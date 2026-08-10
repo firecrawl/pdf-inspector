@@ -118,6 +118,36 @@ pub const OCR_REASON_NO_TEXT: &str = "no_text";
 /// rather than real text operators, so it cannot be extracted as characters.
 pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
 
+/// Reading direction of a page's text layer, as determined by the RTL
+/// detection that drives reading-order logic (`is_rtl_text`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageDirection {
+    /// Left-to-right text (the default).
+    Ltr,
+    /// Right-to-left text (Hebrew, Arabic, ...); RTL ordering was applied.
+    Rtl,
+    /// Both LTR and RTL text on the page; RTL ordering was applied on some
+    /// lines. Callers keying on RTL must test `direction != "ltr"`.
+    Mixed,
+}
+
+impl PageDirection {
+    /// Machine-readable serialization: `"ltr"`, `"rtl"`, or `"mixed"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PageDirection::Ltr => "ltr",
+            PageDirection::Rtl => "rtl",
+            PageDirection::Mixed => "mixed",
+        }
+    }
+}
+
+impl std::fmt::Display for PageDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // =========================================================================
 // Result type
 // =========================================================================
@@ -129,6 +159,19 @@ pub struct PageOcrReasons {
     pub page: u32,
     /// Machine-readable OCR reason identifiers.
     pub reasons: Vec<String>,
+}
+
+/// Per-page reading direction and text-confidence for Full-mode process
+/// results.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageSignals {
+    /// 1-indexed page number (matching `pages_needing_ocr`).
+    pub page: u32,
+    /// Reading direction of this page's text layer.
+    pub direction: PageDirection,
+    /// Per-page text-confidence (0.0–1.0); see the confidence formula
+    /// contract. 0.0 when the page has no usable text layer.
+    pub confidence: f32,
 }
 
 /// High-level PDF processing result.
@@ -146,6 +189,12 @@ pub struct PdfProcessResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// Per-page reading direction + text-confidence signals, one entry per
+    /// processed page (1-indexed). Populated when extraction ran (Full or
+    /// Analyze mode); empty for DetectOnly and Scanned/ImageBased results.
+    /// A page filter naming pages beyond `page_count` yields default entries
+    /// (`ltr` / 0.0), mirroring the extraction path's out-of-range convention.
+    pub page_signals: Vec<PageSignals>,
     /// Title from PDF metadata (if available).
     pub title: Option<String>,
     /// Detection confidence score (0.0–1.0).
@@ -417,6 +466,11 @@ pub struct PageMarkdown {
     pub needs_ocr: bool,
     /// Machine-readable OCR reason when the cause is known.
     pub ocr_reason: Option<String>,
+    /// Reading direction of this page's text layer (`"ltr"`, `"rtl"`, `"mixed"`).
+    pub direction: PageDirection,
+    /// Per-page text-confidence (0.0–1.0): 1.0 for a clean text layer, 0.0 when
+    /// the page has no usable text. Derived from per-page text-quality evidence.
+    pub confidence: f32,
 }
 
 /// Combined per-page markdown extraction and layout classification result.
@@ -527,6 +581,8 @@ pub fn extract_pages_markdown_mem(
                 markdown: String::new(),
                 needs_ocr: true,
                 ocr_reason: None,
+                direction: PageDirection::Ltr,
+                confidence: 0.0,
             });
             continue;
         }
@@ -549,6 +605,19 @@ pub fn extract_pages_markdown_mem(
 
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
+
+        // Direction + per-page confidence are computed over the same items that
+        // feed the emitted markdown (page-number removal applied), so the signal
+        // matches the output a caller can inspect.
+        let (direction, confidence) = page_signal(
+            page_items
+                .iter()
+                .zip(&page_number_removal_mask)
+                .filter(|(_, remove)| !**remove)
+                .map(|(item, _)| item),
+            &text_quality.confidence_by_page,
+            page_1idx,
+        );
 
         // A page can extract cleanly (no decoding issues, non-empty text)
         // while still being fundamentally a scan: a full-page raster with
@@ -630,6 +699,8 @@ pub fn extract_pages_markdown_mem(
             markdown: if needs_ocr { String::new() } else { md },
             needs_ocr,
             ocr_reason,
+            direction,
+            confidence,
         });
     }
 
@@ -3753,6 +3824,7 @@ fn process_document(
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
+            page_signals: Vec::new(),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3769,6 +3841,7 @@ fn process_document(
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
+            page_signals: Vec::new(),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3859,6 +3932,7 @@ fn process_document(
         gid_pages,
         text_quality_pages,
         text_quality_reasons_by_page,
+        page_signals,
     ) = match extracted {
         Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
@@ -3965,6 +4039,45 @@ fn process_document(
                 &chart_regions,
             );
 
+            // Per-page signals (direction + text-confidence) for Full-mode
+            // process results. Computed before `items` is consumed by markdown
+            // generation; page-number footers are removed first (matching the
+            // `extract_pages_markdown` signal), and pages with no text items
+            // default to ltr / 0.0. One O(items) pass buckets by page instead
+            // of re-scanning the full item list per page.
+            let mut items_by_page: std::collections::HashMap<u32, Vec<&TextItem>> =
+                std::collections::HashMap::new();
+            for (item, remove) in items.iter().zip(&removal_mask) {
+                if !*remove {
+                    items_by_page.entry(item.page).or_default().push(item);
+                }
+            }
+            let mut page_signals = Vec::with_capacity(page_count as usize);
+            let signal_pages: Vec<u32> = match &options.page_filter {
+                Some(filter) => {
+                    let mut pages: Vec<u32> = filter.iter().copied().filter(|&p| p >= 1).collect();
+                    pages.sort_unstable();
+                    pages
+                }
+                None => (1..=page_count).collect(),
+            };
+            for page in signal_pages {
+                let bucket = items_by_page
+                    .get(&page)
+                    .map(|v| v.as_slice())
+                    .unwrap_or_default();
+                let (direction, confidence) = page_signal(
+                    bucket.iter().copied(),
+                    &text_quality.confidence_by_page,
+                    page,
+                );
+                page_signals.push(PageSignals {
+                    page,
+                    direction,
+                    confidence,
+                });
+            }
+
             let md = if options.mode == ProcessMode::Analyze {
                 None
             } else {
@@ -3995,6 +4108,7 @@ fn process_document(
                 gid_encoded_pages,
                 text_quality.pages_needing_ocr,
                 ocr_reasons_by_page,
+                page_signals,
             )
         }
         None => (
@@ -4004,6 +4118,7 @@ fn process_document(
             std::collections::HashSet::new(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
         ),
     };
 
@@ -4016,6 +4131,15 @@ fn process_document(
         } else {
             (pdf_type, markdown, confidence)
         };
+
+    // The documented contract says Scanned/ImageBased results carry no per-page
+    // signals. A Mixed PDF upgraded to Scanned above extracted normally, so its
+    // page_signals were populated — clear them to honor the invariant.
+    let page_signals = if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
+        Vec::new()
+    } else {
+        page_signals
+    };
 
     // If a TextBased PDF produces garbage text, the fonts are undecodable
     // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
@@ -4106,6 +4230,7 @@ fn process_document(
         title,
         confidence,
         layout,
+        page_signals,
         has_encoding_issues,
     })
 }
@@ -4116,6 +4241,34 @@ fn process_document(
 
 fn suspected_garbled_reason() -> String {
     OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()
+}
+
+/// Per-page direction + text-confidence for a page's text items (post
+/// page-number removal), defaulting to `ltr` / 0.0 when the page has no text
+/// items or no confidence evidence. Shared by the extraction and Full-mode
+/// process paths so the signal contract stays in sync.
+pub(crate) fn page_signal<'a, I>(
+    page_items: I,
+    confidence_by_page: &BTreeMap<u32, f32>,
+    page_1idx: u32,
+) -> (PageDirection, f32)
+where
+    I: IntoIterator<Item = &'a TextItem>,
+{
+    let items: Vec<&TextItem> = page_items.into_iter().collect();
+    let has_text = items.iter().any(|item| {
+        matches!(
+            item.item_type,
+            crate::types::ItemType::Text | crate::types::ItemType::FormField
+        )
+    });
+    if !has_text {
+        // No usable text survives page-number removal: nothing to grade.
+        return (PageDirection::Ltr, 0.0);
+    }
+    let direction = crate::text_utils::page_direction(items);
+    let confidence = confidence_by_page.get(&page_1idx).copied().unwrap_or(0.0);
+    (direction, confidence)
 }
 
 pub(crate) fn add_ocr_reason(
@@ -6094,6 +6247,29 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    #[test]
+    fn page_signal_grades_zero_when_only_non_text_remains() {
+        // A page whose only remaining item after page-number removal is an
+        // image must not inherit the removed text's confidence.
+        let mut img = test_item("", 0.0, 0.0, 100.0, 100.0);
+        img.item_type = ItemType::Image;
+        let mut conf = BTreeMap::new();
+        conf.insert(1, 1.0); // stale entry from removed page-number text
+        let (direction, confidence) = page_signal([&img].into_iter(), &conf, 1);
+        assert_eq!(direction, PageDirection::Ltr);
+        assert_eq!(confidence, 0.0);
+    }
+
+    #[test]
+    fn page_signal_grades_form_field_text() {
+        let mut field = test_item("Name: John", 0.0, 0.0, 100.0, 10.0);
+        field.item_type = ItemType::FormField;
+        let mut conf = BTreeMap::new();
+        conf.insert(1, 1.0);
+        let (_, confidence) = page_signal([&field].into_iter(), &conf, 1);
+        assert_eq!(confidence, 1.0);
+    }
 
     fn test_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
         TextItem {

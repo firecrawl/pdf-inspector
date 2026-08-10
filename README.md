@@ -17,6 +17,7 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **Table detection** — Dual-mode: rectangle-based detection from PDF drawing ops, plus heuristic detection from text alignment. Handles financial tables, footnotes, and continuation tables across pages.
 - **CID font support** — ToUnicode CMap decoding for Type0/Identity-H fonts, UTF-16BE, UTF-8, and Latin-1 encodings.
 - **Multi-column layout** — Automatic detection of newspaper-style columns, sequential reading order, and RTL text support.
+- **Per-page signals** — Reading direction (`ltr` / `rtl` / `mixed`) and per-page text-confidence on `extract_pages_markdown` results and Full-mode `process_pdf` results (`page_signals`), plus a documented machine-readable OCR-reason vocabulary (`suspected_garbled_text`, `scanned`, `no_text`, `vector_text`).
 - **Encoding issue detection** — Automatically flags broken font encodings so callers can fall back to OCR.
 - **Single document load** — The document is parsed once and shared between detection and extraction, avoiding redundant I/O.
 - **Browser WebAssembly** — Run the same Rust parser locally in browsers and Web Workers, with embedded CMaps and no server round trip.

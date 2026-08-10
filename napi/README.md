@@ -86,6 +86,42 @@ for (const region of result[0].regions) {
 ## Types
 
 ```typescript
+interface PdfResult {
+  pdfType: string          // "TextBased" | "Scanned" | "Mixed" | "ImageBased"
+  markdown?: string
+  pageCount: number
+  processingTimeMs: number
+  pagesNeedingOcr: number[] // 1-indexed page numbers
+  ocrReasonsByPage: PageOcrReasons[]
+  pageSignals: PageSignals[]  // per-page direction + confidence (present when extraction ran)
+  title?: string
+  confidence: number        // 0.0 - 1.0
+  isComplexLayout: boolean
+  pagesWithTables: number[]
+  pagesWithColumns: number[]
+  hasEncodingIssues: boolean
+}
+
+interface PageOcrReasons {
+  page: number              // 1-indexed
+  reasons: string[]         // "suspected_garbled_text" | "scanned" | "no_text" | "vector_text"
+}
+
+interface PageSignals {
+  page: number              // 1-indexed
+  direction: string         // "ltr" | "rtl" | "mixed"
+  confidence: number        // 0.0 - 1.0 (1.0 clean text, 0.0 no usable text)
+}
+
+interface PageMarkdownResult {
+  page: number              // 0-indexed
+  markdown: string
+  needsOcr: boolean
+  ocrReason?: string
+  direction: string         // "ltr" | "rtl" | "mixed"
+  confidence: number        // 0.0 - 1.0
+}
+
 interface PdfClassification {
   pdfType: string          // "TextBased" | "Scanned" | "Mixed" | "ImageBased"
   pageCount: number
@@ -109,6 +145,17 @@ interface RegionText {
   ocrReason?: string        // "suspected_garbled_text" when known
 }
 ```
+
+### OCR reason vocabulary
+
+`ocrReasonsByPage` entries and `PageMarkdownResult.ocrReason` carry
+machine-readable reason identifiers: `suspected_garbled_text`, `scanned`,
+`no_text`, `vector_text`. Reasons are multi-valued per page; on
+`extractPagesMarkdown`, `ocrReason` only ever carries
+`suspected_garbled_text` or `undefined`. `phantom_empty_row`,
+`detection_error`, and `multi_row_in_cell` are TSR table-fallback labels,
+not OCR reasons. `PageSignals.page` is 1-indexed; `PageMarkdownResult.page`
+is 0-indexed. See `docs/rust-api.md` for the full contract.
 
 ## Platforms
 

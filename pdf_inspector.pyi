@@ -13,6 +13,8 @@ class PdfResult:
     """1-indexed page numbers that need OCR."""
     ocr_reasons_by_page: list["PageOcrReasons"]
     """Machine-readable OCR reasons by 1-indexed page."""
+    page_signals: list["PageSignals"]
+    """Per-page direction + text-confidence signals, one entry per processed page (1-indexed). Present when extraction ran."""
     title: Optional[str]
     confidence: float
     is_complex_layout: bool
@@ -26,6 +28,15 @@ class PageOcrReasons:
     """1-indexed page number."""
     reasons: list[str]
     """Machine-readable OCR reason identifiers."""
+
+class PageSignals:
+    """Per-page reading direction and text-confidence for Full-mode results."""
+    page: int
+    """1-indexed page number."""
+    direction: str
+    """Reading direction: 'ltr', 'rtl', or 'mixed'."""
+    confidence: float
+    """Per-page text-confidence (0.0-1.0); 1.0 clean text, 0.0 no usable text."""
 
 class PdfClassification:
     """Lightweight PDF classification result."""
@@ -76,6 +87,10 @@ class PageMarkdown:
     """True when text on this page is unreliable and OCR should be used instead."""
     ocr_reason: Optional[str]
     """Machine-readable OCR reason when the cause is known."""
+    direction: str
+    """Reading direction of this page's text layer: 'ltr', 'rtl', or 'mixed'."""
+    confidence: float
+    """Per-page text-confidence (0.0-1.0); 1.0 clean text, 0.0 no usable text."""
 
 class PagesExtractionResult:
     """Per-page markdown output with document-wide layout classification."""

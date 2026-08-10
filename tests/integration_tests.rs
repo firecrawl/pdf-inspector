@@ -9,8 +9,8 @@ use pdf_inspector::{
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
     process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
-    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
-    PdfType, TextItem,
+    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PageDirection, PdfError,
+    PdfOptions, PdfType, ProcessMode, TextItem,
 };
 use std::collections::HashSet;
 
@@ -1349,6 +1349,7 @@ fn test_pages_needing_ocr_field_accessible() {
         processing_time_ms: 0,
         pages_needing_ocr: vec![1, 3],
         ocr_reasons_by_page: Vec::new(),
+        page_signals: Vec::new(),
         title: None,
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
@@ -1619,6 +1620,32 @@ fn test_extract_pages_mem_shifted_cipher_tounicode_needs_ocr() {
         result.pages[0].ocr_reason.as_deref(),
         Some("suspected_garbled_text")
     );
+    assert_eq!(
+        result.pages[0].confidence, 0.15,
+        "cipher-garbled page should carry the 0.15 binary-garbled confidence"
+    );
+}
+
+/// Locks the documented cross-surface confidence basis divergence: the extract
+/// path scores a GID-garbled page at the 0.15 binary-garbled anchor, while
+/// Full-mode process_pdf scores the same page 0.0 because its items were
+/// garbage-stripped before text-quality analysis (docs/rust-api.md).
+#[test]
+fn test_cross_surface_confidence_divergence_on_gid_page() {
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let extraction = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(extraction.pages[0].confidence, 0.15);
+    let full = process_pdf_mem(&buf).unwrap();
+    assert_eq!(full.page_signals[0].confidence, 0.0);
+}
+
+#[test]
+fn test_process_pdf_mem_page_filter_skips_zero() {
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0)]);
+    let opts = PdfOptions::new().pages([0, 1]);
+    let result = process_pdf_mem_with_options(&buf, opts).unwrap();
+    assert_eq!(result.page_signals.len(), 1);
+    assert_eq!(result.page_signals[0].page, 1);
 }
 
 #[test]
@@ -3996,6 +4023,234 @@ fn pdf_options_debug_redacts_password() {
     assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
 }
 
+fn make_text_pdf_pages(pages: &[Vec<(&str, f32)>]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    let kids: Vec<String> = (0..pages.len())
+        .map(|i| format!("{} 0 R", 3 + i * 2))
+        .collect();
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        &format!(
+            "<< /Type /Pages /Kids [{}] /Count {} >>",
+            kids.join(" "),
+            pages.len()
+        ),
+    );
+    let font_id = 3 + pages.len() * 2;
+    for (i, lines) in pages.iter().enumerate() {
+        let page_id = 3 + i * 2;
+        let content_id = page_id + 1;
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            page_id,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>"
+            ),
+        );
+        let content: String = lines
+            .iter()
+            .map(|(text, y)| format!("BT /F1 12 Tf 1 0 0 1 72 {y} Tm ({text}) Tj ET"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            content_id,
+            &format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                content.len(),
+                content
+            ),
+        );
+    }
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        font_id,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+fn make_text_pdf_lines(lines: &[(&str, f32)]) -> Vec<u8> {
+    make_text_pdf_pages(&[lines.to_vec()])
+}
+
+const HEBREW_A: &str = "\u{05D0}\u{05D1}\u{05D2} \u{05D3}\u{05D4}\u{05D5} \u{05D6}\u{05D7}\u{05D8}";
+const HEBREW_B: &str = "\u{05D9}\u{05DB}\u{05DC} \u{05DE}\u{05E0}\u{05E1} \u{05E2}\u{05E3}";
+
+#[test]
+fn test_extract_pages_mem_hebrew_direction_and_confidence() {
+    // Hebrew-only page: rtl, confidence 1.0, no OCR needed.
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0), (HEBREW_B, 680.0)]);
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(result.pages.len(), 1);
+    let page = &result.pages[0];
+    assert_eq!(
+        page.direction,
+        PageDirection::Rtl,
+        "Hebrew page should be rtl"
+    );
+    assert_eq!(page.confidence, 1.0);
+    assert!(!page.needs_ocr, "clean Hebrew text should not need OCR");
+    assert!(!page.markdown.is_empty());
+}
+
+#[test]
+fn test_extract_pages_mem_mixed_direction() {
+    // One Latin line + one Hebrew line → mixed.
+    let buf = make_text_pdf_lines(&[("Introduction", 700.0), (HEBREW_A, 680.0)]);
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(result.pages[0].direction, PageDirection::Mixed);
+}
+
+#[test]
+fn test_extract_pages_mem_blank_page_defaults() {
+    // Blank page: ltr / 0.0 / needs_ocr.
+    let buf = make_text_pdf_pages(&[vec![]]);
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(result.pages.len(), 1);
+    assert_eq!(result.pages[0].direction, PageDirection::Ltr);
+    assert_eq!(result.pages[0].confidence, 0.0);
+    assert!(result.pages[0].needs_ocr);
+}
+
+#[test]
+fn test_process_pdf_mem_full_page_signals() {
+    // Full mode: page_signals populated with rtl / 1.0.
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0)]);
+    let result = process_pdf_mem(&buf).unwrap();
+    assert_eq!(result.page_signals.len(), 1);
+    assert_eq!(result.page_signals[0].page, 1);
+    assert_eq!(result.page_signals[0].direction, PageDirection::Rtl);
+    assert_eq!(result.page_signals[0].confidence, 1.0);
+}
+
+#[test]
+fn test_process_pdf_mem_detect_only_page_signals_empty() {
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0)]);
+    let result =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().mode(ProcessMode::DetectOnly))
+            .unwrap();
+    assert!(result.page_signals.is_empty());
+}
+
+#[test]
+fn test_process_pdf_mem_page_filter_limits_page_signals() {
+    // Two pages; filter to page 1 (1-indexed) → one entry, page 1.
+    let buf = make_text_pdf_pages(&[vec![(HEBREW_A, 700.0)], vec![("Latin page", 700.0)]]);
+    let opts = PdfOptions::new().pages([1]);
+    let result = process_pdf_mem_with_options(&buf, opts).unwrap();
+    assert_eq!(result.page_signals.len(), 1);
+    assert_eq!(result.page_signals[0].page, 1);
+    assert_eq!(result.page_signals[0].direction, PageDirection::Rtl);
+}
+
+#[test]
+fn test_extract_pages_mem_requested_pages_subset_signals() {
+    // Requested-pages subset: new fields only for requested pages, caller order.
+    let buf = make_text_pdf_pages(&[vec![("Latin page one", 700.0)], vec![(HEBREW_A, 700.0)]]);
+    let result = extract_pages_markdown_mem(&buf, Some(&[1, 0])).unwrap();
+    assert_eq!(result.pages.len(), 2);
+    assert_eq!(result.pages[0].page, 1);
+    assert_eq!(result.pages[0].direction, PageDirection::Rtl);
+    assert_eq!(result.pages[0].confidence, 1.0);
+    assert_eq!(result.pages[1].page, 0);
+    assert_eq!(result.pages[1].direction, PageDirection::Ltr);
+}
+
+#[test]
+fn test_extract_pages_mem_replacement_confidence_half() {
+    // 5 U+FFFD among 100 non-whitespace chars = 500 bps replacement density
+    // → per-page confidence 0.5 through the public extraction API.
+    let text: String =
+        "hello\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}".to_string() + &"a".repeat(90);
+    let buf = make_text_pdf_lines(&[(&text, 700.0)]);
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(result.pages[0].confidence, 0.5);
+}
+
+#[test]
+fn test_process_pdf_mem_analyze_mode_page_signals() {
+    // Analyze mode extracts items (page_signals populated) but skips markdown.
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0)]);
+    let result =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().mode(ProcessMode::Analyze)).unwrap();
+    assert!(result.markdown.is_none());
+    assert_eq!(result.page_signals.len(), 1);
+    assert_eq!(result.page_signals[0].page, 1);
+    assert_eq!(result.page_signals[0].direction, PageDirection::Rtl);
+}
+
+#[test]
+fn test_process_pdf_mem_page_filter_out_of_range() {
+    // A page filter naming a page beyond page_count yields a default entry
+    // (ltr / 0.0), mirroring the extraction path's out-of-range convention.
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0)]);
+    let opts = PdfOptions::new().pages([9999]);
+    let result = process_pdf_mem_with_options(&buf, opts).unwrap();
+    assert_eq!(result.page_signals.len(), 1);
+    assert_eq!(result.page_signals[0].page, 9999);
+    assert_eq!(result.page_signals[0].direction, PageDirection::Ltr);
+    assert_eq!(result.page_signals[0].confidence, 0.0);
+}
+
+#[test]
+fn test_extract_pages_mem_hebrew_page_with_latin_page_number_footer_is_rtl() {
+    // A Hebrew body with a standalone Latin numeric footer: the footer is
+    // removed as a page number before direction is computed, so the page is
+    // rtl (KTD2 post-removal semantics).
+    let buf = make_text_pdf_lines(&[(HEBREW_A, 700.0), ("1", 30.0)]);
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(result.pages[0].direction, PageDirection::Rtl);
+}
+
+#[test]
+fn test_process_pdf_mem_full_blank_page_signals() {
+    // A blank page inside a text-based document gets a default entry.
+    let buf = make_text_pdf_pages(&[vec![(HEBREW_A, 700.0)], vec![]]);
+    let result = process_pdf_mem(&buf).unwrap();
+    assert_eq!(result.page_signals.len(), 2);
+    assert_eq!(result.page_signals[0].direction, PageDirection::Rtl);
+    assert_eq!(result.page_signals[0].confidence, 1.0);
+    assert_eq!(result.page_signals[1].page, 2);
+    assert_eq!(result.page_signals[1].direction, PageDirection::Ltr);
+    assert_eq!(result.page_signals[1].confidence, 0.0);
+}
 /// Regression for #228: a `startxref` pointer corrupted to point at the
 /// wrong byte offset (a single flipped digit — a real, common writer bug)
 /// must not make the whole file unprocessable. The real classic xref table
