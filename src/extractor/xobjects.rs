@@ -246,6 +246,8 @@ fn extract_form_xobject_text_inner(
     let mut current_font = String::new();
     let mut current_font_size: f32 = 12.0;
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut text_leading: f32 = 0.0;
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
@@ -321,6 +323,7 @@ fn extract_form_xobject_text_inner(
             "BT" => {
                 in_text_block = true;
                 text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+                line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
             }
             "ET" => {
                 in_text_block = false;
@@ -333,13 +336,42 @@ fn extract_form_xobject_text_inner(
                     current_font_size = get_number(&op.operands[1]).unwrap_or(12.0);
                 }
             }
+            "TL" => {
+                // Set text leading (used by T*)
+                if let Some(lead) = op.operands.first().and_then(get_number) {
+                    text_leading = lead;
+                }
+            }
             "Td" | "TD" => {
+                // Move text position: TLM = T(tx,ty) × TLM; Tm = TLM.
+                // tx,ty are in text space — must be scaled by the text line
+                // matrix, and must NOT accumulate on the text matrix that Tj
+                // has advanced (issue #325: without a separate line matrix,
+                // every following line starts further right).
                 if op.operands.len() >= 2 {
                     let tx = get_number(&op.operands[0]).unwrap_or(0.0);
                     let ty = get_number(&op.operands[1]).unwrap_or(0.0);
-                    text_matrix[4] += tx * text_matrix[0] + ty * text_matrix[2];
-                    text_matrix[5] += tx * text_matrix[1] + ty * text_matrix[3];
+                    line_matrix[4] += tx * line_matrix[0] + ty * line_matrix[2];
+                    line_matrix[5] += tx * line_matrix[1] + ty * line_matrix[3];
+                    text_matrix = line_matrix;
                 }
+                if op.operator.as_str() == "TD" {
+                    // TD additionally sets the leading to -ty
+                    if let Some(ty) = op.operands.get(1).and_then(get_number) {
+                        text_leading = -ty;
+                    }
+                }
+            }
+            "T*" => {
+                // Move to start of next line: equivalent to 0 -TL Td
+                let tl = if text_leading != 0.0 {
+                    text_leading
+                } else {
+                    current_font_size * 1.2
+                };
+                line_matrix[4] += (-tl) * line_matrix[2]; // Usually 0 for non-rotated text
+                line_matrix[5] += (-tl) * line_matrix[3];
+                text_matrix = line_matrix;
             }
             "Tm" => {
                 if op.operands.len() >= 6 {
@@ -347,6 +379,7 @@ fn extract_form_xobject_text_inner(
                         text_matrix[i] =
                             get_number(operand).unwrap_or(if i == 0 || i == 3 { 1.0 } else { 0.0 });
                     }
+                    line_matrix = text_matrix;
                 }
             }
             "g" => {
