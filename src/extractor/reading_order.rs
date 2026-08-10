@@ -395,6 +395,74 @@ pub(crate) fn infer_image_anchored_flow(
 
 /// Partition a page into the topological order `above -> left -> right -> below`.
 /// These edges encode the reading-order DAG; empty nodes are omitted.
+/// Полоса локальных колонок по согласованным разрывам строк.
+///
+/// Резюме сплошь и рядом верстают так: сбоку узкая колонка с контактами, рядом
+/// текст, а ниже сплошные абзацы во всю ширину. Постраничная гистограмма такого
+/// не видит — сквозного зазора нет, профиль плотный от края до края. Зато
+/// несколько соседних строк подряд рвутся в одном и том же месте, и это
+/// признак не хуже картинки-якоря.
+///
+/// Требования те же, что у якорной ветки: не меньше `MIN_ALIGNED_ROWS` строк с
+/// разрывом в одном месте, и обе стороны должны выглядеть текстом, а не
+/// подписями. Иначе таблицы и списки с выключкой начнут читаться как колонки.
+pub(crate) fn infer_row_aligned_flow(items: &[TextItem]) -> Option<ColumnFlowBand> {
+    let (x_min, x_max) = page_x_bounds(items, &[])?;
+
+    let rows = group_rows(items);
+    let candidates: Vec<(f32, f32)> = rows
+        .iter()
+        .filter_map(|row| aligned_row_split(row, x_min, x_max).map(|split| (split, row.y)))
+        .collect();
+    if candidates.len() < MIN_ALIGNED_ROWS {
+        return None;
+    }
+
+    let mut clusters: Vec<Vec<(f32, f32)>> = Vec::new();
+    for candidate in candidates {
+        if let Some(cluster) = clusters.iter_mut().find(|cluster| {
+            let mean = cluster.iter().map(|entry| entry.0).sum::<f32>() / cluster.len() as f32;
+            (mean - candidate.0).abs() <= SPLIT_CLUSTER_TOLERANCE
+        }) {
+            cluster.push(candidate);
+        } else {
+            clusters.push(vec![candidate]);
+        }
+    }
+    let dominant = clusters.into_iter().max_by_key(Vec::len)?;
+    if dominant.len() < MIN_ALIGNED_ROWS {
+        return None;
+    }
+
+    let split_x = dominant.iter().map(|entry| entry.0).sum::<f32>() / dominant.len() as f32;
+    let y_top = dominant.iter().map(|e| e.1).fold(f32::NEG_INFINITY, f32::max) + 3.0;
+    let y_bottom = dominant.iter().map(|e| e.1).fold(f32::INFINITY, f32::min) - 3.0;
+
+    // Обе стороны полосы должны быть связным текстом. Без этой проверки в
+    // колонки превращается всё, что выровнено по столбцам, — таблицы, перечни
+    // навыков, строки «ключ — значение».
+    let in_band = |item: &&TextItem| item.y <= y_top && item.y >= y_bottom;
+    let left: Vec<&TextItem> = items
+        .iter()
+        .filter(in_band)
+        .filter(|item| item.x + effective_width(item) / 2.0 < split_x)
+        .collect();
+    let right: Vec<&TextItem> = items
+        .iter()
+        .filter(in_band)
+        .filter(|item| item.x + effective_width(item) / 2.0 >= split_x)
+        .collect();
+    if !side_is_prose(&left) || !side_is_prose(&right) {
+        return None;
+    }
+
+    Some(ColumnFlowBand {
+        split_x,
+        y_bottom,
+        y_top,
+    })
+}
+
 pub(crate) fn build_region_graph(items: Vec<TextItem>, band: ColumnFlowBand) -> Vec<RegionNode> {
     let mut above = Vec::new();
     let mut left = Vec::new();

@@ -2019,13 +2019,19 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                 detect_columns(column_detection_items, page, table_pages.contains(&page));
             let detected_split =
                 (preliminary_columns.len() == 2).then(|| preliminary_columns[0].x_max);
-            if let Some(band) = image_regions.get(&page).and_then(|regions| {
-                super::reading_order::infer_image_anchored_flow(
-                    &page_items,
-                    regions,
-                    detected_split,
-                )
-            }) {
+            let band = image_regions
+                .get(&page)
+                .and_then(|regions| {
+                    super::reading_order::infer_image_anchored_flow(
+                        &page_items,
+                        regions,
+                        detected_split,
+                    )
+                })
+                // Без картинки-якоря остаются сами строки: несколько подряд,
+                // рвущихся в одном месте, — тот же признак локальной полосы.
+                .or_else(|| super::reading_order::infer_row_aligned_flow(&page_items));
+            if let Some(band) = band {
                 debug!(
                     "page {}: image-anchored region graph split={:.1} y=[{:.1}..{:.1}]",
                     page, band.split_x, band.y_bottom, band.y_top
