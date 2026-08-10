@@ -4052,3 +4052,228 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         page.markdown
     );
 }
+
+#[test]
+fn blank_page_is_not_an_ocr_job() {
+    let pdf = make_text_pdf("", "0 0 612 792");
+    let result = extract_pages_markdown_mem(&pdf, None).expect("blank PDF should parse");
+
+    assert!(result.pages[0].markdown.is_empty());
+    assert!(!result.pages[0].needs_ocr);
+    assert!(result.pages_needing_ocr.is_empty());
+}
+
+fn make_image_only_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    fn add_stream_object(
+        pdf: &mut Vec<u8>,
+        offsets: &mut Vec<usize>,
+        id: usize,
+        dict: &str,
+        stream_bytes: &[u8],
+    ) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(
+            format!("<< {} /Length {} >>\nstream\n", dict, stream_bytes.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(stream_bytes);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    add_object(&mut pdf, &mut offsets, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+    add_object(&mut pdf, &mut offsets, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /XObject << /Im0 5 0 R >> >> \
+         /Contents 4 0 R >>",
+    );
+    add_stream_object(&mut pdf, &mut offsets, 4, "", b"q 100 0 0 100 100 100 cm /Im0 Do Q");
+    let image_pixel = [128u8];
+    add_stream_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8",
+        &image_pixel,
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+#[test]
+fn image_only_page_needs_ocr() {
+    let pdf = make_image_only_pdf();
+    let result = extract_pages_markdown_mem(&pdf, None).expect("image-only PDF should parse");
+
+    assert!(result.pages[0].markdown.is_empty());
+    assert!(result.pages[0].needs_ocr);
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+}
+
+fn make_vector_only_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    fn add_stream_object(
+        pdf: &mut Vec<u8>,
+        offsets: &mut Vec<usize>,
+        id: usize,
+        dict: &str,
+        stream_bytes: &[u8],
+    ) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(
+            format!("<< {} /Length {} >>\nstream\n", dict, stream_bytes.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(stream_bytes);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    add_object(&mut pdf, &mut offsets, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+    add_object(&mut pdf, &mut offsets, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+    );
+    add_stream_object(&mut pdf, &mut offsets, 4, "", b"10 10 m 20 20 l S");
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+#[test]
+fn vector_only_page_needs_ocr() {
+    let pdf = make_vector_only_pdf();
+    let result = extract_pages_markdown_mem(&pdf, None).expect("vector-only PDF should parse");
+
+    assert!(result.pages[0].markdown.is_empty());
+    assert!(result.pages[0].needs_ocr);
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+}
+
+fn make_mixed_empty_markdown_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    fn add_stream_object(
+        pdf: &mut Vec<u8>,
+        offsets: &mut Vec<usize>,
+        id: usize,
+        dict: &str,
+        stream_bytes: &[u8],
+    ) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(
+            format!("<< {} /Length {} >>\nstream\n", dict, stream_bytes.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(stream_bytes);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    add_object(&mut pdf, &mut offsets, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+    add_object(&mut pdf, &mut offsets, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /XObject << /Im0 5 0 R >> >> \
+         /Contents 4 0 R >>",
+    );
+    // Stream has both vector paths and image invocation, but no text.
+    add_stream_object(&mut pdf, &mut offsets, 4, "", b"10 10 m 20 20 l S q 100 0 0 100 100 100 cm /Im0 Do Q");
+    let image_pixel = [128u8];
+    add_stream_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8",
+        &image_pixel,
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+#[test]
+fn mixed_empty_markdown_needs_ocr() {
+    let pdf = make_mixed_empty_markdown_pdf();
+    let result = extract_pages_markdown_mem(&pdf, None).expect("mixed empty PDF should parse");
+
+    assert!(result.pages[0].markdown.is_empty());
+    assert!(result.pages[0].needs_ocr);
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+}
