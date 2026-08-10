@@ -11,12 +11,11 @@
 //! running it once more over visual-order text, with the paragraph direction
 //! the original layout used, restores logical order.
 //!
-//! The restoration runs **per text item**, at extraction time, because that
-//! is the only level where the invariant holds unconditionally: a show
-//! operation is always in paint order. Line assembly already orders items
-//! logically (RTL lines sort right-to-left), so once each item is restored,
-//! every downstream consumer — joining, headings, lists, table cells, links
-//! — operates on logical text natively. Two refinements:
+//! Restoration happens at two levels, because visual order is imposed twice.
+//!
+//! **Within an item** (`restore_item_text`), at extraction time — the only
+//! level where the invariant holds unconditionally, since a show operation is
+//! always in paint order. Two refinements here:
 //!
 //! 1. **No bracket mirroring.** ToUnicode maps mirrored glyphs back to their
 //!    logical characters, so visual-order text already carries logical
@@ -25,13 +24,29 @@
 //!    break them. A conservative repair pass handles the rare writer that
 //!    stores screen-form brackets instead: an unmatched closer followed by
 //!    an unmatched opener of the same kind is swapped back.
-//! 2. **RTL tables are logicalized** in a final pass over the rendered
-//!    Markdown: in a majority-RTL table the grid detector's left-to-right
-//!    columns are in reversed logical order, so cell order is flipped per
-//!    row (only when every row has the same cell count, so unescaped `|`
-//!    characters in cell text never scramble a row).
+//! 2. **Combining marks** stay attached to their base under reversal, while
+//!    Hebrew punctuation interleaved with the points is not treated as
+//!    combining.
 //!
-//! Both entry points gate on the presence of RTL characters (with an ASCII
+//! **Across a sequence of items** (`order_rtl_sequence` and its callers) —
+//! a line, a table cell, a merged run. Restoring each item is not enough: a
+//! left-to-right run whose glyphs land in *separate* items, such as an
+//! equation or a Latin phrase, is reversed by the surrounding right-to-left
+//! ordering, and no item-level pass can see it because each item is a no-op
+//! on its own. So the sequence is reversed as a whole and embedded LTR runs
+//! are put back in ascending order.
+//!
+//! The direction decision always belongs to the **container** — the line,
+//! the cell, the run — never to the individual fragment. Deciding per
+//! fragment lands an LTR fragment on the wrong side of its RTL neighbours.
+//!
+//! Finally, **RTL tables are logicalized** in a pass over the rendered
+//! Markdown: in a majority-RTL table the grid detector's left-to-right
+//! columns are in reversed logical order, so cell order is flipped per row
+//! (only when every row has the same cell count, so unescaped `|` characters
+//! in cell text never scramble a row, and never inside a code fence).
+//!
+//! Every entry point gates on the presence of RTL characters (with an ASCII
 //! fast path), so LTR documents are byte-identical and pay one scan.
 
 use std::borrow::Cow;
@@ -87,10 +102,18 @@ pub(crate) fn restore_visual_order(markdown: String) -> String {
     let lines: Vec<&str> = markdown.split('\n').collect();
     let mut out: Vec<Cow<str>> = Vec::with_capacity(lines.len());
     let mut i = 0;
+    let mut in_fence = false;
     while i < lines.len() {
-        if is_table_row(lines[i]) {
+        // Code fences are copied through untouched: an extracted source
+        // listing can hold pipe-delimited lines that are not a table, and
+        // reversing them would corrupt the code.
+        if is_code_fence(lines[i]) {
+            in_fence = !in_fence;
+            out.push(Cow::Borrowed(lines[i]));
+            i += 1;
+        } else if !in_fence && is_table_row(lines[i]) {
             let start = i;
-            while i < lines.len() && is_table_row(lines[i]) {
+            while i < lines.len() && is_table_row(lines[i]) && !is_code_fence(lines[i]) {
                 i += 1;
             }
             process_table_block(&lines[start..i], &mut out);
@@ -100,6 +123,12 @@ pub(crate) fn restore_visual_order(markdown: String) -> String {
         }
     }
     out.join("\n")
+}
+
+/// A Markdown code-fence delimiter (``` or ~~~), allowing an info string.
+fn is_code_fence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
 fn is_table_row(line: &str) -> bool {
@@ -113,24 +142,163 @@ pub(crate) fn joins_right_to_left(text: &str) -> bool {
     !text.is_ascii() && is_rtl_majority(&mut text.chars())
 }
 
-/// Append an item's text to a table cell buffer. Cell fills iterate items in
-/// ascending-X (paint) order; for RTL-majority item text that is reversed
-/// logical order, so such items are prepended instead, reconstructing
-/// right-to-left reading order. The LTR path is byte-identical to the
-/// original `push(' ')`/`push_str` pattern at every call site.
-pub(crate) fn append_cell_text(cell: &mut String, text: &str) {
-    if !cell.is_empty() && joins_right_to_left(text) {
-        let mut swapped = String::with_capacity(text.len() + cell.len() + 1);
-        swapped.push_str(text);
-        swapped.push(' ');
-        swapped.push_str(cell);
-        *cell = swapped;
-    } else {
-        if !cell.is_empty() {
-            cell.push(' ');
+/// Put embedded left-to-right runs back in ascending order after a
+/// paint-order sequence has been reversed for a right-to-left container.
+///
+/// Reversing a sequence is right for the RTL fragments themselves, but it
+/// also reverses runs that read left-to-right — an equation split across
+/// items, a Latin phrase, a URL. A run is a maximal span of elements
+/// carrying no RTL characters, trimmed to the outermost elements that carry
+/// a strong LTR letter so that punctuation merely abutting RTL text stays on
+/// the side it was painted on.
+pub(crate) fn restore_embedded_ltr_runs<T>(
+    seq: &mut [T],
+    has_rtl: impl Fn(&T) -> bool,
+    has_strong_ltr: impl Fn(&T) -> bool,
+) {
+    let mut i = 0;
+    while i < seq.len() {
+        if has_rtl(&seq[i]) {
+            i += 1;
+            continue;
         }
-        cell.push_str(text);
+        let start = i;
+        while i < seq.len() && !has_rtl(&seq[i]) {
+            i += 1;
+        }
+        let first = (start..i).find(|&k| has_strong_ltr(&seq[k]));
+        let last = (start..i).rev().find(|&k| has_strong_ltr(&seq[k]));
+        if let (Some(first), Some(last)) = (first, last) {
+            if last > first {
+                seq[first..=last].reverse();
+            }
+        }
     }
+}
+
+/// Reorder a paint-order (ascending-X) sequence into right-to-left logical
+/// reading order, keeping embedded left-to-right runs readable.
+pub(crate) fn order_rtl_sequence<T>(
+    seq: &mut [T],
+    has_rtl: impl Fn(&T) -> bool,
+    has_strong_ltr: impl Fn(&T) -> bool,
+) {
+    seq.reverse();
+    restore_embedded_ltr_runs(seq, has_rtl, has_strong_ltr);
+}
+
+fn text_has_rtl(text: &&str) -> bool {
+    text.chars().any(is_rtl_char)
+}
+
+fn text_has_strong_ltr(text: &&str) -> bool {
+    text.chars().any(char::is_alphabetic)
+}
+
+/// Collects a table cell's fragments in paint (ascending-X) order and renders
+/// them in logical reading order once the cell is complete.
+///
+/// The direction decision belongs to the cell, not to the individual
+/// fragment. In an RTL cell the whole fragment sequence reverses, so an LTR
+/// fragment sitting between two RTL ones keeps its position in the sequence
+/// and only the sequence order flips. Deciding per fragment — prepend when
+/// the fragment is RTL, append otherwise — lands such a fragment on the wrong
+/// side of its neighbours.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct CellText {
+    fragments: Vec<String>,
+}
+
+impl CellText {
+    pub(crate) fn push(&mut self, text: &str) {
+        self.fragments.push(text.to_string());
+    }
+
+    /// Render the cell. The LTR path folds fragments exactly as the original
+    /// `push(' ')`/`push_str` pattern did, including its handling of empty
+    /// fragments, so LTR documents stay byte-identical.
+    pub(crate) fn finish(&self) -> String {
+        let mut ordered: Vec<&str> = self.fragments.iter().map(String::as_str).collect();
+        if crate::text_utils::is_rtl_text(ordered.iter()) {
+            order_rtl_sequence(&mut ordered, text_has_rtl, text_has_strong_ltr);
+        }
+        let mut out = String::new();
+        for fragment in ordered {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(fragment);
+        }
+        out
+    }
+}
+
+/// Put each visual line of a table cell into reading order.
+///
+/// Items must already be in paint order — top-to-bottom, then left-to-right.
+/// Direction is decided per line rather than per cell, because one cell can
+/// hold a Hebrew line and a Latin line, and reversing the whole cell because
+/// its Hebrew line holds the majority would scramble the Latin one.
+pub(crate) fn order_cell_lines(items: &mut [(usize, &crate::types::TextItem)]) {
+    let mut start = 0;
+    while start < items.len() {
+        let y = items[start].1.y;
+        let mut end = start + 1;
+        while end < items.len() && (items[end].1.y - y).abs() < items[end].1.font_size * 0.5 {
+            end += 1;
+        }
+        let line = &mut items[start..end];
+        if crate::text_utils::is_rtl_text(line.iter().map(|(_, item)| &item.text)) {
+            order_rtl_sequence(
+                line,
+                |(_, item)| item.text.chars().any(is_rtl_char),
+                |(_, item)| item.text.chars().any(char::is_alphabetic),
+            );
+        }
+        start = end;
+    }
+}
+
+/// Join a paint-order run of item fragments into logical reading order.
+///
+/// Each fragment carries whether a word gap separates it from the previous
+/// one. Fragments that touch are pieces of a single word, so they are joined
+/// first — reordering must never split a word — and only the resulting word
+/// sequence is put into reading order. As with cells, the direction belongs
+/// to the run, not to the individual fragment.
+pub(crate) fn join_run_fragments(fragments: &[(String, bool)]) -> String {
+    let mut words: Vec<String> = Vec::new();
+    for (text, word_gap) in fragments {
+        match words.last_mut() {
+            // Pieces of one word: an RTL word's pieces are painted
+            // left-to-right, so a later piece precedes the earlier one.
+            Some(word) if !word_gap => {
+                if joins_right_to_left(text) {
+                    let mut merged = String::with_capacity(text.len() + word.len());
+                    merged.push_str(text);
+                    merged.push_str(word);
+                    *word = merged;
+                } else {
+                    word.push_str(text);
+                }
+            }
+            _ => words.push(text.clone()),
+        }
+    }
+
+    let mut ordered: Vec<&str> = words.iter().map(String::as_str).collect();
+    if crate::text_utils::is_rtl_text(ordered.iter()) {
+        order_rtl_sequence(&mut ordered, text_has_rtl, text_has_strong_ltr);
+    }
+    ordered.join(" ")
+}
+
+/// Render a grid of accumulated cells.
+pub(crate) fn finish_cells(cells: &[Vec<CellText>]) -> Vec<Vec<String>> {
+    cells
+        .iter()
+        .map(|row| row.iter().map(CellText::finish).collect())
+        .collect()
 }
 
 /// Reverse the cell order of every row in a majority-RTL table block. Only
@@ -412,5 +580,148 @@ mod tests {
     fn escaped_pipes_do_not_split_cells() {
         let cells = split_cells("|a\\|b|שלום|");
         assert_eq!(cells, vec!["", "a\\|b", "שלום", ""]);
+    }
+}
+
+#[cfg(test)]
+mod mixed_direction {
+    use super::*;
+    use crate::types::{ItemType, TextItem};
+
+    const HEB_A: &str = "\u{5D0}\u{5D1}\u{5D2}"; // אבג
+    const HEB_B: &str = "\u{5D3}\u{5D4}\u{5D5}"; // דהו
+    const HEB_LONG: &str = "\u{5D1}\u{5E8}\u{5D0}\u{5E9}\u{5D9}\u{5EA}"; // בראשית
+                                                                         // Eight letters — outvotes the seven of "New York".
+    const HEB_MAJORITY: &str = "\u{5D1}\u{5E8}\u{5D0}\u{5E9}\u{5D9}\u{5EA}\u{5D0}\u{5D1}";
+
+    fn item(text: &str, x: f32, y: f32) -> TextItem {
+        TextItem {
+            text: text.into(),
+            x,
+            y,
+            width: 10.0,
+            height: 12.0,
+            font: "F1".into(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    /// An RTL cell whose fragments alternate direction: the sequence reverses
+    /// as a whole, so the Latin fragment keeps its place between its Hebrew
+    /// neighbours rather than being pushed to one end.
+    #[test]
+    fn rtl_cell_keeps_latin_between_hebrew() {
+        let mut cell = CellText::default();
+        cell.push(HEB_A); // x = 10
+        cell.push("Latin"); // x = 50
+        cell.push(HEB_B); // x = 90
+        assert_eq!(cell.finish(), format!("{HEB_B} Latin {HEB_A}"));
+    }
+
+    /// A multi-item Latin phrase inside an RTL cell keeps its own word order.
+    #[test]
+    fn rtl_cell_keeps_multi_item_latin_phrase_readable() {
+        // Hebrew long enough to hold the strict letter majority against the
+        // seven Latin letters of "New York".
+        let mut cell = CellText::default();
+        cell.push("New"); // x = 10
+        cell.push("York"); // x = 40
+        cell.push(HEB_MAJORITY); // x = 90
+        assert_eq!(cell.finish(), format!("{HEB_MAJORITY} New York"));
+    }
+
+    /// An LTR cell is joined exactly as the pre-RTL code did, empty fragments
+    /// included, so LTR documents stay byte-identical.
+    #[test]
+    fn ltr_cell_join_is_unchanged() {
+        let mut cell = CellText::default();
+        cell.push("alpha");
+        cell.push("");
+        cell.push("beta");
+        assert_eq!(cell.finish(), "alpha  beta");
+    }
+
+    /// A cell holding a Hebrew line above a Latin line must reverse only the
+    /// Hebrew one — deciding direction for the whole cell scrambles the Latin.
+    #[test]
+    fn mixed_direction_cell_orders_each_line_separately() {
+        let hebrew_line_y = 100.0;
+        let latin_line_y = 80.0;
+        let binding = [
+            item(HEB_A, 10.0, hebrew_line_y),
+            item(HEB_B, 40.0, hebrew_line_y),
+            item("Hello", 10.0, latin_line_y),
+            item("World", 40.0, latin_line_y),
+        ];
+        let mut items: Vec<(usize, &TextItem)> = binding.iter().enumerate().collect();
+        order_cell_lines(&mut items);
+        let order: Vec<&str> = items.iter().map(|(_, i)| i.text.as_str()).collect();
+        // Hebrew line reverses; the Latin line below it does not.
+        assert_eq!(order, vec![HEB_B, HEB_A, "Hello", "World"]);
+    }
+
+    /// Pieces of one word touch (no word gap) and must be reassembled before
+    /// any reordering, so a split RTL word is never turned inside out.
+    #[test]
+    fn run_fragments_reassemble_split_rtl_word_then_order() {
+        // בראשית split across two show operations. The logical tail ית is
+        // painted leftmost, so it arrives first in ascending-X order and the
+        // piece to its right must precede it once reassembled.
+        let fragments = vec![
+            ("\u{5D9}\u{5EA}".into(), false),               // ית
+            ("\u{5D1}\u{5E8}\u{5D0}\u{5E9}".into(), false), // בראש
+            ("Tail".into(), true),
+        ];
+        assert_eq!(join_run_fragments(&fragments), format!("Tail {HEB_LONG}"));
+    }
+
+    /// An LTR run joins in paint order with spaces only at word gaps.
+    #[test]
+    fn run_fragments_ltr_join_is_unchanged() {
+        let fragments = vec![
+            ("Hel".into(), false),
+            ("lo".into(), false),
+            ("World".into(), true),
+        ];
+        assert_eq!(join_run_fragments(&fragments), "Hello World");
+    }
+
+    /// Pipe-delimited lines inside a fenced code block are not a table and
+    /// must survive untouched.
+    #[test]
+    fn fenced_code_block_is_not_treated_as_a_table() {
+        let markdown = format!("```\n|{HEB_A}|{HEB_B}|\n|{HEB_A}|{HEB_B}|\n```\n");
+        assert_eq!(restore_visual_order(markdown.clone()), markdown);
+    }
+
+    /// The same lines outside a fence are a table and do get logicalized.
+    #[test]
+    fn table_outside_a_fence_still_reverses() {
+        let markdown = format!("|{HEB_A}|{HEB_B}|\n|{HEB_A}|{HEB_B}|\n");
+        let restored = restore_visual_order(markdown.clone());
+        assert_ne!(restored, markdown);
+        assert!(restored.starts_with(&format!("|{HEB_B}|{HEB_A}|")));
+    }
+
+    /// Longer Hebrew than Latin, so the line holds the RTL majority: the
+    /// embedded equation still reads left-to-right.
+    #[test]
+    fn embedded_equation_survives_line_ordering() {
+        let mut items = vec![
+            item(HEB_LONG, 300.0, 700.0),
+            item("x", 100.0, 700.0),
+            item("\u{2208}", 130.0, 700.0), // ∈
+            item("G", 160.0, 700.0),
+        ];
+        crate::text_utils::sort_line_items(&mut items);
+        let order: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(order, vec![HEB_LONG, "x", "\u{2208}", "G"]);
     }
 }

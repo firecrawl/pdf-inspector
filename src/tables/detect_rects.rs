@@ -1504,20 +1504,17 @@ pub(crate) fn assign_items_to_grid(
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(num_cols);
         for col_items in row_items.iter_mut() {
-            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|(_, item)| &item.text));
             col_items.sort_by(|a, b| {
                 b.1.y
                     .partial_cmp(&a.1.y)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| {
-                        let (first, second) = if rtl { (b, a) } else { (a, b) };
-                        first
-                            .1
-                            .x
-                            .partial_cmp(&second.1.x)
+                        a.1.x
+                            .partial_cmp(&b.1.x)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
             });
+            crate::rtl::order_cell_lines(col_items);
             let text = col_items
                 .iter()
                 .map(|(_, item)| item.text.trim())

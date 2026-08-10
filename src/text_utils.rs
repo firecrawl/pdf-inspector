@@ -144,10 +144,18 @@ where
 
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
+    items.sort_by(|a, b| a.x.total_cmp(&b.x));
     if rtl {
-        items.sort_by(|a, b| b.x.total_cmp(&a.x));
-    } else {
-        items.sort_by(|a, b| a.x.total_cmp(&b.x));
+        // A plain descending-X sort would also reverse embedded left-to-right
+        // runs whose glyphs land in separate items — an equation like `x ∈ G`
+        // is painted with `x` leftmost and would come out `G ∈ x`. Item-level
+        // restoration cannot fix that: each item is a no-op on its own and
+        // the run spans several of them.
+        crate::rtl::order_rtl_sequence(
+            items,
+            |item| item.text.chars().any(is_rtl_char),
+            |item| item.text.chars().any(char::is_alphabetic),
+        );
     }
 }
 
@@ -191,10 +199,19 @@ pub fn is_italic_font(font_name: &str) -> bool {
 }
 
 /// Normalize show-operation text: ligature expansion plus visual→logical
-/// RTL restoration. Text that went through the Arabic presentation-forms
-/// path is already reversed to logical order by `expand_ligatures` and is
-/// not restored again. Must not be used for `ActualText` replacements,
-/// which the PDF spec defines in logical content order.
+/// RTL restoration.
+///
+/// Items carrying Arabic presentation forms return early. `expand_ligatures`
+/// already reverses those to logical order via `reverse_visual_arabic`, so
+/// running `restore_item_text` over them as well would reverse them twice.
+/// The cost of that gate is that an item mixing presentation forms *with*
+/// another RTL script keeps the coarser run reversal rather than the
+/// bidi-based one; routing it through both is strictly worse, and a single
+/// show operation spanning two RTL scripts is not something real writers
+/// produce.
+///
+/// Must not be used for `ActualText` replacements, which the PDF spec
+/// defines in logical content order.
 pub(crate) fn normalize_show_text(text: &str) -> String {
     let expanded = expand_ligatures(text);
     if expanded.is_ascii() {

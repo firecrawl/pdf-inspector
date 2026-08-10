@@ -113,7 +113,8 @@ pub(crate) fn try_build_rect_guided_table(
     // 4. Assign items to cells
     let n_rows = row_boundaries.len();
     let n_cols = col_boundaries.len();
-    let mut cells: Vec<Vec<String>> = vec![vec![String::new(); n_cols]; n_rows];
+    let mut cell_text: Vec<Vec<crate::rtl::CellText>> =
+        vec![vec![crate::rtl::CellText::default(); n_cols]; n_rows];
     let mut used_indices: Vec<usize> = Vec::new();
 
     // Compute max X to exclude legend text beyond the table area
@@ -140,10 +141,13 @@ pub(crate) fn try_build_rect_guided_table(
         let col = col_boundaries.iter().rposition(|&cx| item.x >= cx - 4.0);
 
         if let (Some(r), Some(c)) = (row, col) {
-            crate::rtl::append_cell_text(&mut cells[r][c], item.text.trim());
+            cell_text[r][c].push(item.text.trim());
             used_indices.push(*orig_idx);
         }
     }
+
+    // Cells are complete: render each in logical reading order.
+    let mut cells = crate::rtl::finish_cells(&cell_text);
 
     // 5. Clean up: strip tilde-leader noise from cells (legend text bleeding
     //    into the last column from the right side of the page)
@@ -481,7 +485,8 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
 
     // Build cell grid
     let col_xs: Vec<f32> = columns.iter().map(|c| c.x_min).collect();
-    let mut cells: Vec<Vec<String>> = vec![vec![String::new(); columns.len()]; row_ys.len()];
+    let mut cell_text: Vec<Vec<crate::rtl::CellText>> =
+        vec![vec![crate::rtl::CellText::default(); columns.len()]; row_ys.len()];
     let mut item_indices: Vec<usize> = Vec::new();
 
     for (item_idx, item) in items.iter().enumerate() {
@@ -512,10 +517,11 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         // Find row
         let row = row_ys.iter().position(|&ry| (ry - item.y).abs() < y_tol);
         if let Some(row) = row {
-            crate::rtl::append_cell_text(&mut cells[row][col], &item.text);
+            cell_text[row][col].push(&item.text);
             item_indices.push(item_idx);
         }
     }
+    let mut cells = crate::rtl::finish_cells(&cell_text);
     merge_superscript_marker_rows(&mut row_ys, &mut cells);
 
     // Validate: need reasonable fill rate
