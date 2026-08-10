@@ -503,7 +503,7 @@ pub(crate) fn recover_header_row(
         }
     }
     let header_cells: Vec<String> = header_text
-        .iter()
+        .into_iter()
         .map(crate::rtl::CellText::finish)
         .collect();
 

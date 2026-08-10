@@ -102,33 +102,51 @@ pub(crate) fn restore_visual_order(markdown: String) -> String {
     let lines: Vec<&str> = markdown.split('\n').collect();
     let mut out: Vec<Cow<str>> = Vec::with_capacity(lines.len());
     let mut i = 0;
-    let mut in_fence = false;
+    // The delimiter and run length of the open fence, per CommonMark: a fence
+    // closes only on the same character at least as long, so a ``` block can
+    // legally contain ~~~ or a shorter run of backticks.
+    let mut fence: Option<(char, usize)> = None;
     while i < lines.len() {
         // Code fences are copied through untouched: an extracted source
         // listing can hold pipe-delimited lines that are not a table, and
         // reversing them would corrupt the code.
-        if is_code_fence(lines[i]) {
-            in_fence = !in_fence;
-            out.push(Cow::Borrowed(lines[i]));
-            i += 1;
-        } else if !in_fence && is_table_row(lines[i]) {
-            let start = i;
-            while i < lines.len() && is_table_row(lines[i]) && !is_code_fence(lines[i]) {
-                i += 1;
+        match (fence, fence_delimiter(lines[i])) {
+            (None, Some(opened)) => fence = Some(opened),
+            (Some((open_char, open_len)), Some((close_char, close_len)))
+                if close_char == open_char && close_len >= open_len =>
+            {
+                fence = None;
             }
-            process_table_block(&lines[start..i], &mut out);
-        } else {
-            out.push(Cow::Borrowed(lines[i]));
-            i += 1;
+            _ => {
+                if fence.is_none() && is_table_row(lines[i]) {
+                    let start = i;
+                    while i < lines.len()
+                        && is_table_row(lines[i])
+                        && fence_delimiter(lines[i]).is_none()
+                    {
+                        i += 1;
+                    }
+                    process_table_block(&lines[start..i], &mut out);
+                    continue;
+                }
+            }
         }
+        out.push(Cow::Borrowed(lines[i]));
+        i += 1;
     }
     out.join("\n")
 }
 
-/// A Markdown code-fence delimiter (``` or ~~~), allowing an info string.
-fn is_code_fence(line: &str) -> bool {
+/// The delimiter character and run length of a Markdown code fence, if the
+/// line opens or closes one (three or more backticks or tildes).
+fn fence_delimiter(line: &str) -> Option<(char, usize)> {
     let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    let delimiter = trimmed.chars().next()?;
+    if delimiter != '`' && delimiter != '~' {
+        return None;
+    }
+    let length = trimmed.chars().take_while(|&c| c == delimiter).count();
+    (length >= 3).then_some((delimiter, length))
 }
 
 fn is_table_row(line: &str) -> bool {
@@ -191,6 +209,13 @@ fn text_has_rtl(text: &&str) -> bool {
     text.chars().any(is_rtl_char)
 }
 
+/// Letters only, deliberately not digits. Two numbers that merely sit next
+/// to each other in an RTL sentence are separate runs — under UAX #9 the
+/// neutrals between them resolve to the paragraph level, so they must not
+/// swap. Counting digits here merged them into one run and reversed real
+/// statistics in the corpus (`(\u{5D9}\u{5D4}\u{5D5}\u{5D3}\u{5D9}\u{5DD} \u{2013} 92%). 98%` became
+/// `(\u{5D9}\u{5D4}\u{5D5}\u{5D3}\u{5D9}\u{5DD} \u{2013} 98%). 92%`), which is worse than leaving a split
+/// number reversed.
 fn text_has_strong_ltr(text: &&str) -> bool {
     text.chars().any(char::is_alphabetic)
 }
@@ -204,32 +229,59 @@ fn text_has_strong_ltr(text: &&str) -> bool {
 /// and only the sequence order flips. Deciding per fragment — prepend when
 /// the fragment is RTL, append otherwise — lands such a fragment on the wrong
 /// side of its neighbours.
+/// A cell that never sees an RTL fragment costs exactly what the pre-RTL code
+/// cost: one `String`, appended in place, and `boundaries` never allocates.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct CellText {
-    fragments: Vec<String>,
+    /// Fragments joined with `' '` in paint order — byte-for-byte what the
+    /// original `push(' ')`/`push_str` pattern built.
+    text: String,
+    /// Byte offset at which each fragment's text starts, recorded only from
+    /// the first fragment that carries an RTL character onward. Everything
+    /// before that point is one opaque left-to-right chunk: reversing the
+    /// sequence puts it at the end, and the embedded-LTR-run pass restores
+    /// its internal order, so its interior boundaries are never needed.
+    boundaries: Vec<usize>,
 }
 
 impl CellText {
     pub(crate) fn push(&mut self, text: &str) {
-        self.fragments.push(text.to_string());
+        let separator = usize::from(!self.text.is_empty());
+        // `is_ascii` is a vectorized byte scan and rules out RTL outright, so
+        // an all-ASCII cell never pays for character iteration.
+        if !self.boundaries.is_empty() || (!text.is_ascii() && text.chars().any(is_rtl_char)) {
+            self.boundaries.push(self.text.len() + separator);
+        }
+        if separator == 1 {
+            self.text.push(' ');
+        }
+        self.text.push_str(text);
     }
 
-    /// Render the cell. The LTR path folds fragments exactly as the original
-    /// `push(' ')`/`push_str` pattern did, including its handling of empty
-    /// fragments, so LTR documents stay byte-identical.
-    pub(crate) fn finish(&self) -> String {
-        let mut ordered: Vec<&str> = self.fragments.iter().map(String::as_str).collect();
-        if crate::text_utils::is_rtl_text(ordered.iter()) {
-            order_rtl_sequence(&mut ordered, text_has_rtl, text_has_strong_ltr);
+    /// Render the cell. Consumes the accumulator so an LTR cell hands over its
+    /// string by move rather than copying it.
+    pub(crate) fn finish(self) -> String {
+        if self.boundaries.is_empty()
+            || !crate::text_utils::is_rtl_text(std::iter::once(&self.text))
+        {
+            return self.text;
         }
-        let mut out = String::new();
-        for fragment in ordered {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(fragment);
+
+        // Split back into the leading LTR chunk plus one chunk per recorded
+        // fragment. Separators are single ASCII spaces, so stepping back one
+        // byte always lands on a character boundary.
+        let mut chunks: Vec<&str> = Vec::with_capacity(self.boundaries.len() + 1);
+        let first = self.boundaries[0];
+        if first > 0 {
+            chunks.push(&self.text[..first - 1]);
         }
-        out
+        for pair in self.boundaries.windows(2) {
+            chunks.push(&self.text[pair[0]..pair[1] - 1]);
+        }
+        chunks.push(&self.text[*self.boundaries.last().unwrap()..]);
+
+        order_rtl_sequence(&mut chunks, text_has_rtl, text_has_strong_ltr);
+        chunks.join(" ")
     }
 }
 
@@ -266,8 +318,24 @@ pub(crate) fn order_cell_lines(items: &mut [(usize, &crate::types::TextItem)]) {
 /// first — reordering must never split a word — and only the resulting word
 /// sequence is put into reading order. As with cells, the direction belongs
 /// to the run, not to the individual fragment.
-pub(crate) fn join_run_fragments(fragments: &[(String, bool)]) -> String {
-    let mut words: Vec<String> = Vec::new();
+/// A run with no RTL fragment takes the plain append path and allocates only
+/// the result string, exactly as the pre-RTL code did.
+pub(crate) fn join_run_fragments(fragments: &[(&str, bool)]) -> String {
+    if !fragments
+        .iter()
+        .any(|(text, _)| !text.is_ascii() && text.chars().any(is_rtl_char))
+    {
+        let mut out = String::new();
+        for (text, word_gap) in fragments {
+            if *word_gap && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(text);
+        }
+        return out;
+    }
+
+    let mut words: Vec<Cow<str>> = Vec::new();
     for (text, word_gap) in fragments {
         match words.last_mut() {
             // Pieces of one word: an RTL word's pieces are painted
@@ -277,16 +345,16 @@ pub(crate) fn join_run_fragments(fragments: &[(String, bool)]) -> String {
                     let mut merged = String::with_capacity(text.len() + word.len());
                     merged.push_str(text);
                     merged.push_str(word);
-                    *word = merged;
+                    *word = Cow::Owned(merged);
                 } else {
-                    word.push_str(text);
+                    word.to_mut().push_str(text);
                 }
             }
-            _ => words.push(text.clone()),
+            _ => words.push(Cow::Borrowed(text)),
         }
     }
 
-    let mut ordered: Vec<&str> = words.iter().map(String::as_str).collect();
+    let mut ordered: Vec<&str> = words.iter().map(Cow::as_ref).collect();
     if crate::text_utils::is_rtl_text(ordered.iter()) {
         order_rtl_sequence(&mut ordered, text_has_rtl, text_has_strong_ltr);
     }
@@ -294,10 +362,10 @@ pub(crate) fn join_run_fragments(fragments: &[(String, bool)]) -> String {
 }
 
 /// Render a grid of accumulated cells.
-pub(crate) fn finish_cells(cells: &[Vec<CellText>]) -> Vec<Vec<String>> {
+pub(crate) fn finish_cells(cells: Vec<Vec<CellText>>) -> Vec<Vec<String>> {
     cells
-        .iter()
-        .map(|row| row.iter().map(CellText::finish).collect())
+        .into_iter()
+        .map(|row| row.into_iter().map(CellText::finish).collect())
         .collect()
 }
 
@@ -698,6 +766,15 @@ mod mixed_direction {
     #[test]
     fn fenced_code_block_is_not_treated_as_a_table() {
         let markdown = format!("```\n|{HEB_A}|{HEB_B}|\n|{HEB_A}|{HEB_B}|\n```\n");
+        assert_eq!(restore_visual_order(markdown.clone()), markdown);
+    }
+
+    /// A tilde run does not close a backtick fence, and a shorter backtick
+    /// run does not close a longer one.
+    #[test]
+    fn fence_closes_only_on_a_matching_delimiter() {
+        let row = format!("|{HEB_A}|{HEB_B}|");
+        let markdown = format!("````\n~~~\n{row}\n```\n{row}\n````\n");
         assert_eq!(restore_visual_order(markdown.clone()), markdown);
     }
 

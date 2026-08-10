@@ -460,7 +460,7 @@ fn build_text_anchor_table(
             item_indices.push(*item_index);
         }
     }
-    let cells = crate::rtl::finish_cells(&cell_text);
+    let cells = crate::rtl::finish_cells(cell_text);
     item_indices.sort_unstable();
     item_indices.dedup();
 
@@ -865,7 +865,7 @@ fn build_dense_row_anchor_table(
             item_indices.push(*item_index);
         }
     }
-    let cells = crate::rtl::finish_cells(&cell_text);
+    let cells = crate::rtl::finish_cells(cell_text);
     item_indices.sort_unstable();
     item_indices.dedup();
 
@@ -983,7 +983,7 @@ fn build_open_edge_grid_table_for_rules(
         }
     }
     let header_cells: Vec<String> = header_text
-        .iter()
+        .into_iter()
         .map(crate::rtl::CellText::finish)
         .collect();
     let mixed_rule_span_in_band = logical_rules.iter().any(|rule| {

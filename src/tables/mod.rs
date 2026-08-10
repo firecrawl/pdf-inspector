@@ -126,7 +126,19 @@ pub(crate) fn try_build_rect_guided_table(
     };
     let max_x = col_boundaries.last().unwrap() + col_spacing * 1.5;
 
-    for (item, orig_idx) in &expanded_items {
+    // `CellText` reconstructs reading order from paint order, so an RTL table
+    // must be filled left-to-right. The incoming slice is in stream order,
+    // which is not guaranteed to be X-ascending. Only RTL tables pay for the
+    // sort, and it is one index vector per table rather than per cell.
+    let fill_order = {
+        let mut order: Vec<usize> = (0..expanded_items.len()).collect();
+        if crate::text_utils::is_rtl_text(expanded_items.iter().map(|(item, _)| &item.text)) {
+            order.sort_by(|&a, &b| expanded_items[a].0.x.total_cmp(&expanded_items[b].0.x));
+        }
+        order
+    };
+
+    for (item, orig_idx) in fill_order.iter().map(|&k| &expanded_items[k]) {
         // Skip items beyond the table's rightmost column (legend text)
         if item.x > max_x {
             continue;
@@ -147,7 +159,7 @@ pub(crate) fn try_build_rect_guided_table(
     }
 
     // Cells are complete: render each in logical reading order.
-    let mut cells = crate::rtl::finish_cells(&cell_text);
+    let mut cells = crate::rtl::finish_cells(cell_text);
 
     // 5. Clean up: strip tilde-leader noise from cells (legend text bleeding
     //    into the last column from the right side of the page)
@@ -489,7 +501,16 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         vec![vec![crate::rtl::CellText::default(); columns.len()]; row_ys.len()];
     let mut item_indices: Vec<usize> = Vec::new();
 
-    for (item_idx, item) in items.iter().enumerate() {
+    // As above: RTL tables must be filled in ascending-X paint order.
+    let fill_order = {
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        if crate::text_utils::is_rtl_text(items.iter().map(|item| &item.text)) {
+            order.sort_by(|&a, &b| items[a].x.total_cmp(&items[b].x));
+        }
+        order
+    };
+
+    for (item_idx, item) in fill_order.iter().map(|&k| (k, &items[k])) {
         if item.page != page {
             continue;
         }
@@ -521,7 +542,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
             item_indices.push(item_idx);
         }
     }
-    let mut cells = crate::rtl::finish_cells(&cell_text);
+    let mut cells = crate::rtl::finish_cells(cell_text);
     merge_superscript_marker_rows(&mut row_ys, &mut cells);
 
     // Validate: need reasonable fill rate
