@@ -1076,6 +1076,7 @@ pub fn to_markdown_from_items_with_rects_and_page_count(
             page_thresholds: &HashMap::new(),
             struct_roles: None,
             struct_tables: &[],
+            reading_order: &Default::default(),
             page_count: document_page_count,
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
@@ -1089,6 +1090,10 @@ pub(crate) struct MarkdownDocumentContext<'a> {
     pub(crate) struct_roles:
         Option<&'a HashMap<u32, HashMap<i64, crate::structure_tree::StructRole>>>,
     pub(crate) struct_tables: &'a [crate::structure_tree::StructTable],
+    /// Порядок чтения, объявленный деревом структуры (ISO 32000-1 §14.8.2.3).
+    /// Пустая карта означает, что документ не размечен и порядок остаётся
+    /// геометрическим.
+    pub(crate) reading_order: &'a crate::tagged_order::ReadingOrder,
     pub(crate) page_count: u32,
     /// Pages where an upstream document-level pass removed folios. This keeps
     /// table-continuation classification consistent after masked items drop.
@@ -1123,6 +1128,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         page_thresholds,
         struct_roles,
         struct_tables,
+        reading_order,
         page_count: document_page_count,
         prefiltered_page_number_pages,
         prefiltered_page_number_mask,
@@ -1968,6 +1974,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         all_lines
     };
 
+    // Порядок чтения, объявленный документом, важнее того, что подсказывает
+    // геометрия: две колонки на одной высоте — это одна строка только на вид.
+    let lines = crate::tagged_order::regroup(lines, context.reading_order);
+
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
         preprocess::strip_repeated_lines(lines, document_page_count)
@@ -2120,6 +2130,7 @@ mod tests {
                 page_thresholds: &HashMap::new(),
                 struct_roles: None,
                 struct_tables: &[],
+                reading_order: &Default::default(),
                 page_count: 1,
                 prefiltered_page_number_pages: Some(&removed_pages),
                 prefiltered_page_number_mask: Some(&removal_mask),
