@@ -245,7 +245,9 @@ fn extract_form_xobject_text_inner(
     // Process the content stream
     let mut current_font = String::new();
     let mut current_font_size: f32 = 12.0;
+    let mut text_leading: f32 = 0.0;
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
@@ -321,6 +323,7 @@ fn extract_form_xobject_text_inner(
             "BT" => {
                 in_text_block = true;
                 text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+                line_matrix = text_matrix;
             }
             "ET" => {
                 in_text_block = false;
@@ -333,12 +336,21 @@ fn extract_form_xobject_text_inner(
                     current_font_size = get_number(&op.operands[1]).unwrap_or(12.0);
                 }
             }
+            "TL" => {
+                if let Some(tl) = op.operands.first().and_then(get_number) {
+                    text_leading = tl;
+                }
+            }
             "Td" | "TD" => {
                 if op.operands.len() >= 2 {
                     let tx = get_number(&op.operands[0]).unwrap_or(0.0);
                     let ty = get_number(&op.operands[1]).unwrap_or(0.0);
-                    text_matrix[4] += tx * text_matrix[0] + ty * text_matrix[2];
-                    text_matrix[5] += tx * text_matrix[1] + ty * text_matrix[3];
+                    line_matrix[4] += tx * line_matrix[0] + ty * line_matrix[2];
+                    line_matrix[5] += tx * line_matrix[1] + ty * line_matrix[3];
+                    text_matrix = line_matrix;
+                    if op.operator == "TD" {
+                        text_leading = -ty;
+                    }
                 }
             }
             "Tm" => {
@@ -347,7 +359,18 @@ fn extract_form_xobject_text_inner(
                         text_matrix[i] =
                             get_number(operand).unwrap_or(if i == 0 || i == 3 { 1.0 } else { 0.0 });
                     }
+                    line_matrix = text_matrix;
                 }
+            }
+            "T*" => {
+                let leading = if text_leading != 0.0 {
+                    text_leading
+                } else {
+                    current_font_size * 1.2
+                };
+                line_matrix[4] += (-leading) * line_matrix[2];
+                line_matrix[5] += (-leading) * line_matrix[3];
+                text_matrix = line_matrix;
             }
             "g" => {
                 if let Some(gray) = op.operands.first().and_then(get_number) {
@@ -682,4 +705,82 @@ pub(crate) fn get_form_fonts<'a>(
     }
 
     fonts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tounicode::FontCMaps;
+    use lopdf::{dictionary, Object, Stream};
+
+    fn extract_form_items(content: &[u8]) -> Vec<TextItem> {
+        let mut doc = Document::new();
+        let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths),
+        });
+        let form_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(font_id),
+                    },
+                },
+            },
+            content.to_vec(),
+        )));
+
+        extract_form_xobject_text(
+            &doc,
+            form_id,
+            1,
+            &FontCMaps::default(),
+            &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            &mut CMapDecisionCache::new(),
+            &mut FontStyleCache::new(),
+        )
+    }
+
+    #[test]
+    fn relative_line_move_uses_form_text_line_matrix() {
+        let items = extract_form_items(b"BT /F1 12 Tf 100 500 Td (AAAA) Tj 0 -20 Td (BBBB) Tj ET");
+        let first = items.iter().find(|item| item.text == "AAAA").unwrap();
+        let second = items.iter().find(|item| item.text == "BBBB").unwrap();
+
+        assert!((first.x - 100.0).abs() < 0.1);
+        assert!((second.x - 100.0).abs() < 0.1);
+        assert!((second.y - 480.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn next_line_uses_form_text_leading_and_line_origin() {
+        let items =
+            extract_form_items(b"BT /F1 12 Tf 20 TL 1 0 0 1 100 500 Tm (AAAA) Tj T* (BBBB) Tj ET");
+        let second = items.iter().find(|item| item.text == "BBBB").unwrap();
+
+        assert!((second.x - 100.0).abs() < 0.1);
+        assert!((second.y - 480.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn relative_line_move_with_leading_sets_next_line_origin() {
+        let items = extract_form_items(
+            b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (AAAA) Tj 0 -20 TD (BBBB) Tj T* (CCCC) Tj ET",
+        );
+        let second = items.iter().find(|item| item.text == "BBBB").unwrap();
+        let third = items.iter().find(|item| item.text == "CCCC").unwrap();
+
+        assert!((second.x - 100.0).abs() < 0.1);
+        assert!((second.y - 480.0).abs() < 0.1);
+        assert!((third.x - 100.0).abs() < 0.1);
+        assert!((third.y - 460.0).abs() < 0.1);
+    }
 }
