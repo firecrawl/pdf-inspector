@@ -21,9 +21,12 @@
 //!    logical characters, so visual-order text already carries logical
 //!    bracket codepoints in reversed positions — plain positional reversal
 //!    restores them, and applying rule L4 (as `python-bidi` does) would
-//!    break them. A conservative repair pass handles the rare writer that
-//!    stores screen-form brackets instead: an unmatched closer followed by
-//!    an unmatched opener of the same kind is swapped back.
+//!    break them. A repair pass handles the writer that stores screen-form
+//!    brackets instead, swapping back a closer that stands where its opener
+//!    belongs. It runs twice: per item here, and again per rendered line
+//!    (`repair_line_brackets`), because a parenthetical wrapping a bold run,
+//!    an equation or a link has its two halves in different items and no
+//!    item-level pass can pair them.
 //! 2. **Combining marks** stay attached to their base under reversal, while
 //!    Hebrew punctuation interleaved with the points is not treated as
 //!    combining.
@@ -109,29 +112,44 @@ pub(crate) fn restore_visual_order(markdown: String) -> String {
     while i < lines.len() {
         // Code fences are copied through untouched: an extracted source
         // listing can hold pipe-delimited lines that are not a table, and
-        // reversing them would corrupt the code.
-        match (fence, fence_delimiter(lines[i])) {
-            (None, Some(opened)) => fence = Some(opened),
+        // reversing them would corrupt the code. Neither are their brackets
+        // repaired — a listing means its brackets literally.
+        let in_fence = match (fence, fence_delimiter(lines[i])) {
+            (None, Some(opened)) => {
+                fence = Some(opened);
+                true
+            }
             (Some((open_char, open_len)), Some((close_char, close_len)))
                 if close_char == open_char && close_len >= open_len =>
             {
                 fence = None;
+                true
             }
-            _ => {
-                if fence.is_none() && is_table_row(lines[i]) {
-                    let start = i;
-                    while i < lines.len()
-                        && is_table_row(lines[i])
-                        && fence_delimiter(lines[i]).is_none()
-                    {
-                        i += 1;
-                    }
-                    process_table_block(&lines[start..i], &mut out);
-                    continue;
+            (Some(_), _) => true,
+            (None, None) => false,
+        };
+        if !in_fence && is_table_row(lines[i]) {
+            let start = i;
+            while i < lines.len() && is_table_row(lines[i]) && fence_delimiter(lines[i]).is_none() {
+                i += 1;
+            }
+            let first_row = out.len();
+            process_table_block(&lines[start..i], &mut out);
+            // Cell text needs the same bracket repair as prose. Run it after
+            // the column order is settled so a repair never crosses a cell
+            // boundary that is about to move.
+            for row in &mut out[first_row..] {
+                if let Cow::Owned(fixed) = repair_line_brackets(row) {
+                    *row = Cow::Owned(fixed);
                 }
             }
+            continue;
         }
-        out.push(Cow::Borrowed(lines[i]));
+        out.push(if in_fence {
+            Cow::Borrowed(lines[i])
+        } else {
+            repair_line_brackets(lines[i])
+        });
         i += 1;
     }
     out.join("\n")
@@ -467,41 +485,65 @@ fn push_reversed(out: &mut String, run: &str) {
     }
 }
 
+const BRACKET_PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+
+fn has_bracket(text: &str) -> bool {
+    text.contains(|c| BRACKET_PAIRS.iter().any(|&(o, cl)| c == o || c == cl))
+}
+
 /// Repair inverted bracket pairs left by writers that store screen-form
-/// (mirrored) bracket glyphs: after reversal those surface as an unmatched
-/// closer appearing before an unmatched opener of the same kind — a pattern
-/// well-formed text never produces. Each such orphan pair is swapped back.
+/// (mirrored) bracket glyphs: after reversal those surface as a closer standing
+/// where its opener belongs — a pattern well-formed text never produces.
+///
+/// Pairs are matched greedily from the left: the first closer that stands at
+/// depth zero is joined with the nearest opener after it, and scanning resumes
+/// beyond that partner. Matching the *nearest* opener is what keeps several
+/// mirrored parentheticals in one string separate — pairing the first orphan
+/// closer with the last orphan opener instead turns `)a( )b(` into the nested
+/// `(a( )b)`, leaving the inner two still mirrored.
+///
+/// The rewrite is kept only if it leaves no closer at depth zero. When the
+/// greedy walk cannot separate the cases — a mirrored parenthetical interleaved
+/// with a correctly stored one — the text is returned untouched rather than
+/// rearranged into something equally wrong.
 fn repair_inverted_brackets(text: String) -> String {
-    const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
-    if !text.contains(|c| PAIRS.iter().any(|&(o, cl)| c == o || c == cl)) {
+    if !has_bracket(&text) {
         return text;
     }
 
     let mut chars: Vec<char> = text.chars().collect();
     let mut changed = false;
-    for &(open, close) in &PAIRS {
-        let mut stack: Vec<usize> = Vec::new();
-        let mut orphan_closers: Vec<usize> = Vec::new();
-        let mut orphan_openers: Vec<usize> = Vec::new();
-        for (i, &c) in chars.iter().enumerate() {
-            if c == open {
-                stack.push(i);
-            } else if c == close && stack.pop().is_none() {
-                orphan_closers.push(i);
-            }
+    for &(open, close) in &BRACKET_PAIRS {
+        if !chars.contains(&close) {
+            continue;
         }
-        orphan_openers.extend(stack);
-
-        let mut openers = orphan_openers.into_iter().peekable();
-        for closer in orphan_closers {
-            while openers.peek().is_some_and(|&o| o < closer) {
-                openers.next();
+        let mut candidate = chars.clone();
+        let mut swapped = false;
+        let mut depth = 0u32;
+        let mut i = 0;
+        while i < candidate.len() {
+            if candidate[i] == open {
+                depth += 1;
+            } else if candidate[i] == close {
+                if depth > 0 {
+                    depth -= 1;
+                } else if let Some(partner) =
+                    (i + 1..candidate.len()).find(|&k| candidate[k] == open)
+                {
+                    candidate[i] = open;
+                    candidate[partner] = close;
+                    swapped = true;
+                    // The pair just formed spans i..=partner and is closed
+                    // there, so depth is 0 again and nothing inside it is
+                    // reconsidered.
+                    i = partner;
+                }
             }
-            if let Some(opener) = openers.next() {
-                chars[closer] = open;
-                chars[opener] = close;
-                changed = true;
-            }
+            i += 1;
+        }
+        if swapped && !has_unopened_closer(&candidate, open, close) {
+            chars = candidate;
+            changed = true;
         }
     }
 
@@ -509,6 +551,61 @@ fn repair_inverted_brackets(text: String) -> String {
         chars.into_iter().collect()
     } else {
         text
+    }
+}
+
+/// True when a closer appears before any opener could have opened it — the
+/// signature of mirrored storage, and what a repair must remove.
+fn has_unopened_closer(chars: &[char], open: char, close: char) -> bool {
+    let mut depth = 0u32;
+    for &c in chars {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            if depth == 0 {
+                return true;
+            }
+            depth -= 1;
+        }
+    }
+    false
+}
+
+/// Repair mirrored brackets over a whole rendered line.
+///
+/// `restore_item_text` sees one extracted item at a time, so a parenthetical
+/// whose opener and closer land in different items — anything wrapping a bold
+/// run, an equation, or a link — keeps its screen form however well each item
+/// is restored. The joined line is the first place both halves are visible.
+///
+/// Table cells are repaired independently: a closer in one cell and an opener
+/// in the next are not a pair, so an unescaped `|` bounds the search. Lines
+/// with no RTL character return borrowed, so LTR documents are untouched.
+fn repair_line_brackets(line: &str) -> Cow<'_, str> {
+    if line.is_ascii() || !has_bracket(line) || !line.chars().any(is_rtl_char) {
+        return Cow::Borrowed(line);
+    }
+
+    let cells = split_cells(line);
+    let mut repaired: Vec<Cow<str>> = Vec::with_capacity(cells.len());
+    let mut changed = false;
+    for cell in cells {
+        if !has_bracket(cell) {
+            repaired.push(Cow::Borrowed(cell));
+            continue;
+        }
+        let fixed = repair_inverted_brackets(cell.to_string());
+        if fixed == cell {
+            repaired.push(Cow::Borrowed(cell));
+        } else {
+            changed = true;
+            repaired.push(Cow::Owned(fixed));
+        }
+    }
+    if changed {
+        Cow::Owned(repaired.join("|"))
+    } else {
+        Cow::Borrowed(line)
     }
 }
 
@@ -648,6 +745,97 @@ mod tests {
     fn escaped_pipes_do_not_split_cells() {
         let cells = split_cells("|a\\|b|שלום|");
         assert_eq!(cells, vec!["", "a\\|b", "שלום", ""]);
+    }
+
+    #[test]
+    fn two_mirrored_pairs_in_one_item_are_repaired_separately() {
+        // Pairing the first orphan closer with the last orphan opener would
+        // nest them — `(א( )ב)` — and leave the inner two mirrored.
+        assert_eq!(
+            repair_inverted_brackets(")א( וכפל )ב(".to_string()),
+            "(א) וכפל (ב)"
+        );
+    }
+
+    #[test]
+    fn three_mirrored_pairs_in_one_line_are_all_repaired() {
+        let line = ")א( ל )ב( ל )ג(";
+        assert_eq!(
+            repair_inverted_brackets(line.to_string()),
+            "(א) ל (ב) ל (ג)"
+        );
+    }
+
+    #[test]
+    fn correctly_stored_brackets_are_left_alone() {
+        for text in ["(שלום) עולם", "ראה f(x) בהמשך", "[10.א] משפט"] {
+            assert_eq!(repair_inverted_brackets(text.to_string()), text);
+        }
+    }
+
+    /// Known limitation. `)א( ב )ג(` (two mirrored pairs) and
+    /// `)א (x) ג(` (a correctly stored Latin pair inside a mirrored Hebrew
+    /// one) present the *identical* bracket sequence `) ( ) (`, so no rule over
+    /// bracket order alone can tell them apart. The pass reads it as two pairs,
+    /// which is the shape the corpus actually produces; in the nested case the
+    /// outer pair is repaired and the inner one is left inverted.
+    #[test]
+    fn a_correct_pair_inside_a_mirrored_one_is_read_as_two_pairs() {
+        assert_eq!(
+            repair_inverted_brackets(")הערה (x) סוף(".to_string()),
+            "(הערה )x( סוף)"
+        );
+    }
+
+    #[test]
+    fn unmatched_closer_with_no_partner_is_left_alone() {
+        assert_eq!(
+            repair_inverted_brackets("סעיף א) המשך".to_string()),
+            "סעיף א) המשך"
+        );
+    }
+
+    #[test]
+    fn mirrored_pair_split_across_items_is_repaired_on_the_line() {
+        // The opener and closer arrived in different items, so no item-level
+        // pass could pair them; the joined line can.
+        let line = "תשלום זה ישולם במועד )ו/או **בני משפחתו**( כפי שנקבע\n";
+        assert_eq!(
+            restore_visual_order(line.to_string()),
+            "תשלום זה ישולם במועד (ו/או **בני משפחתו**) כפי שנקבע\n"
+        );
+    }
+
+    #[test]
+    fn ltr_line_with_brackets_is_untouched() {
+        let doc = "See section a) below and (also) this.\n";
+        assert_eq!(restore_visual_order(doc.to_string()), doc);
+        assert!(matches!(
+            repair_line_brackets("See a) and (b"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn table_cells_are_repaired_independently() {
+        // Each cell holds its own mirrored pair.
+        let table = "|)א(|)ב(|\n|---|---|\n|גימל|דלת|";
+        let fixed = restore_visual_order(table.to_string());
+        assert!(fixed.starts_with("|(ב)|(א)|"), "got {fixed}");
+
+        // A closer in one cell and an opener in the next are not a pair, so
+        // neither orientation changes (the column order still flips, as this
+        // table is majority-RTL).
+        let split = "|שלום א)|(ב שלום|\n|---|---|";
+        let fixed = restore_visual_order(split.to_string());
+        assert!(fixed.contains("שלום א)"), "got {fixed}");
+        assert!(fixed.contains("(ב שלום"), "got {fixed}");
+    }
+
+    #[test]
+    fn brackets_inside_a_code_fence_are_not_repaired() {
+        let doc = "```\nif )x( { שלום }\n```\n";
+        assert_eq!(restore_visual_order(doc.to_string()), doc);
     }
 }
 
