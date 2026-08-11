@@ -1,6 +1,6 @@
 # pdf-inspector
 
-Fast PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Pure Rust, no ML models, no external services; the only PDF dependency is [lopdf](https://crates.io/crates/lopdf). Also available for [Python](https://pypi.org/project/pdf-inspector/) and [Node.js](https://www.npmjs.com/package/@firecrawl/pdf-inspector).
+Fast PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. The default build is pure Rust, has no ML models or external services, and uses [lopdf](https://crates.io/crates/lopdf) for PDF parsing. Also available for [Python](https://pypi.org/project/pdf-inspector/) and [Node.js](https://www.npmjs.com/package/@firecrawl/pdf-inspector/).
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
@@ -116,6 +116,45 @@ use pdf_inspector::process_pdf_mem;
 let bytes = std::fs::read("document.pdf")?;
 let result = process_pdf_mem(&bytes)?;
 ```
+
+### Optional native page rendering
+
+The `render-pdfium` feature adds a native-only page renderer backed by
+[`firecrawl-pdfium`](https://crates.io/crates/firecrawl-pdfium). It is the
+rendering boundary for local OCR pipelines; enabling it does not include an OCR
+model or change the existing extraction functions.
+
+```toml
+[dependencies]
+pdf-inspector = { version = "1", features = ["render-pdfium"] }
+```
+
+PDFium is loaded at runtime. Set `PDFIUM_LIB_PATH`, place its shared library
+next to the executable, or use another discovery route supported by
+`firecrawl-pdfium`.
+
+```rust
+use pdf_inspector::vision::{PdfiumRenderer, RenderOptions};
+
+let renderer = PdfiumRenderer::load()?;
+let bytes = std::fs::read("document.pdf")?;
+let pages = renderer.render_pages(
+    &bytes,
+    &[1, 3], // 1-indexed, matching pages_needing_ocr
+    None,    // optional PDF password
+    &RenderOptions::new().dpi(150.0),
+)?;
+
+for page in pages {
+    // Owned RGB pixels can leave the PDFium critical section and be sent to
+    // an OCR worker. OCR pixel boxes can be mapped back to PDF coordinates.
+    let rect = page.pixel_rect_to_pdf_rect(20.0, 30.0, 100.0, 24.0);
+    println!("page {}: {}x{}, rect={rect:?}", page.page(), page.width(), page.height());
+}
+```
+
+Browser WASM remains on the default text-only path and does not expose native
+PDFium rendering.
 
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):

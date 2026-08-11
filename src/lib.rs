@@ -43,6 +43,7 @@ mod text_quality;
 pub mod text_utils;
 pub mod tounicode;
 pub mod types;
+pub mod vision;
 
 pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
