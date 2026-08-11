@@ -659,6 +659,80 @@ pub fn extract_pages_markdown<P: AsRef<Path>>(
 }
 
 // =========================================================================
+// Structure-tree element extraction (tagged PDFs)
+// =========================================================================
+
+/// One structure-tree element reference from a tagged PDF, resolved to a
+/// page and Marked Content ID.
+///
+/// Join `(page, mcid)` against [`TextItem::page`] / [`TextItem::mcid`] from
+/// [`extract_text_with_positions`] to attach semantic roles (heading levels,
+/// paragraphs, table cells, …) to extracted text.
+#[derive(Debug, Clone)]
+pub struct StructureElement {
+    /// 1-indexed page number (matches [`TextItem::page`]).
+    pub page: u32,
+    /// Marked Content ID from the page's content stream (matches
+    /// [`TextItem::mcid`]).
+    pub mcid: i64,
+    /// Standard structure type name ("H1".."H6", "P", "Table", "TD", …).
+    /// Custom tags are resolved through the document's `/RoleMap`; tags
+    /// with no standard mapping are returned verbatim.
+    pub role: String,
+}
+
+/// Extract structure-tree element references from a tagged PDF in memory.
+///
+/// Parses `/StructTreeRoot` (when present) and returns one entry per
+/// marked-content reference, resolved to its 1-indexed page, MCID, and
+/// structure type name. Returns an empty list when the PDF is not tagged.
+///
+/// Pass `Some(&[...])` with 1-indexed page numbers (matching
+/// [`TextItem::page`]) to restrict output to those pages; pass `None` for
+/// the whole document. Entries are sorted by `(page, mcid)`.
+pub fn extract_structure_elements_mem(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+) -> Result<Vec<StructureElement>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let Some(tree) = structure_tree::StructTree::from_doc(&doc) else {
+        return Ok(Vec::new());
+    };
+    let page_ids = doc.get_pages();
+    let roles = tree.mcid_to_roles(&page_ids);
+
+    let page_filter: Option<HashSet<u32>> = pages.map(|p| p.iter().copied().collect());
+    let mut elements: Vec<StructureElement> = roles
+        .into_iter()
+        .filter(|(page, _)| page_filter.as_ref().is_none_or(|f| f.contains(page)))
+        .flat_map(|(page, mcids)| {
+            mcids.into_iter().map(move |(mcid, role)| StructureElement {
+                page,
+                mcid,
+                role: role.name().to_string(),
+            })
+        })
+        .collect();
+    elements.sort_unstable_by_key(|e| (e.page, e.mcid));
+    Ok(elements)
+}
+
+/// Path-based wrapper for [`extract_structure_elements_mem`].
+///
+/// Reads the PDF from disk and extracts structure-tree element references.
+/// Pass `None` for `pages` to return the whole document, or `Some(&[...])`
+/// to restrict to specific 1-indexed pages.
+pub fn extract_structure_elements<P: AsRef<Path>>(
+    path: P,
+    pages: Option<&[u32]>,
+) -> Result<Vec<StructureElement>, PdfError> {
+    validate_pdf_file(&path)?;
+    let buffer = std::fs::read(path.as_ref())?;
+    extract_structure_elements_mem(&buffer, pages)
+}
+
+// =========================================================================
 // Region-based text extraction (for hybrid OCR pipelines)
 // =========================================================================
 

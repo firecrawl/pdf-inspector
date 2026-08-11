@@ -1,6 +1,6 @@
 [package]
 name = "pdf-inspector-wasm"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Firecrawl Team"]
 description = "Browser WebAssembly bindings for pdf-inspector"

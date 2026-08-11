@@ -1430,6 +1430,77 @@ fn test_firecrawl_tagged_pdf_struct_tree() {
 }
 
 #[test]
+fn test_tagged_pdf_text_items_carry_mcid() {
+    let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    assert!(
+        items.iter().any(|i| i.mcid.is_some()),
+        "Tagged PDF text items should carry Marked Content IDs"
+    );
+}
+
+#[test]
+fn test_extract_structure_elements_tagged_pdf() {
+    let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let elements = pdf_inspector::extract_structure_elements_mem(&buf, None).unwrap();
+    assert!(!elements.is_empty(), "Tagged PDF should yield elements");
+    assert!(
+        elements.iter().any(|e| e.role == "H1"),
+        "Should surface H1 heading roles"
+    );
+    assert!(
+        elements.iter().all(|e| !e.role.is_empty()),
+        "Every element should carry a role name"
+    );
+
+    // Sorted by (page, mcid) for deterministic output
+    assert!(
+        elements
+            .windows(2)
+            .all(|w| (w[0].page, w[0].mcid) <= (w[1].page, w[1].mcid)),
+        "Elements should be sorted by (page, mcid)"
+    );
+
+    // The advertised join: (page, mcid) pairs must line up with the
+    // mcid-carrying TextItems from positioned extraction, and joining the
+    // H1 entries must recover non-empty heading text.
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    let h1_refs: std::collections::HashSet<(u32, i64)> = elements
+        .iter()
+        .filter(|e| e.role == "H1")
+        .map(|e| (e.page, e.mcid))
+        .collect();
+    let h1_text: String = items
+        .iter()
+        .filter(|i| i.mcid.is_some_and(|mcid| h1_refs.contains(&(i.page, mcid))))
+        .map(|i| i.text.as_str())
+        .collect();
+    assert!(
+        !h1_text.trim().is_empty(),
+        "Joining H1 structure elements to text items should recover heading text"
+    );
+
+    // Page filter is 1-indexed (matching TextItem.page) and equals the
+    // corresponding subset of the full document result.
+    let page1 = pdf_inspector::extract_structure_elements_mem(&buf, Some(&[1])).unwrap();
+    assert!(!page1.is_empty(), "Page 1 should have elements");
+    assert!(page1.iter().all(|e| e.page == 1));
+    let full_page1_count = elements.iter().filter(|e| e.page == 1).count();
+    assert_eq!(page1.len(), full_page1_count);
+}
+
+#[test]
+fn test_extract_structure_elements_untagged_pdf_empty() {
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let elements = pdf_inspector::extract_structure_elements_mem(&buf, None).unwrap();
+    assert!(
+        elements.is_empty(),
+        "Untagged PDF should yield no structure elements, got {:?}",
+        elements
+    );
+}
+
+#[test]
 fn test_identity_h_no_tounicode_suppresses_garbage() {
     // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no
     // usable ToUnicode CMap. The raw CID bytes (e.g. 0x08 0x37, 0x0E 0x0F)
