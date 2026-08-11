@@ -1,47 +1,18 @@
-//! PDFium-backed page rendering for OCR.
+//! PDFium-backed implementation of the renderer-neutral page contract.
 
 use std::path::Path;
 
-use firecrawl_pdfium::{
-    PageRect as PdfiumPageRect, Pdfium, PixelFormat, PixelPoint, PixelRect, RenderConfig,
-};
+use firecrawl_pdfium::{Pdfium, PixelFormat, PixelPoint, RenderConfig};
 use thiserror::Error;
 
-use crate::PdfRect;
-
-/// Default rendering resolution for OCR.
-pub const DEFAULT_RENDER_DPI: f32 = 150.0;
-
-/// Default maximum size of one rendered page: 256 MiB.
-pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Pixel layout returned by [`RenderedPage`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RenderPixelFormat {
-    /// Three bytes per pixel in red, green, blue order. This is the default
-    /// because OCR preprocessors conventionally consume RGB images.
-    #[default]
-    Rgb8,
-    /// Four bytes per pixel in red, green, blue, alpha order.
-    Rgba8,
-    /// One luminance byte per pixel.
-    Gray8,
-}
+use super::{
+    PageRenderer, PageTransform, RenderBufferError, RenderOptions, RenderPixelFormat, RenderedPage,
+};
 
 impl RenderPixelFormat {
-    /// Number of bytes used by one pixel.
-    pub fn bytes_per_pixel(self) -> usize {
-        match self {
-            Self::Rgb8 => 3,
-            Self::Rgba8 => 4,
-            Self::Gray8 => 1,
-        }
-    }
-
     fn pdfium_format(self) -> PixelFormat {
         match self {
-            // PDFium produces BGR directly; `RenderedPage::from_pdfium`
+            // PDFium produces BGR directly; `rendered_page_from_pdfium`
             // swaps the red and blue channels in place.
             Self::Rgb8 => PixelFormat::Bgr8,
             Self::Rgba8 => PixelFormat::Rgba8,
@@ -50,69 +21,7 @@ impl RenderPixelFormat {
     }
 }
 
-/// Configuration for pages rendered as input to a local vision pipeline.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RenderOptions {
-    /// Output resolution. Defaults to 150 DPI.
-    pub dpi: f32,
-    /// Pixel layout. Defaults to three-channel RGB.
-    pub pixel_format: RenderPixelFormat,
-    /// Include PDF annotations in the rendered bitmap.
-    pub annotations: bool,
-    /// Include visible static AcroForm field appearances.
-    pub form_fields: bool,
-    /// Maximum allocation for each rendered page.
-    pub max_output_bytes_per_page: u64,
-}
-
-impl Default for RenderOptions {
-    fn default() -> Self {
-        Self {
-            dpi: DEFAULT_RENDER_DPI,
-            pixel_format: RenderPixelFormat::Rgb8,
-            annotations: true,
-            form_fields: true,
-            max_output_bytes_per_page: DEFAULT_MAX_OUTPUT_BYTES,
-        }
-    }
-}
-
 impl RenderOptions {
-    /// Creates local-rendering options with OCR-oriented defaults.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Sets the output resolution in dots per inch.
-    pub fn dpi(mut self, dpi: f32) -> Self {
-        self.dpi = dpi;
-        self
-    }
-
-    /// Sets the output pixel layout.
-    pub fn pixel_format(mut self, pixel_format: RenderPixelFormat) -> Self {
-        self.pixel_format = pixel_format;
-        self
-    }
-
-    /// Toggles annotation rendering.
-    pub fn annotations(mut self, annotations: bool) -> Self {
-        self.annotations = annotations;
-        self
-    }
-
-    /// Toggles visible static form-field rendering.
-    pub fn form_fields(mut self, form_fields: bool) -> Self {
-        self.form_fields = form_fields;
-        self
-    }
-
-    /// Sets the maximum allocation for each rendered page.
-    pub fn max_output_bytes_per_page(mut self, bytes: u64) -> Self {
-        self.max_output_bytes_per_page = bytes;
-        self
-    }
-
     fn pdfium_config(&self) -> RenderConfig {
         RenderConfig::new()
             .dpi(self.dpi)
@@ -120,147 +29,6 @@ impl RenderOptions {
             .annotations(self.annotations)
             .form_fields(self.form_fields)
             .max_output_bytes(self.max_output_bytes_per_page)
-    }
-}
-
-/// A point in PDF page space, measured in points from the bottom-left.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PagePoint {
-    /// Horizontal position in PDF points.
-    pub x: f32,
-    /// Vertical position in PDF points, increasing upward.
-    pub y: f32,
-}
-
-/// One rendered page with owned pixels and its pixel-to-PDF transform.
-///
-/// The value contains no live PDFium page or document handles. It can be
-/// moved to an OCR worker and retained after [`PdfiumRenderer::render_pages`]
-/// returns.
-#[derive(Debug, Clone)]
-pub struct RenderedPage {
-    page: u32,
-    page_width: f32,
-    page_height: f32,
-    width: u32,
-    height: u32,
-    stride: usize,
-    format: RenderPixelFormat,
-    pixels: Vec<u8>,
-    transform: firecrawl_pdfium::PageTransform,
-}
-
-impl RenderedPage {
-    fn from_pdfium(
-        page: u32,
-        page_width: f32,
-        page_height: f32,
-        format: RenderPixelFormat,
-        rendered: firecrawl_pdfium::RenderedPage,
-    ) -> Self {
-        let width = rendered.width();
-        let height = rendered.height();
-        let stride = rendered.stride();
-        let transform = *rendered.transform();
-        let mut pixels = rendered.into_pixels();
-
-        if format == RenderPixelFormat::Rgb8 {
-            bgr_to_rgb_in_place(&mut pixels, width, height, stride);
-        }
-
-        Self {
-            page,
-            page_width,
-            page_height,
-            width,
-            height,
-            stride,
-            format,
-            pixels,
-            transform,
-        }
-    }
-
-    /// 1-indexed page number.
-    pub fn page(&self) -> u32 {
-        self.page
-    }
-
-    /// Page width in PDF points after applying the page's `/Rotate` entry.
-    pub fn page_width(&self) -> f32 {
-        self.page_width
-    }
-
-    /// Page height in PDF points after applying the page's `/Rotate` entry.
-    pub fn page_height(&self) -> f32 {
-        self.page_height
-    }
-
-    /// Bitmap width in pixels.
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    /// Bitmap height in pixels.
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    /// Number of bytes between adjacent bitmap rows.
-    pub fn stride(&self) -> usize {
-        self.stride
-    }
-
-    /// Pixel layout of [`pixels`](Self::pixels).
-    pub fn format(&self) -> RenderPixelFormat {
-        self.format
-    }
-
-    /// Owned bitmap bytes, with rows ordered top-to-bottom.
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
-    }
-
-    /// Consumes the page and returns its pixel buffer.
-    pub fn into_pixels(self) -> Vec<u8> {
-        self.pixels
-    }
-
-    /// Converts a bitmap point (top-left origin, y-down) to PDF page space
-    /// (bottom-left origin, y-up).
-    pub fn pixel_to_page(&self, x: f64, y: f64) -> PagePoint {
-        let point = self.transform.pixel_to_page(PixelPoint::new(x, y));
-        PagePoint {
-            x: point.x as f32,
-            y: point.y as f32,
-        }
-    }
-
-    /// Converts a bitmap rectangle to the repository's existing PDF-space
-    /// rectangle type. The returned page number remains 1-indexed.
-    pub fn pixel_rect_to_pdf_rect(&self, x: f64, y: f64, width: f64, height: f64) -> PdfRect {
-        let rect = self
-            .transform
-            .pixel_rect_to_page(PixelRect::new(x, y, width, height));
-        PdfRect {
-            x: rect.left as f32,
-            y: rect.bottom as f32,
-            width: rect.width() as f32,
-            height: rect.height() as f32,
-            page: self.page,
-        }
-    }
-
-    /// Converts a PDF-space rectangle to bitmap coordinates
-    /// `(x, y, width, height)` with a top-left origin.
-    pub fn pdf_rect_to_pixel(&self, rect: &PdfRect) -> (f64, f64, f64, f64) {
-        let rect = self.transform.page_rect_to_pixel(PdfiumPageRect::new(
-            f64::from(rect.x),
-            f64::from(rect.y),
-            f64::from(rect.x + rect.width),
-            f64::from(rect.y + rect.height),
-        ));
-        (rect.x, rect.y, rect.width, rect.height)
     }
 }
 
@@ -282,6 +50,9 @@ pub enum RenderError {
     /// PDFium loading, document parsing, form setup, or rendering failed.
     #[error(transparent)]
     Pdfium(#[from] firecrawl_pdfium::Error),
+    /// PDFium returned an internally inconsistent bitmap or transform.
+    #[error(transparent)]
+    Buffer(#[from] RenderBufferError),
 }
 
 /// Loaded PDFium renderer used to prepare pages for OCR.
@@ -317,9 +88,19 @@ impl PdfiumRenderer {
 
     /// Renders selected 1-indexed pages in the same order as `pages`.
     ///
-    /// The PDF is parsed once for the full batch. Passing an empty page list
-    /// returns immediately without parsing or allocating.
+    /// This inherent method mirrors [`PageRenderer`] so existing callers do
+    /// not need to import the trait.
     pub fn render_pages(
+        &self,
+        pdf_bytes: &[u8],
+        pages: &[u32],
+        password: Option<&str>,
+        options: &RenderOptions,
+    ) -> Result<Vec<RenderedPage>, RenderError> {
+        self.render_pages_impl(pdf_bytes, pages, password, options)
+    }
+
+    fn render_pages_impl(
         &self,
         pdf_bytes: &[u8],
         pages: &[u32],
@@ -351,17 +132,73 @@ impl PdfiumRenderer {
             let page = document.page(page_number as usize - 1)?;
             let size = page.size();
             let rendered = page.render(&config)?;
-            rendered_pages.push(RenderedPage::from_pdfium(
+            rendered_pages.push(rendered_page_from_pdfium(
                 page_number,
                 size.width,
                 size.height,
                 options.pixel_format,
                 rendered,
-            ));
+            )?);
         }
 
         Ok(rendered_pages)
     }
+}
+
+impl PageRenderer for PdfiumRenderer {
+    type Error = RenderError;
+
+    fn render_pages(
+        &self,
+        pdf_bytes: &[u8],
+        pages: &[u32],
+        password: Option<&str>,
+        options: &RenderOptions,
+    ) -> Result<Vec<RenderedPage>, Self::Error> {
+        self.render_pages_impl(pdf_bytes, pages, password, options)
+    }
+}
+
+fn rendered_page_from_pdfium(
+    page: u32,
+    page_width: f32,
+    page_height: f32,
+    format: RenderPixelFormat,
+    rendered: firecrawl_pdfium::RenderedPage,
+) -> Result<RenderedPage, RenderBufferError> {
+    let width = rendered.width();
+    let height = rendered.height();
+    let stride = rendered.stride();
+    let pdfium_transform = *rendered.transform();
+    let corner = |x, y| {
+        let point = pdfium_transform.pixel_to_page(PixelPoint::new(x, y));
+        (point.x, point.y)
+    };
+    let transform = PageTransform::from_corners(
+        width,
+        height,
+        corner(0.0, 0.0),
+        corner(f64::from(width), 0.0),
+        corner(0.0, f64::from(height)),
+    )
+    .ok_or(RenderBufferError::InvalidTransform)?;
+    let mut pixels = rendered.into_pixels();
+
+    if format == RenderPixelFormat::Rgb8 {
+        bgr_to_rgb_in_place(&mut pixels, width, height, stride);
+    }
+
+    RenderedPage::new(
+        page,
+        page_width,
+        page_height,
+        width,
+        height,
+        stride,
+        format,
+        pixels,
+        transform,
+    )
 }
 
 fn bgr_to_rgb_in_place(pixels: &mut [u8], width: u32, height: u32, stride: usize) {
@@ -383,16 +220,6 @@ fn bgr_to_rgb_in_place(pixels: &mut [u8], width: u32, height: u32, stride: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn defaults_are_ocr_oriented_and_bounded() {
-        let options = RenderOptions::default();
-        assert_eq!(options.dpi, 150.0);
-        assert_eq!(options.pixel_format, RenderPixelFormat::Rgb8);
-        assert!(options.annotations);
-        assert!(options.form_fields);
-        assert_eq!(options.max_output_bytes_per_page, 256 * 1024 * 1024);
-    }
 
     #[test]
     fn bgr_pixels_are_converted_to_rgb_in_place() {

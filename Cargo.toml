@@ -52,6 +52,11 @@ env_logger = "0.11"
 # Optional native page rendering for OCR pipelines. PDFium is loaded at
 # runtime, so enabling this feature does not link or download a native library.
 firecrawl-pdfium = { version = "0.1.0", optional = true }
+# Small support crates used only by the opt-in model cache. Model files remain
+# external and are never embedded in pdf-inspector artifacts.
+dirs = { version = "6.0", optional = true }
+fs2 = { version = "0.4", optional = true }
+sha2 = { version = "0.11", optional = true }
 
 # Browser builds use JavaScript randomness for encrypted PDFs and embed the
 # bundled CMaps because there is no filesystem at runtime.
@@ -65,7 +70,9 @@ tempfile = "3.3"
 [features]
 default = []
 python = ["pyo3"]
-render-pdfium = ["dep:firecrawl-pdfium"]
+local-vision = []
+model-cache = ["local-vision", "dep:dirs", "dep:fs2", "dep:sha2"]
+render-pdfium = ["local-vision", "dep:firecrawl-pdfium"]
 
 [[bin]]
 name = "pdf2md"
