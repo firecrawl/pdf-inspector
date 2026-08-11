@@ -1,0 +1,23 @@
+scripts/tests/test_version.py
+  s_9bf2e0399fd0ed::t_ac2222f71065ad 86-108
+docs/publishing.md
+  s_9bf2e0399fd0ed::t_ac2222f71065ad 46
+scripts/version.py
+  s_9bf2e0399fd0ed::t_ac2222f71065ad 13-15,18,142-144,196-198
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4965734face0011e6bdf0b10dcc0cf04adce656c",
+  "prompts": {},
+  "sessions": {
+    "s_9bf2e0399fd0ed": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fed68-79df-7b11-860a-bc445cab00af",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
