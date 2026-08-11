@@ -137,8 +137,8 @@ fn rise_adjusted(tm: &[f32; 6], rise: f32) -> [f32; 6] {
     ]
 }
 
-/// Returns `(page_extraction, has_gid_fonts)` where `has_gid_fonts` indicates
-/// the page uses fonts with unresolvable gid-encoded glyphs.
+/// Returns extraction results plus page-level font, rotation, and invisible
+/// text metadata.
 pub(crate) fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
@@ -146,7 +146,7 @@ pub(crate) fn extract_page_text_items(
     font_cmaps: &FontCMaps,
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
-) -> Result<(PageExtraction, bool, bool), PdfError> {
+) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
@@ -154,6 +154,7 @@ pub(crate) fn extract_page_text_items(
     let mut clip_rects: Vec<PdfRect> = Vec::new();
     let mut lines: Vec<PdfLine> = Vec::new();
     let mut underline_lines: Vec<UnderlineLine> = Vec::new();
+    let mut has_invisible_text = false;
 
     // Path construction state for m/l/h → S/s line extraction
     let mut path_subpath_start: Option<(f32, f32)> = None;
@@ -252,17 +253,38 @@ pub(crate) fn extract_page_text_items(
     // Content::decode parser, causing it to skip operators like ET and Q.
     let content_data = strip_pdf_comments(&content_data);
 
-    let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
-
     const MAX_OPERATIONS: usize = 1_000_000;
-    if content.operations.len() > MAX_OPERATIONS {
+    let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
+    let mut operations = Vec::with_capacity(content.operations.len());
+    for op in content.operations {
+        if op.operator == "\"" && op.operands.len() >= 3 {
+            operations.push(lopdf::content::Operation::new(
+                "Tw",
+                vec![op.operands[0].clone()],
+            ));
+            operations.push(lopdf::content::Operation::new(
+                "Tc",
+                vec![op.operands[1].clone()],
+            ));
+            operations.push(lopdf::content::Operation::new(
+                "'",
+                vec![op.operands[2].clone()],
+            ));
+        } else {
+            operations.push(op);
+        }
+        if operations.len() > MAX_OPERATIONS {
+            break;
+        }
+    }
+    if operations.len() > MAX_OPERATIONS {
         log::warn!(
             "page {}: skipping extraction — {} operations exceeds limit ({})",
             page_num,
-            content.operations.len(),
+            operations.len(),
             MAX_OPERATIONS
         );
-        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false));
+        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
     }
 
     // Graphics state tracking
@@ -320,7 +342,7 @@ pub(crate) fn extract_page_text_items(
         stack.iter().rev().find_map(|e| e.mcid)
     }
 
-    for op in &content.operations {
+    for op in &operations {
         trace!("{} {:?}", op.operator, op.operands);
         match op.operator.as_str() {
             "q" => {
@@ -375,7 +397,6 @@ pub(crate) fn extract_page_text_items(
                 in_text_block = true;
                 text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
                 line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-                text_rendering_mode = 0;
             }
             "ET" => {
                 // End text block
@@ -462,6 +483,11 @@ pub(crate) fn extract_page_text_items(
             "Tj" => {
                 // Show text string
                 if in_text_block && !op.operands.is_empty() {
+                    if text_rendering_mode == 3
+                        && get_operand_bytes(&op.operands[0]).is_some_and(|raw| !raw.is_empty())
+                    {
+                        has_invisible_text = true;
+                    }
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
                         get_operand_bytes(&op.operands[0]).map(|raw| {
@@ -564,6 +590,13 @@ pub(crate) fn extract_page_text_items(
                 // Show text with positioning — split at column-sized gaps
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
+                        if text_rendering_mode == 3
+                            && array.iter().any(|element| {
+                                get_operand_bytes(element).is_some_and(|raw| !raw.is_empty())
+                            })
+                        {
+                            has_invisible_text = true;
+                        }
                         let font_info = font_widths.get(&current_font);
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
@@ -742,6 +775,15 @@ pub(crate) fn extract_page_text_items(
             }
             "'" => {
                 // Move to next line and show text (equivalent to T* then Tj)
+                if text_rendering_mode == 3
+                    && op
+                        .operands
+                        .first()
+                        .and_then(get_operand_bytes)
+                        .is_some_and(|raw| !raw.is_empty())
+                {
+                    has_invisible_text = true;
+                }
                 let tl = if text_leading != 0.0 {
                     text_leading
                 } else {
@@ -1300,7 +1342,12 @@ pub(crate) fn extract_page_text_items(
 
     let items = super::merge_text_items(items);
     let items = super::merge_subscript_items(items);
-    Ok(((items, rects, lines), has_gid_fonts, coords_rotated))
+    Ok((
+        (items, rects, lines),
+        has_gid_fonts,
+        coords_rotated,
+        has_invisible_text,
+    ))
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.
@@ -1498,7 +1545,7 @@ mod tests {
 
         let (doc, page_id) = simple_doc_with_content(content);
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
@@ -1736,7 +1783,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             &mut FontStyleCache::new(),
         )
         .unwrap();
-        let ((items, rects, lines), _has_gid, _coords_rotated) = result;
+        let ((items, rects, lines), _has_gid, _coords_rotated, _has_invisible_text) = result;
         assert!(items.is_empty());
         assert!(rects.is_empty());
         assert!(lines.is_empty());
@@ -1817,7 +1864,7 @@ BT 30 700 Tm <41> Tj ET";
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,

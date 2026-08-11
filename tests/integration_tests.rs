@@ -81,6 +81,208 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
     pdf
 }
 
+fn make_two_page_text_pdf(first_content: &str, second_content: &str) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            first_content.len(),
+            first_content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            second_content.len(),
+            second_content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        7,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+#[test]
+fn text_based_pdf_falls_back_to_invisible_ocr_text() {
+    let pdf = make_text_pdf(
+        "BT /F1 12 Tf 3 Tr 100 700 Td (Hidden OCR text) Tj ET",
+        "0 0 612 792",
+    );
+
+    let result = process_pdf_mem(&pdf).expect("PDF should parse");
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .is_some_and(|markdown| markdown.contains("Hidden OCR text")),
+        "empty visible extraction should fall back to the invisible OCR layer"
+    );
+}
+
+#[test]
+fn visible_header_does_not_block_invisible_ocr_body() {
+    let hidden_body = "(Hidden OCR body) Tj 0 -5 Td ".repeat(100);
+    let pdf = make_text_pdf(
+        &format!("BT /F1 12 Tf 100 740 Td (Visible header) Tj 3 Tr 0 -20 Td {hidden_body} ET"),
+        "0 0 612 792",
+    );
+
+    let result = process_pdf_mem(&pdf).expect("PDF should parse");
+    let markdown = result.markdown.expect("PDF should produce markdown");
+
+    assert!(markdown.contains("Visible header"));
+    assert!(
+        markdown.contains("Hidden OCR body"),
+        "a visible header must not suppress the page's invisible OCR body"
+    );
+}
+
+#[test]
+fn visible_page_does_not_block_another_pages_invisible_ocr_text() {
+    let visible = "BT /F1 12 Tf 100 700 Td (Visible first page) Tj ET";
+    let hidden = format!(
+        "BT /F1 12 Tf 3 Tr 100 700 Td {} ET",
+        "(Hidden second page) Tj 0 -5 Td ".repeat(100)
+    );
+    let pdf = make_two_page_text_pdf(visible, &hidden);
+
+    let result = process_pdf_mem(&pdf).expect("PDF should parse");
+    let markdown = result.markdown.expect("PDF should produce markdown");
+
+    assert!(markdown.contains("Visible first page"));
+    assert!(
+        markdown.contains("Hidden second page"),
+        "visible text on one page must not suppress another page's invisible OCR layer"
+    );
+}
+
+#[test]
+fn overlaid_invisible_copy_is_not_duplicated() {
+    let pdf = make_text_pdf(
+        "BT /F1 12 Tf 100 700 Td (Same text) Tj 3 Tr 0 0 Td (Same text) Tj ET",
+        "0 0 612 792",
+    );
+
+    let result = process_pdf_mem(&pdf).expect("PDF should parse");
+    let markdown = result.markdown.expect("PDF should produce markdown");
+
+    assert_eq!(
+        markdown.matches("Same text").count(),
+        1,
+        "an overlaid invisible copy must not duplicate visible text: {markdown:?}"
+    );
+}
+
+#[test]
+fn text_rendering_mode_persists_across_bt() {
+    let pdf = make_text_pdf(
+        "3 Tr BT /F1 12 Tf 100 700 Td (Hidden across BT) Tj ET",
+        "0 0 612 792",
+    );
+
+    let visible_items = extract_text_with_positions_mem(&pdf).expect("extract visible text");
+    assert!(
+        visible_items
+            .iter()
+            .all(|item| !item.text.contains("Hidden across BT")),
+        "BT must not reset the text rendering mode"
+    );
+
+    let result = process_pdf_mem(&pdf).expect("PDF should parse");
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .is_some_and(|markdown| markdown.contains("Hidden across BT")),
+        "the invisible fallback should recover text whose Tr state predates BT"
+    );
+}
+
+#[test]
+fn double_quote_operator_invisible_text_is_recovered() {
+    let pdf = make_text_pdf(
+        "BT /F1 12 Tf 3 Tr 14 TL 0 0 (Hidden double quote) \" ET",
+        "0 0 612 792",
+    );
+
+    let result = process_pdf_mem(&pdf).expect("PDF should parse");
+
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .is_some_and(|markdown| markdown.contains("Hidden double quote")),
+        "the double-quote text-showing operator must participate in invisible fallback; \
+         pdf_type={:?}, markdown={:?}, ocr_pages={:?}",
+        result.pdf_type,
+        result.markdown,
+        result.pages_needing_ocr
+    );
+}
+
 fn make_recurring_contextual_folio_pdf() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
@@ -3792,7 +3994,7 @@ fn test_synthetic_type0_broken_tounicode_emits_fffd_not_latin1_mojibake() {
 /// `Do` operator (per PDF spec section 8.9.5 "Image Coordinate System").
 /// For an axis-aligned image at `(x, y)` with size `w × h`, that's
 /// `[w, 0, 0, h, x, y]`.
-fn make_pdf_with_image(image_ctm: [f32; 6]) -> Vec<u8> {
+fn make_pdf_with_image(image_ctm: [f32; 6], invisible_text: bool) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
 
@@ -3844,10 +4046,15 @@ fn make_pdf_with_image(image_ctm: [f32; 6]) -> Vec<u8> {
     // BT/ET around a small text item just so the page isn't classified as
     // image-only (which would route to a different code path). Then save
     // graphics state, apply the image CTM, invoke Im0, restore.
-    let content = format!(
-        "BT /F1 12 Tf 100 700 Td (Hi) Tj ET\nq {} {} {} {} {} {} cm /Im0 Do Q",
-        a, b, c, d, e, f
-    );
+    let text = if invisible_text {
+        format!(
+            "BT /F1 12 Tf 3 Tr 100 700 Td {} ET",
+            "(Hidden OCR text) Tj 0 -5 Td ".repeat(100)
+        )
+    } else {
+        "BT /F1 12 Tf 100 700 Td (Hi) Tj ET".to_string()
+    };
+    let content = format!("{text}\nq {a} {b} {c} {d} {e} {f} cm /Im0 Do Q");
     add_stream_object(&mut pdf, &mut offsets, 4, "", content.as_bytes());
     add_object(
         &mut pdf,
@@ -3886,11 +4093,27 @@ fn make_pdf_with_image(image_ctm: [f32; 6]) -> Vec<u8> {
 }
 
 #[test]
+fn image_placeholder_does_not_block_invisible_ocr_fallback() {
+    let pdf = make_pdf_with_image([200.0, 0.0, 0.0, 100.0, 50.0, 600.0], true);
+
+    let result = process_pdf_mem(&pdf).expect("PDF should parse");
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .is_some_and(|markdown| markdown.contains("Hidden OCR text")),
+        "image placeholders are not usable visible text"
+    );
+}
+
+#[test]
 fn test_extract_text_with_positions_emits_image_bboxes() {
     // Place a 200×100 image at (50, 600) in PDF user space (origin
     // bottom-left). The Do operator applies the CTM to a unit square,
     // so for an axis-aligned image, CTM = [w, 0, 0, h, x, y].
-    let pdf = make_pdf_with_image([200.0, 0.0, 0.0, 100.0, 50.0, 600.0]);
+    let pdf = make_pdf_with_image([200.0, 0.0, 0.0, 100.0, 50.0, 600.0], false);
     let items = extract_text_with_positions_mem(&pdf).expect("extract");
 
     let images: Vec<&TextItem> = items
@@ -3929,7 +4152,7 @@ fn test_image_xobject_bbox_handles_rotated_ctm() {
     //   (1,1) → (100, 400)
     //   (0,1) → (100, 300)
     // → AABB: x=100..200 (w=100), y=300..400 (h=100).
-    let pdf = make_pdf_with_image([0.0, 100.0, -100.0, 0.0, 200.0, 300.0]);
+    let pdf = make_pdf_with_image([0.0, 100.0, -100.0, 0.0, 200.0, 300.0], false);
     let items = extract_text_with_positions_mem(&pdf).expect("extract");
     let img = items
         .iter()
@@ -3947,7 +4170,7 @@ fn test_image_emission_does_not_change_default_markdown() {
     // emission MUST NOT make `extract_pages_markdown` start producing
     // `![Image: …]` placeholders for everyone. Existing callers that
     // upgrade should see no diff in their markdown.
-    let pdf = make_pdf_with_image([200.0, 0.0, 0.0, 100.0, 50.0, 600.0]);
+    let pdf = make_pdf_with_image([200.0, 0.0, 0.0, 100.0, 50.0, 600.0], false);
     let result = extract_pages_markdown_mem(&pdf, None).expect("extract");
     assert_eq!(result.pages.len(), 1);
     assert!(

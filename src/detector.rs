@@ -1426,6 +1426,13 @@ fn scan_content_for_text_operators(
             }
         }
 
+        let follows_text_string = i > 0 && matches!(content[i - 1], b')' | b'>');
+        if matches!(b, b'\'' | b'"') && (is_word_start(i) || follows_text_string) && is_word_end(i)
+        {
+            text_ops += 1;
+            collect_text_chars_before(content, i, unique_chars);
+        }
+
         // Note: We do NOT count 'Do' operators here because Do invokes any
         // XObject — including Form XObjects that contain text.  Actual image
         // detection is handled by scan_xobjects_in_resources (checks Subtype)
@@ -2012,6 +2019,18 @@ mod tests {
             scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
         assert_eq!(ops3, 0);
         assert_eq!(imgs3, 0);
+    }
+
+    #[test]
+    fn test_scan_content_quote_operators_without_operand_whitespace() {
+        let mut uchars = HashSet::new();
+        let content = b"BT /F1 12 Tf (Single)' 0 0 (Double)\" ET";
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+
+        assert_eq!(ops, 2);
+        assert!(uchars.contains(&b'S'));
+        assert!(uchars.contains(&b'D'));
     }
 
     #[test]
