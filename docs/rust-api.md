@@ -308,6 +308,38 @@ SHA-256 verification to `ModelStore`. The store serializes installation across
 processes and publishes completed artifacts atomically. Warm caches make no
 network calls; offline mode and explicit model directories never download.
 
+### OCR Markdown assembly and native fusion
+
+`fuse_ocr_pages` maps OCR polygons back into PDF coordinates and sends the
+result through pdf-inspector's existing deterministic reading-order, table,
+and Markdown pipeline. Pages whose native extraction was rejected use OCR
+output. When `Force` runs on a clean native page, normalized duplicate OCR
+blocks are removed and only additional image-backed text is retained.
+
+```rust
+use pdf_inspector::vision::{fuse_ocr_pages, OcrFusionOptions};
+
+let fused = fuse_ocr_pages(
+    &extraction.pages,
+    &run,
+    extraction.pages.len() as u32,
+    &OcrFusionOptions::new().render_dpi(150.0),
+)?;
+
+for page in &fused.pages {
+    println!("{}", page.markdown);
+    if page.provenance.hosted_recommended {
+        eprintln!("page {} needs the hosted document pipeline", page.page + 1);
+    }
+}
+```
+
+Each page carries `Native`, `Ocr`, or `Fused` provenance, the exact OCR model
+revision, accepted-page confidence, local stage timings, and non-fatal
+warnings. A page that required OCR recommends the hosted pipeline when local
+OCR is missing, empty, or below the configurable page-confidence threshold.
+This keeps the lightweight path explicit about cases it cannot finish well.
+
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):
 

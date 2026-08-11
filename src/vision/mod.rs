@@ -12,6 +12,8 @@
 mod contracts;
 #[cfg(all(feature = "model-download", not(target_arch = "wasm32")))]
 mod download;
+#[cfg(all(feature = "local-vision", not(target_arch = "wasm32")))]
+mod fusion;
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 mod models;
 #[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
@@ -32,6 +34,11 @@ pub use contracts::{
 };
 #[cfg(all(feature = "model-download", not(target_arch = "wasm32")))]
 pub use download::{HttpModelDownloadError, HttpModelDownloader, DEFAULT_MODEL_DOWNLOAD_TIMEOUT};
+#[cfg(all(feature = "local-vision", not(target_arch = "wasm32")))]
+pub use fusion::{
+    fuse_ocr_pages, ocr_page_to_markdown, FusedPageMarkdown, FusedPages, OcrFusionError,
+    OcrFusionOptions,
+};
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 pub use models::{
     ModelAcquireError, ModelArtifact, ModelArtifactKind, ModelDownloader, ModelManifest,
@@ -42,6 +49,7 @@ pub use oar::{OarOcrEngine, OarOcrError, ONNX_RUNTIME_LIBRARY_ENV};
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use render::{
     PagePoint, PageTransform, RenderBufferError, RenderOptions, RenderPixelFormat, RenderedPage,
+    DEFAULT_RENDER_DPI,
 };
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use routing::{
