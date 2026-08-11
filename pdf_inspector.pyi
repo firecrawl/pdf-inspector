@@ -46,6 +46,7 @@ class TextItem:
     font: str
     font_size: float
     page: int
+    """0-indexed page number."""
     is_bold: bool
     is_italic: bool
     is_underline: bool
@@ -60,7 +61,7 @@ class TextItem:
 class StructureElement:
     """One structure-tree element reference from a tagged PDF."""
     page: int
-    """1-indexed page number (matches TextItem.page)."""
+    """0-indexed page number (matches TextItem.page)."""
     mcid: int
     """Marked Content ID from the page's content stream (matches TextItem.mcid)."""
     role: str
@@ -139,23 +140,29 @@ def extract_text_bytes(data: bytes) -> str:
     ...
 
 def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) -> list[TextItem]:
-    """Extract text with position information."""
+    """Extract text with position information.
+
+    ``pages`` and returned ``TextItem.page`` values are 0-indexed.
+    """
     ...
 
 def extract_text_with_positions_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[TextItem]:
-    """Extract text with position information from bytes."""
+    """Extract text with position information from bytes.
+
+    ``pages`` and returned ``TextItem.page`` values are 0-indexed.
+    """
     ...
 
 def extract_structure_elements(path: str, pages: Optional[list[int]] = None) -> list[StructureElement]:
     """Extract structure-tree element references from a tagged PDF file.
 
-    Returns one entry per marked-content reference, resolved to its 1-indexed
+    Returns one entry per marked-content reference, resolved to its 0-indexed
     page, MCID, and structure type name ("H1".."H6", "P", "Table", ...), sorted
     by (page, mcid). Returns an empty list when the PDF is not tagged.
 
     Args:
         path: Path to the PDF file.
-        pages: Optional list of 1-indexed pages (matching ``TextItem.page``).
+        pages: Optional list of 0-indexed pages (matching ``TextItem.page``).
             When ``None`` (default), the whole document is returned.
     """
     ...

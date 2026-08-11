@@ -94,8 +94,8 @@ result = pdf_inspector.extract_pages_markdown("document.pdf", pages=[0, 2])
 | `classify_pdf_bytes(data)` | Lightweight classification from bytes |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_bytes(data)` | Plain text extraction from bytes |
-| `extract_text_with_positions(path, pages=None)` | Text with X/Y coords and font info |
-| `extract_text_with_positions_bytes(data, pages=None)` | Text with positions from bytes |
+| `extract_text_with_positions(path, pages=None)` | Text with X/Y coords and font info; page indexes are 0-based |
+| `extract_text_with_positions_bytes(data, pages=None)` | Text with positions from bytes; page indexes are 0-based |
 | `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions |
 | `extract_text_in_regions_bytes(data, page_regions)` | Region extraction from bytes |
 | `extract_pages_markdown(path, pages=None)` | Per-page Markdown + layout metadata (all pages by default) |
@@ -138,7 +138,7 @@ class TextItem:                      # extract_text_with_positions
     height: float
     font: str
     font_size: float
-    page: int
+    page: int                        # 0-indexed
     is_bold: bool
     is_italic: bool
     is_underline: bool
