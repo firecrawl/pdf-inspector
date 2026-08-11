@@ -251,31 +251,45 @@ fn extract_form_xobject_text_inner(
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
-    let mut ctm_stack: Vec<([f32; 6], f32, String, f32)> = Vec::new();
+    /// Full text/graphics state saved on `q` and restored on `Q` (PR #340).
+    type SavedFormState = ([f32; 6], f32, String, f32, [f32; 6], [f32; 6]);
+    let mut ctm_stack: Vec<SavedFormState> = Vec::new();
 
     for op in &content.operations {
         match op.operator.as_str() {
             "q" => {
                 // Save graphics state — PDF spec: q/Q bracket the full
-                // graphics state, including text state (leading, font,
-                // font size). Without restoring these, a TL/TD set inside a
-                // q/Q block leaks into subsequent T* lines (cubic review,
-                // PR #340).
+                // graphics state, including text state. Leading, font and
+                // font size were the first gap (cubic review, PR #340); the
+                // text matrix and text line matrix are part of the same
+                // state (PDF spec erratum on text objects) — a Td/Tm/T*
+                // inside a q/Q block must not leak its shifted matrices
+                // into lines after Q.
                 ctm_stack.push((
                     ctm,
                     text_leading,
                     current_font.clone(),
                     current_font_size,
+                    text_matrix,
+                    line_matrix,
                 ));
             }
             "Q" => {
-                if let Some((saved_ctm, saved_leading, saved_font, saved_font_size)) =
-                    ctm_stack.pop()
+                if let Some((
+                    saved_ctm,
+                    saved_leading,
+                    saved_font,
+                    saved_font_size,
+                    saved_text_matrix,
+                    saved_line_matrix,
+                )) = ctm_stack.pop()
                 {
                     ctm = saved_ctm;
                     text_leading = saved_leading;
                     current_font = saved_font;
                     current_font_size = saved_font_size;
+                    text_matrix = saved_text_matrix;
+                    line_matrix = saved_line_matrix;
                 }
             }
             "cm" => {
