@@ -1,0 +1,22 @@
+tests/integration_tests.rs
+  s_873e4e52b848d8::t_5ce407daba50fe 1715-1728
+  s_873e4e52b848d8::t_63eff2809f4fe2 1766-1769
+  s_873e4e52b848d8::t_3fddcdda0f5f0c 1660-1666
+  s_873e4e52b848d8::t_93c72847309d8f 1817-1833,1837-1856,1860-1862
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e1c160ddf2a685f0d03d7602705df303a0da2b33",
+  "prompts": {},
+  "sessions": {
+    "s_873e4e52b848d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6944fce5-efea-4ab2-8cf3-1d0a778e2db8",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
