@@ -12,7 +12,7 @@ use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::OcrOptions;
+use super::{ModelDownloadPolicy, OcrOptions};
 
 /// Environment variable overriding the default local model cache.
 pub const MODEL_CACHE_ENV: &str = "PDF_INSPECTOR_MODEL_CACHE";
@@ -138,6 +138,19 @@ pub struct ModelStore {
     override_root: Option<PathBuf>,
 }
 
+/// Streaming source for a pinned model artifact.
+///
+/// Implementations may use HTTP, an object store, or an application-owned
+/// package manager. [`ModelStore`] remains responsible for locking, atomic
+/// installation, exact size validation, and SHA-256 verification.
+pub trait ModelDownloader: Send + Sync {
+    /// Downloader-specific failure type.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Opens a streaming reader for one manifest artifact.
+    fn open(&self, artifact: &ModelArtifact) -> Result<Box<dyn Read + Send>, Self::Error>;
+}
+
 impl ModelStore {
     /// Creates a model store rooted at an explicit cache directory.
     pub fn new(cache_root: impl Into<PathBuf>) -> Self {
@@ -199,6 +212,49 @@ impl ModelStore {
             revision: manifest.revision.to_string(),
             artifacts,
         })
+    }
+
+    /// Resolves a complete model set, fetching only missing or invalid managed
+    /// cache artifacts when policy permits.
+    ///
+    /// Explicit [`OcrOptions::model_directory`] overrides are never mutated or
+    /// supplemented from the network. This method also avoids all downloader
+    /// calls when the cache is already valid or downloads are offline.
+    pub fn resolve_or_download<D: ModelDownloader>(
+        &self,
+        manifest: &ModelManifest,
+        policy: ModelDownloadPolicy,
+        downloader: &D,
+    ) -> Result<ModelPaths, ModelAcquireError<D::Error>> {
+        validate_manifest(manifest).map_err(ModelAcquireError::Store)?;
+        match self.resolve(manifest) {
+            Ok(paths) => return Ok(paths),
+            Err(source) if self.override_root.is_some() => {
+                return Err(ModelAcquireError::ExplicitDirectoryIncomplete { source });
+            }
+            Err(source) if policy == ModelDownloadPolicy::Offline => {
+                return Err(ModelAcquireError::DownloadsDisabled { source });
+            }
+            Err(_) => {}
+        }
+
+        let root = self.manifest_cache_root(manifest);
+        for artifact in manifest.artifacts {
+            if verify_artifact(&root.join(artifact.filename), artifact).is_ok() {
+                continue;
+            }
+            let reader =
+                downloader
+                    .open(artifact)
+                    .map_err(|source| ModelAcquireError::Download {
+                        kind: artifact.kind,
+                        url: artifact.url,
+                        source,
+                    })?;
+            self.install(manifest, artifact.kind, reader)
+                .map_err(ModelAcquireError::Store)?;
+        }
+        self.resolve(manifest).map_err(ModelAcquireError::Store)
     }
 
     /// Atomically installs one artifact from a reader after validating its
@@ -276,6 +332,43 @@ impl ModelStore {
     fn manifest_cache_root(&self, manifest: &ModelManifest) -> PathBuf {
         self.cache_root.join(manifest.id).join(manifest.revision)
     }
+}
+
+/// Failures while resolving or lazily acquiring a model set.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ModelAcquireError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    /// Manifest validation, cache verification, or installation failed.
+    #[error(transparent)]
+    Store(#[from] ModelStoreError),
+    /// A managed-cache artifact could not be downloaded.
+    #[error("failed to download {kind:?} from {url}: {source}")]
+    Download {
+        /// Artifact role.
+        kind: ModelArtifactKind,
+        /// Pinned source URL.
+        url: &'static str,
+        /// Downloader failure.
+        #[source]
+        source: E,
+    },
+    /// Offline policy prevented acquisition of an unavailable artifact.
+    #[error("model artifacts are unavailable and downloads are disabled: {source}")]
+    DownloadsDisabled {
+        /// Original verification failure.
+        #[source]
+        source: ModelStoreError,
+    },
+    /// An explicit package-managed directory was incomplete or invalid.
+    #[error("explicit model directory is incomplete or invalid: {source}")]
+    ExplicitDirectoryIncomplete {
+        /// Original verification failure.
+        #[source]
+        source: ModelStoreError,
+    },
 }
 
 /// Failures while validating or installing model artifacts.
@@ -601,6 +694,34 @@ mod tests {
         artifacts: TEST_ARTIFACTS,
     };
 
+    #[derive(Debug)]
+    struct StaticDownloader {
+        bytes: &'static [u8],
+        requests: std::sync::Mutex<Vec<ModelArtifactKind>>,
+    }
+
+    impl StaticDownloader {
+        fn new(bytes: &'static [u8]) -> Self {
+            Self {
+                bytes,
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    impl ModelDownloader for StaticDownloader {
+        type Error = io::Error;
+
+        fn open(&self, artifact: &ModelArtifact) -> Result<Box<dyn Read + Send>, Self::Error> {
+            self.requests.lock().unwrap().push(artifact.kind);
+            Ok(Box::new(io::Cursor::new(self.bytes)))
+        }
+    }
+
     #[test]
     fn pinned_pp_ocr_manifest_is_well_formed() {
         validate_manifest(&PP_OCR_V6_SMALL).unwrap();
@@ -763,5 +884,46 @@ mod tests {
         let second = second.join().unwrap().unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::read(first).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn resolve_or_download_fetches_once_then_reuses_verified_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(temp.path());
+        let downloader = StaticDownloader::new(b"hello");
+
+        let first = store
+            .resolve_or_download(&TEST_MANIFEST, ModelDownloadPolicy::IfMissing, &downloader)
+            .unwrap();
+        let second = store
+            .resolve_or_download(&TEST_MANIFEST, ModelDownloadPolicy::IfMissing, &downloader)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(downloader.request_count(), 1);
+    }
+
+    #[test]
+    fn resolve_or_download_honors_offline_and_explicit_directory_boundaries() {
+        let cache = tempfile::tempdir().unwrap();
+        let override_dir = tempfile::tempdir().unwrap();
+        let downloader = StaticDownloader::new(b"hello");
+
+        let offline = ModelStore::new(cache.path())
+            .resolve_or_download(&TEST_MANIFEST, ModelDownloadPolicy::Offline, &downloader)
+            .unwrap_err();
+        assert!(matches!(
+            offline,
+            ModelAcquireError::DownloadsDisabled { .. }
+        ));
+
+        let explicit = ModelStore::new(cache.path())
+            .override_root(override_dir.path())
+            .resolve_or_download(&TEST_MANIFEST, ModelDownloadPolicy::IfMissing, &downloader)
+            .unwrap_err();
+        assert!(matches!(
+            explicit,
+            ModelAcquireError::ExplicitDirectoryIncomplete { .. }
+        ));
+        assert_eq!(downloader.request_count(), 0);
     }
 }

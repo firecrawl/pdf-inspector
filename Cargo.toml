@@ -62,6 +62,9 @@ sha2 = { version = "0.11", optional = true }
 image = { version = "0.25.6", default-features = false, optional = true }
 oar-ocr = { version = "0.9.1", default-features = false, features = ["simd"], optional = true }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"], optional = true }
+# HTTPS-only streaming downloader for pinned model artifacts. Kept separate
+# from model-cache so offline and package-managed deployments avoid HTTP/TLS.
+ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
 
 [target.'cfg(all(windows, not(target_arch = "wasm32")))'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"], optional = true }
@@ -80,6 +83,7 @@ default = []
 python = ["pyo3"]
 vision = []
 model-cache = ["vision", "dep:dirs", "dep:fs2", "dep:sha2", "dep:windows-sys"]
+model-download = ["model-cache", "dep:ureq"]
 ocr-oar = ["model-cache", "dep:image", "dep:oar-ocr", "dep:ort"]
 render-pdfium = ["vision", "dep:firecrawl-pdfium"]
 

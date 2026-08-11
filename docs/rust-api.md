@@ -137,11 +137,12 @@ pdf-inspector = { version = "1", features = ["vision", "model-cache"] }
 
 The OCR contracts preserve existing behavior by default: OCR is `Off`, learned
 layout is disabled, and model resolution is never reached. `ModelStore` itself
-does not access the network; a runtime integration can fetch a manifest's
-canonical URL only when allowed and pass the stream to `ModelStore::install`.
-Offline consumers set an explicit model directory and `ModelDownloadPolicy::Offline`.
-Renderer-only consumers do not enable `model-cache` and therefore do not compile
-its filesystem, locking, or hashing dependencies.
+does not access the network. The optional `model-download` feature provides an
+HTTPS downloader that streams pinned artifacts into the checksum-verified
+cache only after routing has selected OCR work. Offline consumers set an
+explicit model directory and `ModelDownloadPolicy::Offline`. Renderer-only
+consumers do not enable `model-cache` or `model-download` and therefore do not
+compile their filesystem, hashing, or HTTP dependencies.
 
 ```rust
 use pdf_inspector::vision::{
@@ -244,8 +245,68 @@ The engine accepts renderer-neutral RGB, RGBA, and grayscale pages, preserves
 OAR's positioned quadrilaterals in bitmap coordinates, filters spans using
 `minimum_confidence`, and records the pinned model revision in every `OcrPage`.
 `OcrMode::Off` is rejected at the engine boundary so default options cannot run
-inference accidentally. Selective routing and OCR/native-text fusion are added
-by higher stack layers.
+inference accidentally.
+
+### Selective routing and lazy model acquisition
+
+`route_ocr_pages` applies the existing detector/text-quality recommendations to
+the configured mode. `Auto` processes only recommended pages, `Force` processes
+all pages (or an explicit page selection), and `Off` always returns an empty
+route. `run_ocr_pages` renders only that route, checks that both dependencies
+preserve its order, and retains each bitmap's PDF transform for fusion.
+
+```toml
+[dependencies]
+pdf-inspector = { version = "1", features = [
+  "render-pdfium",
+  "ocr-oar",
+  "model-download",
+] }
+```
+
+```rust
+use pdf_inspector::vision::{
+    route_ocr_pages, run_ocr_pages, HttpModelDownloader, ModelStore,
+    OarOcrEngine, OcrMode, OcrOptions, PdfiumRenderer, RenderOptions,
+    PP_OCR_V6_SMALL,
+};
+
+let bytes = std::fs::read("scan.pdf")?;
+let extraction = pdf_inspector::extract_pages_markdown_mem(&bytes, None)?;
+let options = OcrOptions::new().mode(OcrMode::Auto);
+let routed = route_ocr_pages(
+    options.mode,
+    extraction.pages.len() as u32,
+    &extraction.pages_needing_ocr,
+    None,
+)?;
+
+if !routed.is_empty() {
+    // No HTTP request or model initialization occurs before this point.
+    let store = ModelStore::from_options(&options)?;
+    let models = store.resolve_or_download(
+        &PP_OCR_V6_SMALL,
+        options.model_downloads,
+        &HttpModelDownloader::default(),
+    )?;
+    let run = run_ocr_pages(
+        &PdfiumRenderer::load()?,
+        &OarOcrEngine::from_models(&models)?,
+        &bytes,
+        &routed,
+        None,
+        &RenderOptions::new(),
+        &options,
+    )?;
+    println!("OCR processed {} pages", run.pages.len());
+}
+```
+
+The downloader accepts HTTPS only, checks a declared content length, caps the
+response stream to the pinned size plus one byte, and delegates final size and
+SHA-256 verification to `ModelStore`. The store serializes installation across
+processes and publishes completed artifacts atomically. Warm caches make no
+network calls; offline mode and explicit model directories never download.
 
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):

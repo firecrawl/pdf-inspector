@@ -10,12 +10,16 @@
 
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 mod contracts;
+#[cfg(all(feature = "model-download", not(target_arch = "wasm32")))]
+mod download;
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 mod models;
 #[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
 mod oar;
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 mod render;
+#[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
+mod routing;
 
 #[cfg(all(feature = "render-pdfium", not(target_arch = "wasm32")))]
 mod pdfium;
@@ -26,16 +30,22 @@ pub use contracts::{
     ModelDownloadPolicy, ModelIdentity, OcrEngine, OcrMode, OcrOptions, OcrPage, OcrProfile,
     OcrSpan, PageContentSource, PageProvenance, PageRenderer, VisionTimings,
 };
+#[cfg(all(feature = "model-download", not(target_arch = "wasm32")))]
+pub use download::{HttpModelDownloadError, HttpModelDownloader, DEFAULT_MODEL_DOWNLOAD_TIMEOUT};
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 pub use models::{
-    ModelArtifact, ModelArtifactKind, ModelManifest, ModelPaths, ModelStore, ModelStoreError,
-    PP_OCR_V6_SMALL,
+    ModelAcquireError, ModelArtifact, ModelArtifactKind, ModelDownloader, ModelManifest,
+    ModelPaths, ModelStore, ModelStoreError, PP_OCR_V6_SMALL,
 };
 #[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
 pub use oar::{OarOcrEngine, OarOcrError, ONNX_RUNTIME_LIBRARY_ENV};
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use render::{
     PagePoint, PageTransform, RenderBufferError, RenderOptions, RenderPixelFormat, RenderedPage,
+};
+#[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
+pub use routing::{
+    route_ocr_pages, run_ocr_pages, LocalOcrPage, LocalOcrRun, OcrRoutingError, OcrRunError,
 };
 
 #[cfg(all(feature = "render-pdfium", not(target_arch = "wasm32")))]
