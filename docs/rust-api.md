@@ -197,6 +197,54 @@ for page in pages {
 Browser WASM remains on the default text-only path and does not expose native
 PDFium rendering.
 
+### Optional local OCR engine
+
+The native-only `ocr-oar` feature adds a CPU PP-OCRv6 Small implementation of
+`OcrEngine` backed by OAR and ONNX Runtime. It implies `model-cache`, but does
+not enable model auto-download or PDF rendering. Model files remain external,
+must match the pinned manifest, and are opened only after `ModelStore` verifies
+their exact size and SHA-256 digest. The feature currently requires Rust 1.95
+or newer, matching OAR 0.9.1's MSRV.
+
+```toml
+[dependencies]
+pdf-inspector = { version = "1", features = ["ocr-oar", "render-pdfium"] }
+```
+
+Direct engine invocation is intentionally separate from extraction routing and
+native/OCR fusion:
+
+```rust
+use pdf_inspector::vision::{
+    ModelDownloadPolicy, ModelStore, OarOcrEngine, OcrEngine, OcrMode,
+    OcrOptions, PdfiumRenderer, RenderOptions, PP_OCR_V6_SMALL,
+};
+
+let options = OcrOptions::new()
+    .mode(OcrMode::Force)
+    .minimum_confidence(0.45)
+    .model_directory("/opt/firecrawl/models/pp-ocrv6-small")
+    .model_downloads(ModelDownloadPolicy::Offline);
+let models = ModelStore::from_options(&options)?.resolve(&PP_OCR_V6_SMALL)?;
+let engine = OarOcrEngine::from_models(&models)?;
+
+let renderer = PdfiumRenderer::load()?;
+let bytes = std::fs::read("scan.pdf")?;
+let pages = renderer.render_pages(&bytes, &[1], None, &RenderOptions::new())?;
+let ocr_pages = engine.recognize(&pages, &options)?;
+
+for span in &ocr_pages[0].spans {
+    println!("{:.3}: {}", span.confidence, span.text);
+}
+```
+
+The engine accepts renderer-neutral RGB, RGBA, and grayscale pages, preserves
+OAR's positioned quadrilaterals in bitmap coordinates, filters spans using
+`minimum_confidence`, and records the pinned model revision in every `OcrPage`.
+`OcrMode::Off` is rejected at the engine boundary so default options cannot run
+inference accidentally. Selective routing and OCR/native-text fusion are added
+by higher stack layers.
+
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):
 

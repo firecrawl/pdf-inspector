@@ -3,14 +3,17 @@
 //! The existing lopdf extractor remains the default path. Native page
 //! rendering is available only with the `render-pdfium` feature. Engine
 //! contracts are available with `vision`, while checksum-verified model
-//! resolution is a separate `model-cache` feature. These remain separate so
-//! browser WASM, text-only consumers, and renderer-only users take on no model
-//! management dependencies.
+//! resolution is a separate `model-cache` feature. The `ocr-oar` feature adds
+//! a CPU PP-OCRv6 Small implementation of [`OcrEngine`]. These remain separate
+//! so browser WASM, text-only consumers, and renderer-only users take on no
+//! model-management or inference dependencies.
 
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 mod contracts;
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 mod models;
+#[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
+mod oar;
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 mod render;
 
@@ -28,6 +31,8 @@ pub use models::{
     ModelArtifact, ModelArtifactKind, ModelManifest, ModelPaths, ModelStore, ModelStoreError,
     PP_OCR_V6_SMALL,
 };
+#[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
+pub use oar::{OarOcrEngine, OarOcrError};
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use render::{
     PagePoint, PageTransform, RenderBufferError, RenderOptions, RenderPixelFormat, RenderedPage,

@@ -1,0 +1,127 @@
+#![cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
+
+use pdf_inspector::vision::{
+    ModelStore, OarOcrEngine, OcrEngine, OcrMode, OcrOptions, PageTransform, RenderPixelFormat,
+    RenderedPage, PP_OCR_V6_SMALL,
+};
+#[cfg(feature = "render-pdfium")]
+use pdf_inspector::vision::{PdfiumRenderer, RenderError, RenderOptions};
+
+const MODEL_DIRECTORY_ENV: &str = "PDF_INSPECTOR_OCR_TEST_MODELS";
+const IMAGE_ENV: &str = "PDF_INSPECTOR_OCR_TEST_IMAGE";
+const EXPECTED_TEXT_ENV: &str = "PDF_INSPECTOR_OCR_TEST_EXPECTED";
+
+#[cfg(feature = "render-pdfium")]
+fn load_renderer() -> Option<PdfiumRenderer> {
+    match PdfiumRenderer::load() {
+        Ok(renderer) => Some(renderer),
+        Err(RenderError::Pdfium(firecrawl_pdfium::Error::Load(
+            firecrawl_pdfium::LoadError::LibraryNotFound { .. },
+        ))) => {
+            eprintln!("skipping OCR runtime test because no native PDFium library is installed");
+            None
+        }
+        Err(error) => panic!("failed to load PDFium: {error}"),
+    }
+}
+
+#[test]
+fn recognizes_an_rgb_image_with_verified_models() {
+    let Some(model_directory) = std::env::var_os(MODEL_DIRECTORY_ENV) else {
+        eprintln!("skipping OCR runtime test because {MODEL_DIRECTORY_ENV} is not set");
+        return;
+    };
+    let Some(image_path) = std::env::var_os(IMAGE_ENV) else {
+        eprintln!("skipping OCR runtime test because {IMAGE_ENV} is not set");
+        return;
+    };
+
+    let image = image::open(image_path).unwrap().into_rgb8();
+    let (width, height) = image.dimensions();
+    let transform = PageTransform::from_corners(
+        width,
+        height,
+        (0.0, f64::from(height)),
+        (f64::from(width), f64::from(height)),
+        (0.0, 0.0),
+    )
+    .unwrap();
+    let page = RenderedPage::new(
+        1,
+        width as f32,
+        height as f32,
+        width,
+        height,
+        width as usize * 3,
+        RenderPixelFormat::Rgb8,
+        image.into_raw(),
+        transform,
+    )
+    .unwrap();
+    let results = recognize(&model_directory, &[page]);
+    assert_usable_result(&results);
+
+    let text = results[0]
+        .spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("recognized: {text}");
+    if let Ok(expected) = std::env::var(EXPECTED_TEXT_ENV) {
+        assert!(
+            text.to_lowercase().contains(&expected.to_lowercase()),
+            "expected OCR output to contain {expected:?}, got {text:?}"
+        );
+    }
+}
+
+#[cfg(feature = "render-pdfium")]
+#[test]
+fn recognizes_a_pdfium_rendered_fixture_with_verified_models() {
+    let Some(model_directory) = std::env::var_os(MODEL_DIRECTORY_ENV) else {
+        eprintln!("skipping OCR runtime test because {MODEL_DIRECTORY_ENV} is not set");
+        return;
+    };
+    let Some(renderer) = load_renderer() else {
+        return;
+    };
+
+    let bytes = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let pages = renderer
+        .render_pages(
+            &bytes,
+            &[1],
+            None,
+            &RenderOptions::new().dpi(150.0).form_fields(false),
+        )
+        .unwrap();
+    let results = recognize(&model_directory, &pages);
+    assert_usable_result(&results);
+}
+
+fn recognize(
+    model_directory: &std::ffi::OsStr,
+    pages: &[RenderedPage],
+) -> Vec<pdf_inspector::vision::OcrPage> {
+    let store = ModelStore::new(model_directory).override_root(model_directory);
+    let models = store.resolve(&PP_OCR_V6_SMALL).unwrap();
+    let engine = OarOcrEngine::from_models(&models).unwrap();
+    engine
+        .recognize(
+            pages,
+            &OcrOptions::new()
+                .mode(OcrMode::Force)
+                .minimum_confidence(0.3),
+        )
+        .unwrap()
+}
+
+fn assert_usable_result(results: &[pdf_inspector::vision::OcrPage]) {
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].page, 1);
+    assert_eq!(results[0].model.name, PP_OCR_V6_SMALL.id);
+    assert_eq!(results[0].model.revision, PP_OCR_V6_SMALL.revision);
+    assert!(!results[0].spans.is_empty());
+    assert!(results[0].spans.iter().all(|span| span.confidence >= 0.3));
+}
