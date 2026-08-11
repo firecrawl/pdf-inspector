@@ -1,0 +1,19 @@
+tests/integration_tests.rs
+  s_873e4e52b848d8::t_c7be4eb41a12fa 1802-1805,1816-1819
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "36e99b6a20ac8da31c51b0f7461fce67d4f0f544",
+  "prompts": {},
+  "sessions": {
+    "s_873e4e52b848d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6944fce5-efea-4ab2-8cf3-1d0a778e2db8",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
