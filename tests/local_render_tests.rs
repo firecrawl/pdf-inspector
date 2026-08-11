@@ -26,7 +26,7 @@ fn renders_owned_rgb_page_and_round_trips_coordinates() {
             &bytes,
             &[1],
             None,
-            &RenderOptions::new().dpi(72.0).form_fields(false),
+            &RenderOptions::new().dpi(150.0).form_fields(false),
         )
         .unwrap();
 
@@ -36,6 +36,7 @@ fn renders_owned_rgb_page_and_round_trips_coordinates() {
     assert_eq!(page.format(), RenderPixelFormat::Rgb8);
     assert_eq!(page.stride(), page.width() as usize * 3);
     assert_eq!(page.pixels().len(), page.stride() * page.height() as usize);
+    assert!((page.width() as f32 - page.page_width()).abs() > 1.0);
 
     let pdf_rect = page.pixel_rect_to_pdf_rect(10.0, 10.0, 20.0, 12.0);
     let pixel_rect = page.pdf_rect_to_pixel(&pdf_rect);
