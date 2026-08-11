@@ -1737,16 +1737,22 @@ pub(crate) fn is_newspaper_layout(
         }
     }
 
-    // For 4+ column layouts (e.g. 4, 5, 6 columns), require dense columns (≥15 lines)
-    // to distinguish multi-column newspapers (WSJ/NYT) from borderless data tables.
-    if columns.len() >= 4 && min_lines < 15 {
+    let balance_ratio = if max_lines > 0 {
+        min_lines as f32 / max_lines as f32
+    } else {
+        1.0
+    };
+
+    // For 4+ column layouts (e.g. 4, 5, 6 columns) or short unbalanced columns (<15 lines with balance <= 0.7),
+    // require dense columns (≥15 lines) to distinguish multi-column newspapers (WSJ/NYT)
+    // from borderless data tables or unbalanced grid fragments.
+    if min_lines < 15 && (columns.len() >= 4 || balance_ratio <= 0.7) {
         return false;
     }
 
     // Dense balanced columns (similar line counts) are newspaper regardless of Y-alignment.
     // By this point table items are already removed, so two dense balanced columns
     // of remaining text are independent prose flows.
-    let balance_ratio = min_lines as f32 / max_lines as f32;
     if balance_ratio > 0.7 {
         return true;
     }
@@ -2926,6 +2932,55 @@ mod tests {
         assert!(
             is_newspaper_layout(&[col1, col2], &cols),
             "Two-column page with 10 lines per column should be classified as newspaper layout"
+        );
+    }
+
+    #[test]
+    fn three_column_balanced_sparse_detected_as_newspaper() {
+        // Three balanced columns with 8 lines per column (sparse/short layout)
+        let cols = vec![
+            ColumnRegion {
+                x_min: 15.0,
+                x_max: 100.0,
+            },
+            ColumnRegion {
+                x_min: 110.0,
+                x_max: 195.0,
+            },
+            ColumnRegion {
+                x_min: 205.0,
+                x_max: 290.0,
+            },
+        ];
+        let col1 = make_lines(8, 20.0);
+        let col2 = make_lines(8, 115.0);
+        let col3 = make_lines(8, 210.0);
+
+        assert!(
+            is_newspaper_layout(&[col1, col2, col3], &cols),
+            "Balanced 3-column page with 8 lines per column should be classified as newspaper layout"
+        );
+    }
+
+    #[test]
+    fn short_unbalanced_two_column_rejected_as_newspaper() {
+        // Two columns with 5 lines vs 10 lines (balance_ratio = 0.5 <= 0.7) and min_lines < 15
+        let cols = vec![
+            ColumnRegion {
+                x_min: 15.0,
+                x_max: 100.0,
+            },
+            ColumnRegion {
+                x_min: 110.0,
+                x_max: 195.0,
+            },
+        ];
+        let col1 = make_lines(5, 20.0);
+        let col2 = make_lines(10, 115.0);
+
+        assert!(
+            !is_newspaper_layout(&[col1, col2], &cols),
+            "Short unbalanced 2-column layout (5 vs 10 lines) should NOT be classified as newspaper layout"
         );
     }
 }

@@ -52,4 +52,3 @@ returns. That is, cap rate compression from 9 percent to 6 percent increased IRR
 
 (R)is R=F+ β(M-F).
 R E V I E W 8 7
-

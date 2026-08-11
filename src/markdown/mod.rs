@@ -488,6 +488,56 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     is_parallel
 }
 
+fn is_newspaper_prose_table(table: &crate::tables::Table, subset_items: &[TextItem]) -> bool {
+    if table.kind != crate::tables::TableKind::Data {
+        return false;
+    }
+
+    let table_items: Vec<TextItem> = table
+        .item_indices
+        .iter()
+        .filter_map(|&idx| subset_items.get(idx).cloned())
+        .collect();
+
+    if table_items.is_empty() {
+        return false;
+    }
+
+    let page = table_items.first().map(|i| i.page).unwrap_or(1);
+    let cols = crate::extractor::detect_columns(&table_items, page, false);
+    if !(2..=3).contains(&cols.len()) {
+        return false;
+    }
+
+    let items_by_col: Vec<Vec<TextItem>> = cols
+        .iter()
+        .map(|col| {
+            table_items
+                .iter()
+                .filter(|i| {
+                    let center = i.x + i.width / 2.0;
+                    center >= col.x_min && center <= col.x_max
+                })
+                .cloned()
+                .collect()
+        })
+        .collect();
+
+    let thresholds = std::collections::HashMap::new();
+    let per_col_lines: Vec<Vec<crate::types::TextLine>> = items_by_col
+        .into_iter()
+        .map(|items| {
+            crate::extractor::group_into_lines_with_thresholds(
+                items,
+                &thresholds,
+                &std::collections::HashSet::new(),
+            )
+        })
+        .collect();
+
+    crate::extractor::is_newspaper_layout(&per_col_lines, &cols)
+}
+
 fn positioned_table(
     table: &crate::tables::Table,
     chart_order: Option<ChartProseOrder>,
@@ -1436,9 +1486,11 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         page_content_width,
                     );
                     for table in tables {
-                        if reject_parallel_prose && is_parallel_prose_table(&table) {
+                        if (reject_parallel_prose && is_parallel_prose_table(&table))
+                            || is_newspaper_prose_table(&table, subset_items)
+                        {
                             log::debug!(
-                                "page {}: rejected {}x{} parallel-prose table hypothesis",
+                                "page {}: rejected {}x{} parallel-prose / newspaper table hypothesis",
                                 page,
                                 table.rows.len(),
                                 table.columns.len()
@@ -2561,6 +2613,63 @@ mod tests {
         assert!(
             split.is_empty(),
             "label+number table should not be split side-by-side"
+        );
+    }
+
+    #[test]
+    fn test_short_two_column_prose_with_headers_and_dates_not_claimed_as_table() {
+        let mut items = Vec::new();
+
+        // Left column header
+        let mut h1 = make_item(50.0, 700.0, 1);
+        h1.text = "PRIMARY ACTIVITY".into();
+        h1.width = 120.0;
+        items.push(h1);
+
+        // Right column header
+        let mut h2 = make_item(300.0, 700.0, 1);
+        h2.text = "ACCOUNT MESSAGES".into();
+        h2.width = 120.0;
+        items.push(h2);
+
+        // 8 aligned rows in two columns (under 40 items total, so split_side_by_side returns empty)
+        for i in 0..8 {
+            let y = 670.0 - i as f32 * 20.0;
+
+            let mut l_text = make_item(50.0, y, 1);
+            l_text.text = format!("LEFT-0{}", i + 1);
+            l_text.width = 50.0;
+            items.push(l_text);
+
+            let mut l_val = make_item(104.0, y, 1); // 4pt gap (normal word gap)
+            l_val.text = format!("${}.00", 10 + i + 1);
+            l_val.width = 40.0;
+            items.push(l_val);
+
+            let mut r_text = make_item(300.0, y, 1);
+            r_text.text = format!("RIGHT-0{}", i + 1);
+            r_text.width = 50.0;
+            items.push(r_text);
+
+            let mut r_val = make_item(354.0, y, 1); // 4pt gap (normal word gap)
+            r_val.text = format!("202{}", i + 1);
+            r_val.width = 30.0;
+            items.push(r_val);
+        }
+
+        let options = MarkdownOptions::default();
+        let markdown = to_markdown_from_items_with_rects(items, options, &[]);
+
+        assert!(
+            !markdown.contains('|'),
+            "Short 2-column prose page should NOT be claimed as a Markdown table:\n{markdown}"
+        );
+
+        let left_pos = markdown.find("LEFT-01").unwrap();
+        let right_pos = markdown.find("RIGHT-01").unwrap();
+        assert!(
+            left_pos < right_pos,
+            "Short 2-column prose should be read sequentially (Left column then Right column):\n{markdown}"
         );
     }
 }

@@ -1168,7 +1168,7 @@ fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bo
 
 /// Check if a cell value looks like table data
 /// Includes: numbers, part numbers, specifications with units, codes
-fn looks_like_table_data(s: &str) -> bool {
+pub(crate) fn looks_like_table_data(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() {
         return false;
