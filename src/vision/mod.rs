@@ -18,6 +18,8 @@ mod fusion;
 mod models;
 #[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
 mod oar;
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+mod pipeline;
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 mod render;
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
@@ -46,6 +48,11 @@ pub use models::{
 };
 #[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
 pub use oar::{OarOcrEngine, OarOcrError, ONNX_RUNTIME_LIBRARY_ENV};
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+pub use pipeline::{
+    process_pdf_local, process_pdf_local_mem, LocalOcrPipelineError, LocalPdfOptions,
+    LocalPdfResult,
+};
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use render::{
     PagePoint, PageTransform, RenderBufferError, RenderOptions, RenderPixelFormat, RenderedPage,

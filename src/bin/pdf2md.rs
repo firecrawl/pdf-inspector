@@ -1,6 +1,11 @@
 //! CLI tool for PDF to Markdown conversion
 
 use pdf_inspector::extractor::ItemType;
+#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+use pdf_inspector::vision::{
+    process_pdf_local, LocalOptions, LocalPdfOptions, LocalPdfResult, ModelDownloadPolicy, OcrMode,
+    OcrOptions, PageContentSource, RenderOptions,
+};
 use pdf_inspector::{
     extract_text_with_positions_pages_with_password, process_pdf_with_options, LayoutComplexity,
     PdfOptions, PdfType, ProcessMode, TextItem,
@@ -101,6 +106,134 @@ fn format_items_json(items: &[TextItem]) -> String {
         underlined_count,
         items_json
     )
+}
+
+#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+fn optional_json_number(value: Option<f32>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+fn format_local_json(result: &LocalPdfResult) -> String {
+    let routed = result
+        .pages_routed_to_ocr
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let recommended = result
+        .pages_recommended_for_ocr
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let hosted = result
+        .pages_recommending_hosted
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let pages = result
+        .pages
+        .iter()
+        .map(|page| {
+            let provenance = &page.provenance;
+            let source = match provenance.source {
+                PageContentSource::Native => "native",
+                PageContentSource::Ocr => "ocr",
+                PageContentSource::Fused => "fused",
+                _ => "unknown",
+            };
+            let model = provenance
+                .ocr_model
+                .as_ref()
+                .map(|model| {
+                    format!(
+                        r#"{{"name":"{}","revision":"{}"}}"#,
+                        json_escape(&model.name),
+                        json_escape(&model.revision)
+                    )
+                })
+                .unwrap_or_else(|| "null".to_string());
+            let warnings = provenance
+                .warnings
+                .iter()
+                .map(|warning| format!(r#""{}""#, json_escape(warning)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                r#"{{"page":{},"source":"{}","markdown":"{}","ocr_model":{},"render_dpi":{},"ocr_confidence":{},"hosted_recommended":{},"timings":{{"render_ms":{},"ocr_ms":{},"layout_ms":{},"assembly_ms":{}}},"warnings":[{}]}}"#,
+                provenance.page,
+                source,
+                json_escape(&page.markdown),
+                model,
+                optional_json_number(provenance.render_dpi),
+                optional_json_number(provenance.ocr_confidence),
+                provenance.hosted_recommended,
+                provenance.timings.render_ms,
+                provenance.timings.ocr_ms,
+                provenance.timings.layout_ms,
+                provenance.timings.assembly_ms,
+                warnings,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let table_pages = result
+        .pages_with_tables
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let column_pages = result
+        .pages_with_columns
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
+    format!(
+        r#"{{"page_count":{},"processing_time_ms":{},"render_time_ms":{},"ocr_time_ms":{},"pages_recommended_for_ocr":[{}],"pages_routed_to_ocr":[{}],"pages_recommending_hosted":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"pages":[{}],"markdown":"{}"}}"#,
+        result.page_count,
+        result.processing_time_ms,
+        result.render_time_ms,
+        result.ocr_time_ms,
+        recommended,
+        routed,
+        hosted,
+        ocr_reasons,
+        result.is_complex,
+        table_pages,
+        column_pages,
+        pages,
+        json_escape(&result.markdown),
+    )
+}
+
+fn argument_value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
+    args.iter()
+        .position(|argument| argument == name)
+        .map(|index| {
+            args.get(index + 1)
+                .map(String::as_str)
+                .ok_or_else(|| format!("{name} requires a value"))
+        })
+        .transpose()
+}
+
+#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+fn float_argument(args: &[String], name: &str, default: f32) -> Result<f32, String> {
+    argument_value(args, name)?
+        .map(|value| {
+            value
+                .parse::<f32>()
+                .map_err(|_| format!("{name} requires a number, got {value:?}"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
 }
 
 fn extract_items_json(
@@ -242,6 +375,12 @@ fn main() {
         eprintln!("  --password PW       Password for an encrypted PDF");
         eprintln!("  --detect-only       Only detect PDF type (no extraction)");
         eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
+        eprintln!("  --ocr MODE          Local OCR mode: off, auto, or force (requires local-ocr)");
+        eprintln!("  --ocr-dpi N         OCR render resolution (default: 150)");
+        eprintln!("  --ocr-min-confidence N  Drop OCR spans below N (default: 0)");
+        eprintln!("  --ocr-hosted-threshold N  Recommend hosted parsing below N (default: 0.5)");
+        eprintln!("  --ocr-model-dir DIR Use a package-managed local model directory");
+        eprintln!("  --ocr-offline       Never download missing OCR models");
         process::exit(1);
     }
 
@@ -253,6 +392,10 @@ fn main() {
     let page_numbers = args.iter().any(|a| a == "--pages");
     let detect_only = args.iter().any(|a| a == "--detect-only");
     let analyze = args.iter().any(|a| a == "--analyze");
+    let ocr_mode_argument = argument_value(&args, "--ocr").unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        process::exit(1);
+    });
 
     // Parse --password value
     let password = args.iter().position(|a| a == "--password").map(|i| {
@@ -283,6 +426,143 @@ fn main() {
             })
         });
 
+    let output_file = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .map(|s| s.as_str());
+
+    let has_ocr_only_option = [
+        "--ocr-dpi",
+        "--ocr-min-confidence",
+        "--ocr-hosted-threshold",
+        "--ocr-model-dir",
+        "--ocr-offline",
+    ]
+    .iter()
+    .any(|option| args.iter().any(|argument| argument == option));
+    if ocr_mode_argument.is_none() && has_ocr_only_option {
+        eprintln!("Error: local OCR options require --ocr off, --ocr auto, or --ocr force");
+        process::exit(1);
+    }
+
+    if let Some(mode) = ocr_mode_argument {
+        if items_json_output || detect_only || analyze {
+            eprintln!(
+                "Error: --ocr cannot be combined with --items-json, --detect-only, or --analyze"
+            );
+            process::exit(1);
+        }
+
+        #[cfg(not(all(feature = "local-ocr", not(target_arch = "wasm32"))))]
+        {
+            let _ = mode;
+            eprintln!("Error: this pdf2md build does not include local OCR; rebuild with --features local-ocr");
+            process::exit(1);
+        }
+
+        #[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+        {
+            let mode = match mode {
+                "off" => OcrMode::Off,
+                "auto" => OcrMode::Auto,
+                "force" => OcrMode::Force,
+                value => {
+                    eprintln!("Error: invalid --ocr mode {value:?}; expected off, auto, or force");
+                    process::exit(1);
+                }
+            };
+            let dpi = float_argument(&args, "--ocr-dpi", 150.0).unwrap_or_else(|error| {
+                eprintln!("Error: {error}");
+                process::exit(1);
+            });
+            let minimum_confidence = float_argument(&args, "--ocr-min-confidence", 0.0)
+                .unwrap_or_else(|error| {
+                    eprintln!("Error: {error}");
+                    process::exit(1);
+                });
+            let hosted_threshold = float_argument(&args, "--ocr-hosted-threshold", 0.5)
+                .unwrap_or_else(|error| {
+                    eprintln!("Error: {error}");
+                    process::exit(1);
+                });
+            let model_directory =
+                argument_value(&args, "--ocr-model-dir").unwrap_or_else(|error| {
+                    eprintln!("Error: {error}");
+                    process::exit(1);
+                });
+
+            let mut ocr = OcrOptions::new()
+                .mode(mode)
+                .minimum_confidence(minimum_confidence);
+            if let Some(directory) = model_directory {
+                ocr = ocr.model_directory(directory);
+            }
+            if args.iter().any(|argument| argument == "--ocr-offline") {
+                ocr = ocr.model_downloads(ModelDownloadPolicy::Offline);
+            }
+            let local = LocalOptions::new()
+                .render(RenderOptions::new().dpi(dpi))
+                .ocr(ocr);
+            let mut markdown = pdf_inspector::MarkdownOptions::default();
+            if compact_output {
+                markdown.profile = pdf_inspector::MarkdownProfile::Compact;
+            }
+            markdown.include_page_numbers = page_numbers;
+            let mut local_options = LocalPdfOptions::new()
+                .local(local)
+                .markdown(markdown)
+                .hosted_recommendation_confidence(hosted_threshold);
+            if let Some(pages) = page_filter.clone() {
+                local_options = local_options.pages(pages);
+            }
+            if let Some(password) = password.clone() {
+                local_options = local_options.password(password);
+            }
+
+            match process_pdf_local(pdf_path, local_options) {
+                Ok(result) => {
+                    if json_output {
+                        println!("{}", format_local_json(&result));
+                    } else if raw_output {
+                        print!("{}", result.markdown);
+                    } else {
+                        eprintln!("PDF to Markdown Conversion (local OCR)");
+                        eprintln!("======================================");
+                        eprintln!("File: {pdf_path}");
+                        eprintln!("Pages: {}", result.page_count);
+                        eprintln!("Pages routed to OCR: {:?}", result.pages_routed_to_ocr);
+                        if !result.pages_recommending_hosted.is_empty() {
+                            eprintln!(
+                                "Hosted parsing recommended for pages: {:?}",
+                                result.pages_recommending_hosted
+                            );
+                        }
+                        eprintln!("Processing time: {}ms", result.processing_time_ms);
+                        if let Some(output) = output_file {
+                            fs::write(output, &result.markdown)
+                                .expect("Failed to write output file");
+                            eprintln!("Markdown written to: {output}");
+                        } else {
+                            eprintln!();
+                            eprintln!("--- Markdown Output ---");
+                            eprintln!();
+                            print!("{}", result.markdown);
+                        }
+                    }
+                }
+                Err(error) => {
+                    if json_output {
+                        println!(r#"{{"error":"{}"}}"#, json_escape(&error.to_string()));
+                    } else {
+                        eprintln!("Error: {error}");
+                    }
+                    process::exit(1);
+                }
+            }
+            return;
+        }
+    }
+
     if items_json_output {
         match extract_items_json(pdf_path, page_filter.as_ref(), password.as_deref()) {
             Ok(json) => println!("{}", json),
@@ -293,11 +573,6 @@ fn main() {
         }
         return;
     }
-
-    let output_file = args
-        .get(2)
-        .filter(|a| !a.starts_with("--"))
-        .map(|s| s.as_str());
 
     let process_mode = if detect_only {
         ProcessMode::DetectOnly

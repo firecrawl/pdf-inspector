@@ -1,5 +1,9 @@
 #![cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
 
+#[cfg(feature = "local-ocr")]
+use pdf_inspector::vision::{
+    process_pdf_local_mem, LocalOptions, LocalPdfOptions, ModelDownloadPolicy, PageContentSource,
+};
 use pdf_inspector::vision::{
     ModelStore, OarOcrEngine, OcrEngine, OcrMode, OcrOptions, PageTransform, RenderPixelFormat,
     RenderedPage, PP_OCR_V6_SMALL,
@@ -98,6 +102,36 @@ fn recognizes_a_pdfium_rendered_fixture_with_verified_models() {
         .unwrap();
     let results = recognize(&model_directory, &pages);
     assert_usable_result(&results);
+}
+
+#[cfg(all(feature = "local-ocr", feature = "render-pdfium"))]
+#[test]
+fn complete_local_pipeline_routes_and_assembles_a_scanned_fixture() {
+    let Some(model_directory) = std::env::var_os(MODEL_DIRECTORY_ENV) else {
+        eprintln!("skipping OCR runtime test because {MODEL_DIRECTORY_ENV} is not set");
+        return;
+    };
+    let Some(_renderer) = load_renderer() else {
+        return;
+    };
+
+    let bytes = std::fs::read("tests/fixtures/scan_with_native_header_text.pdf").unwrap();
+    let local = LocalOptions::new().ocr(
+        OcrOptions::new()
+            .mode(OcrMode::Auto)
+            .minimum_confidence(0.3)
+            .model_directory(model_directory)
+            .model_downloads(ModelDownloadPolicy::Offline),
+    );
+    let result = process_pdf_local_mem(&bytes, LocalPdfOptions::new().local(local)).unwrap();
+
+    assert_eq!(result.pages_routed_to_ocr, vec![1]);
+    assert!(!result.markdown.trim().is_empty());
+    assert_eq!(result.pages[0].provenance.source, PageContentSource::Ocr);
+    assert_eq!(
+        result.pages[0].provenance.ocr_model.as_ref().unwrap().name,
+        PP_OCR_V6_SMALL.id
+    );
 }
 
 fn recognize(

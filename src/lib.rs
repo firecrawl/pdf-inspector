@@ -459,8 +459,28 @@ pub fn extract_pages_markdown_mem(
     buffer: &[u8],
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_mem_impl(buffer, pages, None, &MarkdownOptions::default())
+        .map(|(result, _)| result)
+}
+
+#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+pub(crate) fn extract_pages_markdown_mem_for_local(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+    markdown_options: &MarkdownOptions,
+) -> Result<(PagesExtractionResult, u32), PdfError> {
+    extract_pages_markdown_mem_impl(buffer, pages, password, markdown_options)
+}
+
+fn extract_pages_markdown_mem_impl(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+    markdown_options: &MarkdownOptions,
+) -> Result<(PagesExtractionResult, u32), PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
@@ -575,7 +595,7 @@ pub fn extract_pages_markdown_mem(
             base_font_size: Some(font_stats.most_common_size),
             include_page_numbers: false,
             strip_headers_footers: false,
-            ..MarkdownOptions::default()
+            ..markdown_options.clone()
         };
 
         let md = if has_text_quality_issue {
@@ -634,14 +654,17 @@ pub fn extract_pages_markdown_mem(
         });
     }
 
-    Ok(PagesExtractionResult {
-        pages: results,
-        pages_with_tables: complexity.pages_with_tables,
-        pages_with_columns: complexity.pages_with_columns,
-        pages_needing_ocr,
-        ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
-        is_complex: complexity.is_complex,
-    })
+    Ok((
+        PagesExtractionResult {
+            pages: results,
+            pages_with_tables: complexity.pages_with_tables,
+            pages_with_columns: complexity.pages_with_columns,
+            pages_needing_ocr,
+            ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
+            is_complex: complexity.is_complex,
+        },
+        page_count,
+    ))
 }
 
 /// Path-based wrapper for [`extract_pages_markdown_mem`].
