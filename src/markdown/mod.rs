@@ -575,6 +575,26 @@ fn positioned_table(
     )
 }
 
+/// Same, for a table built from the structure tree.
+///
+/// Geometry-derived tables have their columns in page order, left to right,
+/// which for an RTL table is the reverse of reading order — the final
+/// `rtl::restore_visual_order` pass flips those back. A structure-tree table is
+/// different: `/TR` lists its cells in reading order already (PDF 32000-1
+/// §14.8.4.3), so that same flip would *undo* correct order. Pre-reversing here
+/// cancels it exactly, leaving the order the document itself declared.
+fn positioned_struct_table(
+    table: &crate::tables::Table,
+    chart_order: Option<ChartProseOrder>,
+) -> PositionedMarkdown {
+    PositionedMarkdown::new(
+        table.rows.first().copied().unwrap_or(0.0),
+        table.columns.first().copied().unwrap_or(0.0),
+        crate::rtl::reverse_table_columns(crate::tables::table_to_markdown(table)),
+        chart_order,
+    )
+}
+
 /// Derive a side-by-side split from rect hint regions.
 ///
 /// When `split_side_by_side` doesn't detect a gap (e.g. the text gap is too
@@ -1399,7 +1419,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     page_tables
                         .entry(page)
                         .or_default()
-                        .push(positioned_table(table, chart_prose_order));
+                        .push(positioned_struct_table(table, chart_prose_order));
                 }
             }
 

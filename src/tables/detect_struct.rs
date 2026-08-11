@@ -1163,3 +1163,79 @@ mod tests {
         assert_eq!(table.cells[0][5], "");
     }
 }
+
+#[cfg(test)]
+mod rtl_column_order {
+    use super::*;
+    use crate::structure_tree::{StructTableCell, StructTableRow};
+
+    fn item(text: &str, x: f32, y: f32, mcid: i64) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: text.chars().count() as f32 * 5.0,
+            height: 10.0,
+            font: "Test".to_string(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: crate::types::ItemType::Text,
+            mcid: Some(mcid),
+        }
+    }
+
+    fn cell(mcid: i64, is_header: bool) -> StructTableCell {
+        StructTableCell {
+            is_header,
+            mcids: vec![(mcid, 1)],
+        }
+    }
+
+    /// A tagged RTL table: the structure tree lists each row's cells in reading
+    /// order, so the rightmost column on the page comes first. That order must
+    /// survive both the builder and the Markdown-level logicalization pass —
+    /// the pass exists to fix geometry-ordered columns and would otherwise turn
+    /// a correct tagged table back into visual order.
+    #[test]
+    fn tagged_rtl_table_keeps_logical_column_order() {
+        let name = "\u{5E9}\u{5DD}"; // שם   — rightmost column
+        let age = "\u{5D2}\u{5D9}\u{5DC}"; // גיל  — leftmost column
+        let dina = "\u{5D3}\u{5D9}\u{5E0}\u{5D4}"; // דינה
+        let items = vec![
+            item(name, 200.0, 700.0, 10),
+            item(age, 50.0, 700.0, 11),
+            item(dina, 200.0, 680.0, 20),
+            item("30", 50.0, 680.0, 21),
+        ];
+        let struct_tables = vec![StructTable {
+            rows: vec![
+                StructTableRow {
+                    cells: vec![cell(10, true), cell(11, true)],
+                },
+                StructTableRow {
+                    cells: vec![cell(20, false), cell(21, false)],
+                },
+            ],
+        }];
+
+        let tables = detect_tables_from_struct_tree(&items, &struct_tables, 1);
+        let table = &tables[0];
+        assert_eq!(table.cells[0], vec![name, age]);
+        assert_eq!(table.cells[1], vec![dina, "30"]);
+
+        // What the Markdown pipeline does with it: pre-reverse on the way in,
+        // logicalize on the way out. The two must cancel.
+        let rendered = crate::rtl::reverse_table_columns(crate::tables::table_to_markdown(table));
+        let final_markdown = crate::rtl::restore_visual_order(rendered);
+        let rows: Vec<&str> = final_markdown
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .collect();
+        assert_eq!(rows[0], format!("|{name}|{age}|"), "header order changed");
+        assert_eq!(rows[2], format!("|{dina}|30|"), "body order changed");
+    }
+}

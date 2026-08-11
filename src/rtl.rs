@@ -155,6 +155,38 @@ pub(crate) fn restore_visual_order(markdown: String) -> String {
     out.join("\n")
 }
 
+/// Reverse the cell order of every majority-RTL table in `markdown`, using the
+/// same rules `restore_visual_order` applies at the end of conversion.
+///
+/// For a table whose columns are already in logical order — a tagged table,
+/// where the structure tree gives reading order directly (PDF 32000-1
+/// §14.8.4.3) rather than page geometry — running this first cancels that final
+/// pass exactly: reversing a row's interior twice is the identity, and the
+/// conditions the pass tests (row count, per-row cell count, RTL majority) are
+/// all invariant under the reversal, so it cannot fire on one pass and skip the
+/// other.
+pub(crate) fn reverse_table_columns(markdown: String) -> String {
+    if markdown.is_ascii() || !markdown.chars().any(is_rtl_char) {
+        return markdown;
+    }
+    let lines: Vec<&str> = markdown.split('\n').collect();
+    let mut out: Vec<Cow<str>> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if is_table_row(lines[i]) {
+            let start = i;
+            while i < lines.len() && is_table_row(lines[i]) {
+                i += 1;
+            }
+            process_table_block(&lines[start..i], &mut out);
+            continue;
+        }
+        out.push(Cow::Borrowed(lines[i]));
+        i += 1;
+    }
+    out.join("\n")
+}
+
 /// The delimiter character and run length of a Markdown code fence, if the
 /// line opens or closes one (three or more backticks or tildes).
 fn fence_delimiter(line: &str) -> Option<(char, usize)> {
@@ -836,6 +868,26 @@ mod tests {
     fn brackets_inside_a_code_fence_are_not_repaired() {
         let doc = "```\nif )x( { שלום }\n```\n";
         assert_eq!(restore_visual_order(doc.to_string()), doc);
+    }
+
+    #[test]
+    fn reverse_table_columns_is_cancelled_by_the_final_pass() {
+        // A tagged table arrives with logical columns; pre-reversing must make
+        // the final pass a no-op on it, whatever the final pass decides.
+        for table in [
+            "|שם|גיל|\n|---|---|\n|דינה|30|\n",
+            // ragged (an unescaped pipe in cell text): the final pass declines,
+            // so the pre-pass must decline too
+            "|שם|א|ב|\n|---|---|\n|דינה|30|\n",
+            // no RTL majority: neither pass fires
+            "|Name|Age|\n|---|---|\n|Dina|30|\n",
+        ] {
+            assert_eq!(
+                restore_visual_order(reverse_table_columns(table.to_string())),
+                table,
+                "not cancelled for {table:?}"
+            );
+        }
     }
 }
 
