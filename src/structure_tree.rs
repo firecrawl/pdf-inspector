@@ -1220,11 +1220,11 @@ pub fn fix_bare_struct_names(buf: &[u8]) -> Cow<'_, [u8]> {
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    find_bytes(haystack, needle).is_some()
+    memchr::memmem::find(haystack, needle).is_some()
 }
 
 #[cfg(test)]

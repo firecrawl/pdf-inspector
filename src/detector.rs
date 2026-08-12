@@ -156,7 +156,7 @@ pub fn estimate_page_count_from_bytes(buffer: &[u8]) -> u32 {
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 fn skip_pdf_whitespace(buffer: &[u8], mut pos: usize) -> usize {
