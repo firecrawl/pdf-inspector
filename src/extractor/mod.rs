@@ -889,17 +889,25 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     Some((end, floor * fs))
 }
 
+/// Fractional font-size band within which `merge_text_items` treats two runs as
+/// the same size. Shared with `is_small_caps_continuation`, which exists only to
+/// rescue junctions this band would otherwise break.
+const MERGE_FONT_SIZE_BAND: f32 = 0.20;
+
 /// Detect a small-caps continuation: typesetters render small caps as a
 /// full-size capital immediately followed by shrunken capitals in the same
 /// font (`(R) Tj` at 9.98pt, then `(OLANDO) Tj` at 6.74pt). Those runs are one
-/// word, but the 20% font-size band in `merge_text_items` would split them,
+/// word, but the font-size band in `merge_text_items` would split them,
 /// leaving "R" and "OLANDO" as separate items — which then read as separate
 /// table columns, since column boundaries cluster on item start positions.
 ///
 /// Gated tightly so it cannot absorb the other reasons a smaller run follows a
 /// larger one:
+///   - runs the size band already accepts — excluded by requiring the junction
+///     to *cross* the band, so within-band pairs keep the normal word-spacing
+///     logic instead of having their space suppressed
 ///   - superscripts / footnote markers — excluded by requiring an uppercase
-///     *letter*, so digits never qualify
+///     *letter* on both sides, so digits never qualify
 ///   - drop caps — excluded because the body text that follows is mixed case
 ///   - adjacent table cells or separate words — excluded by requiring the runs
 ///     to be visually contiguous (essentially no gap)
@@ -909,14 +917,18 @@ fn is_small_caps_continuation(
     next: &TextItem,
     gap: f32,
 ) -> bool {
-    // Must shrink, and only into the small-caps ratio range. Real small caps
-    // sit near 0.7-0.8 of the full cap height; anything smaller is a
-    // superscript or a different run entirely.
+    // Must shrink. Real small caps sit near 0.7-0.8 of the full cap height;
+    // anything smaller is a superscript or a different run entirely.
     if first.font_size <= 0.0 || next.font_size >= first.font_size {
         return false;
     }
-    let ratio = next.font_size / first.font_size;
-    if !(0.55..=0.92).contains(&ratio) {
+    // Only rescue junctions the size band would have broken. Within-band pairs
+    // merge on their own, and suppressing their space would swallow real word
+    // gaps between two similarly-sized uppercase words.
+    if (next.font_size - first.font_size).abs() <= first.font_size * MERGE_FONT_SIZE_BAND {
+        return false;
+    }
+    if next.font_size / first.font_size < 0.55 {
         return false;
     }
     // Visually contiguous: the capital and its small caps touch. A real word
@@ -940,13 +952,27 @@ fn is_small_caps_continuation(
     if !saw_letter {
         return false;
     }
-    // What we are continuing must itself end in a capital.
-    text_so_far
-        .trim_end()
+    // What we are continuing must itself end in a capital. Check the actual
+    // trailing character rather than skipping back to the nearest letter: after
+    // "ANGELA M. MAZZARELLI1" the run to continue is the footnote marker, not
+    // the "I" before it.
+    let trimmed = text_so_far.trim_end();
+    if trimmed.chars().last().is_some_and(|c| c.is_numeric()) {
+        // One legitimate exception: an ordinal suffix set as a smaller run,
+        // e.g. "JULY 4" + "TH". Only the four English suffixes qualify —
+        // anything else after a digit is a footnote marker or numeric suffix.
+        return matches!(trimmed_suffix(next), "TH" | "ST" | "ND" | "RD");
+    }
+    trimmed
         .chars()
         .rev()
         .find(|c| c.is_alphabetic())
         .is_some_and(|c| c.is_uppercase())
+}
+
+/// The continuation run's text, trimmed — used to spot ordinal suffixes.
+fn trimmed_suffix(next: &TextItem) -> &str {
+    next.text.trim()
 }
 
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
@@ -1011,10 +1037,10 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 // font-size band below and must never take a space.
                 let small_caps_join =
                     is_small_caps_continuation(&text, first, next, next.x - end_x);
-                // Must be similar font size (within 20%), except for genuine
-                // small-caps runs, where the shrunken capitals are the same
-                // word as the full-size initial (see helper).
-                if (next.font_size - first.font_size).abs() > first.font_size * 0.20
+                // Must be similar font size, except for genuine small-caps
+                // runs, where the shrunken capitals are the same word as the
+                // full-size initial (see helper).
+                if (next.font_size - first.font_size).abs() > first.font_size * MERGE_FONT_SIZE_BAND
                     && !small_caps_join
                 {
                     break;
@@ -3091,18 +3117,73 @@ mod tests {
         assert_eq!(merged[0].text, "ROLANDO T. ACOSTA, P.J.");
     }
 
+    /// The full two-column row: both names must merge independently and the
+    /// 72pt column gap between them must survive as an item boundary.
     #[test]
     fn small_caps_merge_does_not_swallow_a_second_column() {
-        // Same row, but a real column gap (72pt) before the next name.
         let items = vec![
+            // Column 1: "ROLANDO T. ACOSTA, P.J." ending at x=249.65
+            make_item_fs("R", 144.36, 581.84, 7.20, 9.98),
+            make_item_fs("OLANDO", 151.56, 581.84, 30.56, 6.74),
+            make_item_fs("T. A", 185.45, 581.84, 17.58, 9.98),
+            make_item_fs("COSTA", 203.94, 581.84, 23.15, 6.74),
+            make_item_fs(", P.J.", 227.09, 581.84, 22.56, 9.98),
+            // Column 2 starts at x=321.96 — a 72pt gap.
             make_item_fs("A", 321.96, 581.84, 7.20, 9.98),
             make_item_fs("NIL", 329.17, 581.84, 12.72, 6.74),
             make_item_fs("C. S", 345.04, 581.84, 19.59, 9.98),
             make_item_fs("INGH", 364.62, 581.84, 19.08, 6.74),
         ];
         let merged = merge_text_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["ROLANDO T. ACOSTA, P.J.", "ANIL C. SINGH"],
+            "column gap should keep the two names apart"
+        );
+    }
+
+    #[test]
+    fn small_caps_merge_keeps_word_space_between_same_size_capitals() {
+        // Two uppercase words at sizes the merge band already accepts (9.98 and
+        // 9.0, a 10% drop) separated by a real word gap. The small-caps path
+        // must not claim this junction and swallow the space.
+        let items = vec![
+            make_item_fs("SEE", 100.0, 500.0, 18.0, 9.98),
+            make_item_fs("ALSO", 119.2, 500.0, 24.0, 9.0),
+        ];
+        let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1, "got {:?}", merged);
-        assert_eq!(merged[0].text, "ANIL C. SINGH");
+        assert_eq!(merged[0].text, "SEE ALSO");
+    }
+
+    #[test]
+    fn trailing_digit_is_not_a_capital_awaiting_small_caps() {
+        // "...MAZZARELLI1" ends in a footnote marker; the backward search for an
+        // uppercase letter must not skip the digit and glue the next run.
+        assert!(!is_small_caps_continuation(
+            "ANGELA M. MAZZARELLI1",
+            &make_item_fs("ANGELA", 100.0, 500.0, 40.0, 9.98),
+            &make_item_fs("SHULMAN", 140.0, 500.0, 30.0, 6.74),
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn ordinal_suffix_after_a_digit_still_merges() {
+        // "TUESDAY, JULY 4" + "TH" is one word in the source; the digit guard
+        // must not block the four English ordinal suffixes.
+        for suffix in ["TH", "ST", "ND", "RD"] {
+            assert!(
+                is_small_caps_continuation(
+                    "TUESDAY, JULY 4",
+                    &make_item_fs("JULY", 100.0, 500.0, 30.0, 12.0),
+                    &make_item_fs(suffix, 130.0, 500.0, 8.0, 8.0),
+                    0.0,
+                ),
+                "{suffix} should merge after a digit"
+            );
+        }
     }
 
     #[test]
