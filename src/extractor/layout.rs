@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::text_utils::{effective_width, sort_line_items};
+use crate::text_utils::{effective_width, sort_line_items, sort_line_items_with};
 use crate::types::{TextItem, TextLine};
 use log::debug;
 
@@ -2121,13 +2121,19 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                 detect_columns(column_detection_items, page, table_pages.contains(&page));
             let detected_split =
                 (preliminary_columns.len() == 2).then(|| preliminary_columns[0].x_max);
-            if let Some(band) = image_regions.get(&page).and_then(|regions| {
-                super::reading_order::infer_image_anchored_flow(
-                    &page_items,
-                    regions,
-                    detected_split,
-                )
-            }) {
+            let band = image_regions
+                .get(&page)
+                .and_then(|regions| {
+                    super::reading_order::infer_image_anchored_flow(
+                        &page_items,
+                        regions,
+                        detected_split,
+                    )
+                })
+                // Без картинки-якоря остаются сами строки: несколько подряд,
+                // рвущихся в одном месте, — тот же признак локальной полосы.
+                .or_else(|| super::reading_order::infer_row_aligned_flow(&page_items));
+            if let Some(band) = band {
                 debug!(
                     "page {}: image-anchored region graph split={:.1} y=[{:.1}..{:.1}]",
                     page, band.split_x, band.y_bottom, band.y_top
@@ -2531,9 +2537,15 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
         }
     }
 
-    // Sort items within each line by X position (direction-aware)
+    // Порядок в строке — по направлению страницы, а не строки. Заголовок с
+    // латинской должностью содержит больше латиницы, чем иврита, и по счёту
+    // внутри строки получал бы левое направление, хотя слова в нём разложены
+    // по отдельным элементам и весь порядок решает именно эта сортировка.
+    let page_rtl = crate::bidi_order::dominant_direction(
+        lines.iter().flat_map(|l| l.items.iter()).map(|i| i.text.as_str()),
+    ) == crate::bidi_order::Direction::Rtl;
     for line in &mut lines {
-        sort_line_items(&mut line.items);
+        sort_line_items_with(&mut line.items, page_rtl);
     }
 
     debug!("group_single_column: {} lines", lines.len());

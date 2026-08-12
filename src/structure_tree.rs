@@ -344,6 +344,28 @@ impl StructTree {
     ///
     /// Returns a map: page_number (1-indexed) → (MCID → StructRole).
     /// The `page_ids` map should come from `doc.get_pages()`.
+    /// Порядок чтения, объявленный автором документа.
+    ///
+    /// ISO 32000-1 §14.8.2.3: последовательность чтения задаётся деревом
+    /// структуры, а не расположением на странице. Прямой обход даёт каждому
+    /// куску содержимого его номер в этой последовательности.
+    ///
+    /// Это единственный способ разложить колонки правильно: геометрия говорит
+    /// лишь о том, что два текста на одной высоте, но не о том, читаются они
+    /// подряд или принадлежат разным колонкам.
+    pub fn mcid_reading_order(
+        &self,
+        page_ids: &std::collections::BTreeMap<u32, ObjectId>,
+    ) -> HashMap<u32, HashMap<i64, usize>> {
+        let obj_to_page: HashMap<ObjectId, u32> =
+            page_ids.iter().map(|(&num, &id)| (id, num)).collect();
+
+        let mut result: HashMap<u32, HashMap<i64, usize>> = HashMap::new();
+        let mut next = 0usize;
+        collect_reading_order(&self.children, &obj_to_page, &mut result, &mut next);
+        result
+    }
+
     pub fn mcid_to_roles(
         &self,
         page_ids: &std::collections::BTreeMap<u32, ObjectId>,
@@ -534,6 +556,35 @@ fn flatten_recursive(elements: &[StructElement], out: &mut Vec<FlatStructElement
 // ─── Parsing helpers ─────────────────────────────────────────────────
 
 /// Parse the `/RoleMap` dictionary (custom tag → standard tag).
+/// Прямой обход: сначала сам элемент, потом его потомки.
+fn collect_reading_order(
+    elements: &[StructElement],
+    obj_to_page: &HashMap<ObjectId, u32>,
+    result: &mut HashMap<u32, HashMap<i64, usize>>,
+    next: &mut usize,
+) {
+    for elem in elements {
+        for mcref in &elem.content_refs {
+            if let Some(page_id) = mcref.page_id {
+                if let Some(&page_num) = obj_to_page.get(&page_id) {
+                    result
+                        .entry(page_num)
+                        .or_default()
+                        // Один и тот же mcid может встретиться дважды; первое
+                        // вхождение и есть его место в порядке чтения.
+                        .entry(mcref.mcid)
+                        .or_insert_with(|| {
+                            let n = *next;
+                            *next += 1;
+                            n
+                        });
+                }
+            }
+        }
+        collect_reading_order(&elem.children, obj_to_page, result, next);
+    }
+}
+
 fn parse_role_map(doc: &Document, struct_root: &lopdf::Dictionary) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let Ok(rm_obj) = struct_root.get(b"RoleMap") else {

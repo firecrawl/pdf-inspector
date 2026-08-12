@@ -11,7 +11,7 @@ mod reading_order;
 pub(crate) mod underline;
 mod xobjects;
 
-use crate::text_utils::{is_cjk_char, is_rtl_text};
+use crate::text_utils::{is_cjk_char, is_rtl_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
 use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
@@ -887,7 +887,16 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     Some((end, floor * fs))
 }
 
-pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
+pub(crate) fn merge_text_items(mut items: Vec<TextItem>) -> Vec<TextItem> {
+    // Направление берётся от документа целиком, а не от строки: на уровне
+    // строки сигнал шумит — «Hello של world» и «שירותי מחשוב System
+    // Administrator» имеют близкие пропорции, а вести себя должны
+    // противоположно.
+    let direction = crate::bidi_order::dominant_direction(items.iter().map(|i| i.text.as_str()));
+    for item in &mut items {
+        item.text = crate::bidi_order::visual_to_logical(&item.text, direction);
+    }
+
     if items.is_empty() {
         return items;
     }
@@ -912,10 +921,16 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
     for (page, y, mut group) in line_groups {
-        let rtl = is_rtl_text(group.iter().map(|i| &i.text));
+        // Направление строки берётся от документа, а не от счёта букв в самой
+        // строке. Заголовок «שירותי מחשוב System Administrator Genie 2013-2017»
+        // содержит больше латиницы, чем иврита, и по внутреннему счёту получал
+        // левое направление — а слова в нём разложены по отдельным элементам,
+        // так что весь порядок решала именно сортировка.
+        let rtl = direction == crate::bidi_order::Direction::Rtl;
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
             group.sort_by(|a, b| b.x.total_cmp(&a.x));
+            restore_ltr_runs(&mut group);
         } else if !preserve_stream_order {
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
         }
@@ -1035,6 +1050,37 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     }
 
     merged
+}
+
+/// Put embedded left-to-right sequences back into reading order.
+///
+/// An RTL line is ordered right to left, which is right for its words and wrong
+/// for anything Latin inside it. Where such a run is one item the ordering never
+/// touches it, but producers routinely emit an email or a phone number one glyph
+/// per item — and then the line sort reverses the glyphs themselves, turning
+/// `ariel.goarian@gmail.com` into `moc.liamg@nairaog.leira`.
+///
+/// So each maximal run of items carrying no RTL character is flipped back.
+fn restore_ltr_runs(items: &mut [&TextItem]) {
+    // Цифры не считаются письмом справа налево: арабо-индийские лежат в
+    // диапазоне арабского, но читаются слева направо, и телефон из них,
+    // набранный по глифу на элемент, иначе останется вывернутым.
+    let is_rtl_item =
+        |it: &&TextItem| it.text.chars().any(|c| is_rtl_char(c) && !c.is_numeric());
+    let mut i = 0;
+    while i < items.len() {
+        if is_rtl_item(&items[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < items.len() && !is_rtl_item(&items[i]) {
+            i += 1;
+        }
+        if i - start > 1 {
+            items[start..i].reverse();
+        }
+    }
 }
 
 /// Merge subscript/superscript items into their adjacent parent items.
@@ -2750,6 +2796,52 @@ mod tests {
         assert!(!is_rtl_text(["Hello world"].iter()));
         // Empty → not RTL
         assert!(!is_rtl_text(std::iter::empty::<&str>()));
+    }
+
+    /// Ивритская строка, внутри которой латинский адрес набран по одному
+    /// глифу на элемент — ровно тот случай, из-за которого почта выходила как
+    /// `moc.liamg@nairaog.leira`. Сортировка строки справа налево выворачивает
+    /// такие глифы, и `restore_ltr_runs` обязан вернуть им порядок чтения.
+    #[test]
+    fn ltr_glyph_run_inside_rtl_line_keeps_reading_order() {
+        fn item(text: &str, x: f32) -> TextItem {
+            TextItem {
+                text: text.into(),
+                x,
+                y: 700.0,
+                width: 7.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            }
+        }
+
+        // На странице справа налево: сначала (правее всех) ивритское слово,
+        // левее — адрес, разложенный по буквам с растущим x.
+        // Слово лежит в потоке визуально, как его пишет PDF.
+        let mut items = vec![item("\u{05DD}\u{05D5}\u{05DC}\u{05E9}", 200.0)];
+        for (i, ch) in "a@b.c".chars().enumerate() {
+            items.push(item(&ch.to_string(), 100.0 + i as f32 * 7.0));
+        }
+
+        let merged = merge_text_items(items);
+        let line: String = merged.iter().map(|i| i.text.as_str()).collect();
+
+        assert!(
+            line.contains("a@b.c"),
+            "латинский участок должен читаться слева направо, получено: {line:?}"
+        );
+        assert!(
+            line.contains("\u{05E9}\u{05DC}\u{05D5}\u{05DD}"),
+            "ивритское слово должно уцелеть, получено: {line:?}"
+        );
     }
 
     #[test]

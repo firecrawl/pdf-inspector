@@ -29,7 +29,10 @@
 //! ```
 
 #[cfg(feature = "python")]
-pub mod python;
+mod python;
+
+mod bidi_order;
+mod tagged_order;
 
 pub mod adobe_korea1;
 pub mod detector;
@@ -589,6 +592,7 @@ pub fn extract_pages_markdown_mem(
                     page_thresholds: &page_thresholds,
                     struct_roles: None,
                     struct_tables: &[],
+                    reading_order: &Default::default(),
                     page_count,
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
                     prefiltered_page_number_mask: Some(&page_number_removal_mask),
@@ -3971,6 +3975,11 @@ fn process_document(
         Some(extracted?)
     };
 
+    // Порядок чтения из дерева структуры и таблицы — из одного разбора.
+    let tagged_reading_order = structure_tree::StructTree::from_doc(&doc)
+        .map(|tree| tree.mcid_reading_order(&doc.get_pages()))
+        .unwrap_or_default();
+
     // Parse structure tree for tagged PDFs (reuses the loaded document)
     let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
         .map(|tree| {
@@ -4115,6 +4124,7 @@ fn process_document(
                         page_thresholds: &page_thresholds,
                         struct_roles: struct_roles.as_ref(),
                         struct_tables: &struct_tables,
+            reading_order: &tagged_reading_order,
                         page_count,
                         prefiltered_page_number_pages: Some(&removed_pages),
                         prefiltered_page_number_mask: Some(removal_mask.as_slice()),

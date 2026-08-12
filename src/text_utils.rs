@@ -139,16 +139,33 @@ where
             }
         }
     }
-    rtl > 0 && rtl > ltr
+    // A plain majority let one embedded Latin token decide the line. On a CV
+    // contact line — Hebrew role and city next to `israel@example.com` — the
+    // address alone matched the Hebrew letter for letter, the tie fell to LTR,
+    // and the whole line was ordered backwards. Latin now has to outweigh the
+    // RTL text twice over before the line counts as left-to-right, which is
+    // what an actually Latin line does.
+    rtl > 0 && rtl.saturating_mul(2) >= ltr
 }
 
-pub(crate) fn sort_line_items(items: &mut [TextItem]) {
-    let rtl = is_rtl_text(items.iter().map(|i| &i.text));
+/// Порядок элементов в строке.
+///
+/// Направление приходит снаружи — от документа. Считать его по самой строке
+/// нельзя: заголовок с латинской должностью содержит больше латиницы, чем
+/// иврита, а слова в нём разложены по отдельным элементам, и весь порядок
+/// решает именно эта сортировка.
+pub(crate) fn sort_line_items_with(items: &mut [TextItem], rtl: bool) {
     if rtl {
         items.sort_by(|a, b| b.x.total_cmp(&a.x));
     } else {
         items.sort_by(|a, b| a.x.total_cmp(&b.x));
     }
+}
+
+/// Прежняя форма для мест, где направление документа недоступно.
+pub(crate) fn sort_line_items(items: &mut [TextItem]) {
+    let rtl = is_rtl_text(items.iter().map(|i| &i.text));
+    sort_line_items_with(items, rtl);
 }
 
 /// Detect if a font name indicates bold style
@@ -193,9 +210,21 @@ pub fn is_italic_font(font_name: &str) -> bool {
 /// Expand Unicode ligature characters to their component characters.
 /// This makes extracted text more searchable and semantically correct.
 /// Also applies NFKC normalization (converts Arabic presentation forms to base
-/// characters, decomposes Latin ligatures, etc.) and reverses visual-order
-/// Arabic text back to logical order when presentation forms are detected.
+/// characters, decomposes Latin ligatures, etc.) and restores logical order for
+/// RTL text, which a single text-showing operator has to store visually.
 pub(crate) fn expand_ligatures(text: &str) -> String {
+    expand_ligatures_inner(text, true)
+}
+
+/// То же самое, но без переупорядочивания.
+///
+/// Для `ActualText`: по спецификации это логический текст, которым producer
+/// подменяет нарисованное — там уже правильный порядок, и разворот его ломает.
+pub(crate) fn expand_ligatures_logical(text: &str) -> String {
+    expand_ligatures_inner(text, false)
+}
+
+fn expand_ligatures_inner(text: &str, reorder: bool) -> String {
     // Strip null bytes and other control characters (except newline/tab)
     let text = if text
         .bytes()
@@ -249,65 +278,156 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
         }
     }
 
-    // If the original text had Arabic presentation forms, the characters are in
-    // visual (LTR screen) order. After NFKC normalization, reverse to restore
-    // logical reading order.
-    if had_presentation_forms {
-        result = reverse_visual_arabic(&result);
+    // Здесь остаётся только один частный случай: арабские presentation-формы,
+    // которые NFKC уже развернул на базовые буквы. Общий порядок письма
+    // восстанавливает `bidi_order` за один проход по документу, где известно
+    // направление абзаца, — счёт букв внутри одной операции показа для этого
+    // решения непригоден.
+    //
+    // This function only ever sees the text of a single text-showing operator
+    // (Tj/TJ/'/"), and within one such run the pen advances left to right by
+    // each glyph's width. A multi-glyph RTL run therefore has to be stored in
+    // visual order for the page to render correctly — there is no other way to
+    // lay it out with a single advancing run. So the order is not a guess about
+    // the producer: it follows from how PDF places text.
+    //
+    // The exception is a producer that emits logical order in one run; such a
+    // file renders mirrored in every viewer, and matching it would mean
+    // breaking the files that render correctly.
+    //
+    // Arabic presentation forms took this path already; Hebrew never has them,
+    // which is why it came out reversed word by word.
+    if reorder && had_presentation_forms && !is_visual_rtl_run(&result) {
+        result = reverse_visual_rtl(&result);
     }
 
     result
 }
 
-/// Reverse visual-order Arabic text to logical order.
+/// Whether this run is RTL text that needs reordering.
 ///
-/// Pure RTL text (no ASCII alphanumerics) gets a simple character reversal.
-/// Mixed content (embedded numbers or Latin words) splits into LTR and non-LTR
-/// runs: run order is reversed, and only non-LTR runs are reversed internally.
-fn reverse_visual_arabic(text: &str) -> String {
-    // Check if there are any LTR runs (ASCII letters or digits)
-    let has_ltr = text.chars().any(|c| c.is_ascii_alphanumeric());
+/// Two conditions, and the second matters as much as the first. At least two
+/// RTL letters, because a single one reverses to itself. And Latin has to
+/// outweigh them twice over before the run counts as left-to-right — the same
+/// rule `is_rtl_text` uses for a line, and for the same reason: a predominantly
+/// Latin run carrying one Hebrew word used to pass through untouched, and
+/// reordering it whole turns `Hello של world` into `world לש Hello`.
+fn is_visual_rtl_run(text: &str) -> bool {
+    let (mut rtl, mut ltr) = (0usize, 0usize);
+    for c in text.chars() {
+        if is_rtl_letter(c) {
+            rtl += 1;
+        } else if is_ltr_char(c) {
+            ltr += 1;
+        }
+    }
+    rtl >= 2 && rtl.saturating_mul(2) >= ltr
+}
 
-    if !has_ltr {
-        // Pure RTL: simple reversal
-        return text.chars().rev().collect();
+
+/// Буква письма справа налево. Цифры исключены намеренно: арабо-индийские
+/// цифры лежат в диапазоне арабского письма, но читаются слева направо, и
+/// счёт их за буквы выворачивал телефоны и даты.
+fn is_rtl_letter(c: char) -> bool {
+    is_rtl_char(c) && !c.is_numeric()
+}
+
+/// Всё, что читается слева направо: латиница за пределами ASCII, кириллица,
+/// греческий, цифры любого письма. Проверка на `is_ascii_alphanumeric`
+/// оставляла `François` и `Müller` беззащитными.
+fn is_ltr_char(c: char) -> bool {
+    c.is_alphanumeric() && !is_rtl_letter(c)
+}
+
+/// Базовый символ вместе с приклеенными к нему знаками — огласовками,
+/// харакат, диакритикой. Разворот по отдельным скалярам отрывает знак от
+/// буквы, и `שָׁלוֹם` рассыпается.
+fn grapheme_clusters(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in text.chars() {
+        if !out.is_empty() && unicode_normalization::char::is_combining_mark(c) {
+            out.last_mut().unwrap().push(c);
+        } else {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// Reverse visual-order RTL text to logical order.
+///
+/// Runs of one direction are reordered back to front, and RTL runs also reverse
+/// inside themselves. Neutral stretches — punctuation, spaces — join the
+/// surrounding text when both sides pull the same way, and otherwise follow the
+/// line, which is RTL here.
+///
+/// Script-agnostic and cluster-aware: Hebrew, Arabic, Syriac take the same
+/// path, and combining marks travel with the letter they sit on.
+fn reverse_visual_rtl(text: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Dir {
+        Rtl,
+        Ltr,
+        Neutral,
     }
 
-    // Mixed content: split into runs of LTR (ASCII alphanumeric + adjacent
-    // punctuation like '.', ',', '/', '-') vs non-LTR (Arabic + spaces + other).
-    let chars: Vec<char> = text.chars().collect();
-    let mut runs: Vec<(bool, String)> = Vec::new(); // (is_ltr, content)
+    let cells = grapheme_clusters(text);
+    if cells.is_empty() {
+        return String::new();
+    }
+
+    let mut dirs: Vec<Dir> = cells
+        .iter()
+        .map(|c| {
+            let base = c.chars().next().unwrap_or(' ');
+            if is_rtl_letter(base) {
+                Dir::Rtl
+            } else if is_ltr_char(base) {
+                Dir::Ltr
+            } else {
+                Dir::Neutral
+            }
+        })
+        .collect();
 
     let mut i = 0;
-    while i < chars.len() {
-        let is_ltr = chars[i].is_ascii_alphanumeric()
-            || (chars[i].is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
-
-        let mut run = String::new();
-        while i < chars.len() {
-            let c = chars[i];
-            let c_is_ltr = c.is_ascii_alphanumeric()
-                || (c.is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
-            if c_is_ltr != is_ltr {
-                break;
-            }
-            run.push(c);
+    while i < dirs.len() {
+        if dirs[i] != Dir::Neutral {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < dirs.len() && dirs[i] == Dir::Neutral {
             i += 1;
         }
-        runs.push((is_ltr, run));
-    }
-
-    // Reverse run order and reverse non-LTR runs internally
-    runs.reverse();
-    let mut result = String::with_capacity(text.len());
-    for (is_ltr, content) in &runs {
-        if *is_ltr {
-            result.push_str(content);
-        } else {
-            result.extend(content.chars().rev());
+        let before = dirs[..start].iter().rev().find(|&&d| d != Dir::Neutral).copied();
+        let after = dirs[i..].iter().find(|&&d| d != Dir::Neutral).copied();
+        let resolved = match (before, after) {
+            (Some(a), Some(b)) if a == b => a,
+            _ => Dir::Rtl,
+        };
+        for d in &mut dirs[start..i] {
+            *d = resolved;
         }
     }
-    result
+
+    let mut runs: Vec<(Dir, Vec<&str>)> = Vec::new();
+    for (cell, dir) in cells.iter().zip(dirs.iter()) {
+        match runs.last_mut() {
+            Some((d, buf)) if d == dir => buf.push(cell),
+            _ => runs.push((*dir, vec![cell])),
+        }
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for (dir, cells) in runs.iter().rev() {
+        if *dir == Dir::Rtl {
+            out.extend(cells.iter().rev().copied());
+        } else {
+            out.extend(cells.iter().copied());
+        }
+    }
+    out
 }
 
 /// Check if the character at `idx` is adjacent to an ASCII alphanumeric character.
@@ -914,12 +1034,12 @@ mod tests {
         );
     }
 
+
+
+
     #[test]
-    fn no_reversal_for_base_arabic() {
-        // Base Arabic already in logical order — no presentation forms means no reversal
-        let input = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"; // مرحبا
-        let result = expand_ligatures(input);
-        assert_eq!(result, input, "base Arabic should pass through unchanged");
+    fn single_rtl_character_is_left_alone() {
+        assert_eq!(expand_ligatures("a \u{05D0} b"), "a \u{05D0} b");
     }
 
     #[test]
@@ -928,21 +1048,21 @@ mod tests {
     }
 
     #[test]
-    fn reverse_visual_arabic_pure_rtl() {
+    fn reverse_visual_rtl_pure_rtl() {
         // Pure RTL: simple reversal
         let input = "\u{0628}\u{0627}"; // ba (visual order)
-        let result = reverse_visual_arabic(input);
+        let result = reverse_visual_rtl(input);
         assert_eq!(result, "\u{0627}\u{0628}"); // ab (logical order)
     }
 
     #[test]
-    fn reverse_visual_arabic_with_ltr_run() {
+    fn reverse_visual_rtl_with_ltr_run() {
         // Mixed: Arabic + embedded number "123" + Arabic
         // Visual order: أ 123 ب  → runs: [أ], [123], [ب]
         // Reversed runs: [ب], [123], [أ]
         // Non-LTR reversed internally: ب, 123, أ
         let input = "\u{0623}123\u{0628}";
-        let result = reverse_visual_arabic(input);
+        let result = reverse_visual_rtl(input);
         assert_eq!(result, "\u{0628}123\u{0623}");
     }
 

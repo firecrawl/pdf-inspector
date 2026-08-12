@@ -4,7 +4,7 @@
 //! matrix, and emits `TextItem`s and `PdfRect`s.
 
 use crate::text_utils::{
-    decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
+    decode_text_string, effective_font_size, expand_ligatures, expand_ligatures_logical, is_bold_font, is_italic_font,
 };
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
@@ -998,7 +998,7 @@ pub(crate) fn extract_page_text_items(
                                     .copied()
                                     .unwrap_or((false, false));
                                 items.push(TextItem {
-                                    text: expand_ligatures(&at),
+                                    text: expand_ligatures_logical(&at),
                                     x,
                                     y,
                                     width,
