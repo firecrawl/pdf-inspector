@@ -6591,9 +6591,10 @@ mod tests {
     #[test]
     fn test_text_quality_flags_garbled_font_on_mixed_page() {
         let healthy = CAESAR_PROSE.repeat(3);
+        let garbled = caesar_shift(CAESAR_PROSE, 8);
         let items = vec![
             test_text_item_with_font(1, "Helvetica", &healthy),
-            test_text_item_with_font(1, "FixtureFont", SHIFTED_CIPHER_TEXT),
+            test_text_item_with_font(1, "FixtureFont", &garbled),
         ];
 
         let quality = analyze_text_quality(&items);
@@ -6688,17 +6689,70 @@ mod tests {
     }
 
     #[test]
+    fn test_text_quality_allows_line_wrapped_base64_in_dedicated_font() {
+        // MIME-style Base64 wraps at 76 characters. Those long encoded lines
+        // are not the explicitly delimited short words required for a
+        // digit/symbol-heavy font sample to be classified as prose.
+        let wrapped = BASE64_PROSE_SAMPLE
+            .as_bytes()
+            .chunks(76)
+            .map(|chunk| std::str::from_utf8(chunk).expect("Base64 is ASCII"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let healthy = CAESAR_PROSE.repeat(3);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "DataFont", &wrapped),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
     fn test_text_quality_flags_spaceless_garbled_font_on_mixed_page() {
         // Removing separators must not make genuine shifted prose look like a
         // structured token and bypass the per-font detector.
         let healthy = CAESAR_PROSE.repeat(3);
         let spaceless_garble: String = SHIFTED_CIPHER_TEXT
             .chars()
-            .filter(char::is_ascii_alphanumeric)
+            .filter(char::is_ascii_alphabetic)
             .collect();
         let items = vec![
             test_text_item_with_font(1, "Helvetica", &healthy),
             test_text_item_with_font(1, "BrokenFont", &spaceless_garble),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+    }
+
+    #[test]
+    fn test_text_quality_flags_digit_heavy_garbled_font_on_mixed_page() {
+        // Broken maps can also shift identifiers and quantities. Keep the
+        // real word boundaries but remove punctuation and inject enough
+        // digits to satisfy the former broad Base64 exemption.
+        let mut digit_heavy_garble = String::new();
+        let mut letters = 0usize;
+        for ch in caesar_shift(CAESAR_PROSE, 8).chars() {
+            if ch.is_ascii_alphanumeric() || ch.is_whitespace() {
+                digit_heavy_garble.push(ch);
+            }
+            if ch.is_ascii_alphabetic() {
+                letters += 1;
+                if letters.is_multiple_of(17) {
+                    digit_heavy_garble.push('7');
+                }
+            }
+        }
+
+        let healthy = CAESAR_PROSE.repeat(3);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "BrokenIdFont", &digit_heavy_garble),
         ];
 
         let quality = analyze_text_quality(&items);
