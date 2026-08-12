@@ -81,6 +81,27 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
     pdf
 }
 
+/// Source-authored regression fixture for #342: ordinary decodable text with
+/// dense sub-point dotted form rules. No third-party PDF is embedded.
+fn make_text_pdf_with_dotted_form_rules() -> Vec<u8> {
+    let mut content = String::from("BT /F1 12 Tf ");
+    for line in 0..12 {
+        content.push_str(&format!(
+            "1 0 0 1 72 {} Tm (clean text) Tj ",
+            720 - line * 18
+        ));
+    }
+    content.push_str("ET\n");
+
+    for dot in 0..3000 {
+        let x = 36 + (dot % 100) * 5;
+        let y = 450 - (dot / 100) * 5;
+        content.push_str(&format!("{x} {y} 0.25 0.25 re f\n"));
+    }
+
+    make_text_pdf(&content, "0 0 612 792")
+}
+
 fn make_recurring_contextual_folio_pdf() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
@@ -4328,6 +4349,28 @@ fn test_extract_pages_markdown_ocrs_page_with_vector_outlined_text() {
         page.markdown.is_empty(),
         "a page flagged needs_ocr must not return markdown as if extraction were \
          trustworthy, got: {:?}",
+        page.markdown
+    );
+}
+
+/// Regression for #342: dense decorative dotted rules are not outlined text
+/// when the page has a decodable native text layer. Exercise the public
+/// path-based API so callers retain the extracted Markdown.
+#[test]
+fn test_extract_pages_markdown_preserves_decodable_text_with_dotted_form_rules() {
+    let pdf = make_text_pdf_with_dotted_form_rules();
+    let mut fixture = tempfile::NamedTempFile::new().expect("temporary fixture");
+    std::io::Write::write_all(&mut fixture, &pdf).expect("write fixture");
+
+    let extraction = extract_pages_markdown(fixture.path(), None).expect("extract fixture");
+    let page = &extraction.pages[0];
+    assert!(
+        !page.needs_ocr,
+        "decodable native text with dotted form rules must not be routed to OCR"
+    );
+    assert!(
+        page.markdown.contains("clean text"),
+        "the public extraction API must preserve native text, got: {:?}",
         page.markdown
     );
 }

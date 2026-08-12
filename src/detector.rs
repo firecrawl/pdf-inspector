@@ -843,17 +843,6 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         .filter(|b| b.is_ascii_alphanumeric())
         .count() as u32;
 
-    // Vector-outlined text: massive path ops with minimal text ops.
-    // Each outlined glyph needs ~10-30 path commands, so a page of
-    // outlined text produces thousands of path ops.
-    //
-    // Also require few unique alphanum chars: real outlined-text pages have
-    // very few because each glyph is a path, not a Tj/TJ text op. Pages with
-    // real selectable text plus decorative paths (column borders, dividers)
-    // have many unique alphanum chars — these are NOT vector-outlined text.
-    let has_vector_text =
-        path_ops >= 1000 && path_ops > text_ops.saturating_mul(200) && unique_alphanum_chars < 30;
-
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.
     // Only consider fonts actually USED by Tf operators in content streams (P1 fix),
     // and include fonts from Form XObject Resources (P2 fix).
@@ -870,6 +859,21 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // Only considers fonts actually USED via Tf operators (P1 + P2 fix).
     let has_decodable_text_fonts =
         text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
+
+    // Vector-outlined text: massive path ops with minimal text ops.
+    // Each outlined glyph needs ~10-30 path commands, so a page of
+    // outlined text produces thousands of path ops.
+    //
+    // Also require few unique alphanum chars: real outlined-text pages have
+    // very few because each glyph is a path, not a Tj/TJ text op. Pages with
+    // real selectable text plus decorative paths (column borders, dividers)
+    // have many unique alphanum chars — these are NOT vector-outlined text.
+    // Decodable fonts with enough text operations are likewise real native
+    // text even when their raw operands have little ASCII diversity.
+    let has_vector_text = path_ops >= 1000
+        && path_ops > text_ops.saturating_mul(200)
+        && unique_alphanum_chars < 30
+        && !(has_decodable_text_fonts && text_ops >= 10);
 
     PageAnalysis {
         text_operator_count: text_ops,
