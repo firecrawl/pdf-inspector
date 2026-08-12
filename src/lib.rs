@@ -6508,6 +6508,23 @@ mod tests {
             .collect()
     }
 
+    fn digit_heavy_caesar_garble() -> String {
+        let mut garbled = String::new();
+        let mut letters = 0usize;
+        for ch in caesar_shift(CAESAR_PROSE, 8).chars() {
+            if ch.is_ascii_alphanumeric() || ch.is_whitespace() {
+                garbled.push(ch);
+            }
+            if ch.is_ascii_alphabetic() {
+                letters += 1;
+                if letters.is_multiple_of(17) {
+                    garbled.push('7');
+                }
+            }
+        }
+        garbled
+    }
+
     #[test]
     fn test_mixed_case_caesar_shift_flagged() {
         assert!(detect_encoding_issues(&caesar_shift(CAESAR_PROSE, 3)));
@@ -6712,6 +6729,31 @@ mod tests {
     }
 
     #[test]
+    fn test_text_quality_allows_short_wrapped_base64_in_dedicated_font() {
+        let healthy = CAESAR_PROSE.repeat(3);
+        let mut items = Vec::new();
+        for (index, base64) in [BASE64_BINARY_SAMPLE, BASE64_PROSE_SAMPLE]
+            .into_iter()
+            .enumerate()
+        {
+            let page = index as u32 + 1;
+            let wrapped = base64
+                .as_bytes()
+                .chunks(16)
+                .map(|chunk| std::str::from_utf8(chunk).expect("Base64 is ASCII"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            items.push(test_text_item_with_font(page, "Helvetica", &healthy));
+            items.push(test_text_item_with_font(page, "DataFont", &wrapped));
+        }
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
     fn test_text_quality_flags_spaceless_garbled_font_on_mixed_page() {
         // Removing separators must not make genuine shifted prose look like a
         // structured token and bypass the per-font detector.
@@ -6735,25 +6777,30 @@ mod tests {
         // Broken maps can also shift identifiers and quantities. Keep the
         // real word boundaries but remove punctuation and inject enough
         // digits to satisfy the former broad Base64 exemption.
-        let mut digit_heavy_garble = String::new();
-        let mut letters = 0usize;
-        for ch in caesar_shift(CAESAR_PROSE, 8).chars() {
-            if ch.is_ascii_alphanumeric() || ch.is_whitespace() {
-                digit_heavy_garble.push(ch);
-            }
-            if ch.is_ascii_alphabetic() {
-                letters += 1;
-                if letters.is_multiple_of(17) {
-                    digit_heavy_garble.push('7');
-                }
-            }
-        }
-
+        let digit_heavy_garble = digit_heavy_caesar_garble();
         let healthy = CAESAR_PROSE.repeat(3);
         let items = vec![
             test_text_item_with_font(1, "Helvetica", &healthy),
             test_text_item_with_font(1, "BrokenIdFont", &digit_heavy_garble),
         ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+    }
+
+    #[test]
+    fn test_text_quality_flags_word_item_garbled_font_on_mixed_page() {
+        // Some PDFs emit each visible word as its own text-showing item
+        // without carrying a trailing space in the extracted string.
+        let healthy = CAESAR_PROSE.repeat(3);
+        let digit_heavy_garble = digit_heavy_caesar_garble();
+        let mut items = vec![test_text_item_with_font(1, "Helvetica", &healthy)];
+        items.extend(
+            digit_heavy_garble
+                .split_whitespace()
+                .map(|word| test_text_item_with_font(1, "BrokenIdFont", word)),
+        );
 
         let quality = analyze_text_quality(&items);
 

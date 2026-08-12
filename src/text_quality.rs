@@ -104,12 +104,22 @@ struct CipherGarbleStats {
     /// lowercase straight to uppercase mid-word.
     letter_bigrams: usize,
     case_shift_bigrams: usize,
-    /// Aggregate character composition and explicitly delimited short words.
-    /// Item boundaries do not count as delimiters because a PDF may split one
-    /// structured token across arbitrary text-showing operators.
+    /// Aggregate character composition and short word-like items/tokens.
     non_whitespace_chars: usize,
     explicit_word_tokens: usize,
     explicit_word_letters: usize,
+    /// Streaming evidence for a syntactically valid Base64 payload. Whitespace
+    /// and PDF item boundaries are ignored so wrapped or fragmented payloads
+    /// are evaluated as a single aggregate sample.
+    base64_chars: usize,
+    base64_symbol_chars: usize,
+    base64_padding: usize,
+    base64_invalid: bool,
+    base64_saw_padding: bool,
+    base64_bit_buffer: u16,
+    base64_bit_count: u8,
+    base64_decoded_bytes: usize,
+    base64_printable_bytes: usize,
 }
 
 impl CipherGarbleStats {
@@ -130,6 +140,7 @@ impl CipherGarbleStats {
             } else {
                 self.non_whitespace_chars += 1;
                 token_chars += 1;
+                self.add_base64_char(ch);
             }
 
             if ch.is_ascii_alphabetic() {
@@ -158,6 +169,12 @@ impl CipherGarbleStats {
                 prev = None;
             }
         }
+
+        // PDF producers commonly emit each visible word as its own Tj/TJ
+        // item without a trailing space. Count a word-like trailing token as
+        // prose evidence; the aggregate Base64 check below prevents encoded
+        // chunks from becoming false word evidence.
+        self.add_explicit_word(token_chars, token_letters);
     }
 
     fn add_explicit_word(&mut self, chars: usize, letters: usize) {
@@ -170,6 +187,85 @@ impl CipherGarbleStats {
     fn has_explicit_prose_structure(&self) -> bool {
         self.explicit_word_tokens >= Self::MIN_FONT_SAMPLE_WORD_TOKENS
             && self.explicit_word_letters >= Self::MIN_FONT_SAMPLE_WORD_LETTERS
+    }
+
+    fn add_base64_char(&mut self, ch: char) {
+        self.base64_chars += 1;
+
+        if ch == '=' {
+            self.base64_symbol_chars += 1;
+            self.base64_padding += 1;
+            self.base64_saw_padding = true;
+            if self.base64_padding > 2 {
+                self.base64_invalid = true;
+            }
+            return;
+        }
+
+        let value = match ch {
+            'A'..='Z' => (ch as u8 - b'A') as u16,
+            'a'..='z' => (ch as u8 - b'a' + 26) as u16,
+            '0'..='9' => (ch as u8 - b'0' + 52) as u16,
+            '+' => {
+                self.base64_symbol_chars += 1;
+                62
+            }
+            '/' => {
+                self.base64_symbol_chars += 1;
+                63
+            }
+            _ => {
+                self.base64_invalid = true;
+                return;
+            }
+        };
+
+        if self.base64_saw_padding {
+            self.base64_invalid = true;
+            return;
+        }
+
+        self.base64_bit_buffer = (self.base64_bit_buffer << 6) | value;
+        self.base64_bit_count += 6;
+        if self.base64_bit_count >= 8 {
+            self.base64_bit_count -= 8;
+            let byte = (self.base64_bit_buffer >> self.base64_bit_count) as u8;
+            self.base64_decoded_bytes += 1;
+            if byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+                self.base64_printable_bytes += 1;
+            }
+            let mask = (1u16 << self.base64_bit_count) - 1;
+            self.base64_bit_buffer &= mask;
+        }
+    }
+
+    fn looks_like_structured_base64(&self) -> bool {
+        if self.base64_invalid
+            || self.base64_chars < 200
+            || !self.base64_chars.is_multiple_of(4)
+            || self.base64_decoded_bytes == 0
+        {
+            return false;
+        }
+
+        let data_chars = self.base64_chars - self.base64_padding;
+        let padding_is_valid = match self.base64_padding {
+            0 => data_chars.is_multiple_of(4) && self.base64_bit_count == 0,
+            1 => data_chars % 4 == 3 && self.base64_bit_count == 2,
+            2 => data_chars % 4 == 2 && self.base64_bit_count == 4,
+            _ => false,
+        };
+        if !padding_is_valid || self.base64_bit_buffer != 0 {
+            return false;
+        }
+
+        // `+`, `/`, or terminal padding is direct Base64 evidence. A Base64
+        // encoding of plain text may contain none of those, so also accept a
+        // payload that decodes overwhelmingly to printable ASCII. Arbitrary
+        // digit-heavy cipher text can satisfy the alphabet and length rules,
+        // but its decoded bytes do not satisfy either discriminator.
+        self.base64_symbol_chars > 0
+            || self.base64_printable_bytes * 10 >= self.base64_decoded_bytes * 9
     }
 
     /// Cosine similarity between the observed letter histogram and English
@@ -267,12 +363,13 @@ impl CipherGarbleStats {
     /// repeated `myXMLParser` labels). Require broad alphabet coverage before
     /// applying the page-calibrated cipher heuristic to an isolated font.
     /// Structured blobs such as Base64 can also cover the whole alphabet and
-    /// flip case frequently. For a sample with a meaningful digit/symbol
-    /// share, require multiple short words separated by whitespace observed in
-    /// the extracted text itself. This keeps digit-heavy shifted tables in
-    /// scope without pretending arbitrary alphanumeric blobs can be
-    /// distinguished from Base64. Letter-only samples retain the original
-    /// cipher behavior, including uninterrupted shifted prose.
+    /// flip case frequently. Exempt only an aggregate that has valid Base64
+    /// framing plus either Base64-specific symbols/padding or a predominantly
+    /// printable decoded payload. For other samples with a meaningful
+    /// digit/symbol share, require multiple short word-like tokens. This keeps
+    /// digit-heavy shifted tables in scope, including PDFs that emit one word
+    /// per item. Letter-only samples retain the original cipher behavior,
+    /// including uninterrupted shifted prose.
     ///
     /// This guard is intentionally font-only: page-wide detection keeps its
     /// existing behavior, including all-lowercase and all-uppercase shifted
@@ -286,6 +383,7 @@ impl CipherGarbleStats {
             .count();
         let letter_only = self.non_whitespace_chars == self.ascii_letters;
         letter_kinds >= Self::MIN_FONT_SAMPLE_LETTER_KINDS
+            && !self.looks_like_structured_base64()
             && (letter_only || self.has_explicit_prose_structure())
             && self.looks_garbled()
     }
