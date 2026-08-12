@@ -246,19 +246,49 @@ fn extract_form_xobject_text_inner(
     let mut current_font = String::new();
     let mut current_font_size: f32 = 12.0;
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    // Text line matrix (TLM) — Td/TD/T* move relative to the start of the
+    // current line, not to the position left by the last show operator.
+    let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut text_leading: f32 = 0.0; // TL parameter (text-space units)
+    let mut char_spacing: f32 = 0.0; // Tc parameter
+    let mut word_spacing: f32 = 0.0; // Tw parameter
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
-    let mut ctm_stack: Vec<[f32; 6]> = Vec::new();
+
+    // Text state (Tc/Tw/TL/Tf) is part of the graphics state and must be
+    // saved/restored by q/Q alongside the CTM.
+    #[derive(Clone)]
+    struct GraphicsState {
+        ctm: [f32; 6],
+        char_spacing: f32,
+        word_spacing: f32,
+        text_leading: f32,
+        current_font: String,
+        current_font_size: f32,
+    }
+    let mut ctm_stack: Vec<GraphicsState> = Vec::new();
 
     for op in &content.operations {
         match op.operator.as_str() {
             "q" => {
-                ctm_stack.push(ctm);
+                ctm_stack.push(GraphicsState {
+                    ctm,
+                    char_spacing,
+                    word_spacing,
+                    text_leading,
+                    current_font: current_font.clone(),
+                    current_font_size,
+                });
             }
             "Q" => {
                 if let Some(saved) = ctm_stack.pop() {
-                    ctm = saved;
+                    ctm = saved.ctm;
+                    char_spacing = saved.char_spacing;
+                    word_spacing = saved.word_spacing;
+                    text_leading = saved.text_leading;
+                    current_font = saved.current_font;
+                    current_font_size = saved.current_font_size;
                 }
             }
             "cm" => {
@@ -321,6 +351,7 @@ fn extract_form_xobject_text_inner(
             "BT" => {
                 in_text_block = true;
                 text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+                line_matrix = text_matrix;
             }
             "ET" => {
                 in_text_block = false;
@@ -333,12 +364,33 @@ fn extract_form_xobject_text_inner(
                     current_font_size = get_number(&op.operands[1]).unwrap_or(12.0);
                 }
             }
+            "TL" => {
+                // Set text leading (used by T*, ', and ")
+                if let Some(tl) = op.operands.first().and_then(get_number) {
+                    text_leading = tl;
+                }
+            }
+            "Tc" => {
+                if let Some(tc) = op.operands.first().and_then(get_number) {
+                    char_spacing = tc;
+                }
+            }
+            "Tw" => {
+                if let Some(tw) = op.operands.first().and_then(get_number) {
+                    word_spacing = tw;
+                }
+            }
             "Td" | "TD" => {
+                // Move text position: TLM = T(tx,ty) x TLM; Tm = TLM
                 if op.operands.len() >= 2 {
                     let tx = get_number(&op.operands[0]).unwrap_or(0.0);
                     let ty = get_number(&op.operands[1]).unwrap_or(0.0);
-                    text_matrix[4] += tx * text_matrix[0] + ty * text_matrix[2];
-                    text_matrix[5] += tx * text_matrix[1] + ty * text_matrix[3];
+                    line_matrix[4] += tx * line_matrix[0] + ty * line_matrix[2];
+                    line_matrix[5] += tx * line_matrix[1] + ty * line_matrix[3];
+                    text_matrix = line_matrix;
+                    if op.operator == "TD" {
+                        text_leading = -ty;
+                    }
                 }
             }
             "Tm" => {
@@ -347,7 +399,19 @@ fn extract_form_xobject_text_inner(
                         text_matrix[i] =
                             get_number(operand).unwrap_or(if i == 0 || i == 3 { 1.0 } else { 0.0 });
                     }
+                    line_matrix = text_matrix;
                 }
+            }
+            "T*" => {
+                // Move to start of next line: equivalent to `0 -TL Td`
+                let tl = if text_leading != 0.0 {
+                    text_leading
+                } else {
+                    current_font_size * 1.2
+                };
+                line_matrix[4] += (-tl) * line_matrix[2];
+                line_matrix[5] += (-tl) * line_matrix[3];
+                text_matrix = line_matrix;
             }
             "g" => {
                 if let Some(gray) = op.operands.first().and_then(get_number) {
@@ -384,17 +448,33 @@ fn extract_form_xobject_text_inner(
                     _ => fill_is_white = false,
                 }
             }
-            "Tj" => {
-                if in_text_block && !op.operands.is_empty() {
+            "Tj" | "'" | "\"" => {
+                // `'` = move to next line then show; `"` = set word/char spacing,
+                // move to next line, then show (string is the last operand).
+                if op.operator != "Tj" {
+                    if op.operator == "\"" && op.operands.len() >= 3 {
+                        word_spacing = get_number(&op.operands[0]).unwrap_or(word_spacing);
+                        char_spacing = get_number(&op.operands[1]).unwrap_or(char_spacing);
+                    }
+                    let tl = if text_leading != 0.0 {
+                        text_leading
+                    } else {
+                        current_font_size * 1.2
+                    };
+                    line_matrix[4] += (-tl) * line_matrix[2];
+                    line_matrix[5] += (-tl) * line_matrix[3];
+                    text_matrix = line_matrix;
+                }
+                if let (true, Some(show_operand)) = (in_text_block, op.operands.last()) {
                     if fill_is_white {
                         if let Some(font_info) = font_widths.get(&current_font) {
-                            if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
+                            if let Some(raw_bytes) = get_operand_bytes(show_operand) {
                                 let w_ts = compute_string_width_ts(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
-                                    0.0,
-                                    0.0,
+                                    char_spacing,
+                                    word_spacing,
                                 );
                                 text_matrix[4] += w_ts * text_matrix[0];
                                 text_matrix[5] += w_ts * text_matrix[1];
@@ -403,7 +483,7 @@ fn extract_form_xobject_text_inner(
                         continue;
                     }
                     if let Some(text) = extract_text_from_operand(
-                        &op.operands[0],
+                        show_operand,
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
                         font_cmaps,
@@ -419,13 +499,13 @@ fn extract_form_xobject_text_inner(
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                         let (x, y) = (combined[4], combined[5]);
                         let width = if let Some(font_info) = font_widths.get(&current_font) {
-                            if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
+                            if let Some(raw_bytes) = get_operand_bytes(show_operand) {
                                 let w_ts = compute_string_width_ts(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
-                                    0.0,
-                                    0.0,
+                                    char_spacing,
+                                    word_spacing,
                                 );
                                 text_matrix[4] += w_ts * text_matrix[0];
                                 text_matrix[5] += w_ts * text_matrix[1];
@@ -548,8 +628,8 @@ fn extract_form_xobject_text_inner(
                                         raw_bytes,
                                         fi,
                                         current_font_size,
-                                        0.0,
-                                        0.0,
+                                        char_spacing,
+                                        word_spacing,
                                     );
                                 }
                             }
@@ -682,4 +762,168 @@ pub(crate) fn get_form_fonts<'a>(
     }
 
     fonts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::{dictionary, Stream};
+
+    /// Build a document whose page draws *all* of its content through a single
+    /// Form XObject — the shape emitted by print-to-PDF producers like PDFlib,
+    /// where the page stream itself is only `q /X1 Do Q`.
+    fn doc_with_form_content(form_content: &[u8]) -> (Document, ObjectId) {
+        let mut doc = Document::new();
+        let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths),
+        });
+        let form_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                },
+            },
+            form_content.to_vec(),
+        )));
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"q /X1 Do Q".to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "X1" => Object::Reference(form_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, page_id)
+    }
+
+    fn form_items(form_content: &[u8]) -> Vec<TextItem> {
+        let (doc, page_id) = doc_with_form_content(form_content);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = super::super::content_stream::extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+        )
+        .unwrap();
+        items
+    }
+
+    fn find<'a>(items: &'a [TextItem], text: &str) -> &'a TextItem {
+        items
+            .iter()
+            .find(|item| item.text == text)
+            .unwrap_or_else(|| {
+                let found: Vec<&String> = items.iter().map(|i| &i.text).collect();
+                panic!("no item {text:?} in {found:?}")
+            })
+    }
+
+    #[test]
+    fn t_star_inside_form_moves_to_next_line() {
+        // T* was previously unhandled inside Form XObjects, so every line after
+        // the first piled onto the preceding baseline and drifted right.
+        let items =
+            form_items(b"BT /F1 12 Tf 12 TL 1 0 0 1 100 700 Tm (first) Tj T* (second) Tj ET");
+
+        let first = find(&items, "first");
+        let second = find(&items, "second");
+        assert!((first.y - 700.0).abs() < 0.1, "first y = {}", first.y);
+        assert!((second.y - 688.0).abs() < 0.1, "second y = {}", second.y);
+        assert!((second.x - 100.0).abs() < 0.1, "second x = {}", second.x);
+    }
+
+    #[test]
+    fn td_inside_form_is_relative_to_line_start_not_shown_text() {
+        // Td moves relative to the text *line* matrix. Applying it to the
+        // matrix already advanced by Tj marched each line off the right edge.
+        let items = form_items(b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (AAAAA) Tj 0 -12 Td (B) Tj ET");
+
+        let b = find(&items, "B");
+        assert!((b.x - 100.0).abs() < 0.1, "B x = {} (expected 100)", b.x);
+        assert!((b.y - 688.0).abs() < 0.1, "B y = {}", b.y);
+    }
+
+    #[test]
+    fn td_inside_form_sets_leading_for_later_t_star() {
+        // `TD` sets the leading to -ty as a side effect; a following T* must
+        // reuse it.
+        let items = form_items(
+            b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (one) Tj 0 -15 TD (two) Tj T* (three) Tj ET",
+        );
+
+        assert!((find(&items, "two").y - 685.0).abs() < 0.1);
+        let three = find(&items, "three");
+        assert!((three.y - 670.0).abs() < 0.1, "three y = {}", three.y);
+        assert!((three.x - 100.0).abs() < 0.1, "three x = {}", three.x);
+    }
+
+    #[test]
+    fn quote_operator_inside_form_moves_to_next_line() {
+        let items = form_items(b"BT /F1 12 Tf 12 TL 1 0 0 1 100 700 Tm (first) Tj (second) ' ET");
+
+        let second = find(&items, "second");
+        assert!((second.y - 688.0).abs() < 0.1, "second y = {}", second.y);
+        assert!((second.x - 100.0).abs() < 0.1, "second x = {}", second.x);
+    }
+
+    #[test]
+    fn double_quote_operator_inside_form_sets_spacing_and_moves() {
+        // `aw ac (string) "` — set word spacing and char spacing, then T* and show.
+        let items =
+            form_items(b"BT /F1 12 Tf 12 TL 1 0 0 1 100 700 Tm (first) Tj 0 0 (second) \" ET");
+
+        let second = find(&items, "second");
+        assert!((second.y - 688.0).abs() < 0.1, "second y = {}", second.y);
+        assert!((second.x - 100.0).abs() < 0.1, "second x = {}", second.x);
+    }
+
+    #[test]
+    fn char_spacing_inside_form_widens_advance() {
+        // Tc was hardcoded to 0 in the form parser, so advance widths drifted.
+        // 2 glyphs x 600/1000 x 12pt = 14.4, plus 2 x Tc(2.0) = 18.4.
+        let items = form_items(b"BT /F1 12 Tf 1 0 0 1 100 700 Tm 2 Tc (AB) Tj ET");
+
+        let ab = find(&items, "AB");
+        assert!((ab.width - 18.4).abs() < 0.1, "AB width = {}", ab.width);
+    }
+
+    #[test]
+    fn q_restores_text_state_inside_form() {
+        // Tc/TL live in the graphics state; `Q` must roll them back.
+        let items =
+            form_items(b"BT /F1 12 Tf 12 TL 1 0 0 1 100 700 Tm q 30 TL (a) Tj Q T* (b) Tj ET");
+
+        let b = find(&items, "b");
+        assert!(
+            (b.y - 688.0).abs() < 0.1,
+            "b y = {} (leading should restore to 12)",
+            b.y
+        );
+    }
 }
