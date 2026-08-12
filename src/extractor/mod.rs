@@ -37,6 +37,7 @@ pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_re
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
+pub(crate) use xobjects::FormWalkBudget;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -282,6 +283,7 @@ fn extract_positioned_text_impl(
             font_cmaps,
             include_invisible,
             &mut style_cache,
+            &mut FormWalkBudget::new(),
         );
         let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
             match page_result {

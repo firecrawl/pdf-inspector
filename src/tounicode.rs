@@ -1832,6 +1832,11 @@ fn merge_cmaps(mut base: ToUnicodeCMap, overlay: ToUnicodeCMap) -> ToUnicodeCMap
     base
 }
 
+/// Upper bound on CID `/W` range expansion. The CID domain is 16-bit, so more
+/// than 65,536 unique keys cannot exist; repeating full-width ranges must not
+/// re-expand the same domain.
+pub(crate) const MAX_CID_W_EXPANSION: usize = 65_536;
+
 /// Check if a CIDFont's /W (widths) array contains CID values that look like
 /// Unicode codepoints rather than low-value GIDs.
 ///
@@ -1843,20 +1848,23 @@ pub(crate) fn cid_values_look_like_unicode(cid_font_dict: &lopdf::Dictionary) ->
         _ => return false,
     };
 
-    // The /W array format: [cid [w1 w2 ...]] or [cid_start cid_end w]
-    // We extract all CID values (the first element of each group).
-    let mut cids: Vec<u16> = Vec::new();
+    // The /W array format: [cid [w1 w2 ...]] or [cid_start cid_end w].
+    // Collect unique CIDs only: repeating a full-width range must not grow a
+    // temporary vector (or the sort) with the range length on every copy.
+    let mut seen = HashSet::new();
     let mut i = 0;
-    while i < w_arr.len() {
+    while i < w_arr.len() && seen.len() < MAX_CID_W_EXPANSION {
         if let Ok(cid) = w_arr[i].as_i64() {
-            cids.push(cid as u16);
-            // Skip the width data
+            let start = cid as u16;
             if i + 1 < w_arr.len() {
                 match &w_arr[i + 1] {
                     Object::Array(widths) => {
                         // [cid [w1 w2 ...]] — CIDs are cid, cid+1, ..., cid+len-1
-                        for j in 1..widths.len() {
-                            cids.push((cid as u16).wrapping_add(j as u16));
+                        for j in 0..widths.len() {
+                            if seen.len() >= MAX_CID_W_EXPANSION {
+                                break;
+                            }
+                            seen.insert(start.wrapping_add(j as u16));
                         }
                         i += 2;
                     }
@@ -1864,9 +1872,7 @@ pub(crate) fn cid_values_look_like_unicode(cid_font_dict: &lopdf::Dictionary) ->
                         // [cid_start cid_end w] — range of CIDs
                         if i + 2 < w_arr.len() {
                             if let Ok(cid_end) = w_arr[i + 1].as_i64() {
-                                for c in (cid as u16)..=(cid_end as u16) {
-                                    cids.push(c);
-                                }
+                                record_unique_cid_range(start, cid_end as u16, &mut seen);
                             }
                             i += 3;
                         } else {
@@ -1875,6 +1881,7 @@ pub(crate) fn cid_values_look_like_unicode(cid_font_dict: &lopdf::Dictionary) ->
                     }
                 }
             } else {
+                seen.insert(start);
                 i += 1;
             }
         } else {
@@ -1882,16 +1889,29 @@ pub(crate) fn cid_values_look_like_unicode(cid_font_dict: &lopdf::Dictionary) ->
         }
     }
 
-    if cids.is_empty() {
+    if seen.is_empty() {
         return false;
     }
 
+    let mut cids: Vec<u16> = seen.into_iter().collect();
     cids.sort_unstable();
     let median = cids[cids.len() / 2];
     // Unicode text CIDs are typically >= 0x20 (space) with letters at 0x41+.
     // GID-based subsets typically start at low values (0-based).
     // Use median >= 0x41 as a heuristic for Unicode CIDs.
     median >= 0x41
+}
+
+fn record_unique_cid_range(start: u16, end: u16, seen: &mut HashSet<u16>) {
+    if start > end {
+        return;
+    }
+    for cid in start..=end {
+        if seen.len() >= MAX_CID_W_EXPANSION {
+            return;
+        }
+        seen.insert(cid);
+    }
 }
 
 /// Build a ToUnicodeCMap from predefined CID→Unicode mapping based on CIDSystemInfo.
@@ -3297,5 +3317,46 @@ endbfrange
             remapped.is_some(),
             "An indirect /Subtype naming CIDFontType2 must still reach the remap"
         );
+    }
+
+    #[test]
+    fn cid_values_look_like_unicode_letter_range() {
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(
+            "W",
+            Object::Array(vec![
+                Object::Integer(0x41),
+                Object::Integer(0x5A),
+                Object::Integer(500),
+            ]),
+        );
+        assert!(cid_values_look_like_unicode(&dict));
+    }
+
+    #[test]
+    fn cid_values_look_like_unicode_low_gids() {
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(
+            "W",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Array(vec![Object::Integer(500); 10]),
+            ]),
+        );
+        assert!(!cid_values_look_like_unicode(&dict));
+    }
+
+    #[test]
+    fn cid_values_look_like_unicode_repeated_full_ranges_stay_bounded() {
+        // Repeating `[0 65535 w]` must not materialize 65,536 CIDs per copy.
+        let mut w = Vec::new();
+        for _ in 0..5_000 {
+            w.push(Object::Integer(0));
+            w.push(Object::Integer(65535));
+            w.push(Object::Integer(500));
+        }
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("W", Object::Array(w));
+        assert!(cid_values_look_like_unicode(&dict));
     }
 }

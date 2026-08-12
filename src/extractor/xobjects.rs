@@ -16,6 +16,76 @@ use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
 
+/// Upper bound on Form XObject invocations during a single page extraction.
+/// Depth alone is not enough: an acyclic DAG where each form invokes the next
+/// N times expands to N^depth work before the depth cap is reached.
+const MAX_FORM_XOBJECT_INVOCATIONS: usize = 10_000;
+
+/// Upper bound on content-stream operations walked across all Form XObject
+/// expansions for a page. Nested forms are decoded independently of the
+/// page-level operation cap, so this keeps total form work in the same
+/// ballpark as that page cap.
+const MAX_FORM_XOBJECT_OPERATIONS: usize = 1_000_000;
+
+/// Shared budget for Form XObject expansion on a page. Bounds both nested DAG
+/// expansion and repeated sibling `/Do` invocations of the same form.
+pub(crate) struct FormWalkBudget {
+    invocations: usize,
+    operations: usize,
+    max_invocations: usize,
+    max_operations: usize,
+    truncated: bool,
+}
+
+impl FormWalkBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(MAX_FORM_XOBJECT_INVOCATIONS, MAX_FORM_XOBJECT_OPERATIONS)
+    }
+
+    fn with_limits(max_invocations: usize, max_operations: usize) -> Self {
+        Self {
+            invocations: 0,
+            operations: 0,
+            max_invocations,
+            max_operations,
+            truncated: false,
+        }
+    }
+
+    fn exhausted(&mut self) -> bool {
+        if self.invocations >= self.max_invocations || self.operations >= self.max_operations {
+            self.truncated = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn charge_invocation(&mut self) -> bool {
+        if self.exhausted() {
+            return false;
+        }
+        self.invocations += 1;
+        true
+    }
+
+    /// Charge one walked content-stream operator. Independent of the
+    /// invocation cap so a form that was already admitted can finish its
+    /// stream (up to the operation cap).
+    fn charge_operation(&mut self) -> bool {
+        if self.operations >= self.max_operations {
+            self.truncated = true;
+            return false;
+        }
+        self.operations += 1;
+        true
+    }
+
+    pub(crate) fn was_truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
 pub(crate) enum XObjectType {
     Image,
     Form(ObjectId),
@@ -109,6 +179,7 @@ fn collect_xobjects_from_dict(
 }
 
 /// Extract text items from a Form XObject
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_form_xobject_text(
     doc: &Document,
     form_id: ObjectId,
@@ -117,6 +188,7 @@ pub(crate) fn extract_form_xobject_text(
     parent_ctm: &[f32; 6],
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
+    budget: &mut FormWalkBudget,
 ) -> Vec<TextItem> {
     extract_form_xobject_text_inner(
         doc,
@@ -127,6 +199,7 @@ pub(crate) fn extract_form_xobject_text(
         cmap_decisions,
         style_cache,
         0,
+        budget,
     )
 }
 
@@ -140,10 +213,15 @@ fn extract_form_xobject_text_inner(
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
+    budget: &mut FormWalkBudget,
 ) -> Vec<TextItem> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
+
+    if !budget.charge_invocation() {
+        return items;
+    }
 
     // Get the Form XObject stream
     let Ok(Object::Stream(stream)) = doc.get_object(form_id) else {
@@ -271,6 +349,9 @@ fn extract_form_xobject_text_inner(
     let mut ctm_stack: Vec<GraphicsState> = Vec::new();
 
     for op in &content.operations {
+        if !budget.charge_operation() {
+            break;
+        }
         match op.operator.as_str() {
             "q" => {
                 ctm_stack.push(GraphicsState {
@@ -309,7 +390,7 @@ fn extract_form_xobject_text_inner(
                         let xobj_name = String::from_utf8_lossy(name).to_string();
                         match form_xobjects.get(&xobj_name) {
                             Some(XObjectType::Form(nested_id)) => {
-                                if depth < MAX_FORM_XOBJECT_DEPTH {
+                                if depth < MAX_FORM_XOBJECT_DEPTH && !budget.exhausted() {
                                     let nested_items = extract_form_xobject_text_inner(
                                         doc,
                                         *nested_id,
@@ -319,6 +400,7 @@ fn extract_form_xobject_text_inner(
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
+                                        budget,
                                     );
                                     items.extend(nested_items);
                                 }
@@ -770,7 +852,235 @@ pub(crate) fn get_form_fonts<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::{dictionary, Stream};
+    use crate::extractor::content_stream::extract_page_text_items;
+    use lopdf::{dictionary, Dictionary, Stream};
+
+    /// Build an acyclic Form XObject DAG: `levels` form objects, each non-leaf
+    /// invoking the next form `branches` times. The leaf draws a single `(X)`.
+    /// Returns `(doc, root_form_id)`.
+    fn form_dag(branches: usize, levels: usize) -> (Document, ObjectId) {
+        assert!(levels >= 2);
+        let mut doc = Document::new();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let ids: Vec<ObjectId> = (0..levels).map(|_| doc.new_object_id()).collect();
+        for level in 0..levels {
+            let stream = if level + 1 == levels {
+                Stream::new(
+                    dictionary! {
+                        "Type" => "XObject",
+                        "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                        "Resources" => dictionary! {
+                            "Font" => dictionary! {
+                                "F1" => Object::Reference(font_id),
+                            },
+                        },
+                    },
+                    b"BT /F1 10 Tf 10 10 Td (X) Tj ET\n".to_vec(),
+                )
+            } else {
+                let next_name = format!("Fm{}", level + 1);
+                let content = format!("/{next_name} Do\n").repeat(branches);
+                let mut xobjects = Dictionary::new();
+                xobjects.set(next_name, Object::Reference(ids[level + 1]));
+                let mut resources = Dictionary::new();
+                resources.set("XObject", Object::Dictionary(xobjects));
+                let mut dict = dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                };
+                dict.set("Resources", Object::Dictionary(resources));
+                Stream::new(dict, content.into_bytes())
+            };
+            doc.set_object(ids[level], Object::Stream(stream));
+        }
+        (doc, ids[0])
+    }
+
+    fn page_invoking_form(mut doc: Document, form_id: ObjectId) -> (Document, ObjectId) {
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"/Fm0 Do\n".to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "XObject" => dictionary! {
+                    "Fm0" => Object::Reference(form_id),
+                },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, page_id)
+    }
+
+    fn extract_form(
+        doc: &Document,
+        form_id: ObjectId,
+        budget: &mut FormWalkBudget,
+    ) -> Vec<TextItem> {
+        extract_form_xobject_text(
+            doc,
+            form_id,
+            1,
+            &FontCMaps::from_doc(doc),
+            &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            &mut CMapDecisionCache::new(),
+            &mut FontStyleCache::new(),
+            budget,
+        )
+    }
+
+    #[test]
+    fn nested_form_still_extracts_leaf_text() {
+        let (doc, root) = form_dag(1, 3);
+        let items = extract_form(&doc, root, &mut FormWalkBudget::new());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "X");
+    }
+
+    #[test]
+    fn acyclic_form_dag_within_budget_keeps_all_leaves() {
+        // 4 sibling invocations across 4 nested levels → 4^4 leaf drawings.
+        // Default budgets are far above 256, so legitimate nesting is intact.
+        let (doc, root) = form_dag(4, 5);
+        let items = extract_form(&doc, root, &mut FormWalkBudget::new());
+        assert_eq!(items.len(), 4usize.pow(4));
+        assert!(items.iter().all(|item| item.text == "X"));
+    }
+
+    #[test]
+    fn acyclic_form_dag_stops_at_invocation_budget() {
+        // Same DAG as above would draw 256 leaves; a tiny invocation cap must
+        // stop expansion rather than walking the full tree.
+        let (doc, root) = form_dag(4, 5);
+        let mut budget = FormWalkBudget::with_limits(20, MAX_FORM_XOBJECT_OPERATIONS);
+        let items = extract_form(&doc, root, &mut budget);
+        assert!(
+            items.len() < 4usize.pow(4),
+            "invocation budget must truncate DAG expansion; got {} items",
+            items.len()
+        );
+        assert!(budget.was_truncated());
+    }
+
+    #[test]
+    fn form_operations_stop_at_budget() {
+        let mut doc = Document::new();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let mut content = b"q Q\n".repeat(50);
+        content.extend_from_slice(b"BT /F1 10 Tf 10 10 Td (X) Tj ET\n");
+        let form_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(font_id),
+                    },
+                },
+            },
+            content,
+        )));
+
+        let mut budget = FormWalkBudget::with_limits(MAX_FORM_XOBJECT_INVOCATIONS, 10);
+        let items = extract_form(&doc, form_id, &mut budget);
+        assert!(
+            items.is_empty(),
+            "operation budget must stop before the trailing text show"
+        );
+        assert!(budget.was_truncated());
+    }
+
+    #[test]
+    fn page_level_form_dag_stays_within_production_budget() {
+        // A page-level `/Do` of an 8-wide, 6-level Form DAG would expand to
+        // 8^5 = 32_768 leaf drawings without a budget. The production
+        // invocation cap must keep extraction bounded.
+        let (doc, root) = form_dag(8, 6);
+        let (doc, page_id) = page_invoking_form(doc, root);
+
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        assert!(
+            items.len() <= MAX_FORM_XOBJECT_INVOCATIONS,
+            "page-level Form expansion must stay within the invocation cap; got {}",
+            items.len()
+        );
+        assert!(
+            !items.is_empty(),
+            "budget must still allow some nested form text through"
+        );
+    }
+
+    #[test]
+    fn shared_form_budget_spans_two_extraction_passes() {
+        // The invisible-layer retry calls extract_page_text_items twice for
+        // the same page; both passes must share one budget.
+        let (doc, root) = form_dag(1, 2);
+        let (doc, page_id) = page_invoking_form(doc, root);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        // Root + leaf = 2 invocations on the first pass.
+        let mut budget = FormWalkBudget::with_limits(2, MAX_FORM_XOBJECT_OPERATIONS);
+        let ((first, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(first.iter().filter(|item| item.text == "X").count(), 1);
+        assert!(!budget.was_truncated());
+
+        let ((second, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            true,
+            &mut FontStyleCache::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert!(
+            second.iter().all(|item| item.text != "X"),
+            "second pass must not get a fresh invocation budget"
+        );
+        assert!(budget.was_truncated());
+    }
 
     /// Build a document whose page draws *all* of its content through a single
     /// Form XObject — the shape emitted by print-to-PDF producers like PDFlib,
@@ -825,13 +1135,14 @@ mod tests {
     fn form_items(form_content: &[u8]) -> Vec<TextItem> {
         let (doc, page_id) = doc_with_form_content(form_content);
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = super::super::content_stream::extract_page_text_items(
+        let ((items, _, _), _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         items
