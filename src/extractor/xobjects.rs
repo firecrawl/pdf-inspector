@@ -12,7 +12,7 @@ use super::fonts::{
     extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
     FontStyleCache,
 };
-use super::{get_number, image_bbox_from_ctm, multiply_matrices};
+use super::{emits_text_item, get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
 
@@ -436,9 +436,7 @@ fn extract_form_xobject_text_inner(
                         } else {
                             0.0
                         };
-                        // Only create text item for non-whitespace; whitespace
-                        // still advances the text matrix above so gap detection works
-                        if !text.trim().is_empty() {
+                        if emits_text_item(&text, &combined) {
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -570,11 +568,11 @@ fn extract_form_xobject_text_inner(
                                 }
                             }
                         }
-                        if !fill_is_white && !current_text.trim().is_empty() {
+                        let combined = multiply_matrices(&text_matrix, &ctm);
+                        if !fill_is_white && emits_text_item(&current_text, &combined) {
                             sub_items.push((current_text, sub_start_width_ts, total_width_ts));
                         }
                         if !sub_items.is_empty() {
-                            let combined = multiply_matrices(&text_matrix, &ctm);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
