@@ -67,7 +67,7 @@ impl OcrFusionOptions {
 /// Final Markdown and provenance for one page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FusedPageMarkdown {
-    /// 0-indexed page number, matching [`PageMarkdown`].
+    /// 1-indexed document page number, matching OCR and provenance fields.
     pub page: u32,
     /// Final page Markdown.
     pub markdown: String,
@@ -207,7 +207,7 @@ pub fn fuse_ocr_pages(
             };
 
         pages.push(FusedPageMarkdown {
-            page: native.page,
+            page: page_number,
             markdown,
             provenance: PageProvenance {
                 page: page_number,
@@ -325,25 +325,47 @@ fn image_quad_bounds(
 }
 
 fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) {
-    let native_fingerprint = normalize_for_comparison(native);
-    let mut additions = Vec::new();
+    let native_keys = comparison_units(native);
+    let mut addition_keys = Vec::new();
+    let mut additions: Vec<String> = Vec::new();
     for block in markdown_blocks(ocr) {
-        let fingerprint = normalize_for_comparison(block);
-        if fingerprint.is_empty()
-            || native_fingerprint.contains(&fingerprint)
-            || additions
+        let key = ComparisonKey::new(block);
+        if key.is_empty()
+            || native_keys.iter().any(|native| native.same_content(&key))
+            || addition_keys
                 .iter()
-                .any(|existing: &&str| normalize_for_comparison(existing) == fingerprint)
+                .any(|existing: &ComparisonKey| existing.same_content(&key))
         {
             continue;
         }
-        additions.push(block);
+
+        let addition = if let Some(native) = best_partial_overlap(&key, &native_keys) {
+            let Some(novel) = novel_fragments(block, native) else {
+                continue;
+            };
+            novel
+        } else {
+            block.trim_end().to_string()
+        };
+        let addition_key = ComparisonKey::new(&addition);
+        if addition_key.is_empty()
+            || native_keys
+                .iter()
+                .any(|native| native.same_content(&addition_key))
+            || addition_keys
+                .iter()
+                .any(|existing: &ComparisonKey| existing.same_content(&addition_key))
+        {
+            continue;
+        }
+        addition_keys.push(addition_key);
+        additions.push(addition);
     }
 
     if additions.is_empty() {
         (ensure_trailing_newline(native), PageContentSource::Native)
     } else {
-        let mut result = native.trim().to_string();
+        let mut result = native.trim_end_matches('\n').to_string();
         if !result.is_empty() {
             result.push_str("\n\n");
         }
@@ -356,29 +378,126 @@ fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) 
 fn markdown_blocks(markdown: &str) -> impl Iterator<Item = &str> {
     markdown
         .split("\n\n")
-        .map(str::trim)
-        .filter(|block| !block.is_empty())
+        .map(str::trim_end)
+        .filter(|block| !block.trim().is_empty())
 }
 
-fn normalize_for_comparison(text: &str) -> String {
-    let mut normalized = String::new();
-    let mut pending_space = false;
-    for character in text.chars().flat_map(char::to_lowercase) {
-        if character.is_alphanumeric() {
-            if pending_space && !normalized.is_empty() {
-                normalized.push(' ');
+#[derive(Debug)]
+struct ComparisonKey {
+    tokens: Vec<String>,
+    punctuation: String,
+}
+
+impl ComparisonKey {
+    fn new(text: &str) -> Self {
+        let mut tokens = Vec::new();
+        let mut token = String::new();
+        let mut punctuation = String::new();
+        for character in text.chars().flat_map(char::to_lowercase) {
+            if character.is_alphanumeric() {
+                token.push(character);
+            } else {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+                if !character.is_whitespace() {
+                    punctuation.push(character);
+                }
             }
-            normalized.push(character);
-            pending_space = false;
-        } else {
-            pending_space = true;
+        }
+        if !token.is_empty() {
+            tokens.push(token);
+        }
+        Self {
+            tokens,
+            punctuation,
         }
     }
-    normalized
+
+    fn is_empty(&self) -> bool {
+        self.tokens.is_empty() && self.punctuation.is_empty()
+    }
+
+    fn same_content(&self, other: &Self) -> bool {
+        if self.tokens.is_empty() || other.tokens.is_empty() {
+            self.tokens.is_empty()
+                && other.tokens.is_empty()
+                && self.punctuation == other.punctuation
+        } else {
+            token_counts(&self.tokens) == token_counts(&other.tokens)
+        }
+    }
+}
+
+fn comparison_units(markdown: &str) -> Vec<ComparisonKey> {
+    let mut units: Vec<_> = markdown_blocks(markdown).map(ComparisonKey::new).collect();
+    units.extend(
+        markdown
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(ComparisonKey::new),
+    );
+    units
+}
+
+fn token_counts(tokens: &[String]) -> BTreeMap<&str, usize> {
+    let mut counts = BTreeMap::new();
+    for token in tokens {
+        *counts.entry(token.as_str()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn best_partial_overlap<'a>(
+    ocr: &ComparisonKey,
+    native: &'a [ComparisonKey],
+) -> Option<&'a ComparisonKey> {
+    if ocr.tokens.len() < 2 {
+        return None;
+    }
+    native
+        .iter()
+        .filter(|key| !key.tokens.is_empty())
+        .filter_map(|key| {
+            let overlap = token_overlap(&ocr.tokens, &key.tokens);
+            let substantial =
+                overlap >= 2 && overlap * 2 >= ocr.tokens.len() && overlap * 2 >= key.tokens.len();
+            substantial.then_some((overlap, key))
+        })
+        .max_by_key(|(overlap, _)| *overlap)
+        .map(|(_, key)| key)
+}
+
+fn token_overlap(first: &[String], second: &[String]) -> usize {
+    let first = token_counts(first);
+    let second = token_counts(second);
+    first
+        .iter()
+        .map(|(token, count)| (*count).min(second.get(token).copied().unwrap_or(0)))
+        .sum()
+}
+
+fn novel_fragments(block: &str, native: &ComparisonKey) -> Option<String> {
+    let mut available = token_counts(&native.tokens);
+    let mut novel = Vec::new();
+    for fragment in block.split_whitespace() {
+        let key = ComparisonKey::new(fragment);
+        let mut adds_content = false;
+        for token in &key.tokens {
+            match available.get_mut(token.as_str()) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => adds_content = true,
+            }
+        }
+        if adds_content {
+            novel.push(fragment);
+        }
+    }
+    (!novel.is_empty()).then(|| novel.join(" "))
 }
 
 fn ensure_trailing_newline(markdown: &str) -> String {
-    let mut result = markdown.trim().to_string();
+    let mut result = markdown.trim_end_matches('\n').to_string();
     result.push('\n');
     result
 }
@@ -541,6 +660,8 @@ mod tests {
                 < result.pages[0].markdown.find("Second").unwrap()
         );
         assert_eq!(result.pages[0].provenance.source, PageContentSource::Ocr);
+        assert_eq!(result.pages[0].page, 1);
+        assert_eq!(result.pages[0].page, result.pages[0].provenance.page);
         assert_eq!(
             result.pages[0].provenance.ocr_model.as_ref().unwrap().name,
             "test-ocr"
@@ -580,6 +701,60 @@ mod tests {
         assert_eq!(result.pages[0].provenance.source, PageContentSource::Fused);
         assert_eq!(result.pages[0].markdown.matches("Native title").count(), 1);
         assert!(result.pages[0].markdown.contains("Image-only label"));
+    }
+
+    #[test]
+    fn force_mode_preserves_punctuation_and_short_distinct_blocks() {
+        let (markdown, source) = merge_native_and_ocr("Figure 1\n", "1\n\n***");
+        assert_eq!(source, PageContentSource::Fused);
+        assert_eq!(markdown, "Figure 1\n\n1\n\n***\n");
+    }
+
+    #[test]
+    fn force_mode_extracts_only_novel_tokens_from_overlapping_blocks() {
+        let (markdown, source) = merge_native_and_ocr("A C\n", "## A B C");
+        assert_eq!(source, PageContentSource::Fused);
+        assert_eq!(markdown, "A C\n\nB\n");
+        assert_eq!(markdown.matches('A').count(), 1);
+        assert_eq!(markdown.matches('C').count(), 1);
+    }
+
+    #[test]
+    fn force_mode_deduplicates_reordered_tokens() {
+        let native = [native(0, "Alpha Beta Gamma\n", false)];
+        let run = run(vec![local_page(
+            1,
+            vec![span("Gamma Alpha Beta", 10.0, 0.9)],
+            Some(0.9),
+        )]);
+
+        let result = fuse_ocr_pages(&native, &run, 1, &OcrFusionOptions::new()).unwrap();
+
+        assert_eq!(result.pages[0].provenance.source, PageContentSource::Native);
+        assert_eq!(result.pages[0].markdown, "Alpha Beta Gamma\n");
+    }
+
+    #[test]
+    fn fusion_preserves_native_leading_indentation() {
+        let native = [native(0, "    indented code\n", false)];
+        let duplicate = run(vec![local_page(
+            1,
+            vec![span("indented code", 10.0, 0.9)],
+            Some(0.9),
+        )]);
+        let result = fuse_ocr_pages(&native, &duplicate, 1, &OcrFusionOptions::new()).unwrap();
+        assert_eq!(result.pages[0].markdown, "    indented code\n");
+
+        let addition = run(vec![local_page(
+            1,
+            vec![span("image label", 10.0, 0.9)],
+            Some(0.9),
+        )]);
+        let result = fuse_ocr_pages(&native, &addition, 1, &OcrFusionOptions::new()).unwrap();
+        assert_eq!(
+            result.pages[0].markdown,
+            "    indented code\n\nimage label\n"
+        );
     }
 
     #[test]
