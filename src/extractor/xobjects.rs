@@ -256,8 +256,8 @@ fn extract_form_xobject_text_inner(
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
 
-    // Text state (Tc/Tw/TL/Tf) is part of the graphics state and must be
-    // saved/restored by q/Q alongside the CTM.
+    // Text state (Tc/Tw/TL/Tf) and the fill colour are part of the graphics
+    // state and must be saved/restored by q/Q alongside the CTM.
     #[derive(Clone)]
     struct GraphicsState {
         ctm: [f32; 6],
@@ -266,6 +266,7 @@ fn extract_form_xobject_text_inner(
         text_leading: f32,
         current_font: String,
         current_font_size: f32,
+        fill_is_white: bool,
     }
     let mut ctm_stack: Vec<GraphicsState> = Vec::new();
 
@@ -279,6 +280,7 @@ fn extract_form_xobject_text_inner(
                     text_leading,
                     current_font: current_font.clone(),
                     current_font_size,
+                    fill_is_white,
                 });
             }
             "Q" => {
@@ -289,6 +291,7 @@ fn extract_form_xobject_text_inner(
                     text_leading = saved.text_leading;
                     current_font = saved.current_font;
                     current_font_size = saved.current_font_size;
+                    fill_is_white = saved.fill_is_white;
                 }
             }
             "cm" => {
@@ -911,6 +914,25 @@ mod tests {
 
         let ab = find(&items, "AB");
         assert!((ab.width - 18.4).abs() < 0.1, "AB width = {}", ab.width);
+    }
+
+    #[test]
+    fn q_restores_fill_colour_inside_form() {
+        // A white fill set inside q/Q must not leak past the Q — otherwise the
+        // following black text is treated as invisible and dropped entirely.
+        let items = form_items(
+            b"BT /F1 12 Tf 12 TL 1 0 0 1 100 700 Tm q 1 g (hidden) Tj Q T* (visible) Tj ET",
+        );
+
+        assert!(
+            items.iter().any(|item| item.text == "visible"),
+            "text after Q was dropped: {:?}",
+            items.iter().map(|i| &i.text).collect::<Vec<_>>()
+        );
+        assert!(
+            !items.iter().any(|item| item.text == "hidden"),
+            "white-filled text should still be suppressed"
+        );
     }
 
     #[test]
