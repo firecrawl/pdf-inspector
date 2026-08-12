@@ -149,6 +149,7 @@ pub(crate) fn extract_page_text_items(
     font_cmaps: &FontCMaps,
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
     use lopdf::content::Content;
 
@@ -244,7 +245,6 @@ pub(crate) fn extract_page_text_items(
 
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
-    let mut form_budget = FormWalkBudget::new();
 
     // Get content
     let content_data = doc
@@ -917,7 +917,7 @@ pub(crate) fn extract_page_text_items(
                                         &ctm,
                                         &mut cmap_decisions,
                                         style_cache,
-                                        &mut form_budget,
+                                        form_budget,
                                     );
                                     items.extend(form_items);
                                 }
@@ -1552,6 +1552,7 @@ mod tests {
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         items
@@ -1781,6 +1782,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible) = result;
@@ -1871,6 +1873,7 @@ BT 30 700 Tm <41> Tj ET";
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         let text = items

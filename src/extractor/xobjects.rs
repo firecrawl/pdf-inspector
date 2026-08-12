@@ -69,8 +69,12 @@ impl FormWalkBudget {
         true
     }
 
+    /// Charge one walked content-stream operator. Independent of the
+    /// invocation cap so a form that was already admitted can finish its
+    /// stream (up to the operation cap).
     fn charge_operation(&mut self) -> bool {
-        if self.exhausted() {
+        if self.operations >= self.max_operations {
+            self.truncated = true;
             return false;
         }
         self.operations += 1;
@@ -820,6 +824,34 @@ mod tests {
         (doc, ids[0])
     }
 
+    fn page_invoking_form(mut doc: Document, form_id: ObjectId) -> (Document, ObjectId) {
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"/Fm0 Do\n".to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "XObject" => dictionary! {
+                    "Fm0" => Object::Reference(form_id),
+                },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, page_id)
+    }
+
     fn extract_form(
         doc: &Document,
         form_id: ObjectId,
@@ -908,31 +940,8 @@ mod tests {
         // A page-level `/Do` of an 8-wide, 6-level Form DAG would expand to
         // 8^5 = 32_768 leaf drawings without a budget. The production
         // invocation cap must keep extraction bounded.
-        let (mut doc, root) = form_dag(8, 6);
-        let content_id = doc.add_object(Object::Stream(Stream::new(
-            dictionary! {},
-            b"/Fm0 Do\n".to_vec(),
-        )));
-        let page_id = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Contents" => Object::Reference(content_id),
-            "Resources" => dictionary! {
-                "XObject" => dictionary! {
-                    "Fm0" => Object::Reference(root),
-                },
-            },
-            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-        });
-        let pages_id = doc.add_object(dictionary! {
-            "Type" => "Pages",
-            "Count" => Object::Integer(1),
-            "Kids" => vec![Object::Reference(page_id)],
-        });
-        let catalog_id = doc.add_object(dictionary! {
-            "Type" => "Catalog",
-            "Pages" => Object::Reference(pages_id),
-        });
-        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let (doc, root) = form_dag(8, 6);
+        let (doc, page_id) = page_invoking_form(doc, root);
 
         let font_cmaps = FontCMaps::from_doc(&doc);
         let ((items, _, _), _, _, _) = extract_page_text_items(
@@ -942,6 +951,7 @@ mod tests {
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         assert!(
@@ -953,5 +963,44 @@ mod tests {
             !items.is_empty(),
             "budget must still allow some nested form text through"
         );
+    }
+
+    #[test]
+    fn shared_form_budget_spans_two_extraction_passes() {
+        // The invisible-layer retry calls extract_page_text_items twice for
+        // the same page; both passes must share one budget.
+        let (doc, root) = form_dag(1, 2);
+        let (doc, page_id) = page_invoking_form(doc, root);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        // Root + leaf = 2 invocations on the first pass.
+        let mut budget = FormWalkBudget::with_limits(2, MAX_FORM_XOBJECT_OPERATIONS);
+        let ((first, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(first.iter().filter(|item| item.text == "X").count(), 1);
+        assert!(!budget.was_truncated());
+
+        let ((second, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            true,
+            &mut FontStyleCache::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert!(
+            second.iter().all(|item| item.text != "X"),
+            "second pass must not get a fresh invocation budget"
+        );
+        assert!(budget.was_truncated());
     }
 }
