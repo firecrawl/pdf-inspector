@@ -1,0 +1,25 @@
+src/vision/pdfium.rs
+  s_509f955ca4bd26::t_b283be0dd7c45e 1-5,7-167,169-366,380-399,401-404,409-410,375
+  s_509f955ca4bd26::t_806b3d92e68179 6
+  s_509f955ca4bd26::t_0feef39de3fccf 168,367-374,376-379,400,405-408
+tests/local_render_tests.rs
+  s_509f955ca4bd26::t_b283be0dd7c45e 1-2,4-28,30-38,40-65
+  s_509f955ca4bd26::t_386f6197612229 3
+  s_509f955ca4bd26::t_0feef39de3fccf 29,39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5c17e12851a42f5c5b9ec38c6058902dd6cfced5",
+  "prompts": {},
+  "sessions": {
+    "s_509f955ca4bd26": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fedba-8db3-7521-9f16-05cccc9fa3fb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
