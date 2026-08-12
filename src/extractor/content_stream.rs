@@ -19,7 +19,7 @@ use super::fonts::{
     CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
-use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
+use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
@@ -244,6 +244,7 @@ pub(crate) fn extract_page_text_items(
 
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
+    let mut form_budget = FormWalkBudget::new();
 
     // Get content
     let content_data = doc
@@ -916,6 +917,7 @@ pub(crate) fn extract_page_text_items(
                                         &ctm,
                                         &mut cmap_decisions,
                                         style_cache,
+                                        &mut form_budget,
                                     );
                                     items.extend(form_items);
                                 }
@@ -1283,6 +1285,12 @@ pub(crate) fn extract_page_text_items(
             }
             _ => {}
         }
+    }
+
+    if form_budget.was_truncated() {
+        log::warn!(
+            "page {page_num}: Form XObject expansion truncated (invocation or operation budget reached); nested form text may be incomplete"
+        );
     }
 
     // Underline detection reads only painted ink: `re` rects confirmed by
