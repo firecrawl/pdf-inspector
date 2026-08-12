@@ -62,9 +62,9 @@ pub use markdown::{
 pub use process_mode::ProcessMode;
 #[cfg(feature = "render")]
 pub use render::{
-    render_pages_mem, RenderError, RenderOptions, RenderWarning, RenderedPage, DEFAULT_RENDER_DPI,
-    MAX_RENDER_DIMENSION, MAX_RENDER_DPI, MAX_RENDER_OUTPUT_BYTES, MAX_RENDER_PAGES_PER_REQUEST,
-    MAX_RENDER_PIXELS_PER_PAGE,
+    extract_images_mem, render_pages_mem, RenderError, RenderOptions, RenderWarning, RenderedImage,
+    RenderedPage, DEFAULT_RENDER_DPI, MAX_RENDER_DIMENSION, MAX_RENDER_DPI,
+    MAX_RENDER_OUTPUT_BYTES, MAX_RENDER_PAGES_PER_REQUEST, MAX_RENDER_PIXELS_PER_PAGE,
 };
 pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
 

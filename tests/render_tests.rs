@@ -1,9 +1,9 @@
 #![cfg(feature = "render")]
 
 use pdf_inspector::{
-    render_pages_mem, RenderError, RenderOptions, RenderWarning, DEFAULT_RENDER_DPI,
-    MAX_RENDER_DPI, MAX_RENDER_OUTPUT_BYTES, MAX_RENDER_PAGES_PER_REQUEST,
-    MAX_RENDER_PIXELS_PER_PAGE,
+    extract_images_mem, extract_text_with_positions_mem, render_pages_mem, to_markdown_from_items,
+    MarkdownOptions, RenderError, RenderOptions, RenderWarning, DEFAULT_RENDER_DPI, MAX_RENDER_DPI,
+    MAX_RENDER_OUTPUT_BYTES, MAX_RENDER_PAGES_PER_REQUEST, MAX_RENDER_PIXELS_PER_PAGE,
 };
 
 #[path = "support/render_fixture.rs"]
@@ -98,6 +98,35 @@ fn renders_an_image_xobject_to_opaque_color_pixels() {
         pixels.any(|pixel| pixel[2] > 180 && pixel[0] < 80),
         "blue checker cells were not decoded"
     );
+
+    let images =
+        extract_images_mem(&pdf, RenderOptions::new().dpi(72.0)).expect("extract image regions");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].reference, "pdf-image:p1_i1");
+    assert_eq!(images[0].resource_name, "Im0");
+    assert_eq!(images[0].page, 0);
+    assert_eq!(images[0].occurrence, 1);
+    assert_eq!(images[0].bbox, [0.0, 0.0, 64.0, 64.0]);
+    assert_eq!((images[0].width, images[0].height), (64, 64));
+    assert_eq!(images[0].pixels, rendered[0].pixels);
+
+    let markdown = to_markdown_from_items(
+        extract_text_with_positions_mem(&pdf).expect("extract positioned items"),
+        MarkdownOptions {
+            include_images: true,
+            ..MarkdownOptions::default()
+        },
+    );
+    assert!(markdown.contains("![Image: Im0](pdf-image:p1_i1)"));
+
+    let rotated_pdf =
+        render_fixture::synthetic_image_pdf_with_page_options("/CropBox [0 0 40 30] /Rotate 90");
+    let rotated_page = render_pages_mem(&rotated_pdf, &[0], RenderOptions::new().dpi(72.0))
+        .expect("render rotated image page");
+    let rotated_image = extract_images_mem(&rotated_pdf, RenderOptions::new().dpi(72.0))
+        .expect("extract rotated image region");
+    assert_eq!((rotated_image[0].width, rotated_image[0].height), (30, 40));
+    assert_eq!(rotated_image[0].pixels, rotated_page[0].pixels);
 }
 
 #[test]

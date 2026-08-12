@@ -20,7 +20,7 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **Encoding issue detection** — Automatically flags broken font encodings so callers can fall back to OCR.
 - **Single document load** — The document is parsed once and shared between detection and extraction, avoiding redundant I/O.
 - **Browser WebAssembly** — Run the same Rust parser locally in browsers and Web Workers, with embedded CMaps and no server round trip.
-- **Optional page rendering** — Rasterize only selected pages to bounded output RGBA8 buffers for local OCR pipelines, on a wasm32-compatible backend (no JS API exposed yet).
+- **Optional rendering and image extraction** — Rasterize selected pages or return positioned image occurrences as bounded RGBA8 buffers, on a wasm32-compatible backend (no JS API exposed yet).
 - **Lightweight by default** — Pure Rust, no ML models, no external services. The default feature set keeps `lopdf` as its only PDF dependency.
 
 ## Benchmark

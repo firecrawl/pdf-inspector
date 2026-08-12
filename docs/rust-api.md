@@ -10,7 +10,7 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **Markdown conversion** — headings, lists, code blocks, bold/italic, URL linking, and dual-mode table detection (PDF drawing ops + text-alignment heuristics).
 - **Layout-aware extraction** — multi-column reading order, position and font info per text item, RTL support.
 - **Robust text decoding** — CID/Type0 fonts via ToUnicode CMaps, plus automatic flagging of broken encodings so callers can fall back to OCR.
-- **Optional page rendering** — selected pages can be rasterized to bounded RGBA8 buffers for local OCR pipelines, including WebAssembly callers.
+- **Optional rendering and image extraction** — selected pages or positioned image occurrences can be returned as bounded RGBA8 buffers, including for WebAssembly callers.
 - **Lightweight by default** — pure Rust, no ML models, no external services; the default feature set keeps [lopdf](https://crates.io/crates/lopdf) as its only PDF dependency.
 
 ## Benchmark
@@ -197,6 +197,44 @@ buffers from PDF resources. Until it exposes comprehensive internal resource
 limits, isolate untrusted rendering in a process or Web Worker with its own
 memory/input limits; output preflight alone is not an adversarial-PDF sandbox.
 
+The same feature can preserve an image's position in Markdown and return the
+pixels rendered at that position. Both outputs carry the same reference, so a
+caller does not need to match PDF resource names:
+
+```rust
+use pdf_inspector::{
+    extract_images_mem, process_pdf_mem_with_options, MarkdownOptions,
+    PdfOptions, RenderOptions,
+};
+
+let bytes = std::fs::read("report.pdf")?;
+let result = process_pdf_mem_with_options(
+    &bytes,
+    PdfOptions::new().markdown(MarkdownOptions {
+        include_images: true,
+        ..MarkdownOptions::default()
+    }),
+)?;
+let markdown = result.markdown.unwrap_or_default();
+
+for image in extract_images_mem(&bytes, RenderOptions::new().dpi(200.0))? {
+    // Markdown contains, for example:
+    // ![Image: Im0](pdf-image:p1_i1)
+    assert!(markdown.contains(&image.reference));
+
+    // Opaque, row-major RGBA8 pixels for this image occurrence.
+    save_png(image.width, image.height, &image.pixels);
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+# fn save_png(_: u32, _: u32, _: &[u8]) {}
+```
+
+`RenderedImage::page` is zero-based and `occurrence` is one-based within that
+page. Its `bbox` uses the source PDF's bottom-left coordinate space; `width`,
+`height`, and `pixels` describe the rendered crop after applying the page crop
+box and rotation. Repeated uses of one image resource are returned separately
+because each occurrence can have a different position or transform.
+
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):
 
@@ -274,6 +312,7 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | `extract_structure_elements(path, pages)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_mem(bytes, pages)` | Structure-tree elements from bytes |
 | `render_pages_mem(bytes, pages, options)` | Selected pages as bounded RGBA8 buffers (`render` feature) |
+| `extract_images_mem(bytes, options)` | Positioned image occurrences as bounded RGBA8 buffers joined to opt-in Markdown references (`render` feature) |
 
 Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
 
@@ -297,5 +336,6 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |
 | `RenderOptions` | DPI and optional password for selected-page rendering (`render` feature) |
 | `RenderedPage` | Zero-based source page, dimensions, and opaque RGBA8 pixels (`render` feature) |
+| `RenderedImage` | Stable Markdown reference, source page/bbox, dimensions, and rendered RGBA8 pixels (`render` feature) |
 | `RenderError` | Typed parse, password, page-selection, and resource-limit failures (`render` feature) |
 | `RenderWarning` | Per-page unsupported-font or image-decode fidelity warning (`render` feature) |

@@ -59,6 +59,10 @@ pub enum ItemType {
     FormField,
 }
 
+pub(crate) fn image_reference(page: u32, occurrence: u32) -> String {
+    format!("pdf-image:p{page}_i{occurrence}")
+}
+
 /// Layout complexity analysis result.
 ///
 /// Callers can use this to decide whether the extracted markdown is reliable

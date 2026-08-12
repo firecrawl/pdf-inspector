@@ -34,6 +34,11 @@ pub fn build_pdf_from_objects(object_bodies: &[Vec<u8>]) -> Vec<u8> {
 /// XObject. Keeping this generated avoids adding a separately licensed binary
 /// fixture and lets native and WebAssembly tests exercise the same bytes.
 pub fn synthetic_image_pdf() -> Vec<u8> {
+    synthetic_image_pdf_with_page_options("")
+}
+
+/// Build the image-backed fixture with additional entries in its page object.
+pub fn synthetic_image_pdf_with_page_options(page_options: &str) -> Vec<u8> {
     let mut image = Vec::with_capacity(4 * 4 * 3);
     for y in 0..4 {
         for x in 0..4 {
@@ -45,16 +50,16 @@ pub fn synthetic_image_pdf() -> Vec<u8> {
         }
     }
 
-    synthetic_image_pdf_with_data(&image, "")
+    synthetic_image_pdf_with_data(&image, "", page_options)
 }
 
 /// Build an image-backed PDF whose declared JPEG data cannot be decoded.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn synthetic_broken_image_pdf() -> Vec<u8> {
-    synthetic_image_pdf_with_data(b"not a JPEG stream", "/Filter /DCTDecode")
+    synthetic_image_pdf_with_data(b"not a JPEG stream", "/Filter /DCTDecode", "")
 }
 
-fn synthetic_image_pdf_with_data(image: &[u8], image_options: &str) -> Vec<u8> {
+fn synthetic_image_pdf_with_data(image: &[u8], image_options: &str, page_options: &str) -> Vec<u8> {
     let content = b"q 64 0 0 64 0 0 cm /Im0 Do Q";
     let mut content_stream = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
     content_stream.extend_from_slice(content);
@@ -72,9 +77,11 @@ fn synthetic_image_pdf_with_data(image: &[u8], image_options: &str) -> Vec<u8> {
     build_pdf_from_objects(&[
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] \
-          /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"
-            .to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] {page_options} \
+             /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"
+        )
+        .into_bytes(),
         content_stream,
         image_stream,
     ])
