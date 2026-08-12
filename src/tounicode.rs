@@ -1561,23 +1561,31 @@ fn parse_encoding_cmap_stream(data: &[u8]) -> Option<EncodingCMap> {
     }
 
     let mut map = HashMap::new();
+    let mut assigned = 0usize;
     let mut pos = 0;
     while let Some(start) = text[pos..].find("begincidchar") {
         let section_start = pos + start + "begincidchar".len();
         if let Some(end) = text[section_start..].find("endcidchar") {
             let section = &text[section_start..section_start + end];
-            parse_cidchar_section(section, &mut map, &mut src_hex_lengths);
+            if !parse_cidchar_section(section, &mut map, &mut src_hex_lengths, &mut assigned) {
+                break;
+            }
             pos = section_start + end;
         } else {
             break;
         }
     }
     pos = 0;
-    while let Some(start) = text[pos..].find("begincidrange") {
+    while assigned < MAX_CID_W_EXPANSION {
+        let Some(start) = text[pos..].find("begincidrange") else {
+            break;
+        };
         let section_start = pos + start + "begincidrange".len();
         if let Some(end) = text[section_start..].find("endcidrange") {
             let section = &text[section_start..section_start + end];
-            parse_cidrange_section(section, &mut map, &mut src_hex_lengths);
+            if !parse_cidrange_section(section, &mut map, &mut src_hex_lengths, &mut assigned) {
+                break;
+            }
             pos = section_start + end;
         } else {
             break;
@@ -1612,7 +1620,8 @@ fn parse_cidchar_section(
     section: &str,
     map: &mut HashMap<u16, u16>,
     src_hex_lengths: &mut Vec<usize>,
-) {
+    assigned: &mut usize,
+) -> bool {
     let mut chars = section.chars().peekable();
     loop {
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
@@ -1643,16 +1652,20 @@ fn parse_cidchar_section(
             }
         }
         if let (Some(code), Ok(cid)) = (parse_hex_u16(&src_hex), cid_str.parse::<u16>()) {
-            map.insert(code, cid);
+            if !assign_encoding_cid(map, code, cid, assigned) {
+                return false;
+            }
         }
     }
+    true
 }
 
 fn parse_cidrange_section(
     section: &str,
     map: &mut HashMap<u16, u16>,
     src_hex_lengths: &mut Vec<usize>,
-) {
+    assigned: &mut usize,
+) -> bool {
     let mut chars = section.chars().peekable();
     loop {
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
@@ -1703,12 +1716,32 @@ fn parse_cidrange_section(
         ) else {
             continue;
         };
+        if start > end {
+            continue;
+        }
         let mut cid = start_cid;
         for code in start..=end {
-            map.insert(code, cid);
+            if !assign_encoding_cid(map, code, cid, assigned) {
+                return false;
+            }
             cid = cid.saturating_add(1);
         }
     }
+    true
+}
+
+fn assign_encoding_cid(
+    map: &mut HashMap<u16, u16>,
+    code: u16,
+    cid: u16,
+    assigned: &mut usize,
+) -> bool {
+    if *assigned >= MAX_CID_W_EXPANSION {
+        return false;
+    }
+    map.insert(code, cid);
+    *assigned += 1;
+    true
 }
 
 fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
@@ -1832,9 +1865,9 @@ fn merge_cmaps(mut base: ToUnicodeCMap, overlay: ToUnicodeCMap) -> ToUnicodeCMap
     base
 }
 
-/// Upper bound on CID `/W` range expansion. The CID domain is 16-bit, so more
-/// than 65,536 unique keys cannot exist; repeating full-width ranges must not
-/// re-expand the same domain.
+/// Upper bound on expanding 16-bit CID ranges (`/W`, Encoding `begincidrange`).
+/// The CID domain is 16-bit, so more than 65,536 unique keys cannot exist;
+/// repeating full-width ranges must not re-expand the same domain.
 pub(crate) const MAX_CID_W_EXPANSION: usize = 65_536;
 
 /// Check if a CIDFont's /W (widths) array contains CID values that look like
@@ -3358,5 +3391,39 @@ endbfrange
         let mut dict = lopdf::Dictionary::new();
         dict.set("W", Object::Array(w));
         assert!(cid_values_look_like_unicode(&dict));
+    }
+
+    #[test]
+    fn encoding_cidrange_maps_a_normal_range() {
+        let data = b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+1 begincidrange\n<0041> <0043> 65\nendcidrange\n";
+        let enc = parse_encoding_cmap_stream(data).unwrap();
+        assert_eq!(enc.map.get(&0x41), Some(&65));
+        assert_eq!(enc.map.get(&0x42), Some(&66));
+        assert_eq!(enc.map.get(&0x43), Some(&67));
+        assert_eq!(enc.map.len(), 3);
+        assert_eq!(enc.code_byte_length, 2);
+    }
+
+    #[test]
+    fn encoding_cidrange_repeated_full_ranges_stay_bounded() {
+        // 5,000 copies of `<0000> <ffff> 0` must not re-expand the 16-bit
+        // domain on every declaration.
+        let mut body = String::new();
+        let mut remaining = 5_000usize;
+        while remaining > 0 {
+            let n = remaining.min(100);
+            body.push_str(&format!("{n} begincidrange\n"));
+            for _ in 0..n {
+                body.push_str("<0000> <ffff> 0\n");
+            }
+            body.push_str("endcidrange\n");
+            remaining -= n;
+        }
+        let data = format!("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n{body}");
+        let enc = parse_encoding_cmap_stream(data.as_bytes()).unwrap();
+        assert!(enc.map.len() <= MAX_CID_W_EXPANSION);
+        assert_eq!(enc.map.get(&0), Some(&0));
+        assert_eq!(enc.map.get(&65535), Some(&65535));
     }
 }
