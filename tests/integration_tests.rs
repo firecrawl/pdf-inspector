@@ -4501,6 +4501,153 @@ fn extracted_text(pdf: &[u8]) -> String {
         .collect()
 }
 
+fn make_resource_scoped_named_type0_pdf(
+    inline_descendant: bool,
+    shared_font_file: bool,
+) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+    let font1_id = doc.new_object_id();
+    let font2_id = doc.new_object_id();
+    let cid1_id = doc.new_object_id();
+    let cid2_id = doc.new_object_id();
+    let descriptor1_id = doc.new_object_id();
+    let descriptor2_id = doc.new_object_id();
+    let font_file_id = doc.new_object_id();
+
+    let chars = "电子发票 G342 郴州西";
+    let encoded: Vec<u8> = chars.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let mut operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 20.into()]),
+        Operation::new("Td", vec![50.into(), 700.into()]),
+        Operation::new(
+            "Tj",
+            vec![Object::String(encoded.clone(), StringFormat::Hexadecimal)],
+        ),
+    ];
+    if shared_font_file {
+        operations.extend([
+            Operation::new("Td", vec![0.into(), Object::Integer(-40)]),
+            Operation::new("Tf", vec!["F2".into(), 20.into()]),
+            Operation::new(
+                "Tj",
+                vec![Object::String(encoded, StringFormat::Hexadecimal)],
+            ),
+        ]);
+    }
+    operations.push(Operation::new("ET", vec![]));
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    let descriptor = |font_name: &'static str| {
+        dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => font_name,
+            "Flags" => 4,
+            "FontBBox" => vec![0.into(), Object::Integer(-200), 1000.into(), 800.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 800,
+            "Descent" => Object::Integer(-200),
+            "CapHeight" => 700,
+            "StemV" => 80,
+            "FontFile2" => font_file_id,
+        }
+    };
+    doc.objects
+        .insert(descriptor1_id, descriptor("SyntheticGB").into());
+    doc.objects
+        .insert(descriptor2_id, descriptor("SyntheticJIS").into());
+    doc.objects.insert(
+        font_file_id,
+        Stream::new(dictionary! {}, b"not-a-real-font".to_vec()).into(),
+    );
+
+    let cid_font = |ordering: &'static str, descriptor_id| {
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal(ordering),
+                "Supplement" => 4,
+            },
+            "FontDescriptor" => descriptor_id,
+            "DW" => 1000,
+            "W" => vec![32.into(), 126.into(), 500.into(), 19968.into(), 40959.into(), 1000.into()],
+        }
+    };
+    let cid1 = cid_font("GB1", descriptor1_id);
+    let cid2 = cid_font("Japan1", descriptor2_id);
+    if !inline_descendant {
+        doc.objects.insert(cid1_id, cid1.clone().into());
+    }
+    doc.objects.insert(cid2_id, cid2.into());
+
+    doc.objects.insert(
+        font1_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "Encoding" => "UniGB-UCS2-H",
+            "DescendantFonts" => if inline_descendant {
+                vec![Object::Dictionary(cid1)]
+            } else {
+                vec![cid1_id.into()]
+            },
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        font2_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "Encoding" => "UniJIS-UCS2-H",
+            "DescendantFonts" => vec![cid2_id.into()],
+        }
+        .into(),
+    );
+
+    let fonts = if shared_font_file {
+        dictionary! { "F1" => font1_id, "F2" => font2_id }
+    } else {
+        dictionary! { "F1" => font1_id }
+    };
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Resources" => dictionary! { "Font" => fonts },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
 /// Type0 + UniGB-UCS2-H, no ToUnicode, no embedded font — the pattern used by
 /// Chinese OFD→PDF e-tickets (e.g. Suwell OFD convertor railway tickets).
 /// Character codes are UCS-2 Unicode; pdftotext decodes them correctly.
@@ -4518,6 +4665,33 @@ fn extract_unigb_ucs2_h_without_tounicode() {
     assert!(text.contains("电子发票"), "missing 电子发票 in {text:?}");
     assert!(text.contains("郴州西"), "missing 郴州西 in {text:?}");
     assert!(text.contains("G342"), "missing G342 in {text:?}");
+}
+
+#[test]
+fn inline_cidfont_uses_resource_scoped_predefined_cmap() {
+    let pdf = make_resource_scoped_named_type0_pdf(true, false);
+    let text = extracted_text(&pdf);
+
+    assert_eq!(text, "电子发票 G342 郴州西");
+    assert!(!text.contains('\u{FFFD}'));
+}
+
+#[test]
+fn shared_fontfile_does_not_collide_named_encoding_cmaps() {
+    let pdf = make_resource_scoped_named_type0_pdf(false, true);
+    let items = extract_text_with_positions_mem(&pdf).expect("extract");
+
+    assert_eq!(
+        items.len(),
+        2,
+        "expected one item per named font: {items:?}"
+    );
+    assert_eq!(items[0].text, "电子发票 G342 郴州西");
+    assert_ne!(
+        items[1].text, items[0].text,
+        "UniJIS must not reuse the UniGB mapping from a shared FontFile"
+    );
+    assert!(!items[1].text.contains('\u{FFFD}'));
 }
 
 /// GBK-EUC-H mixes one-byte ASCII with two-byte CJK. Until the decoder is

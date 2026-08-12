@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::glyph_names::glyph_to_char;
 
@@ -1197,19 +1198,50 @@ fn build_gid_to_unicode(face: &ttf_parser::Face<'_>) -> Option<HashMap<u16, char
 /// Build a ToUnicodeCMap from pdf.js built-in binary CMaps (bcmaps).
 fn build_cmap_from_builtin_cmap(ordering: &str) -> Option<ToUnicodeCMap> {
     let name = format!("Adobe-{}-UCS2.bcmap", ordering);
-    let data = read_builtin_cmap_file(&name)?;
-    let mut cmap = parse_binary_cmap(&data).ok()?;
-    if cmap.char_map.is_empty() && cmap.ranges.is_empty() {
-        return None;
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<ToUnicodeCMap>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = builtin_cmap_cache_key(&name);
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&cache_key)
+        .cloned()
+    {
+        return cached;
     }
-    cmap.code_byte_length = 2;
-    debug!(
-        "Built-in CMap {}: char_map={} ranges={}",
-        name,
-        cmap.char_map.len(),
-        cmap.ranges.len()
-    );
-    Some(cmap)
+
+    let parsed = (|| {
+        let data = read_builtin_cmap_file(&name)?;
+        let mut cmap = parse_binary_cmap(&data).ok()?;
+        if cmap.char_map.is_empty() && cmap.ranges.is_empty() {
+            return None;
+        }
+        cmap.code_byte_length = 2;
+        debug!(
+            "Built-in CMap {}: char_map={} ranges={}",
+            name,
+            cmap.char_map.len(),
+            cmap.ranges.len()
+        );
+        Some(cmap)
+    })();
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(cache_key, parsed.clone());
+    parsed
+}
+
+fn builtin_cmap_cache_key(name: &str) -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let directory = find_bcmaps_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        format!("{directory}/{name}")
+    }
+    #[cfg(target_arch = "wasm32")]
+    name.to_string()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1239,6 +1271,16 @@ fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
 fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
     let file = BUILTIN_CMAPS.get_file(name)?;
     Some(Cow::Borrowed(file.contents()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn builtin_cmap_file_exists(name: &str) -> bool {
+    find_bcmaps_dir().is_some_and(|directory| directory.join(name).is_file())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn builtin_cmap_file_exists(name: &str) -> bool {
+    BUILTIN_CMAPS.get_file(name).is_some()
 }
 
 fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
@@ -1274,29 +1316,7 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
         let subitems = stream.read_number()? as usize;
         match typ {
             0 | 1 => {
-                // codespacerange (0) / notdefrange (1).
-                // First start is raw bytes; every end/start after that is a
-                // varint delta added to the previous value. Type 1 reads an
-                // extra code that we discard.
-                let mut start = stream.read_hex_bytes(data_size + 1)?;
-                let mut end = start.clone();
-                let end_delta = stream.read_hex_number(data_size)?;
-                add_hex(&mut end, &end_delta);
-                if typ == 1 {
-                    let _ = stream.read_number()?;
-                }
-                for _ in 1..subitems {
-                    inc_hex(&mut end);
-                    let start_delta = stream.read_hex_number(data_size)?;
-                    start = end.clone();
-                    add_hex(&mut start, &start_delta);
-                    let end_delta = stream.read_hex_number(data_size)?;
-                    end = start.clone();
-                    add_hex(&mut end, &end_delta);
-                    if typ == 1 {
-                        let _ = stream.read_number()?;
-                    }
-                }
+                consume_codespace_or_notdef(&mut stream, data_size, typ, subitems)?;
             }
             2 | 3 => {
                 // cidchar (2) / cidrange (3): CID→CID maps, irrelevant to
@@ -1403,6 +1423,37 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
         }
     }
     Ok(cmap)
+}
+
+fn consume_codespace_or_notdef(
+    stream: &mut BinaryCMapStream<'_>,
+    data_size: usize,
+    typ: u8,
+    subitems: usize,
+) -> Result<(), String> {
+    // First start is raw bytes; every end/start after that is a varint delta
+    // added to the previous value. notdefrange (type 1) carries one extra
+    // code per subitem that neither parser needs.
+    let mut start = stream.read_hex_bytes(data_size + 1)?;
+    let mut end = start.clone();
+    let end_delta = stream.read_hex_number(data_size)?;
+    add_hex(&mut end, &end_delta);
+    if typ == 1 {
+        let _ = stream.read_number()?;
+    }
+    for _ in 1..subitems {
+        inc_hex(&mut end);
+        let start_delta = stream.read_hex_number(data_size)?;
+        start = end.clone();
+        add_hex(&mut start, &start_delta);
+        let end_delta = stream.read_hex_number(data_size)?;
+        end = start.clone();
+        add_hex(&mut end, &end_delta);
+        if typ == 1 {
+            let _ = stream.read_number()?;
+        }
+    }
+    Ok(())
 }
 
 /// Insert a single bfrange entry into the CMap. Single-char destinations go
@@ -1629,6 +1680,13 @@ fn build_fallback_tounicode_from_encoding(
 
 fn get_cid_system_info_ordering(font_dict: &lopdf::Dictionary, doc: &Document) -> Option<String> {
     let cid_font_dict = get_descendant_cid_font(font_dict, doc)?;
+    get_cid_system_info_ordering_from_descendant(cid_font_dict, doc)
+}
+
+fn get_cid_system_info_ordering_from_descendant(
+    cid_font_dict: &lopdf::Dictionary,
+    doc: &Document,
+) -> Option<String> {
     let csi_obj = cid_font_dict.get(b"CIDSystemInfo").ok()?;
     let csi_dict = match csi_obj {
         Object::Reference(r) => doc.get_dictionary(*r).ok()?,
@@ -1685,8 +1743,26 @@ fn parse_encoding_cmap_object(obj: &Object, doc: &Document) -> Option<EncodingCM
 }
 
 fn load_builtin_encoding_cmap(name: &str) -> Option<EncodingCMap> {
-    let data = read_builtin_cmap_file(&format!("{}.bcmap", name))?;
-    parse_binary_cmap_encoding(&data).ok()
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<EncodingCMap>>>> = OnceLock::new();
+    let file_name = format!("{}.bcmap", name);
+    let cache_key = builtin_cmap_cache_key(&file_name);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&cache_key)
+        .cloned()
+    {
+        return cached;
+    }
+
+    let parsed =
+        read_builtin_cmap_file(&file_name).and_then(|data| parse_binary_cmap_encoding(&data).ok());
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(cache_key, parsed.clone());
+    parsed
 }
 
 fn parse_encoding_cmap_stream(data: &[u8]) -> Option<EncodingCMap> {
@@ -1934,26 +2010,7 @@ fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
         let subitems = stream.read_number()? as usize;
         match typ {
             0 | 1 => {
-                // codespacerange / notdefrange — consume payload
-                let mut start = stream.read_hex_bytes(data_size + 1)?;
-                let mut end = start.clone();
-                let end_delta = stream.read_hex_number(data_size)?;
-                add_hex(&mut end, &end_delta);
-                if typ == 1 {
-                    let _ = stream.read_number()?;
-                }
-                for _ in 1..subitems {
-                    inc_hex(&mut end);
-                    let start_delta = stream.read_hex_number(data_size)?;
-                    start = end.clone();
-                    add_hex(&mut start, &start_delta);
-                    let end_delta = stream.read_hex_number(data_size)?;
-                    end = start.clone();
-                    add_hex(&mut end, &end_delta);
-                    if typ == 1 {
-                        let _ = stream.read_number()?;
-                    }
-                }
+                consume_codespace_or_notdef(&mut stream, data_size, typ, subitems)?;
             }
             2 => {
                 // cidchar: first char raw, first code varint; subsequent use
@@ -2237,6 +2294,46 @@ pub(crate) fn predefined_cmap_for_font(
     })
 }
 
+/// Cheap detection-side equivalent of `predefined_cmap_for_font`.
+///
+/// Classification only needs to know whether extraction has a fallback; it
+/// must not read and parse a multi-thousand-entry Adobe CMap for every font.
+pub(crate) fn predefined_cmap_is_available(font_dict: &lopdf::Dictionary, doc: &Document) -> bool {
+    if font_dict.get(b"ToUnicode").is_ok() {
+        return false;
+    }
+    let Some(encoding) = font_dict
+        .get(b"Encoding")
+        .ok()
+        .and_then(|object| object.as_name().ok())
+    else {
+        return false;
+    };
+    if is_fixed_two_byte_unicode_encoding(encoding) {
+        // Extraction can always use the explicit UCS-2 passthrough even when
+        // an optional composed Adobe mapping is unavailable.
+        return true;
+    }
+    if encoding != b"Identity-H" && encoding != b"Identity-V" {
+        return false;
+    }
+
+    let Some(cid_font) = get_descendant_cid_font(font_dict, doc) else {
+        return false;
+    };
+    let Some(ordering) = get_cid_system_info_ordering_from_descendant(cid_font, doc) else {
+        return false;
+    };
+    match ordering.as_str() {
+        "Korea1" => true,
+        "Japan1" | "GB1" | "CNS1" => {
+            let name = format!("Adobe-{ordering}-UCS2.bcmap");
+            builtin_cmap_file_exists(&name)
+        }
+        _ => false,
+    }
+}
+
 /// Collection of ToUnicode CMaps indexed by ToUnicode stream object number
 #[derive(Debug, Default, Clone)]
 pub struct FontCMaps {
@@ -2250,6 +2347,75 @@ pub struct CMapEntry {
     pub primary: ToUnicodeCMap,
     pub remapped: Option<ToUnicodeCMap>,
     pub fallback: Option<ToUnicodeCMap>,
+}
+
+/// Build a CMap that must be scoped to a concrete font resource rather than
+/// stored under a shared PDF object number.
+///
+/// Named Uni*-UCS2-* encodings are properties of the parent Type0 font, so
+/// two parents may legally share one embedded FontFile while requiring
+/// different mappings. Inline descendant CIDFont dictionaries likewise have
+/// no object number that the document-wide CMap table can safely use.
+pub(crate) fn build_resource_scoped_cmap_entry(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+) -> Option<CMapEntry> {
+    if font_dict.get(b"ToUnicode").is_ok()
+        || font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|object| object.as_name().ok())
+            != Some(b"Type0")
+    {
+        return None;
+    }
+
+    let encoding = font_dict
+        .get(b"Encoding")
+        .ok()
+        .and_then(|object| object.as_name().ok())?;
+    let is_named_ucs2 = is_fixed_two_byte_unicode_encoding(encoding);
+    let is_identity = encoding == b"Identity-H" || encoding == b"Identity-V";
+    if !(is_named_ucs2 || is_identity && has_inline_descendant_font(font_dict, doc)) {
+        return None;
+    }
+
+    let primary = if is_named_ucs2 {
+        predefined_cmap_for_font(font_dict, doc)?
+    } else {
+        build_fallback_cmap_for_type0(font_dict, doc).or_else(|| {
+            let cid_font = get_descendant_cid_font(font_dict, doc)?;
+            if cid_values_look_like_unicode(cid_font) {
+                let mut cmap = ToUnicodeCMap::new();
+                cmap.code_byte_length = 2;
+                cmap.cid_passthrough = true;
+                Some(cmap)
+            } else {
+                None
+            }
+        })?
+    };
+
+    Some(CMapEntry {
+        primary,
+        remapped: None,
+        fallback: None,
+    })
+}
+
+fn has_inline_descendant_font(font_dict: &lopdf::Dictionary, doc: &Document) -> bool {
+    let Ok(descendants) = font_dict.get(b"DescendantFonts") else {
+        return false;
+    };
+    let descendants = match descendants {
+        Object::Array(array) => array,
+        Object::Reference(reference) => match doc.get_object(*reference) {
+            Ok(Object::Array(array)) => array,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    matches!(descendants.first(), Some(Object::Dictionary(_)))
 }
 
 impl FontCMaps {
@@ -2426,17 +2592,12 @@ impl FontCMaps {
             }
         }
 
-        // Second pass: Type0 fonts without ToUnicode.
-        // - Identity-H/V: embedded TrueType cmap, predefined CIDSystemInfo, or
-        //   CID-as-Unicode passthrough heuristics.
-        // - Fixed-width named encodings (UniGB-UCS2-H, UniCNS-UCS2-V, …):
-        //   compose the builtin encoding CMap with Adobe-*-UCS2; their
-        //   character codes are already Unicode so passthrough is a safe last
-        //   resort. Mixed-width and four-byte encodings are intentionally
-        //   excluded because ToUnicodeCMap is not codespace-aware.
+        // Second pass: Identity-H/V Type0 fonts without ToUnicode. Named
+        // Uni*-UCS2-* maps are resource-scoped because the encoding belongs to
+        // the parent Type0 font and must not be keyed by a shared FontFile.
         // In fast mode skip only the expensive TrueType/OpenType font-file
-        // parse; cheap builtin bcmap / fixed-width named fallbacks still run so
-        // region APIs can decode Adobe-GB1/Japan1/CNS1 and Uni*-UCS2-* fonts.
+        // parse; cheap CIDSystemInfo fallbacks still run. Named encodings are
+        // installed later under their concrete page/Form resource name.
         for font_dict in fonts.values() {
             if font_dict.get(b"ToUnicode").is_ok() {
                 continue;
@@ -2500,14 +2661,13 @@ impl FontCMaps {
                     })
             });
 
-            // The lookup key must match what get_font_file2_obj_num() returns:
-            // font file obj_num if present, else CIDFont dict obj_num
-            let lookup_key = font_file_ref
-                .map(|r| r.0)
-                .unwrap_or_else(|| match &desc_fonts[0] {
-                    Object::Reference(r) => r.0,
-                    _ => 0,
-                });
+            // The lookup key must match get_font_file2_obj_num(). A Type0
+            // mapping depends on the CIDFont's collection/CIDToGIDMap, not
+            // solely on an embedded FontFile that multiple CIDFonts may share.
+            let lookup_key = match &desc_fonts[0] {
+                Object::Reference(r) => r.0,
+                _ => 0,
+            };
             if lookup_key == 0 || by_obj_num.contains_key(&lookup_key) {
                 continue;
             }
@@ -2585,49 +2745,6 @@ impl FontCMaps {
                             lookup_key
                         );
                     }
-                }
-            } else {
-                if !is_fixed_two_byte_unicode_encoding(encoding) {
-                    continue;
-                }
-
-                // Fixed-width named predefined encoding (UniGB-UCS2-H, …).
-                if let Some(cmap) = build_fallback_tounicode_from_encoding(font_dict, doc) {
-                    debug!(
-                        "Named encoding CMap obj={:<6} enc={} char_map={}",
-                        lookup_key,
-                        String::from_utf8_lossy(encoding),
-                        cmap.char_map.len()
-                    );
-                    by_obj_num.insert(
-                        lookup_key,
-                        CMapEntry {
-                            primary: cmap,
-                            remapped: None,
-                            fallback: None,
-                        },
-                    );
-                    resolved = true;
-                }
-
-                // Uni*-UCS2-* character codes are already UCS-2 Unicode.
-                if !resolved {
-                    debug!(
-                        "UCS2 encoding font obj={}: treating charcodes as Unicode (enc={})",
-                        lookup_key,
-                        String::from_utf8_lossy(encoding)
-                    );
-                    let mut cmap = ToUnicodeCMap::new();
-                    cmap.code_byte_length = 2;
-                    cmap.cid_passthrough = true;
-                    by_obj_num.insert(
-                        lookup_key,
-                        CMapEntry {
-                            primary: cmap,
-                            remapped: None,
-                            fallback: None,
-                        },
-                    );
                 }
             }
         }
