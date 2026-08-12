@@ -47,7 +47,7 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "node --test bin/*.test.mjs"
+    "test": "node --test bin/pdf-inspector.test.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.4.1"
