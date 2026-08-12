@@ -947,6 +947,7 @@ pub(crate) fn descriptor_style_flags(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
     style_cache: &mut FontStyleCache,
+    decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> (bool, bool) {
     let descriptor = font_dict
         .get(b"FontDescriptor")
@@ -989,7 +990,7 @@ pub(crate) fn descriptor_style_flags(
             let (emb_italic, emb_bold) = *style_cache
                 .by_font_file
                 .entry(ff_ref)
-                .or_insert_with(|| embedded_style_flags(doc, ff_ref));
+                .or_insert_with(|| embedded_style_flags(doc, ff_ref, decompress_cache));
             italic = italic || emb_italic;
             bold = bold || emb_bold;
         }
@@ -998,8 +999,12 @@ pub(crate) fn descriptor_style_flags(
 }
 
 /// Style flags parsed from an embedded font program stream.
-fn embedded_style_flags(doc: &Document, ff_ref: ObjectId) -> (bool, bool) {
-    let Some(data) = font_file_data(doc, ff_ref) else {
+fn embedded_style_flags(
+    doc: &Document,
+    ff_ref: ObjectId,
+    decompress_cache: Option<&mut crate::DecompressedContentCache>,
+) -> (bool, bool) {
+    let Some(data) = font_file_data(doc, ff_ref, decompress_cache) else {
         return (false, false);
     };
     if let Ok(face) = ttf_parser::Face::parse(&data, 0) {
@@ -1072,16 +1077,21 @@ fn font_file_ref(descriptor: &lopdf::Dictionary) -> Option<ObjectId> {
 }
 
 /// Decompressed embedded font program bytes.
-fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
+fn font_file_data(
+    doc: &Document,
+    ff_ref: ObjectId,
+    decompress_cache: Option<&mut crate::DecompressedContentCache>,
+) -> Option<Vec<u8>> {
     let stream = doc
         .get_object(ff_ref)
         .and_then(lopdf::Object::as_stream)
         .ok()?;
-    Some(
-        stream
+    Some(match decompress_cache {
+        Some(cache) => crate::decompressed_content_cached(stream, ff_ref, cache),
+        None => stream
             .decompressed_content()
             .unwrap_or_else(|_| stream.content.clone()),
-    )
+    })
 }
 
 /// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.
@@ -1758,7 +1768,7 @@ mod tests {
             "Flags" => 32,
         });
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new(), None),
             (true, false)
         );
     }
@@ -1772,7 +1782,7 @@ mod tests {
             "Flags" => 64, // bit 7: Italic
         });
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new(), None),
             (true, false)
         );
     }
@@ -1786,7 +1796,7 @@ mod tests {
             "Flags" => 1 << 18, // ForceBold
         });
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new(), None),
             (false, true)
         );
     }
@@ -1801,7 +1811,7 @@ mod tests {
             "Flags" => 32,
         });
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new(), None),
             (false, false)
         );
     }
@@ -1811,7 +1821,7 @@ mod tests {
         let doc = Document::with_version("1.4");
         let font_dict = dictionary! { "Type" => "Font", "BaseFont" => "Tc1" };
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new(), None),
             (false, false)
         );
     }
@@ -1836,7 +1846,7 @@ mod tests {
             "DescendantFonts" => vec![lopdf::Object::Reference(cid_id)],
         };
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new(), None),
             (true, false)
         );
     }
@@ -1877,7 +1887,7 @@ mod tests {
 
         let mut cache = FontStyleCache::new();
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut cache),
+            descriptor_style_flags(&doc, &font_dict, &mut cache, None),
             (true, true)
         );
         assert_eq!(cache.by_font_file.len(), 1);
@@ -1890,13 +1900,13 @@ mod tests {
             Object::Stream(Stream::new(dictionary! {}, vec![0u8; 4])),
         );
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut cache),
+            descriptor_style_flags(&doc, &font_dict, &mut cache, None),
             (true, true)
         );
         // A cold cache parses the (now garbage) stream, proving the warm
         // call above answered from the memo.
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new(), None),
             (false, false)
         );
     }

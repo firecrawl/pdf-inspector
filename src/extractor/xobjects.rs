@@ -190,7 +190,8 @@ fn extract_form_xobject_text_inner(
                 font_base_names.insert(resource_name.clone(), base_name);
             }
         }
-        let style = descriptor_style_flags(doc, font_dict, style_cache);
+        let style =
+            descriptor_style_flags(doc, font_dict, style_cache, decompress_cache.as_deref_mut());
         if style != (false, false) {
             font_style_flags.insert(resource_name.clone(), style);
         }

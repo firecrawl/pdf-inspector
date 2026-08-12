@@ -114,3 +114,20 @@ Full 200-doc corpus: Exp1 426.9ms, candidate 418.8ms → vs original 1.06x
 Quality: unchanged (byte-identical markdown, overall 0.875690)
 Decision: KEEP (a2738a9)
 
+## Experiment #03 — spatial-hash rect clustering
+--------------
+Hypothesis: `cluster_rects` is O(n²). On pages with thousands of disjoint
+rectangles (vector drawings, dense grids) the full overlap scan dominates.
+Spatial hashing over tolerance-expanded boxes should reduce it to ~O(n).
+
+Files changed: src/tables/detect_rects.rs
+
+Pathological (rect scaling, single doc):
+  rects-2000:  0.02s → 0.00s
+  rects-5000:  0.06s → 0.01s  (~6x)
+  rects-10000: 0.18s → 0.01s  (~18x)
+  rects-20000: 0.71s → 0.03s  (~23x)
+Full 200-doc corpus: unchanged (406.9ms vs baseline 425.7ms, cumulative 1.046x)
+Quality: unchanged (byte-identical markdown, overall 0.875690)
+Decision: KEEP (52fb2df)
+

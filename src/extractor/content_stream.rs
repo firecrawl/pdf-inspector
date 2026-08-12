@@ -202,7 +202,8 @@ pub(crate) fn extract_page_text_items(
         }
         // Descriptor style flags rescue subset fonts whose BaseFont names
         // are opaque tags the name heuristics can't read.
-        let style = descriptor_style_flags(doc, font_dict, style_cache);
+        let style =
+            descriptor_style_flags(doc, font_dict, style_cache, decompress_cache.as_deref_mut());
         if style != (false, false) {
             font_style_flags.insert(resource_name.clone(), style);
         }

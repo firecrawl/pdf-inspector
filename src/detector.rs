@@ -867,8 +867,13 @@ fn analyze_page_content(
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.
     // Only consider fonts actually USED by Tf operators in content streams (P1 fix),
     // and include fonts from Form XObject Resources (P2 fix).
-    let has_identity_h_no_tounicode =
-        text_ops > 0 && used_fonts_have_identity_h_no_tounicode(&used_font_ids, &font_map, doc);
+    let has_identity_h_no_tounicode = text_ops > 0
+        && used_fonts_have_identity_h_no_tounicode(
+            &used_font_ids,
+            &font_map,
+            doc,
+            decompress_cache.as_deref_mut(),
+        );
 
     // Check for Type3-only fonts — glyph bitmaps without Unicode mapping.
     // Uses the usage-based font set for accuracy.
@@ -878,8 +883,8 @@ fn analyze_page_content(
     // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars in raw
     // bytes but are fully decodable — we need this to avoid false scan detection.
     // Only considers fonts actually USED via Tf operators (P1 + P2 fix).
-    let has_decodable_text_fonts =
-        text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
+    let has_decodable_text_fonts = text_ops > 0
+        && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc, decompress_cache);
 
     PageAnalysis {
         text_operator_count: text_ops,
@@ -943,7 +948,7 @@ fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
                     has_other_decodable_font = true;
                     continue;
                 }
-                if identity_h_font_has_fallback(font_dict, doc) {
+                if identity_h_font_has_fallback(font_dict, doc, None) {
                     // Fallback decoding path works — decodable
                     has_other_decodable_font = true;
                     continue;
@@ -980,7 +985,11 @@ fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
 
 /// Check whether an Identity-H font without ToUnicode can still be decoded
 /// via one of the extraction pipeline's fallback paths.
-fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -> bool {
+fn identity_h_font_has_fallback(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    decompress_cache: Option<&mut crate::DecompressedContentCache>,
+) -> bool {
     let desc_fonts_obj = match font_dict.get(b"DescendantFonts").ok() {
         Some(obj) => obj,
         None => return false,
@@ -1032,7 +1041,7 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
                     .and_then(|o| o.as_reference().ok())
             });
         if let Some(ff_ref) = font_file_ref {
-            if embedded_font_has_cmap(doc, ff_ref) {
+            if embedded_font_has_cmap(doc, ff_ref, decompress_cache) {
                 return true;
             }
         }
@@ -1043,14 +1052,21 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
 
 /// Quick check whether an embedded TrueType/OpenType font has a cmap table
 /// that can map GIDs to Unicode codepoints.
-fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
+fn embedded_font_has_cmap(
+    doc: &Document,
+    font_ref: lopdf::ObjectId,
+    decompress_cache: Option<&mut crate::DecompressedContentCache>,
+) -> bool {
     let stream = match doc.get_object(font_ref).and_then(Object::as_stream) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let data = match stream.decompressed_content() {
-        Ok(d) => d,
-        Err(_) => return false,
+    let data = match decompress_cache {
+        Some(cache) => crate::decompressed_content_cached(stream, font_ref, cache),
+        None => match stream.decompressed_content() {
+            Ok(d) => d,
+            Err(_) => return false,
+        },
     };
     let face = match ttf_parser::Face::parse(&data, 0) {
         Ok(f) => f,
@@ -1148,7 +1164,7 @@ fn page_has_decodable_text_fonts(doc: &Document, page_id: ObjectId) -> bool {
             }
             Some(b"Type0") => {
                 // Type0 (CID) without ToUnicode — check if it has a fallback path
-                if identity_h_font_has_fallback(font_dict, doc) {
+                if identity_h_font_has_fallback(font_dict, doc, None) {
                     return true;
                 }
             }
@@ -1168,6 +1184,7 @@ fn used_fonts_have_identity_h_no_tounicode(
     used_font_ids: &HashSet<ObjectId>,
     font_map: &HashMap<ObjectId, FontInfo>,
     doc: &Document,
+    mut decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> bool {
     let mut has_undecodable_identity_h = false;
     let mut has_other_decodable_font = false;
@@ -1190,7 +1207,7 @@ fn used_fonts_have_identity_h_no_tounicode(
                     has_other_decodable_font = true;
                     continue;
                 }
-                if identity_h_font_has_fallback(&info.dict, doc) {
+                if identity_h_font_has_fallback(&info.dict, doc, decompress_cache.as_deref_mut()) {
                     has_other_decodable_font = true;
                     continue;
                 }
@@ -1246,6 +1263,7 @@ fn used_fonts_have_decodable_text(
     used_font_ids: &HashSet<ObjectId>,
     font_map: &HashMap<ObjectId, FontInfo>,
     doc: &Document,
+    mut decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> bool {
     for id in used_font_ids {
         let Some(info) = font_map.get(id) else {
@@ -1259,7 +1277,7 @@ fn used_fonts_have_decodable_text(
                 return true;
             }
             Some(b"Type0") => {
-                if identity_h_font_has_fallback(&info.dict, doc) {
+                if identity_h_font_has_fallback(&info.dict, doc, decompress_cache.as_deref_mut()) {
                     return true;
                 }
             }
