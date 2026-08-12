@@ -87,4 +87,30 @@ lopdf's `Stream::decompressed_content()` re-runs FlateDecode on every call.
 
 # Performance ledger
 
-(experiments appended below)
+## Experiment #01 — memchr substring search
+--------------
+Hypothesis: `fix_bare_struct_names` and `estimate_page_count_from_bytes` use
+`slice::windows(n).position()` — O(n·m) byte scans — to find `/StructTreeRoot`,
+`/S `, and `/Type` in raw PDF buffers on every load. SIMD `memchr::memmem` is
+much faster.
+
+Files changed: Cargo.toml, src/structure_tree.rs, src/detector.rs
+
+Before (baseline): 434.6 ms  →  After: 420.8 ms (target speedup 1.033x)
+Full 200-doc corpus: baseline 434.6ms, candidate 420.8ms → vs original 1.033x
+Quality: unchanged (byte-identical markdown, overall 0.875690)
+Decision: KEEP (b8b4b91)
+
+## Experiment #02 — decompress each content stream once
+--------------
+Hypothesis: detection and extraction both call
+`Stream::decompressed_content()`, which re-runs FlateDecode each call. Thread a
+per-document cache keyed by stream object id through both phases.
+
+Files changed: src/lib.rs, src/detector.rs, src/extractor/{mod,content_stream,xobjects}.rs
+
+Before (Exp 1): 438.1 ms  →  After: 412.1 ms (target speedup 1.063x)
+Full 200-doc corpus: Exp1 426.9ms, candidate 418.8ms → vs original 1.06x
+Quality: unchanged (byte-identical markdown, overall 0.875690)
+Decision: KEEP (a2738a9)
+

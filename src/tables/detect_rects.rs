@@ -99,6 +99,46 @@ pub(crate) fn cluster_rects(
     let n = rects.len();
     let mut uf = UnionFind::new(n);
 
+    // For small inputs the O(n²) scan is already cheap (and avoids building a
+    // HashMap); for large inputs the spatial hash below avoids quadratic blowup.
+    if n < SPATIAL_HASH_MIN_RECTS {
+        cluster_rects_naive(rects, tolerance, &mut uf);
+        return cluster_rects_group(rects, tolerance, min_size, &mut uf);
+    }
+
+    // Spatial hash over the tolerance-expanded boxes. Two rects overlap (per
+    // `rects_overlap`) only if their expanded boxes intersect, and two
+    // intersecting boxes always share at least one grid cell, so enumerating
+    // pairs within each cell finds every overlapping pair while avoiding the
+    // O(n²) full scan for the common case of many disjoint rects. Cell size
+    // affects only bucket sizes, not correctness.
+    const CELL: f32 = 20.0;
+    let cell_idx = |v: f32| -> i64 { (v / CELL).floor() as i64 };
+
+    struct CellRange {
+        x0: i64,
+        x1: i64,
+        y0: i64,
+        y1: i64,
+    }
+
+    let mut ranges: Vec<CellRange> = Vec::with_capacity(n);
+    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (i, &(x, y, w, h)) in rects.iter().enumerate() {
+        let minx = x - tolerance;
+        let miny = y - tolerance;
+        let maxx = x + w + tolerance;
+        let maxy = y + h + tolerance;
+        let (x0, x1) = (cell_idx(minx), cell_idx(maxx));
+        let (y0, y1) = (cell_idx(miny), cell_idx(maxy));
+        ranges.push(CellRange { x0, x1, y0, y1 });
+        for cx in x0..=x1 {
+            for cy in y0..=y1 {
+                grid.entry((cx, cy)).or_default().push(i);
+            }
+        }
+    }
+
     for i in 0..n {
         // If rect i is already in an oversized component, no point comparing
         // it against further rects — the component won't be used for table
@@ -106,7 +146,40 @@ pub(crate) fn cluster_rects(
         if uf.component_size(i) >= MAX_CLUSTER_RECTS {
             continue;
         }
-        for j in (i + 1)..n {
+        let range = &ranges[i];
+        let cell_span = (range.x1 - range.x0 + 1) * (range.y1 - range.y0 + 1);
+        // Large rects (page backgrounds, table borders, fills) cover many grid
+        // cells; the spatial hash would gather a huge per-rect candidate list.
+        // For those the plain scan is already cheap — either the rect count is
+        // small, or overlaps merge the component and hit the cap above.
+        if cell_span > 16 {
+            for j in (i + 1)..n {
+                if rects_overlap(&rects[i], &rects[j], tolerance) {
+                    uf.union(i, j);
+                    if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let mut candidates: Vec<usize> = Vec::new();
+        for cx in range.x0..=range.x1 {
+            for cy in range.y0..=range.y1 {
+                if let Some(bucket) = grid.get(&(cx, cy)) {
+                    for &j in bucket {
+                        if j > i {
+                            candidates.push(j);
+                        }
+                    }
+                }
+            }
+        }
+        // Ascending j order preserves the union-find root determinism of the
+        // original `for j in (i + 1)..n` scan.
+        candidates.sort_unstable();
+        candidates.dedup();
+        for j in candidates {
             if rects_overlap(&rects[i], &rects[j], tolerance) {
                 uf.union(i, j);
                 // Check if the merged component just exceeded the cap —
@@ -117,6 +190,40 @@ pub(crate) fn cluster_rects(
             }
         }
     }
+
+    cluster_rects_group(rects, tolerance, min_size, &mut uf)
+}
+
+/// Below this many rects the plain O(n²) scan is cheaper than building the
+/// spatial hash (and most pages fall here).
+const SPATIAL_HASH_MIN_RECTS: usize = 512;
+
+/// Original O(n²) union-find clustering loop.
+fn cluster_rects_naive(rects: &[(f32, f32, f32, f32)], tolerance: f32, uf: &mut UnionFind) {
+    let n = rects.len();
+    for i in 0..n {
+        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+            continue;
+        }
+        for j in (i + 1)..n {
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Group union-find components by root and filter by `min_size`.
+fn cluster_rects_group(
+    rects: &[(f32, f32, f32, f32)],
+    _tolerance: f32,
+    min_size: usize,
+    uf: &mut UnionFind,
+) -> Vec<Vec<usize>> {
+    let n = rects.len();
 
     // Group indices by root
     let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
