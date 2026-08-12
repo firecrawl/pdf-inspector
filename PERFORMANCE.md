@@ -4,33 +4,34 @@ CURRENT SCORE
 =============
 
 Original baseline SHA:  f4aab3b36f7fa1752c65ea45fa64be1274f671cf
-Current best SHA:       f4aab3b36f7fa1752c65ea45fa64be1274f671cf
+Current best SHA:       b6a93a1
 
-Official corpus (OpenDataLoader 200 PDFs, in-process Rust, median of 7 runs)
+Official corpus (OpenDataLoader 200 PDFs, in-process Rust, median of 9 runs)
 ---------------------------------------------------------------------------
-Baseline median: 427.2 ms
-Current median:  427.2 ms
-Overall speedup: 1.00x
+Baseline median: 401.5 ms
+Current median:  385.3 ms
+Overall speedup: 1.04x (docs/sec 498 → 519)
 
 Quality (official paired evaluator)
 -----------------------------------
 Baseline overall: 0.875690
-Current overall:  0.875690
+Current overall:  0.875690  (byte-identical markdown on all 200 documents)
 Reading order (NID):  Baseline 0.915409 / Current 0.915409
 Tables (TEDS):        Baseline 0.814117 / Current 0.814117
 Headings (MHS):       Baseline 0.787774 / Current 0.787774
 
 Tail
 ----
-Baseline P95: 3.86 ms
-Current P95:  3.86 ms
-Worst pathological speedup: n/a
+Baseline P95: 3.69 ms
+Current P95:  3.32 ms
+Worst pathological speedup: ~23x (20,000-rectangle vector page: 0.71s → 0.03s)
 
 Memory
 ------
-Baseline peak RSS: 44.1 MB
-Current peak RSS:  44.1 MB
-Difference:        —
+Baseline peak RSS: 42.5 MB
+Current peak RSS:  51.2 MB
+Difference:        +8.7 MB (decompressed content-stream cache lives for the
+                   duration of one document; acceptable for the speedup)
 
 ---
 
@@ -130,4 +131,60 @@ Pathological (rect scaling, single doc):
 Full 200-doc corpus: unchanged (406.9ms vs baseline 425.7ms, cumulative 1.046x)
 Quality: unchanged (byte-identical markdown, overall 0.875690)
 Decision: KEEP (52fb2df)
+
+## Experiment #04 — memoize embedded font-file decompression
+--------------
+Hypothesis: `descriptor_style_flags` (extraction) and
+`embedded_font_has_cmap`/`identity_h_font_has_fallback` (detection) each
+decompress the same embedded font program — the largest FlateDecode streams —
+across detection/extraction and per page. Threading the shared
+`DecompressedContentCache` into font-file reads should inflate each font once.
+
+Files changed: src/detector.rs, src/extractor/{fonts,content_stream,xobjects}.rs
+
+Full 200-doc corpus: baseline 403.8ms, candidate 384.1ms → cumulative 1.051x
+Quality: unchanged (byte-identical markdown, overall 0.875690)
+Decision: KEEP (b6a93a1)
+
+
+# Profiling evidence (baseline → final)
+
+`sample` (macOS, ~6ms interval) over a 400-run loop of the in-process harness,
+before vs. after optimization. Samples are wall-clock CPU attribution for the
+application's own frames (rayon idle worker sleeps excluded).
+
+| Function | Before | After |
+| -------- | -----: | ----: |
+| miniz_oxide inflate (FlateDecode) | ~1389 | ~890 |
+| fix_bare_struct_names (naive scan) | ~214 | ~0 (memchr) |
+| lopdf Content::decode (nom) | ~700 | ~520 |
+| scan_content_for_text_operators | ~140 | ~97 |
+| cluster_rects (O(n²)) | ~20 | ~12 (spatial hash) |
+
+FlateDecode dropped ~36% (double-decompress + font re-decompress eliminated);
+the remainder is the single unavoidable inflate pass. `fix_bare_struct_names`
+vanished from the profile after the memchr swap. Rect clustering moved from
+O(n²) to ~O(n) (23x on a 20k-rect page).
+
+# Pathological / stress cases (baseline → final)
+
+| Case | Baseline | Optimized | Speedup |
+| ---- | -------: | --------: | ------: |
+| rects-2000 (vector) | 0.02s | 0.00s | ~2x |
+| rects-5000 (vector) | 0.06s | 0.01s | ~6x |
+| rects-10000 (vector) | 0.18s | 0.01s | ~18x |
+| rects-20000 (vector) | 0.71s | 0.03s | ~23x |
+| long-1000 (pages) | 0.38s | 0.37s | 1.03x |
+
+Long-document scaling was already linear; the big win is vector-heavy pages.
+
+# Failed / rejected experiments
+
+- **Spatial hash for small rect sets (first attempt):** applying the spatial
+  hash unconditionally (no `SPATIAL_HASH_MIN_RECTS` floor) cost ~10x on the
+  official corpus — most pages have <512 rects where the HashMap build is
+  slower than the plain scan, and full-page background rects span many grid
+  cells producing huge candidate lists. Fixed by gating the hash to ≥512 rects
+  and falling back to the plain scan for rects spanning >16 cells; retained the
+  23x pathological win while restoring parity on the official corpus.
 
