@@ -1,0 +1,35 @@
+src/extractor/content_stream.rs
+  s_8b81192caa100a::t_a9e52189aeafde 1290-1295
+  s_8b81192caa100a::t_ab0cad750e1a00 22
+  s_8b81192caa100a::t_04ede2db2adfc1 247
+  s_8b81192caa100a::t_4f10f78e5e9660 920
+src/extractor/xobjects.rs
+  s_8b81192caa100a::t_313c2720b82cdb 771
+  s_8b81192caa100a::t_b59176d32a9012 836,843,849-851,853-901,903
+  s_8b81192caa100a::t_3f55a90ab25937 764-766,772,775-822,828-835,837-842,844-848,852,902,904,957
+  s_8b81192caa100a::t_ab0cad750e1a00 823-827
+  s_8b81192caa100a::t_53af28d0b0a0d7 905-956
+  s_8b81192caa100a::t_14fd090bb9ff39 773-774
+  s_8b81192caa100a::t_f11e4aab6b7a12 329-331
+  s_8b81192caa100a::t_93d6e210ed1f19 767-770
+  s_8b81192caa100a::t_ab941975936dd5 187,198
+  s_8b81192caa100a::t_4c6a70cccbe1bd 212,218-220
+  s_8b81192caa100a::t_8abd7f5ed51967 356,366
+  s_8b81192caa100a::t_f4f6a0dfce03b6 19-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b95c1487cb401f464ab5ffdd987ab90bee1d0773",
+  "prompts": {},
+  "sessions": {
+    "s_8b81192caa100a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "69c52882-fd38-4082-bcc6-5f7987f37382",
+        "model": "grok-4.6"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
