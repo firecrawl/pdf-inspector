@@ -104,14 +104,28 @@ struct CipherGarbleStats {
     /// lowercase straight to uppercase mid-word.
     letter_bigrams: usize,
     case_shift_bigrams: usize,
+    /// Characters in Base64-compatible tokens, and the subset belonging to
+    /// long uninterrupted tokens. The latter distinguishes structured blobs
+    /// from prose before applying page-calibrated heuristics to one font.
+    structured_token_chars: usize,
+    long_structured_token_chars: usize,
 }
 
 impl CipherGarbleStats {
     const MIN_FONT_SAMPLE_LETTER_KINDS: usize = 15;
+    const MIN_LONG_STRUCTURED_TOKEN_CHARS: usize = 32;
 
     fn add_text(&mut self, text: &str) {
         let mut prev: Option<char> = None;
+        let mut structured_token_chars = 0usize;
         for ch in text.chars() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=') {
+                structured_token_chars += 1;
+            } else {
+                self.add_structured_token(structured_token_chars);
+                structured_token_chars = 0;
+            }
+
             if ch.is_ascii_alphabetic() {
                 let idx = (ch.to_ascii_lowercase() as u8 - b'a') as usize;
                 self.letter_counts[idx] += 1;
@@ -136,6 +150,14 @@ impl CipherGarbleStats {
                 }
                 prev = None;
             }
+        }
+        self.add_structured_token(structured_token_chars);
+    }
+
+    fn add_structured_token(&mut self, chars: usize) {
+        self.structured_token_chars += chars;
+        if chars >= Self::MIN_LONG_STRUCTURED_TOKEN_CHARS {
+            self.long_structured_token_chars += chars;
         }
     }
 
@@ -233,6 +255,9 @@ impl CipherGarbleStats {
     /// the text is legitimate (for example, a dedicated code font containing
     /// repeated `myXMLParser` labels). Require broad alphabet coverage before
     /// applying the page-calibrated cipher heuristic to an isolated font.
+    /// Likewise, a Base64-style blob can cover the whole alphabet and flip
+    /// case frequently, but long uninterrupted structured tokens are not
+    /// prose and should not make a readable mixed-font page fall back to OCR.
     ///
     /// This guard is intentionally font-only: page-wide detection keeps its
     /// existing behavior, including all-lowercase and all-uppercase shifted
@@ -244,7 +269,11 @@ impl CipherGarbleStats {
             .iter()
             .filter(|&&count| count > 0)
             .count();
-        letter_kinds >= Self::MIN_FONT_SAMPLE_LETTER_KINDS && self.looks_garbled()
+        let structured_data_dominates =
+            self.long_structured_token_chars.saturating_mul(2) >= self.structured_token_chars;
+        letter_kinds >= Self::MIN_FONT_SAMPLE_LETTER_KINDS
+            && !structured_data_dominates
+            && self.looks_garbled()
     }
 }
 

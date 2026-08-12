@@ -6637,6 +6637,24 @@ mod tests {
     }
 
     #[test]
+    fn test_text_quality_allows_base64_in_dedicated_font() {
+        // Base64 for the bytes 0..=255. Its broad alphabet and frequent
+        // lowercase-to-uppercase transitions satisfy the cipher thresholds,
+        // but the uninterrupted structured token is not prose.
+        let base64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==";
+        let healthy = CAESAR_PROSE.repeat(3);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "DataFont", base64),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
     fn test_text_quality_flags_uniform_case_garbled_fonts_on_mixed_pages() {
         let healthy = CAESAR_PROSE.repeat(3);
         let lowercase_garble = caesar_shift(&CAESAR_PROSE.to_lowercase(), 5);
