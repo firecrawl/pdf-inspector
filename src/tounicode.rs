@@ -77,6 +77,7 @@ pub(crate) fn build_cmap_entry_from_stream(
             primary,
             remapped,
             fallback,
+            hole_filler: None,
         });
     }
 
@@ -91,6 +92,7 @@ pub(crate) fn build_cmap_entry_from_stream(
         primary: fallback,
         remapped: None,
         fallback: None,
+        hole_filler: None,
     })
 }
 
@@ -449,16 +451,40 @@ impl ToUnicodeCMap {
 
     /// Decode a byte slice to a Unicode string, respecting the CMap's code byte width
     pub fn decode_cids(&self, bytes: &[u8]) -> String {
+        self.decode_cids_with_fallbacks(bytes, &[])
+    }
+
+    /// Like [`decode_cids`](Self::decode_cids), but consults `fallbacks` for any
+    /// individual code this CMap cannot map.
+    ///
+    /// A ToUnicode CMap that maps *almost* every CID is a common producer defect:
+    /// one glyph is drawn correctly but has no declared Unicode value, so every
+    /// extractor loses exactly that letter. Choosing between whole-string decodes
+    /// cannot recover it — the winning decode is the one with the hole. The
+    /// resolution chain the PDF spec implies (ToUnicode → embedded font cmap →
+    /// glyph name → U+FFFD) has to be walked per code, which is what this does.
+    ///
+    /// Codes are looked up in `fallbacks` order and the first usable mapping wins;
+    /// a code no map in the chain can resolve still counts as unmapped.
+    pub fn decode_cids_with_fallbacks(&self, bytes: &[u8], fallbacks: &[&ToUnicodeCMap]) -> String {
         let mut result = String::new();
         let mut unmapped_count = 0usize;
+
+        // Walk this CMap first, then each fallback, stopping at the first mapping
+        // that is actually usable (a mapping *to* U+FFFD is a hole of its own).
+        let lookup_chained = |code: u16| -> Option<String> {
+            std::iter::once(self)
+                .chain(fallbacks.iter().copied())
+                .find_map(|cmap| cmap.lookup(code).filter(|s| !s.contains('\u{FFFD}')))
+        };
 
         if self.code_byte_length == 1 {
             // Single-byte codes: each byte is a code
             for &b in bytes {
                 let code = b as u16;
-                match self.lookup(code) {
-                    Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
-                    _ => {
+                match lookup_chained(code) {
+                    Some(s) => result.push_str(&s),
+                    None => {
                         // For single-byte unmapped codes, try as Latin-1
                         // (the byte IS the character code in most legacy encodings)
                         if b >= 0x20 {
@@ -473,9 +499,9 @@ impl ToUnicodeCMap {
             for chunk in bytes.chunks(2) {
                 if chunk.len() == 2 {
                     let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
-                    match self.lookup(cid) {
-                        Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
-                        _ => {
+                    match lookup_chained(cid) {
+                        Some(s) => result.push_str(&s),
+                        None => {
                             if self.cid_passthrough {
                                 // Last-resort: treat CID as Unicode codepoint.
                                 // Valid for Identity-H fonts where the PDF generator
@@ -1950,6 +1976,13 @@ pub struct CMapEntry {
     pub primary: ToUnicodeCMap,
     pub remapped: Option<ToUnicodeCMap>,
     pub fallback: Option<ToUnicodeCMap>,
+    /// The embedded font's own cmap, built only when the ToUnicode CMap leaves
+    /// CIDs the font declares unnamed.
+    ///
+    /// Unlike `fallback`, this is never a competing whole-string interpretation:
+    /// it exists to fill individual holes, so decoders consult it per CID after
+    /// the primary CMap misses. See [`ToUnicodeCMap::decode_cids_with_fallbacks`].
+    pub hole_filler: Option<ToUnicodeCMap>,
 }
 
 impl FontCMaps {
@@ -2081,6 +2114,7 @@ impl FontCMaps {
                     build_fallback_tounicode_from_encoding(font_dict, doc)
                 };
 
+                let mut primary_is_fallback = false;
                 if primary_entries < 10 {
                     if let Some(fb) = fallback.take() {
                         debug!(
@@ -2089,14 +2123,35 @@ impl FontCMaps {
                         );
                         remapped = Some(primary);
                         primary = fb;
+                        primary_is_fallback = true;
                     }
                 }
+
+                // "Rich" is not "complete": a CMap can map 57 of a subset's 58
+                // glyphs and lose exactly one letter everywhere it appears. That
+                // hole is not a competing interpretation of the text — the other
+                // candidates share it — so the embedded font's cmap is kept apart
+                // from `fallback` and consulted per CID instead of being scored
+                // against whole-string decodes.
+                //
+                // Nothing to add when the sparse path above already promoted that
+                // same cmap to primary.
+                let hole_filler = if primary_is_fallback
+                    || skip_truetype_fallback
+                    || !type0_tounicode_has_holes(font_dict, doc, &primary)
+                {
+                    None
+                } else {
+                    build_fallback_cmap_for_type0(font_dict, doc)
+                };
+
                 by_obj_num.insert(
                     obj_num,
                     CMapEntry {
                         primary,
                         remapped,
                         fallback,
+                        hole_filler,
                     },
                 );
             } else {
@@ -2119,6 +2174,7 @@ impl FontCMaps {
                             primary: fb,
                             remapped: None,
                             fallback: None,
+                            hole_filler: None,
                         },
                     );
                 }
@@ -2226,6 +2282,7 @@ impl FontCMaps {
                                 primary: cmap,
                                 remapped: None,
                                 fallback: None,
+                                hole_filler: None,
                             },
                         );
                         resolved = true;
@@ -2247,6 +2304,7 @@ impl FontCMaps {
                             primary: cmap,
                             remapped: None,
                             fallback: None,
+                            hole_filler: None,
                         },
                     );
                     resolved = true;
@@ -2274,6 +2332,7 @@ impl FontCMaps {
                             primary: cmap,
                             remapped: None,
                             fallback: None,
+                            hole_filler: None,
                         },
                     );
                 } else {
@@ -2346,6 +2405,7 @@ impl FontCMaps {
                                 primary: cmap,
                                 remapped: None,
                                 fallback: None,
+                                hole_filler: None,
                             },
                         );
                     }
@@ -2445,6 +2505,163 @@ impl FontCMaps {
     /// Get a CMap by ToUnicode object number
     pub fn get_by_obj(&self, obj_num: u32) -> Option<&CMapEntry> {
         self.by_obj_num.get(&obj_num)
+    }
+}
+
+/// Cap on how many declared CIDs [`type0_tounicode_has_holes`] examines.
+///
+/// A `/W` array can nominally describe all 65536 CIDs. The scan stops early on
+/// the first hole, so the cap only bounds the *negative* case — a large, fully
+/// mapped font pays a bounded walk instead of a complete one.
+const CID_HOLE_SCAN_LIMIT: usize = 4096;
+
+/// True when the descendant CIDFont declares CIDs that `primary` cannot map.
+///
+/// `/W` (widths) and `/CIDSet` (subset bitmap) name the CIDs a font actually
+/// carries. A CID listed there but absent from ToUnicode is a hole in the text
+/// layer: the glyph draws correctly on screen and has a width, but no declared
+/// Unicode value, so every extractor drops it or emits U+FFFD. Both structures
+/// sit next to the font dictionary and are cheap to read, which makes this a
+/// usable gate in front of decompressing and parsing the embedded font file.
+///
+/// CID 0 is `.notdef` by definition and is never counted as a hole.
+fn type0_tounicode_has_holes(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    primary: &ToUnicodeCMap,
+) -> bool {
+    if font_dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        != Some(b"Type0".as_slice())
+    {
+        return false;
+    }
+    let Some(cid_font_dict) = get_descendant_cid_font(font_dict, doc) else {
+        return false;
+    };
+
+    let mut scanned = 0usize;
+    let mut declared_any = false;
+
+    // /W: [c [w ...]] and [c_first c_last w] forms both name concrete CIDs.
+    if let Some(w_array) = cid_font_dict
+        .get(b"W")
+        .ok()
+        .and_then(|o| resolve_array_obj(doc, o))
+    {
+        let mut i = 0usize;
+        while i < w_array.len() && scanned < CID_HOLE_SCAN_LIMIT {
+            let Some(start_cid) = object_as_u16(&w_array[i]) else {
+                i += 1;
+                continue;
+            };
+            i += 1;
+            if i >= w_array.len() {
+                break;
+            }
+            // Widths arrive either as a nested array of per-CID widths or as a
+            // c_first/c_last/w run; both name the CIDs the font actually carries.
+            let cids: Vec<u16> = match resolve_array_obj(doc, &w_array[i]) {
+                Some(widths) => {
+                    i += 1;
+                    (0..widths.len())
+                        .map(|j| start_cid.saturating_add(j as u16))
+                        .collect()
+                }
+                None => {
+                    let Some(end_cid) = object_as_u16(&w_array[i]) else {
+                        i += 1;
+                        continue;
+                    };
+                    i += 2; // consume c_last and w
+                    (start_cid..=end_cid).collect()
+                }
+            };
+            for cid in cids {
+                if scanned >= CID_HOLE_SCAN_LIMIT {
+                    break;
+                }
+                if cid == 0 {
+                    continue; // .notdef has no Unicode by definition
+                }
+                declared_any = true;
+                scanned += 1;
+                if is_unmapped(primary, cid) {
+                    debug!("ToUnicode hole: CID {cid} declared in /W but unmapped");
+                    return true;
+                }
+            }
+        }
+    }
+
+    // /CIDSet: one bit per CID, set when the subset carries that glyph.
+    if !declared_any {
+        if let Some(bits) = cid_set_bits(cid_font_dict, doc) {
+            for (byte_idx, byte) in bits.iter().enumerate() {
+                for bit in 0..8usize {
+                    if byte & (0x80 >> bit) == 0 {
+                        continue;
+                    }
+                    if scanned >= CID_HOLE_SCAN_LIMIT {
+                        return false;
+                    }
+                    let Ok(cid) = u16::try_from(byte_idx * 8 + bit) else {
+                        return false;
+                    };
+                    if cid == 0 {
+                        continue;
+                    }
+                    scanned += 1;
+                    if is_unmapped(primary, cid) {
+                        debug!("ToUnicode hole: CID {cid} declared in /CIDSet but unmapped");
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// A CID is unmapped when the CMap has no entry, or maps it to U+FFFD.
+fn is_unmapped(primary: &ToUnicodeCMap, cid: u16) -> bool {
+    primary.lookup(cid).is_none_or(|s| s.contains('\u{FFFD}'))
+}
+
+/// Read `/CIDSet` from the font descriptor as raw bits.
+fn cid_set_bits(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
+    let descriptor = match cid_font_dict.get(b"FontDescriptor").ok()? {
+        Object::Reference(r) => doc.get_dictionary(*r).ok()?,
+        Object::Dictionary(d) => d,
+        _ => return None,
+    };
+    let stream = match descriptor.get(b"CIDSet").ok()? {
+        Object::Reference(r) => doc.get_object(*r).ok()?.as_stream().ok()?,
+        Object::Stream(s) => s,
+        _ => return None,
+    };
+    stream.decompressed_content().ok()
+}
+
+fn resolve_array_obj<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Vec<Object>> {
+    match obj {
+        Object::Array(arr) => Some(arr),
+        Object::Reference(r) => doc.get_object(*r).ok()?.as_array().ok(),
+        _ => None,
+    }
+}
+
+fn object_as_u16(obj: &Object) -> Option<u16> {
+    match obj {
+        Object::Integer(n) => u16::try_from(*n).ok(),
+        Object::Real(n) => {
+            let n = *n as i64;
+            u16::try_from(n).ok()
+        }
+        _ => None,
     }
 }
 
@@ -2581,6 +2798,7 @@ fn build_fallback_cmap_for_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     #[test]
     fn test_parse_bfchar_2byte() {
@@ -2663,6 +2881,204 @@ endbfchar
         // "AB " in 2-byte CID encoding
         let cids = [0x00, 0x24, 0x00, 0x25, 0x00, 0x03];
         assert_eq!(cmap.decode_cids(&cids), "AB ");
+    }
+
+    /// A ToUnicode CMap covering every Hebrew letter except nun (U+05E0) —
+    /// the shape of the producer defect this fallback chain exists for.
+    fn hebrew_cmap_missing_nun() -> ToUnicodeCMap {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+4 beginbfchar
+<00A9> <05DE>
+<00AB> <05D7>
+<00AC> <05DD>
+<0003> <0020>
+endbfchar
+"#;
+        ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap()
+    }
+
+    /// The embedded font's own cmap: Identity-H means CID == GID, and the
+    /// font maps GID 0xAA (170) to nun even though ToUnicode never does.
+    fn embedded_font_cmap_with_nun() -> ToUnicodeCMap {
+        let mut fallback = ToUnicodeCMap::new();
+        fallback.code_byte_length = 2;
+        fallback.char_map.insert(0x00AA, "\u{05E0}".to_string());
+        fallback.char_map.insert(0x00A9, "\u{05DE}".to_string());
+        fallback
+    }
+
+    #[test]
+    fn decode_cids_fills_single_cid_hole_from_fallback() {
+        let primary = hebrew_cmap_missing_nun();
+        let fallback = embedded_font_cmap_with_nun();
+
+        // "מנחם" — CIDs A9 AA AB AC, where AA (nun) is the hole.
+        let cids = [0x00, 0xA9, 0x00, 0xAA, 0x00, 0xAB, 0x00, 0xAC];
+
+        // Without the fallback the letter is simply gone, which is what every
+        // extractor did with this file.
+        assert_eq!(primary.decode_cids(&cids), "\u{05DE}\u{05D7}\u{05DD}");
+
+        // With it, the word is whole.
+        assert_eq!(
+            primary.decode_cids_with_fallbacks(&cids, &[&fallback]),
+            "\u{05DE}\u{05E0}\u{05D7}\u{05DD}",
+        );
+    }
+
+    #[test]
+    fn decode_cids_fallback_recovers_a_lone_unmapped_cid() {
+        // Producers routinely emit one CID per TJ element for kerning, so the
+        // hole often arrives alone. Alone, it trips the "more than half the
+        // codes were unmapped" rule and the whole operand decodes to nothing,
+        // which is what turned into U+FFFD downstream.
+        let primary = hebrew_cmap_missing_nun();
+        let fallback = embedded_font_cmap_with_nun();
+        let lone_nun = [0x00, 0xAA];
+
+        assert_eq!(primary.decode_cids(&lone_nun), "");
+        assert_eq!(
+            primary.decode_cids_with_fallbacks(&lone_nun, &[&fallback]),
+            "\u{05E0}",
+        );
+    }
+
+    #[test]
+    fn decode_cids_fallback_does_not_override_a_mapped_cid() {
+        // The chain is a repair for holes, not a second opinion: a CID the
+        // primary CMap maps keeps the primary's value.
+        let primary = hebrew_cmap_missing_nun();
+        let mut fallback = embedded_font_cmap_with_nun();
+        fallback.char_map.insert(0x00A9, "X".to_string());
+
+        let cids = [0x00, 0xA9];
+        assert_eq!(
+            primary.decode_cids_with_fallbacks(&cids, &[&fallback]),
+            "\u{05DE}",
+        );
+    }
+
+    #[test]
+    fn decode_cids_reports_failure_when_no_map_in_the_chain_resolves() {
+        // A CID that neither map knows still counts as unmapped, so the
+        // majority-unmapped rule keeps signalling failure to the caller.
+        let primary = hebrew_cmap_missing_nun();
+        let fallback = embedded_font_cmap_with_nun();
+        let unknown = [0x0F, 0xFE, 0x0F, 0xFF];
+
+        assert_eq!(
+            primary.decode_cids_with_fallbacks(&unknown, &[&fallback]),
+            ""
+        );
+    }
+
+    /// Build a Type0/Identity-H font whose descendant declares `declared_cids`
+    /// in `/W`. No font file is attached: the hole gate must decide from the
+    /// widths alone, which is the whole point of it being cheap.
+    fn type0_font_declaring(doc: &mut Document, declared_cids: &[u16]) -> lopdf::Dictionary {
+        let mut w_array = Vec::new();
+        for &cid in declared_cids {
+            w_array.push(Object::Integer(cid as i64));
+            w_array.push(Object::Array(vec![Object::Integer(500)]));
+        }
+        let w_ref = doc.add_object(Object::Array(w_array));
+        let cid_font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => Object::Name(b"CIDFont+F2".to_vec()),
+            "CIDToGIDMap" => Object::Name(b"Identity".to_vec()),
+            "W" => Object::Reference(w_ref),
+        });
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => Object::Name(b"CIDFont+F2".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "DescendantFonts" => Object::Array(vec![Object::Reference(cid_font)]),
+        }
+    }
+
+    #[test]
+    fn hole_gate_fires_for_a_width_bearing_cid_the_cmap_cannot_name() {
+        // CID 0xAA has a width, so the font draws it — but ToUnicode has no
+        // entry for it. That mismatch is the cheap signal that the embedded
+        // font's cmap is worth parsing.
+        let mut doc = Document::with_version("1.7");
+        let font_dict = type0_font_declaring(&mut doc, &[0x00A9, 0x00AA, 0x00AB]);
+
+        assert!(type0_tounicode_has_holes(
+            &font_dict,
+            &doc,
+            &hebrew_cmap_missing_nun()
+        ));
+    }
+
+    #[test]
+    fn hole_gate_stays_quiet_when_every_declared_cid_is_mapped() {
+        // The common case. Firing here would mean decompressing and parsing
+        // the embedded font of every well-formed PDF.
+        let mut doc = Document::with_version("1.7");
+        let font_dict = type0_font_declaring(&mut doc, &[0x00A9, 0x00AB, 0x00AC]);
+
+        assert!(!type0_tounicode_has_holes(
+            &font_dict,
+            &doc,
+            &hebrew_cmap_missing_nun()
+        ));
+    }
+
+    #[test]
+    fn hole_gate_ignores_notdef() {
+        // CID 0 is .notdef and legitimately has no Unicode value; treating it
+        // as a hole would fire the gate on essentially every CID font.
+        let mut doc = Document::with_version("1.7");
+        let font_dict = type0_font_declaring(&mut doc, &[0, 0x00A9]);
+
+        assert!(!type0_tounicode_has_holes(
+            &font_dict,
+            &doc,
+            &hebrew_cmap_missing_nun()
+        ));
+    }
+
+    #[test]
+    fn hole_gate_reads_cid_ranges_and_skips_non_type0_fonts() {
+        let mut doc = Document::with_version("1.7");
+
+        // c_first c_last w form: CIDs 0xA9..=0xAB, which includes the hole.
+        let w_ref = doc.add_object(Object::Array(vec![
+            Object::Integer(0x00A9),
+            Object::Integer(0x00AB),
+            Object::Integer(500),
+        ]));
+        let cid_font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "CIDToGIDMap" => Object::Name(b"Identity".to_vec()),
+            "W" => Object::Reference(w_ref),
+        });
+        let mut font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "DescendantFonts" => Object::Array(vec![Object::Reference(cid_font)]),
+        };
+        assert!(type0_tounicode_has_holes(
+            &font_dict,
+            &doc,
+            &hebrew_cmap_missing_nun()
+        ));
+
+        // Simple fonts have no CIDs to reconcile; the gate must not claim them.
+        font_dict.set("Subtype", Object::Name(b"TrueType".to_vec()));
+        assert!(!type0_tounicode_has_holes(
+            &font_dict,
+            &doc,
+            &hebrew_cmap_missing_nun()
+        ));
     }
 
     #[test]

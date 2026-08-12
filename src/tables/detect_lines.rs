@@ -438,7 +438,7 @@ fn build_text_anchor_table(
     columns.extend(anchors.windows(2).map(|pair| (pair[0] + pair[1]) / 2.0));
     columns.push(x_max);
 
-    let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
+    let mut cell_text = vec![vec![crate::rtl::CellText::default(); anchors.len()]; rows.len()];
     let mut item_indices = Vec::new();
     let mut wide_items = 0usize;
     let mut measured_items = 0usize;
@@ -456,13 +456,11 @@ fn build_text_anchor_table(
                     wide_items += 1;
                 }
             }
-            if !cells[row_index][column].is_empty() {
-                cells[row_index][column].push(' ');
-            }
-            cells[row_index][column].push_str(item.text.trim());
+            cell_text[row_index][column].push(item.text.trim());
             item_indices.push(*item_index);
         }
     }
+    let cells = crate::rtl::finish_cells(cell_text);
     item_indices.sort_unstable();
     item_indices.dedup();
 
@@ -858,18 +856,16 @@ fn build_dense_row_anchor_table(
     columns.extend(anchors.windows(2).map(|pair| (pair[0] + pair[1]) / 2.0));
     columns.push(x_max.max(*anchors.last()?));
 
-    let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
+    let mut cell_text = vec![vec![crate::rtl::CellText::default(); anchors.len()]; rows.len()];
     let mut item_indices = Vec::new();
     for (row_index, (_, row)) in rows.iter().enumerate() {
         for (item_index, item) in row {
             let column = nearest_anchor_column(item, &anchors)?;
-            if !cells[row_index][column].is_empty() {
-                cells[row_index][column].push(' ');
-            }
-            cells[row_index][column].push_str(item.text.trim());
+            cell_text[row_index][column].push(item.text.trim());
             item_indices.push(*item_index);
         }
     }
+    let cells = crate::rtl::finish_cells(cell_text);
     item_indices.sort_unstable();
     item_indices.dedup();
 
@@ -975,20 +971,21 @@ fn build_open_edge_grid_table_for_rules(
     ];
     let header_rows = collect_anchored_rows(items, &header_band, page);
     let header_y = header_rows.first()?.0;
-    let mut header_cells = vec![String::new(); column_count];
+    let mut header_text = vec![crate::rtl::CellText::default(); column_count];
     let mut header_indices = Vec::new();
     for (_, header_items) in &header_rows {
         for (item_index, item) in header_items {
             let center_x = item.x + item.width / 2.0;
             let column = (0..column_count)
                 .find(|&index| center_x >= col_edges[index] && center_x <= col_edges[index + 1])?;
-            if !header_cells[column].is_empty() {
-                header_cells[column].push(' ');
-            }
-            header_cells[column].push_str(item.text.trim());
+            header_text[column].push(item.text.trim());
             header_indices.push(*item_index);
         }
     }
+    let header_cells: Vec<String> = header_text
+        .into_iter()
+        .map(crate::rtl::CellText::finish)
+        .collect();
     let mixed_rule_span_in_band = logical_rules.iter().any(|rule| {
         rule.0 >= y_bottom - RULE_Y_TOLERANCE
             && rule.0 <= y_top + RULE_Y_TOLERANCE

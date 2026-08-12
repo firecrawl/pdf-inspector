@@ -1,5 +1,7 @@
 //! Column/row boundary detection and cell assignment for heuristic tables.
 
+use std::borrow::Cow;
+
 use crate::types::TextItem;
 
 use super::{Table, TableDetectionMode};
@@ -470,26 +472,40 @@ pub(crate) fn recover_header_row(
     // Take the row closest to the table (lowest Y above first_row_y)
     // header_y_groups is sorted by descending Y, so take the last one
     let (header_y, header_items) = header_y_groups.last().unwrap();
+    // An RTL header row is filled in paint (ascending-X) order so that
+    // `CellText` can put each cell into reading order — the direction belongs
+    // to the cell, not to the individual fragment, so a Latin word inside a
+    // Hebrew header keeps its place among its neighbours. LTR rows keep the
+    // original stream order and borrow the group unchanged.
+    let header_items: Cow<[(usize, &TextItem)]> =
+        if crate::text_utils::is_rtl_text(header_items.iter().map(|(_, item)| &item.text)) {
+            let mut sorted = header_items.clone();
+            sorted.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+            Cow::Owned(sorted)
+        } else {
+            Cow::Borrowed(header_items.as_slice())
+        };
 
     // Map header items to table columns
     let num_cols = table.columns.len();
-    let mut header_cells: Vec<String> = vec![String::new(); num_cols];
+    let mut header_text = vec![crate::rtl::CellText::default(); num_cols];
     let mut mapped_count = 0;
     let mut header_indices = Vec::new();
 
-    for (idx, item) in header_items {
+    for (idx, item) in header_items.iter() {
         if let Some(col) = find_column_index(&table.columns, item.x) {
             let text = item.text.trim();
             if !text.is_empty() {
-                if !header_cells[col].is_empty() {
-                    header_cells[col].push(' ');
-                }
-                header_cells[col].push_str(text);
+                header_text[col].push(text);
                 mapped_count += 1;
                 header_indices.push(*idx);
             }
         }
     }
+    let header_cells: Vec<String> = header_text
+        .into_iter()
+        .map(crate::rtl::CellText::finish)
+        .collect();
 
     // Require at least 2 columns populated to look like a real header row
     let populated = header_cells.iter().filter(|c| !c.is_empty()).count();

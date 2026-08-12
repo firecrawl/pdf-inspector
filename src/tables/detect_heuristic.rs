@@ -65,7 +65,9 @@ fn merge_adjacent_items_preserving(
         let mut i = 0;
         while i < group.len() {
             let (first_idx, first_item) = group[i];
-            let mut text = first_item.text.clone();
+            // Paint-order fragments with a "separated from the previous one by
+            // a word gap" flag; ordered into reading order once the run ends.
+            let mut fragments: Vec<(&str, bool)> = vec![(first_item.text.as_str(), false)];
             let mut end_x = first_item.x + first_item.width;
             let mut indices = vec![first_idx];
             let x_gap_max = first_item.font_size * 0.5;
@@ -109,17 +111,15 @@ fn merge_adjacent_items_preserving(
 
                 // Insert space at word boundaries: within a word characters
                 // touch (gap ≈ 0), between words there's a visible gap.
-                if gap > first_item.font_size * 0.08 {
-                    text.push(' ');
-                }
-                text.push_str(&next_item.text);
+                let word_gap = gap > first_item.font_size * 0.08;
+                fragments.push((next_item.text.as_str(), word_gap));
                 end_x = next_item.x + next_item.width;
                 indices.push(next_idx);
                 j += 1;
             }
 
             merged_items.push(TextItem {
-                text,
+                text: crate::rtl::join_run_fragments(&fragments),
                 x: first_item.x,
                 y: first_item.y,
                 width: end_x - first_item.x,
