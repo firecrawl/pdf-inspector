@@ -1,0 +1,24 @@
+src/tounicode.rs
+  s_8b81192caa100a::t_65acf205eb2edb 1623-1624,1655-1657,1660
+  s_8b81192caa100a::t_c05b21adb781f1 1564,1570-1572,1579-1582,1586-1588
+  s_8b81192caa100a::t_1738dedd45e0ec 1868-1870
+  s_8b81192caa100a::t_e8ee29ca450be4 1667-1668,1719-1721,1724-1726,1730-1744
+  s_8b81192caa100a::t_66d7ed85f0552d 3423
+  s_8b81192caa100a::t_1170245f23c9d2 3395-3422,3424-3428
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "00287b293df8e1922ead541a8bbb58785649601a",
+  "prompts": {},
+  "sessions": {
+    "s_8b81192caa100a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "69c52882-fd38-4082-bcc6-5f7987f37382",
+        "model": "grok-4.6"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
