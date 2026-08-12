@@ -470,14 +470,42 @@ fn furniture_key(item: &TextItem) -> FurnitureKey {
 /// it counts as a running header/footer rather than coincidence.
 const RUNNING_FURNITURE_MIN_PAGES: usize = 3;
 
+/// Fraction of each page's vertical content extent, at the top and at the
+/// bottom, where running furniture may live. Repetition alone is not enough:
+/// a form template repeated per record carries identical labels at identical
+/// mid-page coordinates on every page, and those are real table cells. What
+/// makes a header/footer is repetition *at the page edge*.
+const RUNNING_FURNITURE_BAND: f32 = 0.2;
+
 /// Collect the keys of items that repeat verbatim at the same position on at
-/// least [`RUNNING_FURNITURE_MIN_PAGES`] distinct pages — running headers and
-/// footers. Single- and two-page documents produce an empty set.
+/// least [`RUNNING_FURNITURE_MIN_PAGES`] distinct pages, restricted to the
+/// top/bottom [`RUNNING_FURNITURE_BAND`] of each page's content extent —
+/// running headers and footers. Single- and two-page documents produce an
+/// empty set.
 fn running_furniture_keys(items: &[TextItem]) -> HashSet<FurnitureKey> {
+    // Vertical content extent per page, so the edge bands adapt to the
+    // document's real margins instead of assuming a media box.
+    let mut page_extent: HashMap<u32, (f32, f32)> = HashMap::new();
+    for item in items {
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        let entry = page_extent.entry(item.page).or_insert((item.y, item.y));
+        entry.0 = entry.0.min(item.y);
+        entry.1 = entry.1.max(item.y);
+    }
+
     let mut pages_by_key: HashMap<FurnitureKey, HashSet<u32>> = HashMap::new();
     for item in items {
         if item.text.trim().is_empty() {
             continue;
+        }
+        let Some(&(min_y, max_y)) = page_extent.get(&item.page) else {
+            continue;
+        };
+        let band = (max_y - min_y) * RUNNING_FURNITURE_BAND;
+        if item.y > min_y + band && item.y < max_y - band {
+            continue; // mid-page: never furniture, however often it repeats
         }
         pages_by_key
             .entry(furniture_key(item))
@@ -2258,6 +2286,41 @@ mod tests {
             &table_of(&real_items),
             &running
         ));
+    }
+
+    /// A form template repeated per record carries identical labels at
+    /// identical mid-page coordinates on every page — those are real table
+    /// cells, not furniture. Only the page-edge bands qualify.
+    #[test]
+    fn mid_page_repetition_is_not_furniture() {
+        let mut items = Vec::new();
+        for page in 1..=4 {
+            // Content spanning the page: y 60 (bottom) to 740 (top).
+            items.push(furniture_item("body top", 85.0, 740.0, page));
+            items.push(furniture_item("body bottom", 85.0, 60.0, page));
+            // Form labels repeated dead centre on every page.
+            items.push(furniture_item("Name of creditor", 85.0, 400.0, page));
+            items.push(furniture_item("Amount of claim", 300.0, 400.0, page));
+            // A genuine footer inside the bottom band.
+            items.push(furniture_item("FORM 78 — page footer", 85.0, 70.0, page));
+        }
+
+        let running = running_furniture_keys(&items);
+        assert!(
+            !running.contains(&furniture_key(&furniture_item(
+                "Name of creditor",
+                85.0,
+                400.0,
+                1
+            ))),
+            "mid-page form labels must not be furniture"
+        );
+        assert!(running.contains(&furniture_key(&furniture_item(
+            "FORM 78 — page footer",
+            85.0,
+            70.0,
+            1
+        ))));
     }
 
     #[test]
