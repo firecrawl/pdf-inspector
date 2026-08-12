@@ -149,6 +149,7 @@ pub(crate) fn extract_page_text_items(
     font_cmaps: &FontCMaps,
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
+    mut decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
     use lopdf::content::Content;
 
@@ -245,10 +246,13 @@ pub(crate) fn extract_page_text_items(
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
-    // Get content
-    let content_data = doc
-        .get_page_content(page_id)
-        .map_err(|e| PdfError::Parse(e.to_string()))?;
+    // Get content (decompressing each stream at most once via the shared cache)
+    let content_data = match decompress_cache.as_deref_mut() {
+        Some(cache) => crate::get_page_content_cached(doc, page_id, cache)?,
+        None => doc
+            .get_page_content(page_id)
+            .map_err(|e| PdfError::Parse(e.to_string()))?,
+    };
 
     // Strip PDF comments (% to end of line) from the content stream.
     // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's
@@ -916,6 +920,7 @@ pub(crate) fn extract_page_text_items(
                                         &ctm,
                                         &mut cmap_decisions,
                                         style_cache,
+                                        decompress_cache.as_deref_mut(),
                                     );
                                     items.extend(form_items);
                                 }
@@ -1544,6 +1549,7 @@ mod tests {
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            None,
         )
         .unwrap();
         items
@@ -1773,6 +1779,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            None,
         )
         .unwrap();
         let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible) = result;
@@ -1863,6 +1870,7 @@ BT 30 700 Tm <41> Tj ET";
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            None,
         )
         .unwrap();
         let text = items

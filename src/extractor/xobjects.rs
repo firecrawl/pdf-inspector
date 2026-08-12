@@ -109,6 +109,7 @@ fn collect_xobjects_from_dict(
 }
 
 /// Extract text items from a Form XObject
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_form_xobject_text(
     doc: &Document,
     form_id: ObjectId,
@@ -117,6 +118,7 @@ pub(crate) fn extract_form_xobject_text(
     parent_ctm: &[f32; 6],
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
+    decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> Vec<TextItem> {
     extract_form_xobject_text_inner(
         doc,
@@ -126,6 +128,7 @@ pub(crate) fn extract_form_xobject_text(
         parent_ctm,
         cmap_decisions,
         style_cache,
+        decompress_cache,
         0,
     )
 }
@@ -139,6 +142,7 @@ fn extract_form_xobject_text_inner(
     parent_ctm: &[f32; 6],
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
+    mut decompress_cache: Option<&mut crate::DecompressedContentCache>,
     depth: u8,
 ) -> Vec<TextItem> {
     use lopdf::content::Content;
@@ -151,9 +155,12 @@ fn extract_form_xobject_text_inner(
     };
 
     // Decompress the content stream (fall back to raw bytes for uncompressed streams)
-    let content_data = match stream.decompressed_content() {
-        Ok(data) => data,
-        Err(_) => stream.content.clone(),
+    let content_data = match decompress_cache.as_deref_mut() {
+        Some(cache) => crate::decompressed_content_cached(stream, form_id, cache),
+        None => match stream.decompressed_content() {
+            Ok(data) => data,
+            Err(_) => stream.content.clone(),
+        },
     };
 
     // Decode the content stream
@@ -285,6 +292,7 @@ fn extract_form_xobject_text_inner(
                                         &ctm,
                                         cmap_decisions,
                                         style_cache,
+                                        decompress_cache.as_deref_mut(),
                                         depth + 1,
                                     );
                                     items.extend(nested_items);

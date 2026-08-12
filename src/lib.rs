@@ -68,6 +68,54 @@ use text_quality::{
 };
 use tounicode::FontCMaps;
 
+/// Decompressed content-stream cache shared between the detection and
+/// extraction phases of [`process_document`] so each stream is FlateDecoded at
+/// most once per document instead of once per phase. Keyed by the stream's
+/// object id; inline streams (no object id) are not cached.
+pub(crate) type DecompressedContentCache = HashMap<lopdf::ObjectId, Vec<u8>>;
+
+/// Return the decompressed bytes of `stream`, memoized by `id`.
+///
+/// Matches the fallback semantics of lopdf's `Stream::decompressed_content`:
+/// when a filter is unsupported, the raw (still-compressed) bytes are returned
+/// rather than an error.
+pub(crate) fn decompressed_content_cached(
+    stream: &lopdf::Stream,
+    id: lopdf::ObjectId,
+    cache: &mut DecompressedContentCache,
+) -> Vec<u8> {
+    if let Some(data) = cache.get(&id) {
+        return data.clone();
+    }
+    let data = stream
+        .decompressed_content()
+        .unwrap_or_else(|_| stream.content.clone());
+    cache.insert(id, data.clone());
+    data
+}
+
+/// Return a page's concatenated content stream, decompressing each constituent
+/// stream via `cache` so streams already decoded during detection are not
+/// FlateDecoded a second time. Mirrors `lopdf::Document::get_page_content`
+/// (which concatenates every `/Contents` stream with a trailing `\n`), except
+/// that per-stream bytes are memoized by object id.
+pub(crate) fn get_page_content_cached(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+    cache: &mut DecompressedContentCache,
+) -> Result<Vec<u8>, PdfError> {
+    let mut content = Vec::new();
+    for object_id in doc.get_page_contents(page_id) {
+        let data = match doc.get_object(object_id).and_then(lopdf::Object::as_stream) {
+            Ok(stream) => decompressed_content_cached(stream, object_id, cache),
+            Err(_) => continue,
+        };
+        content.extend_from_slice(&data);
+        content.push(b'\n');
+    }
+    Ok(content)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 struct ProcessingTimer(std::time::Instant);
 
@@ -391,7 +439,8 @@ pub struct PdfClassification {
 pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem(buffer)?;
-    let detection = detector::detect_from_document(&doc, page_count, &DetectionConfig::default())?;
+    let detection =
+        detector::detect_from_document(&doc, page_count, &DetectionConfig::default(), None)?;
     Ok(PdfClassification {
         pdf_type: detection.pdf_type,
         page_count,
@@ -479,7 +528,7 @@ pub fn extract_pages_markdown_mem(
                 required_pages,
             )?
         } else {
-            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
+            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None, None)?
         };
     let text_quality = analyze_text_quality(&all_items);
 
@@ -835,6 +884,7 @@ pub fn extract_text_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                None,
             )?;
         // OCR-layer fallback: scanned pages often carry their text as an
         // invisible (Tr 3) layer behind the page raster. The visible-only
@@ -863,6 +913,7 @@ pub fn extract_text_in_regions_mem(
                     &font_cmaps,
                     true,
                     &mut style_cache,
+                    None,
                 )
             {
                 let inv_alnum = non_placeholder_alnum(&inv_items);
@@ -1045,6 +1096,7 @@ pub fn extract_tables_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                None,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -1356,6 +1408,7 @@ pub fn detect_vector_grid_in_region_mem(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
+            None,
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
@@ -1550,6 +1603,7 @@ mod vector_grid_tests {
                 &cmaps,
                 false,
                 &mut crate::extractor::FontStyleCache::new(),
+                None,
             )
             .unwrap();
 
@@ -1593,6 +1647,7 @@ mod vector_grid_tests {
                 &cmaps,
                 false,
                 &mut crate::extractor::FontStyleCache::new(),
+                None,
             )
             .unwrap();
 
@@ -2330,6 +2385,7 @@ pub fn extract_tables_with_structure_cells_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                None,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -3132,6 +3188,7 @@ fn detect_tsr_quality_issue(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
+            None,
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {
@@ -3875,7 +3932,15 @@ fn process_document(
     start: ProcessingTimer,
 ) -> Result<PdfProcessResult, PdfError> {
     // Step 1 — Detection (cheap: scans content streams for text operators)
-    let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
+    // A decompressed-content cache is threaded through detection and extraction
+    // so each stream is FlateDecoded at most once per document.
+    let mut decompress_cache: crate::DecompressedContentCache = HashMap::new();
+    let detection = detector::detect_from_document(
+        &doc,
+        page_count,
+        &options.detection,
+        Some(&mut decompress_cache),
+    )?;
     let pdf_type = detection.pdf_type;
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
@@ -3924,6 +3989,7 @@ fn process_document(
             &doc,
             &font_cmaps,
             options.page_filter.as_ref(),
+            Some(&mut decompress_cache),
         );
 
         // For Mixed/template PDFs: if normal extraction produces garbage text
@@ -3947,6 +4013,7 @@ fn process_document(
                         &doc,
                         &font_cmaps,
                         options.page_filter.as_ref(),
+                        Some(&mut decompress_cache),
                     )
                 } else {
                     result
@@ -3957,6 +4024,7 @@ fn process_document(
                     &doc,
                     &font_cmaps,
                     options.page_filter.as_ref(),
+                    Some(&mut decompress_cache),
                 )
             }
         } else {

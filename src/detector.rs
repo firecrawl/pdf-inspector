@@ -103,7 +103,7 @@ pub fn detect_pdf_type_with_config<P: AsRef<Path>>(
 
     let (doc, page_count) = crate::load_document_from_path(&path)?;
 
-    detect_from_document(&doc, page_count, &config)
+    detect_from_document(&doc, page_count, &config, None)
 }
 
 /// Detect PDF type from memory buffer
@@ -120,7 +120,7 @@ pub fn detect_pdf_type_mem_with_config(
 
     let (doc, page_count) = crate::load_document_from_mem(buffer)?;
 
-    detect_from_document(&doc, page_count, &config)
+    detect_from_document(&doc, page_count, &config, None)
 }
 
 /// Heuristic page-count fallback for malformed PDFs that cannot be parsed.
@@ -185,6 +185,7 @@ pub(crate) fn detect_from_document(
     doc: &Document,
     page_count: u32,
     config: &DetectionConfig,
+    mut decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> Result<PdfTypeResult, PdfError> {
     let pages = doc.get_pages();
     let total_pages = pages.len() as u32;
@@ -220,7 +221,7 @@ pub(crate) fn detect_from_document(
 
     for page_num in &sample_indices {
         if let Some(&page_id) = pages.get(page_num) {
-            let analysis = analyze_page_content(doc, page_id);
+            let analysis = analyze_page_content(doc, page_id, decompress_cache.as_deref_mut());
             pages_actually_sampled += 1;
             log::debug!(
                 "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
@@ -389,7 +390,7 @@ pub(crate) fn detect_from_document(
                     // Cache the fresh analysis so the reason-classification pass
                     // below sees the real signals (vector_text, etc.) instead of
                     // defaulting to "scanned".
-                    let a = analyze_page_content(doc, page_id);
+                    let a = analyze_page_content(doc, page_id, decompress_cache.as_deref_mut());
                     analysis_cache.insert(page_num, a.clone());
                     a
                 } else {
@@ -435,7 +436,7 @@ pub(crate) fn detect_from_document(
                 continue;
             }
             if let Some(&page_id) = pages.get(&page_num) {
-                let analysis = analyze_page_content(doc, page_id);
+                let analysis = analyze_page_content(doc, page_id, decompress_cache.as_deref_mut());
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
                     // Cache so the reason pass reports suspected_garbled_text
@@ -732,7 +733,11 @@ fn resolve_with_shadowing(
 }
 
 /// Analyze a page's content stream for text operators and images
-fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
+fn analyze_page_content(
+    doc: &Document,
+    page_id: ObjectId,
+    mut decompress_cache: Option<&mut crate::DecompressedContentCache>,
+) -> PageAnalysis {
     let mut text_ops = 0u32;
     let mut has_images = false;
     let mut image_count = 0u32;
@@ -758,9 +763,12 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
-                Ok(data) => data,
-                Err(_) => stream.content.clone(),
+            let content = match decompress_cache.as_deref_mut() {
+                Some(cache) => crate::decompressed_content_cached(stream, content_id, cache),
+                None => match stream.decompressed_content() {
+                    Ok(data) => data,
+                    Err(_) => stream.content.clone(),
+                },
             };
 
             // Scan for text operators, collecting raw font names
@@ -804,6 +812,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
+                decompress_cache.as_deref_mut(),
             );
             text_ops += ops;
             image_count += imgs;
@@ -821,6 +830,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
+                    decompress_cache.as_deref_mut(),
                 );
                 text_ops += ops;
                 image_count += imgs;
@@ -1266,6 +1276,7 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
+    mut decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
@@ -1296,9 +1307,12 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
+                    let content = match decompress_cache.as_deref_mut() {
+                        Some(cache) => crate::decompressed_content_cached(stream, obj_id, cache),
+                        None => stream
+                            .decompressed_content()
+                            .unwrap_or_else(|_| stream.content.clone()),
+                    };
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
                     let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
@@ -1338,6 +1352,7 @@ fn scan_xobjects_in_resources(
                             unique_chars,
                             used_font_ids,
                             font_map,
+                            decompress_cache.as_deref_mut(),
                         );
                         text_ops += ops2;
                         image_count += imgs2;
@@ -1788,7 +1803,7 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
 /// the same gates classification needs elsewhere instead of treating the
 /// raw signals alone as sufficient — see #227/#231.
 pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool) {
-    let analysis = analyze_page_content(doc, page_id);
+    let analysis = analyze_page_content(doc, page_id, None);
 
     let needs_ocr_for_template_image = if !analysis.has_template_image {
         false
@@ -2852,7 +2867,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             analysis.has_identity_h_no_tounicode,
             "P1: page using only undecodable Identity-H should be flagged, even though \
@@ -2914,7 +2929,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             !analysis.has_identity_h_no_tounicode,
             "page using both undecodable and decodable fonts should NOT be flagged"
@@ -2996,7 +3011,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             !analysis.has_identity_h_no_tounicode,
             "P2: page with decodable font in Form XObject should NOT be flagged — \
@@ -3080,7 +3095,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             analysis.has_identity_h_no_tounicode,
             "P2 negative: only used font is undecodable (in XObject) — must flag, \
@@ -3147,7 +3162,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             analysis.has_decodable_text_fonts,
             "P2: decodable font from Form XObject should be detected"
@@ -3239,7 +3254,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             !analysis.has_identity_h_no_tounicode,
             "P1 name collision: XObject uses /F1 which resolves to decodable Type1 \
@@ -3329,7 +3344,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             analysis.has_identity_h_no_tounicode,
             "P1 inverse: XObject uses /F1 which resolves to undecodable Identity-H \
@@ -3405,7 +3420,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             analysis.has_decodable_text_fonts,
             "P2 indirect: decodable font behind indirect /Resources must be discovered"
@@ -3496,7 +3511,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             !analysis.has_identity_h_no_tounicode,
             "P1+P2 combined: XObject /F1 resolves to decodable Type1 via indirect \
@@ -3570,7 +3585,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             analysis.has_identity_h_no_tounicode,
             "P3: page /F1 (undecodable) shadows parent /F1 (decodable) — \
@@ -3637,7 +3652,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             !analysis.has_identity_h_no_tounicode,
             "P3: page /F1 (decodable) shadows parent /F1 (undecodable) — \
@@ -3696,7 +3711,7 @@ mod tests {
             }),
         );
 
-        let analysis = analyze_page_content(&doc, page_id);
+        let analysis = analyze_page_content(&doc, page_id, None);
         assert!(
             !analysis.has_identity_h_no_tounicode,
             "P3: page inherits parent's decodable /F1 — must NOT be flagged"

@@ -114,7 +114,7 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let (extraction, _thresholds, _gid_pages) =
-        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
+        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter, None)?;
     Ok(extraction)
 }
 
@@ -141,7 +141,7 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let (extraction, _thresholds, _gid_pages) =
-        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
+        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter, None)?;
     Ok(extraction)
 }
 
@@ -159,8 +159,9 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None)
+    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None, decompress_cache)
 }
 
 /// Extract selected pages and gather document-wide folio evidence only when a
@@ -170,8 +171,15 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        decompress_cache,
+    )
 }
 
 /// Invisible-text variant of [`extract_positioned_text_with_folio_context`].
@@ -179,8 +187,15 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        true,
+        decompress_cache,
+    )
 }
 
 fn extract_positioned_text_with_folio_context_impl(
@@ -188,9 +203,17 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
+    mut decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
     let Some(required_pages) = page_filter else {
-        return extract_positioned_text_impl(doc, font_cmaps, None, include_invisible, None);
+        return extract_positioned_text_impl(
+            doc,
+            font_cmaps,
+            None,
+            include_invisible,
+            None,
+            decompress_cache,
+        );
     };
 
     let (
@@ -203,6 +226,7 @@ fn extract_positioned_text_with_folio_context_impl(
         Some(required_pages),
         include_invisible,
         None,
+        decompress_cache.as_deref_mut(),
     )?;
     if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
         return Ok((
@@ -225,6 +249,7 @@ fn extract_positioned_text_with_folio_context_impl(
             Some(&context_pages),
             include_invisible,
             Some(required_pages),
+            decompress_cache,
         )?;
     selected_items.extend(context_items);
     selected_rects.extend(context_rects);
@@ -245,7 +270,7 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
+    extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages), None)
 }
 
 fn extract_positioned_text_impl(
@@ -254,6 +279,7 @@ fn extract_positioned_text_impl(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
+    mut decompress_cache: Option<&mut crate::DecompressedContentCache>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
@@ -282,6 +308,7 @@ fn extract_positioned_text_impl(
             font_cmaps,
             include_invisible,
             &mut style_cache,
+            decompress_cache.as_deref_mut(),
         );
         let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
             match page_result {
