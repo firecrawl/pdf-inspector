@@ -1,5 +1,6 @@
 //! PP-OCRv6 Small implementation backed by OAR and ONNX Runtime.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use image::RgbImage;
@@ -11,6 +12,9 @@ use super::{
     ImagePoint, ImageQuad, ModelArtifactKind, ModelIdentity, ModelPaths, OcrEngine, OcrMode,
     OcrOptions, OcrPage, OcrSpan, RenderPixelFormat, RenderedPage,
 };
+
+/// Environment variable selecting the ONNX Runtime shared library.
+pub const ONNX_RUNTIME_LIBRARY_ENV: &str = "ORT_DYLIB_PATH";
 
 /// Failures while constructing or running the OAR OCR backend.
 #[derive(Debug, Error)]
@@ -43,6 +47,15 @@ pub enum OarOcrError {
         /// 1-indexed page number.
         page: u32,
     },
+    /// The external ONNX Runtime shared library could not be loaded.
+    #[error("failed to load ONNX Runtime from {path}: {source}")]
+    OnnxRuntimeLoad {
+        /// Requested shared-library path or platform library name.
+        path: PathBuf,
+        /// Dynamic-loader failure.
+        #[source]
+        source: ort::LoadDynamicError,
+    },
     /// OAR returned no result for a submitted page.
     #[error("OAR returned no result for rendered page {page}")]
     MissingPageResult {
@@ -68,6 +81,7 @@ pub struct OarOcrEngine {
 impl OarOcrEngine {
     /// Loads PP-OCRv6 Small from a resolved, verified model set.
     pub fn from_models(models: &ModelPaths) -> Result<Self, OarOcrError> {
+        load_onnx_runtime()?;
         let detection = required_model(models, ModelArtifactKind::TextDetection)?;
         let recognition = required_model(models, ModelArtifactKind::TextRecognition)?;
         let dictionary = required_model(models, ModelArtifactKind::CharacterDictionary)?;
@@ -153,6 +167,30 @@ impl OarOcrEngine {
             warnings,
         })
     }
+}
+
+fn load_onnx_runtime() -> Result<(), OarOcrError> {
+    let path = std::env::var_os(ONNX_RUNTIME_LIBRARY_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_onnx_runtime_library);
+    drop(
+        ort::init_from(&path).map_err(|source| OarOcrError::OnnxRuntimeLoad {
+            path: path.clone(),
+            source,
+        })?,
+    );
+    Ok(())
+}
+
+fn default_onnx_runtime_library() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    const NAME: &str = "onnxruntime.dll";
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    const NAME: &str = "libonnxruntime.so";
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const NAME: &str = "libonnxruntime.dylib";
+    PathBuf::from(NAME)
 }
 
 impl OcrEngine for OarOcrEngine {
@@ -253,7 +291,7 @@ fn bounding_box_to_quad(bounding_box: &BoundingBox, width: u32, height: u32) -> 
         })
         .collect();
 
-    if points.len() == 4 {
+    if bounding_box.points.len() == 4 && points.len() == 4 && is_ordered_convex_quad(&points) {
         return Some(ImageQuad::new([points[0], points[1], points[2], points[3]]));
     }
     if points.len() < 3 {
@@ -276,12 +314,38 @@ fn bounding_box_to_quad(bounding_box: &BoundingBox, width: u32, height: u32) -> 
         .iter()
         .map(|point| point.y)
         .fold(f32::NEG_INFINITY, f32::max);
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
     Some(ImageQuad::new([
         ImagePoint::new(min_x, min_y),
         ImagePoint::new(max_x, min_y),
         ImagePoint::new(max_x, max_y),
         ImagePoint::new(min_x, max_y),
     ]))
+}
+
+fn is_ordered_convex_quad(points: &[ImagePoint]) -> bool {
+    if points.len() != 4 {
+        return false;
+    }
+    let mut orientation = 0.0_f32;
+    for index in 0..4 {
+        let first = points[index];
+        let second = points[(index + 1) % 4];
+        let third = points[(index + 2) % 4];
+        let cross = (second.x - first.x) * (third.y - second.y)
+            - (second.y - first.y) * (third.x - second.x);
+        if cross.abs() <= f32::EPSILON {
+            return false;
+        }
+        if orientation == 0.0 {
+            orientation = cross.signum();
+        } else if cross.signum() != orientation {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -352,6 +416,32 @@ mod tests {
         let quad = bounding_box_to_quad(&bbox, 10, 10).unwrap();
         assert_eq!(quad.points[0], ImagePoint::new(1.0, 1.0));
         assert_eq!(quad.points[2], ImagePoint::new(8.0, 9.0));
+    }
+
+    #[test]
+    fn normalizes_unordered_or_partially_invalid_quads() {
+        let unordered = BoundingBox::new(vec![
+            Point::new(1.0, 1.0),
+            Point::new(8.0, 8.0),
+            Point::new(8.0, 1.0),
+            Point::new(1.0, 8.0),
+        ]);
+        let quad = bounding_box_to_quad(&unordered, 10, 10).unwrap();
+        assert_eq!(quad.points[0], ImagePoint::new(1.0, 1.0));
+        assert_eq!(quad.points[1], ImagePoint::new(8.0, 1.0));
+        assert_eq!(quad.points[2], ImagePoint::new(8.0, 8.0));
+
+        let partially_invalid = BoundingBox::new(vec![
+            Point::new(8.0, 8.0),
+            Point::new(f32::NAN, 4.0),
+            Point::new(1.0, 8.0),
+            Point::new(8.0, 1.0),
+            Point::new(1.0, 1.0),
+        ]);
+        let quad = bounding_box_to_quad(&partially_invalid, 10, 10).unwrap();
+        assert_eq!(quad.points[0], ImagePoint::new(1.0, 1.0));
+        assert_eq!(quad.points[1], ImagePoint::new(8.0, 1.0));
+        assert_eq!(quad.points[2], ImagePoint::new(8.0, 8.0));
     }
 
     #[test]

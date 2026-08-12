@@ -32,7 +32,7 @@ pub use models::{
     PP_OCR_V6_SMALL,
 };
 #[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
-pub use oar::{OarOcrEngine, OarOcrError};
+pub use oar::{OarOcrEngine, OarOcrError, ONNX_RUNTIME_LIBRARY_ENV};
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use render::{
     PagePoint, PageTransform, RenderBufferError, RenderOptions, RenderPixelFormat, RenderedPage,

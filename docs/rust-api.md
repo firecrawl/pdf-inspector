@@ -201,10 +201,12 @@ PDFium rendering.
 
 The native-only `ocr-oar` feature adds a CPU PP-OCRv6 Small implementation of
 `OcrEngine` backed by OAR and ONNX Runtime. It implies `model-cache`, but does
-not enable model auto-download or PDF rendering. Model files remain external,
-must match the pinned manifest, and are opened only after `ModelStore` verifies
-their exact size and SHA-256 digest. The feature currently requires Rust 1.95
-or newer, matching OAR 0.9.1's MSRV.
+not enable model auto-download, ONNX Runtime download, or PDF rendering. Model
+files remain external, must match the pinned manifest, and are opened only
+after `ModelStore` verifies their exact size and SHA-256 digest. Install an
+ONNX Runtime shared library separately and set `ORT_DYLIB_PATH` when it is not
+available through the platform library search path. The feature currently
+requires Rust 1.95 or newer, matching OAR 0.9.1's MSRV.
 
 ```toml
 [dependencies]

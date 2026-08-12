@@ -57,10 +57,11 @@ firecrawl-pdfium = { version = "0.1.0", optional = true }
 dirs = { version = "6.0", optional = true }
 fs2 = { version = "0.4", optional = true }
 sha2 = { version = "0.11", optional = true }
-# Optional CPU OCR backend. Model auto-download stays disabled: pdf-inspector's
-# pinned ModelStore remains the only model-resolution boundary.
+# Optional CPU OCR backend. Models and ONNX Runtime stay external: the latter
+# is loaded dynamically from ORT_DYLIB_PATH or the platform library search path.
 image = { version = "0.25.6", default-features = false, optional = true }
-oar-ocr = { version = "0.9.1", default-features = false, features = ["download-binaries", "simd"], optional = true }
+oar-ocr = { version = "0.9.1", default-features = false, features = ["simd"], optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"], optional = true }
 
 [target.'cfg(all(windows, not(target_arch = "wasm32")))'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"], optional = true }
@@ -79,7 +80,7 @@ default = []
 python = ["pyo3"]
 vision = []
 model-cache = ["vision", "dep:dirs", "dep:fs2", "dep:sha2", "dep:windows-sys"]
-ocr-oar = ["model-cache", "dep:image", "dep:oar-ocr"]
+ocr-oar = ["model-cache", "dep:image", "dep:oar-ocr", "dep:ort"]
 render-pdfium = ["vision", "dep:firecrawl-pdfium"]
 
 [[bin]]
