@@ -453,6 +453,75 @@ fn merged_retry_skips_body_font(detected_columns: bool, has_chart_regions: bool)
     detected_columns && !has_chart_regions
 }
 
+/// Identity of a piece of page furniture: the same trimmed text drawn at the
+/// same position (quantized to 0.5pt) — page numbers excluded by construction
+/// because their text differs per page.
+type FurnitureKey = (String, i32, i32);
+
+fn furniture_key(item: &TextItem) -> FurnitureKey {
+    (
+        item.text.trim().to_string(),
+        (item.x * 2.0).round() as i32,
+        (item.y * 2.0).round() as i32,
+    )
+}
+
+/// Minimum distinct pages an identical (text, position) must appear on before
+/// it counts as a running header/footer rather than coincidence.
+const RUNNING_FURNITURE_MIN_PAGES: usize = 3;
+
+/// Collect the keys of items that repeat verbatim at the same position on at
+/// least [`RUNNING_FURNITURE_MIN_PAGES`] distinct pages — running headers and
+/// footers. Single- and two-page documents produce an empty set.
+fn running_furniture_keys(items: &[TextItem]) -> HashSet<FurnitureKey> {
+    let mut pages_by_key: HashMap<FurnitureKey, HashSet<u32>> = HashMap::new();
+    for item in items {
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        pages_by_key
+            .entry(furniture_key(item))
+            .or_default()
+            .insert(item.page);
+    }
+    pages_by_key
+        .into_iter()
+        .filter(|(_, pages)| pages.len() >= RUNNING_FURNITURE_MIN_PAGES)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Reject a heuristic table whose items are almost entirely running
+/// headers/footers. A wrapped document title repeated at the bottom of every
+/// page aligns well enough to read as a grid, but it is page furniture, not
+/// data — vetoing the table lets the text flow as prose instead. Real tables
+/// carry per-page content, so even a repeated *header row* stays under the
+/// threshold once its body rows differ.
+fn is_running_furniture_table(
+    detection_items: &[TextItem],
+    table: &crate::tables::Table,
+    running: &HashSet<FurnitureKey>,
+) -> bool {
+    if running.is_empty() {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut furniture = 0usize;
+    for &idx in &table.item_indices {
+        let Some(item) = detection_items.get(idx) else {
+            continue;
+        };
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        if running.contains(&furniture_key(item)) {
+            furniture += 1;
+        }
+    }
+    total > 0 && (furniture as f32) >= (total as f32) * 0.8
+}
+
 /// Reject a heuristic table only when its cells are overwhelmingly parallel
 /// prose fragments. This is deliberately narrower than disabling body-font
 /// detection for the whole page: numeric, compact, headed, and otherwise
@@ -1188,6 +1257,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     let mut table_items: HashSet<usize> = HashSet::new();
     let mut page_tables: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
 
+    // Running headers/footers repeat verbatim at the same position on many
+    // pages. When such a block wraps a long title over aligned lines, the
+    // heuristic detector reads it as a table. Knowing which items are page
+    // furniture is a document-wide question, so answer it once here.
+    let running_furniture = running_furniture_keys(&text_items);
+
     // Pre-group items by page with their global indices (O(n) instead of O(pages*n))
     let mut page_groups: HashMap<u32, Vec<(usize, &TextItem)>> = HashMap::new();
     for (global_idx, item) in text_items.iter().enumerate() {
@@ -1517,6 +1592,15 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             );
                             continue;
                         }
+                        if is_running_furniture_table(subset_items, &table, &running_furniture) {
+                            log::debug!(
+                                "page {}: rejected {}x{} running header/footer table hypothesis",
+                                page,
+                                table.rows.len(),
+                                table.columns.len()
+                            );
+                            continue;
+                        }
                         for &idx in &table.item_indices {
                             if let Some(&band_idx) = index_map.get(idx) {
                                 if let Some(&page_idx) = band_index_map.get(band_idx) {
@@ -1697,6 +1781,15 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 if !chart_regions.is_empty() && is_parallel_prose_table(table) {
                     log::debug!(
                         "page {}: rejected {}x{} merged-band parallel-prose table hypothesis",
+                        page,
+                        table.rows.len(),
+                        table.columns.len()
+                    );
+                    continue;
+                }
+                if is_running_furniture_table(&chart_free, table, &running_furniture) {
+                    log::debug!(
+                        "page {}: rejected {}x{} merged-band running header/footer table hypothesis",
                         page,
                         table.rows.len(),
                         table.columns.len()
@@ -2056,6 +2149,124 @@ mod tests {
         let md = to_markdown(text, MarkdownOptions::default());
         assert!(md.contains("- First item"));
         assert!(md.contains("- Second item"));
+    }
+
+    fn furniture_item(text: &str, x: f32, y: f32, page: u32) -> TextItem {
+        let mut it = make_item(x, y, page);
+        it.text = text.into();
+        it
+    }
+
+    /// Items repeating verbatim at the same position on 3+ pages are running
+    /// furniture; the same text on fewer pages, or at different positions, is
+    /// not.
+    #[test]
+    fn running_furniture_requires_three_pages_at_same_position() {
+        let mut items = Vec::new();
+        for page in 1..=3 {
+            items.push(furniture_item("TITULAR DEL", 85.0, 68.0, page));
+        }
+        // Same text but only two pages.
+        for page in 1..=2 {
+            items.push(furniture_item("SECRETARÍA", 200.0, 68.0, page));
+        }
+        // Same text on three pages but at drifting positions.
+        for (page, x) in [(1, 300.0), (2, 320.0), (3, 340.0)] {
+            items.push(furniture_item("MÉXICO", x, 68.0, page));
+        }
+
+        let running = running_furniture_keys(&items);
+        assert!(running.contains(&furniture_key(&furniture_item(
+            "TITULAR DEL",
+            85.0,
+            68.0,
+            1
+        ))));
+        assert!(!running.contains(&furniture_key(&furniture_item(
+            "SECRETARÍA",
+            200.0,
+            68.0,
+            1
+        ))));
+        assert!(!running.contains(&furniture_key(&furniture_item("MÉXICO", 300.0, 68.0, 1))));
+    }
+
+    /// A table made of running-footer items is vetoed; a table whose body rows
+    /// carry per-page content is kept even when its header row repeats.
+    #[test]
+    fn running_furniture_table_veto() {
+        // The footer block, present identically on pages 1-3.
+        let mut items = Vec::new();
+        for page in 1..=3 {
+            items.push(furniture_item("PROPOSICIÓN CON PUNTO", 85.0, 78.5, page));
+            items.push(furniture_item("EL SENADO", 286.6, 78.5, page));
+            items.push(furniture_item("TITULAR DEL", 85.0, 68.0, page));
+            items.push(furniture_item("A TRAVÉS DE LA", 243.4, 68.0, page));
+        }
+        // A real table on page 1: repeated header row, per-page data rows.
+        let header = [
+            furniture_item("Year", 85.0, 500.0, 1),
+            furniture_item("Total", 200.0, 500.0, 1),
+        ];
+        let data = [
+            furniture_item("2023", 85.0, 488.0, 1),
+            furniture_item("1,204", 200.0, 488.0, 1),
+            furniture_item("2024", 85.0, 476.0, 1),
+            furniture_item("1,377", 200.0, 476.0, 1),
+        ];
+        // Header repeats on every page (like a continued table's header).
+        for page in 2..=3 {
+            items.push(furniture_item("Year", 85.0, 500.0, page));
+            items.push(furniture_item("Total", 200.0, 500.0, page));
+        }
+        items.extend(header.iter().cloned());
+        items.extend(data.iter().cloned());
+
+        let running = running_furniture_keys(&items);
+
+        let table_of = |detection_items: &[TextItem]| crate::tables::Table {
+            columns: vec![],
+            rows: vec![],
+            cells: vec![],
+            item_indices: (0..detection_items.len()).collect(),
+            kind: crate::tables::TableKind::Data,
+        };
+
+        // Footer-only candidate: every item is furniture -> vetoed.
+        let footer_items: Vec<TextItem> = (1..=1)
+            .flat_map(|page| {
+                vec![
+                    furniture_item("PROPOSICIÓN CON PUNTO", 85.0, 78.5, page),
+                    furniture_item("EL SENADO", 286.6, 78.5, page),
+                    furniture_item("TITULAR DEL", 85.0, 68.0, page),
+                    furniture_item("A TRAVÉS DE LA", 243.4, 68.0, page),
+                ]
+            })
+            .collect();
+        assert!(is_running_furniture_table(
+            &footer_items,
+            &table_of(&footer_items),
+            &running
+        ));
+
+        // Real table: header row repeats across pages, body rows do not ->
+        // 2 furniture of 6 items (33%) stays under the 80% threshold.
+        let real_items: Vec<TextItem> =
+            header.iter().cloned().chain(data.iter().cloned()).collect();
+        assert!(!is_running_furniture_table(
+            &real_items,
+            &table_of(&real_items),
+            &running
+        ));
+    }
+
+    #[test]
+    fn running_furniture_empty_on_short_documents() {
+        let items = vec![
+            furniture_item("FOOTER", 85.0, 68.0, 1),
+            furniture_item("FOOTER", 85.0, 68.0, 2),
+        ];
+        assert!(running_furniture_keys(&items).is_empty());
     }
 
     fn make_item(x: f32, y: f32, page: u32) -> TextItem {
