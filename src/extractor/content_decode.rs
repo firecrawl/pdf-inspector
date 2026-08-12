@@ -87,7 +87,9 @@ fn count_content_operators(data: &[u8], limit: usize) -> usize {
 }
 
 fn is_content_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+    // PDF whitespace (ISO 32000): NUL, tab, LF, FF, CR, space. Names must
+    // stop on these so a following operator is not absorbed into `/Name`.
+    matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
 }
 
 fn is_operator_byte(b: u8) -> bool {
@@ -198,6 +200,21 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// DoS safety: never report fewer operators than lopdf would allocate.
+    /// Overcount is acceptable (skip a page); undercount would re-open decode.
+    fn assert_count_does_not_undercount(data: &[u8]) {
+        let ours = count_content_operators(data, usize::MAX);
+        match Content::decode(data) {
+            Ok(content) => assert!(
+                ours >= content.operations.len(),
+                "undercount: ours={ours} lopdf={} for {:?}",
+                content.operations.len(),
+                String::from_utf8_lossy(data)
+            ),
+            Err(_) => {}
+        }
+    }
+
     #[test]
     fn operator_count_matches_lopdf_for_typical_streams() {
         let samples: &[&[u8]] = &[
@@ -249,6 +266,38 @@ mod tests {
         assert!(decode_content_bounded(&data, 10).unwrap().is_none());
         let decoded = decode_content_bounded(&data, 50).unwrap().unwrap();
         assert_eq!(decoded.operations.len(), 40);
+    }
+
+    #[test]
+    fn name_whitespace_does_not_swallow_following_operator() {
+        // NUL / form-feed end a name (PDF whitespace). Absorbing `q` into
+        // `/x` would undercount and let decode allocate the operator vector.
+        let mut nul_sep = Vec::new();
+        let mut ff_sep = Vec::new();
+        for _ in 0..8_000 {
+            nul_sep.extend_from_slice(b"/x\x00q");
+            ff_sep.extend_from_slice(b"/x\x0cq");
+        }
+        assert_count_does_not_undercount(&nul_sep);
+        assert_count_does_not_undercount(&ff_sep);
+        assert!(count_content_operators(&ff_sep, usize::MAX) >= 8_000);
+    }
+
+    #[test]
+    fn edge_streams_do_not_undercount_vs_lopdf() {
+        let samples: &[&[u8]] = &[
+            b".5 0 0 .5 0 0 cm",
+            b"+1 -2 3.0 rg",
+            b"<0041> Tj",
+            b"(unbalanced",
+            b"BI /W 1 /H 1 ID \xff\xff no EI here q Q q Q",
+            b"q\x00Q\x00q\x00Q",
+            b"/F1\x0c12 Tf (Hi) Tj",
+            b"{ 1 2 add } cvx",
+        ];
+        for data in samples {
+            assert_count_does_not_undercount(data);
+        }
     }
 
     #[test]
