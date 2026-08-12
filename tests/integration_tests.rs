@@ -14,7 +14,7 @@ use pdf_inspector::{
 };
 use std::collections::HashSet;
 
-fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
+fn make_text_pdf(content: &str, media_box: &str, font_entry: &str) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
 
@@ -42,7 +42,7 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
         &mut offsets,
         3,
         &format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] /Resources << /Font << /F1 {font_entry} >> >> /Contents 4 0 R >>"
         ),
     );
 
@@ -83,7 +83,7 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
 
 /// Source-authored regression fixture for #342: ordinary decodable text with
 /// dense sub-point dotted form rules. No third-party PDF is embedded.
-fn make_text_pdf_with_dotted_form_rules() -> Vec<u8> {
+fn make_text_pdf_with_dotted_form_rules(font_entry: &str) -> Vec<u8> {
     let mut content = String::from("BT /F1 12 Tf ");
     for line in 0..12 {
         content.push_str(&format!(
@@ -99,7 +99,7 @@ fn make_text_pdf_with_dotted_form_rules() -> Vec<u8> {
         content.push_str(&format!("{x} {y} 0.25 0.25 re f\n"));
     }
 
-    make_text_pdf(&content, "0 0 612 792")
+    make_text_pdf(&content, "0 0 612 792", font_entry)
 }
 
 fn make_recurring_contextual_folio_pdf() -> Vec<u8> {
@@ -257,6 +257,7 @@ fn make_minimal_text_pdf() -> Vec<u8> {
     make_text_pdf(
         "BT /F1 12 Tf 100 700 Td (Hello World) Tj 0 -14 Td (Second Line) Tj 0 -14 Td (Third Line) Tj ET",
         "0 0 612 792",
+        "5 0 R",
     )
 }
 
@@ -279,7 +280,7 @@ fn make_digit_run_repro_pdf() -> Vec<u8> {
 1 0 0 1 180 755 Tm (a) Tj
 1 0 0 1 72 720 Tm (C\) Control: The total of 730 seats was approved. let log 2 = a) Tj
 ET"#;
-    make_text_pdf(content, "0 0 595 842")
+    make_text_pdf(content, "0 0 595 842", "5 0 R")
 }
 
 fn truncate_eof_marker(mut pdf: Vec<u8>) -> Vec<u8> {
@@ -4358,21 +4359,26 @@ fn test_extract_pages_markdown_ocrs_page_with_vector_outlined_text() {
 /// path-based API so callers retain the extracted Markdown.
 #[test]
 fn test_extract_pages_markdown_preserves_decodable_text_with_dotted_form_rules() {
-    let pdf = make_text_pdf_with_dotted_form_rules();
-    let mut fixture = tempfile::NamedTempFile::new().expect("temporary fixture");
-    std::io::Write::write_all(&mut fixture, &pdf).expect("write fixture");
+    for font_entry in [
+        "5 0 R",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ] {
+        let pdf = make_text_pdf_with_dotted_form_rules(font_entry);
+        let mut fixture = tempfile::NamedTempFile::new().expect("temporary fixture");
+        std::io::Write::write_all(&mut fixture, &pdf).expect("write fixture");
 
-    let extraction = extract_pages_markdown(fixture.path(), None).expect("extract fixture");
-    let page = &extraction.pages[0];
-    assert!(
-        !page.needs_ocr,
-        "decodable native text with dotted form rules must not be routed to OCR"
-    );
-    assert!(
-        page.markdown.contains("clean text"),
-        "the public extraction API must preserve native text, got: {:?}",
-        page.markdown
-    );
+        let extraction = extract_pages_markdown(fixture.path(), None).expect("extract fixture");
+        let page = &extraction.pages[0];
+        assert!(
+            !page.needs_ocr,
+            "decodable native text with dotted form rules must not be routed to OCR"
+        );
+        assert!(
+            page.markdown.contains("clean text"),
+            "the public extraction API must preserve native text, got: {:?}",
+            page.markdown
+        );
+    }
 }
 
 #[test]
