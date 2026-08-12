@@ -6636,22 +6636,74 @@ mod tests {
         assert!(quality.pages_needing_ocr.is_empty());
     }
 
+    const BASE64_BINARY_SAMPLE: &str =
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==";
+    const BASE64_PROSE_SAMPLE: &str =
+        "VGhlIHJlZ2lzdHJhbnQgaGVyZWJ5IGFncmVlcyB0byBmdXJuaXNoIGEgY29weSBvZiBhbnkgc3VjaCBpbnN0cnVtZW50IHRvIHRoZSBDb21taXNzaW9uIHVwb24gcmVxdWVzdC4gVGhpcyBjZXJ0aWZpY2F0ZSBvZiBkZXNpZ25hdGlvbnMgd2FzIGZpbGVkIEZlYnJ1YXJ5IHdpdGggcmVzcGVjdCB0byBTZXJpZXMgUHJlZmVycmVkIFN0b2NrIGFuZCBpbmNvcnBvcmF0ZWQgaGVyZWluIGJ5IHJlZmVyZW5jZSB0byB0aGUgYW5udWFsIHJlcG9ydCBvbiBmb3JtIGZvciB0aGUgcGVyaW9kIGVuZGVkIERlY2VtYmVyIGFzIGFtZW5kZWQgYW5kIHJlc3RhdGVkIHRoZXJlYWZ0ZXIu";
+
     #[test]
     fn test_text_quality_allows_base64_in_dedicated_font() {
-        // Base64 for the bytes 0..=255. Its broad alphabet and frequent
-        // lowercase-to-uppercase transitions satisfy the cipher thresholds,
-        // but the uninterrupted structured token is not prose.
-        let base64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==";
         let healthy = CAESAR_PROSE.repeat(3);
-        let items = vec![
-            test_text_item_with_font(1, "Helvetica", &healthy),
-            test_text_item_with_font(1, "DataFont", base64),
-        ];
+        let mut items = Vec::new();
+        for (index, base64) in [BASE64_BINARY_SAMPLE, BASE64_PROSE_SAMPLE]
+            .into_iter()
+            .enumerate()
+        {
+            let page = index as u32 + 1;
+            items.push(test_text_item_with_font(page, "Helvetica", &healthy));
+            items.push(test_text_item_with_font(page, "DataFont", base64));
+        }
 
         let quality = analyze_text_quality(&items);
 
         assert!(!quality.has_encoding_issues);
         assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_chunked_base64_in_dedicated_font() {
+        // PDF content streams may split one Base64 token into many Tj/TJ
+        // fragments. Classification must not depend on those item boundaries.
+        let healthy = CAESAR_PROSE.repeat(3);
+        let mut items = Vec::new();
+        for (index, base64) in [BASE64_BINARY_SAMPLE, BASE64_PROSE_SAMPLE]
+            .into_iter()
+            .enumerate()
+        {
+            let page = index as u32 + 1;
+            items.push(test_text_item_with_font(page, "Helvetica", &healthy));
+            items.extend(base64.as_bytes().chunks(16).map(|chunk| {
+                test_text_item_with_font(
+                    page,
+                    "DataFont",
+                    std::str::from_utf8(chunk).expect("Base64 is ASCII"),
+                )
+            }));
+        }
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_flags_spaceless_garbled_font_on_mixed_page() {
+        // Removing separators must not make genuine shifted prose look like a
+        // structured token and bypass the per-font detector.
+        let healthy = CAESAR_PROSE.repeat(3);
+        let spaceless_garble: String = SHIFTED_CIPHER_TEXT
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "BrokenFont", &spaceless_garble),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
     }
 
     #[test]
