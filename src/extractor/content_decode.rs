@@ -173,21 +173,19 @@ fn skip_number(data: &[u8], i: &mut usize) {
     }
 }
 
-/// After a `BI` operator, skip inline-image data through `EI`, matching
-/// lopdf's fallback scan (`[ \\n\\r]EI[ \\n\\r]`).
+/// After a `BI` operator, skip inline-image data through `EI`.
+/// Uses the same PDF whitespace set as `is_content_space`. If `EI` is not
+/// found, leave the cursor in place so later operators are still counted
+/// (undercounting would let decode allocate the full vector).
 fn skip_inline_image_after_bi(data: &[u8], mut i: usize) -> usize {
     skip_content_space(data, &mut i);
     let rest = &data[i..];
     if let Some(pos) = rest.windows(4).position(|w| {
-        matches!(w[0], b' ' | b'\n' | b'\r')
-            && w[1] == b'E'
-            && w[2] == b'I'
-            && matches!(w[3], b' ' | b'\n' | b'\r')
+        is_content_space(w[0]) && w[1] == b'E' && w[2] == b'I' && is_content_space(w[3])
     }) {
-        i + pos + 3
-    } else {
-        data.len()
+        return i + pos + 3;
     }
+    i
 }
 
 #[cfg(test)]
@@ -255,6 +253,22 @@ mod tests {
             lopdf_op_count(data)
         );
         assert_eq!(count_content_operators(data, usize::MAX), 2); // BI, q
+    }
+
+    #[test]
+    fn inline_image_ei_accepts_pdf_whitespace() {
+        let tab = b"BI /W 1 /H 1 ID \xff\tEI\t q Q";
+        let nul = b"BI /W 1 /H 1 ID \xff\x00EI\x00 q Q";
+        let ff = b"BI /W 1 /H 1 ID \xff\x0cEI\x0c q Q";
+        for data in [tab.as_slice(), nul.as_slice(), ff.as_slice()] {
+            assert_count_does_not_undercount(data);
+            assert!(
+                count_content_operators(data, usize::MAX) >= 3,
+                "BI plus following q Q must remain visible after EI, got {} for {:?}",
+                count_content_operators(data, usize::MAX),
+                String::from_utf8_lossy(data)
+            );
+        }
     }
 
     #[test]
