@@ -6619,6 +6619,41 @@ mod tests {
     }
 
     #[test]
+    fn test_text_quality_allows_structured_ascii_in_dedicated_fonts() {
+        let healthy = CAESAR_PROSE.repeat(3);
+        let mixed_case_code = "myXMLParser ".repeat(20);
+        let uppercase_code = "MYXMLPARSER ".repeat(20);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "CodeFont", &mixed_case_code),
+            test_text_item_with_font(2, "Helvetica", &healthy),
+            test_text_item_with_font(2, "AcronymFont", &uppercase_code),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_flags_uniform_case_garbled_fonts_on_mixed_pages() {
+        let healthy = CAESAR_PROSE.repeat(3);
+        let lowercase_garble = caesar_shift(&CAESAR_PROSE.to_lowercase(), 5);
+        let uppercase_garble = caesar_shift(&CAESAR_PROSE.to_uppercase(), 7);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "BrokenLowerFont", &lowercase_garble),
+            test_text_item_with_font(2, "Helvetica", &healthy),
+            test_text_item_with_font(2, "BrokenUpperFont", &uppercase_garble),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1, 2]);
+    }
+
+    #[test]
     fn test_text_quality_cipher_stats_still_accumulate_across_fonts() {
         let items: Vec<TextItem> = SHIFTED_CIPHER_TEXT
             .split_whitespace()

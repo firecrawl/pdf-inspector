@@ -107,6 +107,8 @@ struct CipherGarbleStats {
 }
 
 impl CipherGarbleStats {
+    const MIN_FONT_SAMPLE_LETTER_KINDS: usize = 15;
+
     fn add_text(&mut self, text: &str) {
         let mut prev: Option<char> = None;
         for ch in text.chars() {
@@ -224,6 +226,26 @@ impl CipherGarbleStats {
 
         case_shifts || permuted_language
     }
+
+    /// A per-font slice is more likely than a whole page to contain repeated
+    /// identifiers, acronyms, or other structured ASCII. A small alphabet can
+    /// accidentally resemble the sorted English frequency profile even when
+    /// the text is legitimate (for example, a dedicated code font containing
+    /// repeated `myXMLParser` labels). Require broad alphabet coverage before
+    /// applying the page-calibrated cipher heuristic to an isolated font.
+    ///
+    /// This guard is intentionally font-only: page-wide detection keeps its
+    /// existing behavior, including all-lowercase and all-uppercase shifted
+    /// prose, while the reported mixed-font cipher sample covers well over
+    /// half of the ASCII alphabet.
+    fn font_sample_looks_garbled(&self) -> bool {
+        let letter_kinds = self
+            .letter_counts
+            .iter()
+            .filter(|&&count| count > 0)
+            .count();
+        letter_kinds >= Self::MIN_FONT_SAMPLE_LETTER_KINDS && self.looks_garbled()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -264,7 +286,7 @@ impl PageTextQualityEvidence {
             || self
                 .cipher_garble_by_font
                 .values()
-                .any(CipherGarbleStats::looks_garbled)
+                .any(CipherGarbleStats::font_sample_looks_garbled)
     }
 }
 
