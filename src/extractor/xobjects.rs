@@ -215,8 +215,6 @@ fn extract_form_xobject_text_inner(
     depth: u8,
     budget: &mut FormWalkBudget,
 ) -> Vec<TextItem> {
-    use lopdf::content::Content;
-
     let mut items = Vec::new();
 
     if !budget.charge_invocation() {
@@ -234,8 +232,12 @@ fn extract_form_xobject_text_inner(
         Err(_) => stream.content.clone(),
     };
 
-    // Decode the content stream
-    let Ok(content) = Content::decode(&content_data) else {
+    // Decode the content stream. Cap before lopdf materializes the operator
+    // vector — the walk budget cannot help if decode itself allocates first.
+    let Ok(Some(content)) = super::content_decode::decode_content_bounded(
+        &content_data,
+        super::content_decode::MAX_PAGE_OPERATIONS,
+    ) else {
         return items;
     };
 
