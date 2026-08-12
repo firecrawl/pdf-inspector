@@ -185,7 +185,7 @@ fn rendered_page_from_pdfium(
     let mut pixels = rendered.into_pixels();
 
     if format == RenderPixelFormat::Rgb8 {
-        bgr_to_rgb_in_place(&mut pixels, width, height, stride);
+        bgr_to_rgb_in_place(&mut pixels, width, height, stride)?;
     }
 
     RenderedPage::new(
@@ -201,20 +201,37 @@ fn rendered_page_from_pdfium(
     )
 }
 
-fn bgr_to_rgb_in_place(pixels: &mut [u8], width: u32, height: u32, stride: usize) {
-    let row_bytes = width as usize * RenderPixelFormat::Rgb8.bytes_per_pixel();
-    assert!(stride >= row_bytes, "pixel stride is shorter than one row");
-    assert_eq!(
-        pixels.len(),
-        stride * height as usize,
-        "pixel buffer length does not match stride and height"
-    );
+fn bgr_to_rgb_in_place(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+) -> Result<(), RenderBufferError> {
+    let row_bytes = (width as usize)
+        .checked_mul(RenderPixelFormat::Rgb8.bytes_per_pixel())
+        .ok_or(RenderBufferError::SizeOverflow)?;
+    if stride < row_bytes {
+        return Err(RenderBufferError::InvalidStride {
+            stride,
+            minimum: row_bytes,
+        });
+    }
+    let expected = stride
+        .checked_mul(height as usize)
+        .ok_or(RenderBufferError::SizeOverflow)?;
+    if pixels.len() != expected {
+        return Err(RenderBufferError::InvalidBufferLength {
+            actual: pixels.len(),
+            expected,
+        });
+    }
 
     for row in pixels.chunks_exact_mut(stride) {
         for pixel in row[..row_bytes].chunks_exact_mut(3) {
             pixel.swap(0, 2);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -224,14 +241,26 @@ mod tests {
     #[test]
     fn bgr_pixels_are_converted_to_rgb_in_place() {
         let mut pixels = vec![1, 2, 3, 4, 5, 6];
-        bgr_to_rgb_in_place(&mut pixels, 2, 1, 6);
+        bgr_to_rgb_in_place(&mut pixels, 2, 1, 6).unwrap();
         assert_eq!(pixels, [3, 2, 1, 6, 5, 4]);
     }
 
     #[test]
     fn bgr_conversion_skips_row_padding() {
         let mut pixels = vec![1, 2, 3, 9, 7, 8, 9, 6];
-        bgr_to_rgb_in_place(&mut pixels, 1, 2, 4);
+        bgr_to_rgb_in_place(&mut pixels, 1, 2, 4).unwrap();
         assert_eq!(pixels, [3, 2, 1, 9, 9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn malformed_bgr_buffers_return_errors() {
+        assert!(matches!(
+            bgr_to_rgb_in_place(&mut [0; 6], 2, 1, 5),
+            Err(RenderBufferError::InvalidStride { .. })
+        ));
+        assert!(matches!(
+            bgr_to_rgb_in_place(&mut [0; 5], 1, 2, 3),
+            Err(RenderBufferError::InvalidBufferLength { .. })
+        ));
     }
 }

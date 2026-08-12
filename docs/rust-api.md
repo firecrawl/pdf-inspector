@@ -145,20 +145,16 @@ its filesystem, locking, or hashing dependencies.
 
 ```rust
 use pdf_inspector::vision::{
-    LocalOptions, ModelDownloadPolicy, ModelStore, OcrMode, OcrOptions,
-    PP_OCR_V6_SMALL,
+    ModelDownloadPolicy, ModelStore, OcrMode, OcrOptions, PP_OCR_V6_SMALL,
 };
 
 let ocr = OcrOptions::new()
     .mode(OcrMode::Auto)
     .model_directory("/opt/firecrawl/models/pp-ocrv6-small")
     .model_downloads(ModelDownloadPolicy::Offline);
-let local = LocalOptions::new().ocr(ocr.clone());
-
 // Verifies exact sizes and SHA-256 digests before an engine opens the files.
 let models = ModelStore::from_options(&ocr)?.resolve(&PP_OCR_V6_SMALL)?;
 println!("using {} at {}", models.manifest_id(), models.revision());
-# let _ = local;
 ```
 
 ### Optional native page rendering

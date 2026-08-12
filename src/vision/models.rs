@@ -1,10 +1,12 @@
 //! Versioned model manifests and a checksum-verified local cache.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -243,25 +245,12 @@ impl ModelStore {
             return Ok(target);
         }
 
-        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temporary = root.join(format!(
-            ".{}.{}.{}.part",
-            artifact.filename,
-            std::process::id(),
-            sequence
-        ));
+        sweep_stale_install_files(&root, artifact.filename)?;
+        let (temporary, mut output) = create_temporary_file(&root, artifact.filename)?;
         let result = (|| {
-            let mut output = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)
-                .map_err(|source| ModelStoreError::Io {
-                    path: temporary.clone(),
-                    source,
-                })?;
+            let mut limited = reader.by_ref().take(artifact.size.saturating_add(1));
             let (size, digest) =
-                copy_and_hash(&mut reader, &mut output).map_err(|source| ModelStoreError::Io {
+                copy_and_hash(&mut limited, &mut output).map_err(|source| ModelStoreError::Io {
                     path: temporary.clone(),
                     source,
                 })?;
@@ -271,13 +260,7 @@ impl ModelStore {
             })?;
             validate_size_and_hash(artifact, size, &digest, &temporary)?;
 
-            if target.exists() {
-                fs::remove_file(&target).map_err(|source| ModelStoreError::Io {
-                    path: target.clone(),
-                    source,
-                })?;
-            }
-            fs::rename(&temporary, &target).map_err(|source| ModelStoreError::Io {
+            replace_file_atomic(&temporary, &target).map_err(|source| ModelStoreError::Io {
                 path: target.clone(),
                 source,
             })?;
@@ -362,15 +345,18 @@ fn validate_manifest(manifest: &ModelManifest) -> Result<(), ModelStoreError> {
             "id, revision, and artifacts must be non-empty".to_string(),
         ));
     }
+    for (field, value) in [("id", manifest.id), ("revision", manifest.revision)] {
+        if !is_single_normal_path_component(value) {
+            return Err(ModelStoreError::InvalidManifest(format!(
+                "{field} must be a single path component: {value}"
+            )));
+        }
+    }
 
     let mut kinds = BTreeSet::new();
     let mut filenames = BTreeSet::new();
     for artifact in manifest.artifacts {
-        let mut components = Path::new(artifact.filename).components();
-        if !matches!(components.next(), Some(Component::Normal(_)))
-            || components.next().is_some()
-            || artifact.filename.is_empty()
-        {
+        if !is_single_normal_path_component(artifact.filename) {
             return Err(ModelStoreError::InvalidManifest(format!(
                 "artifact filename must be a single path component: {}",
                 artifact.filename
@@ -407,6 +393,92 @@ fn validate_manifest(manifest: &ModelManifest) -> Result<(), ModelStoreError> {
         }
     }
     Ok(())
+}
+
+fn is_single_normal_path_component(value: &str) -> bool {
+    if value.is_empty() || Path::new(value).file_name() != Some(OsStr::new(value)) {
+        return false;
+    }
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn sweep_stale_install_files(root: &Path, filename: &str) -> Result<(), ModelStoreError> {
+    let prefix = format!(".{filename}.");
+    for entry in fs::read_dir(root).map_err(|source| ModelStoreError::Io {
+        path: root.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| ModelStoreError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".part") {
+            let path = entry.path();
+            fs::remove_file(&path).map_err(|source| ModelStoreError::Io { path, source })?;
+        }
+    }
+    Ok(())
+}
+
+fn create_temporary_file(root: &Path, filename: &str) -> Result<(PathBuf, File), ModelStoreError> {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16 {
+        let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = root.join(format!(
+            ".{filename}.{}.{}.{}.part",
+            std::process::id(),
+            timestamp,
+            sequence
+        ));
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(ModelStoreError::Io { path, source }),
+        }
+    }
+    let path = root.join(format!(".{filename}.part"));
+    Err(ModelStoreError::Io {
+        path,
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique model install file",
+        ),
+    })
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic(source: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn replace_file_atomic(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn verify_artifact(path: &Path, artifact: &ModelArtifact) -> Result<(), ModelStoreError> {
@@ -571,6 +643,88 @@ mod tests {
             store.resolve(&TEST_MANIFEST),
             Err(ModelStoreError::MissingArtifact { .. })
         ));
+    }
+
+    #[test]
+    fn oversized_install_stops_after_one_extra_byte() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(temp.path());
+        assert!(matches!(
+            store.install(
+                &TEST_MANIFEST,
+                ModelArtifactKind::CharacterDictionary,
+                &b"hello and far too much data"[..],
+            ),
+            Err(ModelStoreError::SizeMismatch {
+                expected: 5,
+                actual: 6,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn install_replaces_invalid_cache_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(temp.path());
+        let root = store.manifest_cache_root(&TEST_MANIFEST);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("hello.txt"), b"HELLO").unwrap();
+
+        store
+            .install(
+                &TEST_MANIFEST,
+                ModelArtifactKind::CharacterDictionary,
+                &b"hello"[..],
+            )
+            .unwrap();
+        assert_eq!(fs::read(root.join("hello.txt")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn stale_partial_installs_are_swept_under_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(temp.path());
+        let root = store.manifest_cache_root(&TEST_MANIFEST);
+        fs::create_dir_all(&root).unwrap();
+        let stale = root.join(".hello.txt.123.0.part");
+        fs::write(&stale, b"stale").unwrap();
+
+        store
+            .install(
+                &TEST_MANIFEST,
+                ModelArtifactKind::CharacterDictionary,
+                &b"hello"[..],
+            )
+            .unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn manifest_paths_cannot_escape_the_cache() {
+        const BAD_ID: ModelManifest = ModelManifest {
+            id: "../escape",
+            ..TEST_MANIFEST
+        };
+        const BAD_REVISION: ModelManifest = ModelManifest {
+            revision: "nested/revision",
+            ..TEST_MANIFEST
+        };
+        const BAD_FILENAME_ARTIFACTS: &[ModelArtifact] = &[ModelArtifact {
+            filename: "hello.txt/",
+            ..TEST_ARTIFACTS[0]
+        }];
+        const BAD_FILENAME: ModelManifest = ModelManifest {
+            artifacts: BAD_FILENAME_ARTIFACTS,
+            ..TEST_MANIFEST
+        };
+
+        for manifest in [&BAD_ID, &BAD_REVISION, &BAD_FILENAME] {
+            assert!(matches!(
+                validate_manifest(manifest),
+                Err(ModelStoreError::InvalidManifest(_))
+            ));
+        }
     }
 
     #[test]

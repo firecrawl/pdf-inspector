@@ -147,6 +147,10 @@ impl PageTransform {
         let b = (y_axis.0 - origin.0) / height;
         let d = (y_axis.1 - origin.1) / height;
         let (e, f) = origin;
+        let forward = [a, b, c, d, e, f];
+        if forward.iter().any(|coefficient| !coefficient.is_finite()) {
+            return None;
+        }
         let determinant = a * d - b * c;
         if determinant == 0.0 || !determinant.is_finite() {
             return None;
@@ -158,12 +162,16 @@ impl PageTransform {
         let inverse_d = a / determinant;
         let inverse_e = -(inverse_a * e + inverse_b * f);
         let inverse_f = -(inverse_c * e + inverse_d * f);
+        let inverse = [
+            inverse_a, inverse_b, inverse_c, inverse_d, inverse_e, inverse_f,
+        ];
+        if inverse.iter().any(|coefficient| !coefficient.is_finite()) {
+            return None;
+        }
 
         Some(Self {
-            forward: [a, b, c, d, e, f],
-            inverse: [
-                inverse_a, inverse_b, inverse_c, inverse_d, inverse_e, inverse_f,
-            ],
+            forward,
+            inverse,
             pixel_width,
             pixel_height,
         })
@@ -374,15 +382,33 @@ impl RenderedPage {
     /// Converts a bitmap rectangle to the repository's existing PDF-space
     /// rectangle type. The returned page number remains 1-indexed.
     pub fn pixel_rect_to_pdf_rect(&self, x: f64, y: f64, width: f64, height: f64) -> PdfRect {
-        let first = self.transform.pixel_to_page(x, y);
-        let second = self.transform.pixel_to_page(x + width, y + height);
-        let left = first.x.min(second.x);
-        let bottom = first.y.min(second.y);
+        let points = [
+            self.transform.pixel_to_page(x, y),
+            self.transform.pixel_to_page(x + width, y),
+            self.transform.pixel_to_page(x, y + height),
+            self.transform.pixel_to_page(x + width, y + height),
+        ];
+        let left = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::INFINITY, f32::min);
+        let right = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bottom = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min);
+        let top = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::NEG_INFINITY, f32::max);
         PdfRect {
             x: left,
             y: bottom,
-            width: (second.x - first.x).abs(),
-            height: (second.y - first.y).abs(),
+            width: right - left,
+            height: top - bottom,
             page: self.page,
         }
     }
@@ -390,18 +416,33 @@ impl RenderedPage {
     /// Converts a PDF-space rectangle to bitmap coordinates
     /// `(x, y, width, height)` with a top-left origin.
     pub fn pdf_rect_to_pixel(&self, rect: &PdfRect) -> (f64, f64, f64, f64) {
-        let first = self
-            .transform
-            .page_to_pixel(f64::from(rect.x), f64::from(rect.y + rect.height));
-        let second = self
-            .transform
-            .page_to_pixel(f64::from(rect.x + rect.width), f64::from(rect.y));
-        (
-            first.0.min(second.0),
-            first.1.min(second.1),
-            (second.0 - first.0).abs(),
-            (second.1 - first.1).abs(),
-        )
+        let left = f64::from(rect.x);
+        let right = f64::from(rect.x + rect.width);
+        let bottom = f64::from(rect.y);
+        let top = f64::from(rect.y + rect.height);
+        let points = [
+            self.transform.page_to_pixel(left, bottom),
+            self.transform.page_to_pixel(right, bottom),
+            self.transform.page_to_pixel(left, top),
+            self.transform.page_to_pixel(right, top),
+        ];
+        let min_x = points
+            .iter()
+            .map(|point| point.0)
+            .fold(f64::INFINITY, f64::min);
+        let max_x = points
+            .iter()
+            .map(|point| point.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_y = points
+            .iter()
+            .map(|point| point.1)
+            .fold(f64::INFINITY, f64::min);
+        let max_y = points
+            .iter()
+            .map(|point| point.1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        (min_x, min_y, max_x - min_x, max_y - min_y)
     }
 }
 
@@ -478,5 +519,34 @@ mod tests {
         assert!((pixel.1 - 20.0).abs() < 1e-5);
         assert!((pixel.2 - 30.0).abs() < 1e-5);
         assert!((pixel.3 - 40.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn skewed_transform_bounds_all_rectangle_corners() {
+        let transform =
+            PageTransform::from_corners(100, 100, (0.0, 100.0), (100.0, 125.0), (25.0, 0.0))
+                .unwrap();
+        let page = RenderedPage::new(
+            1,
+            125.0,
+            125.0,
+            100,
+            100,
+            300,
+            RenderPixelFormat::Rgb8,
+            vec![0; 30_000],
+            transform,
+        )
+        .unwrap();
+
+        let pdf = page.pixel_rect_to_pdf_rect(10.0, 20.0, 30.0, 40.0);
+        assert!((pdf.x - 15.0).abs() < 1e-5);
+        assert!((pdf.y - 42.5).abs() < 1e-5);
+        assert!((pdf.width - 40.0).abs() < 1e-5);
+        assert!((pdf.height - 47.5).abs() < 1e-5);
+
+        let pixels = page.pdf_rect_to_pixel(&pdf);
+        assert!(pixels.0 <= 10.0 && pixels.1 <= 20.0);
+        assert!(pixels.0 + pixels.2 >= 40.0 && pixels.1 + pixels.3 >= 60.0);
     }
 }
