@@ -6259,6 +6259,13 @@ mod tests {
         }
     }
 
+    fn test_text_item_with_font(page: u32, font: &str, text: &str) -> TextItem {
+        TextItem {
+            font: font.to_string(),
+            ..test_text_item_on_page(page, text)
+        }
+    }
+
     #[test]
     fn removed_sparse_folios_leave_no_layout_evidence() {
         let items = vec![
@@ -6574,6 +6581,57 @@ mod tests {
         let items: Vec<TextItem> = SHIFTED_CIPHER_TEXT
             .split_whitespace()
             .map(|chunk| test_text_item_on_page(1, chunk))
+            .collect();
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+    }
+
+    #[test]
+    fn test_text_quality_flags_garbled_font_on_mixed_page() {
+        let healthy = CAESAR_PROSE.repeat(3);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "FixtureFont", SHIFTED_CIPHER_TEXT),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+        assert_eq!(
+            quality.reasons_by_page.get(&1).cloned(),
+            Some(vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()])
+        );
+    }
+
+    #[test]
+    fn test_text_quality_allows_clean_multi_font_page() {
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", CAESAR_PROSE),
+            test_text_item_with_font(1, "TimesRoman", &CAESAR_PROSE.repeat(2)),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_cipher_stats_still_accumulate_across_fonts() {
+        let items: Vec<TextItem> = SHIFTED_CIPHER_TEXT
+            .split_whitespace()
+            .enumerate()
+            .map(|(index, chunk)| {
+                let font = match index % 4 {
+                    0 => "FixtureFontA",
+                    1 => "FixtureFontB",
+                    2 => "FixtureFontC",
+                    _ => "FixtureFontD",
+                };
+                test_text_item_with_font(1, font, chunk)
+            })
             .collect();
 
         let quality = analyze_text_quality(&items);

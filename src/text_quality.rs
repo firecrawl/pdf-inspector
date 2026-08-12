@@ -11,8 +11,9 @@
 //!   backstop on the region-extraction and whole-document paths.
 //! - **Item/span-level** ([`analyze_text_quality`],
 //!   [`region_items_have_decoding_issue`]) run on individual `TextItem`s and
-//!   accumulate per-page evidence, so localized garbled spans on an otherwise
-//!   clean page are caught without a single span having to condemn the page.
+//!   accumulate page-wide and per-font evidence, so localized garbled spans on
+//!   an otherwise clean page are caught without a single span having to
+//!   condemn the page.
 //!
 //! Detection classes, roughly by signal:
 //! - **Replacement runs**: U+FFFD clusters ([`has_replacement_text_run`]).
@@ -239,6 +240,32 @@ struct PageTextQualityEvidence {
     replacement_spans: usize,
     longest_replacement_run: usize,
     cipher_garble: CipherGarbleStats,
+    cipher_garble_by_font: BTreeMap<String, CipherGarbleStats>,
+}
+
+impl PageTextQualityEvidence {
+    fn add_cipher_text(&mut self, font: &str, text: &str) {
+        self.cipher_garble.add_text(text);
+        if font.is_empty() {
+            return;
+        }
+
+        if let Some(stats) = self.cipher_garble_by_font.get_mut(font) {
+            stats.add_text(text);
+        } else {
+            let mut stats = CipherGarbleStats::default();
+            stats.add_text(text);
+            self.cipher_garble_by_font.insert(font.to_string(), stats);
+        }
+    }
+
+    fn cipher_sample_looks_garbled(&self) -> bool {
+        self.cipher_garble.looks_garbled()
+            || self
+                .cipher_garble_by_font
+                .values()
+                .any(CipherGarbleStats::looks_garbled)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +285,7 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
 
         let evidence = evidence_by_page.entry(item.page).or_default();
         evidence.chars += item.text.chars().filter(|ch| !ch.is_whitespace()).count();
-        evidence.cipher_garble.add_text(&item.text);
+        evidence.add_cipher_text(&item.font, &item.text);
 
         match text_span_decoding_issue_kind(&item.text) {
             Some(TextSpanIssueKind::Strong) => {
@@ -282,7 +309,7 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         if reasons_by_page.contains_key(&page) {
             continue;
         }
-        if page_replacement_evidence_needs_ocr(&evidence) || evidence.cipher_garble.looks_garbled()
+        if page_replacement_evidence_needs_ocr(&evidence) || evidence.cipher_sample_looks_garbled()
         {
             add_ocr_reason(
                 &mut reasons_by_page,
