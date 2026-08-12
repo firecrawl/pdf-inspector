@@ -39,26 +39,24 @@ pub fn route_ocr_pages(
     recommended_pages: &[u32],
     selected_pages: Option<&[u32]>,
 ) -> Result<Vec<u32>, OcrRoutingError> {
-    if mode == OcrMode::Off {
-        return Ok(Vec::new());
-    }
-
-    let selected = selected_pages
-        .map(|pages| validated_page_set("selected", pages, page_count))
-        .transpose()?;
-    let mut routed = match mode {
-        OcrMode::Off => BTreeSet::new(),
-        OcrMode::Auto => validated_page_set("recommended", recommended_pages, page_count)?,
-        OcrMode::Force => selected
-            .clone()
-            .unwrap_or_else(|| (1..=page_count).collect()),
-    };
-    if mode == OcrMode::Auto {
-        if let Some(selected) = selected {
-            routed.retain(|page| selected.contains(page));
+    match mode {
+        OcrMode::Off => Ok(Vec::new()),
+        OcrMode::Auto => {
+            let mut routed = validated_page_set("recommended", recommended_pages, page_count)?;
+            if let Some(selected) = selected_pages {
+                let selected = validated_page_set("selected", selected, page_count)?;
+                routed.retain(|page| selected.contains(page));
+            }
+            Ok(routed.into_iter().collect())
+        }
+        OcrMode::Force => {
+            let routed = selected_pages
+                .map(|pages| validated_page_set("selected", pages, page_count))
+                .transpose()?
+                .unwrap_or_else(|| (1..=page_count).collect());
+            Ok(routed.into_iter().collect())
         }
     }
-    Ok(routed.into_iter().collect())
 }
 
 /// Renders and recognizes already-routed pages while retaining transforms for
@@ -310,7 +308,7 @@ mod tests {
     #[test]
     fn off_auto_and_force_route_expected_pages() {
         assert_eq!(
-            route_ocr_pages(OcrMode::Off, 5, &[1, 3], None).unwrap(),
+            route_ocr_pages(OcrMode::Off, 0, &[99], Some(&[0])).unwrap(),
             Vec::<u32>::new()
         );
         assert_eq!(

@@ -232,6 +232,9 @@ impl ModelStore {
             Err(source) if self.override_root.is_some() => {
                 return Err(ModelAcquireError::ExplicitDirectoryIncomplete { source });
             }
+            Err(source) if !source.permits_download_recovery() => {
+                return Err(ModelAcquireError::Store(source));
+            }
             Err(source) if policy == ModelDownloadPolicy::Offline => {
                 return Err(ModelAcquireError::DownloadsDisabled { source });
             }
@@ -240,8 +243,11 @@ impl ModelStore {
 
         let root = self.manifest_cache_root(manifest);
         for artifact in manifest.artifacts {
-            if verify_artifact(&root.join(artifact.filename), artifact).is_ok() {
-                continue;
+            let _lock = lock_artifact(&root, artifact).map_err(ModelAcquireError::Store)?;
+            match verify_artifact(&root.join(artifact.filename), artifact) {
+                Ok(()) => continue,
+                Err(source) if source.permits_download_recovery() => {}
+                Err(source) => return Err(ModelAcquireError::Store(source)),
             }
             let reader =
                 downloader
@@ -251,8 +257,7 @@ impl ModelStore {
                         url: artifact.url,
                         source,
                     })?;
-            self.install(manifest, artifact.kind, reader)
-                .map_err(ModelAcquireError::Store)?;
+            install_locked(&root, artifact, reader).map_err(ModelAcquireError::Store)?;
         }
         self.resolve(manifest).map_err(ModelAcquireError::Store)
     }
@@ -275,58 +280,8 @@ impl ModelStore {
             .find(|artifact| artifact.kind == kind)
             .ok_or(ModelStoreError::ArtifactNotInManifest { kind })?;
         let root = self.manifest_cache_root(manifest);
-        fs::create_dir_all(&root).map_err(|source| ModelStoreError::Io {
-            path: root.clone(),
-            source,
-        })?;
-
-        let target = root.join(artifact.filename);
-        let lock_path = root.join(format!(".{}.lock", artifact.filename));
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| ModelStoreError::Io {
-                path: lock_path.clone(),
-                source,
-            })?;
-        FileExt::lock_exclusive(&lock).map_err(|source| ModelStoreError::Io {
-            path: lock_path,
-            source,
-        })?;
-
-        if verify_artifact(&target, artifact).is_ok() {
-            return Ok(target);
-        }
-
-        sweep_stale_install_files(&root, artifact.filename)?;
-        let (temporary, mut output) = create_temporary_file(&root, artifact.filename)?;
-        let result = (|| {
-            let mut limited = reader.by_ref().take(artifact.size.saturating_add(1));
-            let (size, digest) =
-                copy_and_hash(&mut limited, &mut output).map_err(|source| ModelStoreError::Io {
-                    path: temporary.clone(),
-                    source,
-                })?;
-            output.sync_all().map_err(|source| ModelStoreError::Io {
-                path: temporary.clone(),
-                source,
-            })?;
-            validate_size_and_hash(artifact, size, &digest, &temporary)?;
-
-            replace_file_atomic(&temporary, &target).map_err(|source| ModelStoreError::Io {
-                path: target.clone(),
-                source,
-            })?;
-            Ok(target.clone())
-        })();
-
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        let _lock = lock_artifact(&root, artifact)?;
+        install_locked(&root, artifact, &mut reader)
     }
 
     fn manifest_cache_root(&self, manifest: &ModelManifest) -> PathBuf {
@@ -426,6 +381,17 @@ pub enum ModelStoreError {
     },
 }
 
+impl ModelStoreError {
+    fn permits_download_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingArtifact { .. }
+                | Self::SizeMismatch { .. }
+                | Self::ChecksumMismatch { .. }
+        )
+    }
+}
+
 fn validate_manifest(manifest: &ModelManifest) -> Result<(), ModelStoreError> {
     if manifest.schema_version != 1 {
         return Err(ModelStoreError::InvalidManifest(format!(
@@ -494,6 +460,67 @@ fn is_single_normal_path_component(value: &str) -> bool {
     }
     let mut components = Path::new(value).components();
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn lock_artifact(root: &Path, artifact: &ModelArtifact) -> Result<File, ModelStoreError> {
+    fs::create_dir_all(root).map_err(|source| ModelStoreError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let lock_path = root.join(format!(".{}.lock", artifact.filename));
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| ModelStoreError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    FileExt::lock_exclusive(&lock).map_err(|source| ModelStoreError::Io {
+        path: lock_path,
+        source,
+    })?;
+    Ok(lock)
+}
+
+fn install_locked(
+    root: &Path,
+    artifact: &ModelArtifact,
+    mut reader: impl Read,
+) -> Result<PathBuf, ModelStoreError> {
+    let target = root.join(artifact.filename);
+    if verify_artifact(&target, artifact).is_ok() {
+        return Ok(target);
+    }
+
+    sweep_stale_install_files(root, artifact.filename)?;
+    let (temporary, mut output) = create_temporary_file(root, artifact.filename)?;
+    let result = (|| {
+        let mut limited = reader.by_ref().take(artifact.size.saturating_add(1));
+        let (size, digest) =
+            copy_and_hash(&mut limited, &mut output).map_err(|source| ModelStoreError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        output.sync_all().map_err(|source| ModelStoreError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+        validate_size_and_hash(artifact, size, &digest, &temporary)?;
+
+        replace_file_atomic(&temporary, &target).map_err(|source| ModelStoreError::Io {
+            path: target.clone(),
+            source,
+        })?;
+        Ok(target.clone())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn sweep_stale_install_files(root: &Path, filename: &str) -> Result<(), ModelStoreError> {
@@ -900,6 +927,54 @@ mod tests {
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(downloader.request_count(), 1);
+    }
+
+    #[test]
+    fn concurrent_resolve_downloads_once_under_the_artifact_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(temp.path());
+        let downloader = std::sync::Arc::new(StaticDownloader::new(b"hello"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let downloader = std::sync::Arc::clone(&downloader);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.resolve_or_download(
+                        &TEST_MANIFEST,
+                        ModelDownloadPolicy::IfMissing,
+                        downloader.as_ref(),
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(downloader.request_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_io_failures_do_not_trigger_downloads() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(temp.path());
+        let root = store.manifest_cache_root(&TEST_MANIFEST);
+        fs::create_dir_all(&root).unwrap();
+        symlink("hello.txt", root.join("hello.txt")).unwrap();
+        let downloader = StaticDownloader::new(b"hello");
+
+        assert!(matches!(
+            store.resolve_or_download(&TEST_MANIFEST, ModelDownloadPolicy::IfMissing, &downloader,),
+            Err(ModelAcquireError::Store(ModelStoreError::Io { .. }))
+        ));
+        assert_eq!(downloader.request_count(), 0);
     }
 
     #[test]
