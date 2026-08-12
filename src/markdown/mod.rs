@@ -503,7 +503,14 @@ fn running_furniture_keys(items: &[TextItem]) -> HashSet<FurnitureKey> {
         let Some(&(min_y, max_y)) = page_extent.get(&item.page) else {
             continue;
         };
-        let band = (max_y - min_y) * RUNNING_FURNITURE_BAND;
+        // A page whose text has no vertical span gives no evidence of where
+        // its edges are — without this guard, a zero band would classify its
+        // every item as edge furniture.
+        let extent = max_y - min_y;
+        if extent <= 0.0 {
+            continue;
+        }
+        let band = extent * RUNNING_FURNITURE_BAND;
         if item.y > min_y + band && item.y < max_y - band {
             continue; // mid-page: never furniture, however often it repeats
         }
@@ -2192,6 +2199,8 @@ mod tests {
     fn running_furniture_requires_three_pages_at_same_position() {
         let mut items = Vec::new();
         for page in 1..=3 {
+            // Body content so each page has a real vertical extent.
+            items.push(furniture_item("body", 85.0, 700.0, page));
             items.push(furniture_item("TITULAR DEL", 85.0, 68.0, page));
         }
         // Same text but only two pages.
@@ -2325,10 +2334,23 @@ mod tests {
 
     #[test]
     fn running_furniture_empty_on_short_documents() {
-        let items = vec![
-            furniture_item("FOOTER", 85.0, 68.0, 1),
-            furniture_item("FOOTER", 85.0, 68.0, 2),
-        ];
+        let mut items = Vec::new();
+        for page in 1..=2 {
+            items.push(furniture_item("body", 85.0, 700.0, page));
+            items.push(furniture_item("FOOTER", 85.0, 68.0, page));
+        }
+        assert!(running_furniture_keys(&items).is_empty());
+    }
+
+    /// A page whose text has no vertical span (a single line) gives no
+    /// evidence of where its edges are; its items never become furniture.
+    #[test]
+    fn zero_span_page_contributes_no_furniture() {
+        let mut items = Vec::new();
+        for page in 1..=4 {
+            items.push(furniture_item("ROW LABEL", 85.0, 400.0, page));
+            items.push(furniture_item("ROW VALUE", 300.0, 400.0, page));
+        }
         assert!(running_furniture_keys(&items).is_empty());
     }
 
