@@ -1501,55 +1501,41 @@ fn test_extract_structure_elements_untagged_pdf_empty() {
 }
 
 #[test]
-fn test_identity_h_no_tounicode_suppresses_garbage() {
+fn test_identity_h_yugothic_decoded_via_builtin_japan1() {
     // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no
-    // usable ToUnicode CMap. The raw CID bytes (e.g. 0x08 0x37, 0x0E 0x0F)
-    // contain non-ASCII high bytes and previously fell through to the
-    // per-byte Latin-1 fallback, producing high-Latin-1 mojibake that
-    // `is_cid_garbage` flagged. The Type0/CID guard in
-    // `extract_text_from_operand` now emits one U+FFFD per CID instead of
-    // mojibake; `detect_encoding_issues` trips on that and suppresses the
-    // markdown / flags the page for OCR — so we still pass this test, but
-    // via the deliberate marker path rather than by accident.
+    // ToUnicode CMap. Its CIDSystemInfo Ordering is Japan1, so the bundled
+    // Adobe-Japan1-UCS2.bcmap predefined map decodes it (poppler does the
+    // same). Before the binary-CMap fix this map failed to parse and the
+    // font fell through to U+FFFD garbage / OCR routing.
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
 
-    // Pre-suppression check: the raw text items must contain the U+FFFD
-    // markers that prove the Type0/CID fallback fired. This pins the
-    // mechanism so a future regression that re-enables Latin-1 mojibake
-    // would fail loudly here, not just silently change the suppression
-    // chain to one that depends on `is_cid_garbage` + high-Latin-1 chars.
+    // The text must decode to real Japanese, with no U+FFFD markers.
     let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
     let combined: String = items.iter().map(|i| i.text.as_str()).collect();
     assert!(
-        combined.contains('\u{FFFD}'),
-        "Type0/CID font with unparseable ToUnicode CMap should emit U+FFFD per CID; \
-         got {} chars: {:?}",
-        combined.len(),
-        &combined[..combined.len().min(100)]
+        !combined.contains('\u{FFFD}'),
+        "Japan1 Identity-H font should decode via builtin CMap, got U+FFFD: {:?}",
+        combined.chars().take(120).collect::<String>()
     );
     assert!(
-        !combined
-            .chars()
-            .any(|c| ('\u{0080}'..='\u{00FF}').contains(&c)),
-        "Latin-1 mojibake (high bytes) must not leak from Type0/CID fallback; got: {:?}",
-        &combined[..combined.len().min(100)]
+        combined.contains("羽田空港"),
+        "Should extract real Japanese title, got: {:?}",
+        combined.chars().take(120).collect::<String>()
     );
 
     let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
 
-    // Page 1 should be flagged for OCR
+    // The page is now decodable, so it should NOT be flagged for OCR and the
+    // markdown should contain real Japanese.
     assert!(
-        result.pages_needing_ocr.contains(&1),
-        "Page with Identity-H font without ToUnicode should be flagged for OCR"
+        !result.pages_needing_ocr.contains(&1),
+        "Decodable Japan1 page should not be flagged for OCR"
     );
-
-    // Markdown should be empty (garbage suppressed)
     let md = result.markdown.unwrap_or_default();
     assert!(
-        md.trim().is_empty(),
-        "Garbage CID text should be suppressed, got {} chars: {:?}",
-        md.len(),
-        &md[..md.len().min(100)]
+        md.contains("羽田空港"),
+        "Markdown should contain real Japanese, got: {:?}",
+        md.chars().take(120).collect::<String>()
     );
 }
 
@@ -1931,14 +1917,18 @@ fn test_extract_regions_mem_visible_layer_unchanged() {
 }
 
 #[test]
-fn test_extract_regions_mem_identity_h_needs_ocr() {
+fn test_extract_regions_mem_identity_h_decodes() {
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
     let regions =
         extract_text_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
     assert_eq!(regions.len(), 1);
     assert!(
-        regions[0].regions[0].needs_ocr,
-        "Identity-H font without ToUnicode should trigger needs_ocr"
+        !regions[0].regions[0].needs_ocr,
+        "Japan1 Identity-H font should decode via builtin CMap"
+    );
+    assert!(
+        regions[0].regions[0].text.contains("羽田空港"),
+        "region text should contain Japanese title"
     );
 }
 
@@ -2199,14 +2189,18 @@ fn test_extract_tables_in_regions_empty_region() {
 }
 
 #[test]
-fn test_extract_tables_in_regions_identity_h_needs_ocr() {
+fn test_extract_tables_in_regions_identity_h_non_table_needs_ocr() {
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
     let results =
         extract_tables_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
 
     assert_eq!(results.len(), 1);
     let region = &results[0].regions[0];
-    assert!(region.needs_ocr, "Identity-H font should trigger needs_ocr");
+    assert!(
+        region.needs_ocr,
+        "a decodable but non-table region should still request table OCR"
+    );
+    assert!(region.text.is_empty(), "non-table region should be empty");
 }
 
 #[test]
@@ -3595,14 +3589,17 @@ fn test_extract_pages_markdown_invalid_buffer() {
 }
 
 #[test]
-fn test_extract_pages_markdown_gid_pages_need_ocr() {
-    // shinagawa_identity_h.pdf has GID-encoded fonts
+fn test_extract_pages_markdown_japan1_decodes_no_ocr() {
+    // shinagawa_identity_h.pdf uses Japan1 CID fonts (YuGothic). With the
+    // bundled Adobe-Japan1-UCS2.bcmap predefined map these now decode to real
+    // Japanese, so the page must NOT be flagged for OCR (poppler agrees).
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
     let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
 
     assert_eq!(result.pages.len(), 1);
-    assert!(result.pages[0].needs_ocr);
-    assert!(result.pages_needing_ocr.contains(&1)); // 1-indexed
+    assert!(!result.pages[0].needs_ocr);
+    assert!(result.pages[0].markdown.contains("羽田空港"));
+    assert!(!result.pages_needing_ocr.contains(&1)); // 1-indexed
 }
 
 #[test]
@@ -4397,5 +4394,150 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         "a page flagged needs_ocr must not return markdown as if extraction were \
          trustworthy, got: {:?}",
         page.markdown
+    );
+}
+
+fn make_named_type0_pdf(encoding: &str, ordering: &str, encoded_text: &[u8]) -> Vec<u8> {
+    let tj = format!(
+        "<{}> Tj",
+        encoded_text
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>()
+    );
+    let content = format!("BT\n/F1 24 Tf\n50 700 Td\n{tj}\nET\n");
+
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+         /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        &format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /SimSun \
+             /Encoding /{encoding} /DescendantFonts [6 0 R] >>"
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        &format!(
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /SimSun \
+             /CIDSystemInfo << /Registry (Adobe) /Ordering ({ordering}) /Supplement 4 >> \
+             /FontDescriptor 7 0 R /DW 1000 \
+             /W [32 126 500 19968 40959 1000] >>"
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        7,
+        "<< /Type /FontDescriptor /FontName /SimSun /Flags 4 \
+         /FontBBox [0 -200 1000 800] /ItalicAngle 0 \
+         /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+fn extracted_text(pdf: &[u8]) -> String {
+    extract_text_with_positions_mem(pdf)
+        .expect("extract")
+        .into_iter()
+        .map(|it| it.text)
+        .collect()
+}
+
+/// Type0 + UniGB-UCS2-H, no ToUnicode, no embedded font — the pattern used by
+/// Chinese OFD→PDF e-tickets (e.g. Suwell OFD convertor railway tickets).
+/// Character codes are UCS-2 Unicode; pdftotext decodes them correctly.
+#[test]
+fn extract_unigb_ucs2_h_without_tounicode() {
+    let chars = "电子发票 G342 郴州西";
+    let encoded: Vec<u8> = chars.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let pdf = make_named_type0_pdf("UniGB-UCS2-H", "GB1", &encoded);
+    let text = extracted_text(&pdf);
+
+    assert!(
+        !text.contains('\u{FFFD}'),
+        "should not emit replacement chars, got {text:?}"
+    );
+    assert!(text.contains("电子发票"), "missing 电子发票 in {text:?}");
+    assert!(text.contains("郴州西"), "missing 郴州西 in {text:?}");
+    assert!(text.contains("G342"), "missing G342 in {text:?}");
+}
+
+/// GBK-EUC-H mixes one-byte ASCII with two-byte CJK. Until the decoder is
+/// codespace-aware, it must fail loudly instead of returning plausible but
+/// incomplete text with identifiers such as train numbers silently removed.
+#[test]
+fn mixed_width_named_cmap_does_not_emit_partial_text() {
+    let gbk = [
+        0xB5, 0xE7, 0xD7, 0xD3, 0xB7, 0xA2, 0xC6, 0xB1, 0x20, 0x47, 0x33, 0x34, 0x32, 0x20, 0xB3,
+        0xBB, 0xD6, 0xDD, 0xCE, 0xF7,
+    ];
+    let pdf = make_named_type0_pdf("GBK-EUC-H", "GB1", &gbk);
+    let text = extracted_text(&pdf);
+
+    assert!(
+        text.contains('\u{FFFD}'),
+        "unsupported mixed-width CMap must signal decoding failure, got {text:?}"
+    );
+    assert!(
+        !text.contains("电子发票郴州西"),
+        "must not return the previously observed partial text: {text:?}"
     );
 }

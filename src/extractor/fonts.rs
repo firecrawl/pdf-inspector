@@ -903,20 +903,24 @@ fn is_ligature_char(ch: char) -> bool {
     )
 }
 
-/// Get the CMap lookup key for an Identity-H/V CID font without ToUnicode.
+/// Get the CMap lookup key for a Type0 CID font without ToUnicode.
 /// Returns the object number used by `collect_cmaps_from_fonts` to store the CMap:
 /// - FontFile2 or FontFile3 obj_num (for embedded font cmap)
-/// - CIDFont dict obj_num (for predefined CIDSystemInfo-based mapping)
+/// - CIDFont dict obj_num (for predefined CIDSystemInfo / named-encoding maps)
 pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<u32> {
     let subtype = font_dict
         .get(b"Subtype")
         .ok()
         .and_then(|o| o.as_name().ok());
 
-    // Type0 (CID) fonts
+    // Type0 (CID) fonts without ToUnicode: Identity-H/V and fixed-width
+    // Uni*-UCS2-* encodings register fallback CMaps under the FontFile or
+    // CIDFont object id. Mixed-width/four-byte encodings are not supported by
+    // the current decoder and must not be routed through this lookup.
     if subtype == Some(b"Type0") {
         let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
-        if encoding != b"Identity-H" && encoding != b"Identity-V" {
+        let is_identity = encoding == b"Identity-H" || encoding == b"Identity-V";
+        if !is_identity && !crate::tounicode::is_fixed_two_byte_unicode_encoding(encoding) {
             return None;
         }
         let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;

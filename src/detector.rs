@@ -1028,6 +1028,12 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
         }
     }
 
+    // Fallback 3: CIDSystemInfo / fixed-width Uni*-UCS2-* encodings map
+    // through bundled Adobe predefined CMaps (or safe UCS-2 passthrough).
+    if crate::tounicode::predefined_cmap_for_font(font_dict, doc).is_some() {
+        return true;
+    }
+
     false
 }
 
