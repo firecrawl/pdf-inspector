@@ -400,7 +400,7 @@ impl ToUnicodeCMap {
     pub fn lookup(&self, cid: u16) -> Option<String> {
         // First check direct mappings
         if let Some(s) = self.char_map.get(&cid) {
-            return Some(normalize_legacy_thai_pua(s).into_owned());
+            return Some(normalize_legacy_thai_pua(s));
         }
 
         // Binary search through sorted ranges

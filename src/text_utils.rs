@@ -5,7 +5,6 @@
 //! and markdown pipelines.
 
 use crate::types::TextItem;
-use std::borrow::Cow;
 use unicode_normalization::UnicodeNormalization;
 
 /// Return whether text is an explicit page-number expression.
@@ -167,14 +166,10 @@ pub(crate) fn is_legacy_thai_pua_char(c: char) -> bool {
     normalize_legacy_thai_pua_char(c) != c
 }
 
-pub(crate) fn normalize_legacy_thai_pua(text: &str) -> Cow<'_, str> {
-    if !text.chars().any(is_legacy_thai_pua_char) {
-        return Cow::Borrowed(text);
-    }
-
+pub(crate) fn normalize_legacy_thai_pua(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
     normalized.extend(text.chars().map(normalize_legacy_thai_pua_char));
-    Cow::Owned(normalized)
+    normalized
 }
 
 pub(crate) fn is_rtl_char(c: char) -> bool {
@@ -977,20 +972,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_thai_pua_normalization_borrows_unchanged_text() {
-        let text = "Plain text ภาษาไทย";
-        assert!(matches!(
-            normalize_legacy_thai_pua(text),
-            std::borrow::Cow::Borrowed(value) if value == text
-        ));
+    fn legacy_thai_pua_normalization_returns_owned_unchanged_text() {
+        fn assert_owned_string(_: String) {}
+
+        let normalized = normalize_legacy_thai_pua("Plain text ภาษาไทย");
+        assert_eq!(normalized, "Plain text ภาษาไทย");
+        assert_owned_string(normalized);
     }
 
     #[test]
-    fn legacy_thai_pua_normalization_owns_changed_text() {
-        assert!(matches!(
-            normalize_legacy_thai_pua("ก\u{F70B}"),
-            std::borrow::Cow::Owned(value) if value == "ก้"
-        ));
+    fn legacy_thai_pua_normalization_returns_owned_changed_text() {
+        fn assert_owned_string(_: String) {}
+
+        let normalized = normalize_legacy_thai_pua("ก\u{F70B}");
+        assert_eq!(normalized, "ก้");
+        assert_owned_string(normalized);
     }
 
     #[test]
