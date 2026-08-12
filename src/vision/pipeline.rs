@@ -106,7 +106,7 @@ impl LocalPdfOptions {
 pub struct LocalPdfResult {
     /// Final document Markdown in selected-page order.
     pub markdown: String,
-    /// Final per-page Markdown and provenance.
+    /// Final per-page Markdown and provenance, using 1-indexed page numbers.
     pub pages: Vec<FusedPageMarkdown>,
     /// Total pages in the PDF, independent of page selection.
     pub page_count: u32,
@@ -154,6 +154,10 @@ pub fn process_pdf_local_mem(
     if options.local.layout.enabled {
         return Err(LocalOcrPipelineError::LearnedLayoutUnsupported);
     }
+    OcrFusionOptions::new()
+        .render_dpi(options.local.render.dpi)
+        .hosted_recommendation_confidence(options.hosted_recommendation_confidence)
+        .validate()?;
     let minimum_confidence = options.local.ocr.minimum_confidence;
     if !minimum_confidence.is_finite() || !(0.0..=1.0).contains(&minimum_confidence) {
         return Err(LocalOcrPipelineError::InvalidMinimumConfidence {
@@ -264,7 +268,7 @@ fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers:
             document.push_str("\n\n");
         }
         if include_page_numbers {
-            document.push_str(&format!("<!-- Page {} -->\n\n", page.provenance.page));
+            document.push_str(&format!("<!-- Page {} -->\n\n", page.page));
         }
         document.push_str(page.markdown.trim());
     }
@@ -362,7 +366,8 @@ mod tests {
                 .unwrap();
 
         assert_eq!(result.pages.len(), 1);
-        assert_eq!(result.pages[0].page, 1);
+        assert_eq!(result.pages[0].page, 2);
+        assert_eq!(result.pages[0].page, result.pages[0].provenance.page);
         assert!(result.markdown.starts_with("<!-- Page 2 -->"));
     }
 
@@ -403,6 +408,26 @@ mod tests {
         assert!(matches!(
             error,
             LocalOcrPipelineError::InvalidSelectedPage { page: 4 }
+        ));
+    }
+
+    #[test]
+    fn invalid_expensive_options_fail_before_pdf_or_runtime_access() {
+        let mut invalid_dpi = LocalPdfOptions::new();
+        invalid_dpi.local.render.dpi = f32::NAN;
+        assert!(matches!(
+            process_pdf_local_mem(b"not a PDF", invalid_dpi),
+            Err(LocalOcrPipelineError::Fusion(
+                OcrFusionError::InvalidRenderDpi { .. }
+            ))
+        ));
+
+        let invalid_hosted = LocalPdfOptions::new().hosted_recommendation_confidence(1.1);
+        assert!(matches!(
+            process_pdf_local_mem(b"not a PDF", invalid_hosted),
+            Err(LocalOcrPipelineError::Fusion(
+                OcrFusionError::InvalidHostedConfidence { .. }
+            ))
         ));
     }
 }

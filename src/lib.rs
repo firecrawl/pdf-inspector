@@ -459,7 +459,7 @@ pub fn extract_pages_markdown_mem(
     buffer: &[u8],
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
-    extract_pages_markdown_mem_impl(buffer, pages, None, &MarkdownOptions::default())
+    extract_pages_markdown_mem_impl(buffer, pages, None, &MarkdownOptions::default(), false)
         .map(|(result, _)| result)
 }
 
@@ -470,7 +470,13 @@ pub(crate) fn extract_pages_markdown_mem_for_local(
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
 ) -> Result<(PagesExtractionResult, u32), PdfError> {
-    extract_pages_markdown_mem_impl(buffer, pages, password, markdown_options)
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        password,
+        markdown_options,
+        markdown_options.strip_headers_footers,
+    )
 }
 
 fn extract_pages_markdown_mem_impl(
@@ -478,6 +484,7 @@ fn extract_pages_markdown_mem_impl(
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
+    strip_repeated_headers_footers: bool,
 ) -> Result<(PagesExtractionResult, u32), PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
@@ -523,6 +530,11 @@ fn extract_pages_markdown_mem_impl(
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
+    let repeated_header_footer_items = if strip_repeated_headers_footers {
+        repeated_header_footer_item_keys(&all_items, &page_thresholds, &chart_regions, page_count)
+    } else {
+        HashSet::new()
+    };
 
     // When caller doesn't specify pages, return every page in document order.
     let all_pages: Vec<u32>;
@@ -558,7 +570,10 @@ fn extract_pages_markdown_mem_impl(
         let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
             .iter()
             .zip(&page_number_removal_mask)
-            .filter(|(item, _)| item.page == page_1idx)
+            .filter(|(item, _)| {
+                item.page == page_1idx
+                    && !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(*item))
+            })
             .map(|(item, remove)| (item.clone(), *remove))
             .unzip();
 
@@ -665,6 +680,118 @@ fn extract_pages_markdown_mem_impl(
         },
         page_count,
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HeaderFooterItemKey {
+    page: u32,
+    x: u32,
+    y: u32,
+    text: String,
+}
+
+impl From<&TextItem> for HeaderFooterItemKey {
+    fn from(item: &TextItem) -> Self {
+        Self {
+            page: item.page,
+            x: item.x.to_bits(),
+            y: item.y.to_bits(),
+            text: item.text.clone(),
+        }
+    }
+}
+
+fn repeated_header_footer_item_keys(
+    items: &[TextItem],
+    page_thresholds: &HashMap<u32, f32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    page_count: u32,
+) -> HashSet<HeaderFooterItemKey> {
+    let candidates = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.item_type,
+                types::ItemType::Text | types::ItemType::FormField
+            )
+        })
+        .cloned()
+        .collect();
+    let lines = extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
+        candidates,
+        page_thresholds,
+        &HashSet::new(),
+        chart_regions,
+    );
+    let all_items: HashSet<_> = lines
+        .iter()
+        .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
+        .collect();
+    let kept = markdown::strip_repeated_header_footer_lines(lines, page_count);
+    let kept_items: HashSet<_> = kept
+        .iter()
+        .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
+        .collect();
+    all_items.difference(&kept_items).cloned().collect()
+}
+
+#[cfg(all(test, feature = "local-ocr", not(target_arch = "wasm32")))]
+mod local_header_footer_tests {
+    use super::*;
+
+    fn item(page: u32, text: &str, y: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x: 10.0,
+            y,
+            width: 120.0,
+            height: 10.0,
+            font: "Test".to_string(),
+            font_size: 10.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: types::ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn local_pipeline_prefilters_document_wide_repeated_headers() {
+        let mut items = Vec::new();
+        let mut thresholds = HashMap::new();
+        for page in 1..=3 {
+            items.push(item(page, "Repeated report header", 800.0));
+            for line in 0..12 {
+                items.push(item(
+                    page,
+                    &format!("Page {page} paragraph {line} unique content"),
+                    700.0 - line as f32 * 40.0,
+                ));
+            }
+            thresholds.insert(page, 0.1);
+        }
+
+        let removed = repeated_header_footer_item_keys(&items, &thresholds, &HashMap::new(), 3);
+        assert_eq!(removed.len(), 2);
+        for page in 1..=3 {
+            assert_eq!(
+                removed.contains(&HeaderFooterItemKey::from(&item(
+                    page,
+                    "Repeated report header",
+                    800.0,
+                ))),
+                page > 1,
+            );
+            assert!(!removed.contains(&HeaderFooterItemKey::from(&item(
+                page,
+                &format!("Page {page} paragraph 5 unique content"),
+                500.0,
+            ))));
+        }
+    }
 }
 
 /// Path-based wrapper for [`extract_pages_markdown_mem`].

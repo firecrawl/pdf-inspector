@@ -393,7 +393,8 @@ CLI controls include `--ocr-dpi`, `--ocr-min-confidence`,
 `--ocr-hosted-threshold`, `--select-pages`, and the existing encrypted-PDF
 `--password` option. JSON output includes per-page Markdown, source/model
 provenance, confidence, timings, warnings, routed pages, and hosted-fallback
-recommendations.
+recommendations. Page numbers in `LocalPdfResult` and its per-page provenance
+are 1-indexed, matching the PDF page numbers accepted by `LocalPdfOptions::pages`.
 
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):

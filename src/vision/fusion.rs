@@ -62,6 +62,11 @@ impl OcrFusionOptions {
         self.hosted_recommendation_confidence = confidence;
         self
     }
+
+    /// Validates rendering and hosted-fallback thresholds without doing work.
+    pub fn validate(&self) -> Result<(), OcrFusionError> {
+        validate_options(self)
+    }
 }
 
 /// Final Markdown and provenance for one page.
