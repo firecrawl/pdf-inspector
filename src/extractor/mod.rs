@@ -887,6 +887,66 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     Some((end, floor * fs))
 }
 
+/// Detect a small-caps continuation: typesetters render small caps as a
+/// full-size capital immediately followed by shrunken capitals in the same
+/// font (`(R) Tj` at 9.98pt, then `(OLANDO) Tj` at 6.74pt). Those runs are one
+/// word, but the 20% font-size band in `merge_text_items` would split them,
+/// leaving "R" and "OLANDO" as separate items — which then read as separate
+/// table columns, since column boundaries cluster on item start positions.
+///
+/// Gated tightly so it cannot absorb the other reasons a smaller run follows a
+/// larger one:
+///   - superscripts / footnote markers — excluded by requiring an uppercase
+///     *letter*, so digits never qualify
+///   - drop caps — excluded because the body text that follows is mixed case
+///   - adjacent table cells or separate words — excluded by requiring the runs
+///     to be visually contiguous (essentially no gap)
+fn is_small_caps_continuation(
+    text_so_far: &str,
+    first: &TextItem,
+    next: &TextItem,
+    gap: f32,
+) -> bool {
+    // Must shrink, and only into the small-caps ratio range. Real small caps
+    // sit near 0.7-0.8 of the full cap height; anything smaller is a
+    // superscript or a different run entirely.
+    if first.font_size <= 0.0 || next.font_size >= first.font_size {
+        return false;
+    }
+    let ratio = next.font_size / first.font_size;
+    if !(0.55..=0.92).contains(&ratio) {
+        return false;
+    }
+    // Visually contiguous: the capital and its small caps touch. A real word
+    // space or a column gap disqualifies.
+    if !(-first.font_size * 0.2..=first.font_size * 0.15).contains(&gap) {
+        return false;
+    }
+    // The continuation must be all-uppercase letters (digits and lowercase
+    // both disqualify), and must contain at least one letter.
+    let mut saw_letter = false;
+    for ch in next.text.chars() {
+        if ch.is_alphabetic() {
+            saw_letter = true;
+            if !ch.is_uppercase() {
+                return false;
+            }
+        } else if ch.is_numeric() {
+            return false;
+        }
+    }
+    if !saw_letter {
+        return false;
+    }
+    // What we are continuing must itself end in a capital.
+    text_so_far
+        .trim_end()
+        .chars()
+        .rev()
+        .find(|c| c.is_alphabetic())
+        .is_some_and(|c| c.is_uppercase())
+}
+
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
@@ -945,8 +1005,16 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let mut j = i + 1;
             while j < group.len() {
                 let next = group[j];
-                // Must be similar font size (within 20%)
-                if (next.font_size - first.font_size).abs() > first.font_size * 0.20 {
+                // A small-caps junction is mid-word: it both survives the
+                // font-size band below and must never take a space.
+                let small_caps_join =
+                    is_small_caps_continuation(&text, first, next, next.x - end_x);
+                // Must be similar font size (within 20%), except for genuine
+                // small-caps runs, where the shrunken capitals are the same
+                // word as the full-size initial (see helper).
+                if (next.font_size - first.font_size).abs() > first.font_size * 0.20
+                    && !small_caps_join
+                {
                     break;
                 }
                 // Never merge across style boundaries: the merged item
@@ -1000,7 +1068,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     Some((run_end, floor)) if j <= run_end => floor,
                     _ => threshold,
                 };
-                if needs_bullet_space || gap > effective_threshold {
+                if !small_caps_join && (needs_bullet_space || gap > effective_threshold) {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
@@ -3002,6 +3070,90 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    /// Small caps as typesetters emit them: a full-size capital at 9.98pt
+    /// immediately followed by shrunken capitals at 6.74pt, touching.
+    /// Modelled on `199AD3d.pdf` p.5 ("ROLANDO T. ACOSTA, P.J.").
+    #[test]
+    fn small_caps_run_merges_into_one_word() {
+        let items = vec![
+            make_item_fs("R", 144.36, 581.84, 7.20, 9.98),
+            make_item_fs("OLANDO", 151.56, 581.84, 30.56, 6.74),
+            make_item_fs("T. A", 185.45, 581.84, 17.58, 9.98),
+            make_item_fs("COSTA", 203.94, 581.84, 23.15, 6.74),
+            make_item_fs(", P.J.", 227.09, 581.84, 22.56, 9.98),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "got {:?}", merged);
+        assert_eq!(merged[0].text, "ROLANDO T. ACOSTA, P.J.");
+    }
+
+    #[test]
+    fn small_caps_merge_does_not_swallow_a_second_column() {
+        // Same row, but a real column gap (72pt) before the next name.
+        let items = vec![
+            make_item_fs("A", 321.96, 581.84, 7.20, 9.98),
+            make_item_fs("NIL", 329.17, 581.84, 12.72, 6.74),
+            make_item_fs("C. S", 345.04, 581.84, 19.59, 9.98),
+            make_item_fs("INGH", 364.62, 581.84, 19.08, 6.74),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "got {:?}", merged);
+        assert_eq!(merged[0].text, "ANIL C. SINGH");
+    }
+
+    #[test]
+    fn superscript_footnote_marker_is_not_a_small_caps_continuation() {
+        // A digit must never qualify — otherwise footnote markers get glued on
+        // without the superscript handling.
+        assert!(!is_small_caps_continuation(
+            "MAZZARELLI",
+            &make_item_fs("MAZZARELLI", 100.0, 500.0, 50.0, 9.98),
+            &make_item_fs("1", 150.0, 503.0, 3.0, 6.74),
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn drop_cap_is_not_a_small_caps_continuation() {
+        // Mixed-case body text after a large initial is a drop cap, not small
+        // caps.
+        assert!(!is_small_caps_continuation(
+            "T",
+            &make_item_fs("T", 100.0, 500.0, 20.0, 30.0),
+            &make_item_fs("he court held", 120.0, 500.0, 60.0, 10.0),
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn separate_word_is_not_a_small_caps_continuation() {
+        // A real word space disqualifies even when both runs are uppercase.
+        let first = make_item_fs("SEE", 100.0, 500.0, 20.0, 9.98);
+        let next = make_item_fs("ALSO", 128.0, 500.0, 25.0, 6.74);
+        assert!(!is_small_caps_continuation("SEE", &first, &next, 8.0));
+    }
+
+    #[test]
+    fn lowercase_continuation_is_not_small_caps() {
+        assert!(!is_small_caps_continuation(
+            "SMALL",
+            &make_item_fs("SMALL", 100.0, 500.0, 30.0, 9.98),
+            &make_item_fs("caps", 130.0, 500.0, 20.0, 6.74),
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn too_small_a_ratio_is_not_small_caps() {
+        // 0.4 ratio is a superscript/sub-run, outside the small-caps band.
+        assert!(!is_small_caps_continuation(
+            "A",
+            &make_item_fs("A", 100.0, 500.0, 7.0, 10.0),
+            &make_item_fs("BC", 107.0, 500.0, 8.0, 4.0),
+            0.0,
+        ));
     }
 
     #[test]
