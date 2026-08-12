@@ -1161,9 +1161,19 @@ pub(crate) fn extract_text_from_operand(
                         return Some(decoded);
                     }
                 }
-                let decoded_primary = entry.primary.decode_cids(bytes);
+                // Sources for CIDs the ToUnicode CMap has no entry for, consulted
+                // per CID rather than as whole-string alternatives: scoring whole
+                // decodes cannot repair a single-glyph hole, because every
+                // candidate shares it and the winner is garbled either way.
+                let cid_chain: Vec<&crate::tounicode::ToUnicodeCMap> = entry
+                    .hole_filler
+                    .as_ref()
+                    .into_iter()
+                    .chain(entry.fallback.as_ref())
+                    .collect();
+                let decoded_primary = entry.primary.decode_cids_with_fallbacks(bytes, &cid_chain);
                 if let Some(remapped) = entry.remapped.as_ref() {
-                    let decoded_remap = remapped.decode_cids(bytes);
+                    let decoded_remap = remapped.decode_cids_with_fallbacks(bytes, &cid_chain);
                     let decoded_fallback = entry.fallback.as_ref().map(|c| c.decode_cids(bytes));
 
                     if let Some(choice) = cmap_decisions
@@ -2312,5 +2322,258 @@ end",
         // A mapping to U+FFFD is not usable — extraction rejects it as an
         // invalid CMap result — so it must not clear the gid flag.
         assert!(gid_flagged(Some("<01> <FFFD>\n<02> <FFFD>")));
+    }
+
+    /// Assemble a minimal but valid TrueType font whose `cmap` maps the given
+    /// codepoints to the given glyph ids.
+    ///
+    /// Only the tables `ttf_parser` needs to expose a cmap are emitted (`head`,
+    /// `hhea`, `maxp`, `cmap`) — there are no outlines, because the fallback
+    /// path reads nothing but the character-to-glyph mapping.
+    fn truetype_font_with_cmap(mappings: &[(u16, u16)]) -> Vec<u8> {
+        fn be16(v: u16) -> [u8; 2] {
+            v.to_be_bytes()
+        }
+
+        // cmap format 4: one single-character segment per mapping, plus the
+        // mandatory 0xFFFF terminator segment.
+        let seg_count = mappings.len() + 1;
+        let mut subtable = Vec::new();
+        subtable.extend_from_slice(&be16(4)); // format
+        subtable.extend_from_slice(&be16((16 + 8 * seg_count) as u16)); // length
+        subtable.extend_from_slice(&be16(0)); // language
+        subtable.extend_from_slice(&be16((seg_count * 2) as u16));
+        let search_range = 2 * 2u16.pow(seg_count.ilog2());
+        subtable.extend_from_slice(&be16(search_range));
+        subtable.extend_from_slice(&be16(seg_count.ilog2() as u16));
+        subtable.extend_from_slice(&be16((seg_count * 2) as u16 - search_range));
+        for (cp, _) in mappings {
+            subtable.extend_from_slice(&be16(*cp)); // endCode
+        }
+        subtable.extend_from_slice(&be16(0xFFFF));
+        subtable.extend_from_slice(&be16(0)); // reservedPad
+        for (cp, _) in mappings {
+            subtable.extend_from_slice(&be16(*cp)); // startCode
+        }
+        subtable.extend_from_slice(&be16(0xFFFF));
+        for (cp, gid) in mappings {
+            subtable.extend_from_slice(&be16(gid.wrapping_sub(*cp))); // idDelta
+        }
+        subtable.extend_from_slice(&be16(1));
+        for _ in 0..seg_count {
+            subtable.extend_from_slice(&be16(0)); // idRangeOffset
+        }
+
+        let mut cmap = Vec::new();
+        cmap.extend_from_slice(&be16(0)); // version
+        cmap.extend_from_slice(&be16(1)); // numTables
+        cmap.extend_from_slice(&be16(3)); // platformID: Windows
+        cmap.extend_from_slice(&be16(1)); // encodingID: Unicode BMP
+        cmap.extend_from_slice(&12u32.to_be_bytes()); // subtable offset
+        cmap.extend_from_slice(&subtable);
+
+        let mut head = Vec::new();
+        head.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // version
+        head.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // fontRevision
+        head.extend_from_slice(&0u32.to_be_bytes()); // checkSumAdjustment
+        head.extend_from_slice(&0x5F0F_3CF5u32.to_be_bytes()); // magicNumber
+        head.extend_from_slice(&be16(0)); // flags
+        head.extend_from_slice(&be16(1000)); // unitsPerEm
+        head.extend_from_slice(&[0u8; 16]); // created + modified
+        head.extend_from_slice(&be16(0)); // xMin
+        head.extend_from_slice(&be16(0)); // yMin
+        head.extend_from_slice(&be16(1000)); // xMax
+        head.extend_from_slice(&be16(1000)); // yMax
+        head.extend_from_slice(&be16(0)); // macStyle
+        head.extend_from_slice(&be16(8)); // lowestRecPPEM
+        head.extend_from_slice(&be16(2)); // fontDirectionHint
+        head.extend_from_slice(&be16(0)); // indexToLocFormat: short
+        head.extend_from_slice(&be16(0)); // glyphDataFormat
+
+        let mut hhea = Vec::new();
+        hhea.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // version
+        hhea.extend_from_slice(&be16(800)); // ascender
+        hhea.extend_from_slice(&be16(0u16.wrapping_sub(200))); // descender
+        for _ in 0..8 {
+            hhea.extend_from_slice(&be16(0));
+        }
+        for _ in 0..4 {
+            hhea.extend_from_slice(&be16(0)); // reserved
+        }
+        hhea.extend_from_slice(&be16(0)); // metricDataFormat
+        hhea.extend_from_slice(&be16(1)); // numberOfHMetrics
+
+        let num_glyphs = mappings.iter().map(|(_, g)| *g).max().unwrap_or(0) + 1;
+        let mut maxp = Vec::new();
+        maxp.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // version 1.0
+        maxp.extend_from_slice(&be16(num_glyphs));
+        maxp.extend_from_slice(&[0u8; 26]); // remaining 13 uint16 limits
+
+        // Table directory: records must be sorted by tag.
+        let tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
+            (b"cmap", cmap),
+            (b"head", head),
+            (b"hhea", hhea),
+            (b"maxp", maxp),
+        ];
+        let num_tables = tables.len() as u16;
+        let mut font = Vec::new();
+        font.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // sfnt version
+        font.extend_from_slice(&be16(num_tables));
+        let search_range = 16 * 2u16.pow(num_tables.ilog2());
+        font.extend_from_slice(&be16(search_range));
+        font.extend_from_slice(&be16(num_tables.ilog2() as u16));
+        font.extend_from_slice(&be16(num_tables * 16 - search_range));
+
+        let mut offset = 12 + 16 * tables.len() as u32;
+        let mut body = Vec::new();
+        for (tag, data) in &tables {
+            font.extend_from_slice(*tag);
+            font.extend_from_slice(&0u32.to_be_bytes()); // checksum: unverified
+            font.extend_from_slice(&offset.to_be_bytes());
+            font.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            offset += data.len().next_multiple_of(4) as u32;
+            body.extend_from_slice(data);
+            body.resize(body.len().next_multiple_of(4), 0);
+        }
+        font.extend_from_slice(&body);
+        font
+    }
+
+    /// A Type0/Identity-H document reproducing the defect this fix targets:
+    /// the embedded font draws nun (U+05E0) as GID 0xAA and gives it a width,
+    /// but the ToUnicode CMap has no entry for that CID.
+    fn doc_with_tounicode_hole() -> (Document, u32) {
+        let mut doc = Document::with_version("1.7");
+
+        // The font draws the four letters of "מנחם" plus nine more, matching
+        // the real file's shape: a CMap rich enough to look healthy, with one
+        // letter missing from it.
+        let mut glyphs = vec![
+            (0x05DE_u16, 0x00A9_u16), // mem
+            (0x05E0, 0x00AA),         // nun — the letter ToUnicode never names
+            (0x05D7, 0x00AB),         // het
+            (0x05DD, 0x00AC),         // final mem
+        ];
+        for (i, cp) in (0x05D0..=0x05D8_u16).enumerate() {
+            glyphs.push((cp, 0x00B0 + i as u16));
+        }
+        glyphs.sort_by_key(|(cp, _)| *cp);
+        let font_file_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            truetype_font_with_cmap(&glyphs),
+        )));
+
+        // Every glyph the font carries except nun gets a ToUnicode entry.
+        let mut entries = String::new();
+        for (cp, gid) in glyphs.iter().filter(|(cp, _)| *cp != 0x05E0) {
+            entries.push_str(&format!("<{gid:04X}> <{cp:04X}>\n"));
+        }
+        let cmap = format!(
+            "/CIDInit /ProcSet findresource begin\n\
+             1 begincodespacerange\n\
+             <0000><FFFF>\n\
+             endcodespacerange\n\
+             {} beginbfchar\n{entries}endbfchar\n\
+             endcmap\n",
+            glyphs.len() - 1,
+        );
+        let tounicode_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            cmap.as_bytes().to_vec(),
+        )));
+
+        let descriptor_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "CIDFont+F2",
+            "Flags" => Object::Integer(6),
+            "FontFile2" => Object::Reference(font_file_id),
+        });
+        // /W gives every drawn CID a width, nun included — the signal the hole
+        // gate reads before deciding the embedded font is worth parsing.
+        let mut w_array = Vec::new();
+        for (_, gid) in &glyphs {
+            w_array.push(Object::Integer(*gid as i64));
+            w_array.push(Object::Array(vec![Object::Integer(500)]));
+        }
+        let w_id = doc.add_object(Object::Array(w_array));
+        let cid_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "CIDFont+F2",
+            "CIDToGIDMap" => Object::Name(b"Identity".to_vec()),
+            "FontDescriptor" => Object::Reference(descriptor_id),
+            "W" => Object::Reference(w_id),
+        });
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "CIDFont+F2",
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+            "ToUnicode" => Object::Reference(tounicode_id),
+        });
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        (doc, tounicode_id.0)
+    }
+
+    fn decode_with_hole_doc(cid_bytes: Vec<u8>) -> String {
+        let (doc, tounicode_obj) = doc_with_tounicode_hole();
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        font_tounicode_refs.insert("F1".to_string(), tounicode_obj);
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F1".to_string(), make_font_info(&[], 1000, true));
+
+        extract_text_from_operand(
+            &Object::String(cid_bytes, lopdf::StringFormat::Hexadecimal),
+            "F1",
+            Some("CIDFont+F2"),
+            &font_cmaps,
+            &font_tounicode_refs,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut CMapDecisionCache::new(),
+            &font_widths,
+        )
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn cid_absent_from_tounicode_is_recovered_from_the_embedded_font() {
+        // "מנחם" as Identity-H CIDs A9 AA AB AC. The ToUnicode CMap names
+        // three of the four; the fourth is only nameable through the font's
+        // own cmap, which is where the standard resolution chain goes next.
+        let text = decode_with_hole_doc(vec![0x00, 0xA9, 0x00, 0xAA, 0x00, 0xAB, 0x00, 0xAC]);
+
+        assert_eq!(text, "\u{05DE}\u{05E0}\u{05D7}\u{05DD}", "got {text:?}");
+        assert!(!text.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn lone_cid_absent_from_tounicode_does_not_become_a_replacement_char() {
+        // Kerned runs put the unmapped CID in an operand by itself, which is
+        // how this defect surfaced as U+FFFD rather than as a dropped letter.
+        let text = decode_with_hole_doc(vec![0x00, 0xAA]);
+
+        assert_eq!(text, "\u{05E0}", "got {text:?}");
     }
 }
