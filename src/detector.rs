@@ -609,11 +609,44 @@ fn font_info_from_object(doc: &Document, font: &Object) -> Option<FontInfo> {
     })
 }
 
+/// Identity for a resolved font so the same dictionary is cloned once.
+/// Indirect fonts are unique by object id; inline dictionaries are unique
+/// by the resource dict they live in plus the font name in that scope.
+#[derive(Hash, Eq, PartialEq)]
+enum FontDedupKey {
+    Indirect(ObjectId),
+    Inline { scope: usize, name: Vec<u8> },
+}
+
+fn push_resolved_font(
+    doc: &Document,
+    font: &Object,
+    name: &[u8],
+    scope: usize,
+    used_fonts: &mut Vec<FontInfo>,
+    seen: &mut HashSet<FontDedupKey>,
+) {
+    let key = match font {
+        Object::Reference(id) => FontDedupKey::Indirect(*id),
+        _ => FontDedupKey::Inline {
+            scope,
+            name: name.to_vec(),
+        },
+    };
+    if !seen.insert(key) {
+        return;
+    }
+    if let Some(info) = font_info_from_object(doc, font) {
+        used_fonts.push(info);
+    }
+}
+
 fn resolve_font_names(
     doc: &Document,
     resources: &lopdf::Dictionary,
     font_names: &HashSet<Vec<u8>>,
     used_fonts: &mut Vec<FontInfo>,
+    seen: &mut HashSet<FontDedupKey>,
 ) {
     let font_obj = match resources.get(b"Font").ok() {
         Some(obj) => obj,
@@ -627,27 +660,33 @@ fn resolve_font_names(
     let Some(font_dict) = font_dict else {
         return;
     };
+    let scope = font_dict as *const _ as usize;
     for name in font_names {
         if let Ok(font) = font_dict.get(name) {
-            if let Some(info) = font_info_from_object(doc, font) {
-                used_fonts.push(info);
-            }
+            push_resolved_font(doc, font, name, scope, used_fonts, seen);
         }
     }
 }
 
+/// Returns `Some(())` when this resource dict defines `font_name`, so
+/// ancestor scopes are shadowed even if the object cannot be decoded.
 fn lookup_font(
     doc: &Document,
     resources: &lopdf::Dictionary,
     font_name: &[u8],
-) -> Option<Option<FontInfo>> {
+    used_fonts: &mut Vec<FontInfo>,
+    seen: &mut HashSet<FontDedupKey>,
+) -> Option<()> {
     let font_obj = resources.get(b"Font").ok()?;
     let font_dict = match font_obj {
         Object::Dictionary(d) => Some(d),
         Object::Reference(r) => doc.get_dictionary(*r).ok(),
         _ => None,
     }?;
-    Some(font_info_from_object(doc, font_dict.get(font_name).ok()?))
+    let font = font_dict.get(font_name).ok()?;
+    let scope = font_dict as *const _ as usize;
+    push_resolved_font(doc, font, font_name, scope, used_fonts, seen);
+    Some(())
 }
 
 /// Resolve page-level font names with PDF resource inheritance shadowing.
@@ -663,20 +702,19 @@ fn resolve_with_shadowing(
     ancestor_resource_ids: &[ObjectId],
     names: &HashSet<Vec<u8>>,
     used_fonts: &mut Vec<FontInfo>,
+    seen: &mut HashSet<FontDedupKey>,
 ) {
     'name: for name in names {
         // Check page's own inline /Resources first (most specific scope)
         if let Some(rd) = own_resources {
-            if let Some(font) = lookup_font(doc, rd, name) {
-                used_fonts.extend(font);
+            if lookup_font(doc, rd, name, used_fonts, seen).is_some() {
                 continue 'name;
             }
         }
         // Walk inherited resource dicts (most-specific to root); first hit wins
         for ancestor_id in ancestor_resource_ids {
             if let Ok(rd) = doc.get_dictionary(*ancestor_id) {
-                if let Some(font) = lookup_font(doc, rd, name) {
-                    used_fonts.extend(font);
+                if lookup_font(doc, rd, name, used_fonts, seen).is_some() {
                     continue 'name;
                 }
             }
@@ -693,6 +731,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut font_changes = 0u32;
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
     let mut used_fonts = Vec::new();
+    let mut seen_fonts = HashSet::new();
 
     // Get content streams for this page — these use the page's resource dict
     let content_streams = doc.get_page_contents(page_id);
@@ -732,6 +771,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     resource_ids,
                     &page_font_names,
                     &mut used_fonts,
+                    &mut seen_fonts,
                 );
             }
         }
@@ -748,6 +788,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 &mut visited,
                 &mut all_unique_chars,
                 &mut used_fonts,
+                &mut seen_fonts,
             );
             text_ops += ops;
             image_count += imgs;
@@ -763,6 +804,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     &mut visited,
                     &mut all_unique_chars,
                     &mut used_fonts,
+                    &mut seen_fonts,
                 );
                 text_ops += ops;
                 image_count += imgs;
@@ -1190,6 +1232,7 @@ fn scan_xobjects_in_resources(
     visited: &mut HashSet<ObjectId>,
     unique_chars: &mut HashSet<u8>,
     used_fonts: &mut Vec<FontInfo>,
+    seen: &mut HashSet<FontDedupKey>,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
@@ -1251,10 +1294,16 @@ fn scan_xobjects_in_resources(
                     if let Some(res) = xobj_res {
                         // Resolve font names against the XObject's own resource dict
                         // (P1 fix: scoped resolution, not global name-based lookup)
-                        resolve_font_names(doc, res, &xobj_font_names, used_fonts);
+                        resolve_font_names(doc, res, &xobj_font_names, used_fonts, seen);
                         // Recurse into nested XObjects
-                        let (ops2, imgs2, paths2, fonts2) =
-                            scan_xobjects_in_resources(doc, res, visited, unique_chars, used_fonts);
+                        let (ops2, imgs2, paths2, fonts2) = scan_xobjects_in_resources(
+                            doc,
+                            res,
+                            visited,
+                            unique_chars,
+                            used_fonts,
+                            seen,
+                        );
                         text_ops += ops2;
                         image_count += imgs2;
                         path_ops += paths2;
