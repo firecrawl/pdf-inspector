@@ -125,6 +125,38 @@ fn union_bucket_pairs(
     }
 }
 
+fn union_rect_against_bands(
+    uf: &mut UnionFind,
+    rects: &[(f32, f32, f32, f32)],
+    i: usize,
+    bands: &BTreeMap<i32, Vec<usize>>,
+    lo: i32,
+    hi: i32,
+    tolerance: f32,
+) {
+    if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+        return;
+    }
+    for (_, bucket) in bands.range(lo..=hi) {
+        let mut pairs = 0usize;
+        for &j in bucket {
+            if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                break;
+            }
+            if i == j || uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                continue;
+            }
+            pairs += 1;
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Maximum component size for rect clustering.  No real table has thousands
 /// of cell rects — once a component exceeds this, it is a vector drawing or
 /// page-spanning clipping path.  We skip overlap checks for rects already in
@@ -227,10 +259,14 @@ pub(crate) fn cluster_rects(
     }
 
     // Oversized-vs-oversized: band on the short axis so stacked or side-by-side
-    // page-spanning rules stay linear. Dual-oversized rects use a coarser Y band.
-    let mut large_x: HashMap<i32, Vec<usize>> = HashMap::new();
-    let mut large_y: HashMap<i32, Vec<usize>> = HashMap::new();
-    let mut large_coarse_y: HashMap<i32, Vec<usize>> = HashMap::new();
+    // page-spanning rules stay linear. Wide vs tall pairs are matched by
+    // querying the tall X-index; dual-oversized rects occupy every coarse-Y
+    // cell they span.
+    let mut large_x: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut large_y: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut large_coarse_y: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut wide: Vec<usize> = Vec::new();
+    let mut dual: Vec<usize> = Vec::new();
     for &i in &large {
         let (x, y, w, h) = rects[i];
         let xs = grid_span(x - tolerance, x + w + tolerance, cell);
@@ -242,22 +278,43 @@ pub(crate) fn cluster_rects(
                 }
             }
             (_, Some(ys)) => {
+                wide.push(i);
                 for gy in ys {
                     large_y.entry(gy).or_default().push(i);
                 }
             }
             _ => {
-                let gy = grid_coord(y - tolerance, cell * 64.0);
-                large_coarse_y.entry(gy).or_default().push(i);
+                dual.push(i);
+                let coarse = cell * 64.0;
+                match grid_span(y - tolerance, y + h + tolerance, coarse) {
+                    Some(ys) => {
+                        for gy in ys {
+                            large_coarse_y.entry(gy).or_default().push(i);
+                        }
+                    }
+                    None => {
+                        large_coarse_y.entry(i32::MIN).or_default().push(i);
+                    }
+                }
             }
         }
     }
     for bands in [&large_x, &large_y, &large_coarse_y] {
-        let mut band_keys: Vec<_> = bands.keys().copied().collect();
-        band_keys.sort_unstable();
-        for key in band_keys {
-            union_bucket_pairs(&mut uf, rects, &bands[&key], tolerance);
+        for bucket in bands.values() {
+            union_bucket_pairs(&mut uf, rects, bucket, tolerance);
         }
+    }
+    for &i in wide.iter().chain(&dual) {
+        let (x, _, w, _) = rects[i];
+        let x_lo = grid_coord(x - tolerance, cell);
+        let x_hi = grid_coord(x + w + tolerance, cell);
+        union_rect_against_bands(&mut uf, rects, i, &large_x, x_lo, x_hi, tolerance);
+    }
+    for &i in &dual {
+        let (_, y, _, h) = rects[i];
+        let y_lo = grid_coord(y - tolerance, cell);
+        let y_hi = grid_coord(y + h + tolerance, cell);
+        union_rect_against_bands(&mut uf, rects, i, &large_y, y_lo, y_hi, tolerance);
     }
 
     // Group indices by root
@@ -4031,6 +4088,22 @@ mod tests {
                 .any(|g| g.contains(&wide) && g.contains(&target)),
             "wide rule and far-end cell must share a cluster"
         );
+    }
+
+    #[test]
+    fn test_cluster_rects_wide_and_tall_oversized_union() {
+        let rects = vec![(0.0, 0.0, 5000.0, 10.0), (0.0, 0.0, 10.0, 5000.0)];
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_dual_oversized_spans_coarse_y() {
+        let rects = vec![(0.0, 0.0, 5000.0, 5000.0), (0.0, 4500.0, 5000.0, 5000.0)];
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
     }
 
     // --- snap_edges ---
