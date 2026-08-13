@@ -1382,7 +1382,11 @@ fn scan_content_for_text_operators(
     let is_word_end =
         |pos: usize| -> bool { pos + 1 >= content.len() || content[pos + 1].is_ascii_whitespace() };
 
-    // Simple state machine to find operators
+    // Simple state machine to find operators.
+    // Each Tj/TJ/Tf lookback stops at the previous text/font operator so a
+    // malformed `] TJ` (no `[`) cannot rescan the entire prefix — that was
+    // quadratic in the number of operators.
+    let mut operand_floor = 0usize;
     let mut i = 0;
     while i < content.len() {
         let b = content[i];
@@ -1399,7 +1403,8 @@ fn scan_content_for_text_operators(
                 {
                     text_ops += 1;
                     // Scan backward for text string operand to collect unique chars
-                    collect_text_chars_before(content, i, unique_chars);
+                    collect_text_chars_before(content, i, unique_chars, operand_floor);
+                    operand_floor = i;
                 }
             } else if next == b'f' {
                 // Tf = set font operator
@@ -1419,9 +1424,10 @@ fn scan_content_for_text_operators(
                     // Extract the font name operand preceding the size + Tf.
                     // Pattern: /FontName <size> Tf
                     // Scan backward past the size number and whitespace to find /Name.
-                    if let Some(name) = extract_font_name_before_tf(content, i) {
+                    if let Some(name) = extract_font_name_before_tf(content, i, operand_floor) {
                         used_font_names.insert(name);
                     }
+                    operand_floor = i;
                 }
             }
         }
@@ -1473,25 +1479,27 @@ fn scan_content_for_text_operators(
 /// whitespace to find the `/Name` token.
 ///
 /// Returns the font name bytes (without the leading `/`), e.g. `b"F1"` for `/F1`.
-fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>> {
+/// `floor` is the start of the previous text/font operator (or 0); lookback
+/// must not cross it.
+fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> Option<Vec<u8>> {
     // Scan backward past whitespace before "Tf"
     let mut j = tf_pos;
-    while j > 0 && content[j - 1].is_ascii_whitespace() {
+    while j > floor && content[j - 1].is_ascii_whitespace() {
         j -= 1;
     }
     // Scan backward past the size number (digits, '.', '-')
-    while j > 0
+    while j > floor
         && (content[j - 1].is_ascii_digit() || content[j - 1] == b'.' || content[j - 1] == b'-')
     {
         j -= 1;
     }
     // Scan backward past whitespace between font name and size
-    while j > 0 && content[j - 1].is_ascii_whitespace() {
+    while j > floor && content[j - 1].is_ascii_whitespace() {
         j -= 1;
     }
     // Now j should point just after the font name. Scan backward to find '/'.
     let name_end = j;
-    while j > 0 && content[j - 1] != b'/' {
+    while j > floor && content[j - 1] != b'/' {
         // Font names consist of regular characters (not whitespace, not delimiters)
         if content[j - 1].is_ascii_whitespace() || content[j - 1] == b'(' || content[j - 1] == b')'
         {
@@ -1499,7 +1507,7 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>>
         }
         j -= 1;
     }
-    if j == 0 || content[j - 1] != b'/' {
+    if j <= floor || content[j - 1] != b'/' {
         return None;
     }
     // j-1 is the '/', font name is content[j..name_end]
@@ -1514,16 +1522,24 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>>
 /// and collect unique non-whitespace bytes from it.
 ///
 /// Handles both literal strings `(...)` and hex strings `<...>`.
-fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut HashSet<u8>) {
+/// `floor` is the start of the previous text/font operator (or 0); lookback
+/// must not cross it, or a missing `[` before `TJ` rescans the whole prefix.
+fn collect_text_chars_before(
+    content: &[u8],
+    op_pos: usize,
+    unique_chars: &mut HashSet<u8>,
+    floor: usize,
+) {
     // Walk backward past whitespace to find the closing delimiter
     let mut j = op_pos;
-    while j > 0 {
+    while j > floor {
         j -= 1;
         if !content[j].is_ascii_whitespace() {
             break;
         }
     }
-    if j == 0 {
+    // All whitespace, or we landed on the previous operator token.
+    if j == floor {
         return;
     }
 
@@ -1533,7 +1549,7 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
         // Literal string: scan backward for matching '('
         let mut depth = 1i32;
         let mut k = j;
-        while k > 0 && depth > 0 {
+        while k > floor && depth > 0 {
             k -= 1;
             match content[k] {
                 b')' if k == 0 || content[k - 1] != b'\\' => depth += 1,
@@ -1552,7 +1568,7 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
     } else if closing == b'>' {
         // Hex string: scan backward for '<'
         let mut k = j;
-        while k > 0 {
+        while k > floor {
             k -= 1;
             if content[k] == b'<' {
                 break;
@@ -1582,7 +1598,7 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
     } else if closing == b']' {
         // TJ array: scan backward for '[' and collect from all strings inside
         let mut k = j;
-        while k > 0 {
+        while k > floor {
             k -= 1;
             if content[k] == b'[' {
                 break;
@@ -2012,6 +2028,37 @@ mod tests {
             scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
         assert_eq!(ops3, 0);
         assert_eq!(imgs3, 0);
+    }
+
+    #[test]
+    fn test_scan_content_successive_tj_collects_each_operand() {
+        // Lookback is floored at the previous Tj/TJ/Tf so later operators must
+        // still see their own operands.
+        let content = b"[(Hello)] TJ [(World)] TJ (More) Tj";
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, 3);
+        for &ch in b"HeloWrdM" {
+            assert!(uchars.contains(&ch), "missing char {}", ch as char);
+        }
+    }
+
+    #[test]
+    fn test_scan_content_malformed_tj_lookback_stays_linear() {
+        // `] TJ` with no `[` used to walk the entire prefix for every operator
+        // (quadratic). 30k repeats is enough that a prefix rescan would dominate
+        // the test runtime; with the floor it is a single linear pass.
+        let n = 30_000usize;
+        let mut content = Vec::with_capacity(n * 5);
+        for _ in 0..n {
+            content.extend_from_slice(b"] TJ\n");
+        }
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, n as u32);
+        assert!(uchars.is_empty());
     }
 
     #[test]
@@ -2772,14 +2819,14 @@ mod tests {
     fn test_extract_font_name_basic() {
         // Standard pattern: /F1 12 Tf
         let content = b"/F1 12 Tf";
-        let name = extract_font_name_before_tf(content, 6); // 'T' is at index 6
+        let name = extract_font_name_before_tf(content, 6, 0); // 'T' is at index 6
         assert_eq!(name, Some(b"F1".to_vec()));
     }
 
     #[test]
     fn test_extract_font_name_long_name() {
         let content = b"/ArialMT-Bold 9.5 Tf";
-        let name = extract_font_name_before_tf(content, 18);
+        let name = extract_font_name_before_tf(content, 18, 0);
         assert_eq!(name, Some(b"ArialMT-Bold".to_vec()));
     }
 
