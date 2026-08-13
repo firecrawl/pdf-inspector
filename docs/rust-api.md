@@ -81,6 +81,12 @@ match info.pdf_type {
 }
 ```
 
+`detect_pdf*` and `classify_pdf_mem` only inspect structural signals. They do
+not extract text or validate font/character encoding, so an empty
+`pages_needing_ocr` is not a text-quality verdict. Use `ProcessMode::Analyze`
+to run extraction and text-quality routing without generating Markdown, or use
+`extract_pages_markdown*` when per-page Markdown is also needed.
+
 Customize processing with `PdfOptions`:
 
 ```rust
@@ -171,18 +177,19 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | Mode | What it does | Returns |
 |---|---|---|
 | `ProcessMode::Full` (default) | Detect + extract + convert to Markdown | Everything populated |
-| `ProcessMode::Analyze` | Detect + extract + layout analysis (no Markdown) | `markdown` is `None`, `layout` is populated |
-| `ProcessMode::DetectOnly` | Classification only (fastest) | `markdown` is `None`, `layout` is default |
+| `ProcessMode::Analyze` | Detect + extract + text-quality/layout analysis (no Markdown) | `markdown` is `None`, `layout` and encoding-quality OCR routing are populated |
+| `ProcessMode::DetectOnly` | Structural classification only (fastest; no text-quality analysis) | `markdown` is `None`, `layout` is default |
 
 ## Functions
 
 | Function | Description |
 |---|---|
 | `process_pdf(path)` | Full processing with defaults |
-| `detect_pdf(path)` | Fast metadata-only detection (no extraction) |
+| `detect_pdf(path)` | Fast structural detection (no extraction or text-quality analysis) |
 | `process_pdf_with_options(path, options)` | Process with custom `PdfOptions` |
 | `process_pdf_mem(bytes)` | Full processing from a byte buffer |
-| `detect_pdf_mem(bytes)` | Fast detection from a byte buffer |
+| `detect_pdf_mem(bytes)` | Fast structural detection from a byte buffer |
+| `classify_pdf_mem(bytes)` | Lightweight structural classification; 0-indexed OCR pages, no text-quality analysis |
 | `process_pdf_mem_with_options(bytes, options)` | Process from bytes with custom options |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_with_positions(path)` | Text with X/Y coordinates and font info |

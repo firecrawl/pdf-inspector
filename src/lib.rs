@@ -380,14 +380,21 @@ pub struct PdfClassification {
     pub pdf_type: PdfType,
     /// Total page count.
     pub page_count: u32,
-    /// 0-indexed page numbers that need OCR (scanned/image pages).
+    /// 0-indexed page numbers that need OCR based on structural signals such
+    /// as scanned/image pages. Lightweight classification does not extract
+    /// text, so an empty list is not a verdict on text encoding quality.
     pub pages_needing_ocr: Vec<u32>,
     /// Detection confidence score (0.0–1.0).
     pub confidence: f32,
 }
 
 /// Classify a PDF from a memory buffer without extracting text.
-/// Returns the PDF type and which pages need OCR (~10-50ms).
+/// Returns the PDF type and pages with structural OCR signals (~10-50ms).
+///
+/// This fast path does not validate extracted-text encoding quality. Use
+/// [`extract_pages_markdown_mem`] when encoding-quality OCR routing is needed,
+/// or [`process_pdf_mem_with_options`] with [`ProcessMode::Analyze`] to run
+/// text-quality analysis without generating Markdown.
 pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem(buffer)?;

@@ -28,12 +28,18 @@ class PageOcrReasons:
     """Machine-readable OCR reason identifiers."""
 
 class PdfClassification:
-    """Lightweight PDF classification result."""
+    """Lightweight structural PDF classification result.
+
+    This result does not include extracted-text encoding-quality analysis.
+    """
     pdf_type: str
     """'text_based', 'scanned', 'image_based', or 'mixed'."""
     page_count: int
     pages_needing_ocr: list[int]
-    """0-indexed page numbers that need OCR."""
+    """0-indexed pages with structural OCR signals.
+
+    An empty list does not assert that extracted text has a valid encoding.
+    """
     confidence: float
 
 class TextItem:
@@ -123,11 +129,11 @@ def detect_pdf_bytes(data: bytes) -> PdfResult:
     ...
 
 def classify_pdf(path: str) -> PdfClassification:
-    """Lightweight classification — type, page count, and OCR pages (0-indexed)."""
+    """Lightweight structural classification without text-quality analysis."""
     ...
 
 def classify_pdf_bytes(data: bytes) -> PdfClassification:
-    """Lightweight classification from bytes."""
+    """Lightweight structural classification without text-quality analysis."""
     ...
 
 def extract_text(path: str) -> str:
