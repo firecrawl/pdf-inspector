@@ -82,12 +82,16 @@ fn grid_coord(value: f32, cell: f32) -> i32 {
     (value / cell).floor().clamp(-1_000_000.0, 1_000_000.0) as i32
 }
 
-/// Inclusive grid range, capped so a pathological huge rect cannot fill
-/// millions of buckets.
-fn grid_span(lo: f32, hi: f32, cell: f32) -> std::ops::RangeInclusive<i32> {
+/// Inclusive grid range. `None` if the rect covers more cells than we will
+/// materialize — those rects are clustered via a bounded fallback.
+fn grid_span(lo: f32, hi: f32, cell: f32) -> Option<std::ops::RangeInclusive<i32>> {
     let a = grid_coord(lo.min(hi), cell);
     let b = grid_coord(lo.max(hi), cell);
-    a..=a.saturating_add((b.saturating_sub(a)).min(64))
+    let span = b.saturating_sub(a);
+    if span > 64 {
+        return None;
+    }
+    Some(a..=b)
 }
 
 /// Maximum component size for rect clustering.  No real table has thousands
@@ -122,15 +126,27 @@ pub(crate) fn cluster_rects(
     let cell = CLUSTER_GRID_CELL.max(tolerance * 4.0);
 
     let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let mut large: Vec<usize> = Vec::new();
     for (idx, &(x, y, w, h)) in rects.iter().enumerate() {
-        for gx in grid_span(x - tolerance, x + w + tolerance, cell) {
-            for gy in grid_span(y - tolerance, y + h + tolerance, cell) {
-                grid.entry((gx, gy)).or_default().push(idx);
+        match (
+            grid_span(x - tolerance, x + w + tolerance, cell),
+            grid_span(y - tolerance, y + h + tolerance, cell),
+        ) {
+            (Some(xs), Some(ys)) => {
+                for gx in xs {
+                    for gy in ys.clone() {
+                        grid.entry((gx, gy)).or_default().push(idx);
+                    }
+                }
             }
+            _ => large.push(idx),
         }
     }
 
-    for bucket in grid.values() {
+    let mut keys: Vec<_> = grid.keys().copied().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let bucket = &grid[&key];
         let m = bucket.len();
         let mut pairs = 0usize;
         'cell: for a in 0..m {
@@ -151,6 +167,25 @@ pub(crate) fn cluster_rects(
                     if uf.component_size(i) >= MAX_CLUSTER_RECTS {
                         break;
                     }
+                }
+            }
+        }
+    }
+
+    // Oversized spans skip the grid; compare them against every rect so a
+    // page-wide rule still unions the cells it actually overlaps.
+    for &i in large.iter().take(32) {
+        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+            continue;
+        }
+        for j in 0..n {
+            if i == j || uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                continue;
+            }
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    break;
                 }
             }
         }
@@ -3884,6 +3919,15 @@ mod tests {
         rects.push((500.0, 0.0, 10.0, 10.0));
         rects.push((508.0, 0.0, 10.0, 10.0));
         let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_oversized_span_still_unions() {
+        // Wider than 64 grid cells; must still union the small overlapping rect.
+        let rects = vec![(0.0, 0.0, 5000.0, 10.0), (4900.0, 0.0, 10.0, 10.0)];
+        let groups = cluster_rects(&rects, 0.0, 1);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
     }
