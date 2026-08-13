@@ -1867,11 +1867,11 @@ fn merge_cmaps(mut base: ToUnicodeCMap, overlay: ToUnicodeCMap) -> ToUnicodeCMap
     base
 }
 
-/// Upper bound on CID range *insert operations* (`/W` width parse, Encoding
-/// `begincidrange`). Counts every assignment, including overwrites, so
-/// repeating a full-width range cannot re-expand the 16-bit domain. Overlapping
-/// ranges that exceed this many inserts are truncated; a unique-key-only cap
-/// would let later full-range copies keep overwriting at unbounded cost.
+/// Shared 16-bit CID expansion cap (65,536).
+/// Encoding `begincidrange` and `/W` width assignment count every insert,
+/// including overwrites, so a repeated full-width range cannot keep working
+/// after the domain is filled. The `/W` unicode heuristic caps unique CIDs
+/// with the same number.
 pub(crate) const MAX_CID_W_EXPANSION: usize = 65_536;
 
 /// Check if a CIDFont's /W (widths) array contains CID values that look like
