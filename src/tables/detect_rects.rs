@@ -137,11 +137,11 @@ fn union_rect_against_bands(
     if uf.component_size(i) >= MAX_CLUSTER_RECTS {
         return;
     }
+    let mut pairs = 0usize;
     for (_, bucket) in bands.range(lo..=hi) {
-        let mut pairs = 0usize;
         for &j in bucket {
             if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
-                break;
+                return;
             }
             if i == j || uf.component_size(j) >= MAX_CLUSTER_RECTS {
                 continue;
@@ -304,17 +304,27 @@ pub(crate) fn cluster_rects(
             union_bucket_pairs(&mut uf, rects, bucket, tolerance);
         }
     }
-    for &i in wide.iter().chain(&dual) {
-        let (x, _, w, _) = rects[i];
-        let x_lo = grid_coord(x - tolerance, cell);
-        let x_hi = grid_coord(x + w + tolerance, cell);
-        union_rect_against_bands(&mut uf, rects, i, &large_x, x_lo, x_hi, tolerance);
-    }
-    for &i in &dual {
-        let (_, y, _, h) = rects[i];
-        let y_lo = grid_coord(y - tolerance, cell);
-        let y_hi = grid_coord(y + h + tolerance, cell);
-        union_rect_against_bands(&mut uf, rects, i, &large_y, y_lo, y_hi, tolerance);
+    // Cross-orientation is |wide|×|tall| if every wide rule spans the page.
+    // Skip that pass when the product cannot be a table (a few rules).
+    let tall_n = large
+        .len()
+        .saturating_sub(wide.len())
+        .saturating_sub(dual.len());
+    let cross_n =
+        (wide.len() + dual.len()).saturating_mul(tall_n) + dual.len().saturating_mul(wide.len());
+    if cross_n > 0 && cross_n <= MAX_CLUSTER_PAIRS_PER_CELL {
+        for &i in wide.iter().chain(&dual) {
+            let (x, _, w, _) = rects[i];
+            let x_lo = grid_coord(x - tolerance, cell);
+            let x_hi = grid_coord(x + w + tolerance, cell);
+            union_rect_against_bands(&mut uf, rects, i, &large_x, x_lo, x_hi, tolerance);
+        }
+        for &i in &dual {
+            let (_, y, _, h) = rects[i];
+            let y_lo = grid_coord(y - tolerance, cell);
+            let y_hi = grid_coord(y + h + tolerance, cell);
+            union_rect_against_bands(&mut uf, rects, i, &large_y, y_lo, y_hi, tolerance);
+        }
     }
 
     // Group indices by root
@@ -4104,6 +4114,16 @@ mod tests {
         let groups = cluster_rects(&rects, 0.0, 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_wide_and_tall_stays_subquadratic() {
+        let mut rects = Vec::with_capacity(4_000);
+        for i in 0..2_000 {
+            rects.push((0.0, i as f32 * 20.0, 5000.0, 10.0));
+            rects.push((i as f32 * 20.0, 0.0, 10.0, 5000.0));
+        }
+        let _groups = cluster_rects(&rects, 0.0, 2);
     }
 
     // --- snap_edges ---
