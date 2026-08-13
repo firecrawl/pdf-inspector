@@ -1,0 +1,30 @@
+src/detector.rs
+  s_8b81192caa100a::t_01170de2e7c1ca 1427
+  s_8b81192caa100a::t_040d2bf535a822 1525-1532,1535,1542
+  s_8b81192caa100a::t_112567684303c3 1601
+  s_8b81192caa100a::t_e51b894608c5a6 1541,1552
+  s_8b81192caa100a::t_8899849874a594 2034-2063
+  s_8b81192caa100a::t_e0f278b457e2c3 1571
+  s_8b81192caa100a::t_94a59d61a8a12e 2822
+  s_8b81192caa100a::t_887d7021992da7 1510
+  s_8b81192caa100a::t_55768307d17f13 1487,1491,1497,1502
+  s_8b81192caa100a::t_def3f513bc66e9 2829
+  s_8b81192caa100a::t_52f3daf3dcab7e 1482-1484
+  s_8b81192caa100a::t_6cf84d1fb961f3 1385-1389,1406-1407,1430
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "1d9a02525d29afe354ac5c0b5253747343b22007",
+  "prompts": {},
+  "sessions": {
+    "s_8b81192caa100a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "69c52882-fd38-4082-bcc6-5f7987f37382",
+        "model": "grok-4.6"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
