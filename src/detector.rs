@@ -1608,6 +1608,7 @@ struct InlineImageParams {
     components: Option<u32>,
     has_filter: bool,
     dct: bool,
+    image_mask: bool,
 }
 
 const MAX_INLINE_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
@@ -1628,9 +1629,11 @@ fn parse_inline_image_dict(dict: &[u8]) -> InlineImageParams {
             b"H" | b"Height" => params.height = read_pdf_u32(&dict[i..]),
             b"BPC" | b"BitsPerComponent" => params.bpc = read_pdf_u32(&dict[i..]),
             b"CS" | b"ColorSpace" => {
-                if let Some(cs) = read_pdf_name_token(&dict[i..]) {
-                    params.components = Some(inline_color_components(cs));
-                }
+                params.components =
+                    read_pdf_name_token(&dict[i..]).and_then(inline_color_components);
+            }
+            b"IM" | b"ImageMask" => {
+                params.image_mask = read_pdf_bool(&dict[i..]) == Some(true);
             }
             b"F" | b"Filter" => {
                 params.has_filter = true;
@@ -1681,11 +1684,27 @@ fn read_pdf_u32(bytes: &[u8]) -> Option<u32> {
     Some(n)
 }
 
-fn inline_color_components(cs: &[u8]) -> u32 {
+fn read_pdf_bool(bytes: &[u8]) -> Option<bool> {
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let rest = &bytes[i..];
+    if rest.starts_with(b"true") {
+        Some(true)
+    } else if rest.starts_with(b"false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn inline_color_components(cs: &[u8]) -> Option<u32> {
     match cs {
-        b"RGB" | b"DeviceRGB" => 3,
-        b"CMYK" | b"DeviceCMYK" => 4,
-        _ => 1,
+        b"G" | b"DeviceGray" | b"I" | b"Indexed" => Some(1),
+        b"RGB" | b"DeviceRGB" => Some(3),
+        b"CMYK" | b"DeviceCMYK" => Some(4),
+        _ => None,
     }
 }
 
@@ -1713,10 +1732,20 @@ fn expected_raw_inline_bytes(params: &InlineImageParams) -> Option<usize> {
     }
     let w = u64::from(params.width?);
     let h = u64::from(params.height?);
-    let bpc = u64::from(params.bpc.unwrap_or(8));
-    let comps = u64::from(params.components.unwrap_or(1));
-    let bits = w.checked_mul(h)?.checked_mul(bpc)?.checked_mul(comps)?;
-    let bytes = bits.div_ceil(8);
+    let bpc = u64::from(match params.bpc {
+        Some(b) => b,
+        None if params.image_mask => 1,
+        None => return None,
+    });
+    let comps = if params.image_mask {
+        1
+    } else {
+        u64::from(params.components?)
+    };
+    // PDF pads each row to a byte boundary.
+    let row_bits = w.checked_mul(bpc)?.checked_mul(comps)?;
+    let row_bytes = row_bits.div_ceil(8);
+    let bytes = h.checked_mul(row_bytes)?;
     if bytes == 0 || bytes > MAX_INLINE_IMAGE_BYTES {
         None
     } else {
@@ -1769,24 +1798,7 @@ fn inline_ei_looks_real(content: &[u8], ei_pos: usize) -> bool {
         return true;
     }
     let next = content[k];
-    if !(next.is_ascii_alphabetic() || next.is_ascii_digit() || is_pdf_delimiter(next)) {
-        return false;
-    }
-    // Reject `EI` still sitting in binary: the following bytes should look
-    // like PDF syntax, not sample data.
-    looks_like_pdf_content(content, k)
-}
-
-fn looks_like_pdf_content(content: &[u8], pos: usize) -> bool {
-    let slice = &content[pos..content.len().min(pos + 16)];
-    if slice.is_empty() {
-        return true;
-    }
-    let binaryish = slice
-        .iter()
-        .filter(|&&b| b < 0x09 || (b > 0x0D && b < 0x20) || b > 0x7E)
-        .count();
-    binaryish * 5 < slice.len()
+    next.is_ascii_alphabetic() || next.is_ascii_digit() || is_pdf_delimiter(next)
 }
 
 /// Extract the font name operand from content stream bytes preceding a Tf operator.
@@ -2399,6 +2411,18 @@ mod tests {
         assert_eq!(ops, 1);
         assert!(uchars.contains(&b'H'));
         assert!(uchars.contains(&b'i'));
+    }
+
+    #[test]
+    fn test_scan_content_inline_image_ei_before_non_ascii_string() {
+        // Declared 1-byte image, then a literal with high bytes. The real `EI`
+        // must still be accepted so `Tj` is counted.
+        let content = b"BI /W 1 /H 1 /BPC 8 /CS /G ID\nxEI (\xE9\xE9\xE9\xE9\xE9) Tj";
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, 1);
+        assert!(uchars.contains(&0xE9));
     }
 
     #[test]
