@@ -4,13 +4,13 @@ CURRENT SCORE
 =============
 
 Original baseline SHA:  f4aab3b36f7fa1752c65ea45fa64be1274f671cf
-Current best SHA:       b6a93a1
+Current best SHA:       d563a65
 
-Official corpus (OpenDataLoader 200 PDFs, in-process Rust, median of 9 runs)
+Official corpus (OpenDataLoader 200 PDFs, in-process Rust, median of runs)
 ---------------------------------------------------------------------------
-Baseline median: 401.5 ms
-Current median:  385.3 ms
-Overall speedup: 1.04x (docs/sec 498 → 519)
+Baseline median: 434.9 ms
+Current median:  378.5 ms
+Overall speedup: 1.15x (docs/sec ~460 → ~528)
 
 Quality (official paired evaluator)
 -----------------------------------
@@ -145,6 +145,32 @@ Files changed: src/detector.rs, src/extractor/{fonts,content_stream,xobjects}.rs
 Full 200-doc corpus: baseline 403.8ms, candidate 384.1ms → cumulative 1.051x
 Quality: unchanged (byte-identical markdown, overall 0.875690)
 Decision: KEEP (b6a93a1)
+
+## Experiment #05 — fat LTO + codegen-units=1
+--------------
+Hypothesis: parsing is dominated by small hot functions in dependency crates
+(lopdf's nom parser, miniz_oxide inflate, hash maps); the default release
+profile (no LTO, 16 codegen units) blocks cross-crate inlining of those paths.
+
+Files changed: Cargo.toml
+
+Isolated: 415.2ms → 374.2ms (1.110x) on the 200-doc corpus.
+Full 200-doc corpus (cumulative with Exp 1-4): 430.9ms → 373.5ms (1.154x).
+Quality: unchanged (byte-identical markdown, overall 0.875690).
+Decision: KEEP (d563a65)
+
+## Rejected: target-cpu=native (no measurable gain)
+--------------
+`-C target-cpu=native` + LTO was 0.996x vs LTO alone on the M4 Pro — the
+default arm64 target already uses NEON and miniz_oxide ships NEON paths.
+Hardware-specific with no benefit; rejected.
+
+## Rejected (report-only): zlib-ng FlateDecode backend
+--------------
+Swapping flate2's miniz_oxide backend for zlib-ng was 1.047x on the corpus,
+but it needs a C compiler + cmake and breaks the pure-Rust / wasm32 build.
+Non-portable; reported separately, not merged.
+
 
 
 # Profiling evidence (baseline → final)
