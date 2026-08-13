@@ -78,6 +78,18 @@ pub(crate) fn rects_overlap(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), 
     !(a_right < b_left || b_right < a_left || a_top < b_bottom || b_top < a_bottom)
 }
 
+fn grid_coord(value: f32, cell: f32) -> i32 {
+    (value / cell).floor().clamp(-1_000_000.0, 1_000_000.0) as i32
+}
+
+/// Inclusive grid range, capped so a pathological huge rect cannot fill
+/// millions of buckets.
+fn grid_span(lo: f32, hi: f32, cell: f32) -> std::ops::RangeInclusive<i32> {
+    let a = grid_coord(lo.min(hi), cell);
+    let b = grid_coord(lo.max(hi), cell);
+    a..=a.saturating_add((b.saturating_sub(a)).min(64))
+}
+
 /// Maximum component size for rect clustering.  No real table has thousands
 /// of cell rects — once a component exceeds this, it is a vector drawing or
 /// page-spanning clipping path.  We skip overlap checks for rects already in
@@ -85,19 +97,21 @@ pub(crate) fn rects_overlap(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), 
 const MAX_CLUSTER_RECTS: usize = 2000;
 
 /// Pairwise-disjoint rects never merge, so a component-size cap does not
-/// stop the all-pairs loop. Each rect is compared with at most this many
-/// later candidates (already restricted to overlapping X); remaining
-/// X-ranges are still processed so a dense stack cannot starve a table
-/// elsewhere on the page.
-const MAX_CLUSTER_OVERLAP_CHECKS_PER_RECT: usize = 256;
+/// stop an all-pairs loop. Rects are hashed into this many points of grid
+/// and compared only against others in the same cell.
+const CLUSTER_GRID_CELL: f32 = 64.0;
+
+/// All-pairs AABB tests allowed inside one grid cell. A real table cell is
+/// tens of points wide, so a 64-pt cell holds a handful of neighbors — not
+/// thousands of stacked drawings.
+const MAX_CLUSTER_PAIRS_PER_CELL: usize = 16_384;
 
 /// Cluster rects by spatial overlap using union-find.
 /// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
 ///
-/// Overlap tests are ordered by left edge and skipped once a pair cannot
-/// overlap in X. Each rect is limited to
-/// [`MAX_CLUSTER_OVERLAP_CHECKS_PER_RECT`] AABB tests so stacked disjoint
-/// drawings stay linear-ish without dropping later independent clusters.
+/// Overlap tests run inside a uniform grid so far-apart rects are never
+/// compared, and each cell is pair-capped so a dense stack cannot go
+/// quadratic or starve an independent table in another cell.
 pub(crate) fn cluster_rects(
     rects: &[(f32, f32, f32, f32)],
     tolerance: f32,
@@ -105,32 +119,38 @@ pub(crate) fn cluster_rects(
 ) -> Vec<Vec<usize>> {
     let n = rects.len();
     let mut uf = UnionFind::new(n);
-    let two_tol = tolerance * 2.0;
+    let cell = CLUSTER_GRID_CELL.max(tolerance * 4.0);
 
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| rects[a].0.total_cmp(&rects[b].0));
-
-    for (pos, &i) in order.iter().enumerate() {
-        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
-            continue;
-        }
-        let i_right = rects[i].0 + rects[i].2 + two_tol;
-        let mut checks = 0usize;
-        for &j in &order[pos + 1..] {
-            if rects[j].0 > i_right {
-                break;
+    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (idx, &(x, y, w, h)) in rects.iter().enumerate() {
+        for gx in grid_span(x - tolerance, x + w + tolerance, cell) {
+            for gy in grid_span(y - tolerance, y + h + tolerance, cell) {
+                grid.entry((gx, gy)).or_default().push(idx);
             }
-            if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+        }
+    }
+
+    for bucket in grid.values() {
+        let m = bucket.len();
+        let mut pairs = 0usize;
+        'cell: for a in 0..m {
+            let i = bucket[a];
+            if uf.component_size(i) >= MAX_CLUSTER_RECTS {
                 continue;
             }
-            if checks >= MAX_CLUSTER_OVERLAP_CHECKS_PER_RECT {
-                break;
-            }
-            checks += 1;
-            if rects_overlap(&rects[i], &rects[j], tolerance) {
-                uf.union(i, j);
-                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
-                    break;
+            for &j in &bucket[a + 1..] {
+                if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                    break 'cell;
+                }
+                if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                    continue;
+                }
+                pairs += 1;
+                if rects_overlap(&rects[i], &rects[j], tolerance) {
+                    uf.union(i, j);
+                    if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                        break;
+                    }
                 }
             }
         }
@@ -3830,7 +3850,7 @@ mod tests {
 
     #[test]
     fn test_cluster_rects_overlapping_grid_still_clusters() {
-        // Neighboring cells overlap; x-sweep must still union the whole grid.
+        // Neighboring cells overlap; the grid must still union the whole table.
         let mut rects = Vec::new();
         for row in 0..4 {
             for col in 0..4 {
@@ -3845,8 +3865,8 @@ mod tests {
     #[test]
     fn test_cluster_rects_many_disjoint_stays_subquadratic() {
         // Pairwise-disjoint rects never merge, so a component-size cap does
-        // not stop all-pairs overlap tests. Spread in X so the sweep can
-        // skip far-apart pairs; 8k is enough that n² tests would dominate.
+        // not stop all-pairs overlap tests. Spread in X so they land in
+        // different grid cells; 8k is enough that n² tests would dominate.
         let n = 8_000usize;
         let rects: Vec<(f32, f32, f32, f32)> =
             (0..n).map(|i| (i as f32 * 20.0, 0.0, 10.0, 10.0)).collect();
@@ -3855,10 +3875,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_rects_stacked_disjoint_respects_per_rect_budget() {
-        // Same left edge: the X sweep cannot skip pairs. A per-rect check
-        // cap keeps this from going fully quadratic, and a table at a later
-        // X still clusters.
+    fn test_cluster_rects_stacked_disjoint_does_not_starve_later_table() {
+        // Same X, spread in Y: a spatial grid must still union an overlapping
+        // pair in another region of the page.
         let n = 8_000usize;
         let mut rects: Vec<(f32, f32, f32, f32)> =
             (0..n).map(|i| (0.0, i as f32 * 20.0, 10.0, 10.0)).collect();
