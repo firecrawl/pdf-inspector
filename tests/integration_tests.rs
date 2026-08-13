@@ -4070,8 +4070,28 @@ fn synthetic_rtl_pdf(stored_lines: &[&str]) -> Vec<u8> {
 
 /// Multi-page variant: one entry per page.
 fn synthetic_rtl_pdf_pages(pages: &[&[&str]]) -> Vec<u8> {
+    synthetic_rtl_pdf_pages_impl(pages, false)
+}
+
+/// Multi-page variant built with per-glyph `TJ` position adjustments instead
+/// of one `Tj` per line, reproducing the construct behind this fix: `lines`
+/// are stored in ordinary logical order, and each glyph is walked leftward
+/// on the page by a `TJ` adjustment rather than by reversing the character
+/// sequence in the stream. `synthetic_rtl_pdf_pages` above (single `Tj`, no
+/// adjustments) cannot exercise this path at all — every existing test built
+/// on it is blind to the distinction this fix depends on.
+fn synthetic_rtl_pdf_pages_position_adjusted(pages: &[&[&str]]) -> Vec<u8> {
+    synthetic_rtl_pdf_pages_impl(pages, true)
+}
+
+fn synthetic_rtl_pdf_pages_impl(pages: &[&[&str]], position_adjusted: bool) -> Vec<u8> {
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Document, Object, Stream};
+
+    // Glyph advance for every CID (no /W override) and the line's starting
+    // x-coordinate when walking leftward from the right margin.
+    const DW: i64 = 600;
+    const RIGHT_EDGE: i64 = 400;
 
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
@@ -4110,7 +4130,7 @@ fn synthetic_rtl_pdf_pages(pages: &[&[&str]]) -> Vec<u8> {
             "BaseFont" => "AAAAAA+SyntheticRTL",
             "CIDSystemInfo" => cid_system_info_id,
             "FontDescriptor" => descriptor_id,
-            "DW" => 600,
+            "DW" => DW,
         }
         .into(),
     );
@@ -4147,28 +4167,61 @@ endcmap\nend\nend"
     for stored_lines in pages {
         let mut operations = vec![Operation::new("BT", vec![])];
         for (index, line) in stored_lines.iter().enumerate() {
-            let mut bytes = Vec::new();
-            for ch in line.chars() {
-                bytes.extend_from_slice(&(ch as u32 as u16).to_be_bytes());
-            }
+            let y = 700 - 20 * index as i64;
             operations.push(Operation::new("Tf", vec!["F0".into(), 12.into()]));
-            // Tm, not Td: Td is relative to the current line start and would
-            // accumulate across lines.
-            operations.push(Operation::new(
-                "Tm",
-                vec![
-                    1.into(),
-                    0.into(),
-                    0.into(),
-                    1.into(),
-                    50.into(),
-                    Object::Integer(700 - 20 * index as i64),
-                ],
-            ));
-            operations.push(Operation::new(
-                "Tj",
-                vec![Object::String(bytes, lopdf::StringFormat::Hexadecimal)],
-            ));
+            if position_adjusted {
+                // Start at the line's right edge and walk left: TJ's numeric
+                // operand is subtracted from the pen position before the next
+                // glyph paints (ISO 32000-1 §9.4.3), so an adjustment of
+                // `2 * DW` nets a step of exactly `-DW` per glyph — this
+                // glyph's own advance plus one more glyph-width left. No
+                // character in the stream is reordered; only positioning
+                // makes the line read right-to-left.
+                operations.push(Operation::new(
+                    "Tm",
+                    vec![
+                        1.into(),
+                        0.into(),
+                        0.into(),
+                        1.into(),
+                        RIGHT_EDGE.into(),
+                        Object::Integer(y),
+                    ],
+                ));
+                let chars: Vec<char> = line.chars().collect();
+                let mut array = Vec::new();
+                for (i, ch) in chars.iter().enumerate() {
+                    let mut bytes = Vec::new();
+                    bytes.extend_from_slice(&(*ch as u32 as u16).to_be_bytes());
+                    array.push(Object::String(bytes, lopdf::StringFormat::Hexadecimal));
+                    if i + 1 != chars.len() {
+                        array.push(Object::Integer(2 * DW));
+                    }
+                }
+                operations.push(Operation::new("TJ", vec![Object::Array(array)]));
+            } else {
+                let mut bytes = Vec::new();
+                for ch in line.chars() {
+                    bytes.extend_from_slice(&(ch as u32 as u16).to_be_bytes());
+                }
+                // Tm, not Td: Td is relative to the current line start and
+                // would accumulate across lines.
+                operations.push(Operation::new(
+                    "Tm",
+                    vec![
+                        1.into(),
+                        0.into(),
+                        0.into(),
+                        1.into(),
+                        50.into(),
+                        Object::Integer(y),
+                    ],
+                ));
+                operations.push(Operation::new(
+                    "Tj",
+                    vec![Object::String(bytes, lopdf::StringFormat::Hexadecimal)],
+                ));
+            }
         }
         operations.push(Operation::new("ET", vec![]));
 
@@ -4342,6 +4395,51 @@ fn fixture_visual_order_rtl_pdf_extracts_in_logical_order() {
     assert!(
         !md.contains("םולש"),
         "visual-order text survived extraction: {md:?}"
+    );
+}
+
+/// The real-world counter-example to "RTL text is always stored visually":
+/// a producer that keeps logical character order and lays the line out
+/// right-to-left with `TJ` position adjustments alone (see
+/// `synthetic_rtl_pdf_pages_position_adjusted`). This construct is
+/// observed in a production government PDF (see
+/// `docs/evidence/rtl-visual-order/`) and is exactly the case a document-wide
+/// unconditional reversal — as opposed to this fix's per-document
+/// orthographic evidence check — gets backwards, because it never looks past
+/// "does this string contain an RTL character."
+#[test]
+fn position_adjusted_logical_order_rtl_is_left_untouched() {
+    let refs = LOGICAL_LINES;
+    let text = extracted_text(&synthetic_rtl_pdf_pages_position_adjusted(&[refs]));
+
+    assert_reads_logically(&text);
+    assert!(
+        !text.contains("םולש"),
+        "position-adjusted logical-order text was reversed: {text:?}"
+    );
+}
+
+/// End-to-end guard on a committed fixture: a one-page PDF whose content
+/// stream holds `LOGICAL_LINES` in logical character order, laid out
+/// right-to-left purely through `TJ` position adjustments — the same
+/// construct as `position_adjusted_logical_order_rtl_is_left_untouched`,
+/// kept on disk so the regression can be reproduced straight from the CLI:
+///
+///   cargo run --bin pdf2md -- tests/fixtures/rtl_logical_order.pdf
+///
+/// A blanket reversal (any document-wide "contains RTL characters" rule)
+/// turns this into "םלוע םולש …" — every word spelled backwards — even
+/// though the source order was already correct.
+#[test]
+fn fixture_logical_order_rtl_pdf_is_left_untouched() {
+    let result = process_pdf_with_options("tests/fixtures/rtl_logical_order.pdf", PdfOptions::new())
+        .expect("fixture should extract");
+
+    let md = result.markdown.unwrap_or_default();
+    assert_reads_logically(&md);
+    assert!(
+        !md.contains("םולש"),
+        "position-adjusted logical-order text was reversed: {md:?}"
     );
 }
 
