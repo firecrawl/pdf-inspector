@@ -109,6 +109,7 @@ const CLUSTER_GRID_CELL: f32 = 64.0;
 /// tens of points wide, so a 64-pt cell holds a handful of neighbors — not
 /// thousands of stacked drawings.
 const MAX_CLUSTER_PAIRS_PER_CELL: usize = 16_384;
+const MAX_OVERLAP_CHECKS_PER_LARGE_RECT: usize = 8_192;
 
 /// Cluster rects by spatial overlap using union-find.
 /// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
@@ -172,16 +173,22 @@ pub(crate) fn cluster_rects(
         }
     }
 
-    // Oversized spans skip the grid; compare them against every rect so a
-    // page-wide rule still unions the cells it actually overlaps.
-    for &i in large.iter().take(32) {
+    // Oversized spans skip the grid; compare each against other rects so a
+    // page-wide rule still unions the cells it actually overlaps. Every
+    // oversized rect is visited; AABB tests per rect are capped.
+    for &i in &large {
         if uf.component_size(i) >= MAX_CLUSTER_RECTS {
             continue;
         }
+        let mut checks = 0usize;
         for j in 0..n {
+            if checks >= MAX_OVERLAP_CHECKS_PER_LARGE_RECT {
+                break;
+            }
             if i == j || uf.component_size(j) >= MAX_CLUSTER_RECTS {
                 continue;
             }
+            checks += 1;
             if rects_overlap(&rects[i], &rects[j], tolerance) {
                 uf.union(i, j);
                 if uf.component_size(i) >= MAX_CLUSTER_RECTS {
@@ -3928,6 +3935,18 @@ mod tests {
         // Wider than 64 grid cells; must still union the small overlapping rect.
         let rects = vec![(0.0, 0.0, 5000.0, 10.0), (4900.0, 0.0, 10.0, 10.0)];
         let groups = cluster_rects(&rects, 0.0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_oversized_spans_all_get_a_pass() {
+        // More than 32 huge rects: the last one must still union its overlap.
+        let mut rects: Vec<(f32, f32, f32, f32)> = (0..40)
+            .map(|i| (0.0, i as f32 * 20.0, 5000.0, 10.0))
+            .collect();
+        rects.push((4900.0, 39.0 * 20.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
     }
