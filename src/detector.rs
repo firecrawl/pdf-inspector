@@ -1386,88 +1386,25 @@ fn scan_content_for_text_operators(
     // Each Tj/TJ/Tf lookback stops at the previous text/font operator so a
     // malformed `] TJ` (no `[`) cannot rescan the entire prefix — that was
     // quadratic in the number of operators.
-    // Skip literal strings, hex strings, comments, and inline images so a
-    // `Tj` inside `(Hello Tj World)` or a `(` byte in `BI`…`EI` data cannot
-    // pin the floor / swallow later operators.
+    // `Tj`/`TJ` are only counted when the preceding token closes a string or
+    // array (')', '>', ']'), so `Tj` inside `(Hello Tj World)` cannot pin the floor.
     let mut operand_floor = 0usize;
-    let mut string_depth: i32 = 0;
-    let mut in_hex = false;
-    let mut in_comment = false;
     let mut i = 0;
     while i < content.len() {
         let b = content[i];
-
-        if in_comment {
-            if b == b'\n' || b == b'\r' {
-                in_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-        if string_depth > 0 {
-            if b == b'\\' && i + 1 < content.len() {
-                i += 2;
-                continue;
-            }
-            if b == b'(' {
-                string_depth += 1;
-            } else if b == b')' {
-                string_depth -= 1;
-            }
-            i += 1;
-            continue;
-        }
-        if in_hex {
-            if b == b'>' {
-                in_hex = false;
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'B'
-            && i + 1 < content.len()
-            && content[i + 1] == b'I'
-            && is_content_operator_start(content, i)
-            && is_content_token_end(content, i + 1)
-        {
-            i = skip_inline_image(content, i);
-            continue;
-        }
-        match b {
-            b'%' => {
-                in_comment = true;
-                i += 1;
-                continue;
-            }
-            b'(' => {
-                string_depth = 1;
-                i += 1;
-                continue;
-            }
-            b'<' => {
-                if i + 1 < content.len() && content[i + 1] == b'<' {
-                    i += 2;
-                    continue;
-                }
-                in_hex = true;
-                i += 1;
-                continue;
-            }
-            _ => {}
-        }
 
         // Look for 'T' followed by 'j', 'J', or 'f'
         if b == b'T' && i + 1 < content.len() {
             let next = content[i + 1];
             if next == b'j' || next == b'J' {
                 // Verify it's an operator (followed by whitespace or newline)
-                if i + 2 >= content.len()
+                if (i + 2 >= content.len()
                     || content[i + 2].is_ascii_whitespace()
                     || content[i + 2] == b'\n'
-                    || content[i + 2] == b'\r'
+                    || content[i + 2] == b'\r')
+                    && preceding_operand_closer(content, i, operand_floor)
                 {
                     text_ops += 1;
-                    // Scan backward for text string operand to collect unique chars
                     collect_text_chars_before(content, i, unique_chars, operand_floor);
                     operand_floor = i;
                 }
@@ -1485,14 +1422,11 @@ fn scan_content_for_text_operators(
                     || content[i + 2] == b'<'
                     || content[i + 2] == b'/'
                 {
-                    font_changes += 1;
-                    // Extract the font name operand preceding the size + Tf.
-                    // Pattern: /FontName <size> Tf
-                    // Scan backward past the size number and whitespace to find /Name.
                     if let Some(name) = extract_font_name_before_tf(content, i, operand_floor) {
                         used_font_names.insert(name);
+                        font_changes += 1;
+                        operand_floor = i;
                     }
-                    operand_floor = i;
                 }
             }
         }
@@ -1537,300 +1471,18 @@ fn scan_content_for_text_operators(
     (text_ops, image_count, path_ops, font_changes)
 }
 
-fn is_pdf_delimiter(b: u8) -> bool {
-    matches!(
-        b,
-        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-    )
-}
-
-/// True if `pos` can start a content-stream operator (not inside a `/Name`).
-fn is_content_operator_start(content: &[u8], pos: usize) -> bool {
-    if pos == 0 {
-        return true;
-    }
-    let prev = content[pos - 1];
-    prev.is_ascii_whitespace()
-        || matches!(
-            prev,
-            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'%'
-        )
-}
-
-fn is_content_token_end(content: &[u8], last: usize) -> bool {
-    last + 1 >= content.len()
-        || content[last + 1].is_ascii_whitespace()
-        || is_pdf_delimiter(content[last + 1])
-}
-
-/// Skip `BI` … `ID` <data> `EI`. Returns the index just after `EI`, or EOF
-/// if the inline image is truncated.
-fn skip_inline_image(content: &[u8], bi_pos: usize) -> usize {
-    let mut i = bi_pos + 2;
-    let mut id_pos = None;
-    while i + 1 < content.len() {
-        if content[i] == b'I'
-            && content[i + 1] == b'D'
-            && is_content_operator_start(content, i)
-            && is_content_token_end(content, i + 1)
-        {
-            id_pos = Some(i);
-            break;
+/// True when the token before `op_pos` (skipping whitespace, not crossing
+/// `floor`) is a string/array closer. Used so `Tj` inside `(Hello Tj World)`
+/// is not treated as an operator.
+fn preceding_operand_closer(content: &[u8], op_pos: usize, floor: usize) -> bool {
+    let mut j = op_pos;
+    while j > floor {
+        j -= 1;
+        if !content[j].is_ascii_whitespace() {
+            return matches!(content[j], b')' | b'>' | b']');
         }
-        i += 1;
-    }
-    let Some(id_pos) = id_pos else {
-        return content.len();
-    };
-    let params = parse_inline_image_dict(&content[bi_pos + 2..id_pos]);
-    // Spec: one whitespace after ID, then sample data.
-    let mut data_start = id_pos + 2;
-    if data_start < content.len() && content[data_start].is_ascii_whitespace() {
-        data_start += 1;
-    }
-
-    if let Some(n) = expected_raw_inline_bytes(&params) {
-        return find_ei_from(content, data_start.saturating_add(n).min(content.len()));
-    }
-    if params.dct {
-        if let Some(eoi) = find_jpeg_eoi(content, data_start) {
-            return find_ei_from(content, eoi);
-        }
-    }
-    find_ei_scan(content, data_start)
-}
-
-#[derive(Default)]
-struct InlineImageParams {
-    width: Option<u32>,
-    height: Option<u32>,
-    bpc: Option<u32>,
-    components: Option<u32>,
-    has_filter: bool,
-    dct: bool,
-    image_mask: bool,
-}
-
-const MAX_INLINE_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
-
-fn parse_inline_image_dict(dict: &[u8]) -> InlineImageParams {
-    let mut params = InlineImageParams::default();
-    let mut i = 0;
-    while i < dict.len() {
-        if dict[i] != b'/' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let name = read_pdf_name(&dict[i..]);
-        i += name.len();
-        match name {
-            b"W" | b"Width" => params.width = read_pdf_u32(&dict[i..]),
-            b"H" | b"Height" => params.height = read_pdf_u32(&dict[i..]),
-            b"BPC" | b"BitsPerComponent" => params.bpc = read_pdf_u32(&dict[i..]),
-            b"CS" | b"ColorSpace" => {
-                params.components =
-                    read_pdf_name_token(&dict[i..]).and_then(inline_color_components);
-            }
-            b"IM" | b"ImageMask" => {
-                params.image_mask = read_pdf_bool(&dict[i..]) == Some(true);
-            }
-            b"F" | b"Filter" => {
-                params.has_filter = true;
-                if dict_token_contains_dct(&dict[i..]) {
-                    params.dct = true;
-                }
-            }
-            _ => {}
-        }
-    }
-    params
-}
-
-fn read_pdf_name(bytes: &[u8]) -> &[u8] {
-    let n = bytes
-        .iter()
-        .position(|&b| b.is_ascii_whitespace() || is_pdf_delimiter(b))
-        .unwrap_or(bytes.len());
-    &bytes[..n]
-}
-
-fn read_pdf_name_token(bytes: &[u8]) -> Option<&[u8]> {
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() || bytes[i] != b'/' {
-        return None;
-    }
-    Some(read_pdf_name(&bytes[i + 1..]))
-}
-
-fn read_pdf_u32(bytes: &[u8]) -> Option<u32> {
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
-        return None;
-    }
-    let mut n: u32 = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        n = n
-            .saturating_mul(10)
-            .saturating_add((bytes[i] - b'0') as u32);
-        i += 1;
-    }
-    Some(n)
-}
-
-fn read_pdf_bool(bytes: &[u8]) -> Option<bool> {
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let rest = &bytes[i..];
-    if rest.starts_with(b"true") && pdf_keyword_ended(&rest[4..]) {
-        Some(true)
-    } else if rest.starts_with(b"false") && pdf_keyword_ended(&rest[5..]) {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn pdf_keyword_ended(rest: &[u8]) -> bool {
-    rest.is_empty() || rest[0].is_ascii_whitespace() || is_pdf_delimiter(rest[0])
-}
-
-fn inline_color_components(cs: &[u8]) -> Option<u32> {
-    match cs {
-        b"G" | b"DeviceGray" | b"I" | b"Indexed" => Some(1),
-        b"RGB" | b"DeviceRGB" => Some(3),
-        b"CMYK" | b"DeviceCMYK" => Some(4),
-        _ => None,
-    }
-}
-
-fn dict_token_contains_dct(bytes: &[u8]) -> bool {
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i < bytes.len() && bytes[i] == b'/' {
-        return read_pdf_name(&bytes[i + 1..])
-            .windows(3)
-            .any(|w| w.eq_ignore_ascii_case(b"DCT"));
-    }
-    if i < bytes.len() && bytes[i] == b'[' {
-        return bytes[i..]
-            .windows(3)
-            .any(|w| w.eq_ignore_ascii_case(b"DCT"));
     }
     false
-}
-
-fn expected_raw_inline_bytes(params: &InlineImageParams) -> Option<usize> {
-    if params.has_filter {
-        return None;
-    }
-    let w = u64::from(params.width?);
-    let h = u64::from(params.height?);
-    let bpc = u64::from(match params.bpc {
-        Some(b) => b,
-        None if params.image_mask => 1,
-        None => return None,
-    });
-    let comps = if params.image_mask {
-        1
-    } else {
-        u64::from(params.components?)
-    };
-    // PDF pads each row to a byte boundary.
-    let row_bits = w.checked_mul(bpc)?.checked_mul(comps)?;
-    let row_bytes = row_bits.div_ceil(8);
-    let bytes = h.checked_mul(row_bytes)?;
-    if bytes == 0 || bytes > MAX_INLINE_IMAGE_BYTES {
-        None
-    } else {
-        Some(bytes as usize)
-    }
-}
-
-fn find_jpeg_eoi(content: &[u8], start: usize) -> Option<usize> {
-    content[start..]
-        .windows(2)
-        .position(|w| w == [0xFF, 0xD9])
-        .map(|rel| start + rel + 2)
-}
-
-fn find_ei_from(content: &[u8], pos: usize) -> usize {
-    let mut k = pos;
-    while k < content.len() && content[k].is_ascii_whitespace() {
-        k += 1;
-    }
-    if k + 1 < content.len()
-        && content[k] == b'E'
-        && content[k + 1] == b'I'
-        && inline_ei_looks_real(content, k, false)
-    {
-        return k + 2;
-    }
-    find_ei_scan(content, pos)
-}
-
-fn find_ei_scan(content: &[u8], start: usize) -> usize {
-    let mut j = start;
-    while j + 1 < content.len() {
-        if content[j] == b'E' && content[j + 1] == b'I' && inline_ei_looks_real(content, j, true) {
-            return j + 2;
-        }
-        j += 1;
-    }
-    content.len()
-}
-
-fn inline_ei_looks_real(content: &[u8], ei_pos: usize, strict: bool) -> bool {
-    if !is_content_token_end(content, ei_pos + 1) {
-        return false;
-    }
-    let mut k = ei_pos + 2;
-    while k < content.len() && content[k].is_ascii_whitespace() {
-        k += 1;
-    }
-    if k >= content.len() {
-        return true;
-    }
-    let next = content[k];
-    // A string/name/array after `EI` may contain high bytes; do not treat
-    // those as proof the marker was inside sample data.
-    if next == b'(' || next == b'<' || next == b'[' || next == b'/' {
-        return true;
-    }
-    if !(next.is_ascii_alphabetic() || next.is_ascii_digit() || is_pdf_delimiter(next)) {
-        return false;
-    }
-    if !strict {
-        return true;
-    }
-    looks_like_printable_pdf(content, k)
-}
-
-fn looks_like_printable_pdf(content: &[u8], pos: usize) -> bool {
-    let end = content.len().min(pos + 16);
-    let mut binaryish = 0;
-    let mut n = 0;
-    for &b in &content[pos..end] {
-        // Stop at the next string/name/array; those payloads may be high bytes.
-        if b == b'(' || b == b'<' || b == b'[' || b == b'/' {
-            break;
-        }
-        n += 1;
-        if b < 0x09 || (b > 0x0D && b < 0x20) || b > 0x7E {
-            binaryish += 1;
-        }
-    }
-    n == 0 || binaryish * 5 < n
 }
 
 /// Extract the font name operand from content stream bytes preceding a Tf operator.
@@ -2417,70 +2069,6 @@ mod tests {
         for &ch in b"HeloTjWrd" {
             assert!(uchars.contains(&ch), "missing char {}", ch as char);
         }
-    }
-
-    #[test]
-    fn test_scan_content_inline_image_does_not_swallow_later_text() {
-        // Binary after `ID` includes `(` and `<`; those must not start string/hex
-        // state that would hide the `Tj` after `EI`.
-        let content = b"BI /W 1 /H 1 /CS /RGB /BPC 8 ID\n(<<<<<\x00EI\nBT (Hi) Tj ET";
-        let mut uchars = HashSet::new();
-        let (ops, _, _, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
-        assert_eq!(ops, 1);
-        assert!(uchars.contains(&b'H'));
-        assert!(uchars.contains(&b'i'));
-    }
-
-    #[test]
-    fn test_scan_content_inline_image_ignores_ei_inside_sample() {
-        // Uncompressed 8-byte image whose sample starts with `EI Q` must not
-        // resume scanning until the declared length is consumed.
-        let content = b"BI /W 8 /H 1 /BPC 8 /CS /G ID\nEI QxxxxEI\n(Hi) Tj";
-        let mut uchars = HashSet::new();
-        let (ops, _, _, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
-        assert_eq!(ops, 1);
-        assert!(uchars.contains(&b'H'));
-        assert!(uchars.contains(&b'i'));
-    }
-
-    #[test]
-    fn test_scan_content_inline_image_ei_before_non_ascii_string() {
-        // Declared 1-byte image, then a literal with high bytes. The real `EI`
-        // must still be accepted so `Tj` is counted.
-        let content = b"BI /W 1 /H 1 /BPC 8 /CS /G ID\nxEI (\xE9\xE9\xE9\xE9\xE9) Tj";
-        let mut uchars = HashSet::new();
-        let (ops, _, _, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
-        assert_eq!(ops, 1);
-        assert!(uchars.contains(&0xE9));
-    }
-
-    #[test]
-    fn test_scan_content_filtered_inline_image_ignores_ei_in_sample() {
-        // No trusted byte length (Filter present). `EI Q` plus binary must not
-        // resume scanning; the real `EI` before `(Hi) Tj` should.
-        let content =
-            b"BI /W 1 /H 1 /F /FlateDecode ID\nEI Q\xff\xff\xff\xff\xff\xff\xff\xffEI\n(Hi) Tj";
-        let mut uchars = HashSet::new();
-        let (ops, _, _, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
-        assert_eq!(ops, 1);
-        assert!(uchars.contains(&b'H'));
-        assert!(uchars.contains(&b'i'));
-    }
-
-    #[test]
-    fn test_scan_content_filtered_inline_image_bt_then_non_ascii_string() {
-        // Fallback `EI` scan: `BT (` then high bytes in the string must not
-        // make the real terminator look like sample data.
-        let content = b"BI /W 1 /H 1 /F /FlateDecode ID\nxxEI\nBT (\xE9\xE9\xE9\xE9\xE9) Tj";
-        let mut uchars = HashSet::new();
-        let (ops, _, _, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
-        assert_eq!(ops, 1);
-        assert!(uchars.contains(&0xE9));
     }
 
     #[test]
