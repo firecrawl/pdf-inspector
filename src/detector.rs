@@ -1386,8 +1386,9 @@ fn scan_content_for_text_operators(
     // Each Tj/TJ/Tf lookback stops at the previous text/font operator so a
     // malformed `] TJ` (no `[`) cannot rescan the entire prefix — that was
     // quadratic in the number of operators.
-    // Skip literal strings, hex strings, and comments so `Tj` inside
-    // `(Hello Tj World)` cannot pin the floor and hide the real operand.
+    // Skip literal strings, hex strings, comments, and inline images so a
+    // `Tj` inside `(Hello Tj World)` or a `(` byte in `BI`…`EI` data cannot
+    // pin the floor / swallow later operators.
     let mut operand_floor = 0usize;
     let mut string_depth: i32 = 0;
     let mut in_hex = false;
@@ -1421,6 +1422,15 @@ fn scan_content_for_text_operators(
                 in_hex = false;
             }
             i += 1;
+            continue;
+        }
+        if b == b'B'
+            && i + 1 < content.len()
+            && content[i + 1] == b'I'
+            && is_content_operator_start(content, i)
+            && is_content_token_end(content, i + 1)
+        {
+            i = skip_inline_image(content, i);
             continue;
         }
         match b {
@@ -1525,6 +1535,80 @@ fn scan_content_for_text_operators(
     }
 
     (text_ops, image_count, path_ops, font_changes)
+}
+
+fn is_pdf_delimiter(b: u8) -> bool {
+    matches!(
+        b,
+        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+    )
+}
+
+/// True if `pos` can start a content-stream operator (not inside a `/Name`).
+fn is_content_operator_start(content: &[u8], pos: usize) -> bool {
+    if pos == 0 {
+        return true;
+    }
+    let prev = content[pos - 1];
+    prev.is_ascii_whitespace()
+        || matches!(
+            prev,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'%'
+        )
+}
+
+fn is_content_token_end(content: &[u8], last: usize) -> bool {
+    last + 1 >= content.len()
+        || content[last + 1].is_ascii_whitespace()
+        || is_pdf_delimiter(content[last + 1])
+}
+
+/// Skip `BI` … `ID` <data> `EI`. Returns the index just after `EI`, or EOF
+/// if the inline image is truncated.
+fn skip_inline_image(content: &[u8], bi_pos: usize) -> usize {
+    let mut i = bi_pos + 2;
+    let mut id_pos = None;
+    while i + 1 < content.len() {
+        if content[i] == b'I'
+            && content[i + 1] == b'D'
+            && is_content_operator_start(content, i)
+            && is_content_token_end(content, i + 1)
+        {
+            id_pos = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(id_pos) = id_pos else {
+        return content.len();
+    };
+    // Spec: one whitespace after ID, then sample data.
+    let mut j = id_pos + 2;
+    if j < content.len() && content[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    while j + 1 < content.len() {
+        if content[j] == b'E' && content[j + 1] == b'I' && inline_ei_looks_real(content, j) {
+            return j + 2;
+        }
+        j += 1;
+    }
+    content.len()
+}
+
+fn inline_ei_looks_real(content: &[u8], ei_pos: usize) -> bool {
+    if !is_content_token_end(content, ei_pos + 1) {
+        return false;
+    }
+    let mut k = ei_pos + 2;
+    while k < content.len() && content[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k >= content.len() {
+        return true;
+    }
+    let next = content[k];
+    next.is_ascii_alphabetic() || next.is_ascii_digit() || is_pdf_delimiter(next)
 }
 
 /// Extract the font name operand from content stream bytes preceding a Tf operator.
@@ -2111,6 +2195,19 @@ mod tests {
         for &ch in b"HeloTjWrd" {
             assert!(uchars.contains(&ch), "missing char {}", ch as char);
         }
+    }
+
+    #[test]
+    fn test_scan_content_inline_image_does_not_swallow_later_text() {
+        // Binary after `ID` includes `(` and `<`; those must not start string/hex
+        // state that would hide the `Tj` after `EI`.
+        let content = b"BI /W 1 /H 1 /CS /RGB /BPC 8 ID\n(<<<<<\x00EI\nBT (Hi) Tj ET";
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, 1);
+        assert!(uchars.contains(&b'H'));
+        assert!(uchars.contains(&b'i'));
     }
 
     #[test]
