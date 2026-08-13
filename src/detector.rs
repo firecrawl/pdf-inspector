@@ -1386,10 +1386,65 @@ fn scan_content_for_text_operators(
     // Each Tj/TJ/Tf lookback stops at the previous text/font operator so a
     // malformed `] TJ` (no `[`) cannot rescan the entire prefix — that was
     // quadratic in the number of operators.
+    // Skip literal strings, hex strings, and comments so `Tj` inside
+    // `(Hello Tj World)` cannot pin the floor and hide the real operand.
     let mut operand_floor = 0usize;
+    let mut string_depth: i32 = 0;
+    let mut in_hex = false;
+    let mut in_comment = false;
     let mut i = 0;
     while i < content.len() {
         let b = content[i];
+
+        if in_comment {
+            if b == b'\n' || b == b'\r' {
+                in_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if string_depth > 0 {
+            if b == b'\\' && i + 1 < content.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'(' {
+                string_depth += 1;
+            } else if b == b')' {
+                string_depth -= 1;
+            }
+            i += 1;
+            continue;
+        }
+        if in_hex {
+            if b == b'>' {
+                in_hex = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'%' => {
+                in_comment = true;
+                i += 1;
+                continue;
+            }
+            b'(' => {
+                string_depth = 1;
+                i += 1;
+                continue;
+            }
+            b'<' => {
+                if i + 1 < content.len() && content[i + 1] == b'<' {
+                    i += 2;
+                    continue;
+                }
+                in_hex = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
 
         // Look for 'T' followed by 'j', 'J', or 'f'
         if b == b'T' && i + 1 < content.len() {
@@ -2040,6 +2095,20 @@ mod tests {
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 3);
         for &ch in b"HeloWrdM" {
+            assert!(uchars.contains(&ch), "missing char {}", ch as char);
+        }
+    }
+
+    #[test]
+    fn test_scan_content_tj_inside_literal_is_not_an_operator() {
+        // `Tj` followed by space inside a literal must not count as an operator
+        // or pin the lookback floor; the real `Tj` still collects the string.
+        let content = b"BT (Hello Tj World) Tj ET";
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, 1);
+        for &ch in b"HeloTjWrd" {
             assert!(uchars.contains(&ch), "missing char {}", ch as char);
         }
     }
