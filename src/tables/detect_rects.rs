@@ -85,17 +85,19 @@ pub(crate) fn rects_overlap(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), 
 const MAX_CLUSTER_RECTS: usize = 2000;
 
 /// Pairwise-disjoint rects never merge, so a component-size cap does not
-/// stop the all-pairs loop. Bound the number of AABB tests so a page of
-/// thousands of isolated drawing rects cannot go quadratic.
-const MAX_CLUSTER_OVERLAP_CHECKS: usize = 1_000_000;
+/// stop the all-pairs loop. Each rect is compared with at most this many
+/// later candidates (already restricted to overlapping X); remaining
+/// X-ranges are still processed so a dense stack cannot starve a table
+/// elsewhere on the page.
+const MAX_CLUSTER_OVERLAP_CHECKS_PER_RECT: usize = 256;
 
 /// Cluster rects by spatial overlap using union-find.
 /// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
 ///
 /// Overlap tests are ordered by left edge and skipped once a pair cannot
-/// overlap in X. Combined with [`MAX_CLUSTER_RECTS`] and
-/// [`MAX_CLUSTER_OVERLAP_CHECKS`], scattered or stacked disjoint rects stay
-/// linear-ish instead of O(n²).
+/// overlap in X. Each rect is limited to
+/// [`MAX_CLUSTER_OVERLAP_CHECKS_PER_RECT`] AABB tests so stacked disjoint
+/// drawings stay linear-ish without dropping later independent clusters.
 pub(crate) fn cluster_rects(
     rects: &[(f32, f32, f32, f32)],
     tolerance: f32,
@@ -108,12 +110,12 @@ pub(crate) fn cluster_rects(
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| rects[a].0.total_cmp(&rects[b].0));
 
-    let mut checks = 0usize;
-    'outer: for (pos, &i) in order.iter().enumerate() {
+    for (pos, &i) in order.iter().enumerate() {
         if uf.component_size(i) >= MAX_CLUSTER_RECTS {
             continue;
         }
         let i_right = rects[i].0 + rects[i].2 + two_tol;
+        let mut checks = 0usize;
         for &j in &order[pos + 1..] {
             if rects[j].0 > i_right {
                 break;
@@ -121,13 +123,10 @@ pub(crate) fn cluster_rects(
             if uf.component_size(j) >= MAX_CLUSTER_RECTS {
                 continue;
             }
-            checks += 1;
-            if checks > MAX_CLUSTER_OVERLAP_CHECKS {
-                debug!(
-                    "cluster_rects: overlap-check budget {MAX_CLUSTER_OVERLAP_CHECKS} exhausted (n={n})"
-                );
-                break 'outer;
+            if checks >= MAX_CLUSTER_OVERLAP_CHECKS_PER_RECT {
+                break;
             }
+            checks += 1;
             if rects_overlap(&rects[i], &rects[j], tolerance) {
                 uf.union(i, j);
                 if uf.component_size(i) >= MAX_CLUSTER_RECTS {
@@ -3856,14 +3855,18 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_rects_stacked_disjoint_respects_check_budget() {
-        // Same left edge: the X sweep cannot skip pairs. The overlap-check
-        // budget must still keep this from going fully quadratic.
+    fn test_cluster_rects_stacked_disjoint_respects_per_rect_budget() {
+        // Same left edge: the X sweep cannot skip pairs. A per-rect check
+        // cap keeps this from going fully quadratic, and a table at a later
+        // X still clusters.
         let n = 8_000usize;
-        let rects: Vec<(f32, f32, f32, f32)> =
+        let mut rects: Vec<(f32, f32, f32, f32)> =
             (0..n).map(|i| (0.0, i as f32 * 20.0, 10.0, 10.0)).collect();
+        rects.push((500.0, 0.0, 10.0, 10.0));
+        rects.push((508.0, 0.0, 10.0, 10.0));
         let groups = cluster_rects(&rects, 0.0, 2);
-        assert!(groups.is_empty());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
     }
 
     // --- snap_edges ---
