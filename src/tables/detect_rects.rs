@@ -109,7 +109,6 @@ const CLUSTER_GRID_CELL: f32 = 64.0;
 /// tens of points wide, so a 64-pt cell holds a handful of neighbors — not
 /// thousands of stacked drawings.
 const MAX_CLUSTER_PAIRS_PER_CELL: usize = 16_384;
-const MAX_OVERLAP_CHECKS_PER_LARGE_RECT: usize = 8_192;
 
 /// Cluster rects by spatial overlap using union-find.
 /// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
@@ -146,7 +145,7 @@ pub(crate) fn cluster_rects(
 
     let mut keys: Vec<_> = grid.keys().copied().collect();
     keys.sort_unstable();
-    for key in keys {
+    for &key in &keys {
         let bucket = &grid[&key];
         let m = bucket.len();
         let mut pairs = 0usize;
@@ -173,22 +172,99 @@ pub(crate) fn cluster_rects(
         }
     }
 
-    // Oversized spans skip the grid; compare each against other rects so a
-    // page-wide rule still unions the cells it actually overlaps. Every
-    // oversized rect is visited; AABB tests per rect are capped.
+    // Oversized spans skip insert; query the grid cells they cover so a
+    // later overlapping cell is not starved by earlier disjoint candidates.
     for &i in &large {
         if uf.component_size(i) >= MAX_CLUSTER_RECTS {
             continue;
         }
-        let mut checks = 0usize;
-        for j in 0..n {
-            if checks >= MAX_OVERLAP_CHECKS_PER_LARGE_RECT {
+        let (x, y, w, h) = rects[i];
+        let x_lo = grid_coord(x - tolerance, cell);
+        let x_hi = grid_coord(x + w + tolerance, cell);
+        let y_lo = grid_coord(y - tolerance, cell);
+        let y_hi = grid_coord(y + h + tolerance, cell);
+        for &(gx, gy) in &keys {
+            if gx < x_lo || gx > x_hi || gy < y_lo || gy > y_hi {
+                continue;
+            }
+            let bucket = &grid[&(gx, gy)];
+            let mut pairs = 0usize;
+            for &j in bucket {
+                if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                    break;
+                }
+                if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                    continue;
+                }
+                pairs += 1;
+                if rects_overlap(&rects[i], &rects[j], tolerance) {
+                    uf.union(i, j);
+                    if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                        break;
+                    }
+                }
+            }
+            if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                break;
+            }
+        }
+    }
+
+    // Oversized-vs-oversized: band by Y so stacked page-wide rules stay linear.
+    let mut large_y: HashMap<i32, Vec<usize>> = HashMap::new();
+    let mut huge_y: Vec<usize> = Vec::new();
+    for &i in &large {
+        let (_, y, _, h) = rects[i];
+        match grid_span(y - tolerance, y + h + tolerance, cell) {
+            Some(ys) => {
+                for gy in ys {
+                    large_y.entry(gy).or_default().push(i);
+                }
+            }
+            None => huge_y.push(i),
+        }
+    }
+    let mut y_keys: Vec<_> = large_y.keys().copied().collect();
+    y_keys.sort_unstable();
+    for gy in y_keys {
+        let bucket = &large_y[&gy];
+        let m = bucket.len();
+        let mut pairs = 0usize;
+        'y_band: for a in 0..m {
+            let i = bucket[a];
+            if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                continue;
+            }
+            for &j in &bucket[a + 1..] {
+                if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                    break 'y_band;
+                }
+                if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                    continue;
+                }
+                pairs += 1;
+                if rects_overlap(&rects[i], &rects[j], tolerance) {
+                    uf.union(i, j);
+                    if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    for &i in &huge_y {
+        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+            continue;
+        }
+        let mut pairs = 0usize;
+        for &j in &large {
+            if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
                 break;
             }
             if i == j || uf.component_size(j) >= MAX_CLUSTER_RECTS {
                 continue;
             }
-            checks += 1;
+            pairs += 1;
             if rects_overlap(&rects[i], &rects[j], tolerance) {
                 uf.union(i, j);
                 if uf.component_size(i) >= MAX_CLUSTER_RECTS {
@@ -3949,6 +4025,23 @@ mod tests {
         let groups = cluster_rects(&rects, 0.0, 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_oversized_not_starved_by_earlier_disjoint() {
+        // 9k earlier disjoint drawings would exhaust an index-order cap of
+        // 8,192 before the overlapping cell is visited.
+        let mut rects: Vec<(f32, f32, f32, f32)> = (0..9_000)
+            .map(|i| (0.0, i as f32 * 20.0, 10.0, 10.0))
+            .collect();
+        rects.push((0.0, 0.0, 5000.0, 10.0));
+        rects.push((4900.0, 0.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert!(groups.iter().any(|g| {
+            g.len() >= 2
+                && g.iter()
+                    .any(|&idx| (rects[idx].2 - 5000.0).abs() < f32::EPSILON)
+        }));
     }
 
     // --- snap_edges ---
