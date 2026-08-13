@@ -1582,11 +1582,172 @@ fn skip_inline_image(content: &[u8], bi_pos: usize) -> usize {
     let Some(id_pos) = id_pos else {
         return content.len();
     };
+    let params = parse_inline_image_dict(&content[bi_pos + 2..id_pos]);
     // Spec: one whitespace after ID, then sample data.
-    let mut j = id_pos + 2;
-    if j < content.len() && content[j].is_ascii_whitespace() {
-        j += 1;
+    let mut data_start = id_pos + 2;
+    if data_start < content.len() && content[data_start].is_ascii_whitespace() {
+        data_start += 1;
     }
+
+    if let Some(n) = expected_raw_inline_bytes(&params) {
+        return find_ei_from(content, data_start.saturating_add(n).min(content.len()));
+    }
+    if params.dct {
+        if let Some(eoi) = find_jpeg_eoi(content, data_start) {
+            return find_ei_from(content, eoi);
+        }
+    }
+    find_ei_scan(content, data_start)
+}
+
+#[derive(Default)]
+struct InlineImageParams {
+    width: Option<u32>,
+    height: Option<u32>,
+    bpc: Option<u32>,
+    components: Option<u32>,
+    has_filter: bool,
+    dct: bool,
+}
+
+const MAX_INLINE_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn parse_inline_image_dict(dict: &[u8]) -> InlineImageParams {
+    let mut params = InlineImageParams::default();
+    let mut i = 0;
+    while i < dict.len() {
+        if dict[i] != b'/' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let name = read_pdf_name(&dict[i..]);
+        i += name.len();
+        match name {
+            b"W" | b"Width" => params.width = read_pdf_u32(&dict[i..]),
+            b"H" | b"Height" => params.height = read_pdf_u32(&dict[i..]),
+            b"BPC" | b"BitsPerComponent" => params.bpc = read_pdf_u32(&dict[i..]),
+            b"CS" | b"ColorSpace" => {
+                if let Some(cs) = read_pdf_name_token(&dict[i..]) {
+                    params.components = Some(inline_color_components(cs));
+                }
+            }
+            b"F" | b"Filter" => {
+                params.has_filter = true;
+                if dict_token_contains_dct(&dict[i..]) {
+                    params.dct = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    params
+}
+
+fn read_pdf_name(bytes: &[u8]) -> &[u8] {
+    let n = bytes
+        .iter()
+        .position(|&b| b.is_ascii_whitespace() || is_pdf_delimiter(b))
+        .unwrap_or(bytes.len());
+    &bytes[..n]
+}
+
+fn read_pdf_name_token(bytes: &[u8]) -> Option<&[u8]> {
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'/' {
+        return None;
+    }
+    Some(read_pdf_name(&bytes[i + 1..]))
+}
+
+fn read_pdf_u32(bytes: &[u8]) -> Option<u32> {
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+        return None;
+    }
+    let mut n: u32 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        n = n
+            .saturating_mul(10)
+            .saturating_add((bytes[i] - b'0') as u32);
+        i += 1;
+    }
+    Some(n)
+}
+
+fn inline_color_components(cs: &[u8]) -> u32 {
+    match cs {
+        b"RGB" | b"DeviceRGB" => 3,
+        b"CMYK" | b"DeviceCMYK" => 4,
+        _ => 1,
+    }
+}
+
+fn dict_token_contains_dct(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'/' {
+        return read_pdf_name(&bytes[i + 1..])
+            .windows(3)
+            .any(|w| w.eq_ignore_ascii_case(b"DCT"));
+    }
+    if i < bytes.len() && bytes[i] == b'[' {
+        return bytes[i..]
+            .windows(3)
+            .any(|w| w.eq_ignore_ascii_case(b"DCT"));
+    }
+    false
+}
+
+fn expected_raw_inline_bytes(params: &InlineImageParams) -> Option<usize> {
+    if params.has_filter {
+        return None;
+    }
+    let w = u64::from(params.width?);
+    let h = u64::from(params.height?);
+    let bpc = u64::from(params.bpc.unwrap_or(8));
+    let comps = u64::from(params.components.unwrap_or(1));
+    let bits = w.checked_mul(h)?.checked_mul(bpc)?.checked_mul(comps)?;
+    let bytes = bits.div_ceil(8);
+    if bytes == 0 || bytes > MAX_INLINE_IMAGE_BYTES {
+        None
+    } else {
+        Some(bytes as usize)
+    }
+}
+
+fn find_jpeg_eoi(content: &[u8], start: usize) -> Option<usize> {
+    content[start..]
+        .windows(2)
+        .position(|w| w == [0xFF, 0xD9])
+        .map(|rel| start + rel + 2)
+}
+
+fn find_ei_from(content: &[u8], pos: usize) -> usize {
+    let mut k = pos;
+    while k < content.len() && content[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k + 1 < content.len()
+        && content[k] == b'E'
+        && content[k + 1] == b'I'
+        && inline_ei_looks_real(content, k)
+    {
+        return k + 2;
+    }
+    find_ei_scan(content, pos)
+}
+
+fn find_ei_scan(content: &[u8], start: usize) -> usize {
+    let mut j = start;
     while j + 1 < content.len() {
         if content[j] == b'E' && content[j + 1] == b'I' && inline_ei_looks_real(content, j) {
             return j + 2;
@@ -1608,7 +1769,24 @@ fn inline_ei_looks_real(content: &[u8], ei_pos: usize) -> bool {
         return true;
     }
     let next = content[k];
-    next.is_ascii_alphabetic() || next.is_ascii_digit() || is_pdf_delimiter(next)
+    if !(next.is_ascii_alphabetic() || next.is_ascii_digit() || is_pdf_delimiter(next)) {
+        return false;
+    }
+    // Reject `EI` still sitting in binary: the following bytes should look
+    // like PDF syntax, not sample data.
+    looks_like_pdf_content(content, k)
+}
+
+fn looks_like_pdf_content(content: &[u8], pos: usize) -> bool {
+    let slice = &content[pos..content.len().min(pos + 16)];
+    if slice.is_empty() {
+        return true;
+    }
+    let binaryish = slice
+        .iter()
+        .filter(|&&b| b < 0x09 || (b > 0x0D && b < 0x20) || b > 0x7E)
+        .count();
+    binaryish * 5 < slice.len()
 }
 
 /// Extract the font name operand from content stream bytes preceding a Tf operator.
@@ -2202,6 +2380,19 @@ mod tests {
         // Binary after `ID` includes `(` and `<`; those must not start string/hex
         // state that would hide the `Tj` after `EI`.
         let content = b"BI /W 1 /H 1 /CS /RGB /BPC 8 ID\n(<<<<<\x00EI\nBT (Hi) Tj ET";
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, 1);
+        assert!(uchars.contains(&b'H'));
+        assert!(uchars.contains(&b'i'));
+    }
+
+    #[test]
+    fn test_scan_content_inline_image_ignores_ei_inside_sample() {
+        // Uncompressed 8-byte image whose sample starts with `EI Q` must not
+        // resume scanning until the declared length is consumed.
+        let content = b"BI /W 8 /H 1 /BPC 8 /CS /G ID\nEI QxxxxEI\n(Hi) Tj";
         let mut uchars = HashSet::new();
         let (ops, _, _, _) =
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
