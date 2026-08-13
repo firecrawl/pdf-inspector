@@ -64,6 +64,14 @@ tempfile = "3.3"
 default = []
 python = ["pyo3"]
 
+# Enable cross-crate inlining and a single codegen unit. Parsing workloads are
+# dominated by small hot functions in dependency crates (lopdf's nom parser,
+# miniz_oxide inflate, hash maps); fat LTO removes the crate boundaries so the
+# optimizer can inline them. Portable across all supported targets.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [[bin]]
 name = "pdf2md"
 path = "src/bin/pdf2md.rs"
