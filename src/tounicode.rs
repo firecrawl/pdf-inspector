@@ -542,10 +542,20 @@ impl ToUnicodeCMap {
     /// Collects all source CIDs, sorts them, and reassigns to 1, 2, 3, ...
     pub fn remap_to_sequential(&self) -> ToUnicodeCMap {
         let mut cid_to_unicode: HashMap<u16, String> = HashMap::new();
+        let mut assigned = 0usize;
 
-        // Expand ranges first
-        for &(start, end, base) in &self.ranges {
+        // Expand ranges first. Count every CID considered, including
+        // overwrites, so repeating a full-width bfrange cannot re-expand the
+        // 16-bit domain.
+        'ranges: for &(start, end, base) in &self.ranges {
+            if start > end {
+                continue;
+            }
             for cid in start..=end {
+                if assigned >= MAX_CID_W_EXPANSION {
+                    break 'ranges;
+                }
+                assigned += 1;
                 let unicode_cp = base + (cid - start) as u32;
                 if let Some(ch) = char::from_u32(unicode_cp) {
                     cid_to_unicode.insert(cid, ch.to_string());
@@ -1868,10 +1878,10 @@ fn merge_cmaps(mut base: ToUnicodeCMap, overlay: ToUnicodeCMap) -> ToUnicodeCMap
 }
 
 /// Shared 16-bit CID expansion cap (65,536).
-/// Encoding `begincidrange` and `/W` width assignment count every insert,
-/// including overwrites, so a repeated full-width range cannot keep working
-/// after the domain is filled. The `/W` unicode heuristic caps unique CIDs
-/// with the same number.
+/// Encoding `begincidrange`, `/W` width assignment, and ToUnicode sequential
+/// remap count every insert, including overwrites, so a repeated full-width
+/// range cannot keep working after the domain is filled. The `/W` unicode
+/// heuristic caps unique CIDs with the same number.
 pub(crate) const MAX_CID_W_EXPANSION: usize = 65_536;
 
 /// Check if a CIDFont's /W (widths) array contains CID values that look like
@@ -2922,6 +2932,28 @@ endbfrange
         assert_eq!(remapped.lookup(0x0004), Some("Z".to_string()));
         // Ranges should be cleared (all in char_map now)
         assert!(remapped.ranges.is_empty());
+    }
+
+    #[test]
+    fn remap_to_sequential_repeated_full_bfranges_stay_bounded() {
+        // 5,000 copies of `<0003> <ffff> <0041>` must not re-expand the
+        // 16-bit domain on every declaration during subset remap.
+        let mut body = String::new();
+        let mut remaining = 5_000usize;
+        while remaining > 0 {
+            let n = remaining.min(100);
+            body.push_str(&format!("{n} beginbfrange\n"));
+            for _ in 0..n {
+                body.push_str("<0003> <ffff> <0041>\n");
+            }
+            body.push_str("endbfrange\n");
+            remaining -= n;
+        }
+        let data = format!("1 begincodespacerange\n<0000> <ffff>\nendcodespacerange\n{body}");
+        let cmap = ToUnicodeCMap::parse(data.as_bytes()).unwrap();
+        let remapped = cmap.remap_to_sequential();
+        assert!(remapped.char_map.len() <= MAX_CID_W_EXPANSION);
+        assert_eq!(remapped.lookup(1), Some("A".to_string()));
     }
 
     #[test]
