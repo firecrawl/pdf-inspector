@@ -1690,13 +1690,17 @@ fn read_pdf_bool(bytes: &[u8]) -> Option<bool> {
         i += 1;
     }
     let rest = &bytes[i..];
-    if rest.starts_with(b"true") {
+    if rest.starts_with(b"true") && pdf_keyword_ended(&rest[4..]) {
         Some(true)
-    } else if rest.starts_with(b"false") {
+    } else if rest.starts_with(b"false") && pdf_keyword_ended(&rest[5..]) {
         Some(false)
     } else {
         None
     }
+}
+
+fn pdf_keyword_ended(rest: &[u8]) -> bool {
+    rest.is_empty() || rest[0].is_ascii_whitespace() || is_pdf_delimiter(rest[0])
 }
 
 fn inline_color_components(cs: &[u8]) -> Option<u32> {
@@ -1768,7 +1772,7 @@ fn find_ei_from(content: &[u8], pos: usize) -> usize {
     if k + 1 < content.len()
         && content[k] == b'E'
         && content[k + 1] == b'I'
-        && inline_ei_looks_real(content, k)
+        && inline_ei_looks_real(content, k, false)
     {
         return k + 2;
     }
@@ -1778,7 +1782,7 @@ fn find_ei_from(content: &[u8], pos: usize) -> usize {
 fn find_ei_scan(content: &[u8], start: usize) -> usize {
     let mut j = start;
     while j + 1 < content.len() {
-        if content[j] == b'E' && content[j + 1] == b'I' && inline_ei_looks_real(content, j) {
+        if content[j] == b'E' && content[j + 1] == b'I' && inline_ei_looks_real(content, j, true) {
             return j + 2;
         }
         j += 1;
@@ -1786,7 +1790,7 @@ fn find_ei_scan(content: &[u8], start: usize) -> usize {
     content.len()
 }
 
-fn inline_ei_looks_real(content: &[u8], ei_pos: usize) -> bool {
+fn inline_ei_looks_real(content: &[u8], ei_pos: usize, strict: bool) -> bool {
     if !is_content_token_end(content, ei_pos + 1) {
         return false;
     }
@@ -1798,7 +1802,30 @@ fn inline_ei_looks_real(content: &[u8], ei_pos: usize) -> bool {
         return true;
     }
     let next = content[k];
-    next.is_ascii_alphabetic() || next.is_ascii_digit() || is_pdf_delimiter(next)
+    // A string/name/array after `EI` may contain high bytes; do not treat
+    // those as proof the marker was inside sample data.
+    if next == b'(' || next == b'<' || next == b'[' || next == b'/' {
+        return true;
+    }
+    if !(next.is_ascii_alphabetic() || next.is_ascii_digit() || is_pdf_delimiter(next)) {
+        return false;
+    }
+    if !strict {
+        return true;
+    }
+    looks_like_printable_pdf(content, k)
+}
+
+fn looks_like_printable_pdf(content: &[u8], pos: usize) -> bool {
+    let slice = &content[pos..content.len().min(pos + 16)];
+    if slice.is_empty() {
+        return true;
+    }
+    let binaryish = slice
+        .iter()
+        .filter(|&&b| b < 0x09 || (b > 0x0D && b < 0x20) || b > 0x7E)
+        .count();
+    binaryish * 5 < slice.len()
 }
 
 /// Extract the font name operand from content stream bytes preceding a Tf operator.
@@ -2423,6 +2450,20 @@ mod tests {
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 1);
         assert!(uchars.contains(&0xE9));
+    }
+
+    #[test]
+    fn test_scan_content_filtered_inline_image_ignores_ei_in_sample() {
+        // No trusted byte length (Filter present). `EI Q` plus binary must not
+        // resume scanning; the real `EI` before `(Hi) Tj` should.
+        let content =
+            b"BI /W 1 /H 1 /F /FlateDecode ID\nEI Q\xff\xff\xff\xff\xff\xff\xff\xffEI\n(Hi) Tj";
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, 1);
+        assert!(uchars.contains(&b'H'));
+        assert!(uchars.contains(&b'i'));
     }
 
     #[test]
