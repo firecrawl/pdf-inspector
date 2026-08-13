@@ -1,0 +1,21 @@
+src/detector.rs
+  s_8b81192caa100a::t_2806d1b77e7c3f 1585,1587-1675,1679-1702,1706-1723,1725-1750,1772-1789
+  s_8b81192caa100a::t_a30917a3226293 1676-1678,1703-1705
+  s_8b81192caa100a::t_75183e7761fe0f 2392-2403
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "af330f7cc87d63f08ccdd291908bf875367c5613",
+  "prompts": {},
+  "sessions": {
+    "s_8b81192caa100a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "69c52882-fd38-4082-bcc6-5f7987f37382",
+        "model": "grok-4.6"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
