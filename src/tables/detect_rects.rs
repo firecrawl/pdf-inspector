@@ -1,6 +1,6 @@
 //! Rectangle-based table detection using union-find clustering.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use log::debug;
 
@@ -138,8 +138,12 @@ fn union_rect_against_bands(
         return;
     }
     let mut pairs = 0usize;
+    let mut seen = HashSet::new();
     for (_, bucket) in bands.range(lo..=hi) {
         for &j in bucket {
+            if !seen.insert(j) {
+                continue;
+            }
             if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
                 return;
             }
