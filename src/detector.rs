@@ -1817,15 +1817,20 @@ fn inline_ei_looks_real(content: &[u8], ei_pos: usize, strict: bool) -> bool {
 }
 
 fn looks_like_printable_pdf(content: &[u8], pos: usize) -> bool {
-    let slice = &content[pos..content.len().min(pos + 16)];
-    if slice.is_empty() {
-        return true;
+    let end = content.len().min(pos + 16);
+    let mut binaryish = 0;
+    let mut n = 0;
+    for &b in &content[pos..end] {
+        // Stop at the next string/name/array; those payloads may be high bytes.
+        if b == b'(' || b == b'<' || b == b'[' || b == b'/' {
+            break;
+        }
+        n += 1;
+        if b < 0x09 || (b > 0x0D && b < 0x20) || b > 0x7E {
+            binaryish += 1;
+        }
     }
-    let binaryish = slice
-        .iter()
-        .filter(|&&b| b < 0x09 || (b > 0x0D && b < 0x20) || b > 0x7E)
-        .count();
-    binaryish * 5 < slice.len()
+    n == 0 || binaryish * 5 < n
 }
 
 /// Extract the font name operand from content stream bytes preceding a Tf operator.
@@ -2464,6 +2469,18 @@ mod tests {
         assert_eq!(ops, 1);
         assert!(uchars.contains(&b'H'));
         assert!(uchars.contains(&b'i'));
+    }
+
+    #[test]
+    fn test_scan_content_filtered_inline_image_bt_then_non_ascii_string() {
+        // Fallback `EI` scan: `BT (` then high bytes in the string must not
+        // make the real terminator look like sample data.
+        let content = b"BI /W 1 /H 1 /F /FlateDecode ID\nxxEI\nBT (\xE9\xE9\xE9\xE9\xE9) Tj";
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, 1);
+        assert!(uchars.contains(&0xE9));
     }
 
     #[test]
