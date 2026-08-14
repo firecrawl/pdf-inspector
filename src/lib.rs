@@ -31,6 +31,12 @@
 #[cfg(feature = "python")]
 pub mod python;
 
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
+
+#[cfg(feature = "uniffi")]
+pub mod ffi;
+
 pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
