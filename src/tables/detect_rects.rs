@@ -2187,15 +2187,30 @@ fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
     long_dense_cells * 2 >= dense_count
 }
 
-/// Long-side floor for Y-filter page clips (A5 595, 500×600, A4/letter).
-const PAGE_CLIP_MIN_SPAN: f32 = 500.0;
-
 fn is_near_page_origin(x: f32, y: f32, w: f32, h: f32, max_w: f32, max_h: f32) -> bool {
     x < 5.0 && y < 5.0 && w >= max_w * 0.9 && h >= max_h * 0.9
 }
 
+/// True when `(w, h)` matches a standard paper size, independent of the
+/// cluster's max rect. A large origin merged cell must not inherit "page"
+/// scale just because it is the biggest thing in the group.
+fn looks_like_standard_page(w: f32, h: f32) -> bool {
+    let (short, long) = (w.min(h), w.max(h));
+    const PAGES: [(f32, f32); 5] = [
+        (419.5, 595.3),  // A5
+        (500.0, 600.0),  // small-page exporters
+        (595.3, 841.9),  // A4
+        (612.0, 792.0),  // Letter
+        (612.0, 1008.0), // Legal
+    ];
+    const TOL: f32 = 20.0;
+    PAGES
+        .iter()
+        .any(|&(ps, pl)| (short - ps).abs() <= TOL && (long - pl).abs() <= TOL)
+}
+
 /// Origin-anchored, and either much taller than typical cells or nearly as
-/// large as the largest page rect. Clustering uses this (no page-span floor)
+/// large as the largest page rect. Clustering uses this (no paper-size match)
 /// so a compact origin frame can still bridge cells.
 fn is_origin_page_background(
     rect: (f32, f32, f32, f32),
@@ -2203,7 +2218,7 @@ fn is_origin_page_background(
     max_w: f32,
     max_h: f32,
 ) -> bool {
-    origin_page_background(rect, median_height, max_w, max_h, None)
+    origin_page_background(rect, median_height, max_w, max_h, false)
 }
 
 fn origin_page_background(
@@ -2211,7 +2226,7 @@ fn origin_page_background(
     median_height: f32,
     max_w: f32,
     max_h: f32,
-    page_clip_floor: Option<f32>,
+    match_standard_page: bool,
 ) -> bool {
     if x >= 5.0 || y >= 5.0 {
         return false;
@@ -2222,11 +2237,8 @@ fn origin_page_background(
     if !is_near_page_origin(x, y, w, h, max_w, max_h) {
         return false;
     }
-    // Both axes must be page-scale so a wide short origin row is not a clip.
-    // `h > median` keeps equal-height origin rows as table geometry.
     h >= median_height * 4.0
-        || page_clip_floor
-            .is_some_and(|floor| w.max(h) >= floor && w.min(h) >= floor * 0.7 && h > median_height)
+        || (match_standard_page && looks_like_standard_page(w, h) && h > median_height)
 }
 
 /// Classify origin page-scale frames for Y-edge filtering. If clips
@@ -2253,9 +2265,7 @@ fn page_background_flags(rects: &[(f32, f32, f32, f32)]) -> Vec<bool> {
     }
     rects
         .iter()
-        .map(|&rect| {
-            origin_page_background(rect, median_height, max_w, max_h, Some(PAGE_CLIP_MIN_SPAN))
-        })
+        .map(|&rect| origin_page_background(rect, median_height, max_w, max_h, true))
         .collect()
 }
 
@@ -3693,7 +3703,7 @@ mod tests {
             250.0,
             595.3,
             841.9,
-            Some(PAGE_CLIP_MIN_SPAN),
+            true,
         ));
 
         // Few clips: median is already the cell height, no recompute.
@@ -3770,6 +3780,25 @@ mod tests {
             flags.iter().all(|&b| !b),
             "wide short origin row must stay a table row: {flags:?}"
         );
+    }
+
+    #[test]
+    fn page_background_flags_keep_origin_merged_cell_that_is_not_a_page() {
+        // Largest rect is an origin merged header (520×360). Cluster-local
+        // max would call it page-scale; it is not A4/A5/letter.
+        let mut rects = vec![(0.0, 0.0, 520.0, 360.0)];
+        let mut y = 360.0;
+        for _ in 0..4 {
+            rects.push((0.0, y, 260.0, 100.0));
+            rects.push((260.0, y, 260.0, 100.0));
+            y += 100.0;
+        }
+        let flags = page_background_flags(&rects);
+        assert!(
+            !flags[0],
+            "origin merged cell must not be a page clip: {flags:?}"
+        );
+        assert!(flags.iter().skip(1).all(|&b| !b), "{flags:?}");
     }
 
     #[test]
