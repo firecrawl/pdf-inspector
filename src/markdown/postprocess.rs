@@ -180,8 +180,10 @@ const COMPOUND_SUFFIXES: [&str; 14] = [
 ///   4. both fragments are words the document uses ("commercial- type"),
 ///      or the continuation is a [`COMPOUND_SUFFIXES`] element
 ///      ("world- class") — a compound, keep the hyphen;
-///   5. default — join plain (syllable breaks dominate lowercase
-///      continuations).
+///   5. no evidence — leave the break untouched. Evidence covers ~99% of
+///      breaks on vocabulary-rich documents, and an unconditional join was
+///      the one rule able to corrupt output (fusing interleaved-column
+///      fragments into unrecoverable tokens).
 ///
 /// Table rows and fenced code blocks are left untouched.
 fn dehyphenate_line_breaks(text: &str) -> String {
@@ -257,7 +259,13 @@ fn dehyphenate_line_breaks(text: &str) -> String {
             // supply vocabulary evidence.
             format!("{a}-{b}")
         } else {
-            format!("{a}{b}")
+            // No evidence at all: leave the break as it is. An unconditional
+            // join here covered only ~1% more breaks on a vocabulary-rich
+            // document, but it was the sole rule able to corrupt output —
+            // fusing interleaved-column fragments ("com- real" -> "comreal")
+            // into unrecoverable tokens. A visible break is honest; a silent
+            // fusion is not.
+            format!("{a}- {b}")
         }
     };
 
@@ -564,10 +572,11 @@ mod tests {
     }
 
     #[test]
-    fn line_break_defaults_to_plain_join_without_evidence() {
-        // Syllable breaks are the common case for lowercase continuations.
+    fn no_evidence_leaves_the_break_untouched() {
+        // Without document evidence a join cannot be distinguished from
+        // interleaved-column noise; the visible break is kept.
         let text = "The evi- dence was clear.";
-        assert_eq!(dehyphenate_line_breaks(text), "The evidence was clear.");
+        assert_eq!(dehyphenate_line_breaks(text), text);
     }
 
     #[test]
@@ -587,11 +596,13 @@ mod tests {
         // short; fragments this long are left exactly as they are.
         let text = "spreadswerenegativeintheearlytomid- seriouslyflawedduetoappraisallags";
         assert_eq!(dehyphenate_line_breaks(text), text);
-        // Long German compounds stay under the limit and still join.
-        let german = "Das Bundesausbildungsförderungs- gesetz gilt.";
+        // Long German compounds stay under the length gate and join on
+        // vocabulary evidence.
+        let german =
+            "Das Bundesausbildungsförderungsgesetz. Das Bundesausbildungsförderungs- gesetz gilt.";
         assert_eq!(
             dehyphenate_line_breaks(german),
-            "Das Bundesausbildungsförderungsgesetz gilt."
+            "Das Bundesausbildungsförderungsgesetz. Das Bundesausbildungsförderungsgesetz gilt."
         );
     }
 
@@ -626,10 +637,12 @@ mod tests {
 
     #[test]
     fn split_emphasis_span_joins_inside_markers() {
-        let text = "By **Bap-** **tist** pastors and *Consoli-* *dated* Edison.";
+        // Vocabulary evidence ("Baptist", "Consolidated" elsewhere) drives
+        // the join; the split emphasis markers collapse with it.
+        let text = "The Baptist and Consolidated cases. By **Bap-** **tist** pastors and *Consoli-* *dated* Edison.";
         assert_eq!(
             dehyphenate_line_breaks(text),
-            "By **Baptist** pastors and *Consolidated* Edison."
+            "The Baptist and Consolidated cases. By **Baptist** pastors and *Consolidated* Edison."
         );
     }
 
@@ -640,25 +653,34 @@ mod tests {
     }
 
     #[test]
-    fn chained_breaks_join_within_iteration_limit() {
-        let text = "It was unconsti- tu- tional.";
-        assert_eq!(dehyphenate_line_breaks(text), "It was unconstitutional.");
+    fn chained_breaks_join_stepwise_with_evidence() {
+        // A word broken twice joins across passes when each junction has
+        // vocabulary evidence for its intermediate form.
+        let text = "The word unconstitutional, and unconstitu appears too: unconsti- tu- tional.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "The word unconstitutional, and unconstitu appears too: unconstitutional."
+        );
     }
 
     #[test]
     fn table_rows_and_code_blocks_are_untouched() {
-        let text = "|de- fendant|value|\n```\nlet x = de- fendant;\n```\nThe de- fendant won.";
+        let text =
+            "The defendant.\n|de- fendant|value|\n```\nlet x = de- fendant;\n```\nThe de- fendant won.";
         assert_eq!(
             dehyphenate_line_breaks(text),
-            "|de- fendant|value|\n```\nlet x = de- fendant;\n```\nThe defendant won."
+            "The defendant.\n|de- fendant|value|\n```\nlet x = de- fendant;\n```\nThe defendant won."
         );
     }
 
     #[test]
     fn accented_words_join() {
-        // Spanish syllable break with accented continuation.
-        let text = "La resolu- ción fue clara.";
-        assert_eq!(dehyphenate_line_breaks(text), "La resolución fue clara.");
+        // Spanish syllable break with accented continuation, evidence-backed.
+        let text = "Una resolución firme. La resolu- ción fue clara.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "Una resolución firme. La resolución fue clara."
+        );
     }
 
     // --- fix_hyphenation ---
