@@ -110,7 +110,7 @@ Or add it manually:
 
 ```toml
 [dependencies]
-pdf-inspector = "0.1"
+pdf-inspector = "1"
 ```
 
 ```rust

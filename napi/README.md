@@ -83,6 +83,22 @@ for (const region of result[0].regions) {
 }
 ```
 
+### Async variants
+
+`processPdf`, `classifyPdf`, and `extractPagesMarkdown` are synchronous and parse on the calling thread — in Node, that's the event loop. For a one-off call in a script that's fine, but in a server a large document can hold the loop for tens to hundreds of milliseconds.
+
+`processPdfAsync`, `classifyPdfAsync`, and `extractPagesMarkdownAsync` take the same arguments and produce the same results, but run the parse on the libuv thread pool and return a promise, keeping the event loop free. The input buffer is copied before the call returns, so it's safe to reuse or mutate immediately:
+
+```typescript
+import { classifyPdfAsync, extractPagesMarkdownAsync } from '@firecrawl/pdf-inspector'
+
+const classification = await classifyPdfAsync(pdf)
+if (classification.pdfType === 'TextBased') {
+  const { pages } = await extractPagesMarkdownAsync(pdf)
+  // ...
+}
+```
+
 ## Types
 
 ```typescript

@@ -80,6 +80,17 @@ for page in result.pages:
 
 # Restrict to specific 0-indexed pages (preserves caller order)
 result = pdf_inspector.extract_pages_markdown("document.pdf", pages=[0, 2])
+
+# Structure-tree elements from tagged PDFs (empty list when untagged).
+# Pages are 1-indexed to match TextItem.page, so (page, mcid) joins directly
+# against extract_text_with_positions — e.g. to recover real heading levels:
+elements = pdf_inspector.extract_structure_elements("tagged.pdf")
+roles = {(e.page, e.mcid): e.role for e in elements}
+headings = [
+    item.text
+    for item in pdf_inspector.extract_text_with_positions("tagged.pdf")
+    if item.mcid is not None and roles.get((item.page, item.mcid), "").startswith("H")
+]
 ```
 
 ## API reference
@@ -100,6 +111,8 @@ result = pdf_inspector.extract_pages_markdown("document.pdf", pages=[0, 2])
 | `extract_text_in_regions_bytes(data, page_regions)` | Region extraction from bytes |
 | `extract_pages_markdown(path, pages=None)` | Per-page Markdown + layout metadata (all pages by default) |
 | `extract_pages_markdown_bytes(data, pages=None)` | Per-page Markdown from bytes |
+| `extract_structure_elements(path, pages=None)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
+| `extract_structure_elements_bytes(data, pages=None)` | Structure-tree elements from bytes |
 
 ## Types
 
@@ -144,6 +157,12 @@ class TextItem:                      # extract_text_with_positions
     is_underline: bool
     is_strikeout: bool
     item_type: str
+    mcid: int | None                 # marked-content ID for tagged PDFs (None otherwise)
+
+class StructureElement:              # extract_structure_elements
+    page: int                        # 1-indexed (matches TextItem.page)
+    mcid: int
+    role: str                        # "H1".."H6", "P", "Table", ... (resolved via /RoleMap)
 
 class RegionText:                    # extract_text_in_regions
     text: str

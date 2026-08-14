@@ -1,6 +1,6 @@
 //! Rectangle-based table detection using union-find clustering.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use log::debug;
 
@@ -78,19 +78,111 @@ pub(crate) fn rects_overlap(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), 
     !(a_right < b_left || b_right < a_left || a_top < b_bottom || b_top < a_bottom)
 }
 
+fn grid_coord(value: f32, cell: f32) -> i32 {
+    (value / cell).floor().clamp(-1_000_000.0, 1_000_000.0) as i32
+}
+
+/// Inclusive grid range. `None` if the rect covers more cells than we will
+/// materialize — those rects are clustered via a bounded fallback.
+fn grid_span(lo: f32, hi: f32, cell: f32) -> Option<std::ops::RangeInclusive<i32>> {
+    let a = grid_coord(lo.min(hi), cell);
+    let b = grid_coord(lo.max(hi), cell);
+    let span = b.saturating_sub(a);
+    if span > 64 {
+        return None;
+    }
+    Some(a..=b)
+}
+
+fn union_bucket_pairs(
+    uf: &mut UnionFind,
+    rects: &[(f32, f32, f32, f32)],
+    bucket: &[usize],
+    tolerance: f32,
+) {
+    let m = bucket.len();
+    let mut pairs = 0usize;
+    'cell: for a in 0..m {
+        let i = bucket[a];
+        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+            continue;
+        }
+        for &j in &bucket[a + 1..] {
+            if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                break 'cell;
+            }
+            if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                continue;
+            }
+            pairs += 1;
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn union_rect_against_bands(
+    uf: &mut UnionFind,
+    rects: &[(f32, f32, f32, f32)],
+    i: usize,
+    bands: &BTreeMap<i32, Vec<usize>>,
+    lo: i32,
+    hi: i32,
+    tolerance: f32,
+) {
+    if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+        return;
+    }
+    let mut pairs = 0usize;
+    let mut seen = HashSet::new();
+    for (_, bucket) in bands.range(lo..=hi) {
+        for &j in bucket {
+            if !seen.insert(j) {
+                continue;
+            }
+            if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                return;
+            }
+            if i == j || uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                continue;
+            }
+            pairs += 1;
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Maximum component size for rect clustering.  No real table has thousands
 /// of cell rects — once a component exceeds this, it is a vector drawing or
 /// page-spanning clipping path.  We skip overlap checks for rects already in
-/// an oversized component, keeping the original O(n²) loop but making it
-/// effectively O(n) for pathological pages.
+/// an oversized component.
 const MAX_CLUSTER_RECTS: usize = 2000;
+
+/// Pairwise-disjoint rects never merge, so a component-size cap does not
+/// stop an all-pairs loop. Rects are hashed into this many points of grid
+/// and compared only against others in the same cell.
+const CLUSTER_GRID_CELL: f32 = 64.0;
+
+/// All-pairs AABB tests allowed inside one grid cell. A real table cell is
+/// tens of points wide, so a 64-pt cell holds a handful of neighbors — not
+/// thousands of stacked drawings.
+const MAX_CLUSTER_PAIRS_PER_CELL: usize = 16_384;
 
 /// Cluster rects by spatial overlap using union-find.
 /// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
 ///
-/// Skips overlap checks for rects whose component has already exceeded
-/// [`MAX_CLUSTER_RECTS`], so pages with tens of thousands of vector-drawing
-/// rects complete in milliseconds instead of minutes.
+/// Overlap tests run inside a uniform grid so far-apart rects are never
+/// compared, and each cell is pair-capped so a dense stack cannot go
+/// quadratic or starve an independent table in another cell.
 pub(crate) fn cluster_rects(
     rects: &[(f32, f32, f32, f32)],
     tolerance: f32,
@@ -98,23 +190,144 @@ pub(crate) fn cluster_rects(
 ) -> Vec<Vec<usize>> {
     let n = rects.len();
     let mut uf = UnionFind::new(n);
+    let cell = CLUSTER_GRID_CELL.max(tolerance * 4.0);
 
-    for i in 0..n {
-        // If rect i is already in an oversized component, no point comparing
-        // it against further rects — the component won't be used for table
-        // detection anyway.
+    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let mut large: Vec<usize> = Vec::new();
+    for (idx, &(x, y, w, h)) in rects.iter().enumerate() {
+        match (
+            grid_span(x - tolerance, x + w + tolerance, cell),
+            grid_span(y - tolerance, y + h + tolerance, cell),
+        ) {
+            (Some(xs), Some(ys)) => {
+                for gx in xs {
+                    for gy in ys.clone() {
+                        grid.entry((gx, gy)).or_default().push(idx);
+                    }
+                }
+            }
+            _ => large.push(idx),
+        }
+    }
+
+    let mut keys: Vec<_> = grid.keys().copied().collect();
+    keys.sort_unstable();
+    let mut keys_by_y: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+    for &key in &keys {
+        union_bucket_pairs(&mut uf, rects, &grid[&key], tolerance);
+        keys_by_y.entry(key.1).or_default().push(key.0);
+    }
+
+    // Oversized spans skip insert. Range-query occupied cells they cover so
+    // later X-ranges are not starved and we do not scan unrelated rows.
+    for &i in &large {
         if uf.component_size(i) >= MAX_CLUSTER_RECTS {
             continue;
         }
-        for j in (i + 1)..n {
-            if rects_overlap(&rects[i], &rects[j], tolerance) {
-                uf.union(i, j);
-                // Check if the merged component just exceeded the cap —
-                // if so, no need to test more pairs for rect i.
+        let (x, y, w, h) = rects[i];
+        let x_lo = grid_coord(x - tolerance, cell);
+        let x_hi = grid_coord(x + w + tolerance, cell);
+        let y_lo = grid_coord(y - tolerance, cell);
+        let y_hi = grid_coord(y + h + tolerance, cell);
+        for (&gy, gxs) in keys_by_y.range(y_lo..=y_hi) {
+            let start = gxs.partition_point(|&gx| gx < x_lo);
+            for &gx in &gxs[start..] {
+                if gx > x_hi {
+                    break;
+                }
+                let bucket = &grid[&(gx, gy)];
+                let mut pairs = 0usize;
+                for &j in bucket {
+                    if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                        break;
+                    }
+                    if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                        continue;
+                    }
+                    pairs += 1;
+                    if rects_overlap(&rects[i], &rects[j], tolerance) {
+                        uf.union(i, j);
+                        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                            break;
+                        }
+                    }
+                }
                 if uf.component_size(i) >= MAX_CLUSTER_RECTS {
                     break;
                 }
             }
+            if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                break;
+            }
+        }
+    }
+
+    // Oversized-vs-oversized: band on the short axis so stacked or side-by-side
+    // page-spanning rules stay linear. Wide vs tall pairs are matched by
+    // querying the tall X-index; dual-oversized rects occupy every coarse-Y
+    // cell they span.
+    let mut large_x: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut large_y: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut large_coarse_y: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut wide: Vec<usize> = Vec::new();
+    let mut dual: Vec<usize> = Vec::new();
+    for &i in &large {
+        let (x, y, w, h) = rects[i];
+        let xs = grid_span(x - tolerance, x + w + tolerance, cell);
+        let ys = grid_span(y - tolerance, y + h + tolerance, cell);
+        match (xs, ys) {
+            (Some(xs), _) => {
+                for gx in xs {
+                    large_x.entry(gx).or_default().push(i);
+                }
+            }
+            (_, Some(ys)) => {
+                wide.push(i);
+                for gy in ys {
+                    large_y.entry(gy).or_default().push(i);
+                }
+            }
+            _ => {
+                dual.push(i);
+                let coarse = cell * 64.0;
+                match grid_span(y - tolerance, y + h + tolerance, coarse) {
+                    Some(ys) => {
+                        for gy in ys {
+                            large_coarse_y.entry(gy).or_default().push(i);
+                        }
+                    }
+                    None => {
+                        large_coarse_y.entry(i32::MIN).or_default().push(i);
+                    }
+                }
+            }
+        }
+    }
+    for bands in [&large_x, &large_y, &large_coarse_y] {
+        for bucket in bands.values() {
+            union_bucket_pairs(&mut uf, rects, bucket, tolerance);
+        }
+    }
+    // Cross-orientation is |wide|×|tall| if every wide rule spans the page.
+    // Skip that pass when the product cannot be a table (a few rules).
+    let tall_n = large
+        .len()
+        .saturating_sub(wide.len())
+        .saturating_sub(dual.len());
+    let cross_n =
+        (wide.len() + dual.len()).saturating_mul(tall_n) + dual.len().saturating_mul(wide.len());
+    if cross_n > 0 && cross_n <= MAX_CLUSTER_PAIRS_PER_CELL {
+        for &i in wide.iter().chain(&dual) {
+            let (x, _, w, _) = rects[i];
+            let x_lo = grid_coord(x - tolerance, cell);
+            let x_hi = grid_coord(x + w + tolerance, cell);
+            union_rect_against_bands(&mut uf, rects, i, &large_x, x_lo, x_hi, tolerance);
+        }
+        for &i in &dual {
+            let (_, y, _, h) = rects[i];
+            let y_lo = grid_coord(y - tolerance, cell);
+            let y_hi = grid_coord(y + h + tolerance, cell);
+            union_rect_against_bands(&mut uf, rects, i, &large_y, y_lo, y_hi, tolerance);
         }
     }
 
@@ -3808,6 +4021,113 @@ mod tests {
         let groups = cluster_rects(&rects, 0.0, 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_overlapping_grid_still_clusters() {
+        // Neighboring cells overlap; the grid must still union the whole table.
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            for col in 0..4 {
+                rects.push((col as f32 * 9.0, row as f32 * 9.0, 10.0, 10.0));
+            }
+        }
+        let groups = cluster_rects(&rects, 0.0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 16);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_disjoint_stays_subquadratic() {
+        // Pairwise-disjoint rects never merge, so a component-size cap does
+        // not stop all-pairs overlap tests. Spread in X so they land in
+        // different grid cells; 8k is enough that n² tests would dominate.
+        let n = 8_000usize;
+        let rects: Vec<(f32, f32, f32, f32)> =
+            (0..n).map(|i| (i as f32 * 20.0, 0.0, 10.0, 10.0)).collect();
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_rects_stacked_disjoint_does_not_starve_later_table() {
+        // Same X, spread in Y: a spatial grid must still union an overlapping
+        // pair in another region of the page.
+        let n = 8_000usize;
+        let mut rects: Vec<(f32, f32, f32, f32)> =
+            (0..n).map(|i| (0.0, i as f32 * 20.0, 10.0, 10.0)).collect();
+        rects.push((500.0, 0.0, 10.0, 10.0));
+        rects.push((508.0, 0.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_oversized_span_still_unions() {
+        // Wider than 64 grid cells; must still union the small overlapping rect.
+        let rects = vec![(0.0, 0.0, 5000.0, 10.0), (4900.0, 0.0, 10.0, 10.0)];
+        let groups = cluster_rects(&rects, 0.0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_oversized_spans_all_get_a_pass() {
+        // More than 32 huge rects: the last one must still union its overlap.
+        let mut rects: Vec<(f32, f32, f32, f32)> = (0..40)
+            .map(|i| (0.0, i as f32 * 20.0, 5000.0, 10.0))
+            .collect();
+        rects.push((4900.0, 39.0 * 20.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_oversized_not_starved_by_earlier_disjoint() {
+        // 9k earlier disjoint drawings would exhaust an index-order cap of
+        // 8,192 before the overlapping cell is visited.
+        let mut rects: Vec<(f32, f32, f32, f32)> = (0..9_000)
+            .map(|i| (10_000.0, i as f32 * 20.0, 10.0, 10.0))
+            .collect();
+        let wide = rects.len();
+        rects.push((0.0, 0.0, 5000.0, 10.0));
+        let target = rects.len();
+        rects.push((4900.0, 0.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert!(
+            groups
+                .iter()
+                .any(|g| g.contains(&wide) && g.contains(&target)),
+            "wide rule and far-end cell must share a cluster"
+        );
+    }
+
+    #[test]
+    fn test_cluster_rects_wide_and_tall_oversized_union() {
+        let rects = vec![(0.0, 0.0, 5000.0, 10.0), (0.0, 0.0, 10.0, 5000.0)];
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_dual_oversized_spans_coarse_y() {
+        let rects = vec![(0.0, 0.0, 5000.0, 5000.0), (0.0, 4500.0, 5000.0, 5000.0)];
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_wide_and_tall_stays_subquadratic() {
+        let mut rects = Vec::with_capacity(4_000);
+        for i in 0..2_000 {
+            rects.push((0.0, i as f32 * 20.0, 5000.0, 10.0));
+            rects.push((i as f32 * 20.0, 0.0, 10.0, 5000.0));
+        }
+        let _groups = cluster_rects(&rects, 0.0, 2);
     }
 
     // --- snap_edges ---

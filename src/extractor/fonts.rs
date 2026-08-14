@@ -482,7 +482,11 @@ pub(crate) fn parse_cid_w_array(
     widths: &mut HashMap<u16, u16>,
 ) {
     let mut i = 0;
+    let mut assigned = 0usize;
     while i < w_array.len() {
+        if assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+            return;
+        }
         let start_cid = match &w_array[i] {
             Object::Integer(n) => *n as u16,
             Object::Real(n) => *n as u16,
@@ -501,12 +505,14 @@ pub(crate) fn parse_cid_w_array(
             Object::Array(arr) => {
                 // [c [w1 w2 ...]] — consecutive widths starting at c
                 for (j, w_obj) in arr.iter().enumerate() {
-                    let w = match w_obj {
-                        Object::Integer(n) => *n as u16,
-                        Object::Real(n) => *n as u16,
-                        _ => continue,
-                    };
-                    widths.insert(start_cid + j as u16, w);
+                    if !assign_cid_width(
+                        widths,
+                        start_cid.wrapping_add(j as u16),
+                        w_obj,
+                        &mut assigned,
+                    ) {
+                        return;
+                    }
                 }
                 i += 1;
             }
@@ -514,12 +520,14 @@ pub(crate) fn parse_cid_w_array(
                 // Could be a reference to an array
                 if let Ok(Object::Array(arr)) = doc.get_object(*r) {
                     for (j, w_obj) in arr.iter().enumerate() {
-                        let w = match w_obj {
-                            Object::Integer(n) => *n as u16,
-                            Object::Real(n) => *n as u16,
-                            _ => continue,
-                        };
-                        widths.insert(start_cid + j as u16, w);
+                        if !assign_cid_width(
+                            widths,
+                            start_cid.wrapping_add(j as u16),
+                            w_obj,
+                            &mut assigned,
+                        ) {
+                            return;
+                        }
                     }
                     i += 1;
                 } else {
@@ -542,8 +550,8 @@ pub(crate) fn parse_cid_w_array(
                         continue;
                     }
                 };
-                for cid in start_cid..=end {
-                    widths.insert(cid, w);
+                if !assign_cid_width_range(widths, start_cid, end, w, &mut assigned) {
+                    return;
                 }
                 i += 1;
             }
@@ -561,8 +569,8 @@ pub(crate) fn parse_cid_w_array(
                         continue;
                     }
                 };
-                for cid in start_cid..=end {
-                    widths.insert(cid, w);
+                if !assign_cid_width_range(widths, start_cid, end, w, &mut assigned) {
+                    return;
                 }
                 i += 1;
             }
@@ -571,6 +579,45 @@ pub(crate) fn parse_cid_w_array(
             }
         }
     }
+}
+
+fn assign_cid_width(
+    widths: &mut HashMap<u16, u16>,
+    cid: u16,
+    w_obj: &Object,
+    assigned: &mut usize,
+) -> bool {
+    let w = match w_obj {
+        Object::Integer(n) => *n as u16,
+        Object::Real(n) => *n as u16,
+        _ => return true,
+    };
+    if *assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+        return false;
+    }
+    widths.insert(cid, w);
+    *assigned += 1;
+    true
+}
+
+fn assign_cid_width_range(
+    widths: &mut HashMap<u16, u16>,
+    start: u16,
+    end: u16,
+    w: u16,
+    assigned: &mut usize,
+) -> bool {
+    if start > end {
+        return true;
+    }
+    for cid in start..=end {
+        if *assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+            return false;
+        }
+        widths.insert(cid, w);
+        *assigned += 1;
+    }
+    true
 }
 
 /// Compute the width of a string in text space units,
@@ -2312,5 +2359,49 @@ end",
         // A mapping to U+FFFD is not usable — extraction rejects it as an
         // invalid CMap result — so it must not clear the gid flag.
         assert!(gid_flagged(Some("<01> <FFFD>\n<02> <FFFD>")));
+    }
+
+    #[test]
+    fn parse_cid_w_array_range_and_consecutive() {
+        use super::parse_cid_w_array;
+        use lopdf::{Document, Object};
+        use std::collections::HashMap;
+
+        let doc = Document::new();
+        let mut widths = HashMap::new();
+        let w = vec![
+            Object::Integer(10),
+            Object::Integer(12),
+            Object::Integer(500),
+            Object::Integer(20),
+            Object::Array(vec![Object::Integer(100), Object::Integer(200)]),
+        ];
+        parse_cid_w_array(&doc, &w, &mut widths);
+        assert_eq!(widths.get(&10), Some(&500));
+        assert_eq!(widths.get(&11), Some(&500));
+        assert_eq!(widths.get(&12), Some(&500));
+        assert_eq!(widths.get(&20), Some(&100));
+        assert_eq!(widths.get(&21), Some(&200));
+    }
+
+    #[test]
+    fn parse_cid_w_array_repeated_full_ranges_stay_bounded() {
+        use super::parse_cid_w_array;
+        use crate::tounicode::MAX_CID_W_EXPANSION;
+        use lopdf::{Document, Object};
+        use std::collections::HashMap;
+
+        let doc = Document::new();
+        let mut widths = HashMap::new();
+        let mut w = Vec::new();
+        for _ in 0..5_000 {
+            w.push(Object::Integer(0));
+            w.push(Object::Integer(65535));
+            w.push(Object::Integer(500));
+        }
+        parse_cid_w_array(&doc, &w, &mut widths);
+        assert!(widths.len() <= MAX_CID_W_EXPANSION);
+        assert_eq!(widths.get(&0), Some(&500));
+        assert_eq!(widths.get(&65535), Some(&500));
     }
 }

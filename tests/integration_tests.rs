@@ -1430,6 +1430,77 @@ fn test_firecrawl_tagged_pdf_struct_tree() {
 }
 
 #[test]
+fn test_tagged_pdf_text_items_carry_mcid() {
+    let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    assert!(
+        items.iter().any(|i| i.mcid.is_some()),
+        "Tagged PDF text items should carry Marked Content IDs"
+    );
+}
+
+#[test]
+fn test_extract_structure_elements_tagged_pdf() {
+    let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let elements = pdf_inspector::extract_structure_elements_mem(&buf, None).unwrap();
+    assert!(!elements.is_empty(), "Tagged PDF should yield elements");
+    assert!(
+        elements.iter().any(|e| e.role == "H1"),
+        "Should surface H1 heading roles"
+    );
+    assert!(
+        elements.iter().all(|e| !e.role.is_empty()),
+        "Every element should carry a role name"
+    );
+
+    // Sorted by (page, mcid) for deterministic output
+    assert!(
+        elements
+            .windows(2)
+            .all(|w| (w[0].page, w[0].mcid) <= (w[1].page, w[1].mcid)),
+        "Elements should be sorted by (page, mcid)"
+    );
+
+    // The advertised join: (page, mcid) pairs must line up with the
+    // mcid-carrying TextItems from positioned extraction, and joining the
+    // H1 entries must recover non-empty heading text.
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    let h1_refs: std::collections::HashSet<(u32, i64)> = elements
+        .iter()
+        .filter(|e| e.role == "H1")
+        .map(|e| (e.page, e.mcid))
+        .collect();
+    let h1_text: String = items
+        .iter()
+        .filter(|i| i.mcid.is_some_and(|mcid| h1_refs.contains(&(i.page, mcid))))
+        .map(|i| i.text.as_str())
+        .collect();
+    assert!(
+        !h1_text.trim().is_empty(),
+        "Joining H1 structure elements to text items should recover heading text"
+    );
+
+    // Page filter is 1-indexed (matching TextItem.page) and equals the
+    // corresponding subset of the full document result.
+    let page1 = pdf_inspector::extract_structure_elements_mem(&buf, Some(&[1])).unwrap();
+    assert!(!page1.is_empty(), "Page 1 should have elements");
+    assert!(page1.iter().all(|e| e.page == 1));
+    let full_page1_count = elements.iter().filter(|e| e.page == 1).count();
+    assert_eq!(page1.len(), full_page1_count);
+}
+
+#[test]
+fn test_extract_structure_elements_untagged_pdf_empty() {
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let elements = pdf_inspector::extract_structure_elements_mem(&buf, None).unwrap();
+    assert!(
+        elements.is_empty(),
+        "Untagged PDF should yield no structure elements, got {:?}",
+        elements
+    );
+}
+
+#[test]
 fn test_identity_h_no_tounicode_suppresses_garbage() {
     // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no
     // usable ToUnicode CMap. The raw CID bytes (e.g. 0x08 0x37, 0x0E 0x0F)
@@ -1581,6 +1652,282 @@ fn test_extract_regions_mem_basic_text_pdf() {
     let first = &regions[0].regions[0];
     assert!(!first.text.trim().is_empty(), "First page should have text");
     assert_eq!(regions[0].page, 0);
+}
+
+/// Build a synthetic "scanned page" PDF: a full-page image XObject with a
+/// text layer drawn in the given render mode (3 = invisible OCR overlay,
+/// 0 = normal visible fill). `visible_extra` optionally adds a normally
+/// rendered line so double-layer behavior can be tested; `layer_lines`
+/// overrides the layer content (default: three pangram lines);
+/// `quote_ops` shows every layer line via the `'` operator instead of Tj
+/// (both are standard show-text encodings for OCR layers).
+fn make_pdf_with_custom_text_layer(
+    text_render_mode: i32,
+    visible_extra: Option<&str>,
+    layer_lines: Option<&[&str]>,
+    quote_ops: bool,
+) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    fn add_stream_object(
+        pdf: &mut Vec<u8>,
+        offsets: &mut Vec<usize>,
+        id: usize,
+        dict: &str,
+        stream_bytes: &[u8],
+    ) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(
+            format!("<< {} /Length {} >>\nstream\n", dict, stream_bytes.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(stream_bytes);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> \
+         /Contents 4 0 R >>",
+    );
+    // Full-page raster, then the text layer in the requested render mode —
+    // several lines so the OCR-layer gate's alnum floor (40) is well cleared.
+    let mut content = String::from("q 612 0 0 792 0 0 cm /Im0 Do Q\n");
+    let default_layer = [
+        "The quick brown fox jumps over the lazy dog",
+        "Pack my box with five dozen liquor jugs tonight",
+        "Sphinx of black quartz judge my vow carefully",
+    ];
+    let layer: &[&str] = layer_lines.unwrap_or(&default_layer);
+    if quote_ops {
+        // Every line shown via `'` (move-to-next-line + show) — nothing on
+        // this layer goes through Tj, pinning the `'` suppression path.
+        content.push_str(&format!(
+            "BT /F1 12 Tf {text_render_mode} Tr 16 TL 72 716 Td "
+        ));
+        for line in layer {
+            content.push_str(&format!("({line}) ' "));
+        }
+    } else {
+        content.push_str(&format!("BT /F1 12 Tf {text_render_mode} Tr 72 700 Td "));
+        for (i, line) in layer.iter().enumerate() {
+            if i > 0 {
+                content.push_str("0 -16 Td ");
+            }
+            content.push_str(&format!("({line}) Tj "));
+        }
+    }
+    content.push_str("ET\n");
+    if let Some(extra) = visible_extra {
+        content.push_str(&format!("BT /F1 12 Tf 0 Tr 72 500 Td ({extra}) Tj ET\n"));
+    }
+    add_stream_object(&mut pdf, &mut offsets, 4, "", content.as_bytes());
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    let image_pixel = [128u8];
+    add_stream_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8",
+        &image_pixel,
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+fn make_pdf_with_text_layer(text_render_mode: i32, visible_extra: Option<&str>) -> Vec<u8> {
+    make_pdf_with_custom_text_layer(text_render_mode, visible_extra, None, false)
+}
+
+/// A scanned page whose only text is an invisible (Tr 3) OCR layer behind
+/// the raster must serve that layer from the region extractor instead of
+/// reporting the region as needs_ocr — the exact text is already in the PDF.
+#[test]
+fn test_extract_regions_mem_recovers_invisible_ocr_layer() {
+    let buf = make_pdf_with_text_layer(3, None);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    assert_eq!(regions.len(), 1);
+    let region = &regions[0].regions[0];
+    assert!(
+        region.text.contains("quick brown fox"),
+        "invisible OCR layer should be served as region text, got: {:?}",
+        region.text
+    );
+    assert!(
+        !region.needs_ocr,
+        "recovered OCR layer must not fall back to GPU OCR"
+    );
+}
+
+/// ANY visible text on the page — even a single short line — must block the
+/// invisible-layer adoption entirely: the invisible pass returns visible
+/// items too, so adopting it alongside visible text would duplicate the
+/// visible words. Strict zero-visible gate, no fuzzy dedupe.
+#[test]
+fn test_extract_regions_mem_visible_text_blocks_invisible_layer() {
+    let buf = make_pdf_with_text_layer(3, Some("Folio 142"));
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        region.text.contains("Folio 142"),
+        "visible text should be extracted, got: {:?}",
+        region.text
+    );
+    assert!(
+        !region.text.contains("quick brown fox"),
+        "invisible layer must not be adopted when any visible text exists, got: {:?}",
+        region.text
+    );
+    assert_eq!(
+        region.text.matches("Folio 142").count(),
+        1,
+        "visible text must appear exactly once, got: {:?}",
+        region.text
+    );
+}
+
+/// An invisible OCR layer shown entirely via the `'` show-text operator
+/// (move-to-next-line + show) must also be recovered — the skipped_invisible
+/// signal has to fire on every show-text path, not just Tj/TJ.
+#[test]
+fn test_extract_regions_mem_recovers_quote_operator_layer() {
+    let buf = make_pdf_with_custom_text_layer(3, None, None, true);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        region.text.contains("quick brown fox"),
+        "'-operator OCR layer should be recovered, got: {:?}",
+        region.text
+    );
+    assert!(!region.needs_ocr);
+}
+
+/// An invisible layer below the 40-alnum floor (a stray watermark line)
+/// must NOT be adopted — the region keeps its needs_ocr fallback.
+#[test]
+fn test_extract_regions_mem_tiny_invisible_layer_not_adopted() {
+    let buf = make_pdf_with_custom_text_layer(3, None, Some(&["Scanned by ACME"]), false);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        !region.text.contains("Scanned by ACME"),
+        "below-floor invisible layer must not be adopted, got: {:?}",
+        region.text
+    );
+    // Only the raster placeholder remains — needs_ocr stays whatever main
+    // reports for placeholder-only regions (false today; downstream
+    // pipelines route placeholder-only text to OCR themselves, and this PR
+    // deliberately does not change that contract).
+    assert!(
+        region.text.trim().starts_with("[Image:"),
+        "region should hold only the raster placeholder, got: {:?}",
+        region.text
+    );
+}
+
+/// An invisible layer that clears the alnum floor but is mostly symbol
+/// garbage (a broken OCR run) must be rejected by the garbage gate.
+#[test]
+fn test_extract_regions_mem_garbage_invisible_layer_not_adopted() {
+    // Each line: 5 alphanumerics among 15 symbol chars. Ten lines clear the
+    // 40-alnum floor (50 alnum) while staying well under the half-alnum
+    // ratio is_garbage_text requires.
+    let garbage_lines: Vec<&str> = vec!["a@@b%%c&&d==e~~"; 10];
+    let buf = make_pdf_with_custom_text_layer(3, None, Some(&garbage_lines), false);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        !region.text.contains("a@@b"),
+        "garbage invisible layer must not be adopted, got: {:?}",
+        region.text
+    );
+    assert!(
+        region.text.trim().starts_with("[Image:"),
+        "region should hold only the raster placeholder, got: {:?}",
+        region.text
+    );
+}
+
+/// Punctuation-only visible text (zero alphanumerics) must ALSO block
+/// adoption — the gate is item-presence, not alphanumeric mass. (Real-world
+/// rationale: an invisible OCR layer transcribes the raster, so visible
+/// glyphs typically have invisible twins there; this fixture's layers are
+/// disjoint, so it pins the gate itself, not the duplication scenario.)
+#[test]
+fn test_extract_regions_mem_punctuation_visible_blocks_invisible_layer() {
+    let buf = make_pdf_with_text_layer(3, Some("... --- ..."));
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        !region.text.contains("quick brown fox"),
+        "invisible layer must not be adopted over punctuation-only visible text, got: {:?}",
+        region.text
+    );
+    assert_eq!(
+        region.text.matches("... --- ...").count(),
+        1,
+        "visible punctuation must be preserved exactly once, got: {:?}",
+        region.text
+    );
+}
+
+/// Regression guard: a normal visible-text page (render mode 0) is served
+/// once and only once — if the fallback ever mis-fired here and merged a
+/// second pass, the phrase would duplicate.
+#[test]
+fn test_extract_regions_mem_visible_layer_unchanged() {
+    let buf = make_pdf_with_text_layer(0, None);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert_eq!(
+        region.text.matches("quick brown fox").count(),
+        1,
+        "visible text must appear exactly once, got: {:?}",
+        region.text
+    );
+    assert!(!region.needs_ocr);
 }
 
 #[test]
@@ -4432,8 +4779,9 @@ fn position_adjusted_logical_order_rtl_is_left_untouched() {
 /// though the source order was already correct.
 #[test]
 fn fixture_logical_order_rtl_pdf_is_left_untouched() {
-    let result = process_pdf_with_options("tests/fixtures/rtl_logical_order.pdf", PdfOptions::new())
-        .expect("fixture should extract");
+    let result =
+        process_pdf_with_options("tests/fixtures/rtl_logical_order.pdf", PdfOptions::new())
+            .expect("fixture should extract");
 
     let md = result.markdown.unwrap_or_default();
     assert_reads_logically(&md);
