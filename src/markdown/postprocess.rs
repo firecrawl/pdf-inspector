@@ -13,7 +13,11 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
         text = collapse_dot_leaders(&text);
     }
 
-    // Fix hyphenation first (before other processing)
+    // Collapse runs of spaces first: double-spaced breaks ("de-  fendant")
+    // must look like single-spaced ones before the hyphenation passes.
+    collapse_consecutive_spaces(&mut text);
+
+    // Fix hyphenation (before other processing)
     if options.fix_hyphenation {
         text = fix_hyphenation(&text);
     }
@@ -251,7 +255,7 @@ fn dehyphenate_line_breaks(text: &str) -> String {
     use once_cell::sync::Lazy;
     use std::collections::HashSet;
 
-    const WORD: &str = "[A-Za-zÁÀÂÃÄÉÈÊËÍÏÓÔÕÖÚÜÇÑáàâãäéèêëíïóôõöúüçñ]";
+    const WORD: &str = r"\p{L}";
 
     // "de- fendant"
     static BREAK_RE: Lazy<Regex> =
@@ -321,9 +325,10 @@ fn dehyphenate_line_breaks(text: &str) -> String {
             continue;
         }
         // A break can chain ("unconsti- tu- tional"); each pass joins one
-        // junction, and the loop runs until the line is stable.
+        // junction, and every successful join removes a break, so running
+        // until the line is stable is bounded by the number of breaks.
         let mut current = line.to_string();
-        for _ in 0..3 {
+        loop {
             let next = BREAK_EMPH_RE
                 .replace_all(&current, |caps: &regex::Captures| {
                     // Mismatched markers aren't a split span; a Keep decision
@@ -634,6 +639,31 @@ mod tests {
         assert_eq!(
             dehyphenate_line_breaks(text),
             "The Third-Party complaint by Hinds-Radix."
+        );
+    }
+
+    #[test]
+    fn cyrillic_words_join_on_evidence() {
+        // The word class is Unicode-wide, not a hard-coded Latin subset.
+        let text = "Это решение важно. Это реше- ние суда.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "Это решение важно. Это решение суда."
+        );
+    }
+
+    #[test]
+    fn double_spaced_breaks_join_through_clean_markdown() {
+        // Space collapsing runs before hyphenation, so a break that arrives
+        // with two spaces ("de-  fendant") still rejoins.
+        let options = MarkdownOptions::default();
+        let out = clean_markdown(
+            "The defendant appeared. The de-  fendant argued.".to_string(),
+            &options,
+        );
+        assert_eq!(
+            out.trim_end(),
+            "The defendant appeared. The defendant argued."
         );
     }
 
