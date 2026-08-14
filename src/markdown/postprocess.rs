@@ -156,17 +156,6 @@ fn fix_hyphenation(text: &str) -> String {
 /// evidence.
 const SUSPENSION_WORDS: [&str; 3] = ["to", "and", "or"];
 
-/// Productive compound-forming second elements: "world-class", "cloud-based",
-/// "commercial-type", "long-term". English words do not syllable-break so
-/// that the continuation lands exactly on one of these, so a break ending on
-/// one is a hyphenated compound even with no other document evidence.
-/// Deliberately conservative — anything that is also a plausible word tail
-/// ("like": un-like, "free": care-free) is excluded.
-const COMPOUND_SUFFIXES: [&str; 14] = [
-    "based", "class", "type", "level", "wide", "term", "specific", "related", "oriented", "driven",
-    "sized", "scale", "facing", "aware",
-];
-
 /// What a line-break hyphen pair should become. Policy output only — how the
 /// decision is rendered (plain text vs. inside split emphasis markers) is the
 /// caller's business.
@@ -213,10 +202,6 @@ fn join_decision(
         // document uses ("commercial- type"): hyphenated compounds are made
         // of words, while syllable fragments ("evi", "judg", "mo") are not.
         Join::Hyphen
-    } else if COMPOUND_SUFFIXES.contains(&b.to_lowercase().as_str()) {
-        // "World- class", "commercial- type" in documents too short to
-        // supply vocabulary evidence.
-        Join::Hyphen
     } else {
         // No evidence at all: leave the break as it is. An unconditional join
         // here covered only ~1% more breaks on a vocabulary-rich document,
@@ -242,13 +227,19 @@ fn join_decision(
 ///      capitalized ("Hinds- Radix", "Third- Party") — keep the hyphen;
 ///   3. the continuation is a [`SUSPENSION_WORDS`] conjunction
 ///      ("mid- to long-term") — a suspended hyphen, leave untouched;
-///   4. both fragments are words the document uses ("commercial- type"),
-///      or the continuation is a [`COMPOUND_SUFFIXES`] element
-///      ("world- class") — a compound, keep the hyphen;
+///   4. both fragments are words the document uses ("commercial- type"
+///      where "commercial" and "type" appear elsewhere) — a compound,
+///      keep the hyphen;
 ///   5. no evidence — leave the break untouched. Evidence covers ~99% of
 ///      breaks on vocabulary-rich documents, and an unconditional join was
 ///      the one rule able to corrupt output (fusing interleaved-column
 ///      fragments into unrecoverable tokens).
+///
+/// Every rule is either document evidence or script-agnostic typography;
+/// deliberately no hard-coded word lists beyond the three suspension
+/// conjunctions (a curated suffix list was tried and removed — it was
+/// English-only, its membership was unfalsifiable, and it could invent
+/// hyphens: "proto- type" -> "proto-type").
 ///
 /// Table rows and fenced code blocks are left untouched.
 fn dehyphenate_line_breaks(text: &str) -> String {
@@ -692,14 +683,13 @@ mod tests {
     }
 
     #[test]
-    fn compound_suffix_keeps_the_hyphen_without_evidence() {
-        // One-page documents give no vocabulary evidence; the productive
-        // compound suffixes still identify these as compounds.
-        let text = "Their world- class support and cloud- based commercial- type systems.";
-        assert_eq!(
-            dehyphenate_line_breaks(text),
-            "Their world-class support and cloud-based commercial-type systems."
-        );
+    fn no_evidence_compounds_stay_visibly_broken() {
+        // No hard-coded suffix list: without document evidence even a likely
+        // compound keeps its visible break. A curated list was tried and
+        // removed — English-only, unfalsifiable membership, and able to
+        // invent hyphens ("proto- type" -> "proto-type").
+        let text = "Their world- class support and proto- type systems.";
+        assert_eq!(dehyphenate_line_breaks(text), text);
     }
 
     #[test]
