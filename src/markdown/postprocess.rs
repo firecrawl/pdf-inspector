@@ -227,6 +227,13 @@ fn dehyphenate_line_breaks(text: &str) -> String {
     }
 
     let join = |a: &str, b: &str| -> String {
+        // Word-length sanity: syllable fragments are short, and even long
+        // German compounds stay under this. Fragments beyond it are already
+        // fused reading-order noise (interleaved columns), and joining would
+        // compound the damage.
+        if a.chars().count() + b.chars().count() > 40 {
+            return format!("{a}- {b}");
+        }
         let key_plain = format!("{}{}", a.to_lowercase(), b.to_lowercase());
         let key_hyphen = format!("{}-{}", a.to_lowercase(), b.to_lowercase());
         if words.contains(&key_plain) {
@@ -570,6 +577,21 @@ mod tests {
         assert_eq!(
             dehyphenate_line_breaks(text),
             "The Third-Party complaint by Hinds-Radix."
+        );
+    }
+
+    #[test]
+    fn fused_column_noise_is_not_joined() {
+        // Interleaved-column garbage arrives already fused; joining across
+        // its breaks would compound the damage. Real syllable fragments are
+        // short; fragments this long are left exactly as they are.
+        let text = "spreadswerenegativeintheearlytomid- seriouslyflawedduetoappraisallags";
+        assert_eq!(dehyphenate_line_breaks(text), text);
+        // Long German compounds stay under the limit and still join.
+        let german = "Das Bundesausbildungsförderungs- gesetz gilt.";
+        assert_eq!(
+            dehyphenate_line_breaks(german),
+            "Das Bundesausbildungsförderungsgesetz gilt."
         );
     }
 
