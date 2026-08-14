@@ -56,8 +56,13 @@ import pdf_inspector
 
 result = pdf_inspector.process_pdf("document.pdf")
 print(result.pdf_type)   # "text_based", "scanned", "image_based", "mixed"
-print(result.markdown)   # Markdown string or None
+print(result.markdown)   # Markdown string, or None for scanned/image-based PDFs
 ```
+
+> `markdown` is `None` when `pdf_type` is `scanned` or `image_based`: those pages
+> have no text layer, so there is nothing to extract without OCR. This is expected
+> — check `pdf_type` / `pages_needing_ocr` and run OCR (e.g. OCRmyPDF) on those
+> files first. pdf-inspector classifies PDFs; it does not perform OCR itself.
 
 > Full API reference: [docs/python.md](docs/python.md)
 

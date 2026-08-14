@@ -93,6 +93,24 @@ headings = [
 ]
 ```
 
+> **`markdown` is `None` for scanned and image-based PDFs.** When `pdf_type` is
+> `"scanned"` or `"image_based"`, the page has no text layer (it is typically a
+> single full-page image), so there is nothing to extract without OCR — and
+> pdf-inspector classifies PDFs rather than performing OCR. This is expected, not
+> an error. To handle these files, check `pdf_type` and `pages_needing_ocr`, run
+> OCR (for example with [OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF), adding
+> the relevant language pack such as `-l chi_sim`), then re-run `process_pdf` on
+> the OCR'd output:
+>
+> ```python
+> result = pdf_inspector.process_pdf(path)
+> if result.markdown is not None:
+>     use(result.markdown)
+> else:
+>     # scanned / image-based → route to your OCR pipeline
+>     ocr_pages = result.pages_needing_ocr   # 1-indexed
+> ```
+
 ## API reference
 
 | Function | Description |
