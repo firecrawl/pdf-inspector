@@ -1,0 +1,49 @@
+src/python.rs
+  s_d4d02aa936fc22::t_7f1ca32f90893a 272-275
+src/extractor/highlight.rs
+  s_d4d02aa936fc22::t_9347ad04bfed5c 1-51,58-178,182-579
+  s_d4d02aa936fc22::t_c96ff98910643c 52-57
+  s_d4d02aa936fc22::t_79a32362ad457e 179-181
+src/bin/pdf2md.rs
+  s_d4d02aa936fc22::t_79403d58b31a31 148
+  s_d4d02aa936fc22::t_f46ba6196ba327 77,90
+napi/src/lib.rs
+  s_d4d02aa936fc22::t_7549be5c820af7 89-92
+src/types.rs
+  s_d4d02aa936fc22::t_d1209d582c2c22 127-131
+src/extractor/mod.rs
+  s_d4d02aa936fc22::t_f61fc3dcd8af41 1060
+  s_d4d02aa936fc22::t_a3fa545218e222 9
+  s_d4d02aa936fc22::t_e2dfff8f3bc4ca 1128
+docs/python.md
+  s_d4d02aa936fc22::t_a6af1a6757f7bb 159
+pdf_inspector.pyi
+  s_d4d02aa936fc22::t_5bf2b2c769617b 53-55
+src/extractor/content_stream.rs
+  s_d4d02aa936fc22::t_5303ca6f0d38ab 393-445
+  s_d4d02aa936fc22::t_b9f8659b0968d0 350
+  s_d4d02aa936fc22::t_5adb9a5b7528e6 365
+  s_d4d02aa936fc22::t_b0578220dbb885 174-178
+  s_d4d02aa936fc22::t_dd0b68005b8285 1224-1236
+  s_d4d02aa936fc22::t_f65de0f5a56476 21
+  s_d4d02aa936fc22::t_00505a6cc0f630 1292-1301,1305-1315
+  s_d4d02aa936fc22::t_b738c699af6fcd 1441,1449-1457
+  s_d4d02aa936fc22::t_1d588b88c8e330 1569-1589
+  s_d4d02aa936fc22::t_445ceea46cb187 285-288,294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b690904fce7748c8baa9042e55805082b7097aba",
+  "prompts": {},
+  "sessions": {
+    "s_d4d02aa936fc22": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c44a986d-6048-4427-bab5-438d8e108074",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
