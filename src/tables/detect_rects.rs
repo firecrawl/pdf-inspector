@@ -2207,8 +2207,10 @@ fn is_origin_page_background(
     w >= max_w * 0.9 && h >= max_h * 0.9 && h >= median_height * 4.0
 }
 
-/// Classify origin page-scale frames. If clips outnumber cells, `median_h`
-/// would be the page height — recompute it from the remaining rects.
+/// Classify origin page-scale frames for Y-edge filtering. If clips
+/// outnumber cells, recompute median from the remaining rects. Near-page
+/// origin frames skip the clustering `*4` factor so tall cells cannot
+/// miss an A4 clip.
 fn page_background_flags(rects: &[(f32, f32, f32, f32)]) -> Vec<bool> {
     if rects.is_empty() {
         return Vec::new();
@@ -2231,7 +2233,15 @@ fn page_background_flags(rects: &[(f32, f32, f32, f32)]) -> Vec<bool> {
     }
     rects
         .iter()
-        .map(|&(x, y, w, h)| is_origin_page_background(x, y, w, h, median_height, max_w, max_h))
+        .map(|&(x, y, w, h)| {
+            if x >= 5.0 || y >= 5.0 {
+                return false;
+            }
+            if h > median_height * 20.0 {
+                return true;
+            }
+            w >= max_w * 0.9 && h >= max_h * 0.9
+        })
         .collect()
 }
 
@@ -3621,6 +3631,35 @@ mod tests {
         let cell_flags: Vec<bool> = flags.iter().copied().take(10).collect();
         assert!(clip_flags.iter().all(|&b| b), "A4 clips must be page-bg");
         assert!(cell_flags.iter().all(|&b| !b), "cells must not be page-bg");
+    }
+
+    #[test]
+    fn page_background_flags_flag_a4_clip_when_cells_exceed_median_times_four() {
+        // 250pt cells: clustering `*4` needs h >= 1000, so an A4 clip (841.9)
+        // would miss. Y-filter must still drop the clip.
+        let mut rects = vec![(89.4, 200.0, 171.7, 250.0); 10];
+        rects.extend(std::iter::repeat((0.0, 0.0, 595.3, 841.9)).take(20));
+        let flags = page_background_flags(&rects);
+        assert!(
+            flags.iter().skip(10).all(|&b| b),
+            "A4 clips must be page-bg against 250pt cells"
+        );
+        assert!(
+            flags.iter().take(10).all(|&b| !b),
+            "250pt cells must not be page-bg"
+        );
+        assert!(!is_origin_page_background(
+            0.0, 0.0, 595.3, 841.9, 250.0, 595.3, 841.9
+        ));
+
+        // Few clips: median is already the cell height, no recompute.
+        let mut few = vec![(89.4, 200.0, 171.7, 250.0); 10];
+        few.extend(std::iter::repeat((0.0, 0.0, 595.3, 841.9)).take(3));
+        let few_flags = page_background_flags(&few);
+        assert!(
+            few_flags.iter().skip(10).all(|&b| b),
+            "A4 clips must still be page-bg when they do not dominate"
+        );
     }
 
     #[test]
@@ -5778,5 +5817,51 @@ mod tests {
         assert_eq!(table.cells[0], vec!["A", "B", "C"]);
         assert_eq!(table.cells[1], vec!["D", "E", "F"]);
         assert_eq!(table.cells[2], vec!["G", "H", "I"]);
+    }
+
+    #[test]
+    fn cell_rect_row_edges_ignore_clips_when_cells_exceed_median_times_four() {
+        let col_w = [80.0_f32, 80.0, 80.0];
+        let row_h = [250.0_f32, 250.0, 250.0];
+        let left = 100.0_f32;
+        let top = 800.0_f32;
+        let mut rects = Vec::new();
+        let mut y_top = top;
+        for &h in &row_h {
+            let y = y_top - h;
+            let mut x = left;
+            for &w in &col_w {
+                rects.push((x, y, w, h));
+                x += w;
+            }
+            y_top -= h;
+        }
+        for _ in 0..20 {
+            rects.push((0.0, 0.0, 595.3, 841.9));
+        }
+
+        let labels = [["A", "B", "C"], ["D", "E", "F"], ["G", "H", "I"]];
+        let mut items = vec![make_item("Keywordstats research neural", 90.0, 820.0, 9.0)];
+        let mut row_top = top;
+        for (r, row) in labels.iter().enumerate() {
+            let h = row_h[r];
+            let y = row_top - h / 2.0;
+            let mut x = left;
+            for (c, text) in row.iter().enumerate() {
+                items.push(make_item(text, x + 10.0, y, 11.0));
+                x += col_w[c];
+            }
+            row_top -= h;
+        }
+
+        let table = detect_row_stripe_table_from_cell_rects(&items, &rects, 1)
+            .expect("250pt cells plus A4 clips must still build the grid");
+        assert_eq!(table.cells.len(), 3, "got {:?}", table.cells);
+        assert_eq!(table.cells[0], vec!["A", "B", "C"]);
+        assert!(
+            !table_blob(&table).contains("Keywordstats"),
+            "page-top clip must not swallow the paragraph: {:?}",
+            table.cells
+        );
     }
 }
