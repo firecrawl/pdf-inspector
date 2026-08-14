@@ -150,12 +150,6 @@ fn fix_hyphenation(text: &str) -> String {
     dehyphenate_line_breaks(&result)
 }
 
-/// Words that follow a *suspended* hyphen rather than a line-break one:
-/// "mid- to long-term", "two- or three-day". Joining across these would fuse
-/// unrelated words ("midto"), so they only join on explicit vocabulary
-/// evidence.
-const SUSPENSION_WORDS: [&str; 3] = ["to", "and", "or"];
-
 /// What a line-break hyphen pair should become. Policy output only — how the
 /// decision is rendered (plain text vs. inside split emphasis markers) is the
 /// caller's business.
@@ -193,14 +187,19 @@ fn join_decision(
     } else if hyphenated.contains(&key_hyphen) || b.chars().next().is_some_and(|c| c.is_uppercase())
     {
         Join::Hyphen
-    } else if SUSPENSION_WORDS.contains(&b.to_lowercase().as_str()) {
-        // No evidence either way and the continuation is a conjunction:
-        // this is a suspended hyphen ("mid- to long-term"); leave it.
-        Join::Keep
-    } else if words.contains(&a.to_lowercase()) && words.contains(&b.to_lowercase()) {
+    } else if b.chars().count() >= 4
+        && words.contains(&a.to_lowercase())
+        && words.contains(&b.to_lowercase())
+    {
         // No direct evidence, but both fragments are themselves words the
         // document uses ("commercial- type"): hyphenated compounds are made
         // of words, while syllable fragments ("evi", "judg", "mo") are not.
+        //
+        // The continuation must be at least four letters. Suspended hyphens
+        // ("mid- and long-term", "klein- und mittelgroß") put a conjunction
+        // after the hyphen, and conjunctions are near-universally one to
+        // three letters in any language — the length floor keeps this rule
+        // off them without a hard-coded conjunction list.
         Join::Hyphen
     } else {
         // No evidence at all: leave the break as it is. An unconditional join
@@ -225,12 +224,14 @@ fn join_decision(
 ///   1. fragments appear elsewhere joined plain ("defendant") — join plain;
 ///   2. appear elsewhere hyphenated ("six-month"), or the continuation is
 ///      capitalized ("Hinds- Radix", "Third- Party") — keep the hyphen;
-///   3. the continuation is a [`SUSPENSION_WORDS`] conjunction
-///      ("mid- to long-term") — a suspended hyphen, leave untouched;
-///   4. both fragments are words the document uses ("commercial- type"
-///      where "commercial" and "type" appear elsewhere) — a compound,
-///      keep the hyphen;
-///   5. no evidence — leave the break untouched. Evidence covers ~99% of
+///   3. both fragments are words the document uses and the continuation
+///      has four or more letters ("commercial- type" where "commercial"
+///      and "type" appear elsewhere) — a compound, keep the hyphen. The
+///      length floor keeps this rule off suspended hyphens ("mid- and
+///      long-term", "klein- und mittelgroß"): conjunctions are one to
+///      three letters in essentially every language, so no conjunction
+///      list is needed;
+///   4. no evidence — leave the break untouched. Evidence covers ~99% of
 ///      breaks on vocabulary-rich documents, and an unconditional join was
 ///      the one rule able to corrupt output (fusing interleaved-column
 ///      fragments into unrecoverable tokens).
@@ -705,9 +706,17 @@ mod tests {
 
     #[test]
     fn suspended_hyphen_is_preserved() {
-        // "mid- to long-term": joining would fuse unrelated words.
+        // "mid- to long-term": joining would fuse unrelated words. No
+        // conjunction list is involved — conjunctions are 1-3 letters in
+        // essentially every language, and the compound rule requires a
+        // 4-letter continuation, so suspended hyphens fall through to Keep.
         let text = "Planned over the mid- to long-term horizon, in- and out-of-possession.";
         assert_eq!(dehyphenate_line_breaks(text), text);
+        // Same construction in German, which a hard-coded English list
+        // would have missed: "und" is in the vocabulary but under the
+        // length floor.
+        let german = "Für und mit allen klein- und mittelgroßen Betrieben.";
+        assert_eq!(dehyphenate_line_breaks(german), german);
     }
 
     #[test]
