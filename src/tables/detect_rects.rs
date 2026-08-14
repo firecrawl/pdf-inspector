@@ -2187,8 +2187,8 @@ fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
     long_dense_cells * 2 >= dense_count
 }
 
-/// Below letter (792) / A4 (842) so a compact origin row is not a page clip.
-const PAGE_CLIP_MIN_SPAN: f32 = 700.0;
+/// Long-side floor for Y-filter page clips (A5 595, 500×600, A4/letter).
+const PAGE_CLIP_MIN_SPAN: f32 = 500.0;
 
 fn is_near_page_origin(x: f32, y: f32, w: f32, h: f32, max_w: f32, max_h: f32) -> bool {
     x < 5.0 && y < 5.0 && w >= max_w * 0.9 && h >= max_h * 0.9
@@ -2222,8 +2222,11 @@ fn origin_page_background(
     if !is_near_page_origin(x, y, w, h, max_w, max_h) {
         return false;
     }
-    // `w.max(h)` covers landscape A4 (842×595) as well as portrait.
-    h >= median_height * 4.0 || page_clip_floor.is_some_and(|floor| w.max(h) >= floor)
+    // Both axes must be page-scale so a wide short origin row is not a clip.
+    // `h > median` keeps equal-height origin rows as table geometry.
+    h >= median_height * 4.0
+        || page_clip_floor
+            .is_some_and(|floor| w.max(h) >= floor && w.min(h) >= floor * 0.7 && h > median_height)
 }
 
 /// Classify origin page-scale frames for Y-edge filtering. If clips
@@ -3727,6 +3730,45 @@ mod tests {
         assert!(
             flags.iter().all(|&b| !b),
             "compact origin table must not be page-bg: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn page_background_flags_flag_sub_letter_page_clip() {
+        // A5 420×595 and a 500×600 page: both fail a 700pt floor.
+        let mut a5 = vec![(40.0, 80.0, 160.0, 250.0); 10];
+        a5.extend(std::iter::repeat((0.0, 0.0, 419.5, 595.3)).take(20));
+        let a5_flags = page_background_flags(&a5);
+        assert!(
+            a5_flags.iter().skip(10).all(|&b| b),
+            "A5 clips must be page-bg against 250pt cells"
+        );
+        assert!(a5_flags.iter().take(10).all(|&b| !b));
+
+        let mut small = vec![(40.0, 80.0, 160.0, 180.0); 10];
+        small.extend(std::iter::repeat((0.0, 0.0, 500.0, 600.0)).take(20));
+        let small_flags = page_background_flags(&small);
+        assert!(
+            small_flags.iter().skip(10).all(|&b| b),
+            "500×600 clips must be page-bg"
+        );
+    }
+
+    #[test]
+    fn page_background_flags_keep_wide_short_origin_row() {
+        // Landscape table: first row is origin and 842pt wide, but only 80pt
+        // tall. A long-side-only floor would treat it as a page clip.
+        let rects = vec![
+            (0.0, 0.0, 841.9, 80.0),
+            (0.0, 80.0, 841.9, 80.0),
+            (0.0, 160.0, 841.9, 80.0),
+            (0.0, 240.0, 420.0, 80.0),
+            (420.0, 240.0, 421.9, 80.0),
+        ];
+        let flags = page_background_flags(&rects);
+        assert!(
+            flags.iter().all(|&b| !b),
+            "wide short origin row must stay a table row: {flags:?}"
         );
     }
 
