@@ -147,6 +147,47 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     Ok(extraction)
 }
 
+/// Extract image placements in unmodified PDF user-space coordinates.
+///
+/// The general text pipeline may normalize a landscape page's coordinates for
+/// reading order. Rendering needs the original coordinates so the page's own
+/// crop and rotation transform can map each placement to pixels exactly.
+#[cfg(feature = "render")]
+pub(crate) fn extract_image_items_mem_with_password(
+    buffer: &[u8],
+    password: Option<&str>,
+) -> Result<Vec<TextItem>, PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
+    let (doc, _) = crate::load_document_from_mem_with_password(buffer, password)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let mut style_cache = FontStyleCache::new();
+    let mut images = Vec::new();
+
+    for (page_num, page_id) in doc.get_pages() {
+        let ((items, _, _), _, coords_rotated, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            page_num,
+            &font_cmaps,
+            false,
+            &mut style_cache,
+        )?;
+        images.extend(items.into_iter().filter_map(|mut item| {
+            if !matches!(item.item_type, crate::types::ItemType::Image) {
+                return None;
+            }
+            if coords_rotated {
+                let normalized_x = item.x;
+                item.x = -item.y;
+                item.y = normalized_x;
+            }
+            Some(item)
+        }));
+    }
+
+    Ok(images)
+}
+
 // ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------

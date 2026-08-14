@@ -1075,7 +1075,7 @@ impl Default for MarkdownOptions {
             // now emits `ItemType::Image` `TextItem`s for every Image XObject
             // it encounters (see `extractor/content_stream.rs`). If we rendered
             // those into markdown by default, every existing caller would
-            // suddenly see `![Image: Im0](image)` placeholders inserted
+            // suddenly see `![Image: Im0](pdf-image:p1_i1)` references inserted
             // throughout their output — a silent regression for anyone who
             // upgrades. Image bboxes are still available via
             // `extract_text_with_positions` for callers (e.g. layout-aware
@@ -1246,7 +1246,8 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     let removed_page_number_pages = prefiltered_page_number_pages.cloned().unwrap_or_default();
 
     // Separate images and links from text items
-    let mut images: Vec<TextItem> = Vec::new();
+    let mut images: Vec<(TextItem, String)> = Vec::new();
+    let mut image_occurrences: HashMap<u32, u32> = HashMap::new();
     let mut page_image_regions: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
     let mut links: Vec<TextItem> = Vec::new();
     let mut text_items: Vec<TextItem> = Vec::new();
@@ -1262,7 +1263,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     item.y + item.height,
                 ));
                 if options.include_images {
-                    images.push(item);
+                    let occurrence = image_occurrences.entry(item.page).or_default();
+                    *occurrence += 1;
+                    let reference = crate::types::image_reference(item.page, *occurrence);
+                    images.push((item, reference));
                 }
             }
             ItemType::Link(_) => {
@@ -1852,13 +1856,13 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // Images are also removed before line grouping, so give them the same
     // logical chart-page position as tables before reinsertion.
     let mut page_images: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
-    for img in &images {
+    for (img, reference) in &images {
         let img_name = img
             .text
             .strip_prefix("[Image: ")
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(&img.text);
-        let img_md = format!("![Image: {}](image)\n", img_name);
+        let img_md = format!("![Image: {}]({})\n", img_name, reference);
         page_images
             .entry(img.page)
             .or_default()

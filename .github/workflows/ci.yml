@@ -30,6 +30,22 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Run tests with optional page rendering
+        run: cargo test --features render --verbose
+
+      - name: Check out pinned PDF renderer corpus
+        run: |
+          git clone https://github.com/py-pdf/sample-files.git "$RUNNER_TEMP/pdf-inspector-sample-files"
+          git -C "$RUNNER_TEMP/pdf-inspector-sample-files" checkout --detach 89039b6078fd0c9f98bf3d6fcb5583fac6b0ecaf
+
+      - name: Run PDF renderer corpus
+        env:
+          PDF_INSPECTOR_SAMPLE_FILES: ${{ runner.temp }}/pdf-inspector-sample-files
+        run: cargo test --features render --test render_corpus_tests -- --ignored
+
+      - name: Check rendering API documentation
+        run: cargo doc --no-deps --features render
+
       - name: Test developer scripts
         run: python3 -m unittest discover -s scripts/tests
 
@@ -71,6 +87,9 @@ jobs:
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
+      - name: Run clippy with optional page rendering
+        run: cargo clippy --features render -- -D warnings
+
   build:
     name: Build
     runs-on: ${{ matrix.os }}
@@ -92,6 +111,33 @@ jobs:
 
       - name: Build
         run: cargo build --release --verbose
+
+      - name: Build optional page rendering
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --release --features render --verbose
+
+  render-msrv:
+    name: Page rendering MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust 1.92
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.92.0
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: render-msrv
+
+      - name: Check optional page rendering
+        run: cargo check --features render
+
+      - name: Check optional page rendering for WebAssembly
+        run: cargo check --target wasm32-unknown-unknown --features render
 
   wasm:
     name: WebAssembly
@@ -116,14 +162,45 @@ jobs:
       - name: Check WebAssembly bindings
         run: cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
 
+      - name: Check WebAssembly bindings with optional page rendering
+        run: cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown --features render
+
       - name: Check root package for WebAssembly
         run: cargo check --target wasm32-unknown-unknown
+
+      - name: Check root page rendering for WebAssembly
+        run: cargo check --target wasm32-unknown-unknown --features render
 
       - name: Lint WebAssembly bindings
         run: cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 
-      - name: Install wasm-pack
-        run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Lint WebAssembly bindings with optional page rendering
+        run: cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown --features render -- -D warnings
+
+      - name: Lint root page rendering for WebAssembly
+        run: cargo clippy --target wasm32-unknown-unknown --features render -- -D warnings
+
+      - name: Install WebAssembly test tools
+        run: |
+          cargo install wasm-pack --version 0.15.0 --locked
+          # Keep in sync with wasm-bindgen in wasm/Cargo.lock: the test
+          # runner's protocol matches that exact version.
+          cargo install wasm-bindgen-cli --version 0.2.126 --locked
 
       - name: Test WebAssembly package
         run: wasm-pack test --node --release wasm
+
+      - name: Test optional page rendering in WebAssembly
+        run: wasm-pack test --node --release wasm --features render
+
+      - name: Install matching Chrome and ChromeDriver
+        id: chrome
+        uses: browser-actions/setup-chrome@2e1d749697dd1612b833dba4a722266286fbefcd # v2.1.2
+        with:
+          install-chromedriver: true
+
+      - name: Test optional page rendering in Chrome
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver-path }}
+        run: cargo test --manifest-path wasm/Cargo.toml --release --target wasm32-unknown-unknown --features render --test render_browser
