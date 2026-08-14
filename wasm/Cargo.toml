@@ -24,6 +24,10 @@ wasm-bindgen = "0.2"
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 
+[features]
+default = []
+render = ["pdf-inspector/render"]
+
 [profile.release]
 codegen-units = 1
 lto = true

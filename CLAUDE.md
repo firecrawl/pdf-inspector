@@ -8,6 +8,8 @@ Fast PDF text extraction to structured Markdown. CLI binary: `pdf2md`. Detection
 cargo fmt                                    # format
 cargo clippy -- -D warnings                  # lint (enforced, zero warnings)
 cargo test                                   # unit + integration tests (267+ unit, 73+ integration)
+cargo clippy --features render -- -D warnings # lint the optional renderer, zero warnings
+cargo test --features render                 # renderer tests (opt-in via the 'render' feature)
 cargo build --release                        # release binary for benchmarks
 ```
 
@@ -27,6 +29,7 @@ src/
   types.rs                      – TextItem, TextLine, PdfRect, PdfLine
   tounicode.rs                  – CMap/ToUnicode parsing, CID decoding
   text_utils.rs                 – CJK/RTL handling, Otsu threshold, ligature expansion, NFKC
+  render.rs                     – optional selected-page RGBA rasterization ('render' feature, Hayro)
   extractor/
     mod.rs                      – top-level extraction orchestrator
     content_stream.rs           – PDF operator state machine (Tj/TJ/Td/Tm/q/Q)
@@ -63,6 +66,8 @@ src/
 - **Integration tests**: `tests/integration_tests.rs` with fixture PDFs in `tests/fixtures/`.
 - **Regression suite**: sibling repo `pdf-evals` with ~200 snapshot PDFs. Run `cargo build --release` then `bench.py test` in that repo before committing. While iterating, prefer a subset run (`bench.py test -q` for the quick set, or `-s <name>` for a named test set) and save the full `bench.py test` for the final pre-commit check.
 - **Semantic quality**: run `bench.py score` in `pdf-evals` for the semantic verdict (TEDS + MHS + reading order + char/word + list preservation, composited). Character-level diff alone misclassifies structural improvements (e.g., column-detection rewrites) as regressions — `score` is the tie-breaker. See `pdf-evals/CLAUDE.md` "Semantic scoring".
+- **Render corpus**: pinned external `py-pdf/sample-files` render corpus, ignored by default; enable with `PDF_INSPECTOR_SAMPLE_FILES` (checksum-verified).
+- **WebAssembly runtime tests**: `wasm-pack test --node --release wasm` and `wasm-pack test --node --release wasm --features render`.
 
 ## Debugging
 
