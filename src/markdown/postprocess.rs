@@ -163,6 +163,19 @@ const COMPOUND_SUFFIXES: [&str; 14] = [
     "sized", "scale", "facing", "aware",
 ];
 
+/// What a line-break hyphen pair should become. Policy output only — how the
+/// decision is rendered (plain text vs. inside split emphasis markers) is the
+/// caller's business.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Join {
+    /// The fragments are one word: "de- fendant" -> "defendant".
+    Plain,
+    /// The fragments are a hyphenated compound: "six- month" -> "six-month".
+    Hyphen,
+    /// No evidence (or a suspended hyphen): leave the break as it is.
+    Keep,
+}
+
 /// Decide what a line-break hyphen pair becomes, given the document's
 /// vocabulary evidence. The whole dehyphenation policy lives here so it can
 /// be reasoned about (and tested) apart from the Markdown scanning around it;
@@ -172,34 +185,34 @@ fn join_decision(
     b: &str,
     words: &std::collections::HashSet<String>,
     hyphenated: &std::collections::HashSet<String>,
-) -> String {
+) -> Join {
     // Word-length sanity: syllable fragments are short, and even long German
     // compounds stay under this. Fragments beyond it are already fused
     // reading-order noise (interleaved columns); joining would compound the
     // damage.
     if a.chars().count() + b.chars().count() > 40 {
-        return format!("{a}- {b}");
+        return Join::Keep;
     }
     let key_plain = format!("{}{}", a.to_lowercase(), b.to_lowercase());
     let key_hyphen = format!("{}-{}", a.to_lowercase(), b.to_lowercase());
     if words.contains(&key_plain) {
-        format!("{a}{b}")
+        Join::Plain
     } else if hyphenated.contains(&key_hyphen) || b.chars().next().is_some_and(|c| c.is_uppercase())
     {
-        format!("{a}-{b}")
+        Join::Hyphen
     } else if SUSPENSION_WORDS.contains(&b.to_lowercase().as_str()) {
         // No evidence either way and the continuation is a conjunction:
         // this is a suspended hyphen ("mid- to long-term"); leave it.
-        format!("{a}- {b}")
+        Join::Keep
     } else if words.contains(&a.to_lowercase()) && words.contains(&b.to_lowercase()) {
         // No direct evidence, but both fragments are themselves words the
         // document uses ("commercial- type"): hyphenated compounds are made
         // of words, while syllable fragments ("evi", "judg", "mo") are not.
-        format!("{a}-{b}")
+        Join::Hyphen
     } else if COMPOUND_SUFFIXES.contains(&b.to_lowercase().as_str()) {
         // "World- class", "commercial- type" in documents too short to
         // supply vocabulary evidence.
-        format!("{a}-{b}")
+        Join::Hyphen
     } else {
         // No evidence at all: leave the break as it is. An unconditional join
         // here covered only ~1% more breaks on a vocabulary-rich document,
@@ -207,7 +220,7 @@ fn join_decision(
         // interleaved-column fragments ("com- real" -> "comreal") into
         // unrecoverable tokens. A visible break is honest; a silent fusion
         // is not.
-        format!("{a}- {b}")
+        Join::Keep
     }
 }
 
@@ -313,18 +326,28 @@ fn dehyphenate_line_breaks(text: &str) -> String {
         for _ in 0..3 {
             let next = BREAK_EMPH_RE
                 .replace_all(&current, |caps: &regex::Captures| {
-                    let joined = join(&caps[1], &caps[4]);
-                    if caps[2] != caps[3] || joined.ends_with(&format!("- {}", &caps[4])) {
-                        // Mismatched markers aren't a split span; a suspended
-                        // hyphen keeps its spacing. Leave both untouched.
-                        caps[0].to_string()
-                    } else {
-                        joined
+                    // Mismatched markers aren't a split span; a Keep decision
+                    // preserves the original spacing and markers.
+                    if caps[2] != caps[3] {
+                        return caps[0].to_string();
+                    }
+                    let (a, b) = (&caps[1], &caps[4]);
+                    match join(a, b) {
+                        Join::Plain => format!("{a}{b}"),
+                        Join::Hyphen => format!("{a}-{b}"),
+                        Join::Keep => caps[0].to_string(),
                     }
                 })
                 .to_string();
             let next = BREAK_RE
-                .replace_all(&next, |caps: &regex::Captures| join(&caps[1], &caps[2]))
+                .replace_all(&next, |caps: &regex::Captures| {
+                    let (a, b) = (&caps[1], &caps[2]);
+                    match join(a, b) {
+                        Join::Plain => format!("{a}{b}"),
+                        Join::Hyphen => format!("{a}-{b}"),
+                        Join::Keep => caps[0].to_string(),
+                    }
+                })
                 .to_string();
             if next == current {
                 break;
