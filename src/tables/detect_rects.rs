@@ -2234,35 +2234,39 @@ fn origin_page_background(
     if h > median_height * 20.0 {
         return true;
     }
+    // Paper size does not depend on cluster max or cell median. Checking it
+    // after the 90% gate would miss an A4 clip when a larger sibling exists.
+    if match_standard_page && looks_like_standard_page(w, h) {
+        return true;
+    }
     if !is_near_page_origin(x, y, w, h, max_w, max_h) {
         return false;
     }
     h >= median_height * 4.0
-        || (match_standard_page && looks_like_standard_page(w, h) && h > median_height)
 }
 
-/// Classify origin page-scale frames for Y-edge filtering. If clips
-/// outnumber cells, recompute median from the remaining rects.
+/// Classify origin page-scale frames for Y-edge filtering. Median comes from
+/// rects that are not origin paper clips, so a clip majority cannot hide
+/// the cell height.
 fn page_background_flags(rects: &[(f32, f32, f32, f32)]) -> Vec<bool> {
     if rects.is_empty() {
         return Vec::new();
     }
     let max_w = rects.iter().map(|&(_, _, w, _)| w).fold(0.0_f32, f32::max);
     let max_h = rects.iter().map(|&(_, _, _, h)| h).fold(0.0_f32, f32::max);
-    let mut heights: Vec<f32> = rects.iter().map(|&(_, _, _, h)| h).collect();
-    heights.sort_by(|a, b| a.total_cmp(b));
-    let mut median_height = heights[heights.len() / 2];
-    if median_height >= max_h * 0.9 {
-        let mut content_heights: Vec<f32> = rects
-            .iter()
-            .filter(|&&(x, y, w, h)| !is_near_page_origin(x, y, w, h, max_w, max_h))
-            .map(|&(_, _, _, h)| h)
-            .collect();
-        if !content_heights.is_empty() {
-            content_heights.sort_by(|a, b| a.total_cmp(b));
-            median_height = content_heights[content_heights.len() / 2];
-        }
+    let mut content_heights: Vec<f32> = rects
+        .iter()
+        .filter(|&&(x, y, w, h)| {
+            !(is_near_page_origin(x, y, w, h, max_w, max_h)
+                || (x < 5.0 && y < 5.0 && looks_like_standard_page(w, h)))
+        })
+        .map(|&(_, _, _, h)| h)
+        .collect();
+    if content_heights.is_empty() {
+        content_heights = rects.iter().map(|&(_, _, _, h)| h).collect();
     }
+    content_heights.sort_by(|a, b| a.total_cmp(b));
+    let median_height = content_heights[content_heights.len() / 2];
     rects
         .iter()
         .map(|&rect| origin_page_background(rect, median_height, max_w, max_h, true))
@@ -3779,6 +3783,34 @@ mod tests {
         assert!(
             flags.iter().all(|&b| !b),
             "wide short origin row must stay a table row: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn page_background_flags_still_flag_a4_clip_when_a_larger_rect_sets_max() {
+        // Cluster max is 11%+ larger than A4, so the clip fails the 90%
+        // near-page gate. Paper-size match must still drop its Y edge.
+        let mut rects = vec![(89.4, 200.0, 171.7, 250.0); 10];
+        rects.extend(std::iter::repeat((0.0, 0.0, 595.3, 841.9)).take(5));
+        rects.push((10.0, 10.0, 800.0, 1100.0));
+        let flags = page_background_flags(&rects);
+        let clip_flags: Vec<bool> = flags.iter().copied().skip(10).take(5).collect();
+        assert!(
+            clip_flags.iter().all(|&b| b),
+            "A4 clips must stay page-bg when a larger rect dominates max: {flags:?}"
+        );
+        assert!(flags.iter().take(10).all(|&b| !b));
+        assert!(!flags[15], "non-origin oversized rect is not page-bg");
+
+        // Clip majority plus a larger sibling: all-rects median is page
+        // height, so `h > median` would fail. Paper size must still win.
+        let mut majority = vec![(89.4, 200.0, 171.7, 250.0); 6];
+        majority.extend(std::iter::repeat((0.0, 0.0, 595.3, 841.9)).take(20));
+        majority.push((10.0, 10.0, 800.0, 1100.0));
+        let majority_flags = page_background_flags(&majority);
+        assert!(
+            majority_flags.iter().skip(6).take(20).all(|&b| b),
+            "clip-majority A4 must stay page-bg beside a larger rect: {majority_flags:?}"
         );
     }
 
