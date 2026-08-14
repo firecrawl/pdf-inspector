@@ -4424,21 +4424,41 @@ fn synthetic_rtl_pdf_pages(pages: &[&[&str]]) -> Vec<u8> {
 /// of one `Tj` per line, reproducing the construct behind this fix: `lines`
 /// are stored in ordinary logical order, and each glyph is walked leftward
 /// on the page by a `TJ` adjustment rather than by reversing the character
-/// sequence in the stream. `synthetic_rtl_pdf_pages` above (single `Tj`, no
-/// adjustments) cannot exercise this path at all — every existing test built
-/// on it is blind to the distinction this fix depends on.
+/// sequence in the stream.
+///
+/// `synthetic_rtl_pdf_pages` above (single `Tj`, no adjustments) cannot
+/// encode this at the PDF level at all — `Tj` has no numeric-operand array.
+/// What it does *not* prove, contrary to an earlier version of this comment:
+/// with the small per-glyph steps used here, `extract_page_text_items`'s `TJ`
+/// handling (`content_stream.rs`) still collapses the whole array into one
+/// `TextItem`, identical to what the `Tj` path produces, because its
+/// sub-item-split and space-insertion checks only fire on a *negative*
+/// adjustment (`n_val < -threshold`) — a rightward jump. Genuine leftward RTL
+/// advances are positive under this codebase's sign convention (see
+/// `docs/evidence/rtl-visual-order/README.md`), so they never cross that
+/// threshold. The distinct thing this construct tests is the `TJ` numeric
+/// array itself: that per-glyph position operands are parsed and folded into
+/// item geometry rather than corrupting or reordering the interleaved string
+/// operands. `position_adjusted_logical_order_rtl_is_left_untouched` asserts
+/// on the resulting item's geometry, not just its text, to pin that down.
 fn synthetic_rtl_pdf_pages_position_adjusted(pages: &[&[&str]]) -> Vec<u8> {
     synthetic_rtl_pdf_pages_impl(pages, true)
 }
+
+/// Glyph advance for every CID (no `/W` override) in
+/// [`synthetic_rtl_pdf_pages_position_adjusted`]'s font, and the line's
+/// starting x-coordinate when walking leftward from the right margin. Shared
+/// with the test that checks the extractor actually walked the `TJ`
+/// adjustments rather than discarding them.
+const POSITION_ADJUSTED_DW: i64 = 600;
+const POSITION_ADJUSTED_RIGHT_EDGE: i64 = 400;
+const POSITION_ADJUSTED_FONT_SIZE: f32 = 12.0;
 
 fn synthetic_rtl_pdf_pages_impl(pages: &[&[&str]], position_adjusted: bool) -> Vec<u8> {
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Document, Object, Stream};
 
-    // Glyph advance for every CID (no /W override) and the line's starting
-    // x-coordinate when walking leftward from the right margin.
-    const DW: i64 = 600;
-    const RIGHT_EDGE: i64 = 400;
+    let (dw, right_edge) = (POSITION_ADJUSTED_DW, POSITION_ADJUSTED_RIGHT_EDGE);
 
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
@@ -4477,7 +4497,7 @@ fn synthetic_rtl_pdf_pages_impl(pages: &[&[&str]], position_adjusted: bool) -> V
             "BaseFont" => "AAAAAA+SyntheticRTL",
             "CIDSystemInfo" => cid_system_info_id,
             "FontDescriptor" => descriptor_id,
-            "DW" => DW,
+            "DW" => dw,
         }
         .into(),
     );
@@ -4520,7 +4540,7 @@ endcmap\nend\nend"
                 // Start at the line's right edge and walk left: TJ's numeric
                 // operand is subtracted from the pen position before the next
                 // glyph paints (ISO 32000-1 §9.4.3), so an adjustment of
-                // `2 * DW` nets a step of exactly `-DW` per glyph — this
+                // `2 * dw` nets a step of exactly `-dw` per glyph — this
                 // glyph's own advance plus one more glyph-width left. No
                 // character in the stream is reordered; only positioning
                 // makes the line read right-to-left.
@@ -4531,7 +4551,7 @@ endcmap\nend\nend"
                         0.into(),
                         0.into(),
                         1.into(),
-                        RIGHT_EDGE.into(),
+                        right_edge.into(),
                         Object::Integer(y),
                     ],
                 ));
@@ -4542,7 +4562,7 @@ endcmap\nend\nend"
                     bytes.extend_from_slice(&(*ch as u32 as u16).to_be_bytes());
                     array.push(Object::String(bytes, lopdf::StringFormat::Hexadecimal));
                     if i + 1 != chars.len() {
-                        array.push(Object::Integer(2 * DW));
+                        array.push(Object::Integer(2 * dw));
                     }
                 }
                 operations.push(Operation::new("TJ", vec![Object::Array(array)]));
@@ -4754,15 +4774,58 @@ fn fixture_visual_order_rtl_pdf_extracts_in_logical_order() {
 /// unconditional reversal — as opposed to this fix's per-document
 /// orthographic evidence check — gets backwards, because it never looks past
 /// "does this string contain an RTL character."
+///
+/// Text-content assertions alone can't tell this apart from
+/// `logical_order_rtl_document_is_left_untouched` (single `Tj`, no `TJ`
+/// array): with these small per-glyph steps, both collapse to one `TextItem`
+/// holding the same string — see `synthetic_rtl_pdf_pages_position_adjusted`'s
+/// doc comment for why. So this also checks the item's geometry, which only
+/// the `TJ` path computes at all, to confirm the numeric adjustments were
+/// actually walked rather than silently dropped.
 #[test]
 fn position_adjusted_logical_order_rtl_is_left_untouched() {
     let refs = LOGICAL_LINES;
-    let text = extracted_text(&synthetic_rtl_pdf_pages_position_adjusted(&[refs]));
+    let buf = synthetic_rtl_pdf_pages_position_adjusted(&[refs]);
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let text = items
+        .iter()
+        .map(|i| i.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
 
     assert_reads_logically(&text);
     assert!(
         !text.contains("םולש"),
         "position-adjusted logical-order text was reversed: {text:?}"
+    );
+
+    // First line: right-to-left `TJ` walk starting at POSITION_ADJUSTED_RIGHT_EDGE.
+    // Each glyph contributes its own `+advance` (DW/1000 * font_size), each of
+    // the N-1 gaps between them contributes `-2*advance` (the `2 * dw`
+    // adjustment in synthetic_rtl_pdf_pages_impl), netting a total width of
+    // `advance * (N - 2)` — see this test's doc comment for the derivation. A
+    // version that ignored the adjustments and used the font's plain advances
+    // would land at a different width; a version that mishandled the array
+    // could reorder or drop characters (already ruled out above) or zero the
+    // geometry outright.
+    let first_line = items
+        .iter()
+        .find(|i| i.text.contains("שלום"))
+        .unwrap_or_else(|| panic!("first line not found in items: {items:?}"));
+    let glyph_count = "שלום עולם".chars().count() as f32;
+    let advance = POSITION_ADJUSTED_DW as f32 / 1000.0 * POSITION_ADJUSTED_FONT_SIZE;
+    let expected_width = advance * (glyph_count - 2.0);
+    assert!(
+        (first_line.x - POSITION_ADJUSTED_RIGHT_EDGE as f32).abs() < 0.5,
+        "item x={} did not start at the TJ line's right-edge origin {}: TJ adjustments were not applied",
+        first_line.x,
+        POSITION_ADJUSTED_RIGHT_EDGE
+    );
+    assert!(
+        (first_line.width - expected_width).abs() < 0.5,
+        "item width={} did not match the accumulated per-glyph TJ displacement {}: adjustments were not walked",
+        first_line.width,
+        expected_width
     );
 }
 
