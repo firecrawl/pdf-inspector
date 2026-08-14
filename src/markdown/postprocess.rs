@@ -163,6 +163,54 @@ const COMPOUND_SUFFIXES: [&str; 14] = [
     "sized", "scale", "facing", "aware",
 ];
 
+/// Decide what a line-break hyphen pair becomes, given the document's
+/// vocabulary evidence. The whole dehyphenation policy lives here so it can
+/// be reasoned about (and tested) apart from the Markdown scanning around it;
+/// see [`dehyphenate_line_breaks`] for the rule rationale.
+fn join_decision(
+    a: &str,
+    b: &str,
+    words: &std::collections::HashSet<String>,
+    hyphenated: &std::collections::HashSet<String>,
+) -> String {
+    // Word-length sanity: syllable fragments are short, and even long German
+    // compounds stay under this. Fragments beyond it are already fused
+    // reading-order noise (interleaved columns); joining would compound the
+    // damage.
+    if a.chars().count() + b.chars().count() > 40 {
+        return format!("{a}- {b}");
+    }
+    let key_plain = format!("{}{}", a.to_lowercase(), b.to_lowercase());
+    let key_hyphen = format!("{}-{}", a.to_lowercase(), b.to_lowercase());
+    if words.contains(&key_plain) {
+        format!("{a}{b}")
+    } else if hyphenated.contains(&key_hyphen) || b.chars().next().is_some_and(|c| c.is_uppercase())
+    {
+        format!("{a}-{b}")
+    } else if SUSPENSION_WORDS.contains(&b.to_lowercase().as_str()) {
+        // No evidence either way and the continuation is a conjunction:
+        // this is a suspended hyphen ("mid- to long-term"); leave it.
+        format!("{a}- {b}")
+    } else if words.contains(&a.to_lowercase()) && words.contains(&b.to_lowercase()) {
+        // No direct evidence, but both fragments are themselves words the
+        // document uses ("commercial- type"): hyphenated compounds are made
+        // of words, while syllable fragments ("evi", "judg", "mo") are not.
+        format!("{a}-{b}")
+    } else if COMPOUND_SUFFIXES.contains(&b.to_lowercase().as_str()) {
+        // "World- class", "commercial- type" in documents too short to
+        // supply vocabulary evidence.
+        format!("{a}-{b}")
+    } else {
+        // No evidence at all: leave the break as it is. An unconditional join
+        // here covered only ~1% more breaks on a vocabulary-rich document,
+        // but it was the sole rule able to corrupt output — fusing
+        // interleaved-column fragments ("com- real" -> "comreal") into
+        // unrecoverable tokens. A visible break is honest; a silent fusion
+        // is not.
+        format!("{a}- {b}")
+    }
+}
+
 /// Rejoin words hyphenated at the original line breaks.
 ///
 /// Justified print breaks words at syllables; after paragraph lines are
@@ -209,11 +257,27 @@ fn dehyphenate_line_breaks(text: &str) -> String {
         Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})-({WORD}{{2,}})")).unwrap());
 
     // The document is its own dictionary: whole words and hyphenated
-    // compounds as they appear away from line breaks. The break pairs are
-    // scrubbed out first — otherwise every broken word donates its own
-    // fragments ("evi", "dence") to the vocabulary, and the compound rule
-    // below would see them as words.
-    let scrubbed = BREAK_EMPH_RE.replace_all(text, " ");
+    // compounds as they appear away from line breaks. Two exclusions keep the
+    // evidence sound:
+    //   - the break pairs themselves are scrubbed first, otherwise every
+    //     broken word donates its own fragments ("evi", "dence") and the
+    //     compound rule would see them as words;
+    //   - fenced code blocks are skipped: identifiers are a different
+    //     language, and one like `comreal` must not justify fusing prose.
+    //     Table rows stay — cells carry genuine document vocabulary.
+    let mut prose = String::with_capacity(text.len());
+    let mut in_code = false;
+    for line in text.split('\n') {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if !in_code {
+            prose.push_str(line);
+            prose.push('\n');
+        }
+    }
+    let scrubbed = BREAK_EMPH_RE.replace_all(&prose, " ");
     let scrubbed = BREAK_RE.replace_all(&scrubbed, " ");
     let mut words: HashSet<String> = HashSet::new();
     let mut hyphenated: HashSet<String> = HashSet::new();
@@ -228,46 +292,7 @@ fn dehyphenate_line_breaks(text: &str) -> String {
         ));
     }
 
-    let join = |a: &str, b: &str| -> String {
-        // Word-length sanity: syllable fragments are short, and even long
-        // German compounds stay under this. Fragments beyond it are already
-        // fused reading-order noise (interleaved columns), and joining would
-        // compound the damage.
-        if a.chars().count() + b.chars().count() > 40 {
-            return format!("{a}- {b}");
-        }
-        let key_plain = format!("{}{}", a.to_lowercase(), b.to_lowercase());
-        let key_hyphen = format!("{}-{}", a.to_lowercase(), b.to_lowercase());
-        if words.contains(&key_plain) {
-            format!("{a}{b}")
-        } else if hyphenated.contains(&key_hyphen)
-            || b.chars().next().is_some_and(|c| c.is_uppercase())
-        {
-            format!("{a}-{b}")
-        } else if SUSPENSION_WORDS.contains(&b.to_lowercase().as_str()) {
-            // No evidence either way and the continuation is a conjunction:
-            // this is a suspended hyphen ("mid- to long-term"); leave it.
-            format!("{a}- {b}")
-        } else if words.contains(&a.to_lowercase()) && words.contains(&b.to_lowercase()) {
-            // No direct evidence, but both fragments are themselves words the
-            // document uses ("commercial- type"): hyphenated compounds are
-            // made of words, while syllable fragments ("evi", "judg", "mo")
-            // are not. Keep the hyphen.
-            format!("{a}-{b}")
-        } else if COMPOUND_SUFFIXES.contains(&b.to_lowercase().as_str()) {
-            // "World- class", "commercial- type" in documents too short to
-            // supply vocabulary evidence.
-            format!("{a}-{b}")
-        } else {
-            // No evidence at all: leave the break as it is. An unconditional
-            // join here covered only ~1% more breaks on a vocabulary-rich
-            // document, but it was the sole rule able to corrupt output —
-            // fusing interleaved-column fragments ("com- real" -> "comreal")
-            // into unrecoverable tokens. A visible break is honest; a silent
-            // fusion is not.
-            format!("{a}- {b}")
-        }
-    };
+    let join = |a: &str, b: &str| join_decision(a, b, &words, &hyphenated);
 
     let mut in_code_block = false;
     let mut out = String::with_capacity(text.len());
@@ -587,6 +612,13 @@ mod tests {
             dehyphenate_line_breaks(text),
             "The Third-Party complaint by Hinds-Radix."
         );
+    }
+
+    #[test]
+    fn code_block_identifiers_are_not_vocabulary_evidence() {
+        // A fused identifier in code must not justify fusing unrelated prose.
+        let text = "```\nlet comreal = 1;\n```\nThe com- real estate story.";
+        assert_eq!(dehyphenate_line_breaks(text), text);
     }
 
     #[test]
