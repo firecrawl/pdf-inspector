@@ -631,16 +631,22 @@ pub fn detect_tables_from_rects(
     if page_rects.len() >= 6 {
         // Identify origin-anchored page-background rects (clipping paths or
         // page fills) that would bridge separate table regions if included in
-        // clustering.  Exclude them from adjacency but add them back to each
-        // cluster they overlap, so grid detection still has their edges.
+        // clustering. Exclude them from adjacency so their page-top/page-bottom
+        // edges cannot become table rows.
         let is_page_bg = {
             let mut heights: Vec<f32> = page_rects.iter().map(|&(_, _, _, h)| h).collect();
             heights.sort_by(|a, b| a.total_cmp(b));
             let median_height = heights[heights.len() / 2];
-            let height_threshold = median_height * 20.0;
+            let max_h = heights.last().copied().unwrap_or(0.0);
+            let max_w = page_rects
+                .iter()
+                .map(|&(_, _, w, _)| w)
+                .fold(0.0_f32, f32::max);
             let flags: Vec<bool> = page_rects
                 .iter()
-                .map(|&(x, y, _, h)| x < 5.0 && y < 5.0 && h > height_threshold)
+                .map(|&(x, y, w, h)| {
+                    is_origin_page_background(x, y, w, h, median_height, max_w, max_h)
+                })
                 .collect();
             if flags.iter().any(|&b| b) {
                 debug!(
@@ -2179,6 +2185,31 @@ fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
     long_dense_cells * 2 >= dense_count
 }
 
+/// Origin-anchored clip/fill that is either much taller than typical cells
+/// or nearly as large as the largest rect on the page.
+///
+/// The classic `median_h * 20` gate misses Word/WPS A4 clips: a 50–90pt cell
+/// median yields a 1000–1800pt threshold, which is taller than A4 (842pt).
+/// Those clips still dominate the page, so treat near-page-scale origin frames
+/// as backgrounds too.
+fn is_origin_page_background(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    median_height: f32,
+    max_w: f32,
+    max_h: f32,
+) -> bool {
+    if x >= 5.0 || y >= 5.0 {
+        return false;
+    }
+    if h > median_height * 20.0 {
+        return true;
+    }
+    w >= max_w * 0.9 && h >= max_h * 0.9 && h >= median_height * 4.0
+}
+
 /// Remove repeated page-scale fills from a chart-like cluster so the actual
 /// cell/bar geometry can be evaluated independently. A small number of
 /// coincident origin frames may be meaningful table structure, so repetition
@@ -2591,11 +2622,35 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
-    // Extract Y-edges from rects
+    // Drop page-scale frames before deriving row edges. Word/WPS full-page
+    // clips survive the clustering page-bg gate on A4 (page height <
+    // median_cell * 20) and would otherwise invent a page-top row that
+    // swallows the paragraph above the table.
+    let median_h = {
+        let mut heights: Vec<f32> = group_rects.iter().map(|&(_, _, _, h)| h).collect();
+        heights.sort_by(|a, b| a.total_cmp(b));
+        heights[heights.len() / 2]
+    };
+    let content_rects: Vec<_> = group_rects
+        .iter()
+        .filter(|&&(_, _, _, h)| h < median_h * 10.0)
+        .collect();
+    if content_rects.is_empty() {
+        return None;
+    }
+
+    // Extract Y-edges from non-page-scale rects when possible
     let mut y_edges: Vec<f32> = Vec::new();
-    for &(_, y, _, h) in group_rects {
-        y_edges.push(y);
-        y_edges.push(y + h);
+    if content_rects.len() >= 6 {
+        for &&(_, y, _, h) in &content_rects {
+            y_edges.push(y);
+            y_edges.push(y + h);
+        }
+    } else {
+        for &(_, y, _, h) in group_rects {
+            y_edges.push(y);
+            y_edges.push(y + h);
+        }
     }
     let y_edges = snap_edges(&y_edges, 6.0);
 
@@ -2669,20 +2724,6 @@ fn detect_row_stripe_table_from_cell_rects(
         }
         edges
     };
-
-    // Compute bounding box from non-full-page rects
-    let median_h = {
-        let mut heights: Vec<f32> = group_rects.iter().map(|&(_, _, _, h)| h).collect();
-        heights.sort_by(|a, b| a.total_cmp(b));
-        heights[heights.len() / 2]
-    };
-    let content_rects: Vec<_> = group_rects
-        .iter()
-        .filter(|&&(_, _, _, h)| h < median_h * 10.0)
-        .collect();
-    if content_rects.is_empty() {
-        return None;
-    }
 
     let x_left = content_rects
         .iter()
@@ -3511,6 +3552,26 @@ mod tests {
         let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
         assert!(tables.is_empty(), "chart bars must not become a table");
         assert!(hints.is_empty(), "chart bars must not become a hint region");
+    }
+
+    #[test]
+    fn origin_page_background_catches_a4_clips_below_median_height_gate() {
+        // 50pt cells → classic threshold 1000pt, taller than A4 842pt.
+        assert!(is_origin_page_background(
+            0.0, 0.0, 595.3, 841.9, 50.0, 595.3, 841.9
+        ));
+        // Classic gate still fires for very tall origin fills.
+        assert!(is_origin_page_background(
+            0.0, 0.0, 594.0, 2000.0, 15.5, 594.0, 2000.0
+        ));
+        // Ordinary origin-adjacent cell is not a page background.
+        assert!(!is_origin_page_background(
+            0.0, 0.0, 171.7, 52.9, 52.9, 595.3, 841.9
+        ));
+        // Non-origin table frame is not a page background.
+        assert!(!is_origin_page_background(
+            89.4, 164.1, 479.6, 285.9, 52.9, 595.3, 841.9
+        ));
     }
 
     #[test]
@@ -5430,6 +5491,163 @@ mod tests {
             table.rows.len() <= 8,
             "table should have at most ~7 rows from group 1, got {}",
             table.rows.len()
+        );
+    }
+
+    /// Word/WPS emit many origin-anchored A4 clips (`0 0 595.3 841.9 re W* n`).
+    /// Those clips are shorter than `median_cell_h * 20` on A4, so the page-bg
+    /// gate used to miss them. Union-find then glued the clips to the cell
+    /// rects and the cell-rect fallback treated the page-top Y as a table row,
+    /// swallowing the paragraph above the table (issue #383).
+    fn word_wps_clip_scene(include_clips: bool) -> (Vec<TextItem>, Vec<PdfRect>) {
+        const PAGE: u32 = 1;
+        const TABLE_LEFT: f32 = 89.4;
+        const COL_WIDTHS: [f32; 3] = [171.7, 81.1, 226.8];
+        const ROW_HEIGHTS: [f32; 5] = [52.9, 52.7, 48.8, 59.3, 72.2];
+        const TABLE_TOP: f32 = 450.0;
+        const PARA_X: f32 = 90.0;
+        const PARA_Y_TOP: f32 = 758.8;
+        const PARA_LINE_H: f32 = 15.6;
+        const PARA_W: f32 = 415.3;
+
+        let headers = ["Index", "Category", "Domain"];
+        let body = [
+            ["1", "AI", "NLP robotics autonomous vehicles"],
+            ["2", "ML", "Forecasting recommendations fraud detection"],
+            ["3", "DL", "Image speech neural networks"],
+            ["4", "Data", "Bigdata forecasting visualization"],
+        ];
+        // Keyword salad without English function words, so the existing
+        // prose-in-frame guard cannot hide a page-clip regression.
+        let para_lines = [
+            "Keywordstats research neural networks datascience programming machinelearning deeplearning",
+            "Keywordstats AI research machinelearning neural networks programming analysis datascience",
+            "Keywordstats programming AI datascience statistics research machinelearning neural networks",
+            "Keywordstats analysis programming deeplearning statistics AI datascience visualization",
+            "Keywordstats deeplearning machinelearning statistics neural networks analysis datascience",
+            "Keywordstats research programming deeplearning datascience",
+        ];
+
+        let mut rects = Vec::new();
+        let mut y_top = TABLE_TOP;
+        for &h in &ROW_HEIGHTS {
+            let y = y_top - h;
+            let mut x = TABLE_LEFT;
+            for &w in &COL_WIDTHS {
+                // Fill + stroke, matching Word/WPS cell drawing (30 cell rects).
+                for _ in 0..2 {
+                    rects.push(PdfRect {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                        page: PAGE,
+                    });
+                }
+                x += w;
+            }
+            y_top -= h;
+        }
+
+        if include_clips {
+            for _ in 0..17 {
+                rects.push(PdfRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 595.3,
+                    height: 841.9,
+                    page: PAGE,
+                });
+            }
+        }
+
+        let mut items = Vec::new();
+        for (i, line) in para_lines.iter().enumerate() {
+            let mut item = make_item(line, PARA_X, PARA_Y_TOP - i as f32 * PARA_LINE_H, 9.0);
+            item.width = if i + 1 == para_lines.len() {
+                180.0
+            } else {
+                PARA_W
+            };
+            items.push(item);
+        }
+
+        let mut row_top = TABLE_TOP;
+        let rows: Vec<[&str; 3]> = std::iter::once(headers).chain(body).collect();
+        for (r, row) in rows.iter().enumerate() {
+            let h = ROW_HEIGHTS[r];
+            let y = row_top - h / 2.0 - 4.0;
+            let mut x = TABLE_LEFT;
+            for (c, text) in row.iter().enumerate() {
+                let mut item = make_item(text, x + 6.0, y, 11.0);
+                item.width = (COL_WIDTHS[c] - 12.0).min(text.chars().count() as f32 * 11.0);
+                items.push(item);
+                x += COL_WIDTHS[c];
+            }
+            row_top -= h;
+        }
+
+        (items, rects)
+    }
+
+    fn table_blob(table: &Table) -> String {
+        table
+            .cells
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    #[test]
+    fn word_wps_full_page_clips_do_not_swallow_paragraph_above_table() {
+        let (clean_items, clean_rects) = word_wps_clip_scene(false);
+        let (clean_tables, _) = detect_tables_from_rects(&clean_items, &clean_rects, 1);
+        assert_eq!(
+            clean_tables.len(),
+            1,
+            "baseline 5x3 cell-rect table should be detected without clips"
+        );
+        let clean = &clean_tables[0];
+        assert_eq!(clean.cells.len(), 5, "clean table should have 5 rows");
+        assert_eq!(clean.cells[0].len(), 3, "clean table should have 3 columns");
+        assert!(
+            !table_blob(clean).contains("Keywordstats"),
+            "clean table must not contain the paragraph: {:?}",
+            clean.cells
+        );
+        assert!(clean.cells[0][0].contains("Index"), "{:?}", clean.cells[0]);
+
+        let (clip_items, clip_rects) = word_wps_clip_scene(true);
+        let (clip_tables, _) = detect_tables_from_rects(&clip_items, &clip_rects, 1);
+        assert_eq!(
+            clip_tables.len(),
+            1,
+            "same table must still be detected when Word/WPS A4 clips are present; got {:?}",
+            clip_tables
+                .iter()
+                .map(|t| (t.cells.len(), t.cells.first().map_or(0, Vec::len)))
+                .collect::<Vec<_>>()
+        );
+        let clipped = &clip_tables[0];
+        assert_eq!(
+            clipped.cells.len(),
+            5,
+            "clips must not invent a page-top row; got {:?}",
+            clipped.cells
+        );
+        assert_eq!(clipped.cells[0].len(), 3);
+        let blob = table_blob(clipped);
+        assert!(
+            !blob.contains("Keywordstats"),
+            "paragraph above the table must stay outside the grid, got {:?}",
+            clipped.cells
+        );
+        assert!(
+            clipped.cells[0][0].contains("Index"),
+            "first row should remain the real header, got {:?}",
+            clipped.cells[0]
         );
     }
 }
