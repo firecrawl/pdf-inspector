@@ -6,9 +6,10 @@ use pdf_inspector::types::ItemType;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
-    extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
-    extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
-    process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
+    extract_pages_markdown_mem, extract_pages_markdown_with_password,
+    extract_tables_in_regions_mem, extract_text, extract_text_in_regions_mem,
+    extract_text_with_positions, extract_text_with_positions_mem, process_pdf_mem,
+    process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
     PdfType, TextItem,
 };
@@ -4318,6 +4319,35 @@ fn encrypted_pdf_decrypts_with_correct_password() {
     let md = ok.markdown.unwrap_or_default();
     // Assert a stable fixture token so a garbled-but-long extraction (the
     // encrypted-stream regression this guards) still fails the test.
+    assert!(
+        md.contains("Procurement"),
+        "decrypted markdown should contain the fixture's real text, got {} chars",
+        md.len()
+    );
+}
+
+#[test]
+fn extract_pages_markdown_decrypts_with_correct_password() {
+    let path = "tests/fixtures/encrypted-secret123.pdf";
+
+    // No password: the file is encrypted and can't be read.
+    let no_pw = extract_pages_markdown_with_password(path, None, None);
+    assert!(
+        matches!(no_pw, Err(PdfError::Encrypted)),
+        "expected Encrypted without a password, got {no_pw:?}"
+    );
+
+    // Wrong password: still rejected.
+    let wrong = extract_pages_markdown_with_password(path, None, Some("wrong"));
+    assert!(
+        matches!(wrong, Err(PdfError::Encrypted)),
+        "expected Encrypted with a wrong password, got {wrong:?}"
+    );
+
+    // Correct password: decrypts and extracts real content.
+    let ok = extract_pages_markdown_with_password(path, None, Some("secret123"))
+        .expect("correct password should decrypt");
+    let md: String = ok.pages.iter().map(|p| p.markdown.as_str()).collect();
     assert!(
         md.contains("Procurement"),
         "decrypted markdown should contain the fixture's real text, got {} chars",

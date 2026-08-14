@@ -920,16 +920,20 @@ fn extract_text_in_regions_bytes(
 ///     pages: Optional list of 0-indexed pages. When None (default), every
 ///         page is returned in document order. When provided, output
 ///         matches the caller-supplied order.
+///     password: Optional password to decrypt an encrypted PDF. When None
+///         (default), the empty password is tried (owner-only encryption).
 ///
 /// Returns:
 ///     PagesExtractionResult with per-page markdown and classification data.
 #[pyfunction]
-#[pyo3(signature = (path, pages=None))]
+#[pyo3(signature = (path, pages=None, password=None))]
 fn extract_pages_markdown(
     path: &str,
     pages: Option<Vec<u32>>,
+    password: Option<&str>,
 ) -> PyResult<PyPagesExtractionResult> {
-    let result = crate::extract_pages_markdown(path, pages.as_deref()).map_err(to_py_err)?;
+    let result = crate::extract_pages_markdown_with_password(path, pages.as_deref(), password)
+        .map_err(to_py_err)?;
     Ok(to_py_pages_result(result))
 }
 
@@ -937,12 +941,14 @@ fn extract_pages_markdown(
 ///
 /// See [`extract_pages_markdown`] for details.
 #[pyfunction]
-#[pyo3(signature = (data, pages=None))]
+#[pyo3(signature = (data, pages=None, password=None))]
 fn extract_pages_markdown_bytes(
     data: &[u8],
     pages: Option<Vec<u32>>,
+    password: Option<&str>,
 ) -> PyResult<PyPagesExtractionResult> {
-    let result = crate::extract_pages_markdown_mem(data, pages.as_deref()).map_err(to_py_err)?;
+    let result = crate::extract_pages_markdown_mem_with_password(data, pages.as_deref(), password)
+        .map_err(to_py_err)?;
     Ok(to_py_pages_result(result))
 }
 

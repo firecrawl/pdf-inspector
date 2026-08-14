@@ -274,6 +274,7 @@ def extract_text_in_regions_bytes(
 def extract_pages_markdown(
     path: str,
     pages: Optional[list[int]] = None,
+    password: Optional[str] = None,
 ) -> PagesExtractionResult:
     """Extract formatted markdown for pages of a PDF, with layout classification.
 
@@ -282,6 +283,8 @@ def extract_pages_markdown(
         pages: Optional list of 0-indexed pages. When ``None`` (default), every
             page is returned in document order. Otherwise, output matches the
             caller-supplied order.
+        password: Optional password to decrypt an encrypted PDF. When ``None``
+            (default), the empty password is tried (owner-only encryption).
 
     Returns:
         PagesExtractionResult with per-page markdown and document-wide layout
@@ -292,6 +295,7 @@ def extract_pages_markdown(
 def extract_pages_markdown_bytes(
     data: bytes,
     pages: Optional[list[int]] = None,
+    password: Optional[str] = None,
 ) -> PagesExtractionResult:
     """Extract formatted markdown for pages of a PDF from bytes.
 

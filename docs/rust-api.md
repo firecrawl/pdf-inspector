@@ -459,6 +459,15 @@ for page in &result.pages {
 println!("Complex layout? {}", result.is_complex);
 ```
 
+For password-protected PDFs, use `extract_pages_markdown_with_password`
+(and `extract_pages_markdown_mem_with_password` for in-memory buffers):
+
+```rust
+use pdf_inspector::extract_pages_markdown_with_password;
+
+let result = extract_pages_markdown_with_password("document.pdf", None, Some("secret"))?;
+```
+
 Extract structure-tree elements from tagged PDFs, and join them against
 `extract_text_with_positions` to attach semantic roles (heading levels,
 paragraphs, table cells) to extracted text:
@@ -512,6 +521,8 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | `to_markdown_from_items_with_rects(items, options, rects)` | Markdown with rectangle-based table detection |
 | `extract_pages_markdown(path, pages)` | Per-page Markdown + layout metadata (file) |
 | `extract_pages_markdown_mem(bytes, pages)` | Per-page Markdown from bytes |
+| `extract_pages_markdown_with_password(path, pages, password)` | Per-page Markdown, decrypting with `password` if encrypted |
+| `extract_pages_markdown_mem_with_password(bytes, pages, password)` | Per-page Markdown from bytes, decrypting with `password` if encrypted |
 | `extract_structure_elements(path, pages)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_mem(bytes, pages)` | Structure-tree elements from bytes |
 

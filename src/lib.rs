@@ -495,6 +495,17 @@ fn extract_pages_markdown_mem_impl(
     strip_repeated_headers_footers: bool,
     preserve_ocr_candidates: bool,
 ) -> Result<(PagesExtractionResult, u32), PdfError> {
+    extract_pages_markdown_mem_with_password(buffer, pages, None)
+}
+
+/// Same as [`extract_pages_markdown_mem`], decrypting with `password` if the
+/// document is encrypted. `None` falls back to the empty password
+/// (owner-only encryption).
+pub fn extract_pages_markdown_mem_with_password(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+) -> Result<PagesExtractionResult, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
@@ -826,9 +837,20 @@ pub fn extract_pages_markdown<P: AsRef<Path>>(
     path: P,
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_with_password(path, pages, None)
+}
+
+/// Same as [`extract_pages_markdown`], decrypting with `password` if the
+/// document is encrypted. `None` falls back to the empty password
+/// (owner-only encryption).
+pub fn extract_pages_markdown_with_password<P: AsRef<Path>>(
+    path: P,
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+) -> Result<PagesExtractionResult, PdfError> {
     validate_pdf_file(&path)?;
     let buffer = std::fs::read(path.as_ref())?;
-    extract_pages_markdown_mem(&buffer, pages)
+    extract_pages_markdown_mem_with_password(&buffer, pages, password)
 }
 
 // =========================================================================

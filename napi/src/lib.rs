@@ -888,22 +888,27 @@ pub struct PagesExtractionResult {
 /// Omit `pages` (or pass `undefined`) to return every page in document
 /// order. Pass an array of 0-indexed page numbers to restrict output to
 /// those pages, in caller-supplied order.
+///
+/// Pass `password` (or `undefined`) to decrypt an encrypted PDF. When
+/// omitted, the empty password is tried (owner-only encryption).
 #[napi]
 pub fn extract_pages_markdown(
     buffer: Buffer,
     pages: Option<Vec<u32>>,
+    password: Option<String>,
 ) -> Result<PagesExtractionResult> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("extract_pages_markdown", move || {
-        extract_pages_markdown_impl(&bytes, pages.as_deref())
+        extract_pages_markdown_impl(&bytes, pages.as_deref(), password.as_deref())
     })
 }
 
 fn extract_pages_markdown_impl(
     bytes: &[u8],
     pages: Option<&[u32]>,
+    password: Option<&str>,
 ) -> Result<PagesExtractionResult> {
-    let result = pdf_inspector::extract_pages_markdown_mem(bytes, pages)
+    let result = pdf_inspector::extract_pages_markdown_mem_with_password(bytes, pages, password)
         .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
     Ok(PagesExtractionResult {
         pages: result
@@ -1094,6 +1099,7 @@ pub fn classify_pdf_async(buffer: Buffer) -> AsyncTask<ClassifyPdfTask> {
 pub struct ExtractPagesMarkdownTask {
     bytes: Vec<u8>,
     pages: Option<Vec<u32>>,
+    password: Option<String>,
 }
 
 impl Task for ExtractPagesMarkdownTask {
@@ -1103,9 +1109,12 @@ impl Task for ExtractPagesMarkdownTask {
     fn compute(&mut self) -> Result<Self::Output> {
         let bytes = std::mem::take(&mut self.bytes);
         let pages = self.pages.take();
+        let password = self.password.take();
         catch_panic(
             "extract_pages_markdown",
-            panic::AssertUnwindSafe(move || extract_pages_markdown_impl(&bytes, pages.as_deref())),
+            panic::AssertUnwindSafe(move || {
+                extract_pages_markdown_impl(&bytes, pages.as_deref(), password.as_deref())
+            }),
         )
     }
 
@@ -1122,9 +1131,11 @@ impl Task for ExtractPagesMarkdownTask {
 pub fn extract_pages_markdown_async(
     buffer: Buffer,
     pages: Option<Vec<u32>>,
+    password: Option<String>,
 ) -> AsyncTask<ExtractPagesMarkdownTask> {
     AsyncTask::new(ExtractPagesMarkdownTask {
         bytes: buffer.to_vec(),
         pages,
+        password,
     })
 }
