@@ -1,0 +1,31 @@
+tests/snapshots/shannon-entropy-p1-2.md
+  s_0ebb7b0328103c::t_f47cbc724b5dd3 13,16
+src/markdown/postprocess.rs
+  s_0ebb7b0328103c::t_84815aa89be93e 640-642,645
+  s_0ebb7b0328103c::t_54963e8bf46833 678-683
+  s_0ebb7b0328103c::t_240057983bac75 575-577,579
+  s_0ebb7b0328103c::t_cbc8fc966db9bf 183-186
+  s_0ebb7b0328103c::t_108ce6c79cbe5f 599-602,605
+  s_0ebb7b0328103c::t_f6819c394c7514 668
+  s_0ebb7b0328103c::t_802fd357dfe486 669,672
+  s_0ebb7b0328103c::t_3aa69d6b6f55a9 656-663
+  s_0ebb7b0328103c::t_24628d27638264 262-268
+tests/snapshots/real-estate-pricing.md
+  s_0ebb7b0328103c::t_f47cbc724b5dd3 5,45,49,51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "06daa343539aea06faa3a7a545cd6843ab170af7",
+  "prompts": {},
+  "sessions": {
+    "s_0ebb7b0328103c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4d1e95cd-1328-4ff8-bea8-b678f87314d0",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
