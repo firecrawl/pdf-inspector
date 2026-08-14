@@ -1,0 +1,22 @@
+tests/snapshots/td9264.md
+  s_0ebb7b0328103c::t_345d1fad3f676e 44
+src/markdown/postprocess.rs
+  s_0ebb7b0328103c::t_a7fcd570d2a273 230-232,238-242
+  s_0ebb7b0328103c::t_82f0bbf38dbc02 686-692
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ed830a9e6ac59d1c607f755db4f10f1dade3fbde",
+  "prompts": {},
+  "sessions": {
+    "s_0ebb7b0328103c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4d1e95cd-1328-4ff8-bea8-b678f87314d0",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
