@@ -713,9 +713,10 @@ mod tests {
         let text = "Planned over the mid- to long-term horizon, in- and out-of-possession.";
         assert_eq!(dehyphenate_line_breaks(text), text);
         // Same construction in German, which a hard-coded English list
-        // would have missed: "und" is in the vocabulary but under the
-        // length floor.
-        let german = "Für und mit allen klein- und mittelgroßen Betrieben.";
+        // would have missed. "klein" appears standalone so it IS in the
+        // vocabulary — only the length floor (continuation "und" has three
+        // letters) keeps the compound rule from fusing "klein-und".
+        let german = "Das klein geschriebene Wort und die klein- und mittelgroßen Betriebe.";
         assert_eq!(dehyphenate_line_breaks(german), german);
     }
 
