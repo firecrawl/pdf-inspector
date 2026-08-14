@@ -2245,28 +2245,37 @@ fn origin_page_background(
     h >= median_height * 4.0
 }
 
-/// Classify origin page-scale frames for Y-edge filtering. Median comes from
-/// rects that are not origin paper clips, so a clip majority cannot hide
-/// the cell height.
+/// Classify origin page-scale frames for Y-edge filtering.
+///
+/// Median is the full-group height unless standard-page origin clips
+/// outnumber the other rects. Always excluding near-origin geometry would
+/// shrink the median and let `*4` swallow a single merged header row.
 fn page_background_flags(rects: &[(f32, f32, f32, f32)]) -> Vec<bool> {
     if rects.is_empty() {
         return Vec::new();
     }
     let max_w = rects.iter().map(|&(_, _, w, _)| w).fold(0.0_f32, f32::max);
     let max_h = rects.iter().map(|&(_, _, _, h)| h).fold(0.0_f32, f32::max);
-    let mut content_heights: Vec<f32> = rects
+    let page_clip_count = rects
         .iter()
-        .filter(|&&(x, y, w, h)| {
-            !(is_near_page_origin(x, y, w, h, max_w, max_h)
-                || (x < 5.0 && y < 5.0 && looks_like_standard_page(w, h)))
-        })
-        .map(|&(_, _, _, h)| h)
-        .collect();
-    if content_heights.is_empty() {
-        content_heights = rects.iter().map(|&(_, _, _, h)| h).collect();
-    }
-    content_heights.sort_by(|a, b| a.total_cmp(b));
-    let median_height = content_heights[content_heights.len() / 2];
+        .filter(|&&(x, y, w, h)| x < 5.0 && y < 5.0 && looks_like_standard_page(w, h))
+        .count();
+    let mut heights: Vec<f32> = if page_clip_count * 2 >= rects.len() {
+        let content: Vec<f32> = rects
+            .iter()
+            .filter(|&&(x, y, w, h)| !(x < 5.0 && y < 5.0 && looks_like_standard_page(w, h)))
+            .map(|&(_, _, _, h)| h)
+            .collect();
+        if content.is_empty() {
+            rects.iter().map(|&(_, _, _, h)| h).collect()
+        } else {
+            content
+        }
+    } else {
+        rects.iter().map(|&(_, _, _, h)| h).collect()
+    };
+    heights.sort_by(|a, b| a.total_cmp(b));
+    let median_height = heights[heights.len() / 2];
     rects
         .iter()
         .map(|&rect| origin_page_background(rect, median_height, max_w, max_h, true))
@@ -3831,6 +3840,15 @@ mod tests {
             "origin merged cell must not be a page clip: {flags:?}"
         );
         assert!(flags.iter().skip(1).all(|&b| !b), "{flags:?}");
+    }
+
+    #[test]
+    fn page_background_flags_keep_lone_origin_merged_row() {
+        // One tall origin merged row + one short body row. Excluding the
+        // merged row from median would make *4 fire (360 >= 80*4).
+        let rects = vec![(0.0, 0.0, 400.0, 360.0), (0.0, 360.0, 400.0, 80.0)];
+        let flags = page_background_flags(&rects);
+        assert_eq!(flags, vec![false, false], "got {flags:?}");
     }
 
     #[test]
