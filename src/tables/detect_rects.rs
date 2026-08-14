@@ -645,7 +645,7 @@ pub fn detect_tables_from_rects(
             let flags: Vec<bool> = page_rects
                 .iter()
                 .map(|&(x, y, w, h)| {
-                    is_origin_page_background(x, y, w, h, median_height, max_w, max_h)
+                    is_origin_page_background((x, y, w, h), median_height, max_w, max_h)
                 })
                 .collect();
             if flags.iter().any(|&b| b) {
@@ -2187,16 +2187,31 @@ fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
     long_dense_cells * 2 >= dense_count
 }
 
+/// Below letter (792) / A4 (842) so a compact origin row is not a page clip.
+const PAGE_CLIP_MIN_SPAN: f32 = 700.0;
+
+fn is_near_page_origin(x: f32, y: f32, w: f32, h: f32, max_w: f32, max_h: f32) -> bool {
+    x < 5.0 && y < 5.0 && w >= max_w * 0.9 && h >= max_h * 0.9
+}
+
 /// Origin-anchored, and either much taller than typical cells or nearly as
-/// large as the largest page rect.
+/// large as the largest page rect. Clustering uses this (no page-span floor)
+/// so a compact origin frame can still bridge cells.
 fn is_origin_page_background(
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
+    rect: (f32, f32, f32, f32),
     median_height: f32,
     max_w: f32,
     max_h: f32,
+) -> bool {
+    origin_page_background(rect, median_height, max_w, max_h, None)
+}
+
+fn origin_page_background(
+    (x, y, w, h): (f32, f32, f32, f32),
+    median_height: f32,
+    max_w: f32,
+    max_h: f32,
+    page_clip_floor: Option<f32>,
 ) -> bool {
     if x >= 5.0 || y >= 5.0 {
         return false;
@@ -2204,13 +2219,15 @@ fn is_origin_page_background(
     if h > median_height * 20.0 {
         return true;
     }
-    w >= max_w * 0.9 && h >= max_h * 0.9 && h >= median_height * 4.0
+    if !is_near_page_origin(x, y, w, h, max_w, max_h) {
+        return false;
+    }
+    // `w.max(h)` covers landscape A4 (842×595) as well as portrait.
+    h >= median_height * 4.0 || page_clip_floor.is_some_and(|floor| w.max(h) >= floor)
 }
 
 /// Classify origin page-scale frames for Y-edge filtering. If clips
-/// outnumber cells, recompute median from the remaining rects. Near-page
-/// origin frames skip the clustering `*4` factor so tall cells cannot
-/// miss an A4 clip.
+/// outnumber cells, recompute median from the remaining rects.
 fn page_background_flags(rects: &[(f32, f32, f32, f32)]) -> Vec<bool> {
     if rects.is_empty() {
         return Vec::new();
@@ -2223,7 +2240,7 @@ fn page_background_flags(rects: &[(f32, f32, f32, f32)]) -> Vec<bool> {
     if median_height >= max_h * 0.9 {
         let mut content_heights: Vec<f32> = rects
             .iter()
-            .filter(|&&(x, y, w, h)| !(x < 5.0 && y < 5.0 && w >= max_w * 0.9 && h >= max_h * 0.9))
+            .filter(|&&(x, y, w, h)| !is_near_page_origin(x, y, w, h, max_w, max_h))
             .map(|&(_, _, _, h)| h)
             .collect();
         if !content_heights.is_empty() {
@@ -2233,14 +2250,8 @@ fn page_background_flags(rects: &[(f32, f32, f32, f32)]) -> Vec<bool> {
     }
     rects
         .iter()
-        .map(|&(x, y, w, h)| {
-            if x >= 5.0 || y >= 5.0 {
-                return false;
-            }
-            if h > median_height * 20.0 {
-                return true;
-            }
-            w >= max_w * 0.9 && h >= max_h * 0.9
+        .map(|&rect| {
+            origin_page_background(rect, median_height, max_w, max_h, Some(PAGE_CLIP_MIN_SPAN))
         })
         .collect()
 }
@@ -2676,19 +2687,21 @@ fn detect_row_stripe_table_from_cell_rects(
         y_edges.push(y + h);
     }
 
-    // Bbox / column edges still ignore unusually tall overlays.
+    // Page-bg filtering is Y-only. Keep those frames for X so a full-page
+    // clip can still be the last column edge; drop other tall overlays.
     let median_h = {
         let mut heights: Vec<f32> = row_rects.iter().map(|&&(_, _, _, h)| h).collect();
         heights.sort_by(|a, b| a.total_cmp(b));
         heights[heights.len() / 2]
     };
-    let content_rects: Vec<_> = row_rects
+    let content_rects: Vec<_> = group_rects
         .iter()
-        .copied()
-        .filter(|rect| rect.3 < median_h * 10.0)
+        .zip(is_page_bg.iter())
+        .filter(|(rect, &bg)| bg || rect.3 < median_h * 10.0)
+        .map(|(rect, _)| rect)
         .collect();
     let content_rects = if content_rects.is_empty() {
-        row_rects
+        group_rects.iter().collect()
     } else {
         content_rects
     };
@@ -3598,27 +3611,45 @@ mod tests {
     fn origin_page_background_catches_a4_clips_below_median_height_gate() {
         // 50pt cells → classic threshold 1000pt, taller than A4 842pt.
         assert!(is_origin_page_background(
-            0.0, 0.0, 595.3, 841.9, 50.0, 595.3, 841.9
+            (0.0, 0.0, 595.3, 841.9),
+            50.0,
+            595.3,
+            841.9
         ));
         // 90pt cells: height-only `*10` would keep an A4 clip (841.9 < 900).
         assert!(is_origin_page_background(
-            0.0, 0.0, 595.3, 841.9, 90.0, 595.3, 841.9
+            (0.0, 0.0, 595.3, 841.9),
+            90.0,
+            595.3,
+            841.9
         ));
         // Classic gate still fires for very tall origin fills.
         assert!(is_origin_page_background(
-            0.0, 0.0, 594.0, 2000.0, 15.5, 594.0, 2000.0
+            (0.0, 0.0, 594.0, 2000.0),
+            15.5,
+            594.0,
+            2000.0
         ));
         // Ordinary origin-adjacent cell is not a page background.
         assert!(!is_origin_page_background(
-            0.0, 0.0, 171.7, 52.9, 52.9, 595.3, 841.9
+            (0.0, 0.0, 171.7, 52.9),
+            52.9,
+            595.3,
+            841.9
         ));
         // Non-origin table frame is not a page background.
         assert!(!is_origin_page_background(
-            89.4, 164.1, 479.6, 285.9, 52.9, 595.3, 841.9
+            (89.4, 164.1, 479.6, 285.9),
+            52.9,
+            595.3,
+            841.9
         ));
         // Tall non-origin cell must stay (it is a real row, not a page frame).
         assert!(!is_origin_page_background(
-            89.4, 100.0, 171.7, 480.0, 50.0, 595.3, 841.9
+            (89.4, 100.0, 171.7, 480.0),
+            50.0,
+            595.3,
+            841.9
         ));
     }
 
@@ -3649,7 +3680,17 @@ mod tests {
             "250pt cells must not be page-bg"
         );
         assert!(!is_origin_page_background(
-            0.0, 0.0, 595.3, 841.9, 250.0, 595.3, 841.9
+            (0.0, 0.0, 595.3, 841.9),
+            250.0,
+            595.3,
+            841.9
+        ));
+        assert!(origin_page_background(
+            (0.0, 0.0, 595.3, 841.9),
+            250.0,
+            595.3,
+            841.9,
+            Some(PAGE_CLIP_MIN_SPAN),
         ));
 
         // Few clips: median is already the cell height, no recompute.
@@ -3659,6 +3700,33 @@ mod tests {
         assert!(
             few_flags.iter().skip(10).all(|&b| b),
             "A4 clips must still be page-bg when they do not dominate"
+        );
+
+        // Landscape A4: height 595 fails a height-only 700pt floor.
+        let mut landscape = vec![(89.4, 200.0, 171.7, 250.0); 10];
+        landscape.extend(std::iter::repeat((0.0, 0.0, 841.9, 595.3)).take(20));
+        let landscape_flags = page_background_flags(&landscape);
+        assert!(
+            landscape_flags.iter().skip(10).all(|&b| b),
+            "landscape A4 clips must be page-bg against 250pt cells"
+        );
+    }
+
+    #[test]
+    fn page_background_flags_keep_compact_origin_table_row() {
+        // Same-size origin row is near-max for the group but far below a
+        // page clip. Dropping `*4` with no floor would treat it as page-bg.
+        let rects = vec![
+            (0.0, 0.0, 400.0, 200.0),
+            (0.0, 200.0, 400.0, 200.0),
+            (0.0, 400.0, 400.0, 200.0),
+            (0.0, 600.0, 200.0, 200.0),
+            (200.0, 600.0, 200.0, 200.0),
+        ];
+        let flags = page_background_flags(&rects);
+        assert!(
+            flags.iter().all(|&b| !b),
+            "compact origin table must not be page-bg: {flags:?}"
         );
     }
 
@@ -5863,5 +5931,59 @@ mod tests {
             "page-top clip must not swallow the paragraph: {:?}",
             table.cells
         );
+    }
+
+    #[test]
+    fn cell_rect_keeps_page_clip_as_outer_column_edge() {
+        // 250pt cells so the A4 clip fails clustering `*4` but stays a
+        // Y-filter page-bg. Last-column text sits past the cell rects and
+        // needs the clip's right edge.
+        let col_w = [80.0_f32, 80.0, 80.0];
+        let row_h = [250.0_f32, 250.0, 250.0];
+        let left = 100.0_f32;
+        let top = 800.0_f32;
+        let mut rects = Vec::new();
+        let mut y_top = top;
+        for &h in &row_h {
+            let y = y_top - h;
+            let mut x = left;
+            for &w in &col_w {
+                rects.push((x, y, w, h));
+                x += w;
+            }
+            y_top -= h;
+        }
+        for _ in 0..20 {
+            rects.push((0.0, 0.0, 595.3, 841.9));
+        }
+
+        let labels = [["A", "B", "C"], ["D", "E", "F"], ["G", "H", "I"]];
+        let mut items = Vec::new();
+        let mut row_top = top;
+        for (r, row) in labels.iter().enumerate() {
+            let h = row_h[r];
+            let y = row_top - h / 2.0;
+            let mut x = left;
+            for (c, text) in row.iter().enumerate() {
+                items.push(make_item(text, x + 10.0, y, 11.0));
+                x += col_w[c];
+            }
+            if r == 0 {
+                items.push(make_item("Z", 450.0, y, 11.0));
+            } else if r == 1 {
+                items.push(make_item("Y", 450.0, y, 11.0));
+            }
+            row_top -= h;
+        }
+
+        let table = detect_row_stripe_table_from_cell_rects(&items, &rects, 1)
+            .expect("clip X must keep the outer column");
+        let blob = table_blob(&table);
+        assert!(
+            blob.contains('Z') && blob.contains('Y'),
+            "text past the cell rects must stay via the clip X edge: {:?}",
+            table.cells
+        );
+        assert_eq!(table.cells.len(), 3, "got {:?}", table.cells);
     }
 }
