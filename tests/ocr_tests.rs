@@ -121,7 +121,9 @@ fn complete_ocr_pipeline_routes_and_assembles_a_scanned_fixture() {
         .minimum_confidence(0.3)
         .model_directory(model_directory)
         .model_downloads(ModelDownloadPolicy::Offline);
-    let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().ocr(ocr)).unwrap();
+    let options = OcrPdfOptions::new().ocr(ocr);
+    let result = process_pdf_with_ocr_mem(&bytes, options.clone()).unwrap();
+    let repeated = process_pdf_with_ocr_mem(&bytes, options).unwrap();
 
     assert_eq!(result.pages_routed_to_ocr, vec![1]);
     assert!(!result.markdown.trim().is_empty());
@@ -130,6 +132,7 @@ fn complete_ocr_pipeline_routes_and_assembles_a_scanned_fixture() {
         result.pages[0].provenance.ocr_model.as_ref().unwrap().name,
         PP_OCR_V6_SMALL.id
     );
+    assert_eq!(repeated.markdown, result.markdown);
 }
 
 fn recognize(

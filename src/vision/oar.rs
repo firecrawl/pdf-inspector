@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use image::RgbImage;
+use oar_ocr::core::config::onnx::OrtSessionConfig;
 use oar_ocr::oarocr::{OAROCRBuilder, OAROCR};
 use oar_ocr::processors::BoundingBox;
 use thiserror::Error;
@@ -86,7 +87,13 @@ impl OarOcrEngine {
         let recognition = required_model(models, ModelArtifactKind::TextRecognition)?;
         let dictionary = required_model(models, ModelArtifactKind::CharacterDictionary)?;
 
-        let pipeline = OAROCRBuilder::new(detection, recognition, dictionary).build()?;
+        let pipeline = OAROCRBuilder::new(detection, recognition, dictionary)
+            .ort_session(ocr_session_config())
+            // Document line crops often have very different widths. Keeping
+            // CPU recognition batches at one avoids padding every crop to the
+            // widest line, reducing both inference work and peak memory.
+            .region_batch_size(1)
+            .build()?;
         let model = ModelIdentity::new(models.manifest_id(), models.revision());
         Ok(Self { pipeline, model })
     }
@@ -169,11 +176,18 @@ impl OarOcrEngine {
     }
 }
 
+fn ocr_session_config() -> OrtSessionConfig {
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    OrtSessionConfig::new()
+        .with_intra_threads(available.min(4))
+        .with_inter_threads(1)
+        .with_parallel_execution(false)
+}
+
 fn load_onnx_runtime() -> Result<(), OarOcrError> {
-    let path = std::env::var_os(ONNX_RUNTIME_LIBRARY_ENV)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(default_onnx_runtime_library);
+    let path = onnx_runtime_library_path();
     drop(
         ort::init_from(&path).map_err(|source| OarOcrError::OnnxRuntimeLoad {
             path: path.clone(),
@@ -181,6 +195,13 @@ fn load_onnx_runtime() -> Result<(), OarOcrError> {
         })?,
     );
     Ok(())
+}
+
+pub(crate) fn onnx_runtime_library_path() -> PathBuf {
+    std::env::var_os(ONNX_RUNTIME_LIBRARY_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_onnx_runtime_library)
 }
 
 fn default_onnx_runtime_library() -> PathBuf {
@@ -354,6 +375,14 @@ mod tests {
 
     use super::*;
     use crate::vision::PageTransform;
+
+    #[test]
+    fn cpu_session_budget_is_bounded_for_small_ocr_models() {
+        let config = ocr_session_config();
+        assert!((1..=4).contains(&config.intra_threads.unwrap()));
+        assert_eq!(config.inter_threads, Some(1));
+        assert_eq!(config.parallel_execution, Some(false));
+    }
 
     fn page(format: RenderPixelFormat, stride: usize, pixels: Vec<u8>) -> RenderedPage {
         let transform =

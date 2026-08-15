@@ -190,16 +190,17 @@ impl ModelStore {
         &self.cache_root
     }
 
+    /// Effective directory containing one manifest's artifacts.
+    pub(crate) fn model_root(&self, manifest: &ModelManifest) -> PathBuf {
+        self.override_root
+            .clone()
+            .unwrap_or_else(|| self.manifest_cache_root(manifest))
+    }
+
     /// Validates and resolves every required artifact.
     pub fn resolve(&self, manifest: &ModelManifest) -> Result<ModelPaths, ModelStoreError> {
         validate_manifest(manifest)?;
-        let managed_root;
-        let root = if let Some(root) = self.override_root.as_deref() {
-            root
-        } else {
-            managed_root = self.manifest_cache_root(manifest);
-            managed_root.as_path()
-        };
+        let root = self.model_root(manifest);
 
         let mut artifacts = BTreeMap::new();
         for artifact in manifest.artifacts {

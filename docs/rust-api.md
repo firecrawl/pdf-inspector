@@ -380,6 +380,15 @@ provides the same native-only behavior through the OCR result/provenance
 shape; `Force` renders every selected page. Learned layout intentionally
 returns an explicit unsupported error in this lightweight pipeline.
 
+The one-call API keeps the most recently used verified OCR engine in process.
+Long-lived workers therefore verify the pinned artifacts and build the ONNX
+sessions once, then reuse those loaded sessions across documents. The cache is
+bounded to one model configuration; switching the model directory or runtime
+library replaces it. CPU inference uses at most four intra-op threads per ONNX
+session so a single small page does not oversubscribe larger hosts, and
+recognizes variable-width line crops individually to avoid padding-heavy CPU
+batches.
+
 Build the CLI with the same opt-in feature:
 
 ```bash

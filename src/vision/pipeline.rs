@@ -1,19 +1,35 @@
 //! One-call native extraction and OCR pipeline.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use thiserror::Error;
 
 use crate::{MarkdownOptions, PageOcrReasons, PdfError};
 
+use super::oar::onnx_runtime_library_path;
 use super::{
     fuse_ocr_pages, route_ocr_pages, run_ocr_pages, FusedPageMarkdown, HttpModelDownloadError,
     HttpModelDownloader, ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError,
     OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions, OcrRoutingError, OcrRun, OcrRunError,
     PdfiumRenderer, RenderError, RenderOptions, PP_OCR_V6_SMALL,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OcrEngineCacheKey {
+    model_root: PathBuf,
+    runtime_library: PathBuf,
+}
+
+#[derive(Debug)]
+struct CachedOcrEngine {
+    key: OcrEngineCacheKey,
+    engine: Arc<OarOcrEngine>,
+}
+
+static OCR_ENGINE_CACHE: OnceLock<Mutex<Option<CachedOcrEngine>>> = OnceLock::new();
 
 /// Options for native extraction with optional OCR.
 #[derive(Clone)]
@@ -220,16 +236,10 @@ pub fn process_pdf_with_ocr_mem(
         // Resolve the native renderer before any network request so a missing
         // PDFium installation cannot trigger a model download it cannot use.
         let renderer = PdfiumRenderer::load()?;
-        let store = ModelStore::from_options(&options.ocr)?;
-        let models = store.resolve_or_download(
-            &PP_OCR_V6_SMALL,
-            options.ocr.model_downloads,
-            &HttpModelDownloader::default(),
-        )?;
-        let engine = OarOcrEngine::from_models(&models)?;
+        let engine = cached_ocr_engine(&options.ocr)?;
         run_ocr_pages(
             &renderer,
-            &engine,
+            engine.as_ref(),
             buffer,
             &routed,
             options.password.as_deref(),
@@ -266,6 +276,40 @@ pub fn process_pdf_with_ocr_mem(
         render_time_ms: fused.render_time_ms,
         ocr_time_ms: fused.ocr_time_ms,
     })
+}
+
+fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipelineError> {
+    let store = ModelStore::from_options(options)?;
+    let key = OcrEngineCacheKey {
+        model_root: canonicalize_if_present(store.model_root(&PP_OCR_V6_SMALL)),
+        runtime_library: canonicalize_if_present(onnx_runtime_library_path()),
+    };
+    let cache = OCR_ENGINE_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(cached) = cached.as_ref().filter(|cached| cached.key == key) {
+        return Ok(Arc::clone(&cached.engine));
+    }
+
+    // Model verification and session construction happen once per active
+    // configuration. The loaded sessions own the verified model data, so a
+    // cache hit never needs to trust or reopen mutable files on disk. Keeping
+    // the lock through initialization also prevents a first-request stampede.
+    let models = store.resolve_or_download(
+        &PP_OCR_V6_SMALL,
+        options.model_downloads,
+        &HttpModelDownloader::default(),
+    )?;
+    let engine = Arc::new(OarOcrEngine::from_models(&models)?);
+
+    *cached = Some(CachedOcrEngine {
+        key,
+        engine: Arc::clone(&engine),
+    });
+    Ok(engine)
+}
+
+fn canonicalize_if_present(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers: bool) -> String {
