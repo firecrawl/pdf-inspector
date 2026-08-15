@@ -1,4 +1,4 @@
-//! One-call native local OCR pipeline.
+//! One-call native extraction and OCR pipeline.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -10,30 +10,33 @@ use crate::{MarkdownOptions, PageOcrReasons, PdfError};
 
 use super::{
     fuse_ocr_pages, route_ocr_pages, run_ocr_pages, FusedPageMarkdown, HttpModelDownloadError,
-    HttpModelDownloader, LocalOcrRun, LocalOptions, ModelAcquireError, ModelStore, ModelStoreError,
-    OarOcrEngine, OarOcrError, OcrFusionError, OcrFusionOptions, OcrMode, OcrRoutingError,
-    OcrRunError, PdfiumRenderer, RenderError, PP_OCR_V6_SMALL,
+    HttpModelDownloader, ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError,
+    OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions, OcrRoutingError, OcrRun, OcrRunError,
+    PdfiumRenderer, RenderError, RenderOptions, PP_OCR_V6_SMALL,
 };
 
-/// Options for the complete local extraction path.
+/// Options for native extraction with optional OCR.
 #[derive(Clone)]
-pub struct LocalPdfOptions {
-    /// Rendering, OCR routing, model, and optional extension settings.
-    pub local: LocalOptions,
+pub struct OcrPdfOptions {
+    /// Page rasterization settings used when OCR is routed.
+    pub render: RenderOptions,
+    /// OCR routing, model, and recognition settings.
+    pub ocr: OcrOptions,
     /// Markdown formatting shared by native and OCR assembly.
     pub markdown: MarkdownOptions,
     /// Optional 1-indexed page selection. `None` processes the full document.
     pub page_filter: Option<BTreeSet<u32>>,
     /// Password for an encrypted PDF.
     pub password: Option<String>,
-    /// Weak local OCR threshold for recommending the hosted pipeline.
+    /// Weak OCR threshold for recommending the hosted pipeline.
     pub hosted_recommendation_confidence: f32,
 }
 
-impl Default for LocalPdfOptions {
+impl Default for OcrPdfOptions {
     fn default() -> Self {
         Self {
-            local: LocalOptions::default(),
+            render: RenderOptions::default(),
+            ocr: OcrOptions::default(),
             markdown: MarkdownOptions::default(),
             page_filter: None,
             password: None,
@@ -42,11 +45,12 @@ impl Default for LocalPdfOptions {
     }
 }
 
-impl std::fmt::Debug for LocalPdfOptions {
+impl std::fmt::Debug for OcrPdfOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("LocalPdfOptions")
-            .field("local", &self.local)
+            .debug_struct("OcrPdfOptions")
+            .field("render", &self.render)
+            .field("ocr", &self.ocr)
             .field("markdown", &self.markdown)
             .field("page_filter", &self.page_filter)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
@@ -58,21 +62,27 @@ impl std::fmt::Debug for LocalPdfOptions {
     }
 }
 
-impl LocalPdfOptions {
+impl OcrPdfOptions {
     /// Creates options with OCR disabled, preserving the native-only path.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replaces all local rendering and inference settings.
-    pub fn local(mut self, local: LocalOptions) -> Self {
-        self.local = local;
+    /// Replaces page rasterization settings.
+    pub fn render(mut self, render: RenderOptions) -> Self {
+        self.render = render;
         self
     }
 
-    /// Sets local OCR routing without changing other local settings.
-    pub fn ocr_mode(mut self, mode: OcrMode) -> Self {
-        self.local.ocr.mode = mode;
+    /// Replaces OCR routing and recognition settings.
+    pub fn ocr(mut self, ocr: OcrOptions) -> Self {
+        self.ocr = ocr;
+        self
+    }
+
+    /// Sets OCR routing without changing the remaining OCR settings.
+    pub fn mode(mut self, mode: OcrMode) -> Self {
+        self.ocr.mode = mode;
         self
     }
 
@@ -101,9 +111,9 @@ impl LocalPdfOptions {
     }
 }
 
-/// Complete native/OCR Markdown output for a local PDF request.
+/// Complete native/OCR Markdown output for a PDF request.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LocalPdfResult {
+pub struct OcrPdfResult {
     /// Final document Markdown in selected-page order.
     pub markdown: String,
     /// Final per-page Markdown and provenance, using 1-indexed page numbers.
@@ -114,7 +124,7 @@ pub struct LocalPdfResult {
     pub pages_recommended_for_ocr: Vec<u32>,
     /// 1-indexed pages actually rendered and recognized.
     pub pages_routed_to_ocr: Vec<u32>,
-    /// 1-indexed pages whose local result recommends hosted document parsing.
+    /// 1-indexed pages whose OCR result recommends hosted document parsing.
     pub pages_recommending_hosted: Vec<u32>,
     /// Original machine-readable OCR reasons for selected pages.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
@@ -124,7 +134,7 @@ pub struct LocalPdfResult {
     pub pages_with_columns: Vec<u32>,
     /// Whether deterministic extraction found tables or columns.
     pub is_complex: bool,
-    /// End-to-end local processing time.
+    /// End-to-end processing time.
     pub processing_time_ms: u64,
     /// Batch page-rendering time; zero when no OCR work was routed.
     pub render_time_ms: u64,
@@ -132,35 +142,32 @@ pub struct LocalPdfResult {
     pub ocr_time_ms: u64,
 }
 
-/// Processes a local PDF file through native extraction and selective OCR.
-pub fn process_pdf_local(
+/// Processes a PDF file through native extraction and selective OCR.
+pub fn process_pdf_with_ocr(
     path: impl AsRef<Path>,
-    options: LocalPdfOptions,
-) -> Result<LocalPdfResult, LocalOcrPipelineError> {
+    options: OcrPdfOptions,
+) -> Result<OcrPdfResult, OcrPipelineError> {
     let bytes = std::fs::read(path).map_err(PdfError::from)?;
-    process_pdf_local_mem(&bytes, options)
+    process_pdf_with_ocr_mem(&bytes, options)
 }
 
-/// Processes PDF bytes through native extraction and selective local OCR.
+/// Processes PDF bytes through native extraction and selective OCR.
 ///
 /// Native extraction always runs first. `Auto` initializes PDFium, downloads
 /// models, and starts OAR only if the detector selected at least one page.
 /// `Off` therefore has no renderer, model-cache, network, or inference side
 /// effects even though the complete feature is compiled into the application.
-pub fn process_pdf_local_mem(
+pub fn process_pdf_with_ocr_mem(
     buffer: &[u8],
-    options: LocalPdfOptions,
-) -> Result<LocalPdfResult, LocalOcrPipelineError> {
-    if options.local.layout.enabled {
-        return Err(LocalOcrPipelineError::LearnedLayoutUnsupported);
-    }
+    options: OcrPdfOptions,
+) -> Result<OcrPdfResult, OcrPipelineError> {
     OcrFusionOptions::new()
-        .render_dpi(options.local.render.dpi)
+        .render_dpi(options.render.dpi)
         .hosted_recommendation_confidence(options.hosted_recommendation_confidence)
         .validate()?;
-    let minimum_confidence = options.local.ocr.minimum_confidence;
+    let minimum_confidence = options.ocr.minimum_confidence;
     if !minimum_confidence.is_finite() || !(0.0..=1.0).contains(&minimum_confidence) {
-        return Err(LocalOcrPipelineError::InvalidMinimumConfidence {
+        return Err(OcrPipelineError::InvalidMinimumConfidence {
             value: minimum_confidence,
         });
     }
@@ -169,7 +176,7 @@ pub fn process_pdf_local_mem(
         .as_ref()
         .is_some_and(|pages| pages.contains(&0))
     {
-        return Err(LocalOcrPipelineError::InvalidSelectedPage { page: 0 });
+        return Err(OcrPipelineError::InvalidSelectedPage { page: 0 });
     }
 
     let started = Instant::now();
@@ -183,7 +190,7 @@ pub fn process_pdf_local_mem(
 
     let mut page_markdown_options = options.markdown.clone();
     page_markdown_options.include_page_numbers = false;
-    let (native, page_count) = crate::extract_pages_markdown_mem_for_local(
+    let (native, page_count) = crate::extract_pages_markdown_mem_for_ocr(
         buffer,
         selected_pages_zero_indexed.as_deref(),
         options.password.as_deref(),
@@ -193,18 +200,18 @@ pub fn process_pdf_local_mem(
         .as_ref()
         .and_then(|pages| pages.iter().copied().find(|page| *page > page_count))
     {
-        return Err(LocalOcrPipelineError::InvalidSelectedPage { page: invalid });
+        return Err(OcrPipelineError::InvalidSelectedPage { page: invalid });
     }
 
     let routed = route_ocr_pages(
-        options.local.ocr.mode,
+        options.ocr.mode,
         page_count,
         &native.pages_needing_ocr,
         selected_pages.as_deref(),
     )?;
 
     let ocr_run = if routed.is_empty() {
-        LocalOcrRun {
+        OcrRun {
             pages: Vec::new(),
             render_time_ms: 0,
             ocr_time_ms: 0,
@@ -213,10 +220,10 @@ pub fn process_pdf_local_mem(
         // Resolve the native renderer before any network request so a missing
         // PDFium installation cannot trigger a model download it cannot use.
         let renderer = PdfiumRenderer::load()?;
-        let store = ModelStore::from_options(&options.local.ocr)?;
+        let store = ModelStore::from_options(&options.ocr)?;
         let models = store.resolve_or_download(
             &PP_OCR_V6_SMALL,
-            options.local.ocr.model_downloads,
+            options.ocr.model_downloads,
             &HttpModelDownloader::default(),
         )?;
         let engine = OarOcrEngine::from_models(&models)?;
@@ -226,14 +233,14 @@ pub fn process_pdf_local_mem(
             buffer,
             &routed,
             options.password.as_deref(),
-            &options.local.render,
-            &options.local.ocr,
+            &options.render,
+            &options.ocr,
         )?
     };
 
     let fusion_options = OcrFusionOptions::new()
         .markdown(page_markdown_options)
-        .render_dpi(options.local.render.dpi)
+        .render_dpi(options.render.dpi)
         .hosted_recommendation_confidence(options.hosted_recommendation_confidence);
     let fused = fuse_ocr_pages(&native.pages, &ocr_run, page_count, &fusion_options)?;
     let pages_recommending_hosted = fused
@@ -244,7 +251,7 @@ pub fn process_pdf_local_mem(
         .collect();
     let markdown = assemble_document_markdown(&fused.pages, options.markdown.include_page_numbers);
 
-    Ok(LocalPdfResult {
+    Ok(OcrPdfResult {
         markdown,
         pages: fused.pages,
         page_count,
@@ -282,10 +289,10 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Failures from the complete local OCR pipeline.
+/// Failures from the complete OCR pipeline.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum LocalOcrPipelineError {
+pub enum OcrPipelineError {
     /// PDF loading or native extraction failed.
     #[error(transparent)]
     Pdf(#[from] PdfError),
@@ -316,9 +323,6 @@ pub enum LocalOcrPipelineError {
         /// Invalid page number.
         page: u32,
     },
-    /// Learned layout was deliberately left out of the lightweight pipeline.
-    #[error("learned layout is not available in the lightweight local OCR pipeline")]
-    LearnedLayoutUnsupported,
     /// OCR span confidence is outside the inclusive 0–1 range.
     #[error("minimum OCR confidence must be between 0 and 1, got {value}")]
     InvalidMinimumConfidence {
@@ -334,7 +338,7 @@ mod tests {
     #[test]
     fn off_mode_extracts_native_text_without_runtime_side_effects() {
         let bytes = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
-        let result = process_pdf_local_mem(&bytes, LocalPdfOptions::new()).unwrap();
+        let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new()).unwrap();
 
         assert_eq!(result.page_count, 3);
         assert_eq!(result.pages.len(), 3);
@@ -350,7 +354,7 @@ mod tests {
     fn auto_mode_does_not_load_pdfium_or_models_for_clean_pdf() {
         let bytes = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
         let result =
-            process_pdf_local_mem(&bytes, LocalPdfOptions::new().ocr_mode(OcrMode::Auto)).unwrap();
+            process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().mode(OcrMode::Auto)).unwrap();
 
         assert!(result.pages_routed_to_ocr.is_empty());
         assert!(result.markdown.contains("Freon 12"));
@@ -362,7 +366,7 @@ mod tests {
         let mut markdown = MarkdownOptions::default();
         markdown.include_page_numbers = true;
         let result =
-            process_pdf_local_mem(&bytes, LocalPdfOptions::new().pages([2]).markdown(markdown))
+            process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().pages([2]).markdown(markdown))
                 .unwrap();
 
         assert_eq!(result.pages.len(), 1);
@@ -374,7 +378,7 @@ mod tests {
     #[test]
     fn off_mode_marks_unprocessed_scan_for_hosted_fallback() {
         let bytes = std::fs::read("tests/fixtures/scan_with_native_header_text.pdf").unwrap();
-        let result = process_pdf_local_mem(&bytes, LocalPdfOptions::new()).unwrap();
+        let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new()).unwrap();
 
         assert!(result.pages_routed_to_ocr.is_empty());
         assert_eq!(result.pages_recommending_hosted, vec![1]);
@@ -382,50 +386,39 @@ mod tests {
 
     #[test]
     fn password_is_redacted_and_used_for_native_extraction() {
-        let options = LocalPdfOptions::new().password("secret123");
+        let options = OcrPdfOptions::new().password("secret123");
         assert!(!format!("{options:?}").contains("secret123"));
 
         let bytes = std::fs::read("tests/fixtures/encrypted-secret123.pdf").unwrap();
-        let result = process_pdf_local_mem(&bytes, options).unwrap();
+        let result = process_pdf_with_ocr_mem(&bytes, options).unwrap();
         assert!(result.markdown.contains("Procurement"));
-    }
-
-    #[test]
-    fn learned_layout_fails_explicitly() {
-        let mut options = LocalPdfOptions::new();
-        options.local.layout.enabled = true;
-        let error = process_pdf_local_mem(b"not reached", options).unwrap_err();
-        assert!(matches!(
-            error,
-            LocalOcrPipelineError::LearnedLayoutUnsupported
-        ));
     }
 
     #[test]
     fn rejects_out_of_range_selection_even_with_ocr_off() {
         let bytes = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
-        let error = process_pdf_local_mem(&bytes, LocalPdfOptions::new().pages([4])).unwrap_err();
+        let error = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().pages([4])).unwrap_err();
         assert!(matches!(
             error,
-            LocalOcrPipelineError::InvalidSelectedPage { page: 4 }
+            OcrPipelineError::InvalidSelectedPage { page: 4 }
         ));
     }
 
     #[test]
     fn invalid_expensive_options_fail_before_pdf_or_runtime_access() {
-        let mut invalid_dpi = LocalPdfOptions::new();
-        invalid_dpi.local.render.dpi = f32::NAN;
+        let mut invalid_dpi = OcrPdfOptions::new();
+        invalid_dpi.render.dpi = f32::NAN;
         assert!(matches!(
-            process_pdf_local_mem(b"not a PDF", invalid_dpi),
-            Err(LocalOcrPipelineError::Fusion(
+            process_pdf_with_ocr_mem(b"not a PDF", invalid_dpi),
+            Err(OcrPipelineError::Fusion(
                 OcrFusionError::InvalidRenderDpi { .. }
             ))
         ));
 
-        let invalid_hosted = LocalPdfOptions::new().hosted_recommendation_confidence(1.1);
+        let invalid_hosted = OcrPdfOptions::new().hosted_recommendation_confidence(1.1);
         assert!(matches!(
-            process_pdf_local_mem(b"not a PDF", invalid_hosted),
-            Err(LocalOcrPipelineError::Fusion(
+            process_pdf_with_ocr_mem(b"not a PDF", invalid_hosted),
+            Err(OcrPipelineError::Fusion(
                 OcrFusionError::InvalidHostedConfidence { .. }
             ))
         ));

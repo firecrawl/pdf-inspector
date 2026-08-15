@@ -463,8 +463,8 @@ pub fn extract_pages_markdown_mem(
         .map(|(result, _)| result)
 }
 
-#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
-pub(crate) fn extract_pages_markdown_mem_for_local(
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+pub(crate) fn extract_pages_markdown_mem_for_ocr(
     buffer: &[u8],
     pages: Option<&[u32]>,
     password: Option<&str>,
@@ -735,8 +735,8 @@ fn repeated_header_footer_item_keys(
     all_items.difference(&kept_items).cloned().collect()
 }
 
-#[cfg(all(test, feature = "local-ocr", not(target_arch = "wasm32")))]
-mod local_header_footer_tests {
+#[cfg(all(test, feature = "ocr", not(target_arch = "wasm32")))]
+mod ocr_header_footer_tests {
     use super::*;
 
     fn item(page: u32, text: &str, y: f32) -> TextItem {

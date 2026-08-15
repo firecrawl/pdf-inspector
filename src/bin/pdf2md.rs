@@ -1,10 +1,10 @@
 //! CLI tool for PDF to Markdown conversion
 
 use pdf_inspector::extractor::ItemType;
-#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 use pdf_inspector::vision::{
-    process_pdf_local, LocalOptions, LocalPdfOptions, LocalPdfResult, ModelDownloadPolicy, OcrMode,
-    OcrOptions, PageContentSource, RenderOptions,
+    process_pdf_with_ocr, ModelDownloadPolicy, OcrMode, OcrOptions, OcrPdfOptions, OcrPdfResult,
+    PageContentSource, RenderOptions,
 };
 use pdf_inspector::{
     extract_text_with_positions_pages_with_password, process_pdf_with_options, LayoutComplexity,
@@ -108,7 +108,7 @@ fn format_items_json(items: &[TextItem]) -> String {
     )
 }
 
-#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 fn optional_json_number(value: Option<f32>) -> String {
     value
         .filter(|value| value.is_finite())
@@ -116,8 +116,8 @@ fn optional_json_number(value: Option<f32>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
-#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
-fn format_local_json(result: &LocalPdfResult) -> String {
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+fn format_ocr_json(result: &OcrPdfResult) -> String {
     let routed = result
         .pages_routed_to_ocr
         .iter()
@@ -224,7 +224,7 @@ fn argument_value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>,
         .transpose()
 }
 
-#[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 fn float_argument(args: &[String], name: &str, default: f32) -> Result<f32, String> {
     argument_value(args, name)?
         .map(|value| {
@@ -375,7 +375,7 @@ fn main() {
         eprintln!("  --password PW       Password for an encrypted PDF");
         eprintln!("  --detect-only       Only detect PDF type (no extraction)");
         eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
-        eprintln!("  --ocr MODE          Local OCR mode: off, auto, or force (requires local-ocr)");
+        eprintln!("  --ocr MODE          OCR mode: off, auto, or force (requires feature `ocr`)");
         eprintln!("  --ocr-dpi N         OCR render resolution (default: 150)");
         eprintln!("  --ocr-min-confidence N  Drop OCR spans below N (default: 0)");
         eprintln!("  --ocr-hosted-threshold N  Recommend hosted parsing below N (default: 0.5)");
@@ -441,7 +441,7 @@ fn main() {
     .iter()
     .any(|option| args.iter().any(|argument| argument == option));
     if ocr_mode_argument.is_none() && has_ocr_only_option {
-        eprintln!("Error: local OCR options require --ocr off, --ocr auto, or --ocr force");
+        eprintln!("Error: OCR options require --ocr off, --ocr auto, or --ocr force");
         process::exit(1);
     }
 
@@ -453,14 +453,14 @@ fn main() {
             process::exit(1);
         }
 
-        #[cfg(not(all(feature = "local-ocr", not(target_arch = "wasm32"))))]
+        #[cfg(not(all(feature = "ocr", not(target_arch = "wasm32"))))]
         {
             let _ = mode;
-            eprintln!("Error: this pdf2md build does not include local OCR; rebuild with --features local-ocr");
+            eprintln!("Error: this pdf2md build does not include OCR; rebuild with --features ocr");
             process::exit(1);
         }
 
-        #[cfg(all(feature = "local-ocr", not(target_arch = "wasm32")))]
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         {
             let mode = match mode {
                 "off" => OcrMode::Off,
@@ -500,33 +500,31 @@ fn main() {
             if args.iter().any(|argument| argument == "--ocr-offline") {
                 ocr = ocr.model_downloads(ModelDownloadPolicy::Offline);
             }
-            let local = LocalOptions::new()
-                .render(RenderOptions::new().dpi(dpi))
-                .ocr(ocr);
             let mut markdown = pdf_inspector::MarkdownOptions::default();
             if compact_output {
                 markdown.profile = pdf_inspector::MarkdownProfile::Compact;
             }
             markdown.include_page_numbers = page_numbers;
-            let mut local_options = LocalPdfOptions::new()
-                .local(local)
+            let mut pdf_options = OcrPdfOptions::new()
+                .render(RenderOptions::new().dpi(dpi))
+                .ocr(ocr)
                 .markdown(markdown)
                 .hosted_recommendation_confidence(hosted_threshold);
             if let Some(pages) = page_filter.clone() {
-                local_options = local_options.pages(pages);
+                pdf_options = pdf_options.pages(pages);
             }
             if let Some(password) = password.clone() {
-                local_options = local_options.password(password);
+                pdf_options = pdf_options.password(password);
             }
 
-            match process_pdf_local(pdf_path, local_options) {
+            match process_pdf_with_ocr(pdf_path, pdf_options) {
                 Ok(result) => {
                     if json_output {
-                        println!("{}", format_local_json(&result));
+                        println!("{}", format_ocr_json(&result));
                     } else if raw_output {
                         print!("{}", result.markdown);
                     } else {
-                        eprintln!("PDF to Markdown Conversion (local OCR)");
+                        eprintln!("PDF to Markdown Conversion (OCR)");
                         eprintln!("======================================");
                         eprintln!("File: {pdf_path}");
                         eprintln!("Pages: {}", result.page_count);
