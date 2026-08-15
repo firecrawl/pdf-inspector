@@ -383,11 +383,15 @@ returns an explicit unsupported error in this lightweight pipeline.
 The one-call API keeps the most recently used verified OCR engine in process.
 Long-lived workers therefore verify the pinned artifacts and build the ONNX
 sessions once, then reuse those loaded sessions across documents. The cache is
-bounded to one model configuration; switching the model directory or runtime
-library replaces it. CPU inference uses at most four intra-op threads per ONNX
-session so a single small page does not oversubscribe larger hosts, and
-recognizes variable-width line crops individually to avoid padding-heavy CPU
-batches.
+bounded to one model configuration and keyed by normalized model/runtime paths
+plus the pinned manifest revision and artifact digests; switching the model
+directory, runtime library, or compiled manifest replaces it. An active engine
+owns the model data it already verified, so mutating artifacts in place does
+not hot-reload a running process; restart the process when intentionally
+replacing files at the same paths. CPU inference uses at most four intra-op
+threads per ONNX session so a single small page does not oversubscribe larger
+hosts, and recognizes variable-width line crops individually to avoid
+padding-heavy CPU batches.
 
 Build the CLI with the same opt-in feature:
 

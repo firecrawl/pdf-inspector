@@ -21,6 +21,10 @@ use super::{
 struct OcrEngineCacheKey {
     model_root: PathBuf,
     runtime_library: PathBuf,
+    manifest_schema: u32,
+    manifest_id: &'static str,
+    manifest_revision: &'static str,
+    artifact_digests: Vec<&'static str>,
 }
 
 #[derive(Debug)]
@@ -281,19 +285,30 @@ pub fn process_pdf_with_ocr_mem(
 fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipelineError> {
     let store = ModelStore::from_options(options)?;
     let key = OcrEngineCacheKey {
-        model_root: canonicalize_if_present(store.model_root(&PP_OCR_V6_SMALL)),
-        runtime_library: canonicalize_if_present(onnx_runtime_library_path()),
+        model_root: normalized_cache_path(store.model_root(&PP_OCR_V6_SMALL)),
+        runtime_library: normalized_cache_path(onnx_runtime_library_path()),
+        manifest_schema: PP_OCR_V6_SMALL.schema_version,
+        manifest_id: PP_OCR_V6_SMALL.id,
+        manifest_revision: PP_OCR_V6_SMALL.revision,
+        artifact_digests: PP_OCR_V6_SMALL
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.sha256)
+            .collect(),
     };
     let cache = OCR_ENGINE_CACHE.get_or_init(|| Mutex::new(None));
-    let mut cached = cache.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(cached) = cached.as_ref().filter(|cached| cached.key == key) {
-        return Ok(Arc::clone(&cached.engine));
+    {
+        let cached = cache.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(cached) = cached.as_ref().filter(|cached| cached.key == key) {
+            return Ok(Arc::clone(&cached.engine));
+        }
     }
 
-    // Model verification and session construction happen once per active
-    // configuration. The loaded sessions own the verified model data, so a
-    // cache hit never needs to trust or reopen mutable files on disk. Keeping
-    // the lock through initialization also prevents a first-request stampede.
+    // The loaded sessions own the verified model data, so a cache hit never
+    // needs to trust or reopen mutable files on disk. Do the expensive download
+    // and session construction outside the process-wide cache lock so unrelated
+    // OCR requests can continue using a warm engine. Concurrent cold misses may
+    // build redundantly; the second cache check keeps only one shared session.
     let models = store.resolve_or_download(
         &PP_OCR_V6_SMALL,
         options.model_downloads,
@@ -301,6 +316,10 @@ fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipel
     )?;
     let engine = Arc::new(OarOcrEngine::from_models(&models)?);
 
+    let mut cached = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(cached) = cached.as_ref().filter(|cached| cached.key == key) {
+        return Ok(Arc::clone(&cached.engine));
+    }
     *cached = Some(CachedOcrEngine {
         key,
         engine: Arc::clone(&engine),
@@ -308,8 +327,37 @@ fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipel
     Ok(engine)
 }
 
-fn canonicalize_if_present(path: PathBuf) -> PathBuf {
-    std::fs::canonicalize(&path).unwrap_or(path)
+fn normalized_cache_path(path: PathBuf) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(&path))
+            .unwrap_or(path)
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        return canonical;
+    }
+
+    // A managed cache often does not exist on the first request. Resolve the
+    // nearest existing ancestor so a relative path has the same key before
+    // and after model acquisition creates its final directories.
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    while let Some(name) = ancestor.file_name() {
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+    }
+    absolute
 }
 
 fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers: bool) -> String {
@@ -378,6 +426,21 @@ pub enum OcrPipelineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_path_is_stable_when_a_relative_directory_is_created() {
+        let current = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let temporary = tempfile::tempdir_in(&current).unwrap();
+        let relative_root = temporary.path().strip_prefix(&current).unwrap();
+        let relative = relative_root.join("models").join("revision");
+
+        let before = normalized_cache_path(relative.clone());
+        std::fs::create_dir_all(&relative).unwrap();
+        let after = normalized_cache_path(relative);
+
+        assert!(before.is_absolute());
+        assert_eq!(before, after);
+    }
 
     #[test]
     fn off_mode_extracts_native_text_without_runtime_side_effects() {
