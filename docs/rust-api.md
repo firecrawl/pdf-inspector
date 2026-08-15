@@ -197,7 +197,7 @@ for page in pages {
 Browser WASM remains on the default text-only path and does not expose native
 PDFium rendering.
 
-### Optional local OCR engine
+### Optional OCR engine
 
 The native-only `ocr-oar` feature adds a CPU PP-OCRv6 Small implementation of
 `OcrEngine` backed by OAR and ONNX Runtime. It implies `model-cache`, but does
