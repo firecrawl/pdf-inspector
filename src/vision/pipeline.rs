@@ -1,13 +1,19 @@
 //! One-call native extraction and OCR pipeline.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::{MarkdownOptions, PageOcrReasons, PdfError};
+use crate::text_quality::{
+    analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
+};
+use crate::{
+    MarkdownOptions, PageOcrReasons, PdfError, OCR_REASON_SUSPECTED_GARBLED_TEXT,
+    OCR_REASON_VECTOR_TEXT,
+};
 
 use super::oar::onnx_runtime_library_path;
 use super::{
@@ -210,7 +216,7 @@ pub fn process_pdf_with_ocr_mem(
 
     let mut page_markdown_options = options.markdown.clone();
     page_markdown_options.include_page_numbers = false;
-    let (native, page_count) = crate::extract_pages_markdown_mem_for_ocr(
+    let (mut native, page_count) = crate::extract_pages_markdown_mem_for_ocr(
         buffer,
         selected_pages_zero_indexed.as_deref(),
         options.password.as_deref(),
@@ -223,12 +229,49 @@ pub fn process_pdf_with_ocr_mem(
         return Err(OcrPipelineError::InvalidSelectedPage { page: invalid });
     }
 
-    let routed = route_ocr_pages(
+    let mut routed = route_ocr_pages(
         options.ocr.mode,
         page_count,
         &native.pages_needing_ocr,
         selected_pages.as_deref(),
     )?;
+
+    let mut renderer = None;
+    let mut recovered_natively = BTreeSet::new();
+    if options.ocr.mode == OcrMode::Auto {
+        let recovery_candidates = native_recovery_candidates(&routed, &native.ocr_reasons_by_page);
+        if !recovery_candidates.is_empty() {
+            let native_renderer = PdfiumRenderer::load()?;
+            let recovered = native_renderer.extract_text_pages(
+                buffer,
+                &recovery_candidates,
+                options.password.as_deref(),
+            )?;
+            renderer = Some(native_renderer);
+
+            for page in recovered {
+                let Some(markdown) =
+                    credible_native_recovery(&page.items, page_count, &page_markdown_options)
+                else {
+                    continue;
+                };
+                if !is_complete_native_recovery(&markdown) {
+                    continue;
+                }
+                let Some(native_page) = native
+                    .pages
+                    .iter_mut()
+                    .find(|entry| entry.page + 1 == page.page)
+                else {
+                    continue;
+                };
+                native_page.markdown = markdown;
+                native_page.needs_ocr = false;
+                recovered_natively.insert(page.page);
+            }
+            routed.retain(|page| !recovered_natively.contains(page));
+        }
+    }
 
     let ocr_run = if routed.is_empty() {
         OcrRun {
@@ -239,7 +282,10 @@ pub fn process_pdf_with_ocr_mem(
     } else {
         // Resolve the native renderer before any network request so a missing
         // PDFium installation cannot trigger a model download it cannot use.
-        let renderer = PdfiumRenderer::load()?;
+        let renderer = match renderer {
+            Some(renderer) => renderer,
+            None => PdfiumRenderer::load()?,
+        };
         let engine = cached_ocr_engine(&options.ocr)?;
         run_ocr_pages(
             &renderer,
@@ -256,7 +302,14 @@ pub fn process_pdf_with_ocr_mem(
         .markdown(page_markdown_options)
         .render_dpi(options.render.dpi)
         .hosted_recommendation_confidence(options.hosted_recommendation_confidence);
-    let fused = fuse_ocr_pages(&native.pages, &ocr_run, page_count, &fusion_options)?;
+    let mut fused = fuse_ocr_pages(&native.pages, &ocr_run, page_count, &fusion_options)?;
+    for page in &mut fused.pages {
+        if recovered_natively.contains(&page.page) {
+            page.provenance
+                .warnings
+                .push("recovered a credible positioned native text layer before OCR".to_string());
+        }
+    }
     let pages_recommending_hosted = fused
         .pages
         .iter()
@@ -264,6 +317,14 @@ pub fn process_pdf_with_ocr_mem(
         .map(|page| page.provenance.page)
         .collect();
     let markdown = assemble_document_markdown(&fused.pages, options.markdown.include_page_numbers);
+
+    let mut pages_with_tables = native.pages_with_tables;
+    for page in &fused.pages {
+        if markdown_has_table(&page.markdown) && !pages_with_tables.contains(&page.page) {
+            pages_with_tables.push(page.page);
+        }
+    }
+    pages_with_tables.sort_unstable();
 
     Ok(OcrPdfResult {
         markdown,
@@ -273,9 +334,9 @@ pub fn process_pdf_with_ocr_mem(
         pages_routed_to_ocr: routed,
         pages_recommending_hosted,
         ocr_reasons_by_page: native.ocr_reasons_by_page,
-        pages_with_tables: native.pages_with_tables,
+        pages_with_tables: pages_with_tables.clone(),
         pages_with_columns: native.pages_with_columns,
-        is_complex: native.is_complex,
+        is_complex: native.is_complex || !pages_with_tables.is_empty(),
         processing_time_ms: elapsed_ms(started),
         render_time_ms: fused.render_time_ms,
         ocr_time_ms: fused.ocr_time_ms,
@@ -360,6 +421,129 @@ fn normalized_cache_path(path: PathBuf) -> PathBuf {
     absolute
 }
 
+fn native_recovery_candidates(routed: &[u32], reasons: &[PageOcrReasons]) -> Vec<u32> {
+    let reasons_by_page: BTreeMap<u32, &PageOcrReasons> =
+        reasons.iter().map(|entry| (entry.page, entry)).collect();
+    routed
+        .iter()
+        .copied()
+        .filter(|page| {
+            reasons_by_page.get(page).is_some_and(|entry| {
+                !entry.reasons.is_empty()
+                    && entry.reasons.iter().all(|reason| {
+                        reason == OCR_REASON_SUSPECTED_GARBLED_TEXT
+                            || reason == OCR_REASON_VECTOR_TEXT
+                    })
+            })
+        })
+        .collect()
+}
+
+fn credible_native_recovery(
+    items: &[crate::TextItem],
+    document_page_count: u32,
+    options: &MarkdownOptions,
+) -> Option<String> {
+    let quality = analyze_text_quality(items);
+    if quality.has_encoding_issues {
+        return None;
+    }
+    let text = items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if is_garbage_text(&text) || is_cid_garbage(&text) || detect_encoding_issues(&text) {
+        return None;
+    }
+
+    let markdown = crate::to_markdown_from_items_with_rects_and_page_count(
+        items.to_vec(),
+        options.clone(),
+        &[],
+        document_page_count,
+    );
+    let markdown = remove_duplicate_table_lines(&markdown);
+    (!markdown.trim().is_empty()).then_some(markdown)
+}
+
+fn is_complete_native_recovery(markdown: &str) -> bool {
+    let alphanumeric_chars = markdown
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .count();
+    if alphanumeric_chars < 40 {
+        return false;
+    }
+    let visible_chars = markdown
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
+        .max(1);
+    let density = alphanumeric_chars as f32 / visible_chars as f32;
+    let length_score = (alphanumeric_chars as f32 / 160.0).min(1.0);
+    let nonempty_lines = markdown
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .max(1);
+    let line_score = (alphanumeric_chars as f32 / nonempty_lines as f32 / 12.0).min(1.0);
+    let score = (0.45 + length_score * 0.25 + density * 0.20 + line_score * 0.10).min(1.0);
+    score >= 0.68
+}
+
+fn markdown_has_table(markdown: &str) -> bool {
+    markdown.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with('|')
+            && trimmed.ends_with('|')
+            && trimmed
+                .split('|')
+                .filter(|cell| !cell.is_empty())
+                .all(|cell| !cell.is_empty() && cell.chars().all(|ch| ch == '-'))
+    })
+}
+
+fn remove_duplicate_table_lines(markdown: &str) -> String {
+    let table_rows: BTreeSet<String> = markdown
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            (trimmed.starts_with('|')
+                && trimmed.ends_with('|')
+                && !trimmed.contains("|---")
+                && trimmed.matches('|').count() >= 4)
+                .then(|| canonical_table_text(trimmed))
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    if table_rows.is_empty() {
+        return markdown.to_string();
+    }
+
+    let mut output = String::new();
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        let is_table_line = trimmed.starts_with('|') && trimmed.ends_with('|');
+        if !is_table_line && table_rows.contains(&canonical_table_text(trimmed)) {
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    while output.ends_with("\n\n\n") {
+        output.pop();
+    }
+    output
+}
+
+fn canonical_table_text(text: &str) -> String {
+    text.replace('|', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers: bool) -> String {
     let mut document = String::new();
     for (index, page) in pages.iter().enumerate() {
@@ -440,6 +624,44 @@ mod tests {
 
         assert!(before.is_absolute());
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn native_recovery_is_limited_to_recoverable_routing_reasons() {
+        let routed = [1, 2, 3, 4];
+        let reasons = [
+            PageOcrReasons {
+                page: 1,
+                reasons: vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()],
+            },
+            PageOcrReasons {
+                page: 2,
+                reasons: vec![crate::OCR_REASON_SCANNED.to_string()],
+            },
+            PageOcrReasons {
+                page: 3,
+                reasons: vec![OCR_REASON_VECTOR_TEXT.to_string()],
+            },
+            PageOcrReasons {
+                page: 4,
+                reasons: vec![
+                    OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string(),
+                    crate::OCR_REASON_SCANNED.to_string(),
+                ],
+            },
+        ];
+
+        assert_eq!(native_recovery_candidates(&routed, &reasons), vec![1, 3]);
+    }
+
+    #[test]
+    fn recovered_markdown_drops_plain_duplicates_of_table_rows() {
+        let markdown = "|Date|Value|Status|\n|---|---|---|\n|April 1|42|ok|\n\nApril 1 42 ok\n";
+
+        assert_eq!(
+            remove_duplicate_table_lines(markdown),
+            "|Date|Value|Status|\n|---|---|---|\n|April 1|42|ok|\n\n"
+        );
     }
 
     #[test]

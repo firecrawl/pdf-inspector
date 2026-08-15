@@ -2,7 +2,8 @@
 
 #[cfg(feature = "ocr")]
 use pdf_inspector::vision::{
-    process_pdf_with_ocr_mem, ModelDownloadPolicy, OcrPdfOptions, PageContentSource,
+    process_pdf_with_ocr_mem, ModelDownloadPolicy, OcrPdfOptions, OcrPipelineError,
+    PageContentSource,
 };
 use pdf_inspector::vision::{
     ModelStore, OarOcrEngine, OcrEngine, OcrMode, OcrOptions, PageTransform, RenderPixelFormat,
@@ -133,6 +134,50 @@ fn complete_ocr_pipeline_routes_and_assembles_a_scanned_fixture() {
         PP_OCR_V6_SMALL.id
     );
     assert_eq!(repeated.markdown, result.markdown);
+}
+
+#[cfg(all(feature = "ocr", feature = "render-pdfium"))]
+#[test]
+fn auto_recovers_credible_native_text_before_loading_ocr_models() {
+    let Some(_renderer) = load_renderer() else {
+        return;
+    };
+
+    let bytes = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let ocr = OcrOptions::new()
+        .mode(OcrMode::Auto)
+        .model_directory("/models/must-not-be-read")
+        .model_downloads(ModelDownloadPolicy::Offline);
+    let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().ocr(ocr)).unwrap();
+
+    assert_eq!(result.pages_recommended_for_ocr, vec![1]);
+    assert!(result.pages_routed_to_ocr.is_empty());
+    assert!(result.markdown.contains("羽田空港新飛行経路"));
+    assert!(result.markdown.contains("|4月30日|有|81.0|"));
+    assert!(result.markdown.contains("※１ 最大騒音レベル"));
+    assert!(result.pages_with_tables.contains(&1));
+    assert_eq!(result.pages[0].provenance.source, PageContentSource::Native);
+    assert!(result.pages[0].provenance.ocr_model.is_none());
+}
+
+#[cfg(all(feature = "ocr", feature = "render-pdfium"))]
+#[test]
+fn auto_rejects_garbled_native_recovery_and_continues_to_ocr() {
+    let Some(_renderer) = load_renderer() else {
+        return;
+    };
+
+    let bytes = std::fs::read("tests/fixtures/shifted_cipher_tounicode.pdf").unwrap();
+    let ocr = OcrOptions::new()
+        .mode(OcrMode::Auto)
+        .model_directory("/models/must-not-be-read")
+        .model_downloads(ModelDownloadPolicy::Offline);
+    let error = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().ocr(ocr)).unwrap_err();
+
+    assert!(matches!(
+        error,
+        OcrPipelineError::ModelAcquire(_) | OcrPipelineError::ModelStore(_)
+    ));
 }
 
 fn recognize(

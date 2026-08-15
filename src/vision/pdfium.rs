@@ -2,8 +2,10 @@
 
 use std::path::Path;
 
-use firecrawl_pdfium::{Pdfium, PixelFormat, PixelPoint, RenderConfig};
+use firecrawl_pdfium::{PageChar, Pdfium, PixelFormat, PixelPoint, RenderConfig};
 use thiserror::Error;
+
+use crate::types::{ItemType, TextItem};
 
 use super::{
     PageRenderer, PageTransform, RenderBufferError, RenderOptions, RenderPixelFormat, RenderedPage,
@@ -65,6 +67,13 @@ pub struct PdfiumRenderer {
     pdfium: Pdfium,
 }
 
+/// Positioned native text recovered from one selected PDF page.
+#[derive(Debug)]
+pub(crate) struct PdfiumTextPage {
+    pub(crate) page: u32,
+    pub(crate) items: Vec<TextItem>,
+}
+
 impl PdfiumRenderer {
     /// Loads PDFium using `firecrawl-pdfium`'s documented discovery chain.
     pub fn load() -> Result<Self, RenderError> {
@@ -98,6 +107,53 @@ impl PdfiumRenderer {
         options: &RenderOptions,
     ) -> Result<Vec<RenderedPage>, RenderError> {
         self.render_pages_impl(pdf_bytes, pages, password, options)
+    }
+
+    /// Extracts positioned native text from selected 1-indexed pages.
+    ///
+    /// This is deliberately separate from rendering: callers can probe a
+    /// suspicious embedded text layer before paying for rasterization and
+    /// OCR. A page-level text failure is treated as an unavailable recovery
+    /// candidate so the caller can continue to its normal OCR fallback.
+    pub(crate) fn extract_text_pages(
+        &self,
+        pdf_bytes: &[u8],
+        pages: &[u32],
+        password: Option<&str>,
+    ) -> Result<Vec<PdfiumTextPage>, RenderError> {
+        const MAX_TEXT_CHARS_PER_PAGE: usize = 250_000;
+
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+        if pages.contains(&0) {
+            return Err(RenderError::InvalidPageNumber);
+        }
+
+        let document = self.pdfium.load_document(pdf_bytes.to_vec(), password)?;
+        let page_count = document.page_count();
+        if let Some(&page) = pages.iter().find(|&&page| page as usize > page_count) {
+            return Err(RenderError::PageOutOfBounds { page, page_count });
+        }
+
+        let mut recovered = Vec::with_capacity(pages.len());
+        for &page_number in pages {
+            let page = document.page(page_number as usize - 1)?;
+            let text = match page.text_with_limit(MAX_TEXT_CHARS_PER_PAGE) {
+                Ok(text) => text,
+                Err(error) => {
+                    log::debug!(
+                        "page {page_number}: positioned native text recovery unavailable: {error}"
+                    );
+                    continue;
+                }
+            };
+            recovered.push(PdfiumTextPage {
+                page: page_number,
+                items: text_chars_to_items(text.chars(), page_number),
+            });
+        }
+        Ok(recovered)
     }
 
     fn render_pages_impl(
@@ -143,6 +199,97 @@ impl PdfiumRenderer {
 
         Ok(rendered_pages)
     }
+}
+
+fn text_chars_to_items(chars: &[PageChar], page: u32) -> Vec<TextItem> {
+    #[derive(Debug, Clone, Copy)]
+    struct Bounds {
+        left: f64,
+        bottom: f64,
+        right: f64,
+        top: f64,
+    }
+
+    fn flush(items: &mut Vec<TextItem>, text: &mut String, bounds: &mut Option<Bounds>, page: u32) {
+        let Some(bounds) = bounds.take() else {
+            text.clear();
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let width = (bounds.right - bounds.left) as f32;
+        let height = (bounds.top - bounds.bottom) as f32;
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            text.clear();
+            return;
+        }
+        items.push(TextItem {
+            text: std::mem::take(text),
+            x: bounds.left as f32,
+            y: bounds.bottom as f32,
+            width,
+            height,
+            font: "PDFium native text".to_string(),
+            font_size: height.max(1.0),
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        });
+    }
+
+    let mut items = Vec::new();
+    let mut text = String::new();
+    let mut bounds: Option<Bounds> = None;
+    for character in chars {
+        let Some(value) = character.unicode else {
+            flush(&mut items, &mut text, &mut bounds, page);
+            continue;
+        };
+        if value.is_whitespace() {
+            flush(&mut items, &mut text, &mut bounds, page);
+            continue;
+        }
+
+        let rect = character.loose_bounds.normalized();
+        if !rect.left.is_finite()
+            || !rect.bottom.is_finite()
+            || !rect.right.is_finite()
+            || !rect.top.is_finite()
+            || rect.width() <= 0.0
+            || rect.height() <= 0.0
+        {
+            continue;
+        }
+        text.push(value);
+        bounds = Some(match bounds {
+            Some(bounds) => Bounds {
+                left: bounds.left.min(rect.left),
+                bottom: bounds.bottom.min(rect.bottom),
+                right: bounds.right.max(rect.right),
+                top: bounds.top.max(rect.top),
+            },
+            None => Bounds {
+                left: rect.left,
+                bottom: rect.bottom,
+                right: rect.right,
+                top: rect.top,
+            },
+        });
+    }
+    flush(&mut items, &mut text, &mut bounds, page);
+    items.sort_by(|first, second| {
+        first
+            .page
+            .cmp(&second.page)
+            .then(second.y.total_cmp(&first.y))
+            .then(first.x.total_cmp(&second.x))
+    });
+    items
 }
 
 impl PageRenderer for PdfiumRenderer {
