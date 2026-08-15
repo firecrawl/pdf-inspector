@@ -279,9 +279,10 @@ fn fuse_ocr_pages_impl(
                     document_page_count,
                 );
                 let ocr_markdown = preserve_ocr_line_breaks(&ocr_markdown, local);
-                let (markdown, source) = if let Some(candidate) = native_candidates
-                    .get(&page_number)
-                    .filter(|_| native.needs_ocr)
+                let (markdown, source, adaptive_recommends_hosted) = if let Some(candidate) =
+                    native_candidates
+                        .get(&page_number)
+                        .filter(|_| native.needs_ocr)
                 {
                     let choice = choose_adaptive_content(
                         candidate,
@@ -290,17 +291,19 @@ fn fuse_ocr_pages_impl(
                         options.hosted_recommendation_confidence,
                     );
                     warnings.push(choice.warning);
-                    (choice.markdown, choice.source)
+                    (choice.markdown, choice.source, choice.recommend_hosted)
                 } else if native.markdown.trim().is_empty() || native.needs_ocr {
-                    (ocr_markdown, PageContentSource::Ocr)
+                    (ocr_markdown, PageContentSource::Ocr, false)
                 } else {
-                    merge_native_and_ocr(&native.markdown, &ocr_markdown)
+                    let (markdown, source) = merge_native_and_ocr(&native.markdown, &ocr_markdown);
+                    (markdown, source, false)
                 };
                 let weak_ocr = local
                     .ocr
                     .mean_confidence
                     .is_none_or(|confidence| confidence < options.hosted_recommendation_confidence);
-                let recommend_hosted = native.needs_ocr && (markdown.trim().is_empty() || weak_ocr);
+                let recommend_hosted = native.needs_ocr
+                    && (markdown.trim().is_empty() || weak_ocr || adaptive_recommends_hosted);
                 if native.needs_ocr && markdown.trim().is_empty() {
                     warnings.push("OCR produced no usable text".to_string());
                 }
@@ -361,6 +364,7 @@ struct AdaptiveContentChoice {
     markdown: String,
     source: PageContentSource,
     warning: String,
+    recommend_hosted: bool,
 }
 
 fn choose_adaptive_content(
@@ -379,6 +383,7 @@ fn choose_adaptive_content(
                 "kept trustworthy {} because OCR was weak or unusable",
                 native.origin.description()
             ),
+            recommend_hosted: true,
         };
     }
 
@@ -388,7 +393,7 @@ fn choose_adaptive_content(
         .alphanumeric_chars
         .saturating_sub(overlap.shared_chars);
     let material_novelty =
-        ocr_novel_chars >= 12 && ocr_novel_chars * 8 >= ocr_quality.alphanumeric_chars.max(1);
+        ocr_novel_chars >= 2 && ocr_novel_chars * 8 >= ocr_quality.alphanumeric_chars.max(1);
     let native_substantially_covered =
         overlap.shared_chars * 4 >= native.quality.alphanumeric_chars.max(1) * 3;
 
@@ -400,6 +405,7 @@ fn choose_adaptive_content(
                 "kept trustworthy {} because OCR added no material coverage",
                 native.origin.description()
             ),
+            recommend_hosted: false,
         };
     }
 
@@ -416,6 +422,7 @@ fn choose_adaptive_content(
                 "kept higher-quality {} after comparing OCR",
                 native.origin.description()
             ),
+            recommend_hosted: false,
         };
     }
 
@@ -435,6 +442,7 @@ fn choose_adaptive_content(
         markdown,
         source,
         warning,
+        recommend_hosted: false,
     }
 }
 
@@ -1238,6 +1246,45 @@ mod tests {
         assert!(!result.pages[0].provenance.hosted_recommended);
         assert_eq!(result.pages[0].markdown.matches("Invoice").count(), 1);
         assert!(result.pages[0].provenance.warnings[0].contains("no material coverage"));
+    }
+
+    #[test]
+    fn adaptive_fallback_fuses_short_novel_ocr_content() {
+        let native = [native(0, "", true)];
+        let run = run(vec![routed_page(
+            1,
+            vec![span("Status ready 42", 10.0, 0.98)],
+            Some(0.98),
+        )]);
+        let candidates = BTreeMap::from([(1, native_candidate("Status ready\n"))]);
+
+        let result =
+            fuse_ocr_pages_adaptive(&native, &run, 1, &OcrFusionOptions::new(), &candidates)
+                .unwrap();
+
+        assert_eq!(result.pages[0].provenance.source, PageContentSource::Fused);
+        assert!(result.pages[0].markdown.contains("42"));
+        assert!(!result.pages[0].provenance.hosted_recommended);
+    }
+
+    #[test]
+    fn adaptive_fallback_recommends_hosted_for_high_confidence_garbage_ocr() {
+        let native = [native(0, "", true)];
+        let garbage = "a@@b%%c&&d==e~~".repeat(12);
+        let run = run(vec![routed_page(
+            1,
+            vec![span(&garbage, 10.0, 0.99)],
+            Some(0.99),
+        )]);
+        let candidates = BTreeMap::from([(1, native_candidate("Invoice total 420\n"))]);
+
+        let result =
+            fuse_ocr_pages_adaptive(&native, &run, 1, &OcrFusionOptions::new(), &candidates)
+                .unwrap();
+
+        assert_eq!(result.pages[0].provenance.source, PageContentSource::Native);
+        assert!(result.pages[0].provenance.hosted_recommended);
+        assert!(!result.pages[0].markdown.contains("@@"));
     }
 
     #[test]
