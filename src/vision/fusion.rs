@@ -102,12 +102,13 @@ pub fn ocr_page_to_markdown(
     options: &MarkdownOptions,
 ) -> String {
     let (items, _) = ocr_text_items(page);
-    to_markdown_from_items_with_rects_and_page_count(
+    let markdown = to_markdown_from_items_with_rects_and_page_count(
         items,
         options.clone(),
         &[],
         document_page_count,
-    )
+    );
+    preserve_ocr_line_breaks(&markdown, page)
 }
 
 /// Fuses a selective OCR run into per-page native Markdown.
@@ -176,6 +177,7 @@ pub fn fuse_ocr_pages(
                     &[],
                     document_page_count,
                 );
+                let ocr_markdown = preserve_ocr_line_breaks(&ocr_markdown, local);
                 let (markdown, source) = if native.markdown.trim().is_empty() || native.needs_ocr {
                     (ocr_markdown, PageContentSource::Ocr)
                 } else {
@@ -327,6 +329,85 @@ fn image_quad_bounds(
         .fold(f32::NEG_INFINITY, f32::max)
         .clamp(0.0, height as f32);
     (right > left && bottom > top).then_some((left, top, right, bottom))
+}
+
+fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
+    if markdown.lines().any(is_markdown_table_separator) {
+        return markdown.to_string();
+    }
+
+    let mut spans: Vec<(&str, f32, f32, f32)> = page
+        .ocr
+        .spans
+        .iter()
+        .filter_map(|span| {
+            let (left, top, _, bottom) = image_quad_bounds(
+                &span.polygon.points,
+                page.rendered.width(),
+                page.rendered.height(),
+            )?;
+            (!span.text.trim().is_empty()).then_some((span.text.trim(), top, bottom, left))
+        })
+        .collect();
+    spans.sort_by(|first, second| {
+        first
+            .1
+            .total_cmp(&second.1)
+            .then(first.3.total_cmp(&second.3))
+    });
+    if spans.len() < 2 {
+        return markdown.to_string();
+    }
+
+    let mut line_heights: Vec<f32> = spans
+        .iter()
+        .map(|(_, top, bottom, _)| bottom - top)
+        .filter(|height| height.is_finite() && *height > 0.0)
+        .collect();
+    if line_heights.is_empty() {
+        return markdown.to_string();
+    }
+    line_heights.sort_by(f32::total_cmp);
+    let median_height = line_heights[line_heights.len() / 2];
+    let separate: Vec<bool> = spans
+        .windows(2)
+        .map(|pair| pair[1].1 - pair[0].2 >= median_height * 0.65)
+        .collect();
+    if !separate.iter().any(|value| *value) {
+        return markdown.to_string();
+    }
+
+    let mut output = markdown.to_string();
+    let mut search_from = 0usize;
+    for (index, (span_text, _, _, _)) in spans.iter().enumerate() {
+        let Some(relative) = output[search_from..].find(span_text) else {
+            continue;
+        };
+        let end = search_from + relative + span_text.len();
+        if separate.get(index).copied().unwrap_or(false) {
+            let suffix = &output[end..];
+            let whitespace_len = suffix
+                .char_indices()
+                .take_while(|(_, character)| character.is_whitespace())
+                .last()
+                .map_or(0, |(offset, character)| offset + character.len_utf8());
+            output.replace_range(end..end + whitespace_len, "\n\n");
+            search_from = end + 2;
+        } else {
+            search_from = end;
+        }
+    }
+    output
+}
+
+fn is_markdown_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|')
+        && trimmed.ends_with('|')
+        && trimmed
+            .split('|')
+            .filter(|cell| !cell.is_empty())
+            .all(|cell| !cell.is_empty() && cell.chars().all(|character| character == '-'))
 }
 
 fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) {
@@ -638,6 +719,20 @@ mod tests {
         }
     }
 
+    fn positioned_span(text: &str, left: f32, top: f32, right: f32, bottom: f32) -> OcrSpan {
+        OcrSpan {
+            text: text.to_string(),
+            polygon: ImageQuad::new([
+                ImagePoint::new(left, top),
+                ImagePoint::new(right, top),
+                ImagePoint::new(right, bottom),
+                ImagePoint::new(left, bottom),
+            ]),
+            confidence: 0.9,
+            orientation_degrees: None,
+        }
+    }
+
     fn run(pages: Vec<RoutedOcrPage>) -> OcrRun {
         OcrRun {
             pages,
@@ -672,6 +767,24 @@ mod tests {
             "test-ocr"
         );
         assert!(!result.pages[0].provenance.hosted_recommended);
+    }
+
+    #[test]
+    fn ocr_assembly_preserves_well_separated_detected_rows() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("Column A Column B", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("First row value", 10.0, 35.0, 190.0, 45.0),
+                positioned_span("Second row value", 10.0, 60.0, 190.0, 70.0),
+            ],
+            Some(0.9),
+        );
+
+        let markdown = ocr_page_to_markdown(&page, 1, &MarkdownOptions::default());
+
+        assert!(markdown.contains("Column A Column B\n\n"), "{markdown:?}");
+        assert!(markdown.contains("First row value\n\n"), "{markdown:?}");
     }
 
     #[test]
