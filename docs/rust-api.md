@@ -121,7 +121,7 @@ let result = process_pdf_mem(&bytes)?;
 
 The `render-pdfium` feature adds a native-only page renderer backed by
 [`firecrawl-pdfium`](https://crates.io/crates/firecrawl-pdfium). It is the
-rendering boundary for local OCR pipelines; enabling it does not include an OCR
+rendering boundary for OCR pipelines; enabling it does not include an OCR
 model or change the existing extraction functions.
 
 ```toml

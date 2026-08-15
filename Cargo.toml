@@ -49,7 +49,7 @@ ttf-parser = "0.25"
 lopdf = { version = "0.42.0", features = ["rayon"] }
 rayon = "1.10"
 env_logger = "0.11"
-# Optional native page rendering for local OCR pipelines. PDFium is loaded at
+# Optional native page rendering for OCR pipelines. PDFium is loaded at
 # runtime, so enabling this feature does not link or download a native library.
 firecrawl-pdfium = { version = "0.1.0", optional = true }
 
