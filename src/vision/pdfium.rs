@@ -71,6 +71,8 @@ pub struct PdfiumRenderer {
 #[derive(Debug)]
 pub(crate) struct PdfiumTextPage {
     pub(crate) page: u32,
+    pub(crate) page_width: f32,
+    pub(crate) page_height: f32,
     pub(crate) items: Vec<TextItem>,
 }
 
@@ -139,6 +141,7 @@ impl PdfiumRenderer {
         let mut recovered = Vec::with_capacity(pages.len());
         for &page_number in pages {
             let page = document.page(page_number as usize - 1)?;
+            let page_size = page.size();
             let text = match page.text_with_limit(MAX_TEXT_CHARS_PER_PAGE) {
                 Ok(text) => text,
                 Err(error) => {
@@ -150,6 +153,8 @@ impl PdfiumRenderer {
             };
             recovered.push(PdfiumTextPage {
                 page: page_number,
+                page_width: page_size.width,
+                page_height: page_size.height,
                 items: text_chars_to_items(text.chars(), page_number),
             });
         }
@@ -220,14 +225,22 @@ fn text_chars_to_items(chars: &[PageChar], page: u32) -> Vec<TextItem> {
         }
         let width = (bounds.right - bounds.left) as f32;
         let height = (bounds.top - bounds.bottom) as f32;
-        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        let x = bounds.left as f32;
+        let y = bounds.bottom as f32;
+        if !x.is_finite()
+            || !y.is_finite()
+            || !width.is_finite()
+            || !height.is_finite()
+            || width <= 0.0
+            || height <= 0.0
+        {
             text.clear();
             return;
         }
         items.push(TextItem {
             text: std::mem::take(text),
-            x: bounds.left as f32,
-            y: bounds.bottom as f32,
+            x,
+            y,
             width,
             height,
             font: "PDFium native text".to_string(),
@@ -263,6 +276,7 @@ fn text_chars_to_items(chars: &[PageChar], page: u32) -> Vec<TextItem> {
             || rect.width() <= 0.0
             || rect.height() <= 0.0
         {
+            flush(&mut items, &mut text, &mut bounds, page);
             continue;
         }
         text.push(value);
@@ -384,6 +398,17 @@ fn bgr_to_rgb_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use firecrawl_pdfium::{PagePoint, PageRect};
+
+    fn page_char(value: char, bounds: PageRect) -> PageChar {
+        PageChar {
+            unicode: Some(value),
+            code: value as u32,
+            bounds,
+            loose_bounds: bounds,
+            origin: PagePoint::new(bounds.left, bounds.bottom),
+        }
+    }
 
     #[test]
     fn bgr_pixels_are_converted_to_rgb_in_place() {
@@ -409,5 +434,35 @@ mod tests {
             bgr_to_rgb_in_place(&mut [0; 5], 1, 2, 3),
             Err(RenderBufferError::InvalidBufferLength { .. })
         ));
+    }
+
+    #[test]
+    fn invalid_character_geometry_splits_text_runs() {
+        let chars = [
+            page_char('A', PageRect::new(0.0, 0.0, 8.0, 10.0)),
+            page_char('X', PageRect::new(10.0, 0.0, 10.0, 10.0)),
+            page_char('B', PageRect::new(20.0, 0.0, 28.0, 10.0)),
+        ];
+
+        let items = text_chars_to_items(&chars, 1);
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+    }
+
+    #[test]
+    fn coordinates_that_overflow_f32_are_discarded() {
+        let left = f64::from(f32::MAX) * 2.0;
+        let chars = [page_char(
+            'A',
+            PageRect::new(left, 0.0, left + 1.0e30, 10.0),
+        )];
+
+        assert!(text_chars_to_items(&chars, 1).is_empty());
     }
 }

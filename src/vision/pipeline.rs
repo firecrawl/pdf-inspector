@@ -16,6 +16,7 @@ use crate::{
 };
 
 use super::oar::onnx_runtime_library_path;
+use super::pdfium::PdfiumTextPage;
 use super::{
     fuse_ocr_pages, route_ocr_pages, run_ocr_pages, FusedPageMarkdown, HttpModelDownloadError,
     HttpModelDownloader, ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError,
@@ -255,7 +256,7 @@ pub fn process_pdf_with_ocr_mem(
                 else {
                     continue;
                 };
-                if !is_complete_native_recovery(&markdown) {
+                if !is_complete_native_recovery(&markdown) || !native_recovery_covers_page(&page) {
                     continue;
                 }
                 let Some(native_page) = native
@@ -444,16 +445,12 @@ fn credible_native_recovery(
     document_page_count: u32,
     options: &MarkdownOptions,
 ) -> Option<String> {
-    let quality = analyze_text_quality(items);
-    if quality.has_encoding_issues {
-        return None;
-    }
     let text = items
         .iter()
         .map(|item| item.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    if is_garbage_text(&text) || is_cid_garbage(&text) || detect_encoding_issues(&text) {
+    if is_garbage_text(&text) || is_cid_garbage(&text) {
         return None;
     }
 
@@ -464,6 +461,11 @@ fn credible_native_recovery(
         document_page_count,
     );
     let markdown = remove_duplicate_table_lines(&markdown);
+    let structured_uniform_ascii = is_uniform_case_structured_ascii(&text, &markdown);
+    let quality = analyze_text_quality(items);
+    if !structured_uniform_ascii && (quality.has_encoding_issues || detect_encoding_issues(&text)) {
+        return None;
+    }
     (!markdown.trim().is_empty()).then_some(markdown)
 }
 
@@ -492,6 +494,124 @@ fn is_complete_native_recovery(markdown: &str) -> bool {
     score >= 0.68
 }
 
+fn native_recovery_covers_page(page: &PdfiumTextPage) -> bool {
+    const VERTICAL_BANDS: f32 = 6.0;
+
+    let width = page.page_width;
+    let height = page.page_height;
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return false;
+    }
+
+    let mut min_left = width;
+    let mut max_right = 0.0_f32;
+    let mut min_bottom = height;
+    let mut max_top = 0.0_f32;
+    let mut positioned_items = 0usize;
+    let mut occupied_bands = BTreeSet::new();
+    for item in &page.items {
+        if !item.text.chars().any(char::is_alphanumeric)
+            || !item.x.is_finite()
+            || !item.y.is_finite()
+            || !item.width.is_finite()
+            || !item.height.is_finite()
+            || item.width <= 0.0
+            || item.height <= 0.0
+        {
+            continue;
+        }
+        let left = item.x.clamp(0.0, width);
+        let right = (item.x + item.width).clamp(0.0, width);
+        let bottom = item.y.clamp(0.0, height);
+        let top = (item.y + item.height).clamp(0.0, height);
+        if right <= left || top <= bottom {
+            continue;
+        }
+
+        positioned_items += 1;
+        min_left = min_left.min(left);
+        max_right = max_right.max(right);
+        min_bottom = min_bottom.min(bottom);
+        max_top = max_top.max(top);
+        let center = (bottom + top) * 0.5;
+        let band = ((center / height) * VERTICAL_BANDS)
+            .floor()
+            .clamp(0.0, VERTICAL_BANDS - 1.0) as u8;
+        occupied_bands.insert(band);
+    }
+
+    positioned_items >= 6
+        && (max_right - min_left) / width >= 0.15
+        && (max_top - min_bottom) / height >= 0.35
+        && occupied_bands.len() >= 3
+}
+
+fn is_uniform_case_structured_ascii(text: &str, markdown: &str) -> bool {
+    if !text.is_ascii() || text.contains('$') || text.chars().any(char::is_control) {
+        return false;
+    }
+
+    let letters: Vec<_> = text
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .collect();
+    if letters.len() < 200 {
+        return false;
+    }
+    let uniform_case = letters
+        .iter()
+        .all(|character| character.is_ascii_uppercase())
+        || letters
+            .iter()
+            .all(|character| character.is_ascii_lowercase());
+    if !uniform_case {
+        return false;
+    }
+    if markdown_has_table(markdown) {
+        return true;
+    }
+
+    let nonempty_lines = markdown
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let visible_chars = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
+        .max(1);
+    let structural_chars = text
+        .chars()
+        .filter(|character| {
+            character.is_ascii_digit()
+                || matches!(
+                    character,
+                    '{' | '}'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
+                        | '<'
+                        | '>'
+                        | '_'
+                        | '='
+                        | '+'
+                        | '*'
+                        | '/'
+                        | '\\'
+                        | '|'
+                        | '&'
+                        | '^'
+                        | '%'
+                        | '#'
+                        | '@'
+                        | '~'
+                )
+        })
+        .count();
+    nonempty_lines >= 4 && structural_chars * 20 >= visible_chars
+}
+
 fn markdown_has_table(markdown: &str) -> bool {
     markdown.lines().any(|line| {
         let trimmed = line.trim();
@@ -505,28 +625,28 @@ fn markdown_has_table(markdown: &str) -> bool {
 }
 
 fn remove_duplicate_table_lines(markdown: &str) -> String {
-    let table_rows: BTreeSet<String> = markdown
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            (trimmed.starts_with('|')
-                && trimmed.ends_with('|')
-                && !trimmed.contains("|---")
-                && trimmed.matches('|').count() >= 4)
-                .then(|| canonical_table_text(trimmed))
-        })
-        .filter(|line| !line.is_empty())
-        .collect();
-    if table_rows.is_empty() {
-        return markdown.to_string();
-    }
-
     let mut output = String::new();
+    let mut adjacent_table_row = None;
     for line in markdown.lines() {
         let trimmed = line.trim();
         let is_table_line = trimmed.starts_with('|') && trimmed.ends_with('|');
-        if !is_table_line && table_rows.contains(&canonical_table_text(trimmed)) {
-            continue;
+        if is_table_line {
+            if !trimmed.contains("|---") && trimmed.matches('|').count() >= 4 {
+                let canonical = canonical_table_text(trimmed);
+                if !canonical.is_empty() {
+                    adjacent_table_row = Some(canonical);
+                }
+            }
+        } else if trimmed.is_empty() {
+            // Keep adjacency across the blank line emitted after a table.
+        } else {
+            let duplicate = adjacent_table_row
+                .as_ref()
+                .is_some_and(|table_row| *table_row == canonical_table_text(trimmed));
+            adjacent_table_row = None;
+            if duplicate {
+                continue;
+            }
         }
         output.push_str(line);
         output.push('\n');
@@ -611,6 +731,25 @@ pub enum OcrPipelineError {
 mod tests {
     use super::*;
 
+    fn recovery_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> crate::TextItem {
+        crate::TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height,
+            font: "PDFium native text".to_string(),
+            font_size: height,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: crate::types::ItemType::Text,
+            mcid: None,
+        }
+    }
+
     #[test]
     fn cache_path_is_stable_when_a_relative_directory_is_created() {
         let current = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
@@ -655,6 +794,54 @@ mod tests {
     }
 
     #[test]
+    fn native_recovery_requires_text_coverage_beyond_a_header() {
+        let header = PdfiumTextPage {
+            page: 1,
+            page_width: 600.0,
+            page_height: 800.0,
+            items: (0..8)
+                .map(|index| recovery_item("HEADER", index as f32 * 60.0, 740.0, 50.0, 12.0))
+                .collect(),
+        };
+        assert!(!native_recovery_covers_page(&header));
+
+        let complete = PdfiumTextPage {
+            page: 1,
+            page_width: 600.0,
+            page_height: 800.0,
+            items: vec![
+                recovery_item("Top one", 40.0, 700.0, 180.0, 12.0),
+                recovery_item("Top two", 260.0, 680.0, 180.0, 12.0),
+                recovery_item("Middle one", 40.0, 400.0, 180.0, 12.0),
+                recovery_item("Middle two", 260.0, 380.0, 180.0, 12.0),
+                recovery_item("Bottom one", 40.0, 100.0, 180.0, 12.0),
+                recovery_item("Bottom two", 260.0, 80.0, 180.0, 12.0),
+            ],
+        };
+        assert!(native_recovery_covers_page(&complete));
+    }
+
+    #[test]
+    fn uniform_case_guard_requires_structured_content() {
+        let table_text = "STATUS CODE 100 READY ".repeat(20);
+        let table_markdown = "|STATUS|CODE|\n|---|---|\n|READY|100|\n|READY|200|\n|READY|300|\n";
+        assert!(is_uniform_case_structured_ascii(
+            &table_text,
+            table_markdown
+        ));
+
+        let prose = "THIS IS ORDINARY UPPERCASE PROSE WITH NATURAL WORDS ".repeat(20);
+        let prose_markdown = prose
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .chunks(8)
+            .map(|line| line.join(" "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!is_uniform_case_structured_ascii(&prose, &prose_markdown));
+    }
+
+    #[test]
     fn recovered_markdown_drops_plain_duplicates_of_table_rows() {
         let markdown = "|Date|Value|Status|\n|---|---|---|\n|April 1|42|ok|\n\nApril 1 42 ok\n";
 
@@ -662,6 +849,13 @@ mod tests {
             remove_duplicate_table_lines(markdown),
             "|Date|Value|Status|\n|---|---|---|\n|April 1|42|ok|\n\n"
         );
+    }
+
+    #[test]
+    fn recovered_markdown_keeps_nonadjacent_repeated_table_text() {
+        let markdown = "|Date|Value|Status|\n|---|---|---|\n|April 1|42|ok|\n\nSummary follows.\n\nApril 1 42 ok\n";
+
+        assert_eq!(remove_duplicate_table_lines(markdown), markdown);
     }
 
     #[test]

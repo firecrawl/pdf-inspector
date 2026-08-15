@@ -382,9 +382,10 @@ returns an explicit unsupported error in this lightweight pipeline.
 
 In `Auto`, pages routed only for suspicious font encoding or vectorized text
 first get a bounded positioned-text probe through PDFium. A credible recovered
-text layer skips rasterization and model loading for that page; garbled or
-insubstantial recovery continues through OCR. Recovered tables are reflected
-in the same document metadata as tables found by the primary extractor.
+text layer with sufficient geometric page coverage skips rasterization and
+model loading for that page; garbled, partial, or insubstantial recovery
+continues through OCR. Recovered tables are reflected in the same document
+metadata as tables found by the primary extractor.
 
 The one-call API keeps the most recently used verified OCR engine in process.
 Long-lived workers therefore verify the pinned artifacts and build the ONNX
