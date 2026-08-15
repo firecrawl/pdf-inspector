@@ -45,7 +45,7 @@ pub use render::{
 };
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use routing::{
-    route_ocr_pages, run_ocr_pages, LocalOcrPage, LocalOcrRun, OcrRoutingError, OcrRunError,
+    route_ocr_pages, run_ocr_pages, OcrRoutingError, OcrRun, OcrRunError, RoutedOcrPage,
 };
 
 #[cfg(all(feature = "render-pdfium", not(target_arch = "wasm32")))]

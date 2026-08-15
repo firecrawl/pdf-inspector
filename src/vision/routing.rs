@@ -10,25 +10,25 @@ use super::{OcrEngine, OcrMode, OcrOptions, OcrPage, PageRenderer, RenderOptions
 
 /// A rendered page paired with OCR output in the same bitmap coordinate space.
 #[derive(Debug)]
-pub struct LocalOcrPage {
+pub struct RoutedOcrPage {
     /// Renderer-owned bitmap and pixel↔PDF transform.
     pub rendered: RenderedPage,
     /// Positioned OCR spans for the bitmap.
     pub ocr: OcrPage,
 }
 
-/// Output of one selective local OCR invocation.
+/// Output of one selective OCR invocation.
 #[derive(Debug)]
-pub struct LocalOcrRun {
+pub struct OcrRun {
     /// Pages processed in ascending document order.
-    pub pages: Vec<LocalOcrPage>,
+    pub pages: Vec<RoutedOcrPage>,
     /// Total page-rendering wall time.
     pub render_time_ms: u64,
     /// Total engine wall time.
     pub ocr_time_ms: u64,
 }
 
-/// Selects 1-indexed pages for local OCR.
+/// Selects 1-indexed pages for OCR.
 ///
 /// `recommended_pages` comes from pdf-inspector's existing detector/text
 /// quality signals. `selected_pages` is an optional user page filter. Results
@@ -73,13 +73,13 @@ pub fn run_ocr_pages<R, O>(
     password: Option<&str>,
     render_options: &RenderOptions,
     ocr_options: &OcrOptions,
-) -> Result<LocalOcrRun, OcrRunError>
+) -> Result<OcrRun, OcrRunError>
 where
     R: PageRenderer,
     O: OcrEngine,
 {
     if pages.is_empty() {
-        return Ok(LocalOcrRun {
+        return Ok(OcrRun {
             pages: Vec::new(),
             render_time_ms: 0,
             ocr_time_ms: 0,
@@ -108,11 +108,11 @@ where
     let ocr_time_ms = elapsed_ms(ocr_started);
     validate_page_order("OCR engine", pages, recognized.iter().map(|page| page.page))?;
 
-    Ok(LocalOcrRun {
+    Ok(OcrRun {
         pages: rendered
             .into_iter()
             .zip(recognized)
-            .map(|(rendered, ocr)| LocalOcrPage { rendered, ocr })
+            .map(|(rendered, ocr)| RoutedOcrPage { rendered, ocr })
             .collect(),
         render_time_ms,
         ocr_time_ms,
