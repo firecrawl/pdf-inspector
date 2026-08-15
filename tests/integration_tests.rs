@@ -4399,3 +4399,27 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         page.markdown
     );
 }
+
+/// Regression fixture from jsoma/natural-pdf at commit
+/// 99593235bb2f75467ae5bb90e6e478f00840caa7 (`pdfs/24640152.pdf`),
+/// SHA-256 cedb9872a06143f275fd88647cd9aa988299d686bead0b43a747b557f9e9bae4.
+/// Each page is rotated 270 degrees and displays one page-sized scan. On the
+/// current extractor, pages 9, 11, and 12 are the remaining pages whose
+/// non-empty text items are all narrower than 2pt.
+#[test]
+fn test_extract_pages_markdown_ocrs_scan_backed_without_substantial_text() {
+    let buf = std::fs::read("tests/fixtures/natural-24640152.pdf").unwrap();
+
+    let ext = extract_pages_markdown_mem(&buf, None).expect("fixture should extract");
+
+    assert_eq!(ext.pages_needing_ocr, vec![9, 11, 12]);
+    for page in [9, 11, 12] {
+        let extracted = &ext.pages[(page - 1) as usize];
+        assert!(extracted.needs_ocr, "page {page} must be routed to OCR");
+        assert_eq!(extracted.ocr_reason.as_deref(), Some("scanned"));
+        assert!(
+            extracted.markdown.is_empty(),
+            "unreliable native text must not be published for page {page}"
+        );
+    }
+}

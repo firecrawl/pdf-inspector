@@ -436,6 +436,55 @@ pub struct PagesExtractionResult {
     pub is_complex: bool,
 }
 
+const SCAN_BACKED_IMAGE_COVERAGE_THRESHOLD: f32 = 0.80;
+const SUBSTANTIAL_TEXT_WIDTH_THRESHOLD: f32 = 2.0;
+
+fn page_has_scan_backed_no_substantial_text(
+    page_items: &[TextItem],
+    page_box: (f32, f32, f32, f32),
+) -> bool {
+    if page_items.iter().any(|item| {
+        matches!(item.item_type, types::ItemType::Text)
+            && !item.text.trim().is_empty()
+            && item.width.is_finite()
+            && item.width >= SUBSTANTIAL_TEXT_WIDTH_THRESHOLD
+    }) {
+        return false;
+    }
+
+    let (page_x0, page_y0, page_x1, page_y1) = page_box;
+    let page_width = page_x1 - page_x0;
+    let page_height = page_y1 - page_y0;
+    let page_area = page_width * page_height;
+    if !page_area.is_finite() || page_area <= 0.0 {
+        return false;
+    }
+
+    page_items.iter().any(|item| {
+        if !matches!(item.item_type, types::ItemType::Image) {
+            return false;
+        }
+
+        let image_x1 = item.x + item.width;
+        let image_y1 = item.y + item.height;
+        if ![item.x, item.y, image_x1, image_y1]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return false;
+        }
+
+        let image_x0 = item.x.min(image_x1);
+        let image_y0 = item.y.min(image_y1);
+        let image_x1 = item.x.max(image_x1);
+        let image_y1 = item.y.max(image_y1);
+        let visible_width = (image_x1.min(page_x1) - image_x0.max(page_x0)).max(0.0);
+        let visible_height = (image_y1.min(page_y1) - image_y0.max(page_y0)).max(0.0);
+
+        visible_width * visible_height / page_area >= SCAN_BACKED_IMAGE_COVERAGE_THRESHOLD
+    })
+}
+
 /// Extract formatted markdown for pages of a PDF, with layout
 /// classification metadata.
 ///
@@ -568,6 +617,12 @@ pub fn extract_pages_markdown_mem(
             .get(&page_1idx)
             .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
             .unwrap_or((false, false));
+        let has_scan_backed_no_substantial_text = lopdf_pages
+            .get(&page_1idx)
+            .and_then(|&page_id| extractor::get_page_box(&doc, page_id))
+            .is_some_and(|page_box| {
+                page_has_scan_backed_no_substantial_text(&page_items, page_box)
+            });
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -606,7 +661,7 @@ pub fn extract_pages_markdown_mem(
                 OCR_REASON_SUSPECTED_GARBLED_TEXT,
             );
         }
-        if has_template_image {
+        if has_template_image || has_scan_backed_no_substantial_text {
             add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_SCANNED);
         }
         if has_vector_text {
@@ -619,6 +674,7 @@ pub fn extract_pages_markdown_mem(
             || has_gid
             || is_garbage_text(&md)
             || has_template_image
+            || has_scan_backed_no_substantial_text
             || has_vector_text;
 
         if needs_ocr {
@@ -6268,6 +6324,64 @@ mod tests {
             page,
             ..test_item(text, 10.0, 10.0, text.len() as f32 * 5.0, 12.0)
         }
+    }
+
+    fn test_image_item(x: f32, y: f32, width: f32, height: f32) -> TextItem {
+        TextItem {
+            text: "[Image: scan]".to_string(),
+            x,
+            y,
+            width,
+            height,
+            font: String::new(),
+            font_size: 0.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Image,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn scan_backed_page_without_substantial_text_needs_ocr() {
+        let items = vec![
+            test_image_item(-10.0, 0.0, 90.0, 100.0),
+            test_item("broken layer", 10.0, 10.0, 0.0, 12.0),
+        ];
+
+        assert!(page_has_scan_backed_no_substantial_text(
+            &items,
+            (0.0, 0.0, 100.0, 100.0)
+        ));
+    }
+
+    #[test]
+    fn scan_backed_page_with_two_point_text_stays_native() {
+        let items = vec![
+            test_image_item(0.0, 0.0, 100.0, 100.0),
+            test_item("real text", 10.0, 10.0, 2.0, 12.0),
+        ];
+
+        assert!(!page_has_scan_backed_no_substantial_text(
+            &items,
+            (0.0, 0.0, 100.0, 100.0)
+        ));
+    }
+
+    #[test]
+    fn small_page_image_does_not_trigger_scan_backed_ocr() {
+        let items = vec![
+            test_image_item(0.0, 0.0, 79.0, 100.0),
+            test_item("broken layer", 10.0, 10.0, 0.0, 12.0),
+        ];
+
+        assert!(!page_has_scan_backed_no_substantial_text(
+            &items,
+            (0.0, 0.0, 100.0, 100.0)
+        ));
     }
 
     #[test]
