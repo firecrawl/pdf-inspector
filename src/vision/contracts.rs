@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::{RenderOptions, RenderedPage};
 
-/// Selects when local OCR may run.
+/// Selects when OCR may run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OcrMode {
@@ -18,7 +18,7 @@ pub enum OcrMode {
     Force,
 }
 
-/// Resource/quality profile for the local OCR engine.
+/// Resource/quality profile for the OCR engine.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OcrProfile {
@@ -27,7 +27,7 @@ pub enum OcrProfile {
     /// OCR-oriented balance of quality and CPU cost.
     #[default]
     Balanced,
-    /// Highest local quality within the lightweight model family.
+    /// Highest quality within the lightweight model family.
     Quality,
 }
 
@@ -160,42 +160,6 @@ impl LayoutOptions {
     /// Uses an explicit layout model directory.
     pub fn model_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.model_directory = Some(directory.into());
-        self
-    }
-}
-
-/// Complete opt-in local extraction configuration.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LocalOptions {
-    /// Page rasterization configuration.
-    pub render: RenderOptions,
-    /// OCR routing and engine configuration.
-    pub ocr: OcrOptions,
-    /// Optional learned layout configuration.
-    pub layout: LayoutOptions,
-}
-
-impl LocalOptions {
-    /// Creates options with OCR and learned layout disabled.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Replaces rasterization options.
-    pub fn render(mut self, options: RenderOptions) -> Self {
-        self.render = options;
-        self
-    }
-
-    /// Replaces OCR options.
-    pub fn ocr(mut self, options: OcrOptions) -> Self {
-        self.ocr = options;
-        self
-    }
-
-    /// Replaces learned layout options.
-    pub fn layout(mut self, options: LayoutOptions) -> Self {
-        self.layout = options;
         self
     }
 }
@@ -429,11 +393,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_defaults_never_enable_ocr_or_learned_layout() {
-        let options = LocalOptions::default();
-        assert_eq!(options.ocr.mode, OcrMode::Off);
-        assert!(!options.layout.enabled);
-        assert_eq!(options.render.dpi, 150.0);
+    fn ocr_defaults_never_enable_recognition() {
+        let options = OcrOptions::default();
+        assert_eq!(options.mode, OcrMode::Off);
     }
 
     #[test]

@@ -73,9 +73,9 @@ tempfile = "3.3"
 [features]
 default = []
 python = ["pyo3"]
-local-vision = []
-model-cache = ["local-vision", "dep:dirs", "dep:fs2", "dep:sha2", "dep:windows-sys"]
-render-pdfium = ["local-vision", "dep:firecrawl-pdfium"]
+vision = []
+model-cache = ["vision", "dep:dirs", "dep:fs2", "dep:sha2", "dep:windows-sys"]
+render-pdfium = ["vision", "dep:firecrawl-pdfium"]
 
 [[bin]]
 name = "pdf2md"

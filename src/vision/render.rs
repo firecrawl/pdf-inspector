@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::PdfRect;
 
-/// Default rendering resolution for local OCR.
+/// Default rendering resolution for OCR.
 pub const DEFAULT_RENDER_DPI: f32 = 150.0;
 
 /// Default maximum size of one rendered page: 256 MiB.
@@ -15,7 +15,7 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
 #[non_exhaustive]
 pub enum RenderPixelFormat {
     /// Three bytes per pixel in red, green, blue order. This is the default
-    /// because local OCR preprocessors conventionally consume RGB images.
+    /// because OCR preprocessors conventionally consume RGB images.
     #[default]
     Rgb8,
     /// Four bytes per pixel in red, green, blue, alpha order.

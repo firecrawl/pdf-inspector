@@ -117,25 +117,25 @@ let bytes = std::fs::read("document.pdf")?;
 let result = process_pdf_mem(&bytes)?;
 ```
 
-### Local vision extension contracts
+### Vision extension contracts
 
-The native-only `local-vision` feature exposes the stable seam used by local
-OCR integrations without selecting or embedding an inference runtime. The
+The native-only `vision` feature exposes the stable seam used by OCR
+integrations without selecting or embedding an inference runtime. The
 separate `model-cache` feature adds pinned artifact management:
 
 - `PageRenderer`, `OcrEngine`, and `LayoutEngine` traits;
 - renderer-neutral owned page buffers and affine pixel↔PDF transforms;
-- `LocalOptions`, `OcrOptions`, and opt-in `Off`/`Auto`/`Force` routing modes;
+- `OcrOptions` and opt-in `Off`/`Auto`/`Force` routing modes;
 - positioned OCR/layout results and per-page provenance types; and
 - a versioned PP-OCRv6 Small manifest with checksum-verified, locked, atomic
   model-cache installation and explicit offline-directory overrides.
 
 ```toml
 [dependencies]
-pdf-inspector = { version = "1", features = ["local-vision", "model-cache"] }
+pdf-inspector = { version = "1", features = ["vision", "model-cache"] }
 ```
 
-All local options preserve existing behavior by default: OCR is `Off`, learned
+The OCR contracts preserve existing behavior by default: OCR is `Off`, learned
 layout is disabled, and model resolution is never reached. `ModelStore` itself
 does not access the network; a runtime integration can fetch a manifest's
 canonical URL only when allowed and pass the stream to `ModelStore::install`.
@@ -162,7 +162,7 @@ println!("using {} at {}", models.manifest_id(), models.revision());
 The `render-pdfium` feature adds a native-only page renderer backed by
 [`firecrawl-pdfium`](https://crates.io/crates/firecrawl-pdfium). It is the
 rendering boundary for OCR pipelines; enabling it does not include an OCR
-model or change the existing extraction functions. It implies `local-vision`,
+model or change the existing extraction functions. It implies `vision`,
 and `PdfiumRenderer` implements the renderer-neutral `PageRenderer` trait.
 
 ```toml
