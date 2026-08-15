@@ -6,6 +6,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::markdown::{to_markdown_from_items_with_rects_and_page_count, MarkdownOptions};
+use crate::text_quality::{detect_encoding_issues, is_cid_garbage, is_garbage_text};
 use crate::types::{ItemType, TextItem};
 use crate::PageMarkdown;
 
@@ -91,6 +92,73 @@ pub struct FusedPages {
     pub ocr_time_ms: u64,
 }
 
+/// Origin of a trustworthy native-text candidate retained for adaptive OCR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeCandidateOrigin {
+    /// Text produced by pdf-inspector's normal native extractor.
+    Extractor,
+    /// Positioned text independently recovered through PDFium.
+    Pdfium,
+}
+
+impl NativeCandidateOrigin {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Extractor => "native extraction",
+            Self::Pdfium => "PDFium native recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextCandidateQuality {
+    alphanumeric_chars: usize,
+    score: f32,
+}
+
+/// Clean native text retained while an ambiguous page is compared with OCR.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeFallbackCandidate {
+    markdown: String,
+    quality: TextCandidateQuality,
+    origin: NativeCandidateOrigin,
+}
+
+impl NativeFallbackCandidate {
+    /// True when an independent native recovery is substantial enough to
+    /// cancel OCR for recoverable font/vector routing reasons.
+    pub(crate) fn is_complete_recovery(&self) -> bool {
+        self.quality.alphanumeric_chars >= 40 && self.quality.score >= 0.68
+    }
+
+    pub(crate) fn markdown(&self) -> &str {
+        &self.markdown
+    }
+
+    pub(crate) fn is_stronger_than(&self, other: &Self) -> bool {
+        self.quality.alphanumeric_chars > other.quality.alphanumeric_chars
+            || (self.quality.alphanumeric_chars == other.quality.alphanumeric_chars
+                && self.quality.score > other.quality.score)
+    }
+}
+
+/// Validates and scores native Markdown for possible post-OCR comparison.
+///
+/// This intentionally uses script-agnostic evidence. A native candidate only
+/// needs to be trustworthy, not necessarily complete: a clean native header
+/// can still be fused with an image-backed OCR body.
+pub(crate) fn assess_native_candidate(
+    markdown: String,
+    origin: NativeCandidateOrigin,
+) -> Option<NativeFallbackCandidate> {
+    let quality = assess_text_candidate(&markdown)?;
+    (quality.alphanumeric_chars >= 8).then_some(NativeFallbackCandidate {
+        markdown,
+        quality,
+        origin,
+    })
+}
+
 /// Converts positioned OCR spans to Markdown through pdf-inspector's existing
 /// deterministic geometry, reading-order, table, and Markdown pipeline.
 ///
@@ -116,13 +184,46 @@ pub fn ocr_page_to_markdown(
 /// OCR replaces pages whose native extraction was already rejected. On clean
 /// native pages (for example in `Force` mode), normalized duplicate OCR blocks
 /// are removed and only genuinely additional blocks are appended. Pages that
-/// needed OCR but still have no credible local result recommend the hosted
+/// needed OCR but still have no credible OCR result recommend the hosted
 /// document pipeline instead of silently presenting an empty result as final.
 pub fn fuse_ocr_pages(
     native_pages: &[PageMarkdown],
     ocr_run: &OcrRun,
     document_page_count: u32,
     options: &OcrFusionOptions,
+) -> Result<FusedPages, OcrFusionError> {
+    fuse_ocr_pages_impl(
+        native_pages,
+        ocr_run,
+        document_page_count,
+        options,
+        &BTreeMap::new(),
+    )
+}
+
+/// OCR-pipeline fusion with trustworthy partial native candidates.
+pub(crate) fn fuse_ocr_pages_adaptive(
+    native_pages: &[PageMarkdown],
+    ocr_run: &OcrRun,
+    document_page_count: u32,
+    options: &OcrFusionOptions,
+    native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
+) -> Result<FusedPages, OcrFusionError> {
+    fuse_ocr_pages_impl(
+        native_pages,
+        ocr_run,
+        document_page_count,
+        options,
+        native_candidates,
+    )
+}
+
+fn fuse_ocr_pages_impl(
+    native_pages: &[PageMarkdown],
+    ocr_run: &OcrRun,
+    document_page_count: u32,
+    options: &OcrFusionOptions,
+    native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
 ) -> Result<FusedPages, OcrFusionError> {
     validate_options(options)?;
 
@@ -178,7 +279,19 @@ pub fn fuse_ocr_pages(
                     document_page_count,
                 );
                 let ocr_markdown = preserve_ocr_line_breaks(&ocr_markdown, local);
-                let (markdown, source) = if native.markdown.trim().is_empty() || native.needs_ocr {
+                let (markdown, source) = if let Some(candidate) = native_candidates
+                    .get(&page_number)
+                    .filter(|_| native.needs_ocr)
+                {
+                    let choice = choose_adaptive_content(
+                        candidate,
+                        &ocr_markdown,
+                        local.ocr.mean_confidence,
+                        options.hosted_recommendation_confidence,
+                    );
+                    warnings.push(choice.warning);
+                    (choice.markdown, choice.source)
+                } else if native.markdown.trim().is_empty() || native.needs_ocr {
                     (ocr_markdown, PageContentSource::Ocr)
                 } else {
                     merge_native_and_ocr(&native.markdown, &ocr_markdown)
@@ -241,6 +354,150 @@ pub fn fuse_ocr_pages(
         pages,
         render_time_ms: ocr_run.render_time_ms,
         ocr_time_ms: ocr_run.ocr_time_ms,
+    })
+}
+
+struct AdaptiveContentChoice {
+    markdown: String,
+    source: PageContentSource,
+    warning: String,
+}
+
+fn choose_adaptive_content(
+    native: &NativeFallbackCandidate,
+    ocr: &str,
+    ocr_confidence: Option<f32>,
+    weak_ocr_threshold: f32,
+) -> AdaptiveContentChoice {
+    let ocr_quality = assess_text_candidate(ocr);
+    let weak_ocr = ocr_confidence.is_none_or(|confidence| confidence < weak_ocr_threshold);
+    if weak_ocr || ocr_quality.is_none() {
+        return AdaptiveContentChoice {
+            markdown: ensure_trailing_newline(native.markdown()),
+            source: PageContentSource::Native,
+            warning: format!(
+                "kept trustworthy {} because OCR was weak or unusable",
+                native.origin.description()
+            ),
+        };
+    }
+
+    let ocr_quality = ocr_quality.expect("checked above");
+    let overlap = content_overlap(native.markdown(), ocr);
+    let ocr_novel_chars = ocr_quality
+        .alphanumeric_chars
+        .saturating_sub(overlap.shared_chars);
+    let material_novelty =
+        ocr_novel_chars >= 12 && ocr_novel_chars * 8 >= ocr_quality.alphanumeric_chars.max(1);
+    let native_substantially_covered =
+        overlap.shared_chars * 4 >= native.quality.alphanumeric_chars.max(1) * 3;
+
+    if native_substantially_covered && !material_novelty {
+        return AdaptiveContentChoice {
+            markdown: ensure_trailing_newline(native.markdown()),
+            source: PageContentSource::Native,
+            warning: format!(
+                "kept trustworthy {} because OCR added no material coverage",
+                native.origin.description()
+            ),
+        };
+    }
+
+    // A shorter, materially lower-quality OCR hypothesis should not displace
+    // exact native text even when its mean confidence happens to be high.
+    if ocr_quality.score + 0.12 < native.quality.score
+        && ocr_quality.alphanumeric_chars * 10
+            <= native.quality.alphanumeric_chars.saturating_mul(11)
+    {
+        return AdaptiveContentChoice {
+            markdown: ensure_trailing_newline(native.markdown()),
+            source: PageContentSource::Native,
+            warning: format!(
+                "kept higher-quality {} after comparing OCR",
+                native.origin.description()
+            ),
+        };
+    }
+
+    let (markdown, source) = merge_native_and_ocr(native.markdown(), ocr);
+    let warning = match source {
+        PageContentSource::Native => format!(
+            "kept trustworthy {} because OCR duplicated its content",
+            native.origin.description()
+        ),
+        PageContentSource::Fused => format!(
+            "fused trustworthy {} with complementary OCR",
+            native.origin.description()
+        ),
+        PageContentSource::Ocr => unreachable!("merge never returns OCR-only content"),
+    };
+    AdaptiveContentChoice {
+        markdown,
+        source,
+        warning,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContentOverlap {
+    shared_chars: usize,
+}
+
+fn content_overlap(first: &str, second: &str) -> ContentOverlap {
+    let mut first_counts = BTreeMap::<char, usize>::new();
+    for character in normalized_content_chars(first) {
+        *first_counts.entry(character).or_insert(0) += 1;
+    }
+    let mut second_counts = BTreeMap::<char, usize>::new();
+    for character in normalized_content_chars(second) {
+        *second_counts.entry(character).or_insert(0) += 1;
+    }
+    let shared_chars = first_counts
+        .iter()
+        .map(|(character, count)| (*count).min(second_counts.get(character).copied().unwrap_or(0)))
+        .sum();
+    ContentOverlap { shared_chars }
+}
+
+fn normalized_content_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+}
+
+fn assess_text_candidate(markdown: &str) -> Option<TextCandidateQuality> {
+    if markdown.trim().is_empty()
+        || is_garbage_text(markdown)
+        || is_cid_garbage(markdown)
+        || detect_encoding_issues(markdown)
+    {
+        return None;
+    }
+
+    let alphanumeric_chars = markdown
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .count();
+    if alphanumeric_chars == 0 {
+        return None;
+    }
+    let visible_chars = markdown
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
+        .max(1);
+    let density = alphanumeric_chars as f32 / visible_chars as f32;
+    let length_score = (alphanumeric_chars as f32 / 160.0).min(1.0);
+    let nonempty_lines = markdown
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .max(1);
+    let line_score = (alphanumeric_chars as f32 / nonempty_lines as f32 / 12.0).min(1.0);
+    let score = (0.45 + length_score * 0.25 + density * 0.20 + line_score * 0.10).min(1.0);
+    Some(TextCandidateQuality {
+        alphanumeric_chars,
+        score,
     })
 }
 
@@ -778,6 +1035,10 @@ mod tests {
         }
     }
 
+    fn native_candidate(markdown: &str) -> NativeFallbackCandidate {
+        assess_native_candidate(markdown.to_string(), NativeCandidateOrigin::Extractor).unwrap()
+    }
+
     #[test]
     fn scanned_page_uses_geometry_ordered_ocr_and_provenance() {
         let native = [native(0, "", true)];
@@ -928,6 +1189,94 @@ mod tests {
 
         assert_eq!(result.pages[0].markdown, "Hello, world!\n");
         assert_eq!(result.pages[0].provenance.source, PageContentSource::Native);
+    }
+
+    #[test]
+    fn adaptive_fallback_keeps_native_text_when_ocr_is_weak() {
+        let native = [native(0, "", true)];
+        let run = run(vec![routed_page(
+            1,
+            vec![span("Inv0ice total uncertain", 10.0, 0.3)],
+            Some(0.3),
+        )]);
+        let candidates = BTreeMap::from([(
+            1,
+            native_candidate("Invoice total: $420.00\nPayment received\n"),
+        )]);
+
+        let result =
+            fuse_ocr_pages_adaptive(&native, &run, 1, &OcrFusionOptions::new(), &candidates)
+                .unwrap();
+
+        assert_eq!(result.pages[0].provenance.source, PageContentSource::Native);
+        assert_eq!(
+            result.pages[0].markdown,
+            "Invoice total: $420.00\nPayment received\n"
+        );
+        assert!(result.pages[0].provenance.hosted_recommended);
+        assert!(result.pages[0].provenance.warnings[0].contains("OCR was weak"));
+    }
+
+    #[test]
+    fn adaptive_fallback_prefers_exact_native_text_over_duplicate_ocr() {
+        let native = [native(0, "", true)];
+        let run = run(vec![routed_page(
+            1,
+            vec![span("Invoice total 420.00 Payment received", 10.0, 0.98)],
+            Some(0.98),
+        )]);
+        let candidates = BTreeMap::from([(
+            1,
+            native_candidate("Invoice total: $420.00\nPayment received\n"),
+        )]);
+
+        let result =
+            fuse_ocr_pages_adaptive(&native, &run, 1, &OcrFusionOptions::new(), &candidates)
+                .unwrap();
+
+        assert_eq!(result.pages[0].provenance.source, PageContentSource::Native);
+        assert!(!result.pages[0].provenance.hosted_recommended);
+        assert_eq!(result.pages[0].markdown.matches("Invoice").count(), 1);
+        assert!(result.pages[0].provenance.warnings[0].contains("no material coverage"));
+    }
+
+    #[test]
+    fn adaptive_fallback_fuses_native_header_with_scanned_body() {
+        let native = [native(0, "", true)];
+        let run = run(vec![routed_page(
+            1,
+            vec![
+                span("Quarterly account report", 10.0, 0.96),
+                span("March revenue 420 units", 30.0, 0.96),
+                span("April revenue 510 units", 50.0, 0.96),
+            ],
+            Some(0.96),
+        )]);
+        let candidates = BTreeMap::from([(1, native_candidate("# Quarterly account report\n"))]);
+
+        let result =
+            fuse_ocr_pages_adaptive(&native, &run, 1, &OcrFusionOptions::new(), &candidates)
+                .unwrap();
+
+        assert_eq!(result.pages[0].provenance.source, PageContentSource::Fused);
+        assert_eq!(result.pages[0].markdown.matches("Quarterly").count(), 1);
+        assert!(result.pages[0].markdown.contains("March revenue 420 units"));
+        assert!(result.pages[0].markdown.contains("April revenue 510 units"));
+        assert!(result.pages[0].provenance.warnings[0].contains("complementary"));
+    }
+
+    #[test]
+    fn native_candidate_scoring_is_multilingual_and_rejects_garbage() {
+        assert!(assess_native_candidate(
+            "請求書 合計金額 4200円\n支払済み\n".to_string(),
+            NativeCandidateOrigin::Extractor,
+        )
+        .is_some());
+        assert!(assess_native_candidate(
+            "a@@b%%c&&d==e~~".repeat(12),
+            NativeCandidateOrigin::Extractor,
+        )
+        .is_none());
     }
 
     #[test]

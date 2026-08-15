@@ -380,6 +380,15 @@ provides the same native-only behavior through the OCR result/provenance
 shape; `Force` renders every selected page. Learned layout intentionally
 returns an explicit unsupported error in this lightweight pipeline.
 
+For ambiguous mixed pages, `Auto` privately retains clean native fragments
+instead of discarding them when OCR is selected. After recognition it compares
+script-agnostic text quality, OCR confidence, character overlap, and material
+new coverage. Exact native text wins over a duplicate or weak OCR hypothesis;
+complementary image-backed text is fused; and pages where both candidates are
+weak recommend the hosted document pipeline. Public native-only extraction
+continues to suppress pages marked unreliable, and clean text documents pay no
+renderer or model-initialization cost.
+
 In `Auto`, pages routed only for suspicious font encoding or vectorized text
 first get a bounded positioned-text probe through PDFium. A credible recovered
 text layer with sufficient geometric page coverage skips rasterization and

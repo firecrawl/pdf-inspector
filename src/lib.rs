@@ -459,8 +459,15 @@ pub fn extract_pages_markdown_mem(
     buffer: &[u8],
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
-    extract_pages_markdown_mem_impl(buffer, pages, None, &MarkdownOptions::default(), false)
-        .map(|(result, _)| result)
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        None,
+        &MarkdownOptions::default(),
+        false,
+        false,
+    )
+    .map(|(result, _)| result)
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -476,6 +483,7 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
         password,
         markdown_options,
         markdown_options.strip_headers_footers,
+        true,
     )
 }
 
@@ -485,6 +493,7 @@ fn extract_pages_markdown_mem_impl(
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
     strip_repeated_headers_footers: bool,
+    preserve_ocr_candidates: bool,
 ) -> Result<(PagesExtractionResult, u32), PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
@@ -663,7 +672,15 @@ fn extract_pages_markdown_mem_impl(
 
         results.push(PageMarkdown {
             page: page_0idx,
-            markdown: if needs_ocr { String::new() } else { md },
+            // The public native extractor continues to suppress unreliable
+            // text. The OCR orchestrator retains clean partial text
+            // internally so it can compare/fuse it with OCR before deciding
+            // what is safe to return.
+            markdown: if needs_ocr && !preserve_ocr_candidates {
+                String::new()
+            } else {
+                md
+            },
             needs_ocr,
             ocr_reason,
         });

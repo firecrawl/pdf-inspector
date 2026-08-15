@@ -15,13 +15,17 @@ use crate::{
     OCR_REASON_VECTOR_TEXT,
 };
 
+use super::fusion::{
+    assess_native_candidate, fuse_ocr_pages_adaptive, NativeCandidateOrigin,
+    NativeFallbackCandidate,
+};
 use super::oar::onnx_runtime_library_path;
 use super::pdfium::PdfiumTextPage;
 use super::{
-    fuse_ocr_pages, route_ocr_pages, run_ocr_pages, FusedPageMarkdown, HttpModelDownloadError,
-    HttpModelDownloader, ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError,
-    OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions, OcrRoutingError, OcrRun, OcrRunError,
-    PdfiumRenderer, RenderError, RenderOptions, PP_OCR_V6_SMALL,
+    route_ocr_pages, run_ocr_pages, FusedPageMarkdown, HttpModelDownloadError, HttpModelDownloader,
+    ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError, OcrFusionError,
+    OcrFusionOptions, OcrMode, OcrOptions, OcrRoutingError, OcrRun, OcrRunError, PdfiumRenderer,
+    RenderError, RenderOptions, PP_OCR_V6_SMALL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,22 +234,52 @@ pub fn process_pdf_with_ocr_mem(
         return Err(OcrPipelineError::InvalidSelectedPage { page: invalid });
     }
 
-    let mut routed = route_ocr_pages(
+    let initially_routed = route_ocr_pages(
         options.ocr.mode,
         page_count,
         &native.pages_needing_ocr,
         selected_pages.as_deref(),
     )?;
 
+    // The OCR extractor retains clean native fragments on pages that still
+    // require OCR. Remove them from the ordinary native result now so Off mode
+    // preserves the existing suppression contract, while keeping a private
+    // candidate for post-OCR comparison and geometry-aware fusion.
+    let mut native_candidates = BTreeMap::<u32, NativeFallbackCandidate>::new();
+    for page in &mut native.pages {
+        if !page.needs_ocr || page.markdown.trim().is_empty() {
+            continue;
+        }
+        let page_number = page.page + 1;
+        let markdown = std::mem::take(&mut page.markdown);
+        if may_preserve_extractor_candidate(page_number, &native.ocr_reasons_by_page) {
+            if let Some(candidate) =
+                assess_native_candidate(markdown, NativeCandidateOrigin::Extractor)
+            {
+                native_candidates.insert(page_number, candidate);
+            }
+        }
+    }
+
+    let mut routed = initially_routed.clone();
     let mut renderer = None;
     let mut recovered_natively = BTreeSet::new();
     if options.ocr.mode == OcrMode::Auto {
-        let recovery_candidates = native_recovery_candidates(&routed, &native.ocr_reasons_by_page);
-        if !recovery_candidates.is_empty() {
+        let complete_recovery_candidates =
+            native_recovery_candidates(&initially_routed, &native.ocr_reasons_by_page);
+        let mut native_probe_pages: BTreeSet<u32> =
+            complete_recovery_candidates.iter().copied().collect();
+        native_probe_pages.extend(
+            native_candidates
+                .keys()
+                .filter(|page| routed.contains(page))
+                .copied(),
+        );
+        if !native_probe_pages.is_empty() {
             let native_renderer = PdfiumRenderer::load()?;
             let recovered = native_renderer.extract_text_pages(
                 buffer,
-                &recovery_candidates,
+                &native_probe_pages.iter().copied().collect::<Vec<_>>(),
                 options.password.as_deref(),
             )?;
             renderer = Some(native_renderer);
@@ -256,19 +290,38 @@ pub fn process_pdf_with_ocr_mem(
                 else {
                     continue;
                 };
-                if !is_complete_native_recovery(&markdown) || !native_recovery_covers_page(&page) {
-                    continue;
-                }
-                let Some(native_page) = native
-                    .pages
-                    .iter_mut()
-                    .find(|entry| entry.page + 1 == page.page)
+                let Some(candidate) =
+                    assess_native_candidate(markdown, NativeCandidateOrigin::Pdfium)
                 else {
                     continue;
                 };
-                native_page.markdown = markdown;
-                native_page.needs_ocr = false;
-                recovered_natively.insert(page.page);
+                let may_skip_ocr = complete_recovery_candidates.contains(&page.page)
+                    && candidate.is_complete_recovery()
+                    && native_recovery_covers_page(&page);
+                if may_skip_ocr {
+                    let Some(native_page) = native
+                        .pages
+                        .iter_mut()
+                        .find(|entry| entry.page + 1 == page.page)
+                    else {
+                        continue;
+                    };
+                    native_page.markdown = candidate.markdown().to_string();
+                    native_page.needs_ocr = false;
+                    native_candidates.remove(&page.page);
+                    recovered_natively.insert(page.page);
+                } else {
+                    match native_candidates.entry(page.page) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(candidate);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if candidate.is_stronger_than(entry.get()) {
+                                entry.insert(candidate);
+                            }
+                        }
+                    }
+                }
             }
             routed.retain(|page| !recovered_natively.contains(page));
         }
@@ -303,7 +356,13 @@ pub fn process_pdf_with_ocr_mem(
         .markdown(page_markdown_options)
         .render_dpi(options.render.dpi)
         .hosted_recommendation_confidence(options.hosted_recommendation_confidence);
-    let mut fused = fuse_ocr_pages(&native.pages, &ocr_run, page_count, &fusion_options)?;
+    let mut fused = fuse_ocr_pages_adaptive(
+        &native.pages,
+        &ocr_run,
+        page_count,
+        &fusion_options,
+        &native_candidates,
+    )?;
     for page in &mut fused.pages {
         if recovered_natively.contains(&page.page) {
             page.provenance
@@ -440,6 +499,22 @@ fn native_recovery_candidates(routed: &[u32], reasons: &[PageOcrReasons]) -> Vec
         .collect()
 }
 
+fn may_preserve_extractor_candidate(page: u32, reasons: &[PageOcrReasons]) -> bool {
+    reasons
+        .iter()
+        .find(|entry| entry.page == page)
+        .is_some_and(|entry| {
+            !entry.reasons.is_empty()
+                && !entry
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == OCR_REASON_SUSPECTED_GARBLED_TEXT)
+                && entry.reasons.iter().any(|reason| {
+                    reason == crate::OCR_REASON_SCANNED || reason == OCR_REASON_VECTOR_TEXT
+                })
+        })
+}
+
 fn credible_native_recovery(
     items: &[crate::TextItem],
     document_page_count: u32,
@@ -467,31 +542,6 @@ fn credible_native_recovery(
         return None;
     }
     (!markdown.trim().is_empty()).then_some(markdown)
-}
-
-fn is_complete_native_recovery(markdown: &str) -> bool {
-    let alphanumeric_chars = markdown
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .count();
-    if alphanumeric_chars < 40 {
-        return false;
-    }
-    let visible_chars = markdown
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .count()
-        .max(1);
-    let density = alphanumeric_chars as f32 / visible_chars as f32;
-    let length_score = (alphanumeric_chars as f32 / 160.0).min(1.0);
-    let nonempty_lines = markdown
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count()
-        .max(1);
-    let line_score = (alphanumeric_chars as f32 / nonempty_lines as f32 / 12.0).min(1.0);
-    let score = (0.45 + length_score * 0.25 + density * 0.20 + line_score * 0.10).min(1.0);
-    score >= 0.68
 }
 
 fn native_recovery_covers_page(page: &PdfiumTextPage) -> bool {
@@ -859,6 +909,37 @@ mod tests {
     }
 
     #[test]
+    fn extractor_candidates_require_clean_partial_content_reasons() {
+        let reasons = [
+            PageOcrReasons {
+                page: 1,
+                reasons: vec![crate::OCR_REASON_SCANNED.to_string()],
+            },
+            PageOcrReasons {
+                page: 2,
+                reasons: vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()],
+            },
+            PageOcrReasons {
+                page: 3,
+                reasons: vec![OCR_REASON_VECTOR_TEXT.to_string()],
+            },
+            PageOcrReasons {
+                page: 4,
+                reasons: vec![
+                    crate::OCR_REASON_SCANNED.to_string(),
+                    OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string(),
+                ],
+            },
+        ];
+
+        assert!(may_preserve_extractor_candidate(1, &reasons));
+        assert!(!may_preserve_extractor_candidate(2, &reasons));
+        assert!(may_preserve_extractor_candidate(3, &reasons));
+        assert!(!may_preserve_extractor_candidate(4, &reasons));
+        assert!(!may_preserve_extractor_candidate(5, &reasons));
+    }
+
+    #[test]
     fn off_mode_extracts_native_text_without_runtime_side_effects() {
         let bytes = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
         let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new()).unwrap();
@@ -904,7 +985,28 @@ mod tests {
         let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new()).unwrap();
 
         assert!(result.pages_routed_to_ocr.is_empty());
+        assert!(result.markdown.trim().is_empty());
         assert_eq!(result.pages_recommending_hosted, vec![1]);
+    }
+
+    #[test]
+    fn partial_native_scan_text_is_retained_only_inside_ocr_orchestration() {
+        let bytes = std::fs::read("tests/fixtures/scan_with_native_header_text.pdf").unwrap();
+        let public = crate::extract_pages_markdown_mem(&bytes, None).unwrap();
+        assert!(public.pages[0].needs_ocr);
+        assert!(public.pages[0].markdown.trim().is_empty());
+
+        let (ocr, _) = crate::extract_pages_markdown_mem_for_ocr(
+            &bytes,
+            None,
+            None,
+            &MarkdownOptions::default(),
+        )
+        .unwrap();
+        assert!(ocr.pages[0].needs_ocr);
+        assert!(ocr.pages[0]
+            .markdown
+            .contains("Order Detail Report by Account"));
     }
 
     #[test]

@@ -128,7 +128,16 @@ fn complete_ocr_pipeline_routes_and_assembles_a_scanned_fixture() {
 
     assert_eq!(result.pages_routed_to_ocr, vec![1]);
     assert!(!result.markdown.trim().is_empty());
-    assert_eq!(result.pages[0].provenance.source, PageContentSource::Ocr);
+    assert!(result
+        .markdown
+        .contains("Order Date Item Code Description Status Unit Cost\n\n03/14/2024"));
+    assert!(result.markdown.contains("$482,110.40\n\n05/02/2024"));
+    assert_eq!(result.pages[0].provenance.source, PageContentSource::Fused);
+    assert!(result.pages[0]
+        .provenance
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("complementary OCR")));
     assert_eq!(
         result.pages[0].provenance.ocr_model.as_ref().unwrap().name,
         PP_OCR_V6_SMALL.id
