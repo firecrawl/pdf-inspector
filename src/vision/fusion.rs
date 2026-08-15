@@ -10,7 +10,7 @@ use crate::types::{ItemType, TextItem};
 use crate::PageMarkdown;
 
 use super::{
-    LocalOcrPage, LocalOcrRun, PageContentSource, PageProvenance, VisionTimings, DEFAULT_RENDER_DPI,
+    OcrRun, PageContentSource, PageProvenance, RoutedOcrPage, VisionTimings, DEFAULT_RENDER_DPI,
 };
 
 /// OCR assembly and hosted-fallback policy.
@@ -75,7 +75,7 @@ pub struct FusedPageMarkdown {
     pub provenance: PageProvenance,
 }
 
-/// Output of fusing a selective local OCR run into native page extraction.
+/// Output of fusing a selective OCR run into native page extraction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FusedPages {
     /// Pages in the same order as the native input.
@@ -92,7 +92,7 @@ pub struct FusedPages {
 /// The page number is 1-indexed. `document_page_count` prevents a selected
 /// page from being mistaken for a one-page document during page-number logic.
 pub fn ocr_page_to_markdown(
-    page: &LocalOcrPage,
+    page: &RoutedOcrPage,
     document_page_count: u32,
     options: &MarkdownOptions,
 ) -> String {
@@ -114,7 +114,7 @@ pub fn ocr_page_to_markdown(
 /// document pipeline instead of silently presenting an empty result as final.
 pub fn fuse_ocr_pages(
     native_pages: &[PageMarkdown],
-    ocr_run: &LocalOcrRun,
+    ocr_run: &OcrRun,
     document_page_count: u32,
     options: &OcrFusionOptions,
 ) -> Result<FusedPages, OcrFusionError> {
@@ -182,7 +182,7 @@ pub fn fuse_ocr_pages(
                     .is_none_or(|confidence| confidence < options.hosted_recommendation_confidence);
                 let recommend_hosted = native.needs_ocr && (markdown.trim().is_empty() || weak_ocr);
                 if native.needs_ocr && markdown.trim().is_empty() {
-                    warnings.push("local OCR produced no usable text".to_string());
+                    warnings.push("OCR produced no usable text".to_string());
                 }
                 (
                     markdown,
@@ -238,7 +238,7 @@ pub fn fuse_ocr_pages(
 }
 
 /// Converts recognized line polygons to ordinary PDF-space text items.
-fn ocr_text_items(page: &LocalOcrPage) -> (Vec<TextItem>, usize) {
+fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
     let mut discarded = 0usize;
     let mut items = Vec::with_capacity(page.ocr.spans.len());
     for span in &page.ocr.spans {
@@ -619,8 +619,8 @@ mod tests {
         }
     }
 
-    fn local_page(page: u32, spans: Vec<OcrSpan>, confidence: Option<f32>) -> LocalOcrPage {
-        LocalOcrPage {
+    fn routed_page(page: u32, spans: Vec<OcrSpan>, confidence: Option<f32>) -> RoutedOcrPage {
+        RoutedOcrPage {
             rendered: rendered_page(page),
             ocr: OcrPage {
                 page,
@@ -633,8 +633,8 @@ mod tests {
         }
     }
 
-    fn run(pages: Vec<LocalOcrPage>) -> LocalOcrRun {
-        LocalOcrRun {
+    fn run(pages: Vec<RoutedOcrPage>) -> OcrRun {
+        OcrRun {
             pages,
             render_time_ms: 5,
             ocr_time_ms: 7,
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn scanned_page_uses_geometry_ordered_ocr_and_provenance() {
         let native = [native(0, "", true)];
-        let run = run(vec![local_page(
+        let run = run(vec![routed_page(
             1,
             vec![
                 span("Second line", 30.0, 0.9),
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn force_mode_deduplicates_native_content() {
         let native = [native(0, "Hello, world!\n", false)];
-        let run = run(vec![local_page(
+        let run = run(vec![routed_page(
             1,
             vec![span("Hello world", 10.0, 0.9)],
             Some(0.9),
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn force_mode_appends_only_additional_ocr_blocks() {
         let native = [native(0, "Native title\n", false)];
-        let run = run(vec![local_page(
+        let run = run(vec![routed_page(
             1,
             vec![
                 span("Native title", 10.0, 0.9),
@@ -722,7 +722,7 @@ mod tests {
     #[test]
     fn force_mode_deduplicates_reordered_tokens() {
         let native = [native(0, "Alpha Beta Gamma\n", false)];
-        let run = run(vec![local_page(
+        let run = run(vec![routed_page(
             1,
             vec![span("Gamma Alpha Beta", 10.0, 0.9)],
             Some(0.9),
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn fusion_preserves_native_leading_indentation() {
         let native = [native(0, "    indented code\n", false)];
-        let duplicate = run(vec![local_page(
+        let duplicate = run(vec![routed_page(
             1,
             vec![span("indented code", 10.0, 0.9)],
             Some(0.9),
@@ -745,7 +745,7 @@ mod tests {
         let result = fuse_ocr_pages(&native, &duplicate, 1, &OcrFusionOptions::new()).unwrap();
         assert_eq!(result.pages[0].markdown, "    indented code\n");
 
-        let addition = run(vec![local_page(
+        let addition = run(vec![routed_page(
             1,
             vec![span("image label", 10.0, 0.9)],
             Some(0.9),
@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn missing_or_weak_required_ocr_recommends_hosted() {
         let native = [native(0, "", true), native(1, "", true)];
-        let run = run(vec![local_page(
+        let run = run(vec![routed_page(
             2,
             vec![span("uncertain", 10.0, 0.3)],
             Some(0.3),
@@ -776,7 +776,7 @@ mod tests {
     fn rejects_ocr_pages_outside_native_selection() {
         let error = fuse_ocr_pages(
             &[native(0, "text", false)],
-            &run(vec![local_page(2, Vec::new(), None)]),
+            &run(vec![routed_page(2, Vec::new(), None)]),
             2,
             &OcrFusionOptions::new(),
         )
