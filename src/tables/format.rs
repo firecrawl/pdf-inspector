@@ -442,6 +442,16 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
 fn is_footnote_row(text: &str) -> bool {
     let trimmed = text.trim();
 
+    // Japanese documents commonly use the reference mark followed by an
+    // ASCII or full-width number (for example `※1` / `※１`). These rows often
+    // sit immediately below a wide table and must not be merged into its last
+    // data row as wrapped first-column content.
+    if let Some(rest) = trimmed.strip_prefix('※') {
+        return rest.chars().next().is_some_and(|character| {
+            character.is_ascii_digit() || ('０'..='９').contains(&character)
+        });
+    }
+
     // Check for common footnote patterns
     // (1), (2), etc.
     if trimmed.starts_with('(') && trimmed.len() >= 2 {
@@ -501,6 +511,13 @@ mod tests {
     fn test_is_footnote_row_notes_colon() {
         assert!(is_footnote_row("Notes: multiple"));
         assert!(is_footnote_row("NOTES: uppercase"));
+    }
+
+    #[test]
+    fn test_is_footnote_row_reference_mark_number() {
+        assert!(is_footnote_row("※1 explanation"));
+        assert!(is_footnote_row("※１ 説明"));
+        assert!(!is_footnote_row("※ general marker"));
     }
 
     #[test]
