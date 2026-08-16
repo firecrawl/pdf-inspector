@@ -31,9 +31,8 @@ Thumbs.db
 napi/index.js
 napi/index.d.ts
 
-# Local samples and scripts
+# Local samples
 samples/
-scripts/
 
 # Test output
 test_output/

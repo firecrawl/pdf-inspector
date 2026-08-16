@@ -28,6 +28,9 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Check package version sync
+        run: python3 scripts/version.py --check
+
       - name: Check package version
         id: check
         run: |

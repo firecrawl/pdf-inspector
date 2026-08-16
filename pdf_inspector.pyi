@@ -51,6 +51,20 @@ class TextItem:
     is_underline: bool
     is_strikeout: bool
     item_type: str
+    mcid: Optional[int]
+    """Marked Content ID from the content stream's BDC/BMC operator, None when
+    the text is not part of marked content. Join with the (page, mcid) pairs
+    from extract_structure_elements to attach structure-tree roles in tagged
+    PDFs."""
+
+class StructureElement:
+    """One structure-tree element reference from a tagged PDF."""
+    page: int
+    """1-indexed page number (matches TextItem.page)."""
+    mcid: int
+    """Marked Content ID from the page's content stream (matches TextItem.mcid)."""
+    role: str
+    """Standard structure type name ("H1".."H6", "P", "Table", "TD", ...)."""
 
 class RegionText:
     """Extracted text for a single region."""
@@ -130,6 +144,27 @@ def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) ->
 
 def extract_text_with_positions_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[TextItem]:
     """Extract text with position information from bytes."""
+    ...
+
+def extract_structure_elements(path: str, pages: Optional[list[int]] = None) -> list[StructureElement]:
+    """Extract structure-tree element references from a tagged PDF file.
+
+    Returns one entry per marked-content reference, resolved to its 1-indexed
+    page, MCID, and structure type name ("H1".."H6", "P", "Table", ...), sorted
+    by (page, mcid). Returns an empty list when the PDF is not tagged.
+
+    Args:
+        path: Path to the PDF file.
+        pages: Optional list of 1-indexed pages (matching ``TextItem.page``).
+            When ``None`` (default), the whole document is returned.
+    """
+    ...
+
+def extract_structure_elements_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[StructureElement]:
+    """Extract structure-tree element references from tagged PDF bytes.
+
+    See :func:`extract_structure_elements` for details.
+    """
     ...
 
 def extract_text_in_regions(

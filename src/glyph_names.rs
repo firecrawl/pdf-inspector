@@ -4566,9 +4566,13 @@ pub fn glyph_to_char(name: &str) -> Option<char> {
         }
     }
 
-    // Try to parse uniXXXX format
-    if name.starts_with("uni") && name.len() >= 7 {
-        if let Ok(code) = u32::from_str_radix(&name[3..7], 16) {
+    // Try to parse uniXXXX format.
+    // Use `get` rather than a byte-length check + slice: `name` can contain
+    // non-ASCII bytes (e.g. U+FFFD from lossy UTF-8 decoding of an attacker
+    // controlled /Differences name), so byte index 7 may not be a char
+    // boundary and `&name[3..7]` would panic.
+    if let Some(hex) = name.strip_prefix("uni").and_then(|rest| rest.get(..4)) {
+        if let Ok(code) = u32::from_str_radix(hex, 16) {
             // Strip PUA F000 offset: uniF0XX → U+00XX (Windows Symbol encoding convention)
             let code = if (0xF000..=0xF0FF).contains(&code) {
                 code - 0xF000
@@ -4587,4 +4591,37 @@ pub fn glyph_to_char(name: &str) -> Option<char> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uni_hex_parsing() {
+        assert_eq!(glyph_to_char("uni0041"), Some('A'));
+        assert_eq!(glyph_to_char("uni00e9"), Some('\u{00e9}'));
+        // PUA F0xx symbol-encoding offset is stripped.
+        assert_eq!(glyph_to_char("uniF041"), Some('A'));
+    }
+
+    #[test]
+    fn u_hex_parsing() {
+        assert_eq!(glyph_to_char("u0041"), Some('A'));
+        assert_eq!(glyph_to_char("u1F600"), Some('\u{1F600}'));
+    }
+
+    #[test]
+    fn non_ascii_uni_name_does_not_panic() {
+        // A crafted /Differences name like `/uni#80#80#80#80` decodes via
+        // from_utf8_lossy into "uni" followed by four U+FFFD replacements.
+        // Byte index 7 lands mid-character, so a naive `&name[3..7]` slice
+        // would panic. It must be handled gracefully instead.
+        let crafted = format!("uni{0}{0}{0}{0}", '\u{FFFD}');
+        assert_eq!(glyph_to_char(&crafted), None);
+
+        // Assorted non-ASCII bytes right after the "uni" prefix.
+        assert_eq!(glyph_to_char("uni\u{FFFD}bc"), None);
+        assert_eq!(glyph_to_char("uni\u{00e9}00"), None);
+    }
 }

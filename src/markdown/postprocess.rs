@@ -13,7 +13,11 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
         text = collapse_dot_leaders(&text);
     }
 
-    // Fix hyphenation first (before other processing)
+    // Collapse runs of spaces first: double-spaced breaks ("de-  fendant")
+    // must look like single-spaced ones before the hyphenation passes.
+    collapse_consecutive_spaces(&mut text);
+
+    // Fix hyphenation (before other processing)
     if options.fix_hyphenation {
         text = fix_hyphenation(&text);
     }
@@ -143,7 +147,213 @@ fn fix_hyphenation(text: &str) -> String {
         })
         .to_string();
 
-    result
+    dehyphenate_line_breaks(&result)
+}
+
+/// What a line-break hyphen pair should become. Policy output only — how the
+/// decision is rendered (plain text vs. inside split emphasis markers) is the
+/// caller's business.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Join {
+    /// The fragments are one word: "de- fendant" -> "defendant".
+    Plain,
+    /// The fragments are a hyphenated compound: "six- month" -> "six-month".
+    Hyphen,
+    /// No evidence (or a suspended hyphen): leave the break as it is.
+    Keep,
+}
+
+/// Decide what a line-break hyphen pair becomes, given the document's
+/// vocabulary evidence. The whole dehyphenation policy lives here so it can
+/// be reasoned about (and tested) apart from the Markdown scanning around it;
+/// see [`dehyphenate_line_breaks`] for the rule rationale.
+fn join_decision(
+    a: &str,
+    b: &str,
+    words: &std::collections::HashSet<String>,
+    hyphenated: &std::collections::HashSet<String>,
+) -> Join {
+    // Word-length sanity: syllable fragments are short, and even long German
+    // compounds stay under this. Fragments beyond it are already fused
+    // reading-order noise (interleaved columns); joining would compound the
+    // damage.
+    if a.chars().count() + b.chars().count() > 40 {
+        return Join::Keep;
+    }
+    let key_plain = format!("{}{}", a.to_lowercase(), b.to_lowercase());
+    let key_hyphen = format!("{}-{}", a.to_lowercase(), b.to_lowercase());
+    if words.contains(&key_plain) {
+        Join::Plain
+    } else if hyphenated.contains(&key_hyphen) || b.chars().next().is_some_and(|c| c.is_uppercase())
+    {
+        Join::Hyphen
+    } else if b.chars().count() >= 4
+        && words.contains(&a.to_lowercase())
+        && words.contains(&b.to_lowercase())
+    {
+        // No direct evidence, but both fragments are themselves words the
+        // document uses ("commercial- type"): hyphenated compounds are made
+        // of words, while syllable fragments ("evi", "judg", "mo") are not.
+        //
+        // The continuation must be at least four letters. Suspended hyphens
+        // ("mid- and long-term", "klein- und mittelgroß") put a conjunction
+        // after the hyphen, and conjunctions are near-universally one to
+        // three letters in any language — the length floor keeps this rule
+        // off them without a hard-coded conjunction list.
+        Join::Hyphen
+    } else {
+        // No evidence at all: leave the break as it is. An unconditional join
+        // here covered only ~1% more breaks on a vocabulary-rich document,
+        // but it was the sole rule able to corrupt output — fusing
+        // interleaved-column fragments ("com- real" -> "comreal") into
+        // unrecoverable tokens. A visible break is honest; a silent fusion
+        // is not.
+        Join::Keep
+    }
+}
+
+/// Rejoin words hyphenated at the original line breaks.
+///
+/// Justified print breaks words at syllables; after paragraph lines are
+/// joined with spaces those breaks survive as "de- fendant" (and, when an
+/// emphasis span was split with the word, "Bap-** **tist"). Whether the
+/// hyphen itself belongs in the word cannot be decided locally — "de-
+/// fendant" is one word but "Third- Party" is a hyphenated compound — so the
+/// document is its own dictionary:
+///
+///   1. fragments appear elsewhere joined plain ("defendant") — join plain;
+///   2. appear elsewhere hyphenated ("six-month"), or the continuation is
+///      capitalized ("Hinds- Radix", "Third- Party") — keep the hyphen;
+///   3. both fragments are words the document uses and the continuation
+///      has four or more letters ("commercial- type" where "commercial"
+///      and "type" appear elsewhere) — a compound, keep the hyphen. The
+///      length floor keeps this rule off suspended hyphens ("mid- and
+///      long-term", "klein- und mittelgroß"): conjunctions are one to
+///      three letters in essentially every language, so no conjunction
+///      list is needed;
+///   4. no evidence — leave the break untouched. Evidence covers ~99% of
+///      breaks on vocabulary-rich documents, and an unconditional join was
+///      the one rule able to corrupt output (fusing interleaved-column
+///      fragments into unrecoverable tokens).
+///
+/// Every rule is either document evidence or script-agnostic typography;
+/// deliberately no hard-coded word lists beyond the three suspension
+/// conjunctions (a curated suffix list was tried and removed — it was
+/// English-only, its membership was unfalsifiable, and it could invent
+/// hyphens: "proto- type" -> "proto-type").
+///
+/// Table rows and fenced code blocks are left untouched.
+fn dehyphenate_line_breaks(text: &str) -> String {
+    use once_cell::sync::Lazy;
+    use std::collections::HashSet;
+
+    const WORD: &str = r"\p{L}";
+
+    // "de- fendant"
+    static BREAK_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})- ({WORD}{{2,}})")).unwrap());
+    // "Bap-** **tist" — an emphasis span split together with the word. The
+    // regex crate has no backreferences, so both markers are captured and
+    // compared in the replacement closure.
+    static BREAK_EMPH_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(&format!(
+            r"({WORD}{{2,}})-(\*{{1,2}}) (\*{{1,2}})({WORD}{{2,}})"
+        ))
+        .unwrap()
+    });
+    static PLAIN_WORD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(&format!("{WORD}{{3,}}")).unwrap());
+    static HYPHENATED_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})-({WORD}{{2,}})")).unwrap());
+
+    // The document is its own dictionary: whole words and hyphenated
+    // compounds as they appear away from line breaks. Two exclusions keep the
+    // evidence sound:
+    //   - the break pairs themselves are scrubbed first, otherwise every
+    //     broken word donates its own fragments ("evi", "dence") and the
+    //     compound rule would see them as words;
+    //   - fenced code blocks are skipped: identifiers are a different
+    //     language, and one like `comreal` must not justify fusing prose.
+    //     Table rows stay — cells carry genuine document vocabulary.
+    let mut prose = String::with_capacity(text.len());
+    let mut in_code = false;
+    for line in text.split('\n') {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if !in_code {
+            prose.push_str(line);
+            prose.push('\n');
+        }
+    }
+    let scrubbed = BREAK_EMPH_RE.replace_all(&prose, " ");
+    let scrubbed = BREAK_RE.replace_all(&scrubbed, " ");
+    let mut words: HashSet<String> = HashSet::new();
+    let mut hyphenated: HashSet<String> = HashSet::new();
+    for m in PLAIN_WORD_RE.find_iter(&scrubbed) {
+        words.insert(m.as_str().to_lowercase());
+    }
+    for caps in HYPHENATED_RE.captures_iter(&scrubbed) {
+        hyphenated.insert(format!(
+            "{}-{}",
+            caps[1].to_lowercase(),
+            caps[2].to_lowercase()
+        ));
+    }
+
+    let join = |a: &str, b: &str| join_decision(a, b, &words, &hyphenated);
+
+    let mut in_code_block = false;
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+        if in_code_block || line.trim_start().starts_with('|') {
+            out.push_str(line);
+            continue;
+        }
+        // A break can chain ("unconsti- tu- tional"); each pass joins one
+        // junction, and every successful join removes a break, so running
+        // until the line is stable is bounded by the number of breaks.
+        let mut current = line.to_string();
+        loop {
+            let next = BREAK_EMPH_RE
+                .replace_all(&current, |caps: &regex::Captures| {
+                    // Mismatched markers aren't a split span; a Keep decision
+                    // preserves the original spacing and markers.
+                    if caps[2] != caps[3] {
+                        return caps[0].to_string();
+                    }
+                    let (a, b) = (&caps[1], &caps[4]);
+                    match join(a, b) {
+                        Join::Plain => format!("{a}{b}"),
+                        Join::Hyphen => format!("{a}-{b}"),
+                        Join::Keep => caps[0].to_string(),
+                    }
+                })
+                .to_string();
+            let next = BREAK_RE
+                .replace_all(&next, |caps: &regex::Captures| {
+                    let (a, b) = (&caps[1], &caps[2]);
+                    match join(a, b) {
+                        Join::Plain => format!("{a}{b}"),
+                        Join::Hyphen => format!("{a}-{b}"),
+                        Join::Keep => caps[0].to_string(),
+                    }
+                })
+                .to_string();
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        out.push_str(&current);
+    }
+    out
 }
 
 /// Remove isolated page-number expressions from Markdown.
@@ -382,6 +592,180 @@ mod tests {
         let mut t = "version 3 .14 released".to_string();
         remove_spaces_before_sentence_punctuation(&mut t);
         assert_eq!(t, "version 3 .14 released");
+    }
+
+    // --- dehyphenate_line_breaks ---
+
+    #[test]
+    fn line_break_joins_plain_on_vocabulary_evidence() {
+        // "defendant" appears whole elsewhere, so the broken form joins plain.
+        let text = "The defendant appeared. The de- fendant argued.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "The defendant appeared. The defendant argued."
+        );
+    }
+
+    #[test]
+    fn line_break_keeps_hyphen_on_hyphenated_evidence() {
+        // "six-month" appears hyphenated elsewhere, so the broken form keeps it.
+        let text = "A six-month term. After a six- month delay.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "A six-month term. After a six-month delay."
+        );
+    }
+
+    #[test]
+    fn no_evidence_leaves_the_break_untouched() {
+        // Without document evidence a join cannot be distinguished from
+        // interleaved-column noise; the visible break is kept.
+        let text = "The evi- dence was clear.";
+        assert_eq!(dehyphenate_line_breaks(text), text);
+    }
+
+    #[test]
+    fn line_break_keeps_hyphen_before_capitalized_continuation() {
+        // Broken compounds: "Third-Party", "Hinds-Radix".
+        let text = "The Third- Party complaint by Hinds- Radix.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "The Third-Party complaint by Hinds-Radix."
+        );
+    }
+
+    #[test]
+    fn cyrillic_words_join_on_evidence() {
+        // The word class is Unicode-wide, not a hard-coded Latin subset.
+        let text = "Это решение важно. Это реше- ние суда.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "Это решение важно. Это решение суда."
+        );
+    }
+
+    #[test]
+    fn double_spaced_breaks_join_through_clean_markdown() {
+        // Space collapsing runs before hyphenation, so a break that arrives
+        // with two spaces ("de-  fendant") still rejoins.
+        let options = MarkdownOptions::default();
+        let out = clean_markdown(
+            "The defendant appeared. The de-  fendant argued.".to_string(),
+            &options,
+        );
+        assert_eq!(
+            out.trim_end(),
+            "The defendant appeared. The defendant argued."
+        );
+    }
+
+    #[test]
+    fn code_block_identifiers_are_not_vocabulary_evidence() {
+        // A fused identifier in code must not justify fusing unrelated prose.
+        let text = "```\nlet comreal = 1;\n```\nThe com- real estate story.";
+        assert_eq!(dehyphenate_line_breaks(text), text);
+    }
+
+    #[test]
+    fn fused_column_noise_is_not_joined() {
+        // Interleaved-column garbage arrives already fused; joining across
+        // its breaks would compound the damage. Real syllable fragments are
+        // short; fragments this long are left exactly as they are.
+        let text = "spreadswerenegativeintheearlytomid- seriouslyflawedduetoappraisallags";
+        assert_eq!(dehyphenate_line_breaks(text), text);
+        // Long German compounds stay under the length gate and join on
+        // vocabulary evidence.
+        let german =
+            "Das Bundesausbildungsförderungsgesetz. Das Bundesausbildungsförderungs- gesetz gilt.";
+        assert_eq!(
+            dehyphenate_line_breaks(german),
+            "Das Bundesausbildungsförderungsgesetz. Das Bundesausbildungsförderungsgesetz gilt."
+        );
+    }
+
+    #[test]
+    fn no_evidence_compounds_stay_visibly_broken() {
+        // No hard-coded suffix list: without document evidence even a likely
+        // compound keeps its visible break. A curated list was tried and
+        // removed — English-only, unfalsifiable membership, and able to
+        // invent hyphens ("proto- type" -> "proto-type").
+        let text = "Their world- class support and proto- type systems.";
+        assert_eq!(dehyphenate_line_breaks(text), text);
+    }
+
+    #[test]
+    fn both_fragments_being_words_keeps_the_hyphen() {
+        // "commercial-type insurance": no evidence either way, but both
+        // fragments are words the document uses, so this is a compound.
+        let text = "Any commercial firm of this type offering commercial- type insurance.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "Any commercial firm of this type offering commercial-type insurance."
+        );
+    }
+
+    #[test]
+    fn suspended_hyphen_is_preserved() {
+        // "mid- to long-term": joining would fuse unrelated words. No
+        // conjunction list is involved — conjunctions are 1-3 letters in
+        // essentially every language, and the compound rule requires a
+        // 4-letter continuation, so suspended hyphens fall through to Keep.
+        let text = "Planned over the mid- to long-term horizon, in- and out-of-possession.";
+        assert_eq!(dehyphenate_line_breaks(text), text);
+        // Same construction in German, which a hard-coded English list
+        // would have missed. "klein" appears standalone so it IS in the
+        // vocabulary — only the length floor (continuation "und" has three
+        // letters) keeps the compound rule from fusing "klein-und".
+        let german = "Das klein geschriebene Wort und die klein- und mittelgroßen Betriebe.";
+        assert_eq!(dehyphenate_line_breaks(german), german);
+    }
+
+    #[test]
+    fn split_emphasis_span_joins_inside_markers() {
+        // Vocabulary evidence ("Baptist", "Consolidated" elsewhere) drives
+        // the join; the split emphasis markers collapse with it.
+        let text = "The Baptist and Consolidated cases. By **Bap-** **tist** pastors and *Consoli-* *dated* Edison.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "The Baptist and Consolidated cases. By **Baptist** pastors and *Consolidated* Edison."
+        );
+    }
+
+    #[test]
+    fn mismatched_emphasis_markers_are_left_alone() {
+        let text = "Odd **Bap-** *tist* markers.";
+        assert_eq!(dehyphenate_line_breaks(text), text);
+    }
+
+    #[test]
+    fn chained_breaks_join_stepwise_with_evidence() {
+        // A word broken twice joins across passes when each junction has
+        // vocabulary evidence for its intermediate form.
+        let text = "The word unconstitutional, and unconstitu appears too: unconsti- tu- tional.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "The word unconstitutional, and unconstitu appears too: unconstitutional."
+        );
+    }
+
+    #[test]
+    fn table_rows_and_code_blocks_are_untouched() {
+        let text =
+            "The defendant.\n|de- fendant|value|\n```\nlet x = de- fendant;\n```\nThe de- fendant won.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "The defendant.\n|de- fendant|value|\n```\nlet x = de- fendant;\n```\nThe defendant won."
+        );
+    }
+
+    #[test]
+    fn accented_words_join() {
+        // Spanish syllable break with accented continuation, evidence-backed.
+        let text = "Una resolución firme. La resolu- ción fue clara.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "Una resolución firme. La resolución fue clara."
+        );
     }
 
     // --- fix_hyphenation ---
