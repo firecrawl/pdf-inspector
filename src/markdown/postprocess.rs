@@ -4,7 +4,8 @@ use regex::Regex;
 
 use super::{MarkdownOptions, MarkdownProfile};
 use crate::text_utils::{
-    is_page_number_line, is_rtl_char, is_visual_order_hebrew, reverse_visual_rtl,
+    is_arabic_char, is_hebrew_letter, is_page_number_line, is_visual_order_hebrew,
+    reverse_visual_rtl,
 };
 
 /// Clean up markdown output with post-processing
@@ -66,8 +67,8 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
 /// Documents already in logical order, and documents with no Hebrew, are
 /// returned untouched.
 ///
-/// Arabic is deliberately out of scope here: it is already restored per text
-/// item during extraction, and reversing it a second time would undo that.
+/// Arabic is out of scope: it is already restored per text item during
+/// extraction, so [`restore_rtl_line`] skips any line carrying it.
 fn restore_rtl_reading_order(text: &str) -> String {
     if !is_visual_order_hebrew(text) {
         return text.to_string();
@@ -85,7 +86,11 @@ fn restore_rtl_reading_order(text: &str) -> String {
 
 /// Restore one line, keeping markdown structure in place around the prose.
 fn restore_rtl_line(line: &str) -> String {
-    if !line.chars().any(is_rtl_char) {
+    // Scoped to Hebrew, not RTL generally. Arabic reaches this point already
+    // in logical order — `expand_ligatures` restored it per text item during
+    // extraction — so reversing it here would undo that work. A line carrying
+    // both scripts is genuinely ambiguous, and is left alone.
+    if !line.chars().any(is_hebrew_letter) || line.chars().any(is_arabic_char) {
         return line.to_string();
     }
 
@@ -94,7 +99,7 @@ fn restore_rtl_line(line: &str) -> String {
         // An RTL table's leftmost visual column is its last logical one, so
         // cell order reverses along with the text inside each cell.
         let inner = &trimmed[1..trimmed.len() - 1];
-        let cells: Vec<String> = inner.split('|').rev().map(reverse_visual_rtl).collect();
+        let cells: Vec<String> = inner.split('|').rev().map(reverse_segments).collect();
         return format!("|{}|", cells.join("|"));
     }
 
@@ -105,7 +110,48 @@ fn restore_rtl_line(line: &str) -> String {
     let marker_len = leading_marker_len(rest);
     let (marker, prose) = rest.split_at(marker_len);
 
-    format!("{indent}{marker}{}", reverse_visual_rtl(prose))
+    format!("{indent}{marker}{}", reverse_segments(prose))
+}
+
+/// Reverse the text of a span while leaving inline markup where it sits.
+///
+/// Emphasis runs and `<u>` tags are emitted around text, not inside it, so
+/// reversing them along with the prose would produce `>u/<` and break the
+/// markup. Splitting on the tags and reversing only what lies between them
+/// keeps `<u>` wrapping the same words it wrapped before.
+fn reverse_segments(text: &str) -> String {
+    if !text.contains('<') && !text.contains('*') && !text.contains('`') {
+        return reverse_visual_rtl(text);
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut segment = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => {
+                // An HTML tag: copy it through verbatim.
+                out.push_str(&reverse_visual_rtl(&segment));
+                segment.clear();
+                out.push('<');
+                for tag_char in chars.by_ref() {
+                    out.push(tag_char);
+                    if tag_char == '>' {
+                        break;
+                    }
+                }
+            }
+            '*' | '`' => {
+                out.push_str(&reverse_visual_rtl(&segment));
+                segment.clear();
+                out.push(c);
+            }
+            _ => segment.push(c),
+        }
+    }
+    out.push_str(&reverse_visual_rtl(&segment));
+    out
 }
 
 /// Length of the leading markdown marker on a line, if any.
@@ -725,5 +771,32 @@ mod tests {
         let visual = "םלוע םולש".to_string();
         let result = clean_markdown(visual, &MarkdownOptions::default());
         assert_eq!(result, "שלום עולם\n");
+    }
+
+    #[test]
+    fn rtl_never_reverses_arabic_twice() {
+        // Hebrew supplies the document-level signal; the Arabic line was
+        // already restored per item during extraction and must be left alone.
+        let doc = "םלוע םולש\n\n\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}";
+        let out = restore_rtl_reading_order(doc);
+        assert_eq!(out.lines().next().unwrap(), "שלום עולם");
+        assert_eq!(
+            out.lines().last().unwrap(),
+            "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"
+        );
+    }
+
+    #[test]
+    fn rtl_keeps_inline_markup_intact() {
+        let doc = "םלוע םולש\n\n<u>םלוע םולש</u>";
+        let out = restore_rtl_reading_order(doc);
+        assert_eq!(out.lines().last().unwrap(), "<u>שלום עולם</u>");
+    }
+
+    #[test]
+    fn rtl_keeps_emphasis_intact() {
+        let doc = "םלוע םולש\n\n**םלוע םולש**";
+        let out = restore_rtl_reading_order(doc);
+        assert_eq!(out.lines().last().unwrap(), "**שלום עולם**");
     }
 }

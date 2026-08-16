@@ -124,8 +124,20 @@ fn is_arabic_presentation_form(c: char) -> bool {
     matches!(c, '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFE}')
 }
 
-fn is_hebrew_letter(c: char) -> bool {
+pub(crate) fn is_hebrew_letter(c: char) -> bool {
     matches!(c, '\u{05D0}'..='\u{05EA}')
+}
+
+/// Arabic in any of its forms, including the presentation forms that mark
+/// visual-order storage.
+pub(crate) fn is_arabic_char(c: char) -> bool {
+    matches!(c,
+        '\u{0600}'..='\u{06FF}'   // Arabic
+        | '\u{0750}'..='\u{077F}' // Arabic Supplement
+        | '\u{08A0}'..='\u{08FF}' // Arabic Extended-A
+        | '\u{FB50}'..='\u{FDFF}' // Presentation Forms-A
+        | '\u{FE70}'..='\u{FEFE}' // Presentation Forms-B
+    )
 }
 
 /// Hebrew final forms (ך ם ן ף ץ), which are legal only as a word's last letter.
