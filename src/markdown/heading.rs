@@ -127,7 +127,9 @@ fn visual_style(line: &TextLine) -> Option<VisualStyle> {
     })
 }
 
-fn roman_value(token: &str) -> Option<u32> {
+/// Shared with `analysis::starts_with_numbering_prefix` so the veto
+/// exemption and the heading parser agree on what a roman numeral is.
+pub(super) fn roman_value(token: &str) -> Option<u32> {
     if token.is_empty() || token.len() > 8 {
         return None;
     }

@@ -1,6 +1,6 @@
 //! Rectangle-based table detection using union-find clustering.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use log::debug;
 
@@ -78,19 +78,111 @@ pub(crate) fn rects_overlap(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), 
     !(a_right < b_left || b_right < a_left || a_top < b_bottom || b_top < a_bottom)
 }
 
+fn grid_coord(value: f32, cell: f32) -> i32 {
+    (value / cell).floor().clamp(-1_000_000.0, 1_000_000.0) as i32
+}
+
+/// Inclusive grid range. `None` if the rect covers more cells than we will
+/// materialize — those rects are clustered via a bounded fallback.
+fn grid_span(lo: f32, hi: f32, cell: f32) -> Option<std::ops::RangeInclusive<i32>> {
+    let a = grid_coord(lo.min(hi), cell);
+    let b = grid_coord(lo.max(hi), cell);
+    let span = b.saturating_sub(a);
+    if span > 64 {
+        return None;
+    }
+    Some(a..=b)
+}
+
+fn union_bucket_pairs(
+    uf: &mut UnionFind,
+    rects: &[(f32, f32, f32, f32)],
+    bucket: &[usize],
+    tolerance: f32,
+) {
+    let m = bucket.len();
+    let mut pairs = 0usize;
+    'cell: for a in 0..m {
+        let i = bucket[a];
+        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+            continue;
+        }
+        for &j in &bucket[a + 1..] {
+            if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                break 'cell;
+            }
+            if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                continue;
+            }
+            pairs += 1;
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn union_rect_against_bands(
+    uf: &mut UnionFind,
+    rects: &[(f32, f32, f32, f32)],
+    i: usize,
+    bands: &BTreeMap<i32, Vec<usize>>,
+    lo: i32,
+    hi: i32,
+    tolerance: f32,
+) {
+    if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+        return;
+    }
+    let mut pairs = 0usize;
+    let mut seen = HashSet::new();
+    for (_, bucket) in bands.range(lo..=hi) {
+        for &j in bucket {
+            if !seen.insert(j) {
+                continue;
+            }
+            if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                return;
+            }
+            if i == j || uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                continue;
+            }
+            pairs += 1;
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Maximum component size for rect clustering.  No real table has thousands
 /// of cell rects — once a component exceeds this, it is a vector drawing or
 /// page-spanning clipping path.  We skip overlap checks for rects already in
-/// an oversized component, keeping the original O(n²) loop but making it
-/// effectively O(n) for pathological pages.
+/// an oversized component.
 const MAX_CLUSTER_RECTS: usize = 2000;
+
+/// Pairwise-disjoint rects never merge, so a component-size cap does not
+/// stop an all-pairs loop. Rects are hashed into this many points of grid
+/// and compared only against others in the same cell.
+const CLUSTER_GRID_CELL: f32 = 64.0;
+
+/// All-pairs AABB tests allowed inside one grid cell. A real table cell is
+/// tens of points wide, so a 64-pt cell holds a handful of neighbors — not
+/// thousands of stacked drawings.
+const MAX_CLUSTER_PAIRS_PER_CELL: usize = 16_384;
 
 /// Cluster rects by spatial overlap using union-find.
 /// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
 ///
-/// Skips overlap checks for rects whose component has already exceeded
-/// [`MAX_CLUSTER_RECTS`], so pages with tens of thousands of vector-drawing
-/// rects complete in milliseconds instead of minutes.
+/// Overlap tests run inside a uniform grid so far-apart rects are never
+/// compared, and each cell is pair-capped so a dense stack cannot go
+/// quadratic or starve an independent table in another cell.
 pub(crate) fn cluster_rects(
     rects: &[(f32, f32, f32, f32)],
     tolerance: f32,
@@ -98,23 +190,144 @@ pub(crate) fn cluster_rects(
 ) -> Vec<Vec<usize>> {
     let n = rects.len();
     let mut uf = UnionFind::new(n);
+    let cell = CLUSTER_GRID_CELL.max(tolerance * 4.0);
 
-    for i in 0..n {
-        // If rect i is already in an oversized component, no point comparing
-        // it against further rects — the component won't be used for table
-        // detection anyway.
+    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let mut large: Vec<usize> = Vec::new();
+    for (idx, &(x, y, w, h)) in rects.iter().enumerate() {
+        match (
+            grid_span(x - tolerance, x + w + tolerance, cell),
+            grid_span(y - tolerance, y + h + tolerance, cell),
+        ) {
+            (Some(xs), Some(ys)) => {
+                for gx in xs {
+                    for gy in ys.clone() {
+                        grid.entry((gx, gy)).or_default().push(idx);
+                    }
+                }
+            }
+            _ => large.push(idx),
+        }
+    }
+
+    let mut keys: Vec<_> = grid.keys().copied().collect();
+    keys.sort_unstable();
+    let mut keys_by_y: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+    for &key in &keys {
+        union_bucket_pairs(&mut uf, rects, &grid[&key], tolerance);
+        keys_by_y.entry(key.1).or_default().push(key.0);
+    }
+
+    // Oversized spans skip insert. Range-query occupied cells they cover so
+    // later X-ranges are not starved and we do not scan unrelated rows.
+    for &i in &large {
         if uf.component_size(i) >= MAX_CLUSTER_RECTS {
             continue;
         }
-        for j in (i + 1)..n {
-            if rects_overlap(&rects[i], &rects[j], tolerance) {
-                uf.union(i, j);
-                // Check if the merged component just exceeded the cap —
-                // if so, no need to test more pairs for rect i.
+        let (x, y, w, h) = rects[i];
+        let x_lo = grid_coord(x - tolerance, cell);
+        let x_hi = grid_coord(x + w + tolerance, cell);
+        let y_lo = grid_coord(y - tolerance, cell);
+        let y_hi = grid_coord(y + h + tolerance, cell);
+        for (&gy, gxs) in keys_by_y.range(y_lo..=y_hi) {
+            let start = gxs.partition_point(|&gx| gx < x_lo);
+            for &gx in &gxs[start..] {
+                if gx > x_hi {
+                    break;
+                }
+                let bucket = &grid[&(gx, gy)];
+                let mut pairs = 0usize;
+                for &j in bucket {
+                    if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                        break;
+                    }
+                    if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                        continue;
+                    }
+                    pairs += 1;
+                    if rects_overlap(&rects[i], &rects[j], tolerance) {
+                        uf.union(i, j);
+                        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                            break;
+                        }
+                    }
+                }
                 if uf.component_size(i) >= MAX_CLUSTER_RECTS {
                     break;
                 }
             }
+            if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                break;
+            }
+        }
+    }
+
+    // Oversized-vs-oversized: band on the short axis so stacked or side-by-side
+    // page-spanning rules stay linear. Wide vs tall pairs are matched by
+    // querying the tall X-index; dual-oversized rects occupy every coarse-Y
+    // cell they span.
+    let mut large_x: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut large_y: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut large_coarse_y: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut wide: Vec<usize> = Vec::new();
+    let mut dual: Vec<usize> = Vec::new();
+    for &i in &large {
+        let (x, y, w, h) = rects[i];
+        let xs = grid_span(x - tolerance, x + w + tolerance, cell);
+        let ys = grid_span(y - tolerance, y + h + tolerance, cell);
+        match (xs, ys) {
+            (Some(xs), _) => {
+                for gx in xs {
+                    large_x.entry(gx).or_default().push(i);
+                }
+            }
+            (_, Some(ys)) => {
+                wide.push(i);
+                for gy in ys {
+                    large_y.entry(gy).or_default().push(i);
+                }
+            }
+            _ => {
+                dual.push(i);
+                let coarse = cell * 64.0;
+                match grid_span(y - tolerance, y + h + tolerance, coarse) {
+                    Some(ys) => {
+                        for gy in ys {
+                            large_coarse_y.entry(gy).or_default().push(i);
+                        }
+                    }
+                    None => {
+                        large_coarse_y.entry(i32::MIN).or_default().push(i);
+                    }
+                }
+            }
+        }
+    }
+    for bands in [&large_x, &large_y, &large_coarse_y] {
+        for bucket in bands.values() {
+            union_bucket_pairs(&mut uf, rects, bucket, tolerance);
+        }
+    }
+    // Cross-orientation is |wide|×|tall| if every wide rule spans the page.
+    // Skip that pass when the product cannot be a table (a few rules).
+    let tall_n = large
+        .len()
+        .saturating_sub(wide.len())
+        .saturating_sub(dual.len());
+    let cross_n =
+        (wide.len() + dual.len()).saturating_mul(tall_n) + dual.len().saturating_mul(wide.len());
+    if cross_n > 0 && cross_n <= MAX_CLUSTER_PAIRS_PER_CELL {
+        for &i in wide.iter().chain(&dual) {
+            let (x, _, w, _) = rects[i];
+            let x_lo = grid_coord(x - tolerance, cell);
+            let x_hi = grid_coord(x + w + tolerance, cell);
+            union_rect_against_bands(&mut uf, rects, i, &large_x, x_lo, x_hi, tolerance);
+        }
+        for &i in &dual {
+            let (_, y, _, h) = rects[i];
+            let y_lo = grid_coord(y - tolerance, cell);
+            let y_hi = grid_coord(y + h + tolerance, cell);
+            union_rect_against_bands(&mut uf, rects, i, &large_y, y_lo, y_hi, tolerance);
         }
     }
 
@@ -1996,17 +2209,249 @@ fn without_dominant_page_backgrounds(rects: &[(f32, f32, f32, f32)]) -> Vec<(f32
         .collect()
 }
 
-/// Detect a table from cell-background rects that failed grid detection.
+/// Repeated rows of touching cell rectangles are stronger table evidence
+/// than the bar-length variation used by the chart detector.
 ///
-/// Uses rect Y-edges for row boundaries and text X-position clustering for
-/// columns.  Handles tables with cell backgrounds that don't form a clean
-/// X-edge grid (variable column widths, decorative fills).
-/// Chart-bar signature: ≥3 rects sharing an aligned bottom edge (the axis),
-/// with similar widths (bars) but strongly varying heights (data-driven),
-/// holding at most a single numeric data label each. Bar charts drawn as
-/// filled rects otherwise read as cell rects and grid their axis labels
-/// into a phantom table. The mirrored check catches horizontal bar charts.
-fn is_chart_bar_cluster(
+/// Ruled tables with wrapped labels naturally have variable row heights, and
+/// numeric-heavy cells can otherwise resemble horizontal or vertical bars.
+/// Require several rows to repeat a shared edge schema before overriding the
+/// chart hypothesis so sparse plots and independent bars remain unaffected.
+fn is_repeated_cell_grid(group_rects: &[(f32, f32, f32, f32)]) -> bool {
+    type RowGroup = (f32, f32, Vec<(f32, f32)>);
+
+    const ROW_EDGE_TOLERANCE: f32 = 3.0;
+    const MIN_GRID_ROWS: usize = 4;
+    const MIN_CELLS_PER_ROW: usize = 3;
+
+    if group_rects.len() < MIN_GRID_ROWS * MIN_CELLS_PER_ROW {
+        return false;
+    }
+
+    let mut row_groups: Vec<RowGroup> = Vec::new();
+    for &(x, y, width, height) in group_rects {
+        if width < 5.0 || height < 5.0 {
+            continue;
+        }
+        let top = y + height;
+        if let Some((_, _, cells)) = row_groups.iter_mut().find(|(bottom, row_top, _)| {
+            (y - *bottom).abs() <= ROW_EDGE_TOLERANCE
+                && (top - *row_top).abs() <= ROW_EDGE_TOLERANCE
+        }) {
+            cells.push((x, x + width));
+        } else {
+            row_groups.push((y, top, vec![(x, x + width)]));
+        }
+    }
+
+    let mut row_schemas = Vec::new();
+    for (_, _, mut cells) in row_groups {
+        if cells.len() < MIN_CELLS_PER_ROW {
+            continue;
+        }
+        let mut widths: Vec<f32> = cells.iter().map(|&(left, right)| right - left).collect();
+        widths.sort_by(f32::total_cmp);
+        let median_width = widths[widths.len() / 2];
+        cells.retain(|&(left, right)| right - left <= median_width * 2.5);
+        cells.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+        });
+        cells.dedup_by(|left, right| {
+            (left.0 - right.0).abs() <= ROW_EDGE_TOLERANCE
+                && (left.1 - right.1).abs() <= ROW_EDGE_TOLERANCE
+        });
+        if cells.len() < MIN_CELLS_PER_ROW
+            || cells
+                .windows(2)
+                .any(|pair| pair[1].0 > pair[0].1 + ROW_EDGE_TOLERANCE)
+        {
+            continue;
+        }
+        let edges: Vec<f32> = cells
+            .iter()
+            .flat_map(|&(left, right)| [left, right])
+            .collect();
+        let schema = snap_edges(&edges, ROW_EDGE_TOLERANCE);
+        if schema.len() > MIN_CELLS_PER_ROW {
+            row_schemas.push(schema);
+        }
+    }
+    if row_schemas.len() < MIN_GRID_ROWS {
+        return false;
+    }
+
+    let reference = row_schemas
+        .iter()
+        .max_by_key(|schema| schema.len())
+        .expect("grid rows are non-empty");
+    row_schemas
+        .iter()
+        .filter(|schema| {
+            let comparable_edges = reference.len().min(schema.len());
+            let matched_edges = schema
+                .iter()
+                .filter(|edge| {
+                    reference
+                        .iter()
+                        .any(|reference_edge| (*edge - *reference_edge).abs() <= ROW_EDGE_TOLERANCE)
+                })
+                .count();
+            matched_edges > MIN_CELLS_PER_ROW && matched_edges * 4 >= comparable_edges * 3
+        })
+        .count()
+        >= MIN_GRID_ROWS
+}
+
+fn repeated_cell_grid_overrides_bar_hypothesis(group_rects: &[(f32, f32, f32, f32)]) -> bool {
+    is_repeated_cell_grid(group_rects)
+        && without_dominant_page_backgrounds(group_rects).len() == group_rects.len()
+}
+
+/// Detect horizontal segmented stacks from aligned rows of touching rects.
+///
+/// Category rows must have visible gutters and data-varying internal segment
+/// boundaries, unlike the stable boundaries of a ruled table.
+struct SegmentedBarGeometry {
+    bounds: (f32, f32, f32, f32),
+    row_bands: Vec<(f32, f32)>,
+}
+
+fn segmented_stacked_bar_geometry(
+    group_rects: &[(f32, f32, f32, f32)],
+) -> Option<SegmentedBarGeometry> {
+    type BarRow = (f32, f32, Vec<(f32, f32)>);
+
+    const EDGE_TOLERANCE: f32 = 3.0;
+    const MIN_ROWS: usize = 4;
+    const MIN_SEGMENTS: usize = 3;
+
+    let mut rows: Vec<BarRow> = Vec::new();
+    for &(x, y, width, height) in group_rects {
+        if width < 5.0 || height < 5.0 {
+            continue;
+        }
+        let top = y + height;
+        if let Some((_, _, segments)) = rows.iter_mut().find(|(bottom, row_top, _)| {
+            (y - *bottom).abs() <= EDGE_TOLERANCE && (top - *row_top).abs() <= EDGE_TOLERANCE
+        }) {
+            segments.push((x, x + width));
+        } else {
+            rows.push((y, top, vec![(x, x + width)]));
+        }
+    }
+
+    rows.retain_mut(|(_, _, segments)| {
+        segments.sort_by(|left, right| left.0.total_cmp(&right.0));
+        segments.len() >= MIN_SEGMENTS
+            && segments
+                .windows(2)
+                .all(|pair| (pair[1].0 - pair[0].1).abs() <= EDGE_TOLERANCE)
+    });
+    if rows.len() < MIN_ROWS {
+        return None;
+    }
+    rows.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    // Table rows normally share borders. Horizontal stacked bars instead
+    // leave a visible gutter between category rows.
+    if rows.windows(2).any(|pair| {
+        let shorter_height = (pair[0].1 - pair[0].0).min(pair[1].1 - pair[1].0);
+        pair[1].0 - pair[0].1 < (shorter_height * 0.25).max(2.0)
+    }) {
+        return None;
+    }
+
+    // At least two rows must move an internal segment boundary. Stable
+    // boundaries across every row are stronger evidence for a ruled table.
+    let reference_edges: Vec<f32> = rows[0]
+        .2
+        .iter()
+        .take(rows[0].2.len() - 1)
+        .map(|segment| segment.1)
+        .collect();
+    let drifting_rows = rows
+        .iter()
+        .skip(1)
+        .filter(|(_, _, segments)| {
+            let edges: Vec<f32> = segments
+                .iter()
+                .take(segments.len() - 1)
+                .map(|segment| segment.1)
+                .collect();
+            edges.len() == reference_edges.len()
+                && edges
+                    .iter()
+                    .zip(&reference_edges)
+                    .any(|(edge, reference)| (edge - reference).abs() > EDGE_TOLERANCE)
+        })
+        .count();
+    if drifting_rows < 2 {
+        return None;
+    }
+
+    let left = rows
+        .iter()
+        .flat_map(|row| &row.2)
+        .map(|segment| segment.0)
+        .reduce(f32::min)?;
+    let right = rows
+        .iter()
+        .flat_map(|row| &row.2)
+        .map(|segment| segment.1)
+        .reduce(f32::max)?;
+    let bottom = rows.iter().map(|row| row.0).reduce(f32::min)?;
+    let top = rows.iter().map(|row| row.1).reduce(f32::max)?;
+    let row_bands = rows.iter().map(|row| (row.0, row.1)).collect();
+    Some(SegmentedBarGeometry {
+        bounds: (left, bottom, right, top),
+        row_bands,
+    })
+}
+
+/// Category labels beside multiple bar rows are independent chart evidence:
+/// numeric table text stays inside its cells, regardless of whether the table
+/// has an outer border or extra padding.
+fn has_external_segmented_bar_labels(
+    items: &[TextItem],
+    page: u32,
+    geometry: &SegmentedBarGeometry,
+) -> bool {
+    const LABEL_EDGE_TOLERANCE: f32 = 3.0;
+    const LABEL_CLAIM_PAD: f32 = 20.0;
+
+    let (content_left, _, content_right, _) = geometry.bounds;
+    let labeled_rows = geometry
+        .row_bands
+        .iter()
+        .filter(|&&(row_bottom, row_top)| {
+            items.iter().any(|item| {
+                if item.page != page || item.text.trim().is_empty() {
+                    return false;
+                }
+                let item_left = item.x.min(item.x + item.width);
+                let item_right = item.x.max(item.x + item.width);
+                let item_center_x = (item_left + item_right) / 2.0;
+                let item_center_y = item.y + item.height / 2.0;
+                let beside_stack = (item_center_x <= content_left + LABEL_EDGE_TOLERANCE
+                    && item_center_x >= content_left - LABEL_CLAIM_PAD
+                    && item_left < content_left)
+                    || (item_center_x >= content_right - LABEL_EDGE_TOLERANCE
+                        && item_center_x <= content_right + LABEL_CLAIM_PAD
+                        && item_right > content_right);
+                beside_stack
+                    && item_center_y >= row_bottom - LABEL_EDGE_TOLERANCE
+                    && item_center_y <= row_top + LABEL_EDGE_TOLERANCE
+            })
+        })
+        .count();
+
+    labeled_rows >= 2 && labeled_rows * 2 >= geometry.row_bands.len()
+}
+
+/// Recognize filled vertical or horizontal bars whose geometry and labels are
+/// data-driven rather than uniform table cells.
+fn has_chart_bar_signature(
     items: &[TextItem],
     group_rects: &[(f32, f32, f32, f32)],
     page: u32,
@@ -2111,6 +2556,30 @@ fn is_chart_bar_cluster(
     bar_family(|r| r.0, |r| r.2, |r| r.3, |r| r.1)
         // horizontal bars: position/breadth = y/height, length = width, along = x
         || bar_family(|r| r.1, |r| r.3, |r| r.2, |r| r.0)
+}
+
+fn is_chart_bar_cluster(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> bool {
+    let has_bar_signature = has_chart_bar_signature(items, group_rects, page);
+
+    // A segmented horizontal chart can share most of its edges across rows.
+    // Row-aligned category labels outside the stack distinguish it from a
+    // numeric table without depending on whether either shape has a frame.
+    if has_bar_signature {
+        if let Some(geometry) = segmented_stacked_bar_geometry(group_rects) {
+            if has_external_segmented_bar_labels(items, page, &geometry) {
+                return true;
+            }
+        }
+    }
+    if repeated_cell_grid_overrides_bar_hypothesis(group_rects) {
+        return false;
+    }
+
+    has_bar_signature
 }
 
 fn detect_row_stripe_table_from_cell_rects(
@@ -3083,6 +3552,194 @@ mod tests {
         assert!(detect_chart_regions(&items, &rects, 1).is_empty());
     }
 
+    #[test]
+    fn variable_height_ruled_grid_overrides_bar_hypothesis() {
+        let edge_sets = [
+            [80.0, 140.0, 200.0, 260.0, 320.0, 380.0, 440.0, 500.0, 560.0],
+            [80.0, 140.0, 210.0, 260.0, 320.0, 380.0, 450.0, 500.0, 560.0],
+        ];
+        let heights = [20.0, 34.0, 26.0, 42.0, 20.0, 34.0];
+        let edge_variants = [0, 0, 0, 0, 1, 1];
+        let mut rects = Vec::new();
+        let mut y = 650.0;
+        for (row, height) in heights.into_iter().enumerate() {
+            let edges = edge_sets[edge_variants[row]];
+            rects.extend(
+                edges
+                    .windows(2)
+                    .map(|edge| (edge[0], y, edge[1] - edge[0], height)),
+            );
+            y -= height;
+        }
+
+        assert!(is_repeated_cell_grid(&rects));
+        assert!(has_chart_bar_signature(&[], &rects, 1));
+        assert!(repeated_cell_grid_overrides_bar_hypothesis(&rects));
+        assert!(segmented_stacked_bar_geometry(&rects).is_none());
+        assert!(!is_chart_bar_cluster(&[], &rects, 1));
+
+        let mut with_page_fills =
+            vec![(0.0, 0.0, 600.0, 800.0); DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        with_page_fills.extend(rects);
+        assert!(!repeated_cell_grid_overrides_bar_hypothesis(
+            &with_page_fills
+        ));
+    }
+
+    #[test]
+    fn touching_segments_with_spaced_rows_remain_a_chart() {
+        let row_edges = [
+            [100.0, 140.0, 180.0, 220.0, 260.0],
+            [100.0, 140.0, 180.0, 228.0, 260.0],
+            [100.0, 140.0, 180.0, 214.0, 260.0],
+            [100.0, 140.0, 180.0, 232.0, 260.0],
+        ];
+        let mut raw_rects = vec![(90.0, 530.0, 190.0, 100.0)];
+        for (row, edges) in row_edges.into_iter().enumerate() {
+            let y = 540.0 + row as f32 * 20.0;
+            raw_rects.extend(
+                edges
+                    .windows(2)
+                    .map(|edge| (edge[0], y, edge[1] - edge[0], 12.0)),
+            );
+        }
+        let items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("Category", 62.0, 541.0 + row as f32 * 20.0, 9.0))
+            .collect();
+
+        assert!(is_repeated_cell_grid(&raw_rects));
+        assert!(has_chart_bar_signature(&items, &raw_rects, 1));
+        let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented stack");
+        assert!(has_external_segmented_bar_labels(&items, 1, &geometry));
+        assert!(is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let numeric_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("2024", 80.0, 541.0 + row as f32 * 18.0, 9.0))
+            .collect();
+        assert!(has_external_segmented_bar_labels(
+            &numeric_items,
+            1,
+            &geometry
+        ));
+        assert!(is_chart_bar_cluster(&numeric_items, &raw_rects, 1));
+
+        let edge_adjacent_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("2024", 92.0, 541.0 + row as f32 * 18.0, 9.0))
+            .collect();
+        assert!(has_external_segmented_bar_labels(
+            &edge_adjacent_items,
+            1,
+            &geometry
+        ));
+        assert!(is_chart_bar_cluster(&edge_adjacent_items, &raw_rects, 1));
+
+        let far_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("Category", 20.0, 541.0 + row as f32 * 18.0, 9.0))
+            .collect();
+        assert!(!has_external_segmented_bar_labels(&far_items, 1, &geometry));
+        assert!(!is_chart_bar_cluster(&far_items, &raw_rects, 1));
+
+        let rects: Vec<PdfRect> = raw_rects
+            .into_iter()
+            .map(|(x, y, width, height)| PdfRect {
+                x,
+                y,
+                width,
+                height,
+                page: 1,
+            })
+            .collect();
+        assert_eq!(detect_chart_regions(&items, &rects, 1).len(), 1);
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(tables.is_empty());
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn padded_numeric_grid_frame_remains_a_table() {
+        let row_edges = [
+            [100.0, 140.0, 180.0, 220.0, 260.0],
+            [100.0, 140.0, 180.0, 228.0, 260.0],
+            [100.0, 140.0, 180.0, 214.0, 260.0],
+            [100.0, 140.0, 180.0, 232.0, 260.0],
+        ];
+        let mut raw_rects = vec![(96.0, 536.0, 168.0, 80.0)];
+        let mut items = Vec::new();
+        for (row, edges) in row_edges.into_iter().enumerate() {
+            let y = 540.0 + row as f32 * 20.0;
+            for edge in edges.windows(2) {
+                raw_rects.push((edge[0], y, edge[1] - edge[0], 12.0));
+                items.push(make_item("42", edge[0] + 8.0, y + 1.0, 9.0));
+            }
+        }
+
+        assert!(is_repeated_cell_grid(&raw_rects));
+        assert!(has_chart_bar_signature(&items, &raw_rects, 1));
+        let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented rows");
+        assert!(!has_external_segmented_bar_labels(&items, 1, &geometry));
+        assert!(!is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let flush_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("1", 100.0, 541.0 + row as f32 * 20.0, 9.0))
+            .collect();
+        assert!(!has_external_segmented_bar_labels(
+            &flush_items,
+            1,
+            &geometry
+        ));
+        assert!(!is_chart_bar_cluster(&flush_items, &raw_rects, 1));
+
+        let rects: Vec<PdfRect> = raw_rects
+            .into_iter()
+            .map(|(x, y, width, height)| PdfRect {
+                x,
+                y,
+                width,
+                height,
+                page: 1,
+            })
+            .collect();
+        assert!(detect_chart_regions(&items, &rects, 1).is_empty());
+        assert!(!detect_tables_from_rects(&items, &rects, 1).0.is_empty());
+    }
+
+    #[test]
+    fn frameless_segmented_chart_with_category_labels_remains_a_chart() {
+        let row_edges = [
+            [100.0, 140.0, 180.0, 220.0, 260.0],
+            [100.0, 140.0, 180.0, 228.0, 260.0],
+            [100.0, 140.0, 180.0, 214.0, 260.0],
+            [100.0, 140.0, 180.0, 232.0, 260.0],
+        ];
+        let mut raw_rects = Vec::new();
+        let mut items = Vec::new();
+        for (row, edges) in row_edges.into_iter().enumerate() {
+            let y = 540.0 + row as f32 * 18.0;
+            raw_rects.extend(
+                edges
+                    .windows(2)
+                    .map(|edge| (edge[0], y, edge[1] - edge[0], 12.0)),
+            );
+            items.push(make_item("Category", 62.0, y + 1.0, 9.0));
+        }
+
+        let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented stack");
+        assert!(has_external_segmented_bar_labels(&items, 1, &geometry));
+        assert!(is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let rects: Vec<PdfRect> = raw_rects
+            .into_iter()
+            .map(|(x, y, width, height)| PdfRect {
+                x,
+                y,
+                width,
+                height,
+                page: 1,
+            })
+            .collect();
+        assert_eq!(detect_chart_regions(&items, &rects, 1).len(), 1);
+    }
+
     // --- detect_stacked_box_table ---
 
     /// N stacked boxes at x=100, w=300, h=22, top-to-bottom from y=600.
@@ -3364,6 +4021,113 @@ mod tests {
         let groups = cluster_rects(&rects, 0.0, 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_overlapping_grid_still_clusters() {
+        // Neighboring cells overlap; the grid must still union the whole table.
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            for col in 0..4 {
+                rects.push((col as f32 * 9.0, row as f32 * 9.0, 10.0, 10.0));
+            }
+        }
+        let groups = cluster_rects(&rects, 0.0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 16);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_disjoint_stays_subquadratic() {
+        // Pairwise-disjoint rects never merge, so a component-size cap does
+        // not stop all-pairs overlap tests. Spread in X so they land in
+        // different grid cells; 8k is enough that n² tests would dominate.
+        let n = 8_000usize;
+        let rects: Vec<(f32, f32, f32, f32)> =
+            (0..n).map(|i| (i as f32 * 20.0, 0.0, 10.0, 10.0)).collect();
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_rects_stacked_disjoint_does_not_starve_later_table() {
+        // Same X, spread in Y: a spatial grid must still union an overlapping
+        // pair in another region of the page.
+        let n = 8_000usize;
+        let mut rects: Vec<(f32, f32, f32, f32)> =
+            (0..n).map(|i| (0.0, i as f32 * 20.0, 10.0, 10.0)).collect();
+        rects.push((500.0, 0.0, 10.0, 10.0));
+        rects.push((508.0, 0.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_oversized_span_still_unions() {
+        // Wider than 64 grid cells; must still union the small overlapping rect.
+        let rects = vec![(0.0, 0.0, 5000.0, 10.0), (4900.0, 0.0, 10.0, 10.0)];
+        let groups = cluster_rects(&rects, 0.0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_oversized_spans_all_get_a_pass() {
+        // More than 32 huge rects: the last one must still union its overlap.
+        let mut rects: Vec<(f32, f32, f32, f32)> = (0..40)
+            .map(|i| (0.0, i as f32 * 20.0, 5000.0, 10.0))
+            .collect();
+        rects.push((4900.0, 39.0 * 20.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_oversized_not_starved_by_earlier_disjoint() {
+        // 9k earlier disjoint drawings would exhaust an index-order cap of
+        // 8,192 before the overlapping cell is visited.
+        let mut rects: Vec<(f32, f32, f32, f32)> = (0..9_000)
+            .map(|i| (10_000.0, i as f32 * 20.0, 10.0, 10.0))
+            .collect();
+        let wide = rects.len();
+        rects.push((0.0, 0.0, 5000.0, 10.0));
+        let target = rects.len();
+        rects.push((4900.0, 0.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert!(
+            groups
+                .iter()
+                .any(|g| g.contains(&wide) && g.contains(&target)),
+            "wide rule and far-end cell must share a cluster"
+        );
+    }
+
+    #[test]
+    fn test_cluster_rects_wide_and_tall_oversized_union() {
+        let rects = vec![(0.0, 0.0, 5000.0, 10.0), (0.0, 0.0, 10.0, 5000.0)];
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_dual_oversized_spans_coarse_y() {
+        let rects = vec![(0.0, 0.0, 5000.0, 5000.0), (0.0, 4500.0, 5000.0, 5000.0)];
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_wide_and_tall_stays_subquadratic() {
+        let mut rects = Vec::with_capacity(4_000);
+        for i in 0..2_000 {
+            rects.push((0.0, i as f32 * 20.0, 5000.0, 10.0));
+            rects.push((i as f32 * 20.0, 0.0, 10.0, 5000.0));
+        }
+        let _groups = cluster_rects(&rects, 0.0, 2);
     }
 
     // --- snap_edges ---

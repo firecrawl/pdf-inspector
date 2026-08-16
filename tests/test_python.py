@@ -203,6 +203,79 @@ class TestExtractTextWithPositions:
         assert len(items) > 0
         assert all(item.page == 1 for item in items)
 
+    def test_mcid(self):
+        # Untagged fixture: mcid is None or int, never anything else
+        items = pdf_inspector.extract_text_with_positions(
+            fixture_path("thermo-freon12.pdf")
+        )
+        assert all(item.mcid is None or isinstance(item.mcid, int) for item in items)
+        # Tagged fixture: marked content carries MCIDs
+        tagged = pdf_inspector.extract_text_with_positions(
+            fixture_path("firecrawl_docs_tagged.pdf")
+        )
+        assert any(item.mcid is not None for item in tagged)
+
+
+# ---------------------------------------------------------------------------
+# extract_structure_elements / extract_structure_elements_bytes
+# ---------------------------------------------------------------------------
+
+
+class TestExtractStructureElements:
+    def test_tagged_file(self):
+        elements = pdf_inspector.extract_structure_elements(
+            fixture_path("firecrawl_docs_tagged.pdf")
+        )
+        assert len(elements) > 0
+        assert all(isinstance(e.page, int) for e in elements)
+        assert all(isinstance(e.mcid, int) for e in elements)
+        assert all(isinstance(e.role, str) and len(e.role) > 0 for e in elements)
+        assert any(e.role == "H1" for e in elements)
+
+    def test_join_with_text_items(self):
+        # (page, mcid) joins against extract_text_with_positions to recover
+        # heading text
+        path = fixture_path("firecrawl_docs_tagged.pdf")
+        elements = pdf_inspector.extract_structure_elements(path)
+        items = pdf_inspector.extract_text_with_positions(path)
+        h1_refs = {(e.page, e.mcid) for e in elements if e.role == "H1"}
+        h1_text = "".join(
+            item.text
+            for item in items
+            if item.mcid is not None and (item.page, item.mcid) in h1_refs
+        )
+        assert len(h1_text.strip()) > 0
+
+    def test_with_pages(self):
+        # pages filter is 1-indexed, matching TextItem.page
+        elements = pdf_inspector.extract_structure_elements(
+            fixture_path("firecrawl_docs_tagged.pdf"), pages=[1]
+        )
+        assert len(elements) > 0
+        assert all(e.page == 1 for e in elements)
+
+    def test_bytes(self):
+        data = fixture_bytes("firecrawl_docs_tagged.pdf")
+        elements = pdf_inspector.extract_structure_elements_bytes(data)
+        assert len(elements) > 0
+        assert any(e.role == "H1" for e in elements)
+
+    def test_untagged_returns_empty(self):
+        elements = pdf_inspector.extract_structure_elements(
+            fixture_path("thermo-freon12.pdf")
+        )
+        assert elements == []
+
+    def test_repr(self):
+        elements = pdf_inspector.extract_structure_elements(
+            fixture_path("firecrawl_docs_tagged.pdf")
+        )
+        assert "StructureElement" in repr(elements[0])
+
+    def test_not_a_pdf(self):
+        with pytest.raises(ValueError):
+            pdf_inspector.extract_structure_elements_bytes(b"not a pdf")
+
 
 # ---------------------------------------------------------------------------
 # extract_text_in_regions / extract_text_in_regions_bytes

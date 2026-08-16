@@ -1382,7 +1382,13 @@ fn scan_content_for_text_operators(
     let is_word_end =
         |pos: usize| -> bool { pos + 1 >= content.len() || content[pos + 1].is_ascii_whitespace() };
 
-    // Simple state machine to find operators
+    // Simple state machine to find operators.
+    // Each Tj/TJ/Tf lookback stops at the previous text/font operator so a
+    // malformed `] TJ` (no `[`) cannot rescan the entire prefix — that was
+    // quadratic in the number of operators.
+    // `Tj`/`TJ` are only counted when the preceding token closes a string or
+    // array (')', '>', ']'), so `Tj` inside `(Hello Tj World)` cannot pin the floor.
+    let mut operand_floor = 0usize;
     let mut i = 0;
     while i < content.len() {
         let b = content[i];
@@ -1392,14 +1398,15 @@ fn scan_content_for_text_operators(
             let next = content[i + 1];
             if next == b'j' || next == b'J' {
                 // Verify it's an operator (followed by whitespace or newline)
-                if i + 2 >= content.len()
+                if (i + 2 >= content.len()
                     || content[i + 2].is_ascii_whitespace()
                     || content[i + 2] == b'\n'
-                    || content[i + 2] == b'\r'
+                    || content[i + 2] == b'\r')
+                    && preceding_operand_closer(content, i, operand_floor)
                 {
                     text_ops += 1;
-                    // Scan backward for text string operand to collect unique chars
-                    collect_text_chars_before(content, i, unique_chars);
+                    collect_text_chars_before(content, i, unique_chars, operand_floor);
+                    operand_floor = i;
                 }
             } else if next == b'f' {
                 // Tf = set font operator
@@ -1415,12 +1422,10 @@ fn scan_content_for_text_operators(
                     || content[i + 2] == b'<'
                     || content[i + 2] == b'/'
                 {
-                    font_changes += 1;
-                    // Extract the font name operand preceding the size + Tf.
-                    // Pattern: /FontName <size> Tf
-                    // Scan backward past the size number and whitespace to find /Name.
-                    if let Some(name) = extract_font_name_before_tf(content, i) {
+                    if let Some(name) = extract_font_name_before_tf(content, i, operand_floor) {
                         used_font_names.insert(name);
+                        font_changes += 1;
+                        operand_floor = i;
                     }
                 }
             }
@@ -1466,6 +1471,20 @@ fn scan_content_for_text_operators(
     (text_ops, image_count, path_ops, font_changes)
 }
 
+/// True when the token before `op_pos` (skipping whitespace, not crossing
+/// `floor`) is a string/array closer. Used so `Tj` inside `(Hello Tj World)`
+/// is not treated as an operator.
+fn preceding_operand_closer(content: &[u8], op_pos: usize, floor: usize) -> bool {
+    let mut j = op_pos;
+    while j > floor {
+        j -= 1;
+        if !content[j].is_ascii_whitespace() {
+            return matches!(content[j], b')' | b'>' | b']');
+        }
+    }
+    false
+}
+
 /// Extract the font name operand from content stream bytes preceding a Tf operator.
 ///
 /// The Tf operator syntax is: `/FontName size Tf`
@@ -1473,25 +1492,27 @@ fn scan_content_for_text_operators(
 /// whitespace to find the `/Name` token.
 ///
 /// Returns the font name bytes (without the leading `/`), e.g. `b"F1"` for `/F1`.
-fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>> {
+/// `floor` is the start of the previous text/font operator (or 0); lookback
+/// must not cross it.
+fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> Option<Vec<u8>> {
     // Scan backward past whitespace before "Tf"
     let mut j = tf_pos;
-    while j > 0 && content[j - 1].is_ascii_whitespace() {
+    while j > floor && content[j - 1].is_ascii_whitespace() {
         j -= 1;
     }
     // Scan backward past the size number (digits, '.', '-')
-    while j > 0
+    while j > floor
         && (content[j - 1].is_ascii_digit() || content[j - 1] == b'.' || content[j - 1] == b'-')
     {
         j -= 1;
     }
     // Scan backward past whitespace between font name and size
-    while j > 0 && content[j - 1].is_ascii_whitespace() {
+    while j > floor && content[j - 1].is_ascii_whitespace() {
         j -= 1;
     }
     // Now j should point just after the font name. Scan backward to find '/'.
     let name_end = j;
-    while j > 0 && content[j - 1] != b'/' {
+    while j > floor && content[j - 1] != b'/' {
         // Font names consist of regular characters (not whitespace, not delimiters)
         if content[j - 1].is_ascii_whitespace() || content[j - 1] == b'(' || content[j - 1] == b')'
         {
@@ -1499,7 +1520,7 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>>
         }
         j -= 1;
     }
-    if j == 0 || content[j - 1] != b'/' {
+    if j <= floor || content[j - 1] != b'/' {
         return None;
     }
     // j-1 is the '/', font name is content[j..name_end]
@@ -1514,16 +1535,24 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>>
 /// and collect unique non-whitespace bytes from it.
 ///
 /// Handles both literal strings `(...)` and hex strings `<...>`.
-fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut HashSet<u8>) {
+/// `floor` is the start of the previous text/font operator (or 0); lookback
+/// must not cross it, or a missing `[` before `TJ` rescans the whole prefix.
+fn collect_text_chars_before(
+    content: &[u8],
+    op_pos: usize,
+    unique_chars: &mut HashSet<u8>,
+    floor: usize,
+) {
     // Walk backward past whitespace to find the closing delimiter
     let mut j = op_pos;
-    while j > 0 {
+    while j > floor {
         j -= 1;
         if !content[j].is_ascii_whitespace() {
             break;
         }
     }
-    if j == 0 {
+    // All whitespace, or we landed on the previous operator token.
+    if j == floor {
         return;
     }
 
@@ -1533,7 +1562,7 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
         // Literal string: scan backward for matching '('
         let mut depth = 1i32;
         let mut k = j;
-        while k > 0 && depth > 0 {
+        while k > floor && depth > 0 {
             k -= 1;
             match content[k] {
                 b')' if k == 0 || content[k - 1] != b'\\' => depth += 1,
@@ -1552,7 +1581,7 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
     } else if closing == b'>' {
         // Hex string: scan backward for '<'
         let mut k = j;
-        while k > 0 {
+        while k > floor {
             k -= 1;
             if content[k] == b'<' {
                 break;
@@ -1582,7 +1611,7 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
     } else if closing == b']' {
         // TJ array: scan backward for '[' and collect from all strings inside
         let mut k = j;
-        while k > 0 {
+        while k > floor {
             k -= 1;
             if content[k] == b'[' {
                 break;
@@ -1659,7 +1688,15 @@ fn hex_val(b: u8) -> Option<u8> {
 /// Standard page: 612x792 points (US Letter) = ~485,000 sq points
 /// At 2x resolution that's ~1.9M pixels, so we use 250K pixels as threshold
 /// (accounting for varying DPI and page sizes)
-fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
+/// Returns `(has_images, total_image_area, has_template_image)` for a page.
+/// `has_template_image` means a single large (>50% page coverage)
+/// background image — the signal `classify_pdf`/`detect_pdf_type` uses to
+/// route a page to OCR regardless of any incidental native text drawn over
+/// it. Exposed at crate visibility so extraction-side per-page `needs_ocr`
+/// computation (`extract_pages_markdown_mem`) can consult the same signal
+/// instead of maintaining its own, independent notion of "needs OCR" that
+/// can silently disagree with detection — see #227.
+pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
     // Threshold: image covering roughly half a page at 150+ DPI
     // 612 * 792 / 2 * (150/72)^2 ≈ 1M pixels, but we'll be conservative
     const TEMPLATE_IMAGE_THRESHOLD: u64 = 500_000; // 500K pixels
@@ -1739,6 +1776,62 @@ fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
     }
 
     (has_images, total_area, has_template_image)
+}
+
+/// Computes both `(needs_ocr_for_template_image, has_vector_text)` for a
+/// page from a single shared `analyze_page_content` pass — that call
+/// decompresses and scans every content stream (page + XObjects) plus
+/// image coverage, so `extract_pages_markdown_mem` must not invoke it
+/// twice per page (once per signal) the way `detect_from_document` avoids
+/// by caching its per-page `PageAnalysis`.
+///
+/// `needs_ocr_for_template_image` is true when a page's template image
+/// should be treated as a scan needing OCR — a single full-page background
+/// image with little/no real text — rather than a text page that happens
+/// to carry a watermark, letterhead, or figure. Mirrors the two distinct
+/// signals classification uses to route a template-image page to OCR:
+///
+/// 1. `looks_like_scan`: image_count <= 1, few text operators (<50), and
+///    low alphanumeric diversity in raw string operands (unless decodable
+///    CID/ToUnicode fonts explain that away) — the gate used for
+///    `pages_with_template_images` and Mixed-type per-page routing.
+/// 2. Insufficient real text volume, using `DetectionConfig::default()`'s
+///    `min_text_ops_per_page` (3) — the same threshold Mixed-type per-page
+///    routing applies via `text_operator_count < config.min_text_ops_per_page
+///    && has_images` (simplified here since a template image implies
+///    `has_images`). Deliberately *not* the higher `effective_min_ops`
+///    floor (`min_text_ops_per_page.max(10)`) that whole-document
+///    `PdfType::ImageBased`/`Scanned` classification uses for
+///    `pages_with_text` — that's a cross-page aggregate decision this
+///    per-page function has no way to replicate exactly, and the lower
+///    per-page threshold is the one a single page's own signals can
+///    actually agree with.
+///
+/// `has_vector_text` is true when a page has vector-outlined text (glyphs
+/// drawn as paths rather than shown via text-showing operators) —
+/// `detect_from_document`'s Mixed-type per-page routing always sends
+/// these pages to OCR, independent of any template-image check, since
+/// outlined glyphs can't be extracted as text at all.
+///
+/// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
+/// the same gates classification needs elsewhere instead of treating the
+/// raw signals alone as sufficient — see #227/#231.
+pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool) {
+    let analysis = analyze_page_content(doc, page_id);
+
+    let needs_ocr_for_template_image = if !analysis.has_template_image {
+        false
+    } else {
+        let alphanum_low = analysis.unique_alphanum_chars < 10
+            && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
+        let looks_like_scan =
+            analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
+        let insufficient_text =
+            analysis.text_operator_count < DetectionConfig::default().min_text_ops_per_page;
+        looks_like_scan || insufficient_text
+    };
+
+    (needs_ocr_for_template_image, analysis.has_vector_text)
 }
 
 /// Recursively collect image dimensions from XObject resources,
@@ -1948,6 +2041,51 @@ mod tests {
             scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
         assert_eq!(ops3, 0);
         assert_eq!(imgs3, 0);
+    }
+
+    #[test]
+    fn test_scan_content_successive_tj_collects_each_operand() {
+        // Lookback is floored at the previous Tj/TJ/Tf so later operators must
+        // still see their own operands.
+        let content = b"[(Hello)] TJ [(World)] TJ (More) Tj";
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, 3);
+        for &ch in b"HeloWrdM" {
+            assert!(uchars.contains(&ch), "missing char {}", ch as char);
+        }
+    }
+
+    #[test]
+    fn test_scan_content_tj_inside_literal_is_not_an_operator() {
+        // `Tj` followed by space inside a literal must not count as an operator
+        // or pin the lookback floor; the real `Tj` still collects the string.
+        let content = b"BT (Hello Tj World) Tj ET";
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, 1);
+        for &ch in b"HeloTjWrd" {
+            assert!(uchars.contains(&ch), "missing char {}", ch as char);
+        }
+    }
+
+    #[test]
+    fn test_scan_content_malformed_tj_lookback_stays_linear() {
+        // `] TJ` with no `[` used to walk the entire prefix for every operator
+        // (quadratic). 30k repeats is enough that a prefix rescan would dominate
+        // the test runtime; with the floor it is a single linear pass.
+        let n = 30_000usize;
+        let mut content = Vec::with_capacity(n * 5);
+        for _ in 0..n {
+            content.extend_from_slice(b"] TJ\n");
+        }
+        let mut uchars = HashSet::new();
+        let (ops, _, _, _) =
+            scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
+        assert_eq!(ops, n as u32);
+        assert!(uchars.is_empty());
     }
 
     #[test]
@@ -2708,14 +2846,14 @@ mod tests {
     fn test_extract_font_name_basic() {
         // Standard pattern: /F1 12 Tf
         let content = b"/F1 12 Tf";
-        let name = extract_font_name_before_tf(content, 6); // 'T' is at index 6
+        let name = extract_font_name_before_tf(content, 6, 0); // 'T' is at index 6
         assert_eq!(name, Some(b"F1".to_vec()));
     }
 
     #[test]
     fn test_extract_font_name_long_name() {
         let content = b"/ArialMT-Bold 9.5 Tf";
-        let name = extract_font_name_before_tf(content, 18);
+        let name = extract_font_name_before_tf(content, 18, 0);
         assert_eq!(name, Some(b"ArialMT-Bold".to_vec()));
     }
 

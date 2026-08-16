@@ -41,15 +41,110 @@ pub(crate) fn detect_columns(
     }
     debug!("page {}: detect_columns: {} items", page, page_items.len());
 
-    // Find page bounds
-    let x_min = page_items.iter().map(|i| i.x).fold(f32::INFINITY, f32::min);
-    let x_max = page_items
-        .iter()
-        .map(|i| i.x + effective_width(i))
-        .fold(f32::NEG_INFINITY, f32::max);
+    // The width of one ordinary page, used three ways below: as the largest
+    // credible width for a single text run, as the size of empty gap that marks
+    // content as detached, and as the span past which those checks run at all.
+    // This is a heuristic, not a format rule: PDF 2.0 sets no page-size limit,
+    // and since PDF 1.6 `UserUnit` scales a page's physical size independently
+    // of its coordinates. 14_400 units (200in at the default 1/72in unit) is
+    // the traditional Acrobat architectural limit, which makes it a reasonable
+    // "wider than any ordinary page" mark in coordinate space.
+    const MAX_PAGE_EXTENT: f32 = 14_400.0;
+    // A detached cluster is only dropped if it also holds a small minority of
+    // the items, so a genuine two-part layout keeps its full bounds even when
+    // the halves are far apart.
+    const MAX_TRIM_FRACTION: f32 = 0.10;
+
+    // Position and width of each item, skipping only non-finite geometry.
+    let finite_span = |i: &&TextItem| -> Option<(f32, f32)> {
+        let (left, width) = (i.x, effective_width(i));
+        (left.is_finite() && (left + width).is_finite()).then_some((left, width))
+    };
+
+    let (min_left, max_right, total) = page_items.iter().filter_map(finite_span).fold(
+        (f32::INFINITY, f32::NEG_INFINITY, 0usize),
+        |(lo, hi, n), (left, width)| (lo.min(left), hi.max(left + width), n + 1),
+    );
+
+    // No item had usable geometry, so there is no layout to report.
+    if total == 0 {
+        return vec![];
+    }
+
+    // Every threshold below (gutter margins, spanning-item width, the XY-cut
+    // margin) is a fraction of the page width, so a far item can set the scale
+    // for the whole page and shrink the effective detection window to a
+    // rounding error — real gutters then fall inside the margin band and a
+    // genuine multi-column page collapses to one region.
+    //
+    // Anything inside one page extent is ordinary, so the common case keeps the
+    // plain bounds and skips the work below entirely.
+    let (x_min, x_max) = if max_right - min_left <= MAX_PAGE_EXTENT {
+        (min_left, max_right)
+    } else {
+        // Discarding content needs positive evidence that it is not part of the
+        // layout, because a count-based rule alone cannot tell a stray from a
+        // sparse far sidebar. The evidence is geometric: positions are grouped
+        // into clusters separated by more than a whole page of continuous
+        // emptiness. Real content, however sparse, does not leave a void that
+        // large; a malformed coordinate sits alone beyond one.
+        let mut spans: Vec<(f32, f32)> = page_items.iter().filter_map(finite_span).collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut core: Option<std::ops::Range<usize>> = None;
+        let mut start = 0usize;
+        for i in 1..=spans.len() {
+            if i < spans.len() && spans[i].0 - spans[i - 1].0 <= MAX_PAGE_EXTENT {
+                continue;
+            }
+            if core.as_ref().is_none_or(|best| i - start > best.len()) {
+                core = Some(start..i);
+            }
+            start = i;
+        }
+        let mut core = core.unwrap_or(0..spans.len());
+
+        // Only drop the detached clusters when they are a small minority, so a
+        // genuine two-part layout keeps its full bounds.
+        let dropped = spans.len() - core.len();
+        if dropped as f32 > spans.len() as f32 * MAX_TRIM_FRACTION {
+            core = 0..spans.len();
+        }
+        let core = &spans[core];
+
+        // Positions cannot be inflated by a bogus width, so the spread of the
+        // content is a sound scale for judging one. A run much wider than the
+        // page's own content is a malformed width — the test is relative, so a
+        // genuinely large page keeps its genuinely long runs.
+        let (lo, widest_left) = (core[0].0, core[core.len() - 1].0);
+        let max_run_width = (widest_left - lo) + MAX_PAGE_EXTENT;
+        let hi = core
+            .iter()
+            .filter(|&&(_, width)| width <= max_run_width)
+            .map(|&(left, width)| left + width)
+            .fold(widest_left, f32::max);
+
+        if lo != min_left || hi != max_right {
+            debug!(
+                "page {page}: bounds {min_left}..{max_right} exceed one page; \
+                 dropped {dropped}/{} detached item(s), using {lo}..{hi}",
+                spans.len()
+            );
+        }
+        (lo, hi)
+    };
+
+    // Hard ceiling on the histogram size, independent of the trimming above:
+    // the bounds are attacker-influenced, so an unclamped
+    // `page_width / BIN_WIDTH` lets a crafted PDF force an arbitrarily large
+    // `vec![0u32; num_bins]` allocation. 65_536 bins covers ~128k points at
+    // BIN_WIDTH 2.0 — roughly 9x the largest legal page — so this never binds
+    // on a real layout. Kept as a bound that does not depend on the outlier
+    // heuristic staying correct.
+    const MAX_BINS: usize = 65_536;
 
     let page_width = x_max - x_min;
-    if page_width < 200.0 {
+    if !page_width.is_finite() || page_width < 200.0 {
         return vec![ColumnRegion { x_min, x_max }];
     }
 
@@ -57,13 +152,20 @@ pub(crate) fn detect_columns(
         return vec![ColumnRegion { x_min, x_max }];
     }
 
+    // Widen the bins rather than dropping the tail of the page. Clamping the
+    // count alone would leave anything past MAX_BINS * BIN_WIDTH outside the
+    // histogram, folded into the last bin, which places gutters at the wrong
+    // coordinates. Scaling keeps full coverage under the same allocation
+    // ceiling; only the resolution degrades, and only beyond ~131k points.
+    let bin_width = BIN_WIDTH.max(page_width / MAX_BINS as f32);
+
     // Build occupancy histogram.
     // Exclude items wider than 60% of page width — these are spanning items
     // (titles, full-width paragraphs) that would fill the gutter and prevent
     // detection of partial-page column layouts (e.g. two-column abstracts on
     // a page that also has single-column introduction text).
     let wide_threshold = page_width * 0.6;
-    let num_bins = ((page_width / BIN_WIDTH).ceil() as usize).max(1);
+    let num_bins = ((page_width / bin_width).ceil() as usize).clamp(1, MAX_BINS);
     let mut histogram = vec![0u32; num_bins];
 
     for item in &page_items {
@@ -71,8 +173,8 @@ pub(crate) fn detect_columns(
         if w > wide_threshold {
             continue;
         }
-        let left = ((item.x - x_min) / BIN_WIDTH).floor() as usize;
-        let right = (((item.x + w) - x_min) / BIN_WIDTH).ceil() as usize;
+        let left = ((item.x - x_min) / bin_width).floor() as usize;
+        let right = (((item.x + w) - x_min) / bin_width).ceil() as usize;
         let left = left.min(num_bins);
         let right = right.min(num_bins);
         for count in histogram.iter_mut().take(right).skip(left) {
@@ -109,12 +211,12 @@ pub(crate) fn detect_columns(
     let valleys: Vec<(usize, usize)> = valleys
         .into_iter()
         .filter(|&(start, end)| {
-            let width_pts = (end - start) as f32 * BIN_WIDTH;
+            let width_pts = (end - start) as f32 * bin_width;
             if width_pts < MIN_GUTTER_WIDTH {
                 return false;
             }
             // Valley center must not be within 5% of page edges
-            let center_pts = ((start + end) as f32 / 2.0) * BIN_WIDTH;
+            let center_pts = ((start + end) as f32 / 2.0) * bin_width;
             center_pts > margin_threshold && center_pts < (page_width - margin_threshold)
         })
         .collect();
@@ -132,7 +234,7 @@ pub(crate) fn detect_columns(
             &histogram,
             num_bins,
             x_min,
-            BIN_WIDTH,
+            bin_width,
             page_width,
             margin_threshold,
         );
@@ -141,7 +243,7 @@ pub(crate) fn detect_columns(
                 &rel_valleys,
                 &page_items,
                 x_min,
-                BIN_WIDTH,
+                bin_width,
                 x_max,
                 MIN_ITEMS_PER_COLUMN,
                 MIN_VERTICAL_SPAN_RATIO,
@@ -182,7 +284,7 @@ pub(crate) fn detect_columns(
         &valleys,
         &page_items,
         x_min,
-        BIN_WIDTH,
+        bin_width,
         x_max,
         MIN_ITEMS_PER_COLUMN,
         MIN_VERTICAL_SPAN_RATIO,
@@ -196,7 +298,7 @@ pub(crate) fn detect_columns(
         &valleys,
         &page_items,
         x_min,
-        BIN_WIDTH,
+        bin_width,
         x_max,
         MIN_ITEMS_PER_COLUMN,
         MIN_VERTICAL_SPAN_RATIO,
@@ -1827,7 +1929,7 @@ fn split_column_stragglers(lines: Vec<TextLine>) -> (Vec<TextLine>, Vec<TextLine
         .unwrap();
 
     let (cs, ce) = segments[core_seg];
-    let mut core = Vec::with_capacity(ce - cs);
+    let mut core = Vec::with_capacity(ce.saturating_sub(cs));
     let mut stragglers = Vec::new();
     for (i, line) in lines.into_iter().enumerate() {
         if i >= cs && i < ce {
@@ -2530,6 +2632,214 @@ mod tests {
         assert!(
             (620.0..=680.0).contains(&g2),
             "Second gutter at {g2}, expected between middle and right zones"
+        );
+    }
+
+    #[test]
+    fn extreme_far_coordinate_does_not_allocate_unboundedly() {
+        // A crafted PDF can place a text run at an arbitrary coordinate via the
+        // text matrix. The derived page width must not drive an unbounded
+        // histogram allocation (previously `page_width / BIN_WIDTH` bins with no
+        // upper bound would try to reserve terabytes and abort the process).
+        let mut items = Vec::new();
+        for i in 0..24 {
+            items.push(make_item(1, i as f32 * 10.0, 700.0 - i as f32 * 5.0, "A"));
+        }
+        // Item placed 1e12 points away — 5e11 bins if left unclamped.
+        items.push(make_item(1, 1e12, 700.0, "Z"));
+
+        // Must return without aborting; content is preserved as a single region.
+        let cols = detect_columns(&items, 1, false);
+        assert!(!cols.is_empty());
+    }
+
+    #[test]
+    fn non_finite_coordinates_never_leak_into_region_bounds() {
+        // An inf/NaN coordinate must not escape as a column boundary: callers
+        // treat these as page/column edges.
+        for bad_x in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let mut items = Vec::new();
+            for i in 0..24 {
+                items.push(make_item(1, i as f32 * 10.0, 700.0 - i as f32 * 5.0, "A"));
+            }
+            items.push(make_item(1, bad_x, 700.0, "Z"));
+
+            for col in detect_columns(&items, 1, false) {
+                assert!(
+                    col.x_min.is_finite() && col.x_max.is_finite(),
+                    "bad_x {bad_x} leaked bounds {}..{}",
+                    col.x_min,
+                    col.x_max
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_non_finite_coordinates_yield_no_columns() {
+        let items: Vec<TextItem> = (0..24)
+            .map(|i| make_item(1, f32::NAN, 700.0 - i as f32 * 5.0, "A"))
+            .collect();
+
+        assert!(detect_columns(&items, 1, false).is_empty());
+    }
+
+    #[test]
+    fn one_bad_item_does_not_disable_column_detection() {
+        // A single stray item should not collapse a clean two-column page to
+        // one region. Every gutter threshold is a fraction of the page width,
+        // so an untrimmed outlier pushes real gutters inside the rejected
+        // margin band. A malformed *width* at an ordinary position poisons the
+        // bounds just as a malformed position does.
+        for (label, bad_x, bad_width) in [
+            ("nan position", f32::NAN, 0.0),
+            ("inf position", f32::INFINITY, 0.0),
+            ("far position", 50_000.0, 0.0),
+            ("very far position", 1e12, 0.0),
+            ("huge width", 100.0, 1e12),
+            ("inf width", 100.0, f32::INFINITY),
+        ] {
+            let mut items = Vec::new();
+            items.extend(fill_zone(1, 30.0, 280.0, 750.0, 50.0));
+            items.extend(fill_zone(1, 320.0, 570.0, 750.0, 50.0));
+            let mut bad = make_item(1, bad_x, 400.0, "Z");
+            bad.width = bad_width;
+            items.push(bad);
+
+            let cols = detect_columns(&items, 1, false);
+            assert_eq!(
+                cols.len(),
+                2,
+                "{label}: expected 2 columns, got {}",
+                cols.len()
+            );
+            for col in &cols {
+                assert!(
+                    col.x_max - col.x_min <= MAX_PAGE_EXTENT_FOR_TEST,
+                    "{label}: region {}..{} exceeds one page",
+                    col.x_min,
+                    col.x_max
+                );
+            }
+        }
+    }
+
+    /// Mirrors `MAX_PAGE_EXTENT` in `detect_columns`.
+    const MAX_PAGE_EXTENT_FOR_TEST: f32 = 14_400.0;
+
+    #[test]
+    fn very_wide_page_keeps_full_histogram_coverage() {
+        // Beyond MAX_BINS * BIN_WIDTH (~131k points) the bins must widen rather
+        // than stop covering the page. Three zones: the first gutter is inside
+        // the old coverage limit, the second is past it. Because the first
+        // gutter is found, the XY-cut fallback never runs, so a truncated
+        // histogram silently reports two columns instead of three.
+        let mut items = Vec::new();
+        items.extend(fill_zone(1, 0.0, 60_000.0, 750.0, 700.0));
+        items.extend(fill_zone(1, 70_000.0, 140_000.0, 750.0, 700.0));
+        items.extend(fill_zone(1, 160_000.0, 200_000.0, 750.0, 700.0));
+
+        let cols = detect_columns(&items, 1, false);
+        assert_eq!(
+            cols.len(),
+            3,
+            "Expected 3 columns across a 200k-wide page, got {}",
+            cols.len()
+        );
+        assert!(
+            (140_000.0..=160_000.0).contains(&cols[1].x_max),
+            "second gutter at {}, expected inside the real 140k..160k gap",
+            cols[1].x_max
+        );
+    }
+
+    #[test]
+    fn large_page_with_legitimately_long_runs_is_kept() {
+        // On a very large page, individual runs can exceed one ordinary page's
+        // width. They are real content, so they must not be judged malformed:
+        // the page keeps its columns and its full right edge.
+        let mut items = Vec::new();
+        for row in 0..30 {
+            let y = 750.0 - row as f32 * 14.0;
+            let mut left = make_item(1, 0.0, y, "Left run");
+            left.width = 20_000.0;
+            let mut right = make_item(1, 25_000.0, y, "Right run");
+            right.width = 20_000.0;
+            items.extend([left, right]);
+        }
+
+        let cols = detect_columns(&items, 1, false);
+        assert!(
+            !cols.is_empty(),
+            "a page of long-but-valid runs must still report a layout"
+        );
+        let right_edge = cols
+            .iter()
+            .map(|c| c.x_max)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            right_edge > 44_000.0,
+            "long runs were treated as malformed: right edge {right_edge}, expected ~45_000"
+        );
+    }
+
+    #[test]
+    fn sparse_far_sidebar_on_a_large_page_is_kept() {
+        // A large-format page with a thin, sparsely-populated sidebar far from
+        // the main block. The sidebar is a small minority of the items, so an
+        // item-count rule alone would discard it — but nothing about its
+        // geometry says it is invalid, so its bounds must survive.
+        let mut items = Vec::new();
+        items.extend(fill_zone(1, 0.0, 12_000.0, 750.0, 500.0));
+        for i in 0..12 {
+            items.push(make_item(1, 24_000.0, 750.0 - i as f32 * 14.0, "Sidebar"));
+        }
+
+        let cols = detect_columns(&items, 1, false);
+        let right_edge = cols
+            .iter()
+            .map(|c| c.x_max)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            right_edge > 24_000.0,
+            "sidebar was trimmed away: right edge {right_edge}, expected >24_000"
+        );
+    }
+
+    #[test]
+    fn genuinely_wide_layout_keeps_its_true_bounds() {
+        // A large-format page whose content really is spread beyond one
+        // ordinary page must not be trimmed to the median cluster: its far
+        // items are the majority, not strays.
+        let mut items = Vec::new();
+        items.extend(fill_zone(1, 100.0, 20_000.0, 750.0, 600.0));
+        items.extend(fill_zone(1, 22_000.0, 40_000.0, 750.0, 600.0));
+
+        let cols = detect_columns(&items, 1, false);
+        let widest = cols
+            .iter()
+            .map(|c| c.x_max)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            widest > 35_000.0,
+            "wide layout was trimmed: right edge {widest}, expected ~40_000"
+        );
+    }
+
+    #[test]
+    fn oversized_but_legal_page_is_not_trimmed() {
+        // A wide-format page well inside the 14_400pt spec limit must keep its
+        // real bounds — outlier trimming is only for spans beyond a legal page.
+        let mut items = Vec::new();
+        items.extend(fill_zone(1, 100.0, 4_000.0, 750.0, 400.0));
+        items.extend(fill_zone(1, 4_400.0, 8_000.0, 750.0, 400.0));
+
+        let cols = detect_columns(&items, 1, false);
+        assert_eq!(cols.len(), 2, "Expected 2 columns, got {}", cols.len());
+        assert!(
+            cols[1].x_max > 7_000.0,
+            "right column should keep its true extent, got {}",
+            cols[1].x_max
         );
     }
 

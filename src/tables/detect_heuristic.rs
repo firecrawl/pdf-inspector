@@ -435,6 +435,72 @@ fn revised_table_cell_indices(
         .collect()
 }
 
+/// Index of candidate "body" items (larger-font attachment targets) sorted by
+/// Y, so script-attachment checks scan a narrow Y window instead of the whole
+/// page per candidate.
+struct ScriptBodyIndex<'a> {
+    /// (y, item), sorted ascending by y
+    by_y: Vec<(f32, &'a TextItem)>,
+    /// widest vertical attachment window any body item can produce
+    max_window: f32,
+}
+
+impl<'a> ScriptBodyIndex<'a> {
+    fn new(items: &'a [TextItem]) -> Self {
+        // Smallest table-candidate font is 6pt, so any possible attachment
+        // target is at least 6 x 1.2 pt.
+        let mut by_y: Vec<(f32, &TextItem)> = items
+            .iter()
+            .filter(|i| i.font_size >= 6.0 * 1.2)
+            .map(|i| (i.y, i))
+            .collect();
+        by_y.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let max_window = by_y
+            .iter()
+            .map(|(_, i)| i.font_size * 0.8)
+            .fold(0.0f32, f32::max);
+        Self { by_y, max_window }
+    }
+
+    /// True when a small-font item is horizontally attached to a larger-font
+    /// item at a script baseline offset — a sub/superscript in running text
+    /// or math (equation subscripts, footnote markers). Script attachments
+    /// are not table cells; without this filter, display equations with
+    /// sub/superscripts form phantom small-font table regions (e.g. TeX
+    /// papers where log subscripts cluster with footnote lines into a fake
+    /// 3-column table). A genuine baseline offset is required so same-line
+    /// table neighbours (a small cell beside a larger label cell) are never
+    /// classified as scripts.
+    ///
+    /// `min_anchor_size` additionally constrains what counts as an
+    /// attachment target: the small-font pass accepts any sufficiently
+    /// larger item (0.0), while the body-font pass requires a heading-sized
+    /// anchor so a body-size table cell beside a slightly larger label with
+    /// baseline jitter is never treated as a script.
+    fn is_script_attachment(&self, small: &TextItem, min_anchor_size: f32) -> bool {
+        let attach_gap = small.font_size.max(4.0) * 0.6;
+        let lo = self
+            .by_y
+            .partition_point(|(y, _)| *y < small.y - self.max_window);
+        self.by_y[lo..]
+            .iter()
+            .take_while(|(y, _)| *y <= small.y + self.max_window)
+            .any(|(_, body)| {
+                let dy = (small.y - body.y).abs();
+                body.font_size >= small.font_size * 1.2
+                    && body.font_size >= min_anchor_size
+                    && dy > body.font_size * 0.05
+                    && dy <= body.font_size * 0.8
+                    && {
+                        let gap_after_body = small.x - (body.x + body.width);
+                        let gap_before_body = body.x - (small.x + small.width);
+                        (-attach_gap..=attach_gap).contains(&gap_after_body)
+                            || (-attach_gap..=attach_gap).contains(&gap_before_body)
+                    }
+            })
+    }
+}
+
 /// Detect tables in a set of text items from a single page
 pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bool) -> Vec<Table> {
     detect_tables_with_page_width(items, base_font_size, skip_body_font, content_width(items))
@@ -483,6 +549,27 @@ pub(crate) fn detect_tables_with_page_width(
     // === Pass 1: Small-font tables (existing behavior) ===
     let table_font_threshold = base_font_size * 0.90;
 
+    // Mark sub/superscript attachments once per pass. They stay candidates —
+    // the masks only remove them from region qualification and column/row
+    // geometry.
+    //
+    // The two passes need different anchor thresholds. In the small-font pass
+    // any sufficiently larger neighbour is a plausible base for a script. In
+    // the body-font pass the candidates are themselves body-sized
+    // (0.85..1.05x), so a merely "slightly larger" neighbour is usually a bold
+    // label or an adjacent column header, not the base of a superscript —
+    // treating it as one would strip real cells out of the geometry and lose
+    // the table. Requiring a heading-sized anchor (>= 1.15x base) keeps the
+    // body pass to genuine scripts hanging off headings.
+    let script_index = ScriptBodyIndex::new(items);
+    let script_flags: Vec<bool> = items
+        .iter()
+        .map(|item| script_index.is_script_attachment(item, 0.0))
+        .collect();
+    let body_script_flags: Vec<bool> = items
+        .iter()
+        .map(|item| script_index.is_script_attachment(item, base_font_size * 1.15))
+        .collect();
     let table_candidates: Vec<(usize, &TextItem)> = items
         .iter()
         .enumerate()
@@ -494,7 +581,14 @@ pub(crate) fn detect_tables_with_page_width(
         .collect();
 
     if table_candidates.len() >= 6 {
-        let regions = find_table_regions(&table_candidates);
+        // Qualify regions from non-script items: a cluster of sub/superscripts
+        // must not, on its own, mark out a table region.
+        let region_evidence: Vec<(usize, &TextItem)> = table_candidates
+            .iter()
+            .filter(|(idx, _)| !script_flags[*idx])
+            .cloned()
+            .collect();
+        let regions = find_table_regions(&region_evidence);
 
         for (y_min, y_max) in regions {
             let region_items: Vec<(usize, &TextItem)> = table_candidates
@@ -508,7 +602,9 @@ pub(crate) fn detect_tables_with_page_width(
             }
 
             if let Some(mut table) =
-                detect_table_in_region(&region_items, TableDetectionMode::SmallFont)
+                detect_table_in_region(&region_items, TableDetectionMode::SmallFont, &|i| {
+                    script_flags[i]
+                })
             {
                 // Try to recover body-font header row above the small-font table
                 recover_header_row(&mut table, items, table_font_threshold);
@@ -553,8 +649,20 @@ pub(crate) fn detect_tables_with_page_width(
             body_font_low,
             body_font_high,
         );
+        // Scripts are NOT filtered out of the candidate set here, mirroring
+        // the small-font pass: they must stay eligible for cell assignment so
+        // a sub/superscript that belongs inside a table cell keeps its text.
+        // The heading-anchored `body_script_flags` mask removes them from
+        // geometry only.
         if body_candidates.len() >= 6 {
-            let regions = find_table_regions_strict(&body_candidates);
+            // Same reasoning as the small-font pass: scripts do not qualify
+            // regions, but remain available for cell assignment within one.
+            let region_evidence: Vec<(usize, &TextItem)> = body_candidates
+                .iter()
+                .filter(|(idx, _)| !body_script_flags[*idx])
+                .cloned()
+                .collect();
+            let regions = find_table_regions_strict(&region_evidence);
             log::debug!("body-font: {} strict regions found", regions.len());
 
             for (y_min, y_max, _x_min, _x_max) in &regions {
@@ -580,7 +688,9 @@ pub(crate) fn detect_tables_with_page_width(
                 }
 
                 if let Some(table) =
-                    detect_table_in_region(&region_items, TableDetectionMode::BodyFont)
+                    detect_table_in_region(&region_items, TableDetectionMode::BodyFont, &|i| {
+                        body_script_flags[i]
+                    })
                 {
                     tables.push(table);
                 }
@@ -808,10 +918,30 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
     regions
 }
 
-/// Detect a table within a specific region
-fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode) -> Option<Table> {
-    // Find column boundaries
-    let columns = find_column_boundaries(items, mode);
+/// Detect a table within a specific region.
+///
+/// `is_script` marks items that are sub/superscript attachments. Those are
+/// excluded from the *geometry* — they must not be able to create a column,
+/// which is how equation subscript clusters used to fabricate phantom grids —
+/// but they remain eligible for cell assignment, so legitimate cell content
+/// (exponents in an engineering-notation table, footnote markers) stays in
+/// the cell it belongs to instead of leaking out into the reading order.
+fn detect_table_in_region(
+    items: &[(usize, &TextItem)],
+    mode: TableDetectionMode,
+    is_script: &dyn Fn(usize) -> bool,
+) -> Option<Table> {
+    // Column geometry from non-script items only.
+    let geometry_items: Vec<(usize, &TextItem)> = items
+        .iter()
+        .filter(|(idx, _)| !is_script(*idx))
+        .cloned()
+        .collect();
+    // A region that is *entirely* scripts has no table structure at all.
+    if geometry_items.is_empty() {
+        return None;
+    }
+    let columns = find_column_boundaries(&geometry_items, mode);
     let min_cols = 2;
     if columns.len() < min_cols || columns.len() > 25 {
         log::debug!(
@@ -822,8 +952,8 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         return None;
     }
 
-    // Find row boundaries
-    let rows = find_row_boundaries(items);
+    // Find row boundaries (geometry items only, same reasoning)
+    let rows = find_row_boundaries(&geometry_items);
     let min_rows = 2;
     if rows.len() < min_rows {
         log::debug!(
@@ -842,6 +972,11 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     );
 
     // Verify this looks like a table: multiple items should align to columns
+    // Validate against ALL items, including scripts. Columns are derived from
+    // non-script geometry so scripts cannot *create* a column, but excluding
+    // them from validation too would let a region manufacture alignment: drop
+    // the awkward items and whatever remains looks like a tidy grid. Block
+    // diagrams did exactly that. Everything in the region must fit.
     let col_alignment = check_column_alignment(items, &columns, mode);
     let min_alignment = match mode {
         TableDetectionMode::SmallFont => 0.5,
@@ -910,6 +1045,29 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
             row_cells.push(text);
         }
         cells.push(row_cells);
+    }
+
+    // Validation 0 (small-font pass only): reject tiny all-numeric
+    // fragments. A <=2-row grid whose every cell is a bare 1-2 digit number
+    // carries no tabular information — in practice these are
+    // exponent/subscript clusters from display math that happen to align.
+    // Body-font tables are not subject to this veto: their cells cannot be
+    // script glyphs.
+    if matches!(mode, TableDetectionMode::SmallFont) {
+        let nonempty_cells: Vec<&String> =
+            cells.iter().flatten().filter(|c| !c.is_empty()).collect();
+        if rows.len() <= 2
+            && !nonempty_cells.is_empty()
+            && nonempty_cells
+                .iter()
+                .all(|c| c.len() <= 2 && c.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            log::debug!(
+                "  validation 0 fail: tiny all-numeric fragment ({} cells)",
+                nonempty_cells.len()
+            );
+            return None;
+        }
     }
 
     // Validation 1: some rows should have content in first column.
@@ -1977,6 +2135,146 @@ fn try_add_label_column(
 
 #[cfg(test)]
 mod tests {
+
+    fn make_item(text: &str, x: f32, y: f32, font_size: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height: font_size,
+            font: "TestFont".to_string(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn script_attachment_detects_subscript_after_body_text() {
+        let body = make_item("log", 100.0, 500.0, 10.0, 15.0);
+        let sub = make_item("10", 115.5, 497.0, 7.0, 7.0);
+        let items = vec![body, sub.clone()];
+        assert!(ScriptBodyIndex::new(&items).is_script_attachment(&sub, 0.0));
+    }
+
+    #[test]
+    fn script_attachment_detects_superscript_footnote_marker() {
+        let body = make_item("Hartley", 200.0, 500.0, 10.0, 35.0);
+        let sup = make_item("2", 235.8, 504.0, 6.6, 3.5);
+        let items = vec![body, sup.clone()];
+        assert!(ScriptBodyIndex::new(&items).is_script_attachment(&sup, 0.0));
+    }
+
+    #[test]
+    fn script_attachment_ignores_small_cell_far_from_body_text() {
+        let body = make_item("Revenue", 100.0, 500.0, 10.0, 40.0);
+        let cell = make_item("1,234", 180.0, 500.0, 7.0, 20.0);
+        let items = vec![body, cell.clone()];
+        assert!(!ScriptBodyIndex::new(&items).is_script_attachment(&cell, 0.0));
+    }
+
+    #[test]
+    fn body_pass_anchor_spares_cells_beside_slightly_larger_labels() {
+        // A body-font table cell (10pt) sitting beside a slightly larger,
+        // NON-heading label (12.5pt) with a little baseline jitter. The
+        // small-font pass treats any larger neighbour as a possible script
+        // base, but the body pass must not: at body sizes a slightly larger
+        // neighbour is a bold label or column header, and flagging the cell
+        // would strip it out of the table geometry and lose the table.
+        // Cell at the low end of the body band (0.85x base) beside a 10.5pt
+        // label. 10.5 clears the inherent 1.2x-of-cell rule (10.2) but falls
+        // below the body pass's heading anchor (11.5), which is exactly the
+        // band where the two masks must disagree.
+        let label = make_item("Revenue", 100.0, 500.0, 10.5, 40.0);
+        let cell = make_item("1,234", 141.0, 496.5, 8.5, 22.0);
+        let items = vec![label, cell.clone()];
+        let index = ScriptBodyIndex::new(&items);
+        let base = 10.0;
+        assert!(
+            index.is_script_attachment(&cell, 0.0),
+            "small-font pass anchor should still see this as an attachment"
+        );
+        assert!(
+            !index.is_script_attachment(&cell, base * 1.15),
+            "body pass must not treat a cell beside a slightly larger label \
+             as a script — that removes real cells from the geometry"
+        );
+        // A genuine heading-sized anchor still qualifies in the body pass.
+        let heading = make_item("Section", 100.0, 500.0, 20.0, 60.0);
+        let sup = make_item("3", 161.0, 508.0, 10.0, 5.0);
+        let h_items = vec![heading, sup.clone()];
+        assert!(
+            ScriptBodyIndex::new(&h_items).is_script_attachment(&sup, base * 1.15),
+            "script hanging off a heading must still be excluded in the body pass"
+        );
+    }
+
+    #[test]
+    fn script_attachment_ignores_same_baseline_neighbor_cell() {
+        // A small cell beside a larger label on the SAME baseline is a table
+        // layout, not a subscript — a genuine baseline offset is required.
+        let label = make_item("Total", 100.0, 500.0, 10.0, 25.0);
+        let cell = make_item("42", 127.0, 500.0, 7.5, 9.0);
+        let items = vec![label, cell.clone()];
+        assert!(!ScriptBodyIndex::new(&items).is_script_attachment(&cell, 0.0));
+    }
+
+    #[test]
+    fn script_attachment_ignores_neighbor_on_different_line() {
+        let body = make_item("Header", 100.0, 500.0, 10.0, 30.0);
+        let cell = make_item("42", 131.0, 486.0, 7.0, 10.0);
+        let items = vec![body, cell.clone()];
+        assert!(!ScriptBodyIndex::new(&items).is_script_attachment(&cell, 0.0));
+    }
+
+    /// Equation-subscript + footnote layout from Shannon entropy.pdf page 1,
+    /// with real coordinates. Without the larger-font anchors the small items
+    /// alone DO form a phantom table — proving the layout reaches detection —
+    /// and adding the anchors must suppress it.
+    fn shannon_page1_small_items() -> Vec<TextItem> {
+        vec![
+            make_item("2", 267.4, 133.9, 7.4, 3.7),
+            make_item("10", 306.2, 133.9, 7.4, 7.4),
+            make_item("10", 342.7, 133.9, 7.4, 7.4),
+            make_item("10", 325.0, 118.9, 7.4, 7.4),
+            make_item("Bell System Technical Journal,", 295.7, 101.9, 8.0, 95.0),
+            make_item(
+                "April 1924, p. 324; Certain Topics in",
+                396.7,
+                101.9,
+                8.0,
+                130.0,
+            ),
+            make_item("v. 47, April 1928, p. 617.", 250.9, 92.5, 8.0, 90.0),
+            make_item("Bell System Technical Journal,", 264.2, 82.6, 8.0, 95.0),
+            make_item("July 1928, p. 535.", 364.3, 82.6, 8.0, 65.0),
+        ]
+    }
+
+    #[test]
+    fn equation_scripts_do_not_form_phantom_table() {
+        let bare = shannon_page1_small_items();
+        assert!(
+            !detect_tables(&bare, 10.0, false).is_empty(),
+            "test layout must form a phantom table when the filter cannot fire"
+        );
+        let mut items = shannon_page1_small_items();
+        items.push(make_item("log", 253.0, 137.0, 10.0, 13.5));
+        items.push(make_item("log", 291.5, 137.0, 10.0, 13.5));
+        items.push(make_item("log", 328.0, 137.0, 10.0, 13.5));
+        items.push(make_item("log", 310.3, 122.0, 10.0, 13.5));
+        let tables = detect_tables(&items, 10.0, false);
+        assert!(
+            tables.is_empty(),
+            "equation scripts + footnotes must not become a table: {tables:?}"
+        );
+    }
     use super::*;
     use crate::types::ItemType;
 

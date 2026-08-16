@@ -24,6 +24,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - name: Check package version sync
+        run: python3 scripts/version.py --check
+
       - name: Run tests
         run: cargo test --verbose
 

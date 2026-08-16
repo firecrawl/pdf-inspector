@@ -171,6 +171,74 @@ pub(crate) fn is_toc_marker_heading(text: &str) -> bool {
 /// equation and absent from name-plus-number headings. A bare trailing colon
 /// is NOT a fragment signal either: real headings frequently end with colons
 /// ("Procedure:", "Steps for Using the Microscope:").
+/// True when the line opens with a section number ("3.", "2.1.4", "IV)").
+///
+/// Mirrors the acceptance of `heading::parse_numbering` rather than the
+/// stricter `convert::starts_with_section_number`, which deliberately
+/// requires two components because it bypasses isolation checks. Here a
+/// single "1." counts: numbering is independent evidence of a heading, and
+/// `heading.rs` applies its numbered-prefix allowance *after* consulting
+/// `is_heading_fragment`, so without this exemption a numbered
+/// sentence-case heading would be vetoed before that allowance can run.
+fn starts_with_numbering_prefix(t: &str) -> bool {
+    let Some(first) = t.split_whitespace().next() else {
+        return false;
+    };
+    let has_delimiter = first.ends_with(['.', ')', ':']);
+    let token = first.trim_end_matches(['.', ')', ':']);
+    if token.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = token.split('.').collect();
+    let decimal = parts
+        .iter()
+        .all(|p| !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit()));
+    if decimal {
+        // "1." / "2.1." carry a delimiter; "2.3 Title" is written without
+        // one, so a multi-component number is accepted bare. A bare single
+        // number ("3 apples") is not — that is ordinary prose.
+        return has_delimiter || parts.len() >= 2;
+    }
+    // Roman numerals go through the heading parser's own grammar so the two
+    // agree: uppercase I/V/X/L/C only, at most 8 characters. A looser rule
+    // here would exempt markers the parser rejects — "iv)" or "d)" from an
+    // alphabetical list — letting an ordinary list item bypass the veto and
+    // reach heading promotion.
+    //
+    // A delimiter is also required: a bare leading "I" is the pronoun far
+    // more often than a section number.
+    has_delimiter && crate::markdown::heading::roman_value(token).is_some()
+}
+
+/// True when the line reads as a title rather than a sentence: every
+/// content word (ignoring minor words) starts uppercase. Used to spare real
+/// headings from the dangling-verb veto — "Bond Yields" is a section title,
+/// "the method yields" is a stranded clause, and only the casing tells them
+/// apart.
+fn looks_title_case(t: &str) -> bool {
+    const MINOR: &[&str] = &[
+        "a", "an", "the", "of", "and", "or", "for", "to", "in", "on", "at", "by", "with", "from",
+        "as", "is", "are", "that", "than", "into",
+    ];
+    let mut content = 0usize;
+    let mut capitalized = 0usize;
+    for w in t.split_whitespace() {
+        let cleaned: String = w.chars().filter(|c| c.is_alphabetic()).collect();
+        if cleaned.is_empty() {
+            continue;
+        }
+        if MINOR.contains(&cleaned.to_lowercase().as_str()) {
+            continue;
+        }
+        content += 1;
+        if cleaned.chars().next().is_some_and(char::is_uppercase) {
+            capitalized += 1;
+        }
+    }
+    // A single content word ("Yields") is a title by default.
+    content == 0 || capitalized == content
+}
+
 pub(crate) fn is_heading_fragment(text: &str) -> bool {
     let t = text.trim_end();
 
@@ -244,7 +312,131 @@ pub(crate) fn is_heading_fragment(text: &str) -> bool {
     if t.ends_with(':') && t.split_whitespace().any(is_equation_number) {
         return true;
     }
+
+    // Dangling clause: a stranded sentence lead-in ends on a relational
+    // verb with no terminal punctuation — "Note that the exact error equals"
+    // left ahead of its formula when a phantom table dissolved.
+    //
+    // Gated on the line reading as prose rather than a title. Case is the
+    // discriminator the trailing word alone cannot provide: a heading is
+    // title case ("Bond Yields", "The Method Yields") while a stranded
+    // lead-in is sentence case ("the method yields"). Without this gate the
+    // veto eats real headings — "Bond Yields", "Crop Yields" and any wrapped
+    // title-case heading the preprocessor failed to merge.
+    if !t.ends_with(['.', '!', '?', ':', ';', ')', ']'])
+        && !looks_title_case(t)
+        && !starts_with_numbering_prefix(t)
+    {
+        if let Some(last) = t.split_whitespace().next_back() {
+            let word: String = last
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            // Relational verbs only, and only those with no common noun
+            // sense. "yields" was dropped for exactly that reason: "Bond
+            // Yields" is a real section title. Function words, copulas and
+            // auxiliaries were measured and rejected outright — a heading
+            // that wraps across lines ends on those, and suppressing them
+            // destroyed real IRS Publication 17 headings.
+            const DANGLING_TAIL: &[&str] =
+                &["equals", "denotes", "implies", "satisfies", "signifies"];
+            if DANGLING_TAIL.contains(&word.as_str()) {
+                return true;
+            }
+        }
+    }
     false
+}
+
+#[cfg(test)]
+mod fragment_heading_tests {
+    use super::is_heading_fragment;
+
+    #[test]
+    fn dangling_tail_marks_stranded_clause() {
+        // opendataloader 01030000000144: left behind when a phantom table
+        // dissolved, ahead of its formula on the next line.
+        assert!(is_heading_fragment("Note that the exact error equals"));
+        assert!(is_heading_fragment("The remainder term satisfies"));
+        assert!(is_heading_fragment("we conclude that the sum equals"));
+    }
+
+    #[test]
+    fn real_headings_survive() {
+        assert!(!is_heading_fragment("Introduction"));
+        assert!(!is_heading_fragment("Error Analysis"));
+        assert!(!is_heading_fragment("Materials and Methods"));
+        assert!(!is_heading_fragment("Results"));
+        assert!(!is_heading_fragment("3.2 Richardson Extrapolation"));
+        assert!(!is_heading_fragment("Discussion and Conclusions"));
+        // Terminal punctuation means the clause is complete.
+        assert!(!is_heading_fragment("What is a Derivative?"));
+        assert!(!is_heading_fragment("Procedure:"));
+        assert!(!is_heading_fragment("Note that this is important."));
+    }
+
+    #[test]
+    fn title_case_headings_ending_in_a_verb_survive() {
+        // "yields" is also a plural noun; these are real section titles.
+        assert!(!is_heading_fragment("Bond Yields"));
+        assert!(!is_heading_fragment("Crop Yields"));
+        assert!(!is_heading_fragment("Dividend Yields"));
+        assert!(!is_heading_fragment("Yields"));
+        // A wrapped title-case heading whose first line ends on a listed
+        // verb must survive even if the preprocessor failed to merge it.
+        assert!(!is_heading_fragment("The Theorem Implies"));
+        assert!(!is_heading_fragment("What This Denotes"));
+    }
+
+    #[test]
+    fn numbered_sentence_case_headings_survive() {
+        // heading.rs consults is_heading_fragment BEFORE applying its
+        // numbered-prefix allowance, so the veto must not pre-empt it.
+        assert!(!is_heading_fragment("1. What the model implies"));
+        assert!(!is_heading_fragment("2.3 How the estimator satisfies"));
+        assert!(!is_heading_fragment("IV) What this denotes"));
+        // Without numbering the same wording is still a stranded clause.
+        assert!(is_heading_fragment("What the model implies"));
+        // A bare leading number or pronoun is prose, not numbering.
+        assert!(is_heading_fragment("3 apples and what that implies"));
+        assert!(is_heading_fragment("I think the model implies"));
+        // Markers heading::parse_numbering rejects must not be exempted
+        // either, or an ordinary list item bypasses the veto: lowercase
+        // roman, alphabetical markers, and over-long tokens.
+        assert!(is_heading_fragment("iv) the estimator satisfies"));
+        assert!(is_heading_fragment("d) the value implies"));
+        // Unsupported character (M is outside the parser's I/V/X/L/C set).
+        assert!(is_heading_fragment("MMMM. the value implies"));
+        // Over-long token: nine valid characters, so this exercises the
+        // 8-character bound rather than the character set.
+        assert!(is_heading_fragment("IIIIIIIII. the value implies"));
+        // Eight is still within the bound and stays exempt.
+        assert!(!is_heading_fragment("IIIIIIII. What this implies"));
+        // Uppercase roman within the parser's grammar is still exempt.
+        assert!(!is_heading_fragment("IV. What this denotes"));
+        assert!(!is_heading_fragment("XII) What this implies"));
+    }
+
+    #[test]
+    fn wrapped_headings_are_not_fragments() {
+        // A heading that wraps across lines ends on a function word. These
+        // are real headings from IRS Publication 17 and must survive.
+        assert!(!is_heading_fragment("Casualty and"));
+        assert!(!is_heading_fragment("Rule 10. You Must Be at"));
+        assert!(!is_heading_fragment("Higher Standard Deduction for"));
+        assert!(!is_heading_fragment("Qualifying Child of"));
+        assert!(!is_heading_fragment("When Can I Withdraw or"));
+        // Copulas and auxiliaries also end real wrapped headings.
+        assert!(!is_heading_fragment("Rule 15. Your AGI Must Be"));
+        assert!(!is_heading_fragment("What Medical Expenses Are"));
+        assert!(!is_heading_fragment("Rule 13. You Must Have"));
+        assert!(!is_heading_fragment("When Can a Roth IRA Be"));
+    }
+
+    #[test]
+    fn dangling_check_is_case_insensitive() {
+        // All-caps is not sentence case, so the veto must not fire there.
+        assert!(!is_heading_fragment("THE REMAINDER EQUALS"));
+    }
 }
 
 /// Compute the Y-gap threshold for paragraph break detection.

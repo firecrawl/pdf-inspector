@@ -10,12 +10,22 @@ class PdfResult:
     page_count: int
     processing_time_ms: int
     pages_needing_ocr: list[int]
+    """1-indexed page numbers that need OCR."""
+    ocr_reasons_by_page: list["PageOcrReasons"]
+    """Machine-readable OCR reasons by 1-indexed page."""
     title: Optional[str]
     confidence: float
     is_complex_layout: bool
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool
+
+class PageOcrReasons:
+    """OCR reasons for a single 1-indexed page."""
+    page: int
+    """1-indexed page number."""
+    reasons: list[str]
+    """Machine-readable OCR reason identifiers."""
 
 class PdfClassification:
     """Lightweight PDF classification result."""
@@ -41,12 +51,28 @@ class TextItem:
     is_underline: bool
     is_strikeout: bool
     item_type: str
+    mcid: Optional[int]
+    """Marked Content ID from the content stream's BDC/BMC operator, None when
+    the text is not part of marked content. Join with the (page, mcid) pairs
+    from extract_structure_elements to attach structure-tree roles in tagged
+    PDFs."""
+
+class StructureElement:
+    """One structure-tree element reference from a tagged PDF."""
+    page: int
+    """1-indexed page number (matches TextItem.page)."""
+    mcid: int
+    """Marked Content ID from the page's content stream (matches TextItem.mcid)."""
+    role: str
+    """Standard structure type name ("H1".."H6", "P", "Table", "TD", ...)."""
 
 class RegionText:
     """Extracted text for a single region."""
     text: str
     needs_ocr: bool
     """True when the text should not be trusted."""
+    ocr_reason: Optional[str]
+    """Machine-readable OCR reason when the cause is known."""
 
 class PageRegionTexts:
     """Extracted text for one page's regions."""
@@ -62,6 +88,8 @@ class PageMarkdown:
     """Formatted markdown for this page (empty string when needs_ocr is True)."""
     needs_ocr: bool
     """True when text on this page is unreliable and OCR should be used instead."""
+    ocr_reason: Optional[str]
+    """Machine-readable OCR reason when the cause is known."""
 
 class PagesExtractionResult:
     """Per-page markdown output with document-wide layout classification."""
@@ -73,6 +101,8 @@ class PagesExtractionResult:
     """1-indexed pages where multi-column layout was detected."""
     pages_needing_ocr: list[int]
     """1-indexed pages that need OCR."""
+    ocr_reasons_by_page: list[PageOcrReasons]
+    """Machine-readable OCR reasons by 1-indexed page."""
     is_complex: bool
     """True if any page has tables or multi-column layout."""
 
@@ -114,6 +144,27 @@ def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) ->
 
 def extract_text_with_positions_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[TextItem]:
     """Extract text with position information from bytes."""
+    ...
+
+def extract_structure_elements(path: str, pages: Optional[list[int]] = None) -> list[StructureElement]:
+    """Extract structure-tree element references from a tagged PDF file.
+
+    Returns one entry per marked-content reference, resolved to its 1-indexed
+    page, MCID, and structure type name ("H1".."H6", "P", "Table", ...), sorted
+    by (page, mcid). Returns an empty list when the PDF is not tagged.
+
+    Args:
+        path: Path to the PDF file.
+        pages: Optional list of 1-indexed pages (matching ``TextItem.page``).
+            When ``None`` (default), the whole document is returned.
+    """
+    ...
+
+def extract_structure_elements_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[StructureElement]:
+    """Extract structure-tree element references from tagged PDF bytes.
+
+    See :func:`extract_structure_elements` for details.
+    """
     ...
 
 def extract_text_in_regions(

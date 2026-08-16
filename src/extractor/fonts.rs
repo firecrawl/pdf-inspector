@@ -138,6 +138,93 @@ pub(crate) fn build_font_widths(
     widths
 }
 
+/// Visual-size scale factors for Type3 fonts, keyed by resource name.
+///
+/// A Type3 font's glyph space maps to text space through FontMatrix, so the
+/// visual height of its glyphs is `nominal_size × |matrix_y| × FontBBox
+/// height`. For a well-behaved font (matrix 0.001, bbox ≈ 1000 units) that
+/// factor is ≈ 1.0 and the nominal size is already right. TeX PK bitmap
+/// fonts (dvips → Distiller) instead use FontMatrix [1 0 0 -1 0 0] with
+/// nominal sizes like 0.12, which makes every downstream font-size heuristic
+/// (drop caps, sub/superscripts, small-font tables, line heights) see
+/// nonsense. Fonts without a usable FontBBox are omitted (treated as 1.0).
+pub(crate) fn build_type3_scales(
+    doc: &Document,
+    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+) -> HashMap<String, f32> {
+    let mut scales = HashMap::new();
+    for (font_name, font_dict) in fonts {
+        let is_type3 = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .is_some_and(|n| n == b"Type3");
+        if !is_type3 {
+            continue;
+        }
+        // Array elements may themselves be indirect references per PDF
+        // syntax — resolve before reading the numeric value.
+        let num = |o: &Object| {
+            let resolved = match o {
+                Object::Reference(r) => match doc.get_object(*r) {
+                    Ok(inner) => inner,
+                    Err(_) => return 0.0,
+                },
+                other => other,
+            };
+            match resolved {
+                Object::Integer(i) => *i as f32,
+                Object::Real(r) => *r,
+                _ => 0.0,
+            }
+        };
+        let Some(matrix) = font_dict
+            .get(b"FontMatrix")
+            .ok()
+            .and_then(|o| resolve_array(doc, o))
+        else {
+            continue;
+        };
+        let Some(bbox) = font_dict
+            .get(b"FontBBox")
+            .ok()
+            .and_then(|o| resolve_array(doc, o))
+        else {
+            continue;
+        };
+        if matrix.len() < 4 || bbox.len() < 4 {
+            continue;
+        }
+        let scale_y = (num(&matrix[2]).powi(2) + num(&matrix[3]).powi(2)).sqrt();
+        let bbox_h = (num(&bbox[3]) - num(&bbox[1])).abs();
+        let scale = bbox_h * scale_y;
+
+        // `scale` is the glyph box measured in text-space units. For a
+        // self-consistent font it lands near 1.0 — the FontMatrix is the
+        // reciprocal of the glyph-space em by construction — so the Tf
+        // operand is already the rendered size and must be left alone.
+        // A modest deviation is normal and must NOT trigger rescaling:
+        // FontBBox is the glyph bounding box, not the em box, so it is
+        // routinely somewhat smaller (descender..ascender ≈ 0.7) or larger
+        // (tall accents > 1.0).
+        //
+        // Only a wildly inconsistent font gets renormalized. dvips/PK
+        // bitmap fonts declare [1 0 0 -1 0 0] with glyphs spanning
+        // hundreds of units, giving scale ≈ 159 against a nominal size of
+        // 0.12pt — there the declared size carries no information. The
+        // band is deliberately wide so that only that class qualifies,
+        // while any matrix scale (including non-standard ones like 0.005
+        // with a full-em bbox, scale = 5.0) is judged on the product
+        // rather than on the matrix alone.
+        const CONSISTENT_LO: f32 = 0.25;
+        const CONSISTENT_HI: f32 = 4.0;
+        if scale.is_finite() && scale > 0.0 && !(CONSISTENT_LO..=CONSISTENT_HI).contains(&scale) {
+            scales.insert(String::from_utf8_lossy(font_name).to_string(), scale);
+        }
+    }
+    scales
+}
+
 /// Parse font widths from a font dictionary, dispatching by Subtype
 pub(crate) fn parse_font_widths(
     doc: &Document,
@@ -149,9 +236,69 @@ pub(crate) fn parse_font_widths(
 
     match subtype_name {
         b"Type0" => parse_type0_widths(doc, font_dict),
-        b"Type1" | b"TrueType" | b"MMType1" | b"Type3" => parse_simple_font_widths(doc, font_dict),
+        b"Type1" | b"TrueType" | b"MMType1" => parse_simple_font_widths(doc, font_dict)
+            .or_else(|| base14_fallback_widths(doc, font_dict)),
+        b"Type3" => parse_simple_font_widths(doc, font_dict),
         _ => None,
     }
+}
+
+/// Fallback metrics for non-embedded base-14 fonts whose dictionary omits
+/// `/FirstChar`/`/Widths` (legal per the PDF spec — the reader must supply
+/// standard-font metrics). Without this, every glyph advances 0 and all
+/// downstream gap-based logic (space synthesis, script detection, table
+/// columns) collapses — common in 1990s dvips/Distiller PDFs.
+///
+/// Widths are resolved per code through the font's Differences encoding when
+/// present, falling back to the same single-byte decode the text extractor
+/// uses (cp1252-style smart punctuation for 0x80..=0x9F, Latin-1 elsewhere) —
+/// so the width of a code always matches the char we extract for it.
+fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<FontWidthInfo> {
+    let base_font = font_dict
+        .get(b"BaseFont")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .map(|n| String::from_utf8_lossy(n).to_string())?;
+    if !crate::extractor::base14::is_base14_font(&base_font) {
+        return None;
+    }
+
+    let enc_map = parse_font_encoding(doc, font_dict)
+        .map(|r| r.map)
+        .unwrap_or_default();
+
+    let mut widths = HashMap::new();
+    for code in 0u16..=255 {
+        // Resolution order: Differences override, then the font's BUILT-IN
+        // encoding (Symbol/ZapfDingbats glyphs live at positions unrelated
+        // to cp1252 — the renderer draws α for Symbol 0x61 no matter how
+        // the text decoder transliterates it, so the advance must be α's),
+        // then the cp1252-style fallback used by the text decoder.
+        let ch = enc_map
+            .get(&(code as u8))
+            .copied()
+            .or_else(|| crate::extractor::base14::builtin_encoding_char(&base_font, code as u8))
+            .unwrap_or_else(|| decode_single_byte_fallback_char(code as u8, true));
+        if let Some(w) = crate::extractor::base14::base14_char_width(&base_font, ch) {
+            widths.insert(code, w);
+        }
+    }
+    let space_width = widths.get(&32).copied().unwrap_or(250);
+
+    debug!(
+        "  base14 fallback widths for {} ({} codes mapped)",
+        base_font,
+        widths.len()
+    );
+
+    Some(FontWidthInfo {
+        widths,
+        default_width: 500,
+        space_width,
+        is_cid: false,
+        units_scale: 0.001,
+        wmode: 0,
+    })
 }
 
 /// Parse widths for simple fonts (Type1, TrueType, MMType1, Type3)
@@ -335,7 +482,11 @@ pub(crate) fn parse_cid_w_array(
     widths: &mut HashMap<u16, u16>,
 ) {
     let mut i = 0;
+    let mut assigned = 0usize;
     while i < w_array.len() {
+        if assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+            return;
+        }
         let start_cid = match &w_array[i] {
             Object::Integer(n) => *n as u16,
             Object::Real(n) => *n as u16,
@@ -354,12 +505,14 @@ pub(crate) fn parse_cid_w_array(
             Object::Array(arr) => {
                 // [c [w1 w2 ...]] — consecutive widths starting at c
                 for (j, w_obj) in arr.iter().enumerate() {
-                    let w = match w_obj {
-                        Object::Integer(n) => *n as u16,
-                        Object::Real(n) => *n as u16,
-                        _ => continue,
-                    };
-                    widths.insert(start_cid + j as u16, w);
+                    if !assign_cid_width(
+                        widths,
+                        start_cid.wrapping_add(j as u16),
+                        w_obj,
+                        &mut assigned,
+                    ) {
+                        return;
+                    }
                 }
                 i += 1;
             }
@@ -367,12 +520,14 @@ pub(crate) fn parse_cid_w_array(
                 // Could be a reference to an array
                 if let Ok(Object::Array(arr)) = doc.get_object(*r) {
                     for (j, w_obj) in arr.iter().enumerate() {
-                        let w = match w_obj {
-                            Object::Integer(n) => *n as u16,
-                            Object::Real(n) => *n as u16,
-                            _ => continue,
-                        };
-                        widths.insert(start_cid + j as u16, w);
+                        if !assign_cid_width(
+                            widths,
+                            start_cid.wrapping_add(j as u16),
+                            w_obj,
+                            &mut assigned,
+                        ) {
+                            return;
+                        }
                     }
                     i += 1;
                 } else {
@@ -395,8 +550,8 @@ pub(crate) fn parse_cid_w_array(
                         continue;
                     }
                 };
-                for cid in start_cid..=end {
-                    widths.insert(cid, w);
+                if !assign_cid_width_range(widths, start_cid, end, w, &mut assigned) {
+                    return;
                 }
                 i += 1;
             }
@@ -414,8 +569,8 @@ pub(crate) fn parse_cid_w_array(
                         continue;
                     }
                 };
-                for cid in start_cid..=end {
-                    widths.insert(cid, w);
+                if !assign_cid_width_range(widths, start_cid, end, w, &mut assigned) {
+                    return;
                 }
                 i += 1;
             }
@@ -424,6 +579,45 @@ pub(crate) fn parse_cid_w_array(
             }
         }
     }
+}
+
+fn assign_cid_width(
+    widths: &mut HashMap<u16, u16>,
+    cid: u16,
+    w_obj: &Object,
+    assigned: &mut usize,
+) -> bool {
+    let w = match w_obj {
+        Object::Integer(n) => *n as u16,
+        Object::Real(n) => *n as u16,
+        _ => return true,
+    };
+    if *assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+        return false;
+    }
+    widths.insert(cid, w);
+    *assigned += 1;
+    true
+}
+
+fn assign_cid_width_range(
+    widths: &mut HashMap<u16, u16>,
+    start: u16,
+    end: u16,
+    w: u16,
+    assigned: &mut usize,
+) -> bool {
+    if start > end {
+        return true;
+    }
+    for cid in start..=end {
+        if *assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+            return false;
+        }
+        widths.insert(cid, w);
+        *assigned += 1;
+    }
+    true
 }
 
 /// Compute the width of a string in text space units,
@@ -1471,6 +1665,92 @@ fn score_text(text: &str) -> i32 {
 mod tests {
 
     #[test]
+    fn type3_scale_resolves_indirect_matrix_and_bbox_numbers() {
+        use lopdf::{dictionary, Document, Object};
+        // FontMatrix/FontBBox elements may be indirect references per PDF
+        // syntax; the scale must use their resolved values, not zero.
+        let mut doc = Document::with_version("1.4");
+        let matrix_d = doc.add_object(Object::Real(-1.0));
+        let bbox_top = doc.add_object(Object::Integer(3));
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontMatrix" => vec![
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Reference(matrix_d),
+                Object::Integer(0),
+                Object::Integer(0),
+            ],
+            "FontBBox" => vec![
+                Object::Integer(1),
+                Object::Integer(-156),
+                Object::Integer(37),
+                Object::Reference(bbox_top),
+            ],
+        };
+        let mut fonts = std::collections::BTreeMap::new();
+        fonts.insert(b"T2".to_vec(), &font_dict);
+        let scales = super::build_type3_scales(&doc, &fonts);
+        let scale = scales.get("T2").copied().unwrap_or(1.0);
+        // bbox height 159 x |matrix_y| 1.0
+        assert!(
+            (scale - 159.0).abs() < 0.5,
+            "scale should use resolved indirect values, got {scale}"
+        );
+    }
+
+    /// Build a one-font Type3 document and return its computed scale, if any.
+    #[cfg(test)]
+    fn type3_scale_for(matrix_y: f32, bbox_lo: i64, bbox_hi: i64) -> Option<f32> {
+        use lopdf::{dictionary, Document, Object};
+        let doc = Document::with_version("1.4");
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontMatrix" => vec![
+                Object::Real(matrix_y), Object::Integer(0), Object::Integer(0),
+                Object::Real(matrix_y), Object::Integer(0), Object::Integer(0),
+            ],
+            "FontBBox" => vec![
+                Object::Integer(0), Object::Integer(bbox_lo),
+                Object::Integer(600), Object::Integer(bbox_hi),
+            ],
+        };
+        let mut fonts = std::collections::BTreeMap::new();
+        fonts.insert(b"T9".to_vec(), &font_dict);
+        super::build_type3_scales(&doc, &fonts).get("T9").copied()
+    }
+
+    #[test]
+    fn type3_scale_skips_self_consistent_fonts() {
+        // Conventional 1/1000 matrix with a descender..ascender bbox of 700
+        // units: scale 0.7. The Tf operand is already the rendered size, so
+        // renormalizing would report every size at 0.7x.
+        assert_eq!(type3_scale_for(0.001, -200, 500), None);
+        // Tall-accent bbox slightly over the em (1100 units, scale 1.1).
+        assert_eq!(type3_scale_for(0.001, -100, 1000), None);
+    }
+
+    #[test]
+    fn type3_scale_applies_to_inconsistent_fonts_at_any_matrix_scale() {
+        // Non-standard but valid matrix (0.005) with a full-em bbox:
+        // scale 5.0, so the declared size is off by 5x and must be fixed.
+        let s = type3_scale_for(0.005, 0, 1000).expect("0.005 matrix should rescale");
+        assert!((s - 5.0).abs() < 0.01, "got {s}");
+        // dvips/PK bitmap pattern: unit matrix, glyphs spanning ~159 units.
+        let s = type3_scale_for(1.0, -156, 3).expect("PK pattern should rescale");
+        assert!((s - 159.0).abs() < 0.5, "got {s}");
+    }
+
+    #[test]
+    fn type3_scale_ignores_degenerate_bbox() {
+        // [0 0 0 0] is legal and carries no size information.
+        assert_eq!(type3_scale_for(0.001, 0, 0), None);
+    }
+
+    #[test]
     fn texcm_math_symbols_remap() {
         assert_eq!(
             super::remap_texcm_math_symbols("S ¼ kB þ 1".into(), Some("EEKVNO+TeXCMMathsSymbols")),
@@ -2079,5 +2359,49 @@ end",
         // A mapping to U+FFFD is not usable — extraction rejects it as an
         // invalid CMap result — so it must not clear the gid flag.
         assert!(gid_flagged(Some("<01> <FFFD>\n<02> <FFFD>")));
+    }
+
+    #[test]
+    fn parse_cid_w_array_range_and_consecutive() {
+        use super::parse_cid_w_array;
+        use lopdf::{Document, Object};
+        use std::collections::HashMap;
+
+        let doc = Document::new();
+        let mut widths = HashMap::new();
+        let w = vec![
+            Object::Integer(10),
+            Object::Integer(12),
+            Object::Integer(500),
+            Object::Integer(20),
+            Object::Array(vec![Object::Integer(100), Object::Integer(200)]),
+        ];
+        parse_cid_w_array(&doc, &w, &mut widths);
+        assert_eq!(widths.get(&10), Some(&500));
+        assert_eq!(widths.get(&11), Some(&500));
+        assert_eq!(widths.get(&12), Some(&500));
+        assert_eq!(widths.get(&20), Some(&100));
+        assert_eq!(widths.get(&21), Some(&200));
+    }
+
+    #[test]
+    fn parse_cid_w_array_repeated_full_ranges_stay_bounded() {
+        use super::parse_cid_w_array;
+        use crate::tounicode::MAX_CID_W_EXPANSION;
+        use lopdf::{Document, Object};
+        use std::collections::HashMap;
+
+        let doc = Document::new();
+        let mut widths = HashMap::new();
+        let mut w = Vec::new();
+        for _ in 0..5_000 {
+            w.push(Object::Integer(0));
+            w.push(Object::Integer(65535));
+            w.push(Object::Integer(500));
+        }
+        parse_cid_w_array(&doc, &w, &mut widths);
+        assert!(widths.len() <= MAX_CID_W_EXPANSION);
+        assert_eq!(widths.get(&0), Some(&500));
+        assert_eq!(widths.get(&65535), Some(&500));
     }
 }

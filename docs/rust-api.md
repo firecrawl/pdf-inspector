@@ -138,6 +138,34 @@ for page in &result.pages {
 println!("Complex layout? {}", result.is_complex);
 ```
 
+Extract structure-tree elements from tagged PDFs, and join them against
+`extract_text_with_positions` to attach semantic roles (heading levels,
+paragraphs, table cells) to extracted text:
+
+```rust
+use pdf_inspector::{extract_structure_elements, extract_text_with_positions};
+use std::collections::HashMap;
+
+// One entry per marked-content reference, sorted by (page, mcid); empty for
+// untagged PDFs. Pages are 1-indexed to match `TextItem::page`, so the
+// (page, mcid) pair is a direct join key.
+let elements = extract_structure_elements("tagged.pdf", None)?;
+let roles: HashMap<(u32, i64), &str> = elements
+    .iter()
+    .map(|e| ((e.page, e.mcid), e.role.as_str()))
+    .collect();
+
+for item in extract_text_with_positions("tagged.pdf")? {
+    if let Some(mcid) = item.mcid {
+        if let Some(role) = roles.get(&(item.page, mcid)) {
+            if role.starts_with('H') {
+                println!("{}: {}", role, item.text);
+            }
+        }
+    }
+}
+```
+
 ## Processing modes
 
 | Mode | What it does | Returns |
@@ -163,6 +191,8 @@ println!("Complex layout? {}", result.is_complex);
 | `to_markdown_from_items_with_rects(items, options, rects)` | Markdown with rectangle-based table detection |
 | `extract_pages_markdown(path, pages)` | Per-page Markdown + layout metadata (file) |
 | `extract_pages_markdown_mem(bytes, pages)` | Per-page Markdown from bytes |
+| `extract_structure_elements(path, pages)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
+| `extract_structure_elements_mem(bytes, pages)` | Structure-tree elements from bytes |
 
 Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
 
@@ -178,7 +208,8 @@ Low-level detection functions are also available via the `detector` module (`det
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
-| `TextItem` | Text with position, font info, and page number |
+| `TextItem` | Text with position, font info, page number, and optional structure-tree `mcid` |
+| `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |

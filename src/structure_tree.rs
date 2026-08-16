@@ -9,7 +9,7 @@
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ─── Standard structure types ────────────────────────────────────────
 
@@ -120,6 +120,65 @@ impl StructRole {
                 | Self::TBody
                 | Self::TFoot
         )
+    }
+
+    /// The standard structure type name for this role ("H1", "P", "Table", …).
+    ///
+    /// Inverse of [`StructRole::from_name`]: for [`StructRole::Other`] the
+    /// custom tag name is returned verbatim.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Document => "Document",
+            Self::Part => "Part",
+            Self::Art => "Art",
+            Self::Sect => "Sect",
+            Self::Div => "Div",
+            Self::BlockQuote => "BlockQuote",
+            Self::Caption => "Caption",
+            Self::TOC => "TOC",
+            Self::TOCI => "TOCI",
+            Self::Index => "Index",
+            Self::NonStruct => "NonStruct",
+            Self::Private => "Private",
+            Self::H => "H",
+            Self::H1 => "H1",
+            Self::H2 => "H2",
+            Self::H3 => "H3",
+            Self::H4 => "H4",
+            Self::H5 => "H5",
+            Self::H6 => "H6",
+            Self::P => "P",
+            Self::L => "L",
+            Self::LI => "LI",
+            Self::Lbl => "Lbl",
+            Self::LBody => "LBody",
+            Self::Table => "Table",
+            Self::TR => "TR",
+            Self::TH => "TH",
+            Self::TD => "TD",
+            Self::THead => "THead",
+            Self::TBody => "TBody",
+            Self::TFoot => "TFoot",
+            Self::Span => "Span",
+            Self::Quote => "Quote",
+            Self::Note => "Note",
+            Self::Reference => "Reference",
+            Self::BibEntry => "BibEntry",
+            Self::Code => "Code",
+            Self::Link => "Link",
+            Self::Annot => "Annot",
+            Self::Figure => "Figure",
+            Self::Formula => "Formula",
+            Self::Form => "Form",
+            Self::Ruby => "Ruby",
+            Self::RB => "RB",
+            Self::RT => "RT",
+            Self::RP => "RP",
+            Self::Warichu => "Warichu",
+            Self::WT => "WT",
+            Self::WP => "WP",
+            Self::Other(name) => name,
+        }
     }
 
     fn from_name(name: &str) -> Self {
@@ -252,9 +311,27 @@ impl StructTree {
         let role_map = parse_role_map(doc, struct_root);
         debug!("structure tree: {} role map entries", role_map.len());
 
+        // Seed the cycle guard with the struct-root's own object id so a `/K`
+        // that points back at the root is treated as a cycle, and bound total
+        // node materialization with a global budget.
+        let mut walk = StructWalk::new();
+        if let Ok(root_id) = struct_root_obj.as_reference() {
+            walk.active.insert(root_id);
+        }
+
         // Parse child elements from /K
-        let children = parse_kids(doc, struct_root, &role_map, None, 0);
+        let children = parse_kids(doc, struct_root, &role_map, None, 0, &mut walk);
         debug!("structure tree: {} top-level elements", children.len());
+
+        if walk.truncated {
+            log::warn!(
+                "structure tree parsing was truncated (node budget of \
+                 {MAX_STRUCT_NODES} or traversal budget of {MAX_STRUCT_WORK} \
+                 reached, a `/K` reference cycle, or the max nesting depth of \
+                 {MAX_DEPTH}); tagged roles/tables may be incomplete (likely a \
+                 very large or malformed tagged PDF)"
+            );
+        }
 
         if children.is_empty() {
             return None;
@@ -479,6 +556,123 @@ fn parse_role_map(doc: &Document, struct_root: &lopdf::Dictionary) -> HashMap<St
 /// malformed PDFs).
 const MAX_DEPTH: usize = 64;
 
+/// Global cap on the number of structure-tree nodes materialized in a single
+/// parse. Real tagged trees are far smaller; a crafted PDF can alias one struct
+/// element into its own `/K` (e.g. `/K [n 0 R n 0 R]`) so the tree branches
+/// exponentially (2^depth) before the depth cap is reached, exhausting memory.
+/// This budget bounds total work and allocation regardless of tree shape.
+const MAX_STRUCT_NODES: usize = 500_000;
+
+/// Cap on the number of `/K` items *examined* during a single parse, regardless
+/// of whether they materialize anything. Bounds CPU for crafted wide `/K` arrays
+/// of non-materializing entries (unsupported value types, `/OBJR` dicts, cycle
+/// back-edges) that would otherwise be scanned in full without ever touching the
+/// node budget. Kept well above the node budget so it never truncates content
+/// that already fits within `MAX_STRUCT_NODES`.
+const MAX_STRUCT_WORK: usize = 2_000_000;
+
+/// Traversal state shared across the recursive structure-tree parse.
+///
+/// `budget` is a global allowance charged once per materialized item — each
+/// struct-element node and each marked-content reference — so total work is
+/// bounded even for aliased/DAG-shaped `/K` graphs of distinct objects or a
+/// single element with a very wide `/K` array. `active` holds the object IDs
+/// currently on the depth-first path so a struct element that references itself
+/// (or an ancestor) is not expanded into an unbounded/exponential subtree.
+/// `budget` bounds *materialization* (nodes + content refs). `work` separately
+/// bounds *traversal* — every `/K` item examined is charged against it, even
+/// ones that materialize nothing (unsupported values, `/OBJR`, cycle back-edges)
+/// — so a wide malformed array cannot force an unbounded scan, and those skipped
+/// items don't drain the materialization budget and truncate real content.
+/// `truncated` records whether any parse work was skipped — the budget was
+/// exhausted, a `/K` reference cycle was broken, or the depth cap was hit — so
+/// the caller can log it once rather than per skipped item. `stalled` is set
+/// when an atomic multi-unit reservation could not fit in the remaining budget;
+/// it makes [`exhausted`](Self::exhausted) report done so a wide `/K` array is
+/// not scanned to the end once no further leaf can be materialized.
+struct StructWalk {
+    budget: usize,
+    work: usize,
+    active: HashSet<ObjectId>,
+    truncated: bool,
+    stalled: bool,
+}
+
+impl StructWalk {
+    fn new() -> Self {
+        Self {
+            budget: MAX_STRUCT_NODES,
+            work: MAX_STRUCT_WORK,
+            active: HashSet::new(),
+            truncated: false,
+            stalled: false,
+        }
+    }
+
+    /// Charge one unit of traversal work for an examined `/K` item, whether or
+    /// not it materializes anything. Returns `false` (flagging truncation) once
+    /// the traversal budget is spent, so an enclosing loop stops instead of
+    /// scanning the rest of a wide array of non-materializing entries.
+    fn spend_work(&mut self) -> bool {
+        if self.work == 0 {
+            self.truncated = true;
+            return false;
+        }
+        self.work -= 1;
+        true
+    }
+
+    /// Record that some parse work was skipped for a non-budget reason (a `/K`
+    /// reference cycle or the depth cap), so the one-shot truncation warning
+    /// also covers malformed/over-deep trees, not just budget exhaustion.
+    fn note_skipped(&mut self) {
+        self.truncated = true;
+    }
+
+    /// Charge one unit against the budget for a materialized item (a struct
+    /// element node or a marked-content reference). Returns `false` — without
+    /// underflowing — once the budget is exhausted, so callers skip the item.
+    fn charge(&mut self) -> bool {
+        if self.budget == 0 {
+            self.truncated = true;
+            return false;
+        }
+        self.budget -= 1;
+        true
+    }
+
+    /// Atomically charge `n` units for a single item that materializes several
+    /// budget-counted parts at once (a leaf wrapper node *plus* its content
+    /// reference). Charges nothing when fewer than `n` units remain — so a
+    /// partial reservation never wastes capacity — and marks the walk `stalled`
+    /// so the enclosing loop stops instead of scanning the rest of a wide `/K`
+    /// array that can no longer fit any leaf.
+    fn charge_n(&mut self, n: usize) -> bool {
+        if self.budget < n {
+            self.truncated = true;
+            self.stalled = true;
+            return false;
+        }
+        self.budget -= n;
+        true
+    }
+
+    /// Whether traversal should stop: the budget is spent, or a multi-unit
+    /// reservation could not fit (`stalled`) so no further leaf will materialize.
+    /// Use this at the guards that break/return to skip remaining items; it
+    /// records that truncation occurred (a guard only fires while an item is
+    /// still pending), so callers that drop work without going through
+    /// [`charge`](Self::charge) still flag the truncation for logging.
+    fn exhausted(&mut self) -> bool {
+        if self.budget == 0 || self.stalled {
+            self.truncated = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Parse child elements from a `/K` entry.
 fn parse_kids(
     doc: &Document,
@@ -486,8 +680,13 @@ fn parse_kids(
     role_map: &HashMap<String, String>,
     inherited_page: Option<ObjectId>,
     depth: usize,
+    walk: &mut StructWalk,
 ) -> Vec<StructElement> {
     if depth >= MAX_DEPTH {
+        walk.note_skipped();
+        return Vec::new();
+    }
+    if walk.exhausted() {
         return Vec::new();
     }
 
@@ -498,21 +697,58 @@ fn parse_kids(
     // /Pg on this element (inherited by children)
     let page_id = get_page_ref(doc, dict).or(inherited_page);
 
+    let mut children = Vec::new();
     match k_obj {
         Object::Array(arr) => {
-            let mut children = Vec::new();
             for item in arr {
-                let resolved = resolve_obj(doc, item);
-                parse_kid(doc, resolved, role_map, page_id, depth, &mut children);
+                if walk.exhausted() || !walk.spend_work() {
+                    break;
+                }
+                process_kid_item(doc, item, role_map, page_id, depth, &mut children, walk);
             }
-            children
         }
         other => {
-            let resolved = resolve_obj(doc, other);
-            let mut children = Vec::new();
-            parse_kid(doc, resolved, role_map, page_id, depth, &mut children);
-            children
+            process_kid_item(doc, other, role_map, page_id, depth, &mut children, walk);
         }
+    }
+    children
+}
+
+/// Resolve one `/K` array item (following at most one level of indirection),
+/// guarding against reference cycles and the global node budget, then dispatch
+/// it via [`parse_kid`].
+fn process_kid_item(
+    doc: &Document,
+    item: &Object,
+    role_map: &HashMap<String, String>,
+    inherited_page: Option<ObjectId>,
+    depth: usize,
+    out: &mut Vec<StructElement>,
+    walk: &mut StructWalk,
+) {
+    if walk.exhausted() {
+        return;
+    }
+    if depth >= MAX_DEPTH {
+        walk.note_skipped();
+        return;
+    }
+    // If this child is an indirect reference, track its id on the active path so
+    // a self/ancestor reference is not expanded into an exponential subtree.
+    let ref_id = match item {
+        Object::Reference(id) => Some(*id),
+        _ => None,
+    };
+    if let Some(id) = ref_id {
+        if !walk.active.insert(id) {
+            walk.note_skipped();
+            return; // cycle: this object is already on the current path
+        }
+    }
+    let resolved = resolve_obj(doc, item);
+    parse_kid(doc, resolved, role_map, inherited_page, depth, out, walk);
+    if let Some(id) = ref_id {
+        walk.active.remove(&id);
     }
 }
 
@@ -524,10 +760,16 @@ fn parse_kid(
     inherited_page: Option<ObjectId>,
     depth: usize,
     out: &mut Vec<StructElement>,
+    walk: &mut StructWalk,
 ) {
     match obj {
         // Direct MCID integer — create a leaf wrapper
         Object::Integer(mcid) => {
+            // A wrapper node plus its content reference — two items — reserved
+            // atomically so we never consume one unit without emitting both.
+            if !walk.charge_n(2) {
+                return;
+            }
             // This is a bare MCID at the struct-element level.
             // We attach it to the parent element, so we create a wrapper struct element.
             // Actually, bare MCIDs inside /K are content refs for the parent,
@@ -546,11 +788,11 @@ fn parse_kid(
             });
         }
         Object::Dictionary(d) => {
-            parse_struct_element_dict(doc, d, role_map, inherited_page, depth, out);
+            parse_struct_element_dict(doc, d, role_map, inherited_page, depth, out, walk);
         }
         Object::Stream(s) => {
             // Some PDFs wrap struct elements in streams (rare)
-            parse_struct_element_dict(doc, &s.dict, role_map, inherited_page, depth, out);
+            parse_struct_element_dict(doc, &s.dict, role_map, inherited_page, depth, out, walk);
         }
         _ => {}
     }
@@ -565,13 +807,23 @@ fn parse_struct_element_dict(
     inherited_page: Option<ObjectId>,
     depth: usize,
     out: &mut Vec<StructElement>,
+    walk: &mut StructWalk,
 ) {
     if depth >= MAX_DEPTH {
+        walk.note_skipped();
         return;
     }
-    // Check if this is a marked-content reference dict (has /Type /MCR)
+
+    // A marked-content reference dict materializes a wrapper node + one content
+    // reference (two items). Reserve both atomically *before* the node charge so
+    // we never consume a unit without emitting the reference — which would also
+    // deny that unit to a later element that would have fit. This matches the
+    // bare-MCID path.
     if is_mcr_dict(dict) {
         if let Ok(Object::Integer(mcid)) = dict.get(b"MCID") {
+            if !walk.charge_n(2) {
+                return;
+            }
             let page_id = get_page_ref(doc, dict).or(inherited_page);
             out.push(StructElement {
                 role: StructRole::Span,
@@ -588,12 +840,15 @@ fn parse_struct_element_dict(
         return;
     }
 
-    // Check if this is an object reference dict (has /Type /OBJR) — skip these
+    // Skip object-reference dicts (`/Type /OBJR`) — they materialize no node, so
+    // recognize and return *before* charging the budget (otherwise a document
+    // full of OBJRs would drain the shared budget and truncate real content).
     if is_objr_dict(dict) {
         return;
     }
 
-    // It's a struct element — parse its /S (structure type)
+    // It's a struct element — parse its /S (structure type). A dict without a
+    // valid /S also materializes nothing, so validate before charging.
     let role_name = match dict.get(b"S") {
         Ok(s_obj) => {
             let resolved = resolve_obj(doc, s_obj);
@@ -604,6 +859,12 @@ fn parse_struct_element_dict(
         }
         Err(_) => return,
     };
+
+    // Charge the node only now that we know it will materialize (bounds
+    // aliased/DAG-shaped `/K` graphs the per-path cycle guard alone cannot stop).
+    if !walk.charge() {
+        return;
+    }
 
     let role = StructRole::from_name_with_role_map(&role_name, role_map);
     let page_id = get_page_ref(doc, dict).or(inherited_page);
@@ -621,51 +882,73 @@ fn parse_struct_element_dict(
         let k_resolved = resolve_obj(doc, k_obj);
         match k_resolved {
             Object::Integer(mcid) => {
-                content_refs.push(MarkedContentRef {
-                    mcid: *mcid,
-                    page_id,
-                });
+                if walk.charge() {
+                    content_refs.push(MarkedContentRef {
+                        mcid: *mcid,
+                        page_id,
+                    });
+                }
             }
             Object::Array(arr) => {
                 for item in arr {
+                    if walk.exhausted() || !walk.spend_work() {
+                        break;
+                    }
+                    // Only content-ref items (bare MCIDs / MCR dicts) are charged
+                    // here — those are the unbounded allocations. Structural
+                    // children are charged once at their own node entry in the
+                    // recursive call, so charging them here too would double-count
+                    // and drain the budget ~2× faster than the per-node semantics.
+                    let ref_id = match item {
+                        Object::Reference(id) => Some(*id),
+                        _ => None,
+                    };
                     let resolved = resolve_obj(doc, item);
                     match resolved {
                         Object::Integer(mcid) => {
-                            content_refs.push(MarkedContentRef {
-                                mcid: *mcid,
-                                page_id,
-                            });
+                            if walk.charge() {
+                                content_refs.push(MarkedContentRef {
+                                    mcid: *mcid,
+                                    page_id,
+                                });
+                            }
                         }
                         Object::Dictionary(d) => {
                             if is_mcr_dict(d) {
                                 if let Ok(Object::Integer(mcid)) = d.get(b"MCID") {
-                                    let pg = get_page_ref(doc, d).or(page_id);
-                                    content_refs.push(MarkedContentRef {
-                                        mcid: *mcid,
-                                        page_id: pg,
-                                    });
+                                    if walk.charge() {
+                                        let pg = get_page_ref(doc, d).or(page_id);
+                                        content_refs.push(MarkedContentRef {
+                                            mcid: *mcid,
+                                            page_id: pg,
+                                        });
+                                    }
                                 }
                             } else if is_objr_dict(d) {
                                 // Skip object references
                             } else {
-                                parse_struct_element_dict(
+                                recurse_struct_child(
                                     doc,
+                                    ref_id,
                                     d,
                                     role_map,
                                     page_id,
-                                    depth + 1,
+                                    depth,
                                     &mut children,
+                                    walk,
                                 );
                             }
                         }
                         Object::Stream(s) => {
-                            parse_struct_element_dict(
+                            recurse_struct_child(
                                 doc,
+                                ref_id,
                                 &s.dict,
                                 role_map,
                                 page_id,
-                                depth + 1,
+                                depth,
                                 &mut children,
+                                walk,
                             );
                         }
                         _ => {}
@@ -675,14 +958,29 @@ fn parse_struct_element_dict(
             Object::Dictionary(d) => {
                 if is_mcr_dict(d) {
                     if let Ok(Object::Integer(mcid)) = d.get(b"MCID") {
-                        let pg = get_page_ref(doc, d).or(page_id);
-                        content_refs.push(MarkedContentRef {
-                            mcid: *mcid,
-                            page_id: pg,
-                        });
+                        if walk.charge() {
+                            let pg = get_page_ref(doc, d).or(page_id);
+                            content_refs.push(MarkedContentRef {
+                                mcid: *mcid,
+                                page_id: pg,
+                            });
+                        }
                     }
                 } else {
-                    parse_struct_element_dict(doc, d, role_map, page_id, depth + 1, &mut children);
+                    let ref_id = match k_obj {
+                        Object::Reference(id) => Some(*id),
+                        _ => None,
+                    };
+                    recurse_struct_child(
+                        doc,
+                        ref_id,
+                        d,
+                        role_map,
+                        page_id,
+                        depth,
+                        &mut children,
+                        walk,
+                    );
                 }
             }
             _ => {}
@@ -697,6 +995,37 @@ fn parse_struct_element_dict(
         content_refs,
         children,
     });
+}
+
+/// Recurse into a child struct-element dictionary, guarding against reference
+/// cycles (via the active-path object-id set) and the global node budget.
+///
+/// `ref_id` is the object id of the child when it was reached through an
+/// indirect reference (`None` for an inline dictionary, which cannot alias).
+#[allow(clippy::too_many_arguments)]
+fn recurse_struct_child(
+    doc: &Document,
+    ref_id: Option<ObjectId>,
+    dict: &lopdf::Dictionary,
+    role_map: &HashMap<String, String>,
+    inherited_page: Option<ObjectId>,
+    depth: usize,
+    out: &mut Vec<StructElement>,
+    walk: &mut StructWalk,
+) {
+    if walk.exhausted() {
+        return;
+    }
+    if let Some(id) = ref_id {
+        if !walk.active.insert(id) {
+            walk.note_skipped();
+            return; // cycle: this object is already on the current path
+        }
+    }
+    parse_struct_element_dict(doc, dict, role_map, inherited_page, depth + 1, out, walk);
+    if let Some(id) = ref_id {
+        walk.active.remove(&id);
+    }
 }
 
 /// Check if dict has `/Type /MCR`.
@@ -901,6 +1230,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     #[test]
     fn non_heading_content_roles() {
@@ -960,6 +1290,66 @@ mod tests {
             StructRole::from_name("CustomTag"),
             StructRole::Other("CustomTag".to_string())
         );
+    }
+
+    #[test]
+    fn test_struct_role_name_roundtrip() {
+        // `name()` is the inverse of `from_name` for every standard type.
+        for name in [
+            "Document",
+            "Part",
+            "Art",
+            "Sect",
+            "Div",
+            "BlockQuote",
+            "Caption",
+            "TOC",
+            "TOCI",
+            "Index",
+            "NonStruct",
+            "Private",
+            "H",
+            "H1",
+            "H2",
+            "H3",
+            "H4",
+            "H5",
+            "H6",
+            "P",
+            "L",
+            "LI",
+            "Lbl",
+            "LBody",
+            "Table",
+            "TR",
+            "TH",
+            "TD",
+            "THead",
+            "TBody",
+            "TFoot",
+            "Span",
+            "Quote",
+            "Note",
+            "Reference",
+            "BibEntry",
+            "Code",
+            "Link",
+            "Annot",
+            "Figure",
+            "Formula",
+            "Form",
+            "Ruby",
+            "RB",
+            "RT",
+            "RP",
+            "Warichu",
+            "WT",
+            "WP",
+        ] {
+            assert_eq!(StructRole::from_name(name).name(), name);
+        }
+        // Custom tags pass through verbatim.
+        assert_eq!(StructRole::from_name("CustomTag").name(), "CustomTag");
     }
 
     #[test]
@@ -1230,5 +1620,396 @@ mod tests {
         let page_ids = doc.get_pages();
         let role_map = tree.mcid_to_roles(&page_ids);
         assert!(!role_map.is_empty(), "Should have MCID→role mappings");
+    }
+
+    fn count_nodes(elems: &[StructElement]) -> usize {
+        elems.iter().map(|e| 1 + count_nodes(&e.children)).sum()
+    }
+
+    /// Wrap already-created struct elements under a `/StructTreeRoot` and
+    /// `/Catalog`, returning a document ready for [`StructTree::from_doc`].
+    /// `root_kid` is the top-level element the root's `/K` points at.
+    fn finalize_tagged_doc(mut doc: Document, root_kid: ObjectId) -> Document {
+        let root_id = doc.add_object(dictionary! {
+            "Type" => "StructTreeRoot",
+            "K" => vec![Object::Reference(root_kid)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "StructTreeRoot" => Object::Reference(root_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn struct_tree_self_alias_kids_terminates() {
+        // A struct element that lists itself twice in `/K` (`/K [n 0 R n 0 R]`)
+        // must not expand into an exponential tree.
+        let mut doc = Document::new();
+        let elem = doc.new_object_id();
+        doc.set_object(
+            elem,
+            dictionary! {
+                "Type" => "StructElem",
+                "S" => "Div",
+                "K" => vec![Object::Reference(elem), Object::Reference(elem)],
+            },
+        );
+        let doc = finalize_tagged_doc(doc, elem);
+
+        let tree = StructTree::from_doc(&doc).expect("tree should parse");
+        let n = count_nodes(&tree.children);
+        assert!(
+            n < 10,
+            "self-alias must not explode; materialized {n} nodes"
+        );
+    }
+
+    #[test]
+    fn struct_tree_mutual_alias_kids_terminates() {
+        // A → B → A cycle via `/K` must terminate.
+        let mut doc = Document::new();
+        let a = doc.new_object_id();
+        let b = doc.new_object_id();
+        doc.set_object(
+            a,
+            dictionary! {
+                "Type" => "StructElem",
+                "S" => "Div",
+                "K" => vec![Object::Reference(b), Object::Reference(b)],
+            },
+        );
+        doc.set_object(
+            b,
+            dictionary! {
+                "Type" => "StructElem",
+                "S" => "Div",
+                "K" => vec![Object::Reference(a), Object::Reference(a)],
+            },
+        );
+        let doc = finalize_tagged_doc(doc, a);
+
+        let tree = StructTree::from_doc(&doc).expect("tree should parse");
+        let n = count_nodes(&tree.children);
+        assert!(
+            n < 100,
+            "mutual alias must terminate small; materialized {n} nodes"
+        );
+    }
+
+    #[test]
+    fn struct_tree_aliased_dag_respects_node_budget() {
+        // Distinct elements, each aliased twice in the next level's `/K`, form a
+        // DAG that would expand to 2^depth nodes (the per-path cycle guard does
+        // not catch this since every id is on the path only once). The global
+        // node budget must cap total materialization.
+        let mut doc = Document::new();
+        let levels = 22; // 2^22 ≈ 4.2M unbounded, well past the budget
+        let ids: Vec<ObjectId> = (0..=levels).map(|_| doc.new_object_id()).collect();
+        for i in 0..levels {
+            doc.set_object(
+                ids[i],
+                dictionary! {
+                    "Type" => "StructElem",
+                    "S" => "Div",
+                    "K" => vec![Object::Reference(ids[i + 1]), Object::Reference(ids[i + 1])],
+                },
+            );
+        }
+        doc.set_object(
+            ids[levels],
+            dictionary! { "Type" => "StructElem", "S" => "P" },
+        );
+        let root_id = doc.add_object(dictionary! {
+            "Type" => "StructTreeRoot",
+            "K" => vec![Object::Reference(ids[0])],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "StructTreeRoot" => Object::Reference(root_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let tree = StructTree::from_doc(&doc).expect("tree should parse");
+        let n = count_nodes(&tree.children);
+        assert!(
+            n <= MAX_STRUCT_NODES,
+            "node count {n} exceeded budget {MAX_STRUCT_NODES}"
+        );
+    }
+
+    #[test]
+    fn struct_tree_wide_mcid_array_respects_budget() {
+        // A single struct element with a `/K` array of bare MCIDs wider than the
+        // budget must not allocate `content_refs` without bound — each array item
+        // is charged, so materialized marked-content refs stay within the budget.
+        let mut doc = Document::new();
+        let elem = doc.new_object_id();
+        let kids: Vec<Object> = (0..(MAX_STRUCT_NODES as i64 + 100))
+            .map(Object::Integer)
+            .collect();
+        doc.set_object(
+            elem,
+            dictionary! {
+                "Type" => "StructElem",
+                "S" => "P",
+                "K" => kids,
+            },
+        );
+        let doc = finalize_tagged_doc(doc, elem);
+
+        let tree = StructTree::from_doc(&doc).expect("tree should parse");
+        assert!(
+            tree.mcid_count() <= MAX_STRUCT_NODES,
+            "content_refs unbounded: {} > {MAX_STRUCT_NODES}",
+            tree.mcid_count()
+        );
+    }
+
+    #[test]
+    fn budget_charge_flags_truncation_once_exhausted() {
+        let mut walk = StructWalk::new();
+        walk.budget = 1;
+        assert!(walk.charge(), "should spend the last unit");
+        assert!(!walk.truncated, "not truncated while budget remained");
+        assert!(!walk.charge(), "budget exhausted");
+        assert!(walk.truncated, "exhaustion must set the truncation flag");
+        // Stays exhausted/flagged on subsequent calls.
+        assert!(!walk.charge());
+        assert!(walk.truncated);
+    }
+
+    #[test]
+    fn exhausted_flags_truncation_after_budget_spent_by_charge() {
+        // The dominant truncation path: the budget is driven to 0 by a
+        // successful `charge()` (which does not set the flag), and remaining
+        // items are then dropped by an `exhausted()` guard — which must flag it.
+        let mut walk = StructWalk::new();
+        walk.budget = 1;
+        assert!(walk.charge());
+        assert!(
+            !walk.truncated,
+            "spending the last unit is not truncation yet"
+        );
+        assert!(walk.exhausted(), "budget is now spent");
+        assert!(
+            walk.truncated,
+            "the guard that skips work must flag truncation"
+        );
+    }
+
+    #[test]
+    fn wide_kids_array_flags_truncation_via_parser() {
+        // Reproduce the reviewer's scenario through the real parser: a `/K`
+        // array wider than the budget drives the budget to 0 via `charge()`,
+        // then the loop guard drops the rest — the truncation flag must be set
+        // (so `from_doc` logs it) rather than staying silently false.
+        let mut doc = Document::new();
+        let elem = doc.new_object_id();
+        let kids: Vec<Object> = (0..20i64).map(Object::Integer).collect();
+        doc.set_object(
+            elem,
+            dictionary! { "Type" => "StructElem", "S" => "P", "K" => kids },
+        );
+        let dict = doc.get_dictionary(elem).unwrap().clone();
+
+        let mut walk = StructWalk::new();
+        walk.budget = 5; // smaller than the 20-item `/K` array
+        let role_map = HashMap::new();
+        let mut out = Vec::new();
+        parse_struct_element_dict(&doc, &dict, &role_map, None, 0, &mut out, &mut walk);
+        assert!(
+            walk.truncated,
+            "a `/K` array wider than the budget must flag truncation"
+        );
+    }
+
+    #[test]
+    fn cycle_skip_flags_truncation() {
+        // A `/K` reference cycle is dropped rather than expanded; that skip must
+        // still flag truncation so the one-shot warning fires for malformed
+        // trees, not only for budget exhaustion.
+        let mut doc = Document::new();
+        let elem = doc.new_object_id();
+        doc.set_object(
+            elem,
+            dictionary! {
+                "Type" => "StructElem",
+                "S" => "Div",
+                "K" => vec![Object::Reference(elem), Object::Reference(elem)],
+            },
+        );
+        let dict = doc.get_dictionary(elem).unwrap().clone();
+
+        let mut walk = StructWalk::new();
+        walk.active.insert(elem); // simulate `elem` already on the DFS path
+        let role_map = HashMap::new();
+        let mut out = Vec::new();
+        parse_struct_element_dict(&doc, &dict, &role_map, None, 0, &mut out, &mut walk);
+        assert!(
+            walk.truncated,
+            "a cycle-skipped `/K` child must flag truncation"
+        );
+    }
+
+    #[test]
+    fn bare_mcid_charges_node_and_reference() {
+        // A bare MCID `/K` child becomes a wrapper node carrying one content
+        // reference — two materialized items — so it must charge two budget
+        // units, not one.
+        let doc = Document::new();
+        let obj = Object::Integer(7);
+        let role_map = HashMap::new();
+        let mut out = Vec::new();
+        let mut walk = StructWalk::new();
+        let before = walk.budget;
+        parse_kid(&doc, &obj, &role_map, None, 0, &mut out, &mut walk);
+        assert_eq!(
+            out.len(),
+            1,
+            "bare MCID should materialize one wrapper node"
+        );
+        assert_eq!(
+            before - walk.budget,
+            2,
+            "bare MCID must charge for both the node and its content reference"
+        );
+    }
+
+    #[test]
+    fn mcr_dict_charges_node_and_reference() {
+        // A top-level MCR `/K` dict materializes the same wrapper node + content
+        // reference as a bare MCID, so it must charge the same two budget units
+        // (not one), keeping the per-item budgeting uniform.
+        let doc = Document::new();
+        let obj = Object::Dictionary(dictionary! { "Type" => "MCR", "MCID" => 3 });
+        let role_map = HashMap::new();
+        let mut out = Vec::new();
+        let mut walk = StructWalk::new();
+        let before = walk.budget;
+        parse_kid(&doc, &obj, &role_map, None, 0, &mut out, &mut walk);
+        assert_eq!(out.len(), 1, "MCR dict should materialize one wrapper node");
+        assert_eq!(
+            before - walk.budget,
+            2,
+            "MCR dict must charge for both the node and its content reference"
+        );
+    }
+
+    #[test]
+    fn leaf_wrappers_reserve_both_units_atomically() {
+        // With only one unit left, a two-item leaf wrapper (bare MCID or MCR
+        // dict) must consume nothing and flag truncation, leaving the unit for a
+        // later single-item element instead of half-charging.
+        let doc = Document::new();
+        let role_map = HashMap::new();
+
+        // Bare MCID via parse_kid.
+        let mut walk = StructWalk::new();
+        walk.budget = 1;
+        let mut out = Vec::new();
+        parse_kid(
+            &doc,
+            &Object::Integer(5),
+            &role_map,
+            None,
+            0,
+            &mut out,
+            &mut walk,
+        );
+        assert!(out.is_empty(), "bare MCID must not partially materialize");
+        assert_eq!(walk.budget, 1, "the leftover unit must be preserved");
+        assert!(walk.truncated);
+
+        // MCR dict via parse_struct_element_dict.
+        let mcr = dictionary! { "Type" => "MCR", "MCID" => 1 };
+        let mut walk = StructWalk::new();
+        walk.budget = 1;
+        let mut out = Vec::new();
+        parse_struct_element_dict(&doc, &mcr, &role_map, None, 0, &mut out, &mut walk);
+        assert!(out.is_empty(), "MCR dict must not partially materialize");
+        assert_eq!(walk.budget, 1, "the leftover unit must be preserved");
+        assert!(walk.truncated);
+    }
+
+    #[test]
+    fn insufficient_reservation_stops_the_scan() {
+        // A one-unit budget is not "exhausted" for a one-unit item, but once a
+        // two-unit leaf reservation fails, the walk is stalled so enclosing `/K`
+        // loops stop instead of scanning the rest of a wide array.
+        let mut walk = StructWalk::new();
+        walk.budget = 1;
+        assert!(
+            !walk.exhausted(),
+            "one unit left must still allow a one-unit item"
+        );
+        assert!(!walk.charge_n(2), "cannot reserve two units from one");
+        assert!(
+            walk.exhausted(),
+            "an insufficient reservation must stop the loop"
+        );
+        assert!(walk.truncated);
+    }
+
+    #[test]
+    fn work_budget_bounds_examined_items() {
+        let mut walk = StructWalk::new();
+        walk.work = 2;
+        assert!(walk.spend_work());
+        assert!(walk.spend_work());
+        assert!(!walk.spend_work(), "traversal budget exhausted");
+        assert!(walk.truncated);
+    }
+
+    #[test]
+    fn wide_unsupported_kids_stop_at_work_budget() {
+        // A wide `/K` array of unsupported values (nulls) materializes nothing;
+        // it must stop at the traversal budget instead of scanning every entry.
+        let mut doc = Document::new();
+        let elem = doc.new_object_id();
+        let kids: Vec<Object> = (0..1000).map(|_| Object::Null).collect();
+        doc.set_object(
+            elem,
+            dictionary! { "Type" => "StructElem", "S" => "P", "K" => kids },
+        );
+        let dict = doc.get_dictionary(elem).unwrap().clone();
+
+        let mut walk = StructWalk::new();
+        walk.work = 10; // far smaller than the 1000-entry array
+        let role_map = HashMap::new();
+        let mut out = Vec::new();
+        parse_struct_element_dict(&doc, &dict, &role_map, None, 0, &mut out, &mut walk);
+        assert!(
+            walk.truncated,
+            "a wide unsupported `/K` array must hit the work budget"
+        );
+    }
+
+    #[test]
+    fn non_materializing_dicts_do_not_charge_node_budget() {
+        let doc = Document::new();
+        let role_map = HashMap::new();
+
+        // OBJR dict: materializes no node, so it must not spend the node budget.
+        let objr = dictionary! { "Type" => "OBJR" };
+        let mut walk = StructWalk::new();
+        let before = walk.budget;
+        let mut out = Vec::new();
+        parse_struct_element_dict(&doc, &objr, &role_map, None, 0, &mut out, &mut walk);
+        assert!(out.is_empty());
+        assert_eq!(walk.budget, before, "OBJR must not spend the node budget");
+
+        // A struct dict without a valid /S also materializes nothing.
+        let no_s = dictionary! { "Type" => "StructElem" };
+        let mut walk = StructWalk::new();
+        let before = walk.budget;
+        let mut out = Vec::new();
+        parse_struct_element_dict(&doc, &no_s, &role_map, None, 0, &mut out, &mut walk);
+        assert!(out.is_empty());
+        assert_eq!(
+            walk.budget, before,
+            "a dict without /S must not spend the node budget"
+        );
     }
 }

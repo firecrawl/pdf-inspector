@@ -14,12 +14,12 @@ use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
 use super::fonts::{
-    build_font_encodings, build_font_widths, compute_string_width_ts, descriptor_style_flags,
-    extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
-    FontStyleCache,
+    build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
+    descriptor_style_flags, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
+    CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
-use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
+use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
@@ -41,6 +41,17 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     while i < data.len() {
         let b = data[i];
         match b {
+            // Inside a string literal, a backslash escapes the next byte —
+            // `\(`, `\)`, and `\\` must not touch the nesting depth, or a
+            // later `%` glyph inside a string gets stripped as a comment,
+            // corrupting the stream.
+            b'\\' if in_string > 0 => {
+                result.push(b);
+                if let Some(&next) = data.get(i + 1) {
+                    result.push(next);
+                    i += 1;
+                }
+            }
             b'(' if !in_hex_string => {
                 in_string += 1;
                 result.push(b);
@@ -126,8 +137,11 @@ fn rise_adjusted(tm: &[f32; 6], rise: f32) -> [f32; 6] {
     ]
 }
 
-/// Returns `(page_extraction, has_gid_fonts)` where `has_gid_fonts` indicates
-/// the page uses fonts with unresolvable gid-encoded glyphs.
+/// Returns `(page_extraction, has_gid_fonts, coords_rotated, skipped_invisible)`
+/// where `has_gid_fonts` indicates the page uses fonts with unresolvable
+/// gid-encoded glyphs and `skipped_invisible` reports that invisible (Tr 3)
+/// text was present but suppressed — callers can use it to decide whether an
+/// `include_invisible` retry could recover anything at all.
 pub(crate) fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
@@ -135,9 +149,8 @@ pub(crate) fn extract_page_text_items(
     font_cmaps: &FontCMaps,
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
-) -> Result<(PageExtraction, bool, bool), PdfError> {
-    use lopdf::content::Content;
-
+    form_budget: &mut FormWalkBudget,
+) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
@@ -166,6 +179,7 @@ pub(crate) fn extract_page_text_items(
 
     // Build font width info for accurate text positioning
     let font_widths = build_font_widths(doc, &fonts);
+    let type3_scales = build_type3_scales(doc, &fonts);
 
     // Build maps of font resource names to their base font names and ToUnicode object refs
     let mut font_base_names: std::collections::HashMap<String, String> =
@@ -240,22 +254,27 @@ pub(crate) fn extract_page_text_items(
     // Content::decode parser, causing it to skip operators like ET and Q.
     let content_data = strip_pdf_comments(&content_data);
 
-    let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
-
-    const MAX_OPERATIONS: usize = 1_000_000;
-    if content.operations.len() > MAX_OPERATIONS {
-        log::warn!(
-            "page {}: skipping extraction — {} operations exceeds limit ({})",
-            page_num,
-            content.operations.len(),
-            MAX_OPERATIONS
-        );
-        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false));
-    }
+    let content = match super::content_decode::decode_content_bounded(
+        &content_data,
+        super::content_decode::MAX_PAGE_OPERATIONS,
+    )? {
+        Some(content) => content,
+        None => {
+            log::warn!(
+                "page {}: skipping extraction — content stream exceeds {} operations",
+                page_num,
+                super::content_decode::MAX_PAGE_OPERATIONS
+            );
+            return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
+        }
+    };
 
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
+                                          // Invisible (Tr 3) text was present but suppressed — reported to callers
+                                          // so an include_invisible retry is attempted only when it can recover.
+    let mut skipped_invisible = false;
     let mut line_width: f32 = 1.0;
     #[derive(Clone)]
     struct SavedGraphicsState {
@@ -482,6 +501,14 @@ pub(crate) fn extract_page_text_items(
                     // For Mixed/template PDFs, include_invisible=true extracts
                     // the OCR text layer that sits behind scanned images.
                     if text_rendering_mode == 3 && !include_invisible {
+                        if op
+                            .operands
+                            .first()
+                            .and_then(get_operand_bytes)
+                            .is_some_and(|raw| !raw.is_empty())
+                        {
+                            skipped_invisible = true;
+                        }
                         if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -502,7 +529,8 @@ pub(crate) fn extract_page_text_items(
                     ) {
                         let combined =
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
-                        let rendered_size = effective_font_size(current_font_size, &combined);
+                        let rendered_size = effective_font_size(current_font_size, &combined)
+                            * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                         let (x, y) = (combined[4], combined[5]);
                         if combined[0].abs() >= combined[1].abs() {
                             rotation_votes.horizontal += 1;
@@ -552,6 +580,16 @@ pub(crate) fn extract_page_text_items(
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
+                        // Numeric-only TJ arrays (pure kerning) show no
+                        // text — they must not trigger the invisible retry.
+                        if text_rendering_mode == 3
+                            && !include_invisible
+                            && array
+                                .iter()
+                                .any(|el| get_operand_bytes(el).is_some_and(|raw| !raw.is_empty()))
+                        {
+                            skipped_invisible = true;
+                        }
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
                         // Capture first-glyph position for ActualText
@@ -673,7 +711,8 @@ pub(crate) fn extract_page_text_items(
                             } else {
                                 rotation_votes.rotated += 1;
                             }
-                            let rendered_size = effective_font_size(current_font_size, &combined);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -756,6 +795,16 @@ pub(crate) fn extract_page_text_items(
                         )
                     })
                 });
+                if text_rendering_mode == 3
+                    && !include_invisible
+                    && op
+                        .operands
+                        .first()
+                        .and_then(get_operand_bytes)
+                        .is_some_and(|raw| !raw.is_empty())
+                {
+                    skipped_invisible = true;
+                }
                 if !((text_rendering_mode == 3 && !include_invisible)
                     || suppress_glyph_extraction
                     || op.operands.is_empty())
@@ -780,7 +829,8 @@ pub(crate) fn extract_page_text_items(
                             } else {
                                 rotation_votes.rotated += 1;
                             }
-                            let rendered_size = effective_font_size(current_font_size, &combined);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let (x, y) = (combined[4], combined[5]);
                             let width = w_ts_opt
                                 .map(|w_ts| {
@@ -867,6 +917,7 @@ pub(crate) fn extract_page_text_items(
                                         &ctm,
                                         &mut cmap_decisions,
                                         style_cache,
+                                        form_budget,
                                     );
                                     items.extend(form_items);
                                 }
@@ -932,7 +983,8 @@ pub(crate) fn extract_page_text_items(
                             } else {
                                 rotation_votes.rotated += 1;
                             }
-                            let rendered_size = effective_font_size(current_font_size, &combined);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let (x, y) = (combined[4], combined[5]);
                             // Width in device space from text matrix delta
                             let delta_ts = text_matrix[4] - start_tm[4];
@@ -1235,6 +1287,12 @@ pub(crate) fn extract_page_text_items(
         }
     }
 
+    if form_budget.was_truncated() {
+        log::warn!(
+            "page {page_num}: Form XObject expansion truncated (invocation or operation budget reached); nested form text may be incomplete"
+        );
+    }
+
     // Underline detection reads only painted ink: `re` rects confirmed by
     // a paint operator plus filled-subpath rects — never clip-only rects,
     // which draw nothing.
@@ -1284,7 +1342,12 @@ pub(crate) fn extract_page_text_items(
 
     let items = super::merge_text_items(items);
     let items = super::merge_subscript_items(items);
-    Ok(((items, rects, lines), has_gid_fonts, coords_rotated))
+    Ok((
+        (items, rects, lines),
+        has_gid_fonts,
+        coords_rotated,
+        skipped_invisible,
+    ))
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.
@@ -1482,13 +1545,14 @@ mod tests {
 
         let (doc, page_id) = simple_doc_with_content(content);
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         items
@@ -1718,9 +1782,10 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
-        let ((items, rects, lines), _has_gid, _coords_rotated) = result;
+        let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible) = result;
         assert!(items.is_empty());
         assert!(rects.is_empty());
         assert!(lines.is_empty());
@@ -1801,13 +1866,14 @@ BT 30 700 Tm <41> Tj ET";
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         let text = items
@@ -1847,6 +1913,43 @@ BT 30 700 Tm <41> Tj ET";
         assert!(
             output_str.contains("ET"),
             "ET should be preserved after comment stripping"
+        );
+    }
+
+    #[test]
+    fn test_strip_pdf_comments_escaped_parens() {
+        // An escaped `\)` must not close the string: the `%` after it is
+        // still string content, not a comment (subset fonts routinely map
+        // glyphs to `%` and to escaped parens in the same TJ array).
+        let input = b"[ (a\\)b) 1 (%) 1 (c) ] TJ\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, input.to_vec());
+
+        // Same for an escaped `\(` — must not open a phantom string that
+        // shields a real comment.
+        let input = b"(x\\(y) Tj % real comment\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"(x\\(y) Tj  \nET\n");
+
+        // Escaped backslash before a real close-paren: `\\` ends the escape,
+        // the `)` does close the string, and the comment is stripped.
+        let input = b"(x\\\\) Tj % comment\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"(x\\\\) Tj  \nET\n");
+    }
+
+    #[test]
+    fn oversized_content_stream_skips_extraction() {
+        let mut content =
+            Vec::with_capacity((super::super::content_decode::MAX_PAGE_OPERATIONS + 1) * 2);
+        for _ in 0..=super::super::content_decode::MAX_PAGE_OPERATIONS {
+            content.extend_from_slice(b"q\n");
+        }
+        content.extend_from_slice(b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET\n");
+        let items = extract_simple_items(&content);
+        assert!(
+            items.is_empty(),
+            "pages over the operator cap must not be decoded"
         );
     }
 }

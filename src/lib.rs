@@ -50,7 +50,7 @@ pub use detector::{
 };
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_mem,
-    extract_text_with_positions_pages,
+    extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
@@ -491,7 +491,14 @@ pub fn extract_pages_markdown_mem(
 
     // Tables need the original numeric cells; columns use folio-cleaned
     // evidence so removed page numbers cannot create false layout metadata.
-    let complexity = compute_layout_complexity(&all_items, &filtered_items, &all_rects, &all_lines);
+    let chart_regions = markdown::chart_regions_by_page(&all_items, &all_rects, &all_lines);
+    let complexity = compute_layout_complexity_with_chart_regions(
+        &all_items,
+        &filtered_items,
+        &all_rects,
+        &all_lines,
+        &chart_regions,
+    );
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
@@ -509,6 +516,7 @@ pub fn extract_pages_markdown_mem(
     let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
+    let lopdf_pages = doc.get_pages();
 
     for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
@@ -542,6 +550,25 @@ pub fn extract_pages_markdown_mem(
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
 
+        // A page can extract cleanly (no decoding issues, non-empty text)
+        // while still being fundamentally a scan: a full-page raster with
+        // a little genuine native text drawn over it (a header, a stamp, a
+        // cover-sheet annotation). Text-quality signals alone can't see
+        // that — consult the same "large background image" signal
+        // classify_pdf/detect_pdf_type already uses, so the two APIs can't
+        // silently disagree on whether a page needs OCR. See #227.
+        // Also covers vector-outlined text (glyphs drawn as paths, not
+        // shown via a text-showing operator): a hybrid page with real
+        // embedded-font body text elsewhere would otherwise still extract
+        // non-empty, non-garbled markdown and miss OCR routing entirely.
+        // detect_from_document's Mixed-type per-page routing always sends
+        // these pages to OCR; mirror that here too. Both signals share one
+        // analyze_page_content pass — see page_ocr_signals's doc comment.
+        let (has_template_image, has_vector_text) = lopdf_pages
+            .get(&page_1idx)
+            .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
+            .unwrap_or((false, false));
+
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
             base_font_size: Some(font_stats.most_common_size),
@@ -565,6 +592,7 @@ pub fn extract_pages_markdown_mem(
                     page_count,
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
                     prefiltered_page_number_mask: Some(&page_number_removal_mask),
+                    precomputed_chart_regions: Some(&chart_regions),
                 },
             )
         };
@@ -578,10 +606,20 @@ pub fn extract_pages_markdown_mem(
                 OCR_REASON_SUSPECTED_GARBLED_TEXT,
             );
         }
+        if has_template_image {
+            add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_SCANNED);
+        }
+        if has_vector_text {
+            add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_VECTOR_TEXT);
+        }
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 
-        let needs_ocr =
-            ocr_reason.is_some() || md.trim().is_empty() || has_gid || is_garbage_text(&md);
+        let needs_ocr = ocr_reason.is_some()
+            || md.trim().is_empty()
+            || has_gid
+            || is_garbage_text(&md)
+            || has_template_image
+            || has_vector_text;
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
@@ -620,6 +658,80 @@ pub fn extract_pages_markdown<P: AsRef<Path>>(
 }
 
 // =========================================================================
+// Structure-tree element extraction (tagged PDFs)
+// =========================================================================
+
+/// One structure-tree element reference from a tagged PDF, resolved to a
+/// page and Marked Content ID.
+///
+/// Join `(page, mcid)` against [`TextItem::page`] / [`TextItem::mcid`] from
+/// [`extract_text_with_positions`] to attach semantic roles (heading levels,
+/// paragraphs, table cells, …) to extracted text.
+#[derive(Debug, Clone)]
+pub struct StructureElement {
+    /// 1-indexed page number (matches [`TextItem::page`]).
+    pub page: u32,
+    /// Marked Content ID from the page's content stream (matches
+    /// [`TextItem::mcid`]).
+    pub mcid: i64,
+    /// Standard structure type name ("H1".."H6", "P", "Table", "TD", …).
+    /// Custom tags are resolved through the document's `/RoleMap`; tags
+    /// with no standard mapping are returned verbatim.
+    pub role: String,
+}
+
+/// Extract structure-tree element references from a tagged PDF in memory.
+///
+/// Parses `/StructTreeRoot` (when present) and returns one entry per
+/// marked-content reference, resolved to its 1-indexed page, MCID, and
+/// structure type name. Returns an empty list when the PDF is not tagged.
+///
+/// Pass `Some(&[...])` with 1-indexed page numbers (matching
+/// [`TextItem::page`]) to restrict output to those pages; pass `None` for
+/// the whole document. Entries are sorted by `(page, mcid)`.
+pub fn extract_structure_elements_mem(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+) -> Result<Vec<StructureElement>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let Some(tree) = structure_tree::StructTree::from_doc(&doc) else {
+        return Ok(Vec::new());
+    };
+    let page_ids = doc.get_pages();
+    let roles = tree.mcid_to_roles(&page_ids);
+
+    let page_filter: Option<HashSet<u32>> = pages.map(|p| p.iter().copied().collect());
+    let mut elements: Vec<StructureElement> = roles
+        .into_iter()
+        .filter(|(page, _)| page_filter.as_ref().is_none_or(|f| f.contains(page)))
+        .flat_map(|(page, mcids)| {
+            mcids.into_iter().map(move |(mcid, role)| StructureElement {
+                page,
+                mcid,
+                role: role.name().to_string(),
+            })
+        })
+        .collect();
+    elements.sort_unstable_by_key(|e| (e.page, e.mcid));
+    Ok(elements)
+}
+
+/// Path-based wrapper for [`extract_structure_elements_mem`].
+///
+/// Reads the PDF from disk and extracts structure-tree element references.
+/// Pass `None` for `pages` to return the whole document, or `Some(&[...])`
+/// to restrict to specific 1-indexed pages.
+pub fn extract_structure_elements<P: AsRef<Path>>(
+    path: P,
+    pages: Option<&[u32]>,
+) -> Result<Vec<StructureElement>, PdfError> {
+    validate_pdf_file(&path)?;
+    let buffer = std::fs::read(path.as_ref())?;
+    extract_structure_elements_mem(&buffer, pages)
+}
+
+// =========================================================================
 // Region-based text extraction (for hybrid OCR pipelines)
 // =========================================================================
 
@@ -643,6 +755,23 @@ pub struct PageRegionResult {
     pub page: u32,
     /// Per-region results, parallel to the input regions.
     pub regions: Vec<RegionText>,
+}
+
+/// Minimum alphanumeric mass an invisible (Tr 3) text layer must carry for
+/// the OCR-layer fallback in [`extract_text_in_regions_mem`] to adopt it. A
+/// real OCR layer carries far more; a stray watermark or artifact does not.
+const OCR_LAYER_MIN_ALNUM: usize = 40;
+
+/// Alphanumeric mass of extracted items, ignoring raster placeholders.
+/// `[Image: ...]` items (ItemType::Image) are synthesized for image
+/// XObjects — they mark that pixels exist, not that text was read, so they
+/// must not count as coverage.
+fn non_placeholder_alnum(items: &[TextItem]) -> usize {
+    items
+        .iter()
+        .filter(|it| !matches!(it.item_type, types::ItemType::Image))
+        .map(|it| it.text.chars().filter(|c| c.is_alphanumeric()).count())
+        .sum()
 }
 
 /// Extract text within bounding-box regions from a PDF in memory.
@@ -697,8 +826,11 @@ pub fn extract_text_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        // Extract text items for this page
-        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
+        // Extract text items for this page. The Form XObject budget is shared
+        // with the invisible-layer retry below so one page cannot consume two
+        // full expansion budgets.
+        let mut form_budget = extractor::FormWalkBudget::new();
+        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -706,7 +838,54 @@ pub fn extract_text_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                &mut form_budget,
             )?;
+        // OCR-layer fallback: scanned pages often carry their text as an
+        // invisible (Tr 3) layer behind the page raster. The visible-only
+        // pass sees nothing there but `[Image: ...]` placeholders, so every
+        // region on the page reports needs_ocr even though the exact text is
+        // embedded in the PDF — and this extractor then disagrees with the
+        // markdown path, which already retries Mixed PDFs with the invisible
+        // layer included. Retry page-scoped, and only when (a) the first
+        // pass actually SKIPPED invisible text — blank pages and image-only
+        // scans without an OCR layer must not pay a second content-stream
+        // parse (review catch) — and (b) the page has NO visible text item
+        // at all (punctuation counts, whitespace-only artifacts don't): an
+        // invisible OCR layer transcribes the raster, so any visible glyph
+        // has an invisible twin there and adoption would duplicate it
+        // (review catches — strict gate, no fuzzy dedupe). Adopt the retry
+        // only when it contributes real, non-garbage text.
+        let has_visible_text = items.iter().any(|it| {
+            !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
+        });
+        if skipped_invisible && !has_visible_text {
+            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
+                extractor::content_stream::extract_page_text_items(
+                    &doc,
+                    page_id,
+                    *page_num,
+                    &font_cmaps,
+                    true,
+                    &mut style_cache,
+                    &mut form_budget,
+                )
+            {
+                let inv_alnum = non_placeholder_alnum(&inv_items);
+                // Judge the WHOLE recovered layer, not a prefix — a broken
+                // OCR layer can hide its garbage past any fixed sample size
+                // (review catch).
+                let sample: String = inv_items
+                    .iter()
+                    .filter(|it| !matches!(it.item_type, types::ItemType::Image))
+                    .map(|it| it.text.as_str())
+                    .collect();
+                if inv_alnum >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample) {
+                    items = inv_items;
+                    has_gid = inv_gid;
+                    coords_rotated = inv_rotated;
+                }
+            }
+        }
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -863,7 +1042,7 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, rects, lines), has_gid, coords_rotated) =
+        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -871,6 +1050,7 @@ pub fn extract_tables_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                &mut extractor::FormWalkBudget::new(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -1174,7 +1354,7 @@ pub fn detect_vector_grid_in_region_mem(
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
     let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated) =
+    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -1182,6 +1362,7 @@ pub fn detect_vector_grid_in_region_mem(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
+            &mut extractor::FormWalkBudget::new(),
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
@@ -1368,15 +1549,17 @@ mod vector_grid_tests {
         let &page_id = pages.get(&1).unwrap();
         let needed: HashSet<u32> = HashSet::from([1]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
-            &doc,
-            page_id,
-            1,
-            &cmaps,
-            false,
-            &mut crate::extractor::FontStyleCache::new(),
-        )
-        .unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+            extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &cmaps,
+                false,
+                &mut crate::extractor::FontStyleCache::new(),
+                &mut crate::extractor::FormWalkBudget::new(),
+            )
+            .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, 1);
         assert_eq!(rect_tables.len(), 1, "expected one rect-detected table");
@@ -1410,15 +1593,17 @@ mod vector_grid_tests {
         let &page_id = pages.get(&page_num).unwrap();
         let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
-            &doc,
-            page_id,
-            page_num,
-            &cmaps,
-            false,
-            &mut crate::extractor::FontStyleCache::new(),
-        )
-        .unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+            extract_page_text_items(
+                &doc,
+                page_id,
+                page_num,
+                &cmaps,
+                false,
+                &mut crate::extractor::FontStyleCache::new(),
+                &mut crate::extractor::FormWalkBudget::new(),
+            )
+            .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, page_num);
         rect_tables
@@ -2146,7 +2331,7 @@ pub fn extract_tables_with_structure_cells_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -2154,6 +2339,7 @@ pub fn extract_tables_with_structure_cells_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                &mut extractor::FormWalkBudget::new(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -2948,7 +3134,7 @@ fn detect_tsr_quality_issue(
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -2956,6 +3142,7 @@ fn detect_tsr_quality_issue(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
+            &mut extractor::FormWalkBudget::new(),
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {
@@ -3515,6 +3702,7 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
     let mut candidates = Vec::new();
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
+    add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
 
     let stripped = strip_leading_pdf_container_bytes(buf);
     if let Some(stripped_buf) = stripped.as_deref() {
@@ -3524,9 +3712,110 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
             append_missing_eof_marker(stripped_buf),
             buf,
         );
+        add_repair_candidate(
+            &mut candidates,
+            recover_startxref_pointer(stripped_buf),
+            buf,
+        );
     }
 
     candidates
+}
+
+/// Some PDF writers emit a `startxref` pointer that doesn't actually point
+/// at the cross-reference table — a single corrupted byte in the offset is
+/// enough. lopdf trusts that pointer outright and fails to load rather than
+/// searching for the real table, unlike pypdf/pdfium which both recover by
+/// locating it directly. This finds the real (classic, non-stream) `xref`
+/// table by scanning for the keyword — validating that a plausible
+/// subsection header follows, not just any standalone "xref" token, since
+/// this crate processes untrusted input and a coincidental match inside
+/// unrelated stream/string content must not get "repaired" against a bogus
+/// offset (lopdf would then load successfully against garbage instead of
+/// returning a clean error) — and appends a corrected trailing
+/// `startxref`/`%%EOF` block. lopdf's own `get_xref_start` always uses the
+/// *last* `%%EOF` in the final 512 bytes of the buffer, so ours
+/// transparently supersedes the broken one without needing to touch
+/// anything already in the file.
+///
+/// Doesn't cover cross-reference *streams* (`N 0 obj << /Type /XRef ...`,
+/// used by some PDF 1.5+ writers instead of a classic table) — recovering
+/// those needs the containing object's number, not just a byte offset.
+fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
+    let xref_pos = find_last_valid_xref_table_start(buf)?;
+
+    let mut repaired = Vec::with_capacity(buf.len() + 32);
+    repaired.extend_from_slice(buf);
+    if !repaired.ends_with(b"\n") {
+        repaired.push(b'\n');
+    }
+    repaired.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF\n").as_bytes());
+    Some(repaired)
+}
+
+/// Finds the last standalone `xref` token in `buf` that is immediately
+/// followed by a plausible classic cross-reference subsection header
+/// (`<start-id> <count>`, e.g. "0 6") — the shape every real classic xref
+/// table starts with. A single reverse byte scan: O(n) even on a
+/// pathological buffer with many non-matching or non-standalone "xref"
+/// occurrences, unlike repeatedly re-searching a shrinking prefix.
+fn find_last_valid_xref_table_start(buf: &[u8]) -> Option<usize> {
+    const KEYWORD: &[u8] = b"xref";
+    if buf.len() < KEYWORD.len() {
+        return None;
+    }
+    let mut pos = buf.len() - KEYWORD.len();
+    loop {
+        if &buf[pos..pos + KEYWORD.len()] == KEYWORD {
+            let before_ok = pos == 0 || buf[pos - 1].is_ascii_whitespace();
+            let after_ok = buf
+                .get(pos + KEYWORD.len())
+                .is_none_or(|c| c.is_ascii_whitespace());
+            if before_ok && after_ok && looks_like_xref_subsection_header(buf, pos + KEYWORD.len())
+            {
+                return Some(pos);
+            }
+        }
+        if pos == 0 {
+            return None;
+        }
+        pos -= 1;
+    }
+}
+
+/// Checks that `buf[pos..]` starts (after whitespace) with two
+/// whitespace-separated runs of ASCII digits — `<start-id> <count>`, the
+/// first subsection header of a classic PDF cross-reference table.
+fn looks_like_xref_subsection_header(buf: &[u8], pos: usize) -> bool {
+    fn skip_ws(buf: &[u8], mut pos: usize) -> usize {
+        while buf.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        pos
+    }
+    fn skip_digits(buf: &[u8], mut pos: usize) -> usize {
+        while buf.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        pos
+    }
+
+    let pos = skip_ws(buf, pos);
+    let after_first_digits = skip_digits(buf, pos);
+    if after_first_digits == pos {
+        return false; // no start-id
+    }
+    let sep = skip_ws(buf, after_first_digits);
+    if sep == after_first_digits {
+        return false; // start-id and count must be whitespace-separated
+    }
+    let after_count = skip_digits(buf, sep);
+    if after_count == sep {
+        return false; // no count
+    }
+    // The count run must end at whitespace/buffer-end, not run into trailing
+    // garbage (e.g. a coincidental "xref\n0 6garbage" in stream content).
+    buf.get(after_count).is_none_or(u8::is_ascii_whitespace)
 }
 
 fn add_repair_candidate(
@@ -3816,7 +4105,14 @@ fn process_document(
 
             let text_quality = analyze_text_quality(&items);
             merge_ocr_reasons(&mut ocr_reasons_by_page, text_quality.reasons_by_page);
-            let layout = compute_layout_complexity(&items, &layout_items, &rects, &lines);
+            let chart_regions = markdown::chart_regions_by_page(&items, &rects, &lines);
+            let layout = compute_layout_complexity_with_chart_regions(
+                &items,
+                &layout_items,
+                &rects,
+                &lines,
+                &chart_regions,
+            );
 
             let md = if options.mode == ProcessMode::Analyze {
                 None
@@ -3833,6 +4129,7 @@ fn process_document(
                         page_count,
                         prefiltered_page_number_pages: Some(&removed_pages),
                         prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                        precomputed_chart_regions: Some(&chart_regions),
                     },
                 ))
             };
@@ -5633,11 +5930,29 @@ fn select_items_with_document_folio_context(
 }
 
 /// Analyse extracted items and rects for layout complexity.
+#[cfg(test)]
 fn compute_layout_complexity(
     items: &[types::TextItem],
     column_items: &[types::TextItem],
     rects: &[types::PdfRect],
     lines: &[types::PdfLine],
+) -> LayoutComplexity {
+    let page_chart_regions = markdown::chart_regions_by_page(items, rects, lines);
+    compute_layout_complexity_with_chart_regions(
+        items,
+        column_items,
+        rects,
+        lines,
+        &page_chart_regions,
+    )
+}
+
+fn compute_layout_complexity_with_chart_regions(
+    items: &[types::TextItem],
+    column_items: &[types::TextItem],
+    rects: &[types::PdfRect],
+    lines: &[types::PdfLine],
+    page_chart_regions: &markdown::PageChartRegions,
 ) -> LayoutComplexity {
     use markdown::analysis::calculate_font_stats_from_items;
 
@@ -5659,6 +5974,10 @@ fn compute_layout_complexity(
         let owned_items: Vec<types::TextItem> = page_items.iter().map(|i| (*i).clone()).collect();
         let page_content_width = tables::content_width(&owned_items);
         let bands = markdown::split_side_by_side(&owned_items);
+        let chart_regions = page_chart_regions
+            .get(&page)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
 
         let band_ranges: Vec<(f32, f32)> = if bands.is_empty() {
             // Single region — use sentinel range that includes everything
@@ -5673,7 +5992,8 @@ fn compute_layout_complexity(
             let band_items: Vec<types::TextItem> = owned_items
                 .iter()
                 .filter(|item| {
-                    x_lo == f32::MIN || (item.x >= x_lo - margin && item.x < x_hi + margin)
+                    (x_lo == f32::MIN || (item.x >= x_lo - margin && item.x < x_hi + margin))
+                        && !markdown::item_is_in_chart_region(item, chart_regions)
                 })
                 .cloned()
                 .collect();
@@ -5725,8 +6045,20 @@ fn compute_layout_complexity(
     }
 
     let mut pages_with_columns: Vec<u32> = Vec::new();
-    for page in seen_pages {
-        let cols = extractor::detect_columns(column_items, page, pages_with_tables.contains(&page));
+    for &page in &seen_pages {
+        let chart_regions = page_chart_regions
+            .get(&page)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let page_column_items: Vec<types::TextItem> = column_items
+            .iter()
+            .filter(|item| {
+                item.page == page && !markdown::item_is_in_chart_region(item, chart_regions)
+            })
+            .cloned()
+            .collect();
+        let cols =
+            extractor::detect_columns(&page_column_items, page, pages_with_tables.contains(&page));
         if cols.len() >= 2 {
             pages_with_columns.push(page);
         }
@@ -5953,6 +6285,66 @@ mod tests {
         assert!(!filtered.is_complex);
         assert!(filtered.pages_with_tables.is_empty());
         assert!(filtered.pages_with_columns.is_empty());
+    }
+
+    #[test]
+    fn dense_chart_panel_is_not_reported_as_a_table() {
+        let mut items: Vec<TextItem> = (0..8)
+            .flat_map(|row| {
+                (0..6).map(move |column| {
+                    test_item(
+                        &format!("{}", row * 10 + column),
+                        105.0 + column as f32 * 35.0,
+                        525.0 - row as f32 * 15.0,
+                        24.0,
+                        10.0,
+                    )
+                })
+            })
+            .collect();
+        for row in 0..6 {
+            items.push(test_item(
+                "Left column prose continues here",
+                80.0,
+                320.0 - row as f32 * 15.0,
+                160.0,
+                10.0,
+            ));
+            items.push(test_item(
+                "Right column prose continues here",
+                300.0,
+                320.0 - row as f32 * 15.0,
+                160.0,
+                10.0,
+            ));
+        }
+        let mut lines: Vec<PdfLine> = (0..30)
+            .map(|column| PdfLine {
+                x1: 100.0 + column as f32 * 8.0,
+                y1: 400.0,
+                x2: 100.0 + column as f32 * 8.0,
+                y2: 550.0,
+                page: 1,
+            })
+            .collect();
+        lines.extend((0..6).map(|row| PdfLine {
+            x1: 100.0,
+            y1: 400.0 + row as f32 * 30.0,
+            x2: 332.0,
+            y2: 400.0 + row as f32 * 30.0,
+            page: 1,
+        }));
+        let rects = vec![PdfRect {
+            x: 80.0,
+            y: 350.0,
+            width: 280.0,
+            height: 240.0,
+            page: 1,
+        }];
+
+        let complexity = compute_layout_complexity(&items, &items, &rects, &lines);
+
+        assert!(complexity.pages_with_tables.is_empty());
     }
 
     #[test]
@@ -6957,5 +7349,66 @@ mod tests {
         assert_eq!(cells[0].text, "");
         // Pre-filled cell was not touched.
         assert_eq!(cells[1].text, "Pre-filled");
+    }
+
+    // -- recover_startxref_pointer / find_last_valid_xref_table_start ------
+    //
+    // Direct unit tests on the byte-level scan, addressing review feedback
+    // on #230: a coincidental standalone "xref" token that isn't actually
+    // followed by a subsection header (start-id + count) must not be
+    // treated as a real table — accepting it would let lopdf "succeed"
+    // against a bogus offset and silently return garbled/empty content
+    // instead of a clean error.
+
+    #[test]
+    fn find_xref_rejects_standalone_token_without_subsection_header() {
+        // "xref" appears as a real standalone word, but nothing that looks
+        // like "<start-id> <count>" follows it.
+        let buf = b"Please refer to the xref appendix for details.";
+        assert_eq!(find_last_valid_xref_table_start(buf), None);
+    }
+
+    #[test]
+    fn find_xref_accepts_real_classic_table_header() {
+        let buf = b"garbage\nxref\n0 6\n0000000000 65535 f \n%%EOF";
+        let pos = find_last_valid_xref_table_start(buf).expect("should find the real table");
+        assert_eq!(&buf[pos..pos + 4], b"xref");
+        assert_eq!(&buf[pos..], b"xref\n0 6\n0000000000 65535 f \n%%EOF");
+    }
+
+    #[test]
+    fn find_xref_skips_coincidental_match_and_finds_real_table_before_it() {
+        // A coincidental "xref" (no subsection header) appears *after* the
+        // real table in the buffer — the scan must not stop at the first
+        // (rightmost) standalone token it finds; it must keep looking
+        // backward until one actually validates.
+        let buf = b"xref\n0 3\n0000000000 65535 f \ntrailer\nsee the xref\n";
+        let pos = find_last_valid_xref_table_start(buf).expect("should find the real table");
+        assert_eq!(pos, 0);
+    }
+
+    #[test]
+    fn find_xref_rejects_substring_of_startxref() {
+        // "xref" is a substring of "startxref" but isn't a standalone
+        // token there (not preceded by whitespace) — must not match, even
+        // though a number immediately follows it.
+        let buf = b"startxref\n1234\n%%EOF";
+        assert_eq!(find_last_valid_xref_table_start(buf), None);
+    }
+
+    #[test]
+    fn find_xref_rejects_count_run_with_trailing_garbage() {
+        // "xref\n0 6garbage" has the right shape (digits, whitespace,
+        // digits) but the count run doesn't end at whitespace/EOF — it
+        // runs straight into non-digit garbage, so this must not be
+        // accepted as a real subsection header.
+        let buf = b"xref\n0 6garbage\n%%EOF";
+        assert_eq!(find_last_valid_xref_table_start(buf), None);
+    }
+
+    #[test]
+    fn recover_startxref_pointer_returns_none_without_a_valid_table() {
+        let buf = b"Please refer to the xref appendix for details.";
+        assert!(recover_startxref_pointer(buf).is_none());
     }
 }

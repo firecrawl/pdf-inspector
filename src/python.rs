@@ -271,6 +271,12 @@ pub struct PyTextItem {
     pub is_strikeout: bool,
     #[pyo3(get)]
     pub item_type: String,
+    /// Marked Content ID from the content stream's BDC/BMC operator, None
+    /// when the text is not part of marked content. Join with the
+    /// (page, mcid) pairs from extract_structure_elements to attach
+    /// structure-tree roles (headings, paragraphs, ...) in tagged PDFs.
+    #[pyo3(get)]
+    pub mcid: Option<i64>,
 }
 
 #[pymethods]
@@ -282,6 +288,32 @@ impl PyTextItem {
             self.page,
             self.x,
             self.y,
+        )
+    }
+}
+
+/// One structure-tree element reference from a tagged PDF.
+#[pyclass(name = "StructureElement")]
+#[derive(Clone)]
+pub struct PyStructureElement {
+    /// 1-indexed page number (matches TextItem.page).
+    #[pyo3(get)]
+    pub page: u32,
+    /// Marked Content ID from the page's content stream (matches
+    /// TextItem.mcid).
+    #[pyo3(get)]
+    pub mcid: i64,
+    /// Standard structure type name ("H1".."H6", "P", "Table", "TD", ...).
+    #[pyo3(get)]
+    pub role: String,
+}
+
+#[pymethods]
+impl PyStructureElement {
+    fn __repr__(&self) -> String {
+        format!(
+            "StructureElement(page={}, mcid={}, role='{}')",
+            self.page, self.mcid, self.role
         )
     }
 }
@@ -356,6 +388,18 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
             item_type: item_type_str(&item.item_type),
+            mcid: item.mcid,
+        })
+        .collect()
+}
+
+fn convert_structure_elements(elements: Vec<crate::StructureElement>) -> Vec<PyStructureElement> {
+    elements
+        .into_iter()
+        .map(|e| PyStructureElement {
+            page: e.page,
+            mcid: e.mcid,
+            role: e.role,
         })
         .collect()
 }
@@ -613,6 +657,48 @@ fn extract_pages_markdown_bytes(
     Ok(to_py_pages_result(result))
 }
 
+/// Extract structure-tree element references from a tagged PDF file.
+///
+/// Parses the document's structure tree (when present) and returns one
+/// entry per marked-content reference, resolved to its 1-indexed page,
+/// MCID, and structure type name ("H1".."H6", "P", "Table", ...). Returns
+/// an empty list when the PDF is not tagged.
+///
+/// Join (page, mcid) against the page/mcid attributes from
+/// [`extract_text_with_positions`] to attach heading levels and other
+/// semantic roles to extracted text.
+///
+/// Args:
+///     path: Path to the PDF file.
+///     pages: Optional list of 1-indexed pages (matching TextItem.page).
+///         When None (default), the whole document is returned.
+///
+/// Returns:
+///     List of StructureElement sorted by (page, mcid).
+#[pyfunction]
+#[pyo3(signature = (path, pages=None))]
+fn extract_structure_elements(
+    path: &str,
+    pages: Option<Vec<u32>>,
+) -> PyResult<Vec<PyStructureElement>> {
+    let elements = crate::extract_structure_elements(path, pages.as_deref()).map_err(to_py_err)?;
+    Ok(convert_structure_elements(elements))
+}
+
+/// Extract structure-tree element references from tagged PDF bytes.
+///
+/// See [`extract_structure_elements`] for details.
+#[pyfunction]
+#[pyo3(signature = (data, pages=None))]
+fn extract_structure_elements_bytes(
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+) -> PyResult<Vec<PyStructureElement>> {
+    let elements =
+        crate::extract_structure_elements_mem(data, pages.as_deref()).map_err(to_py_err)?;
+    Ok(convert_structure_elements(elements))
+}
+
 /// Python module definition.
 #[pymodule]
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -620,6 +706,7 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPageOcrReasons>()?;
     m.add_class::<PyPdfClassification>()?;
     m.add_class::<PyTextItem>()?;
+    m.add_class::<PyStructureElement>()?;
     m.add_class::<PyRegionText>()?;
     m.add_class::<PyPageRegionTexts>()?;
     m.add_class::<PyPageMarkdown>()?;
@@ -634,6 +721,8 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_positions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_positions_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_structure_elements, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_structure_elements_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_pages_markdown, m)?)?;
