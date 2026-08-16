@@ -724,7 +724,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "pdf-inspector"
-version = "1.14.1"
+version = "1.14.2"
 dependencies = [
  "env_logger",
  "include_dir",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-inspector-wasm"
-version = "1.14.1"
+version = "1.14.2"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",

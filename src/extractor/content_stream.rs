@@ -19,7 +19,7 @@ use super::fonts::{
     CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
-use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
+use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
@@ -149,9 +149,8 @@ pub(crate) fn extract_page_text_items(
     font_cmaps: &FontCMaps,
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
-    use lopdf::content::Content;
-
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
@@ -255,18 +254,20 @@ pub(crate) fn extract_page_text_items(
     // Content::decode parser, causing it to skip operators like ET and Q.
     let content_data = strip_pdf_comments(&content_data);
 
-    let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
-
-    const MAX_OPERATIONS: usize = 1_000_000;
-    if content.operations.len() > MAX_OPERATIONS {
-        log::warn!(
-            "page {}: skipping extraction — {} operations exceeds limit ({})",
-            page_num,
-            content.operations.len(),
-            MAX_OPERATIONS
-        );
-        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
-    }
+    let content = match super::content_decode::decode_content_bounded(
+        &content_data,
+        super::content_decode::MAX_PAGE_OPERATIONS,
+    )? {
+        Some(content) => content,
+        None => {
+            log::warn!(
+                "page {}: skipping extraction — content stream exceeds {} operations",
+                page_num,
+                super::content_decode::MAX_PAGE_OPERATIONS
+            );
+            return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
+        }
+    };
 
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
@@ -916,6 +917,7 @@ pub(crate) fn extract_page_text_items(
                                         &ctm,
                                         &mut cmap_decisions,
                                         style_cache,
+                                        form_budget,
                                     );
                                     items.extend(form_items);
                                 }
@@ -1285,6 +1287,12 @@ pub(crate) fn extract_page_text_items(
         }
     }
 
+    if form_budget.was_truncated() {
+        log::warn!(
+            "page {page_num}: Form XObject expansion truncated (invocation or operation budget reached); nested form text may be incomplete"
+        );
+    }
+
     // Underline detection reads only painted ink: `re` rects confirmed by
     // a paint operator plus filled-subpath rects — never clip-only rects,
     // which draw nothing.
@@ -1544,6 +1552,7 @@ mod tests {
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         items
@@ -1773,6 +1782,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible) = result;
@@ -1863,6 +1873,7 @@ BT 30 700 Tm <41> Tj ET";
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
         )
         .unwrap();
         let text = items
@@ -1925,5 +1936,20 @@ BT 30 700 Tm <41> Tj ET";
         let input = b"(x\\\\) Tj % comment\nET\n";
         let output = strip_pdf_comments(input);
         assert_eq!(output, b"(x\\\\) Tj  \nET\n");
+    }
+
+    #[test]
+    fn oversized_content_stream_skips_extraction() {
+        let mut content =
+            Vec::with_capacity((super::super::content_decode::MAX_PAGE_OPERATIONS + 1) * 2);
+        for _ in 0..=super::super::content_decode::MAX_PAGE_OPERATIONS {
+            content.extend_from_slice(b"q\n");
+        }
+        content.extend_from_slice(b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET\n");
+        let items = extract_simple_items(&content);
+        assert!(
+            items.is_empty(),
+            "pages over the operator cap must not be decoded"
+        );
     }
 }
