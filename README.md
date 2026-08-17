@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/pdf-inspector.svg)](https://pypi.org/project/pdf-inspector/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Fast Rust library for PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Includes bindings for [Python](docs/python.md), [Node.js](napi/README.md), and [browser WebAssembly](wasm/README.md).
+Fast Rust library for PDF classification and text extraction. By default it detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown without OCR. Native Rust and CLI consumers can opt into selective OCR. Includes bindings for [Python](docs/python.md), [Node.js](napi/README.md), and [browser WebAssembly](wasm/README.md).
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
@@ -18,9 +18,10 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **CID font support** — ToUnicode CMap decoding for Type0/Identity-H fonts, UTF-16BE, UTF-8, and Latin-1 encodings.
 - **Multi-column layout** — Automatic detection of newspaper-style columns, sequential reading order, and RTL text support.
 - **Encoding issue detection** — Automatically flags broken font encodings so callers can fall back to OCR.
+- **Optional OCR** — An opt-in Rust and CLI feature selectively renders only pages that need OCR, runs PP-OCRv6 Small locally, and preserves per-page provenance and hosted-fallback recommendations.
 - **Single document load** — The document is parsed once and shared between detection and extraction, avoiding redundant I/O.
 - **Browser WebAssembly** — Run the same Rust parser locally in browsers and Web Workers, with embedded CMaps and no server round trip.
-- **Lightweight** — Pure Rust, no ML models, no external services. Single dependency on `lopdf` for PDF parsing.
+- **Lightweight by default** — The default build is pure Rust with no ML models or external services. PDFium, ONNX Runtime, and OCR models are added only when the native `ocr` feature is selected and remain external runtime artifacts.
 
 ## Benchmark
 
@@ -159,6 +160,19 @@ detect-pdf document.pdf --json
 # Detection + layout analysis (tables, columns)
 detect-pdf document.pdf --analyze --json
 ```
+
+OCR is a separate native CLI build and does not change the default package:
+
+```bash
+cargo install pdf-inspector --features ocr --bin pdf2md
+PDFIUM_LIB_PATH=/path/to/libpdfium ORT_DYLIB_PATH=/path/to/libonnxruntime \
+  pdf2md scan.pdf --ocr auto --json
+```
+
+The OCR JSON envelope is versioned and reports routed pages, per-page source
+and confidence, warnings, and pages recommended for the hosted document
+pipeline. See the [Rust API guide](docs/rust-api.md#complete-ocr-api) for model
+cache and offline configuration.
 
 From a source checkout, use `cargo run --bin pdf2md -- document.pdf` or `cargo run --bin detect-pdf -- document.pdf` instead.
 

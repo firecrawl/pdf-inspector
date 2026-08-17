@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test
@@ -68,8 +71,11 @@ jobs:
         with:
           key: clippy
 
-      - name: Run clippy
+      - name: Run default clippy
         run: cargo clippy -- -D warnings
+
+      - name: Run OCR clippy
+        run: cargo clippy --features ocr -- -D warnings
 
   build:
     name: Build
@@ -92,6 +98,109 @@ jobs:
 
       - name: Build
         run: cargo build --release --verbose
+
+  ocr:
+    name: OCR (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ocr-${{ matrix.os }}
+
+      - name: Test optional OCR feature
+        run: cargo test --features ocr
+
+  ocr-runtime:
+    name: OCR runtime smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ocr-runtime
+
+      - name: Install PDFium
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/firecrawl-pdfium-linux-x64.tgz"
+          directory="$RUNNER_TEMP/firecrawl-pdfium"
+          curl --fail --location --silent --show-error \
+            https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-linux-x64.tgz \
+            --output "$archive"
+          echo "6248189e07bbc33cdeb31976c539a88614307c8a19f3276dbd018efbe5b4a2a2  $archive" | sha256sum --check
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          pdfium_path="$(find "$directory" -type f -name 'libpdfium.so' -print -quit)"
+          test -n "$pdfium_path"
+          echo "PDFIUM_LIB_PATH=$pdfium_path" >> "$GITHUB_ENV"
+
+      - name: Install ONNX Runtime
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.27.0.tgz"
+          directory="$RUNNER_TEMP/onnxruntime"
+          curl --fail --location --silent --show-error \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz \
+            --output "$archive"
+          echo "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f  $archive" | sha256sum --check
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          ort_path="$(find "$directory" -type f -name 'libonnxruntime.so*' -print -quit)"
+          test -n "$ort_path"
+          echo "ORT_DYLIB_PATH=$ort_path" >> "$GITHUB_ENV"
+
+      - name: Build OCR CLI
+        run: cargo build --features ocr --bin pdf2md
+
+      - name: Test PDFium runtime
+        run: cargo test --features ocr --test local_render_tests
+
+      - name: Run OCR CLI
+        shell: bash
+        run: |
+          target/debug/pdf2md \
+            tests/fixtures/scan_with_native_header_text.pdf \
+            --ocr auto \
+            --json > "$RUNNER_TEMP/ocr-result.json"
+
+      - name: Validate OCR JSON contract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "ocr-result.json").read_text()
+          )
+          assert result["schema_version"] == 1
+          assert result["pages_routed_to_ocr"] == [1]
+          assert result["pages_recommending_hosted"] == []
+          assert result["pages"][0]["source"] in {"ocr", "fused"}
+          assert result["pages"][0]["markdown"].strip()
+          assert "layout_ms" not in result["pages"][0]["timings"]
+          PY
 
   wasm:
     name: WebAssembly

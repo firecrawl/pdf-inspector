@@ -49,6 +49,25 @@ ttf-parser = "0.25"
 lopdf = { version = "0.42.0", features = ["rayon"] }
 rayon = "1.10"
 env_logger = "0.11"
+# Optional native page rendering for OCR pipelines. PDFium is loaded at
+# runtime, so enabling this feature does not link or download a native library.
+firecrawl-pdfium = { version = "0.1.0", optional = true }
+# Small support crates used only by the opt-in model cache. Model files remain
+# external and are never embedded in pdf-inspector artifacts.
+dirs = { version = "6.0", optional = true }
+fs2 = { version = "0.4", optional = true }
+sha2 = { version = "0.11", optional = true }
+# Optional CPU OCR backend. Models and ONNX Runtime stay external: the latter
+# is loaded dynamically from ORT_DYLIB_PATH or the platform library search path.
+image = { version = "0.25.6", default-features = false, optional = true }
+oar-ocr = { version = "0.9.1", default-features = false, features = ["simd"], optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"], optional = true }
+# HTTPS-only streaming downloader for pinned model artifacts. Kept separate
+# from model-cache so offline and package-managed deployments avoid HTTP/TLS.
+ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
+
+[target.'cfg(all(windows, not(target_arch = "wasm32")))'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"], optional = true }
 
 # Browser builds use JavaScript randomness for encrypted PDFs and embed the
 # bundled CMaps because there is no filesystem at runtime.
@@ -62,6 +81,14 @@ tempfile = "3.3"
 [features]
 default = []
 python = ["pyo3"]
+vision = []
+model-cache = ["vision", "dep:dirs", "dep:fs2", "dep:sha2", "dep:windows-sys"]
+model-download = ["model-cache", "dep:ureq"]
+ocr-oar = ["model-cache", "dep:image", "dep:oar-ocr", "dep:ort"]
+render-pdfium = ["vision", "dep:firecrawl-pdfium"]
+# Complete native OCR path. This remains opt-in so default library,
+# renderer-only, and browser consumers do not inherit inference or HTTP/TLS.
+ocr = ["render-pdfium", "ocr-oar", "model-download"]
 
 [[bin]]
 name = "pdf2md"

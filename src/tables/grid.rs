@@ -604,7 +604,7 @@ mod tests {
         let items: Vec<(usize, &TextItem)> = vec![];
         assert_eq!(
             find_column_boundaries(&items, TableDetectionMode::SmallFont),
-            vec![]
+            Vec::<f32>::new()
         );
     }
 
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn test_find_row_boundaries_empty() {
         let items: Vec<(usize, &TextItem)> = vec![];
-        assert_eq!(find_row_boundaries(&items), vec![]);
+        assert_eq!(find_row_boundaries(&items), Vec::<f32>::new());
     }
 
     #[test]
