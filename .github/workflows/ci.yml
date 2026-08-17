@@ -157,18 +157,16 @@ jobs:
       - name: Install ONNX Runtime
         shell: bash
         run: |
-          python3 -m pip install --disable-pip-version-check onnxruntime==1.27.0
-          ort_path="$(python3 - <<'PY'
-          from pathlib import Path
-          import onnxruntime
-
-          root = Path(onnxruntime.__file__).parent
-          matches = sorted(root.rglob("libonnxruntime.so*"))
-          if not matches:
-              raise SystemExit("ONNX Runtime shared library was not installed")
-          print(matches[0])
-          PY
-          )"
+          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.27.0.tgz"
+          directory="$RUNNER_TEMP/onnxruntime"
+          curl --fail --location --silent --show-error \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz \
+            --output "$archive"
+          echo "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f  $archive" | sha256sum --check
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          ort_path="$(find "$directory" -type f -name 'libonnxruntime.so*' -print -quit)"
+          test -n "$ort_path"
           echo "ORT_DYLIB_PATH=$ort_path" >> "$GITHUB_ENV"
 
       - name: Build OCR CLI
