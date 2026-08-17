@@ -194,6 +194,43 @@ impl TextLine {
             // we push text_trimmed below (which strips it).
             let has_leading_space = text.starts_with(' ');
 
+            // True geometric contiguity with the previous item — tight
+            // enough that these two items are the same visual word split
+            // across positioned-text fragments, not merely two items
+            // `needs_space_between` happens to join without inserting a
+            // space. Some real documents kern punctuation just as tightly
+            // against the preceding word as a genuine same-word split, so
+            // geometry alone isn't enough (see the punctuation check
+            // below); this narrows out most unrelated no-space joins
+            // first (larger, deliberate letter-spacing gaps, real word
+            // gaps, etc.).
+            let is_tight_geometric_continuation = i > 0 && {
+                let prev_item = &self.items[i - 1];
+                prev_item.width > 0.0 && {
+                    let gap = item.x - (prev_item.x + prev_item.width);
+                    gap.abs() < prev_item.font_size * 0.02
+                }
+            };
+
+            // A trailing period/comma/etc. isn't part of the word before
+            // it, even when kerned touching it — closing punctuation is a
+            // legitimate style boundary regardless of geometric gap.
+            let curr_starts_with_join_punct = text_trimmed
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c, '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}' | '\''));
+
+            // Whether a space will separate this item from the previously
+            // rendered content — i.e. whether this item starts a new word
+            // rather than continuing the previous item's word with zero gap.
+            let is_word_boundary = i == 0
+                || result.is_empty()
+                || result.ends_with(' ')
+                || needs_space
+                || has_leading_space
+                || !is_tight_geometric_continuation
+                || curr_starts_with_join_punct;
+
             // Check for style changes. Source decorations are exclusive:
             // `<u>`/`<s>` content stays free of `**`/`*` markers — consumers
             // (and the eval harnesses this feeds) match tag content literally,
@@ -201,7 +238,26 @@ impl TextLine {
             // emitted as struck text because deletion is the stronger semantic
             // distinction in redline documents.
             let item_strikeout = format_decorations && item.is_strikeout;
-            let item_underline = format_decorations && item.is_underline && !item_strikeout;
+            let item_underline_raw = format_decorations && item.is_underline && !item_strikeout;
+            // Never toggle the underline tag on a non-word-boundary
+            // character. A single visual word can be split across several
+            // positioned items at the content-stream level, and the
+            // source PDF can carry the underline flag on only one
+            // fragment (e.g. an underline rectangle covering just the
+            // first fragment's width) — layout-level merging already
+            // refuses to combine such items across a style difference
+            // (see extractor::mod's merge_text_items), so they arrive
+            // here as adjacent, unmerged items with zero gap between
+            // them. Toggling `<u>` per-item in that case opens/closes the
+            // tag mid-word (`<u>We</u>alth`), which isn't formatting that
+            // was in the source. A same-word continuation instead
+            // inherits whichever underline state is already open. See
+            // #397.
+            let item_underline = if is_word_boundary {
+                item_underline_raw
+            } else {
+                current_underline
+            };
             let item_bold = format_bold && item.is_bold && !item_underline && !item_strikeout;
             let item_italic = format_italic && item.is_italic && !item_underline && !item_strikeout;
 
@@ -394,6 +450,55 @@ mod formatting_tests {
         assert_eq!(
             line.text_with_formatting(true, true, true),
             "<s>deleted words</s>"
+        );
+    }
+
+    #[test]
+    fn underline_does_not_toggle_mid_word() {
+        // Regression for #397: a single visual word ("Wealth") split
+        // across three positioned items at the content-stream level, with
+        // the underline flag set on only the middle fragment ("We") — a
+        // real pattern from source PDFs where an underline rectangle
+        // covers only part of a word's width. The items are contiguous
+        // (zero gap, no space anywhere), so this must render as one
+        // undivided word, not a `<u>` tag opening/closing mid-word.
+        let title = item("The Institutional", 45.0, 200.0, false);
+        // Real word gap before "We" (new word starts here) ...
+        let mut we = item("We", title.x + title.width + 6.0, 24.0, false);
+        we.is_underline = true;
+        // ... zero gap before "alth" — it's a continuation of the same
+        // word ("We" + "alth" = "Wealth") ...
+        let alth = item("alth", we.x + we.width, 40.0, false);
+        // ... then a real word gap before the next, separate word.
+        let landscape = item("Landscape", alth.x + alth.width + 6.0, 100.0, false);
+
+        let line = line(vec![title, we, alth, landscape]);
+
+        let result = line.text_with_formatting(false, false, true);
+        assert!(
+            !result.contains("</u>alth") && !result.contains("We</u>"),
+            "the underline tag must not close in the middle of \"Wealth\", got: {result:?}"
+        );
+        assert!(
+            result.contains("Wealth"),
+            "the word \"Wealth\" must render undivided, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn underline_still_toggles_at_a_real_word_boundary() {
+        // Sanity check that the #397 fix doesn't suppress underline
+        // entirely — a genuinely separate, space-divided word must still
+        // get its own `<u>` span when it's the one flagged.
+        let plain = item("Plain", 10.0, 40.0, false);
+        let mut underlined = item("Underlined", 60.0, 70.0, false);
+        underlined.is_underline = true;
+
+        let line = line(vec![plain, underlined]);
+
+        assert_eq!(
+            line.text_with_formatting(false, false, true),
+            "Plain <u>Underlined</u>"
         );
     }
 
