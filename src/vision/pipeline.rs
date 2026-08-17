@@ -11,7 +11,7 @@ use crate::text_quality::{
     analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
 };
 use crate::{
-    MarkdownOptions, PageOcrReasons, PdfError, OCR_REASON_SUSPECTED_GARBLED_TEXT,
+    MarkdownOptions, PageMarkdown, PageOcrReasons, PdfError, OCR_REASON_SUSPECTED_GARBLED_TEXT,
     OCR_REASON_VECTOR_TEXT,
 };
 
@@ -22,11 +22,14 @@ use super::fusion::{
 use super::oar::onnx_runtime_library_path;
 use super::pdfium::PdfiumTextPage;
 use super::{
-    route_ocr_pages, run_ocr_pages, FusedPageMarkdown, HttpModelDownloadError, HttpModelDownloader,
-    ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError, OcrFusionError,
-    OcrFusionOptions, OcrMode, OcrOptions, OcrRoutingError, OcrRun, OcrRunError, PdfiumRenderer,
-    RenderError, RenderOptions, PP_OCR_V6_SMALL,
+    route_ocr_pages, run_ocr_pages, FusedPageMarkdown, FusedPages, HttpModelDownloadError,
+    HttpModelDownloader, ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError,
+    OcrEngine, OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions, OcrRoutingError, OcrRun,
+    OcrRunError, PageRenderer, PdfiumRenderer, RenderError, RenderOptions, PP_OCR_V6_SMALL,
 };
+
+/// Bounds live rendered-page memory while preserving small OCR batches.
+const OCR_PAGE_CHUNK_SIZE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OcrEngineCacheKey {
@@ -327,12 +330,22 @@ pub fn process_pdf_with_ocr_mem(
         }
     }
 
-    let ocr_run = if routed.is_empty() {
-        OcrRun {
-            pages: Vec::new(),
-            render_time_ms: 0,
-            ocr_time_ms: 0,
-        }
+    let fusion_options = OcrFusionOptions::new()
+        .markdown(page_markdown_options)
+        .render_dpi(options.render.dpi)
+        .hosted_recommendation_confidence(options.hosted_recommendation_confidence);
+    let mut fused = if routed.is_empty() {
+        fuse_ocr_pages_adaptive(
+            &native.pages,
+            &OcrRun {
+                pages: Vec::new(),
+                render_time_ms: 0,
+                ocr_time_ms: 0,
+            },
+            page_count,
+            &fusion_options,
+            &native_candidates,
+        )?
     } else {
         // Resolve the native renderer before any network request so a missing
         // PDFium installation cannot trigger a model download it cannot use.
@@ -341,7 +354,7 @@ pub fn process_pdf_with_ocr_mem(
             None => PdfiumRenderer::load()?,
         };
         let engine = cached_ocr_engine(&options.ocr)?;
-        run_ocr_pages(
+        run_and_fuse_ocr_chunks(
             &renderer,
             engine.as_ref(),
             buffer,
@@ -349,20 +362,12 @@ pub fn process_pdf_with_ocr_mem(
             options.password.as_deref(),
             &options.render,
             &options.ocr,
+            &native.pages,
+            page_count,
+            &fusion_options,
+            &native_candidates,
         )?
     };
-
-    let fusion_options = OcrFusionOptions::new()
-        .markdown(page_markdown_options)
-        .render_dpi(options.render.dpi)
-        .hosted_recommendation_confidence(options.hosted_recommendation_confidence);
-    let mut fused = fuse_ocr_pages_adaptive(
-        &native.pages,
-        &ocr_run,
-        page_count,
-        &fusion_options,
-        &native_candidates,
-    )?;
     for page in &mut fused.pages {
         if recovered_natively.contains(&page.page) {
             page.provenance
@@ -401,6 +406,104 @@ pub fn process_pdf_with_ocr_mem(
         render_time_ms: fused.render_time_ms,
         ocr_time_ms: fused.ocr_time_ms,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_and_fuse_ocr_chunks<R, O>(
+    renderer: &R,
+    engine: &O,
+    pdf_bytes: &[u8],
+    routed_pages: &[u32],
+    password: Option<&str>,
+    render_options: &RenderOptions,
+    ocr_options: &OcrOptions,
+    native_pages: &[PageMarkdown],
+    document_page_count: u32,
+    fusion_options: &OcrFusionOptions,
+    native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
+) -> Result<FusedPages, OcrPipelineError>
+where
+    R: PageRenderer,
+    O: OcrEngine,
+{
+    let routed: BTreeSet<u32> = routed_pages.iter().copied().collect();
+    let mut pages_by_number = BTreeMap::new();
+    let mut render_time_ms = 0u64;
+    let mut ocr_time_ms = 0u64;
+
+    for chunk in routed_pages.chunks(OCR_PAGE_CHUNK_SIZE) {
+        let native_chunk = select_native_pages(native_pages, |page| chunk.contains(&page));
+        let run = run_ocr_pages(
+            renderer,
+            engine,
+            pdf_bytes,
+            chunk,
+            password,
+            render_options,
+            ocr_options,
+        )?;
+        let fused = fuse_ocr_pages_adaptive(
+            &native_chunk,
+            &run,
+            document_page_count,
+            fusion_options,
+            native_candidates,
+        )?;
+        render_time_ms = render_time_ms.saturating_add(fused.render_time_ms);
+        ocr_time_ms = ocr_time_ms.saturating_add(fused.ocr_time_ms);
+        for page in fused.pages {
+            pages_by_number.insert(page.page, page);
+        }
+        // `run` and its rendered bitmaps are released before the next chunk.
+    }
+
+    let native_only = select_native_pages(native_pages, |page| !routed.contains(&page));
+    if !native_only.is_empty() {
+        let fused = fuse_ocr_pages_adaptive(
+            &native_only,
+            &OcrRun {
+                pages: Vec::new(),
+                render_time_ms: 0,
+                ocr_time_ms: 0,
+            },
+            document_page_count,
+            fusion_options,
+            native_candidates,
+        )?;
+        for page in fused.pages {
+            pages_by_number.insert(page.page, page);
+        }
+    }
+
+    let pages = native_pages
+        .iter()
+        .map(|native| {
+            pages_by_number
+                .remove(&(native.page + 1))
+                .expect("every native page is fused exactly once")
+        })
+        .collect();
+    Ok(FusedPages {
+        pages,
+        render_time_ms,
+        ocr_time_ms,
+    })
+}
+
+fn select_native_pages(
+    native_pages: &[PageMarkdown],
+    include: impl Fn(u32) -> bool,
+) -> Vec<PageMarkdown> {
+    native_pages
+        .iter()
+        .filter(|page| include(page.page + 1))
+        .map(|page| PageMarkdown {
+            page: page.page,
+            markdown: page.markdown.clone(),
+            needs_ocr: page.needs_ocr,
+            ocr_reason: page.ocr_reason.clone(),
+        })
+        .collect()
 }
 
 fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipelineError> {
@@ -677,6 +780,7 @@ fn markdown_has_table(markdown: &str) -> bool {
 fn remove_duplicate_table_lines(markdown: &str) -> String {
     let mut output = String::new();
     let mut adjacent_table_row = None;
+    let mut wide_table_rows = BTreeSet::new();
     for line in markdown.lines() {
         let trimmed = line.trim();
         let is_table_line = trimmed.starts_with('|') && trimmed.ends_with('|');
@@ -684,15 +788,20 @@ fn remove_duplicate_table_lines(markdown: &str) -> String {
             if !trimmed.contains("|---") && trimmed.matches('|').count() >= 4 {
                 let canonical = canonical_table_text(trimmed);
                 if !canonical.is_empty() {
+                    if table_cell_count(trimmed) >= 8 {
+                        wide_table_rows.insert(canonical.clone());
+                    }
                     adjacent_table_row = Some(canonical);
                 }
             }
         } else if trimmed.is_empty() {
             // Keep adjacency across the blank line emitted after a table.
         } else {
-            let duplicate = adjacent_table_row
-                .as_ref()
-                .is_some_and(|table_row| *table_row == canonical_table_text(trimmed));
+            let canonical = canonical_table_text(trimmed);
+            let duplicate = wide_table_rows.contains(&canonical)
+                || adjacent_table_row
+                    .as_ref()
+                    .is_some_and(|table_row| *table_row == canonical);
             adjacent_table_row = None;
             if duplicate {
                 continue;
@@ -705,6 +814,13 @@ fn remove_duplicate_table_lines(markdown: &str) -> String {
         output.pop();
     }
     output
+}
+
+fn table_cell_count(row: &str) -> usize {
+    row.trim_matches('|')
+        .split('|')
+        .filter(|cell| !cell.trim().is_empty())
+        .count()
 }
 
 fn canonical_table_text(text: &str) -> String {
@@ -781,6 +897,84 @@ pub enum OcrPipelineError {
 mod tests {
     use super::*;
 
+    struct TrackingRenderer {
+        batches: Mutex<Vec<Vec<u32>>>,
+    }
+
+    impl PageRenderer for TrackingRenderer {
+        type Error = std::convert::Infallible;
+
+        fn render_pages(
+            &self,
+            _pdf_bytes: &[u8],
+            pages: &[u32],
+            _password: Option<&str>,
+            _options: &RenderOptions,
+        ) -> Result<Vec<super::super::RenderedPage>, Self::Error> {
+            self.batches.lock().unwrap().push(pages.to_vec());
+            Ok(pages
+                .iter()
+                .map(|page| {
+                    let transform = super::super::PageTransform::from_corners(
+                        1,
+                        1,
+                        (0.0, 1.0),
+                        (1.0, 1.0),
+                        (0.0, 0.0),
+                    )
+                    .unwrap();
+                    super::super::RenderedPage::new(
+                        *page,
+                        1.0,
+                        1.0,
+                        1,
+                        1,
+                        3,
+                        super::super::RenderPixelFormat::Rgb8,
+                        vec![255; 3],
+                        transform,
+                    )
+                    .unwrap()
+                })
+                .collect())
+        }
+    }
+
+    struct TrackingEngine {
+        batches: Mutex<Vec<Vec<u32>>>,
+        model: super::super::ModelIdentity,
+    }
+
+    impl OcrEngine for TrackingEngine {
+        type Error = std::convert::Infallible;
+
+        fn model(&self) -> &super::super::ModelIdentity {
+            &self.model
+        }
+
+        fn recognize(
+            &self,
+            pages: &[super::super::RenderedPage],
+            _options: &OcrOptions,
+        ) -> Result<Vec<super::super::OcrPage>, Self::Error> {
+            self.batches
+                .lock()
+                .unwrap()
+                .push(pages.iter().map(super::super::RenderedPage::page).collect());
+            Ok(pages
+                .iter()
+                .map(|page| super::super::OcrPage {
+                    page: page.page(),
+                    spans: Vec::new(),
+                    mean_confidence: None,
+                    model: self.model.clone(),
+                    processing_time_ms: 0,
+                    warnings: Vec::new(),
+                })
+                .collect())
+        }
+    }
+
     fn recovery_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> crate::TextItem {
         crate::TextItem {
             text: text.to_string(),
@@ -813,6 +1007,51 @@ mod tests {
 
         assert!(before.is_absolute());
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn high_level_ocr_bounds_rendering_and_inference_batches() {
+        let renderer = TrackingRenderer {
+            batches: Mutex::new(Vec::new()),
+        };
+        let engine = TrackingEngine {
+            batches: Mutex::new(Vec::new()),
+            model: super::super::ModelIdentity::new("test-ocr", "v1"),
+        };
+        let native_pages = (0..10)
+            .map(|page| PageMarkdown {
+                page,
+                markdown: String::new(),
+                needs_ocr: true,
+                ocr_reason: Some(crate::OCR_REASON_SCANNED.to_string()),
+            })
+            .collect::<Vec<_>>();
+        let routed_pages = (1..=10).collect::<Vec<_>>();
+        let ocr_options = OcrOptions::new().mode(OcrMode::Force);
+
+        let fused = run_and_fuse_ocr_chunks(
+            &renderer,
+            &engine,
+            b"test",
+            &routed_pages,
+            None,
+            &RenderOptions::new(),
+            &ocr_options,
+            &native_pages,
+            10,
+            &OcrFusionOptions::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let expected = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10]];
+        assert_eq!(*renderer.batches.lock().unwrap(), expected);
+        assert_eq!(*engine.batches.lock().unwrap(), expected);
+        assert_eq!(fused.pages.len(), 10);
+        assert!(fused
+            .pages
+            .iter()
+            .all(|page| page.provenance.hosted_recommended));
     }
 
     #[test]
@@ -906,6 +1145,16 @@ mod tests {
         let markdown = "|Date|Value|Status|\n|---|---|---|\n|April 1|42|ok|\n\nSummary follows.\n\nApril 1 42 ok\n";
 
         assert_eq!(remove_duplicate_table_lines(markdown), markdown);
+    }
+
+    #[test]
+    fn recovered_markdown_drops_nonadjacent_duplicate_of_wide_table_row() {
+        let markdown = "|Date|A|B|C|D|E|F|G|\n|---|---|---|---|---|---|---|---|\n|April 1|1|2|3|4|5|6|7|\n\nSummary follows.\n\nApril 1 1 2 3 4 5 6 7\n";
+
+        assert_eq!(
+            remove_duplicate_table_lines(markdown),
+            "|Date|A|B|C|D|E|F|G|\n|---|---|---|---|---|---|---|---|\n|April 1|1|2|3|4|5|6|7|\n\nSummary follows.\n\n"
+        );
     }
 
     #[test]

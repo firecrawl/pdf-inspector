@@ -405,7 +405,10 @@ fn choose_adaptive_content(
                 "kept trustworthy {} because OCR added no material coverage",
                 native.origin.description()
             ),
-            recommend_hosted: false,
+            // The page was already routed because native extraction appeared
+            // incomplete. Agreement between two partial hypotheses preserves
+            // trustworthy text, but it does not prove full-page coverage.
+            recommend_hosted: true,
         };
     }
 
@@ -1243,7 +1246,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(result.pages[0].provenance.source, PageContentSource::Native);
-        assert!(!result.pages[0].provenance.hosted_recommended);
+        assert!(result.pages[0].provenance.hosted_recommended);
         assert_eq!(result.pages[0].markdown.matches("Invoice").count(), 1);
         assert!(result.pages[0].provenance.warnings[0].contains("no material coverage"));
     }
