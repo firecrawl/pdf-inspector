@@ -2077,10 +2077,17 @@ impl FontCMaps {
                 skip_truetype_fallback,
             );
 
-            if !skip_truetype_fallback {
-                // Fonts inside Form XObjects referenced by this page
-                Self::collect_cmaps_from_xobjects(doc, page_id, &mut by_obj_num);
-            }
+            // Fonts inside Form XObjects referenced by this page. Always
+            // run — even in fast mode — so primary ToUnicode CMaps on Form
+            // XObject fonts are still discovered; skip_truetype_fallback
+            // only skips the *expensive* embedded-font fallback parsing
+            // for those fonts, not CMap discovery entirely. See #398.
+            Self::collect_cmaps_from_xobjects(
+                doc,
+                page_id,
+                &mut by_obj_num,
+                skip_truetype_fallback,
+            );
         }
 
         FontCMaps { by_obj_num }
@@ -2089,14 +2096,6 @@ impl FontCMaps {
     /// Parse ToUnicode CMaps from a set of font dictionaries.
     /// Also handles Identity-H/V CID fonts without ToUnicode by parsing
     /// the embedded TrueType cmap from FontFile2.
-    fn collect_cmaps_from_fonts(
-        fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
-        doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
-    ) {
-        Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, false);
-    }
-
     fn collect_cmaps_from_fonts_inner(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
@@ -2439,6 +2438,7 @@ impl FontCMaps {
         doc: &Document,
         page_id: ObjectId,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
+        skip_truetype_fallback: bool,
     ) {
         let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
             Ok(r) => r,
@@ -2448,12 +2448,35 @@ impl FontCMaps {
         let mut visited = HashSet::new();
 
         if let Some(resources) = resource_dict {
-            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+            Self::walk_xobject_fonts(
+                resources,
+                doc,
+                by_obj_num,
+                &mut visited,
+                skip_truetype_fallback,
+            );
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+                Self::walk_xobject_fonts(
+                    resources,
+                    doc,
+                    by_obj_num,
+                    &mut visited,
+                    skip_truetype_fallback,
+                );
             }
+        }
+    }
+
+    /// Resolve a dictionary-or-reference-to-dictionary `Object`, matching
+    /// the two shapes the PDF spec allows for entries like `/Resources`
+    /// (inline dictionary, or an indirect reference to one).
+    fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a lopdf::Dictionary> {
+        match obj {
+            Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+            Object::Dictionary(dict) => Some(dict),
+            _ => None,
         }
     }
 
@@ -2463,10 +2486,10 @@ impl FontCMaps {
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
         visited: &mut HashSet<ObjectId>,
+        skip_truetype_fallback: bool,
     ) {
         let xobject_dict = match resources.get(b"XObject") {
-            Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
-            Ok(Object::Dictionary(dict)) => Some(dict),
+            Ok(obj) => Self::resolve_dict(doc, obj),
             _ => None,
         };
         let xobject_dict = match xobject_dict {
@@ -2494,12 +2517,20 @@ impl FontCMaps {
             if !is_form {
                 continue;
             }
-            // Collect fonts from this Form XObject's Resources
-            if let Ok(form_resources) = stream.dict.get(b"Resources").and_then(Object::as_dict) {
+            // Collect fonts from this Form XObject's Resources. /Resources
+            // can be an inline dictionary or an indirect reference to one
+            // (both are valid per spec) — resolve_dict handles both, where
+            // the old inline-only lookup silently skipped the latter,
+            // dropping the Form's ToUnicode CMap discovery entirely. See
+            // #398.
+            let form_resources = match stream.dict.get(b"Resources") {
+                Ok(obj) => Self::resolve_dict(doc, obj),
+                _ => None,
+            };
+            if let Some(form_resources) = form_resources {
                 // Extract font dict from the Form's resources
                 let font_dict_obj = match form_resources.get(b"Font") {
-                    Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
-                    Ok(Object::Dictionary(dict)) => Some(dict),
+                    Ok(obj) => Self::resolve_dict(doc, obj),
                     _ => None,
                 };
                 if let Some(font_dict) = font_dict_obj {
@@ -2514,10 +2545,21 @@ impl FontCMaps {
                             fonts.insert(name.clone(), font);
                         }
                     }
-                    Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
+                    Self::collect_cmaps_from_fonts_inner(
+                        &fonts,
+                        doc,
+                        by_obj_num,
+                        skip_truetype_fallback,
+                    );
                 }
                 // Recurse into nested XObjects
-                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
+                Self::walk_xobject_fonts(
+                    form_resources,
+                    doc,
+                    by_obj_num,
+                    visited,
+                    skip_truetype_fallback,
+                );
             }
         }
     }
@@ -2661,6 +2703,184 @@ fn build_fallback_cmap_for_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for #398: a Form XObject's `/Resources` entry can be an
+    /// indirect reference to a dictionary rather than an inline
+    /// dictionary — both are valid per spec. Builds a minimal PDF with a
+    /// page → Form XObject → indirect `/Resources` → Type0 font with a
+    /// ToUnicode CMap, and confirms `FontCMaps::from_doc` still discovers
+    /// that CMap.
+    #[test]
+    fn form_xobject_with_indirect_resources_discovers_tounicode_cmap() {
+        use lopdf::{dictionary, Stream};
+
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let cmap_content = b"\
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfchar
+<0003> <0041>
+endbfchar
+endcmap"
+            .to_vec();
+        let tounicode_id =
+            doc.add_object(Object::Stream(Stream::new(dictionary! {}, cmap_content)));
+
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Test".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "ToUnicode" => Object::Reference(tounicode_id),
+        });
+
+        // The Form's /Resources is stored as an indirect reference to a
+        // dictionary — the case the old inline-only lookup silently
+        // skipped.
+        let form_resources_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(font_id),
+            },
+        }));
+
+        let form_stream_content = b"BT /F1 12 Tf (test) Tj ET".to_vec();
+        let mut form_dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => Object::Name(b"Form".to_vec()),
+            "Resources" => Object::Reference(form_resources_id),
+        };
+        form_dict.set("Length", form_stream_content.len() as i64);
+        let form_id = doc.add_object(Object::Stream(Stream::new(form_dict, form_stream_content)));
+
+        let page_resources = dictionary! {
+            "XObject" => dictionary! {
+                "X1" => Object::Reference(form_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => page_resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let cmaps = FontCMaps::from_doc(&doc);
+        let entry = cmaps.get_by_obj(tounicode_id.0);
+        assert!(
+            entry.is_some(),
+            "ToUnicode CMap on a Form XObject font should be discovered even when \
+             the Form's /Resources is an indirect reference"
+        );
+        assert_eq!(entry.unwrap().primary.lookup(0x0003), Some("A".to_string()));
+    }
+
+    /// Same fixture as above, but via the fast/page-selected extraction
+    /// path (`from_doc_pages_fast`) — primary ToUnicode CMaps on Form
+    /// XObject fonts must still be discovered there too, even though the
+    /// expensive TrueType embedded-font fallback is skipped in that mode.
+    #[test]
+    fn form_xobject_indirect_resources_discovered_in_fast_mode_too() {
+        use lopdf::{dictionary, Stream};
+
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let cmap_content = b"\
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfchar
+<0003> <0041>
+endbfchar
+endcmap"
+            .to_vec();
+        let tounicode_id =
+            doc.add_object(Object::Stream(Stream::new(dictionary! {}, cmap_content)));
+
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Test".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "ToUnicode" => Object::Reference(tounicode_id),
+        });
+
+        let form_resources_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(font_id),
+            },
+        }));
+
+        let form_stream_content = b"BT /F1 12 Tf (test) Tj ET".to_vec();
+        let mut form_dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => Object::Name(b"Form".to_vec()),
+            "Resources" => Object::Reference(form_resources_id),
+        };
+        form_dict.set("Length", form_stream_content.len() as i64);
+        let form_id = doc.add_object(Object::Stream(Stream::new(form_dict, form_stream_content)));
+
+        let page_resources = dictionary! {
+            "XObject" => dictionary! {
+                "X1" => Object::Reference(form_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => page_resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let cmaps = FontCMaps::from_doc_pages_fast(&doc, None);
+        let entry = cmaps.get_by_obj(tounicode_id.0);
+        assert!(
+            entry.is_some(),
+            "primary ToUnicode CMap on a Form XObject font should still be \
+             discovered in fast mode, even with indirect /Resources"
+        );
+    }
 
     #[test]
     fn test_parse_bfchar_2byte() {
