@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "pdf-inspector"
 # Keep package versions in sync with `python3 scripts/version.py <version>`.
 # CI publishes automatically when the synchronized change lands on main.
-version = "1.14.2"
+version = "1.15.0"
 description = "Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection"
 readme = "docs/python.md"
 license = { text = "MIT" }

@@ -2089,7 +2089,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pdf-inspector"
-version = "1.14.2"
+version = "1.15.0"
 dependencies = [
  "dirs",
  "env_logger",
@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-inspector-napi"
-version = "1.14.2"
+version = "1.15.0"
 dependencies = [
  "napi",
  "napi-build",
