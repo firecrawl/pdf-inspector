@@ -1,0 +1,12 @@
+src/markdown/convert.rs
+  s_3fa7a2abc03ac9::t_a0fc3097ba2b04 942,1371,1474
+  s_3fa7a2abc03ac9::t_30e75ba302431b 14
+src/markdown/classify.rs
+  s_3fa7a2abc03ac9::t_830c16e626b261 206-224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c42961cf9184098f0e5c0887f93199ac937ec9a1",
+  "prompts": {}
+}
