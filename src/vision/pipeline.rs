@@ -63,6 +63,9 @@ pub struct OcrPdfOptions {
     /// Password for an encrypted PDF.
     pub password: Option<String>,
     /// Weak OCR threshold for recommending the hosted pipeline.
+    ///
+    /// Pages with incomplete native coverage may also recommend the hosted
+    /// pipeline when confident OCR only duplicates the retained fragment.
     pub hosted_recommendation_confidence: f32,
 }
 
@@ -427,12 +430,26 @@ where
     O: OcrEngine,
 {
     let routed: BTreeSet<u32> = routed_pages.iter().copied().collect();
+    let native_by_number: BTreeMap<u32, &PageMarkdown> = native_pages
+        .iter()
+        .map(|page| (page.page + 1, page))
+        .collect();
     let mut pages_by_number = BTreeMap::new();
     let mut render_time_ms = 0u64;
     let mut ocr_time_ms = 0u64;
 
     for chunk in routed_pages.chunks(OCR_PAGE_CHUNK_SIZE) {
-        let native_chunk = select_native_pages(native_pages, |page| chunk.contains(&page));
+        let native_chunk = chunk
+            .iter()
+            .map(|page_number| {
+                clone_native_page(
+                    native_by_number
+                        .get(page_number)
+                        .copied()
+                        .expect("every routed page has a native page"),
+                )
+            })
+            .collect::<Vec<_>>();
         let run = run_ocr_pages(
             renderer,
             engine,
@@ -497,13 +514,17 @@ fn select_native_pages(
     native_pages
         .iter()
         .filter(|page| include(page.page + 1))
-        .map(|page| PageMarkdown {
-            page: page.page,
-            markdown: page.markdown.clone(),
-            needs_ocr: page.needs_ocr,
-            ocr_reason: page.ocr_reason.clone(),
-        })
+        .map(clone_native_page)
         .collect()
+}
+
+fn clone_native_page(page: &PageMarkdown) -> PageMarkdown {
+    PageMarkdown {
+        page: page.page,
+        markdown: page.markdown.clone(),
+        needs_ocr: page.needs_ocr,
+        ocr_reason: page.ocr_reason.clone(),
+    }
 }
 
 fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipelineError> {
@@ -806,6 +827,10 @@ fn remove_duplicate_table_lines(markdown: &str) -> String {
             if duplicate {
                 continue;
             }
+            // Wide rows are only candidates inside the duplicate block that
+            // immediately follows a table. Once unrelated prose begins, the
+            // same text may be a legitimate later reference.
+            wide_table_rows.clear();
         }
         output.push_str(line);
         output.push('\n');
@@ -1148,12 +1173,19 @@ mod tests {
     }
 
     #[test]
-    fn recovered_markdown_drops_nonadjacent_duplicate_of_wide_table_row() {
+    fn recovered_markdown_keeps_wide_table_text_after_unrelated_prose() {
         let markdown = "|Date|A|B|C|D|E|F|G|\n|---|---|---|---|---|---|---|---|\n|April 1|1|2|3|4|5|6|7|\n\nSummary follows.\n\nApril 1 1 2 3 4 5 6 7\n";
+
+        assert_eq!(remove_duplicate_table_lines(markdown), markdown);
+    }
+
+    #[test]
+    fn recovered_markdown_drops_contiguous_duplicate_block_of_wide_table_rows() {
+        let markdown = "|Date|A|B|C|D|E|F|G|\n|---|---|---|---|---|---|---|---|\n|April 1|1|2|3|4|5|6|7|\n|April 2|8|9|10|11|12|13|14|\n\nApril 1 1 2 3 4 5 6 7\nApril 2 8 9 10 11 12 13 14\n\nSummary follows.\n";
 
         assert_eq!(
             remove_duplicate_table_lines(markdown),
-            "|Date|A|B|C|D|E|F|G|\n|---|---|---|---|---|---|---|---|\n|April 1|1|2|3|4|5|6|7|\n\nSummary follows.\n\n"
+            "|Date|A|B|C|D|E|F|G|\n|---|---|---|---|---|---|---|---|\n|April 1|1|2|3|4|5|6|7|\n|April 2|8|9|10|11|12|13|14|\n\n\nSummary follows.\n"
         );
     }
 

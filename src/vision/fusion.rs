@@ -184,8 +184,9 @@ pub fn ocr_page_to_markdown(
 /// OCR replaces pages whose native extraction was already rejected. On clean
 /// native pages (for example in `Force` mode), normalized duplicate OCR blocks
 /// are removed and only genuinely additional blocks are appended. Pages that
-/// needed OCR but still have no credible OCR result recommend the hosted
-/// document pipeline instead of silently presenting an empty result as final.
+/// needed OCR but still have no credible OCR result, or whose confident OCR
+/// only repeats an incomplete native fragment, recommend the hosted document
+/// pipeline instead of silently presenting partial content as final.
 pub fn fuse_ocr_pages(
     native_pages: &[PageMarkdown],
     ocr_run: &OcrRun,
@@ -405,9 +406,10 @@ fn choose_adaptive_content(
                 "kept trustworthy {} because OCR added no material coverage",
                 native.origin.description()
             ),
-            // The page was already routed because native extraction appeared
-            // incomplete. Agreement between two partial hypotheses preserves
-            // trustworthy text, but it does not prove full-page coverage.
+            // The candidate exists only because this page was routed with
+            // incomplete native coverage. Agreement between two partial
+            // hypotheses preserves trustworthy text, but does not prove that
+            // the rest of the page was recovered.
             recommend_hosted: true,
         };
     }
