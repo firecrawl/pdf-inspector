@@ -134,6 +134,14 @@ jobs:
         with:
           toolchain: stable
 
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -200,6 +208,50 @@ jobs:
           assert result["pages"][0]["source"] in {"ocr", "fused"}
           assert result["pages"][0]["markdown"].strip()
           assert "layout_ms" not in result["pages"][0]["timings"]
+          PY
+
+      - name: Build Node binding
+        working-directory: napi
+        run: |
+          bun install --frozen-lockfile
+          bunx napi build --platform --release
+
+      - name: Run Node OCR binding
+        shell: bash
+        run: |
+          node --input-type=module - <<'JS'
+          import { readFileSync } from 'node:fs'
+          import { processPdfWithOcr } from './napi/index.js'
+
+          const pdf = readFileSync('tests/fixtures/scan_with_native_header_text.pdf')
+          const result = await processPdfWithOcr(pdf, { offline: true })
+          if (JSON.stringify(result.pagesRoutedToOcr) !== '[1]') throw new Error('unexpected OCR route')
+          if (result.pagesRecommendingHosted.length !== 0) throw new Error('unexpected hosted recommendation')
+          if (!['Ocr', 'Fused'].includes(result.pages[0].provenance.source)) throw new Error('unexpected source')
+          if (!result.pages[0].markdown.trim()) throw new Error('empty OCR markdown')
+          JS
+
+      - name: Build and install Python binding
+        shell: bash
+        run: |
+          python -m pip install 'maturin>=1,<2'
+          maturin build --release --out "$RUNNER_TEMP/python-wheels"
+          python -m pip install "$RUNNER_TEMP"/python-wheels/*.whl
+
+      - name: Run Python OCR binding
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pdf_inspector
+
+          result = pdf_inspector.process_pdf_with_ocr(
+              "tests/fixtures/scan_with_native_header_text.pdf",
+              offline=True,
+          )
+          assert result.pages_routed_to_ocr == [1]
+          assert result.pages_recommending_hosted == []
+          assert result.pages[0].provenance.source in {"ocr", "fused"}
+          assert result.pages[0].markdown.strip()
           PY
 
   wasm:

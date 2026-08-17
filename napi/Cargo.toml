@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-pdf-inspector = { path = ".." }
+pdf-inspector = { path = "..", features = ["ocr"] }
 napi = { version = "3.0.0", features = ["serde-json"] }
 napi-derive = "3.0.0"
 

@@ -1,6 +1,6 @@
 """Type stubs for pdf_inspector."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 class PdfResult:
     """Result of processing a PDF file."""
@@ -26,6 +26,53 @@ class PageOcrReasons:
     """1-indexed page number."""
     reasons: list[str]
     """Machine-readable OCR reason identifiers."""
+
+class OcrModelIdentity:
+    """Exact OCR model identity retained in page provenance."""
+    name: str
+    revision: str
+
+class OcrTimings:
+    """Per-page OCR processing timings."""
+    render_ms: int
+    ocr_ms: int
+    assembly_ms: int
+
+class OcrPageProvenance:
+    """Source, model, confidence, and fallback metadata for one page."""
+    page_number: int
+    """1-indexed page number."""
+    source: Literal["native", "ocr", "fused"]
+    """'native', 'ocr', or 'fused'."""
+    ocr_model: Optional[OcrModelIdentity]
+    render_dpi: Optional[float]
+    ocr_confidence: Optional[float]
+    timings: OcrTimings
+    warnings: list[str]
+    hosted_recommended: bool
+
+class OcrPageResult:
+    """Final Markdown and provenance for one page."""
+    page_number: int
+    """1-indexed page number."""
+    markdown: str
+    provenance: OcrPageProvenance
+
+class OcrPdfResult:
+    """Complete native/OCR Markdown output."""
+    markdown: str
+    pages: list[OcrPageResult]
+    page_count: int
+    pages_recommended_for_ocr: list[int]
+    pages_routed_to_ocr: list[int]
+    pages_recommending_hosted: list[int]
+    ocr_reasons_by_page: list[PageOcrReasons]
+    pages_with_tables: list[int]
+    pages_with_columns: list[int]
+    is_complex: bool
+    processing_time_ms: int
+    render_time_ms: int
+    ocr_time_ms: int
 
 class PdfClassification:
     """Lightweight PDF classification result."""
@@ -112,6 +159,39 @@ def process_pdf(path: str, pages: Optional[list[int]] = None) -> PdfResult:
 
 def process_pdf_bytes(data: bytes, pages: Optional[list[int]] = None) -> PdfResult:
     """Process a PDF from bytes in memory."""
+    ...
+
+def process_pdf_with_ocr(
+    path: str,
+    *,
+    mode: Literal["off", "auto", "force"] = "auto",
+    page_numbers: Optional[list[int]] = None,
+    password: Optional[str] = None,
+    dpi: float = 150.0,
+    minimum_confidence: float = 0.0,
+    hosted_recommendation_confidence: float = 0.5,
+    model_directory: Optional[str] = None,
+    offline: bool = False,
+) -> OcrPdfResult:
+    """Process a PDF through native extraction and selective OCR.
+
+    Page numbers are 1-indexed. OCR runs without holding the Python GIL.
+    """
+    ...
+
+def process_pdf_with_ocr_bytes(
+    data: bytes,
+    *,
+    mode: Literal["off", "auto", "force"] = "auto",
+    page_numbers: Optional[list[int]] = None,
+    password: Optional[str] = None,
+    dpi: float = 150.0,
+    minimum_confidence: float = 0.0,
+    hosted_recommendation_confidence: float = 0.5,
+    model_directory: Optional[str] = None,
+    offline: bool = False,
+) -> OcrPdfResult:
+    """Process PDF bytes through native extraction and selective OCR."""
     ...
 
 def detect_pdf(path: str) -> PdfResult:
