@@ -159,9 +159,33 @@ class PageOcrReasons:                # per-page OCR diagnostics
     page: int                        # 1-indexed
     reasons: list[str]               # machine-readable reason identifiers
 
+class OcrModelIdentity:
+    name: str                        # model family/name
+    revision: str                    # immutable artifact-set revision
+
+class OcrTimings:                    # per-page processing stages
+    render_ms: int
+    ocr_ms: int
+    assembly_ms: int
+
+class OcrPageProvenance:
+    page_number: int                 # 1-indexed
+    source: Literal["native", "ocr", "fused"]
+    ocr_model: OcrModelIdentity | None
+    render_dpi: float | None
+    ocr_confidence: float | None
+    timings: OcrTimings
+    warnings: list[str]
+    hosted_recommended: bool
+
+class OcrPageResult:
+    page_number: int                 # 1-indexed
+    markdown: str
+    provenance: OcrPageProvenance
+
 class OcrPdfResult:                  # process_pdf_with_ocr / bytes
     markdown: str
-    pages: list[OcrPageResult]        # 1-indexed pages + provenance
+    pages: list[OcrPageResult]
     page_count: int
     pages_recommended_for_ocr: list[int]
     pages_routed_to_ocr: list[int]
