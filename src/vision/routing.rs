@@ -106,7 +106,11 @@ where
                 source: Box::new(source),
             })?;
     let ocr_time_ms = elapsed_ms(ocr_started);
-    validate_page_order("OCR engine", pages, recognized.iter().map(|page| page.page))?;
+    validate_page_order(
+        "OCR engine",
+        pages,
+        recognized.iter().map(|page| page.page_number),
+    )?;
 
     Ok(OcrRun {
         pages: rendered
@@ -268,7 +272,7 @@ mod tests {
             Ok(pages
                 .iter()
                 .map(|page| OcrPage {
-                    page: page.page(),
+                    page_number: page.page(),
                     spans: vec![OcrSpan {
                         text: format!("page {}", page.page()),
                         polygon: ImageQuad::new([

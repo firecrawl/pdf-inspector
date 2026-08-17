@@ -1,6 +1,6 @@
 # pdf-inspector
 
-Fast PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. The default build is pure Rust, has no ML models or external services, and uses [lopdf](https://crates.io/crates/lopdf) for PDF parsing. Also available for [Python](https://pypi.org/project/pdf-inspector/) and [Node.js](https://www.npmjs.com/package/@firecrawl/pdf-inspector/).
+Fast PDF classification and text extraction. The default build detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown without OCR. It is pure Rust, has no ML models or external services, and uses [lopdf](https://crates.io/crates/lopdf) for PDF parsing. Native Rust and CLI consumers can opt into selective OCR. Also available for [Python](https://pypi.org/project/pdf-inspector/) and [Node.js](https://www.npmjs.com/package/@firecrawl/pdf-inspector/).
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
@@ -123,10 +123,10 @@ The native-only `vision` feature exposes the stable seam used by OCR
 integrations without selecting or embedding an inference runtime. The
 separate `model-cache` feature adds pinned artifact management:
 
-- `PageRenderer`, `OcrEngine`, and `LayoutEngine` traits;
+- `PageRenderer` and `OcrEngine` traits;
 - renderer-neutral owned page buffers and affine pixel↔PDF transforms;
 - `OcrOptions` and opt-in `Off`/`Auto`/`Force` routing modes;
-- positioned OCR/layout results and per-page provenance types; and
+- positioned OCR results and per-page provenance types; and
 - a versioned PP-OCRv6 Small manifest with checksum-verified, locked, atomic
   model-cache installation and explicit offline-directory overrides.
 
@@ -135,9 +135,9 @@ separate `model-cache` feature adds pinned artifact management:
 pdf-inspector = { version = "1", features = ["vision", "model-cache"] }
 ```
 
-The OCR contracts preserve existing behavior by default: OCR is `Off`, learned
-layout is disabled, and model resolution is never reached. `ModelStore` itself
-does not access the network. The optional `model-download` feature provides an
+The OCR contracts preserve existing behavior by default: OCR is `Off` and
+model resolution is never reached. `ModelStore` itself does not access the
+network. The optional `model-download` feature provides an
 HTTPS downloader that streams pinned artifacts into the checksum-verified
 cache only after routing has selected OCR work. Offline consumers set an
 explicit model directory and `ModelDownloadPolicy::Offline`. Renderer-only
@@ -171,9 +171,10 @@ and `PdfiumRenderer` implements the renderer-neutral `PageRenderer` trait.
 pdf-inspector = { version = "1", features = ["render-pdfium"] }
 ```
 
-PDFium is loaded at runtime. Set `PDFIUM_LIB_PATH`, place its shared library
-next to the executable, or use another discovery route supported by
-`firecrawl-pdfium`.
+PDFium is loaded at runtime and is not bundled into the crate. Set
+`PDFIUM_LIB_PATH` to the platform shared library, place that library next to
+the executable, or use another discovery route supported by
+`firecrawl-pdfium`. A load failure reports this prerequisite directly.
 
 ```rust
 use pdf_inspector::vision::{PdfiumRenderer, RenderOptions};
@@ -205,9 +206,11 @@ The native-only `ocr-oar` feature adds a CPU PP-OCRv6 Small implementation of
 not enable model auto-download, ONNX Runtime download, or PDF rendering. Model
 files remain external, must match the pinned manifest, and are opened only
 after `ModelStore` verifies their exact size and SHA-256 digest. Install an
-ONNX Runtime shared library separately and set `ORT_DYLIB_PATH` when it is not
-available through the platform library search path. The feature currently
-requires Rust 1.95 or newer, matching OAR 0.9.1's MSRV.
+ONNX Runtime shared library separately and set `ORT_DYLIB_PATH` to its full
+path when it is not available through the platform library search path. The
+runtime is resolved only when an OCR engine is first constructed; clean
+`Auto` requests do not require it. The feature currently requires Rust 1.95
+or newer, matching OAR 0.9.1's MSRV.
 
 ```toml
 [dependencies]
@@ -329,7 +332,10 @@ let fused = fuse_ocr_pages(
 for page in &fused.pages {
     println!("{}", page.markdown);
     if page.provenance.hosted_recommended {
-        eprintln!("page {} needs the hosted document pipeline", page.page + 1);
+        eprintln!(
+            "page {} needs the hosted document pipeline",
+            page.page_number,
+        );
     }
 }
 ```
@@ -354,15 +360,11 @@ pdf-inspector = { version = "1", features = ["ocr"] }
 ```
 
 ```rust
-use pdf_inspector::vision::{
-    process_pdf_with_ocr, OcrMode, OcrPdfOptions,
-};
+use pdf_inspector::vision::{process_pdf_with_ocr, OcrPdfOptions};
 
 let result = process_pdf_with_ocr(
     "document.pdf",
-    OcrPdfOptions::new()
-        .mode(OcrMode::Auto)
-        .pages([1, 2, 3]),
+    OcrPdfOptions::auto().page_numbers([1, 2, 3]),
 )?;
 
 println!("{}", result.markdown);
@@ -377,8 +379,9 @@ Native extraction always runs first. In `Auto`, a clean PDF returns before
 PDFium loading, model-cache access, HTTP, or OAR initialization. Model files
 remain external and the default crate feature set remains unchanged. `Off`
 provides the same native-only behavior through the OCR result/provenance
-shape; `Force` renders every selected page. Learned layout intentionally
-returns an explicit unsupported error in this lightweight pipeline.
+shape; `Force` renders every selected page. OCR uses the existing deterministic
+table, column, reading-order, and Markdown assembly path; no learned layout
+model is included.
 
 For ambiguous mixed pages, `Auto` privately retains clean native fragments
 instead of discarding them when OCR is selected. After recognition it compares
@@ -410,11 +413,13 @@ not hot-reload a running process; restart the process when intentionally
 replacing files at the same paths. CPU inference uses at most four intra-op
 threads per ONNX session so a single small page does not oversubscribe larger
 hosts, and recognizes variable-width line crops individually to avoid
-padding-heavy CPU batches.
+padding-heavy CPU batches. The high-level pipeline renders and fuses at most
+four routed pages at a time, bounding bitmap memory on long documents.
 
 Build the CLI with the same opt-in feature:
 
 ```bash
+cargo install pdf-inspector --features ocr --bin pdf2md
 cargo build --release --features ocr --bin pdf2md
 pdf2md document.pdf --ocr auto --raw
 pdf2md document.pdf --ocr auto --json
@@ -423,10 +428,11 @@ pdf2md document.pdf --ocr auto --ocr-offline --ocr-model-dir /opt/models/pp-ocrv
 
 CLI controls include `--ocr-dpi`, `--ocr-min-confidence`,
 `--ocr-hosted-threshold`, `--select-pages`, and the existing encrypted-PDF
-`--password` option. JSON output includes per-page Markdown, source/model
+`--password` option. JSON output has `schema_version: 1` and includes per-page Markdown, source/model
 provenance, confidence, timings, warnings, routed pages, and hosted-fallback
 recommendations. Page numbers in `OcrPdfResult` and its per-page provenance
-are 1-indexed, matching the PDF page numbers accepted by `OcrPdfOptions::pages`.
+are 1-indexed, matching the PDF page numbers accepted by
+`OcrPdfOptions::page_numbers`.
 
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):

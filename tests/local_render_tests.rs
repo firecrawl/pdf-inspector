@@ -5,9 +5,7 @@ use pdf_inspector::vision::{PdfiumRenderer, RenderError, RenderOptions, RenderPi
 fn load_renderer() -> Option<PdfiumRenderer> {
     match PdfiumRenderer::load() {
         Ok(renderer) => Some(renderer),
-        Err(RenderError::Pdfium(firecrawl_pdfium::Error::Load(
-            firecrawl_pdfium::LoadError::LibraryNotFound { .. },
-        ))) => {
+        Err(RenderError::PdfiumLoad { .. }) => {
             eprintln!("skipping PDFium runtime test because no native library is installed");
             None
         }

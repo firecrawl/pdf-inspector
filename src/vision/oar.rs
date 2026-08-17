@@ -49,7 +49,9 @@ pub enum OarOcrError {
         page: u32,
     },
     /// The external ONNX Runtime shared library could not be loaded.
-    #[error("failed to load ONNX Runtime from {path}: {source}")]
+    #[error(
+        "failed to load ONNX Runtime from {path}; install a compatible ONNX Runtime shared library or set ORT_DYLIB_PATH to its path: {source}"
+    )]
     OnnxRuntimeLoad {
         /// Requested shared-library path or platform library name.
         path: PathBuf,
@@ -143,10 +145,6 @@ impl OarOcrEngine {
         }
 
         let mut warnings = Vec::new();
-        if !options.languages.is_empty() {
-            warnings
-                .push("language hints are not used by the PP-OCRv6 Small OAR backend".to_string());
-        }
         if missing_recognition > 0 {
             warnings.push(format!(
                 "discarded {missing_recognition} regions without usable recognition output"
@@ -166,7 +164,7 @@ impl OarOcrEngine {
         let processing_time_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         Ok(OcrPage {
-            page: page.page(),
+            page_number: page.page(),
             spans,
             mean_confidence,
             model: self.model.clone(),

@@ -49,6 +49,15 @@ pub enum RenderError {
         /// Number of pages in the document.
         page_count: usize,
     },
+    /// The PDFium shared library could not be discovered or loaded.
+    #[error(
+        "failed to load PDFium; install a compatible PDFium shared library or set PDFIUM_LIB_PATH to its path"
+    )]
+    PdfiumLoad {
+        /// Dynamic loading failure.
+        #[source]
+        source: firecrawl_pdfium::Error,
+    },
     /// PDFium loading, document parsing, form setup, or rendering failed.
     #[error(transparent)]
     Pdfium(#[from] firecrawl_pdfium::Error),
@@ -80,14 +89,15 @@ impl PdfiumRenderer {
     /// Loads PDFium using `firecrawl-pdfium`'s documented discovery chain.
     pub fn load() -> Result<Self, RenderError> {
         Ok(Self {
-            pdfium: Pdfium::load()?,
+            pdfium: Pdfium::load().map_err(|source| RenderError::PdfiumLoad { source })?,
         })
     }
 
     /// Loads PDFium from an explicit native library path.
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, RenderError> {
         Ok(Self {
-            pdfium: Pdfium::load_from_path(path)?,
+            pdfium: Pdfium::load_from_path(path)
+                .map_err(|source| RenderError::PdfiumLoad { source })?,
         })
     }
 

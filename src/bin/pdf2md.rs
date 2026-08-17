@@ -165,8 +165,8 @@ fn format_ocr_json(result: &OcrPdfResult) -> String {
                 .collect::<Vec<_>>()
                 .join(",");
             format!(
-                r#"{{"page":{},"source":"{}","markdown":"{}","ocr_model":{},"render_dpi":{},"ocr_confidence":{},"hosted_recommended":{},"timings":{{"render_ms":{},"ocr_ms":{},"layout_ms":{},"assembly_ms":{}}},"warnings":[{}]}}"#,
-                provenance.page,
+                r#"{{"page":{},"source":"{}","markdown":"{}","ocr_model":{},"render_dpi":{},"ocr_confidence":{},"hosted_recommended":{},"timings":{{"render_ms":{},"ocr_ms":{},"assembly_ms":{}}},"warnings":[{}]}}"#,
+                provenance.page_number,
                 source,
                 json_escape(&page.markdown),
                 model,
@@ -175,7 +175,6 @@ fn format_ocr_json(result: &OcrPdfResult) -> String {
                 provenance.hosted_recommended,
                 provenance.timings.render_ms,
                 provenance.timings.ocr_ms,
-                provenance.timings.layout_ms,
                 provenance.timings.assembly_ms,
                 warnings,
             )
@@ -196,7 +195,7 @@ fn format_ocr_json(result: &OcrPdfResult) -> String {
         .join(",");
     let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
     format!(
-        r#"{{"page_count":{},"processing_time_ms":{},"render_time_ms":{},"ocr_time_ms":{},"pages_recommended_for_ocr":[{}],"pages_routed_to_ocr":[{}],"pages_recommending_hosted":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"pages":[{}],"markdown":"{}"}}"#,
+        r#"{{"schema_version":1,"page_count":{},"processing_time_ms":{},"render_time_ms":{},"ocr_time_ms":{},"pages_recommended_for_ocr":[{}],"pages_routed_to_ocr":[{}],"pages_recommending_hosted":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"pages":[{}],"markdown":"{}"}}"#,
         result.page_count,
         result.processing_time_ms,
         result.render_time_ms,
@@ -224,6 +223,19 @@ fn argument_value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>,
         .transpose()
 }
 
+fn format_ocr_error_json(error: &str) -> String {
+    format!(r#"{{"schema_version":1,"error":"{}"}}"#, json_escape(error))
+}
+
+fn exit_ocr_error(error: &str, json_output: bool) -> ! {
+    if json_output {
+        println!("{}", format_ocr_error_json(error));
+    } else {
+        eprintln!("Error: {error}");
+    }
+    process::exit(1);
+}
+
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 fn float_argument(args: &[String], name: &str, default: f32) -> Result<f32, String> {
     argument_value(args, name)?
@@ -247,7 +259,9 @@ fn extract_items_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_items_json, format_items_json};
+    use super::{extract_items_json, format_items_json, format_ocr_error_json};
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    use super::{format_ocr_json, process_pdf_with_ocr, OcrPdfOptions};
     use pdf_inspector::extractor::ItemType;
     use pdf_inspector::TextItem;
 
@@ -295,6 +309,27 @@ mod tests {
         assert!(
             json.contains("Procurement"),
             "decrypted item JSON should contain fixture text, got {json}"
+        );
+    }
+
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    #[test]
+    fn ocr_json_has_a_versioned_stable_envelope() {
+        let result =
+            process_pdf_with_ocr("tests/fixtures/thermo-freon12.pdf", OcrPdfOptions::new())
+                .unwrap();
+        let json = format_ocr_json(&result);
+
+        assert!(json.starts_with(r#"{"schema_version":1,"page_count":3,"#));
+        assert!(json.contains(r#""page":1,"source":"native""#));
+        assert!(!json.contains("layout_ms"));
+    }
+
+    #[test]
+    fn ocr_json_errors_use_the_same_versioned_envelope() {
+        assert_eq!(
+            format_ocr_error_json("bad \"value\""),
+            r#"{"schema_version":1,"error":"bad \"value\""}"#
         );
     }
 }
@@ -441,23 +476,27 @@ fn main() {
     .iter()
     .any(|option| args.iter().any(|argument| argument == option));
     if ocr_mode_argument.is_none() && has_ocr_only_option {
-        eprintln!("Error: OCR options require --ocr off, --ocr auto, or --ocr force");
-        process::exit(1);
+        exit_ocr_error(
+            "OCR options require --ocr off, --ocr auto, or --ocr force",
+            json_output,
+        );
     }
 
     if let Some(mode) = ocr_mode_argument {
         if items_json_output || detect_only || analyze {
-            eprintln!(
-                "Error: --ocr cannot be combined with --items-json, --detect-only, or --analyze"
+            exit_ocr_error(
+                "--ocr cannot be combined with --items-json, --detect-only, or --analyze",
+                json_output,
             );
-            process::exit(1);
         }
 
         #[cfg(not(all(feature = "ocr", not(target_arch = "wasm32"))))]
         {
             let _ = mode;
-            eprintln!("Error: this pdf2md build does not include OCR; rebuild with --features ocr");
-            process::exit(1);
+            exit_ocr_error(
+                "this pdf2md build does not include OCR; rebuild with --features ocr",
+                json_output,
+            );
         }
 
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -467,28 +506,26 @@ fn main() {
                 "auto" => OcrMode::Auto,
                 "force" => OcrMode::Force,
                 value => {
-                    eprintln!("Error: invalid --ocr mode {value:?}; expected off, auto, or force");
-                    process::exit(1);
+                    exit_ocr_error(
+                        &format!("invalid --ocr mode {value:?}; expected off, auto, or force"),
+                        json_output,
+                    );
                 }
             };
             let dpi = float_argument(&args, "--ocr-dpi", 150.0).unwrap_or_else(|error| {
-                eprintln!("Error: {error}");
-                process::exit(1);
+                exit_ocr_error(&error, json_output);
             });
             let minimum_confidence = float_argument(&args, "--ocr-min-confidence", 0.0)
                 .unwrap_or_else(|error| {
-                    eprintln!("Error: {error}");
-                    process::exit(1);
+                    exit_ocr_error(&error, json_output);
                 });
             let hosted_threshold = float_argument(&args, "--ocr-hosted-threshold", 0.5)
                 .unwrap_or_else(|error| {
-                    eprintln!("Error: {error}");
-                    process::exit(1);
+                    exit_ocr_error(&error, json_output);
                 });
             let model_directory =
                 argument_value(&args, "--ocr-model-dir").unwrap_or_else(|error| {
-                    eprintln!("Error: {error}");
-                    process::exit(1);
+                    exit_ocr_error(&error, json_output);
                 });
 
             let mut ocr = OcrOptions::new()
@@ -511,7 +548,7 @@ fn main() {
                 .markdown(markdown)
                 .hosted_recommendation_confidence(hosted_threshold);
             if let Some(pages) = page_filter.clone() {
-                pdf_options = pdf_options.pages(pages);
+                pdf_options = pdf_options.page_numbers(pages);
             }
             if let Some(password) = password.clone() {
                 pdf_options = pdf_options.password(password);
@@ -549,12 +586,7 @@ fn main() {
                     }
                 }
                 Err(error) => {
-                    if json_output {
-                        println!(r#"{{"error":"{}"}}"#, json_escape(&error.to_string()));
-                    } else {
-                        eprintln!("Error: {error}");
-                    }
-                    process::exit(1);
+                    exit_ocr_error(&error.to_string(), json_output);
                 }
             }
             return;

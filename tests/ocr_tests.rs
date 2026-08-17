@@ -20,9 +20,7 @@ const EXPECTED_TEXT_ENV: &str = "PDF_INSPECTOR_OCR_TEST_EXPECTED";
 fn load_renderer() -> Option<PdfiumRenderer> {
     match PdfiumRenderer::load() {
         Ok(renderer) => Some(renderer),
-        Err(RenderError::Pdfium(firecrawl_pdfium::Error::Load(
-            firecrawl_pdfium::LoadError::LibraryNotFound { .. },
-        ))) => {
+        Err(RenderError::PdfiumLoad { .. }) => {
             eprintln!("skipping OCR runtime test because no native PDFium library is installed");
             None
         }
@@ -208,7 +206,7 @@ fn recognize(
 
 fn assert_usable_result(results: &[pdf_inspector::vision::OcrPage]) {
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].page, 1);
+    assert_eq!(results[0].page_number, 1);
     assert_eq!(results[0].model.name, PP_OCR_V6_SMALL.id);
     assert_eq!(results[0].model.revision, PP_OCR_V6_SMALL.revision);
     assert!(!results[0].spans.is_empty());

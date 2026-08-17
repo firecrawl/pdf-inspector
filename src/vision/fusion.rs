@@ -74,7 +74,7 @@ impl OcrFusionOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FusedPageMarkdown {
     /// 1-indexed document page number, matching OCR and provenance fields.
-    pub page: u32,
+    pub page_number: u32,
     /// Final page Markdown.
     pub markdown: String,
     /// Native/OCR source, model, timing, and fallback metadata.
@@ -331,13 +331,12 @@ fn fuse_ocr_pages_impl(
             };
 
         pages.push(FusedPageMarkdown {
-            page: page_number,
+            page_number,
             markdown,
             provenance: PageProvenance {
-                page: page_number,
+                page_number,
                 source,
                 ocr_model,
-                layout_model: None,
                 render_dpi: ocr_by_page
                     .contains_key(&page_number)
                     .then_some(options.render_dpi),
@@ -345,7 +344,6 @@ fn fuse_ocr_pages_impl(
                 timings: VisionTimings {
                     render_ms: render_by_page.get(&page_number).copied().unwrap_or(0),
                     ocr_ms,
-                    layout_ms: 0,
                     assembly_ms: elapsed_ms(assembly_started),
                 },
                 warnings,
@@ -1016,7 +1014,7 @@ mod tests {
         RoutedOcrPage {
             rendered: rendered_page(page),
             ocr: OcrPage {
-                page,
+                page_number: page,
                 spans,
                 mean_confidence: confidence,
                 model: ModelIdentity::new("test-ocr", "v1"),
@@ -1071,8 +1069,11 @@ mod tests {
                 < result.pages[0].markdown.find("Second").unwrap()
         );
         assert_eq!(result.pages[0].provenance.source, PageContentSource::Ocr);
-        assert_eq!(result.pages[0].page, 1);
-        assert_eq!(result.pages[0].page, result.pages[0].provenance.page);
+        assert_eq!(result.pages[0].page_number, 1);
+        assert_eq!(
+            result.pages[0].page_number,
+            result.pages[0].provenance.page_number
+        );
         assert_eq!(
             result.pages[0].provenance.ocr_model.as_ref().unwrap().name,
             "test-ocr"

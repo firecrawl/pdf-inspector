@@ -59,7 +59,7 @@ pub struct OcrPdfOptions {
     /// Markdown formatting shared by native and OCR assembly.
     pub markdown: MarkdownOptions,
     /// Optional 1-indexed page selection. `None` processes the full document.
-    pub page_filter: Option<BTreeSet<u32>>,
+    pub page_numbers: Option<BTreeSet<u32>>,
     /// Password for an encrypted PDF.
     pub password: Option<String>,
     /// Weak OCR threshold for recommending the hosted pipeline.
@@ -75,7 +75,7 @@ impl Default for OcrPdfOptions {
             render: RenderOptions::default(),
             ocr: OcrOptions::default(),
             markdown: MarkdownOptions::default(),
-            page_filter: None,
+            page_numbers: None,
             password: None,
             hosted_recommendation_confidence: 0.5,
         }
@@ -89,7 +89,7 @@ impl std::fmt::Debug for OcrPdfOptions {
             .field("render", &self.render)
             .field("ocr", &self.ocr)
             .field("markdown", &self.markdown)
-            .field("page_filter", &self.page_filter)
+            .field("page_numbers", &self.page_numbers)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .field(
                 "hosted_recommendation_confidence",
@@ -103,6 +103,11 @@ impl OcrPdfOptions {
     /// Creates options with OCR disabled, preserving the native-only path.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates options with selective OCR enabled for recommended pages.
+    pub fn auto() -> Self {
+        Self::default().mode(OcrMode::Auto)
     }
 
     /// Replaces page rasterization settings.
@@ -130,8 +135,8 @@ impl OcrPdfOptions {
     }
 
     /// Restricts processing to 1-indexed pages in ascending order.
-    pub fn pages(mut self, pages: impl IntoIterator<Item = u32>) -> Self {
-        self.page_filter = Some(pages.into_iter().collect());
+    pub fn page_numbers(mut self, pages: impl IntoIterator<Item = u32>) -> Self {
+        self.page_numbers = Some(pages.into_iter().collect());
         self
     }
 
@@ -209,7 +214,7 @@ pub fn process_pdf_with_ocr_mem(
         });
     }
     if options
-        .page_filter
+        .page_numbers
         .as_ref()
         .is_some_and(|pages| pages.contains(&0))
     {
@@ -218,7 +223,7 @@ pub fn process_pdf_with_ocr_mem(
 
     let started = Instant::now();
     let selected_pages: Option<Vec<u32>> = options
-        .page_filter
+        .page_numbers
         .as_ref()
         .map(|pages| pages.iter().copied().collect());
     let selected_pages_zero_indexed: Option<Vec<u32>> = selected_pages
@@ -372,7 +377,7 @@ pub fn process_pdf_with_ocr_mem(
         )?
     };
     for page in &mut fused.pages {
-        if recovered_natively.contains(&page.page) {
+        if recovered_natively.contains(&page.page_number) {
             page.provenance
                 .warnings
                 .push("recovered a credible positioned native text layer before OCR".to_string());
@@ -382,14 +387,14 @@ pub fn process_pdf_with_ocr_mem(
         .pages
         .iter()
         .filter(|page| page.provenance.hosted_recommended)
-        .map(|page| page.provenance.page)
+        .map(|page| page.provenance.page_number)
         .collect();
     let markdown = assemble_document_markdown(&fused.pages, options.markdown.include_page_numbers);
 
     let mut pages_with_tables = native.pages_with_tables;
     for page in &fused.pages {
-        if markdown_has_table(&page.markdown) && !pages_with_tables.contains(&page.page) {
-            pages_with_tables.push(page.page);
+        if markdown_has_table(&page.markdown) && !pages_with_tables.contains(&page.page_number) {
+            pages_with_tables.push(page.page_number);
         }
     }
     pages_with_tables.sort_unstable();
@@ -469,7 +474,7 @@ where
         render_time_ms = render_time_ms.saturating_add(fused.render_time_ms);
         ocr_time_ms = ocr_time_ms.saturating_add(fused.ocr_time_ms);
         for page in fused.pages {
-            pages_by_number.insert(page.page, page);
+            pages_by_number.insert(page.page_number, page);
         }
         // `run` and its rendered bitmaps are released before the next chunk.
     }
@@ -488,7 +493,7 @@ where
             native_candidates,
         )?;
         for page in fused.pages {
-            pages_by_number.insert(page.page, page);
+            pages_by_number.insert(page.page_number, page);
         }
     }
 
@@ -862,7 +867,7 @@ fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers:
             document.push_str("\n\n");
         }
         if include_page_numbers {
-            document.push_str(&format!("<!-- Page {} -->\n\n", page.page));
+            document.push_str(&format!("<!-- Page {} -->\n\n", page.page_number));
         }
         document.push_str(page.markdown.trim());
     }
@@ -989,7 +994,7 @@ mod tests {
             Ok(pages
                 .iter()
                 .map(|page| super::super::OcrPage {
-                    page: page.page(),
+                    page_number: page.page(),
                     spans: Vec::new(),
                     mean_confidence: None,
                     model: self.model.clone(),
@@ -1250,13 +1255,18 @@ mod tests {
         let bytes = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
         let mut markdown = MarkdownOptions::default();
         markdown.include_page_numbers = true;
-        let result =
-            process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().pages([2]).markdown(markdown))
-                .unwrap();
+        let result = process_pdf_with_ocr_mem(
+            &bytes,
+            OcrPdfOptions::new().page_numbers([2]).markdown(markdown),
+        )
+        .unwrap();
 
         assert_eq!(result.pages.len(), 1);
-        assert_eq!(result.pages[0].page, 2);
-        assert_eq!(result.pages[0].page, result.pages[0].provenance.page);
+        assert_eq!(result.pages[0].page_number, 2);
+        assert_eq!(
+            result.pages[0].page_number,
+            result.pages[0].provenance.page_number
+        );
         assert!(result.markdown.starts_with("<!-- Page 2 -->"));
     }
 
@@ -1303,7 +1313,8 @@ mod tests {
     #[test]
     fn rejects_out_of_range_selection_even_with_ocr_off() {
         let bytes = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
-        let error = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().pages([4])).unwrap_err();
+        let error =
+            process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().page_numbers([4])).unwrap_err();
         assert!(matches!(
             error,
             OcrPipelineError::InvalidSelectedPage { page: 4 }

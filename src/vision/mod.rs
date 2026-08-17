@@ -30,9 +30,8 @@ mod pdfium;
 
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use contracts::{
-    ImagePoint, ImageQuad, LayoutEngine, LayoutOptions, LayoutPage, LayoutRegion, LayoutRegionKind,
-    ModelDownloadPolicy, ModelIdentity, OcrEngine, OcrMode, OcrOptions, OcrPage, OcrProfile,
-    OcrSpan, PageContentSource, PageProvenance, PageRenderer, VisionTimings,
+    ImagePoint, ImageQuad, ModelDownloadPolicy, ModelIdentity, OcrEngine, OcrMode, OcrOptions,
+    OcrPage, OcrSpan, PageContentSource, PageProvenance, PageRenderer, VisionTimings,
 };
 #[cfg(all(feature = "model-download", not(target_arch = "wasm32")))]
 pub use download::{HttpModelDownloadError, HttpModelDownloader, DEFAULT_MODEL_DOWNLOAD_TIMEOUT};
