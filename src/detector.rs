@@ -403,8 +403,15 @@ pub(crate) fn detect_from_document(
                     && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
                 let looks_like_scan =
                     analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
+                // A template-image page below the `pages_with_text` floor is
+                // a scan with incidental chrome (masthead, stamp, date line)
+                // even when that chrome is diverse, decodable text — keep
+                // this in sync with `page_ocr_signals`.
+                let sparse_text_over_scan = analysis.has_template_image
+                    && analysis.text_operator_count < config.min_text_ops_per_page.max(10);
                 if (analysis.has_template_image && looks_like_scan)
                     || analysis.has_vector_text
+                    || sparse_text_over_scan
                     || (analysis.text_operator_count < config.min_text_ops_per_page
                         && analysis.has_images)
                 {
@@ -1795,17 +1802,24 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
 ///    low alphanumeric diversity in raw string operands (unless decodable
 ///    CID/ToUnicode fonts explain that away) — the gate used for
 ///    `pages_with_template_images` and Mixed-type per-page routing.
-/// 2. Insufficient real text volume, using `DetectionConfig::default()`'s
-///    `min_text_ops_per_page` (3) — the same threshold Mixed-type per-page
-///    routing applies via `text_operator_count < config.min_text_ops_per_page
-///    && has_images` (simplified here since a template image implies
-///    `has_images`). Deliberately *not* the higher `effective_min_ops`
-///    floor (`min_text_ops_per_page.max(10)`) that whole-document
-///    `PdfType::ImageBased`/`Scanned` classification uses for
-///    `pages_with_text` — that's a cross-page aggregate decision this
-///    per-page function has no way to replicate exactly, and the lower
-///    per-page threshold is the one a single page's own signals can
-///    actually agree with.
+/// 2. Insufficient real text volume, using the same `effective_min_ops`
+///    floor (`min_text_ops_per_page.max(10)`) that `pages_with_text`
+///    applies to image-bearing pages. That floor is a per-page judgment,
+///    not part of the cross-page aggregate: classification counts a
+///    template-image page with fewer ops as textless and routes it to OCR,
+///    so this function must agree. The lower bare threshold (3) let a
+///    full-page scan carrying a small native masthead — a newspaper
+///    header, stamp, or date line of ~4 diverse, decodable text ops —
+///    extract as "a text page" here while whole-document classification
+///    called the same page scanned, silently dropping the page body from
+///    OCR routing. `alphanum_low` can't catch that case: masthead chrome
+///    is real text, so its byte diversity is high.
+///
+/// This function always evaluates against `DetectionConfig::default()` —
+/// it has no config parameter, and the per-page extraction path that calls
+/// it never carries one. A caller passing a custom `min_text_ops_per_page`
+/// to `detect_from_document` affects whole-document detection only; the
+/// two paths agree under the default configuration.
 ///
 /// `has_vector_text` is true when a page has vector-outlined text (glyphs
 /// drawn as paths rather than shown via text-showing operators) —
@@ -1827,7 +1841,7 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool
         let looks_like_scan =
             analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
         let insufficient_text =
-            analysis.text_operator_count < DetectionConfig::default().min_text_ops_per_page;
+            analysis.text_operator_count < DetectionConfig::default().min_text_ops_per_page.max(10);
         looks_like_scan || insufficient_text
     };
 
@@ -2992,6 +3006,130 @@ mod tests {
         assert!(
             !analysis.has_identity_h_no_tounicode,
             "page using both undecodable and decodable fonts should NOT be flagged"
+        );
+    }
+
+    // ---------- masthead-over-scan tests: template image + sparse chrome ----------
+
+    /// Builds a page whose only image is a full-page scan inside a Form
+    /// XObject, plus `masthead_ops` native text-show ops of diverse,
+    /// decodable chrome (newspaper masthead / date line style).
+    fn masthead_scan_page(masthead_lines: &[&str]) -> (Document, ObjectId) {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let image_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Image".to_vec()),
+                "Width" => Object::Integer(1500),
+                "Height" => Object::Integer(2383),
+            },
+            Vec::new(),
+        )));
+        let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! {
+                        "Im0" => Object::Reference(image_id),
+                    },
+                },
+            },
+            b"1500 0 0 2383 0 0 cm /Im0 Do".to_vec(),
+        )));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+
+        let mut content = b"q /Fm0 Do Q BT /F1 12 Tf ".to_vec();
+        for line in masthead_lines {
+            content.extend_from_slice(format!("({line}) Tj ").as_bytes());
+        }
+        content.extend_from_slice(b"ET");
+        let content_id =
+            doc.add_object(Object::Stream(lopdf::Stream::new(dictionary! {}, content)));
+
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 1500.into(), 2383.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                    "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) },
+                },
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        (doc, page_id)
+    }
+
+    #[test]
+    fn test_masthead_over_form_wrapped_scan_needs_ocr() {
+        // A full-page scan wrapped in a Form XObject with ~4 ops of real,
+        // diverse masthead text. `alphanum_low` can't flag it (the chrome is
+        // genuine text), so the sparse-text floor must: without OCR the page
+        // body is silently lost while classification calls the page scanned.
+        let (doc, page_id) = masthead_scan_page(&[
+            "18",
+            "FINANCIAL EXPRESS",
+            "WWW.FINANCIALEXPRESS.COM",
+            "FRIDAY, DECEMBER 13, 2024",
+        ]);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.has_template_image,
+            "sanity: full-page image inside the form must be found"
+        );
+        assert!(
+            analysis.unique_alphanum_chars >= 10,
+            "sanity: masthead text is diverse, alphanum_low cannot fire"
+        );
+        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        assert!(
+            needs_ocr,
+            "template image + text below the pages_with_text floor is a scan"
+        );
+    }
+
+    #[test]
+    fn test_text_page_over_background_image_stays_native() {
+        // Counterpart: a real text page over a full-page background image
+        // (letterhead/watermark) has enough text ops to clear the
+        // `pages_with_text` floor and must NOT be routed to OCR.
+        let lines: Vec<String> = (0..12)
+            .map(|i| format!("Paragraph line {i} with ordinary body text"))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (doc, page_id) = masthead_scan_page(&refs);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.has_template_image,
+            "sanity: background image found"
+        );
+        assert!(
+            analysis.text_operator_count >= 10,
+            "sanity: body text clears the floor"
+        );
+        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        assert!(
+            !needs_ocr,
+            "a text page with a background image must stay native"
         );
     }
 
