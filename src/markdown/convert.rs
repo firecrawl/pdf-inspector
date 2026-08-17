@@ -1504,18 +1504,10 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // Detect code blocks by font. Only at a paragraph boundary — a
         // mono-set line continuing an open prose paragraph is an inline
         // code literal's style smeared across a wrapped line, not code.
-        if options.detect_code && !in_paragraph {
-            let is_mono = super::classify::line_is_monospace(line);
-            if is_mono {
-                if in_paragraph {
-                    output.push_str("\n\n");
-                    in_paragraph = false;
-                    paragraph_in_wrapped_bold_run = false;
-                }
-                // Use plain text for code blocks
-                output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
-                continue;
-            }
+        if options.detect_code && !in_paragraph && super::classify::line_is_monospace(line) {
+            // Use plain text for code blocks
+            output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
+            continue;
         }
 
         // Regular text - join lines within same paragraph with space
