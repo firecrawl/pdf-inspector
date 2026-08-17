@@ -772,7 +772,15 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // Code lines accumulate here and the fence is emitted only when the
     // block flushes with content — an empty ``` ``` pair can never appear.
     fn flush_code_block(output: &mut String, pending_code: &mut String) {
-        if !pending_code.trim().is_empty() {
+        let trimmed = pending_code.trim();
+        // A fragment too short to be code — a lone ® or stray glyph set in
+        // a mono face — reads better as plain text than as a fenced block.
+        if trimmed.chars().count() < 3 {
+            if !trimmed.is_empty() {
+                output.push_str(trimmed);
+                output.push_str("\n\n");
+            }
+        } else {
             output.push_str("```\n");
             output.push_str(pending_code);
             output.push_str("```\n");
