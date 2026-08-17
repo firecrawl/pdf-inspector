@@ -86,12 +86,14 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+            docker-options: -e CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8
           # macos-13 was retired by GitHub; macos-15-intel is the remaining
           # Intel runner label (available through 2027).
           - os: macos-15-intel
@@ -113,6 +115,9 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
+          # The manylinux AArch64 GCC omits this macro while preprocessing
+          # ring's assembly. AArch64 is ARMv8 by definition.
+          docker-options: ${{ matrix.docker-options }}
 
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
