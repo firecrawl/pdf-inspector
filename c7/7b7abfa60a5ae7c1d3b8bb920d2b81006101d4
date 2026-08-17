@@ -1,0 +1,48 @@
+src/vision/pipeline.rs
+  s_3fa7a2abc03ac9::t_a757d7833e7519 453
+  s_3fa7a2abc03ac9::t_3fc1b8bf392872 34-38
+  s_3fa7a2abc03ac9::t_76cb460eb855a3 937-945
+  s_3fa7a2abc03ac9::t_98057affdc5167 39-40
+src/vision/oar.rs
+  s_3fa7a2abc03ac9::t_81beacd7d84c6e 362,365-366,369-379
+  s_3fa7a2abc03ac9::t_998c3ce041c49c 308,357-358
+  s_3fa7a2abc03ac9::t_6bfe1978e9bf52 239,256,264,267,269,275,285-307,309-341
+  s_3fa7a2abc03ac9::t_60c78f7b4f29d5 348
+  s_3fa7a2abc03ac9::t_f82d4f0eb7ee68 107
+  s_3fa7a2abc03ac9::t_9ec39b971edc32 11
+  s_3fa7a2abc03ac9::t_a7644738226625 351-354,356,359-361,392-393,398,401
+  s_3fa7a2abc03ac9::t_e6dac5463eeb7b 453-456,458-468,470
+  s_3fa7a2abc03ac9::t_fafea40f78cb3d 457
+  s_3fa7a2abc03ac9::t_5d356c3f734366 178-190,195-196,198-224,226
+  s_3fa7a2abc03ac9::t_edfd64fa5e2984 517,522,533-535
+  s_3fa7a2abc03ac9::t_ec674822d094c5 518-519,521,523-526,531-532
+  s_3fa7a2abc03ac9::t_040490f258a831 803-840
+  s_3fa7a2abc03ac9::t_a22b932b2c64c4 98-106,113-117,119,127
+  s_3fa7a2abc03ac9::t_c68e71c26fcb10 124-126,128-133
+  s_3fa7a2abc03ac9::t_13e10e0f973515 520,527-530
+  s_3fa7a2abc03ac9::t_818e3ac39d9267 4,9-10
+  s_3fa7a2abc03ac9::t_441e86041eeed0 170
+  s_3fa7a2abc03ac9::t_1221f4fca019e4 683-684,688-689
+  s_3fa7a2abc03ac9::t_ae5699b05695f9 435-452
+  s_3fa7a2abc03ac9::t_ff0387feadecab 76-97,118,120,134-169,171-177,191-194,197,225,237-238,240-253,255,257-263,265-266,268,270-274,276-284,355
+  s_3fa7a2abc03ac9::t_04d16c90d0630e 536
+  s_3fa7a2abc03ac9::t_d31ef127145e42 367-368
+src/vision/contracts.rs
+  s_3fa7a2abc03ac9::t_cdbd95ddcf8317 240-246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c77b7abfa60a5ae7c1d3b8bb920d2b81006101d4",
+  "prompts": {},
+  "sessions": {
+    "s_3fa7a2abc03ac9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9bb20049-a216-4dbf-9154-e1bfc58f484d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
