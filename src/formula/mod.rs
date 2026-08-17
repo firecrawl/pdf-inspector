@@ -102,6 +102,9 @@ fn font_profile(font: &str) -> FontProfile {
         ("stmary", MathAlphabet::Plain),
         ("mathitalic", MathAlphabet::Plain),
         ("math-italic", MathAlphabet::Plain),
+        ("mathsymbols", MathAlphabet::Plain),
+        ("mathextension", MathAlphabet::Plain),
+        ("mathoperators", MathAlphabet::Plain),
         ("wasy", MathAlphabet::Plain),
         ("lasy", MathAlphabet::Plain),
     ];
@@ -798,6 +801,8 @@ mod tests {
         assert!(font_profile("MSBM10").is_math);
         assert!(font_profile("XITSMath").is_math);
         assert!(font_profile("LatinModernMath-Regular").is_math);
+        assert!(font_profile("QILUSS+LMMathSymbols10-Regular").is_math);
+        assert!(font_profile("TDHQPX+LMMathItalic10-Regular").is_math);
         assert!(!font_profile("Times-Roman").is_math);
         assert!(!font_profile("ABCDEF+Calibri").is_math);
         assert!(!font_profile("MathiasHandwriting").is_math);
