@@ -203,6 +203,33 @@ pub(crate) fn is_code_like(text: &str) -> bool {
     false
 }
 
+/// True when a line's text is essentially all monospace (≥90% by character
+/// count). Code lines are wholly monospace; anything less is prose carrying
+/// mono-styled fragments — a URL sidebar, or a sentence quoting an inline
+/// code literal — and fencing it would split paragraphs mid-sentence.
+/// Any-item matching was safe only while items carried opaque font resource
+/// names that never matched the monospace patterns; items now carry real
+/// family names.
+pub(crate) fn line_is_monospace(line: &crate::types::TextLine) -> bool {
+    let mut monospace_chars = 0usize;
+    let mut total_chars = 0usize;
+    for item in &line.items {
+        let text = item.text.trim();
+        let chars = text.chars().count();
+        total_chars += chars;
+        // Hyperlinks and underlined text set in a mono face are link
+        // styling, not code — a URL sidebar must not fence lyric lines.
+        let looks_like_link = item.is_underline
+            || matches!(item.item_type, crate::types::ItemType::Link(_))
+            || text.contains("://")
+            || text.starts_with("www.");
+        if is_monospace_font(&item.font) && !looks_like_link {
+            monospace_chars += chars;
+        }
+    }
+    total_chars > 0 && monospace_chars * 10 >= total_chars * 9
+}
+
 /// Check if font name indicates monospace
 pub(crate) fn is_monospace_font(font_name: &str) -> bool {
     let lower = font_name.to_lowercase();

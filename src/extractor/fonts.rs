@@ -225,6 +225,26 @@ pub(crate) fn build_type3_scales(
     scales
 }
 
+/// The name a `TextItem` carries for its font: the `/BaseFont` family name
+/// ("ABCDEF+CMMI10"), which identifies the actual face, rather than the
+/// arbitrary per-page resource tag ("F2").
+///
+/// Exception: resource names using Distiller's CID convention (`C2_0`,
+/// `C0_1`) are kept as-is — `text_utils::is_cid_font` keys on that prefix
+/// for micro-gap joining, and the family name carries no CID marker to
+/// replace it. This is a known, deliberate wart: `TextItem::font` is the
+/// face name except for this one producer convention. The clean fix is an
+/// explicit CID flag on `TextItem`, which touches its ~29 construction
+/// sites; do that migration when `TextItem` next changes shape, and delete
+/// this carve-out with it.
+pub(crate) fn item_font_name<'a>(resource_name: &'a str, base_font: &'a str) -> &'a str {
+    if crate::text_utils::is_cid_font(resource_name) {
+        resource_name
+    } else {
+        base_font
+    }
+}
+
 /// Parse font widths from a font dictionary, dispatching by Subtype
 pub(crate) fn parse_font_widths(
     doc: &Document,
@@ -1663,6 +1683,17 @@ fn score_text(text: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn item_font_name_prefers_family_over_resource_tag() {
+        use super::item_font_name;
+        assert_eq!(item_font_name("F2", "ABCDEF+CMMI10"), "ABCDEF+CMMI10");
+        assert_eq!(item_font_name("T22", "Times-Roman"), "Times-Roman");
+        // Distiller CID-convention resources keep the resource name:
+        // is_cid_font keys on the C2_/C0_ prefix for micro-gap joining.
+        assert_eq!(item_font_name("C2_0", "ABCDEE+SimSun"), "C2_0");
+        assert_eq!(item_font_name("C0_1", "ABCDEE+MSMincho"), "C0_1");
+    }
 
     #[test]
     fn type3_scale_resolves_indirect_matrix_and_bbox_numbers() {
