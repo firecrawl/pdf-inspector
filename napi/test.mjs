@@ -3,6 +3,7 @@ import { strict as assert } from 'assert';
 import {
   processPdf,
   processPdfAsync,
+  processPdfWithOcr,
   detectPdf,
   classifyPdf,
   classifyPdfAsync,
@@ -219,6 +220,37 @@ scratch.fill(0);
 const fromMutated = await inFlight;
 assert.equal(fromMutated.markdown, result.markdown);
 console.log('  processPdfAsync input copied at call time: OK');
+
+// --- Selective OCR ---
+console.log('Testing processPdfWithOcr...');
+
+// Off exercises the complete result/provenance contract without loading
+// external PDFium, ONNX Runtime, or model artifacts.
+const ocrOff = await processPdfWithOcr(fixture, { mode: 'Off' });
+assert.equal(ocrOff.pageCount, 3);
+assert.equal(ocrOff.pages.length, 3);
+assert.deepEqual(ocrOff.pagesRoutedToOcr, []);
+assert.ok(ocrOff.pages.every(page => page.provenance.source === 'Native'));
+assert.ok(ocrOff.pages.every(page => page.provenance.ocrModel === undefined));
+assert.ok(ocrOff.markdown.length > 0);
+
+// Auto must preserve the lightweight path for clean text PDFs.
+const ocrAuto = await processPdfWithOcr(fixture);
+assert.deepEqual(ocrAuto.pagesRoutedToOcr, []);
+assert.equal(ocrAuto.renderTimeMs, 0);
+assert.equal(ocrAuto.ocrTimeMs, 0);
+
+const ocrSelected = await processPdfWithOcr(fixture, {
+  mode: 'Off',
+  pageNumbers: [2],
+});
+assert.deepEqual(ocrSelected.pages.map(page => page.pageNumber), [2]);
+
+await assert.rejects(
+  processPdfWithOcr(fixture, { mode: 'Off', pageNumbers: [0] }),
+  /page 0/,
+);
+console.log('  processPdfWithOcr: OK');
 
 // concurrent async calls all settle
 const [c1, c2, c3] = await Promise.all([

@@ -27,6 +27,26 @@ pub enum ItemType {
     FormField,
 }
 
+/// Selects when OCR runs.
+#[napi(string_enum)]
+#[derive(Clone, Copy)]
+pub enum OcrMode {
+    /// Never run OCR; return the native extraction in the OCR result shape.
+    Off,
+    /// Run OCR only on pages selected by the native quality signals.
+    Auto,
+    /// Run OCR on every selected page.
+    Force,
+}
+
+/// How final page content was sourced.
+#[napi(string_enum)]
+pub enum PageContentSource {
+    Native,
+    Ocr,
+    Fused,
+}
+
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
@@ -128,6 +148,84 @@ pub struct VectorGridDetectionJs {
     pub cell_bboxes: Vec<Vec<f64>>,
 }
 
+/// Options for one-call native extraction with selective OCR.
+#[napi(object)]
+#[derive(Clone)]
+pub struct OcrOptions {
+    /// OCR routing behavior. Defaults to Auto.
+    pub mode: Option<OcrMode>,
+    /// Optional 1-indexed page selection.
+    pub page_numbers: Option<Vec<u32>>,
+    /// Password for an encrypted PDF.
+    pub password: Option<String>,
+    /// Page rasterization resolution. Defaults to 150 DPI.
+    pub dpi: Option<f64>,
+    /// Drop OCR spans below this inclusive 0-1 threshold.
+    pub minimum_confidence: Option<f64>,
+    /// Recommend hosted parsing below this inclusive 0-1 page confidence.
+    pub hosted_recommendation_confidence: Option<f64>,
+    /// Directory containing an offline OCR model set.
+    pub model_directory: Option<String>,
+    /// Disable model downloads and require a model directory or warm cache.
+    pub offline: Option<bool>,
+}
+
+/// Exact OCR model identity retained in page provenance.
+#[napi(object)]
+pub struct OcrModelIdentity {
+    pub name: String,
+    pub revision: String,
+}
+
+/// Per-page OCR processing timings.
+#[napi(object)]
+pub struct OcrTimings {
+    pub render_ms: u32,
+    pub ocr_ms: u32,
+    pub assembly_ms: u32,
+}
+
+/// Source, model, confidence, and fallback metadata for one page.
+#[napi(object)]
+pub struct OcrPageProvenance {
+    /// 1-indexed page number.
+    pub page_number: u32,
+    pub source: PageContentSource,
+    pub ocr_model: Option<OcrModelIdentity>,
+    pub render_dpi: Option<f64>,
+    pub ocr_confidence: Option<f64>,
+    pub timings: OcrTimings,
+    pub warnings: Vec<String>,
+    pub hosted_recommended: bool,
+}
+
+/// Final Markdown and provenance for one page.
+#[napi(object)]
+pub struct OcrPageResult {
+    /// 1-indexed page number.
+    pub page_number: u32,
+    pub markdown: String,
+    pub provenance: OcrPageProvenance,
+}
+
+/// Complete native/OCR Markdown output.
+#[napi(object)]
+pub struct OcrPdfResult {
+    pub markdown: String,
+    pub pages: Vec<OcrPageResult>,
+    pub page_count: u32,
+    pub pages_recommended_for_ocr: Vec<u32>,
+    pub pages_routed_to_ocr: Vec<u32>,
+    pub pages_recommending_hosted: Vec<u32>,
+    pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    pub pages_with_tables: Vec<u32>,
+    pub pages_with_columns: Vec<u32>,
+    pub is_complex: bool,
+    pub processing_time_ms: u32,
+    pub render_time_ms: u32,
+    pub ocr_time_ms: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -166,6 +264,103 @@ fn to_napi_page_ocr_reasons(reasons: Vec<pdf_inspector::PageOcrReasons>) -> Vec<
             reasons: reason.reasons,
         })
         .collect()
+}
+
+fn to_core_ocr_options(options: Option<OcrOptions>) -> pdf_inspector::vision::OcrPdfOptions {
+    let mut result = pdf_inspector::vision::OcrPdfOptions::auto();
+    let Some(options) = options else {
+        return result;
+    };
+
+    if let Some(mode) = options.mode {
+        result.ocr.mode = match mode {
+            OcrMode::Off => pdf_inspector::vision::OcrMode::Off,
+            OcrMode::Auto => pdf_inspector::vision::OcrMode::Auto,
+            OcrMode::Force => pdf_inspector::vision::OcrMode::Force,
+        };
+    }
+    if let Some(pages) = options.page_numbers {
+        result = result.page_numbers(pages);
+    }
+    if let Some(password) = options.password {
+        result = result.password(password);
+    }
+    if let Some(dpi) = options.dpi {
+        result.render.dpi = dpi as f32;
+    }
+    if let Some(minimum_confidence) = options.minimum_confidence {
+        result.ocr.minimum_confidence = minimum_confidence as f32;
+    }
+    if let Some(confidence) = options.hosted_recommendation_confidence {
+        result.hosted_recommendation_confidence = confidence as f32;
+    }
+    if let Some(directory) = options.model_directory {
+        result.ocr.model_directory = Some(directory.into());
+    }
+    if options.offline.unwrap_or(false) {
+        result.ocr.model_downloads = pdf_inspector::vision::ModelDownloadPolicy::Offline;
+    }
+    result
+}
+
+fn convert_page_content_source(
+    source: pdf_inspector::vision::PageContentSource,
+) -> PageContentSource {
+    match source {
+        pdf_inspector::vision::PageContentSource::Native => PageContentSource::Native,
+        pdf_inspector::vision::PageContentSource::Ocr => PageContentSource::Ocr,
+        pdf_inspector::vision::PageContentSource::Fused => PageContentSource::Fused,
+        _ => PageContentSource::Native,
+    }
+}
+
+fn timing_ms(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn to_napi_ocr_result(result: pdf_inspector::vision::OcrPdfResult) -> OcrPdfResult {
+    OcrPdfResult {
+        markdown: result.markdown,
+        pages: result
+            .pages
+            .into_iter()
+            .map(|page| {
+                let provenance = page.provenance;
+                OcrPageResult {
+                    page_number: page.page_number,
+                    markdown: page.markdown,
+                    provenance: OcrPageProvenance {
+                        page_number: provenance.page_number,
+                        source: convert_page_content_source(provenance.source),
+                        ocr_model: provenance.ocr_model.map(|model| OcrModelIdentity {
+                            name: model.name,
+                            revision: model.revision,
+                        }),
+                        render_dpi: provenance.render_dpi.map(f64::from),
+                        ocr_confidence: provenance.ocr_confidence.map(f64::from),
+                        timings: OcrTimings {
+                            render_ms: timing_ms(provenance.timings.render_ms),
+                            ocr_ms: timing_ms(provenance.timings.ocr_ms),
+                            assembly_ms: timing_ms(provenance.timings.assembly_ms),
+                        },
+                        warnings: provenance.warnings,
+                        hosted_recommended: provenance.hosted_recommended,
+                    },
+                }
+            })
+            .collect(),
+        page_count: result.page_count,
+        pages_recommended_for_ocr: result.pages_recommended_for_ocr,
+        pages_routed_to_ocr: result.pages_routed_to_ocr,
+        pages_recommending_hosted: result.pages_recommending_hosted,
+        ocr_reasons_by_page: to_napi_page_ocr_reasons(result.ocr_reasons_by_page),
+        pages_with_tables: result.pages_with_tables,
+        pages_with_columns: result.pages_with_columns,
+        is_complex: result.is_complex,
+        processing_time_ms: timing_ms(result.processing_time_ms),
+        render_time_ms: timing_ms(result.render_time_ms),
+        ocr_time_ms: timing_ms(result.ocr_time_ms),
+    }
 }
 
 fn convert_item_type(t: &pdf_inspector::types::ItemType) -> (ItemType, Option<String>) {
@@ -217,6 +412,13 @@ fn process_pdf_impl(bytes: &[u8], pages: Option<Vec<u32>>) -> Result<PdfResult> 
     let result = pdf_inspector::process_pdf_mem_with_options(bytes, opts)
         .map_err(|e| to_napi_err(e, "process_pdf"))?;
     Ok(to_napi_result(result))
+}
+
+fn process_pdf_with_ocr_impl(bytes: &[u8], options: Option<OcrOptions>) -> Result<OcrPdfResult> {
+    let options = to_core_ocr_options(options);
+    let result = pdf_inspector::vision::process_pdf_with_ocr_mem(bytes, options)
+        .map_err(|error| to_napi_err(error, "process_pdf_with_ocr"))?;
+    Ok(to_napi_ocr_result(result))
 }
 
 fn classify_pdf_impl(bytes: &[u8]) -> Result<PdfClassification> {
@@ -815,6 +1017,45 @@ pub fn process_pdf_async(buffer: Buffer, pages: Option<Vec<u32>>) -> AsyncTask<P
     AsyncTask::new(ProcessPdfTask {
         bytes: buffer.to_vec(),
         pages,
+    })
+}
+
+pub struct ProcessPdfWithOcrTask {
+    bytes: Vec<u8>,
+    options: Option<OcrOptions>,
+}
+
+impl Task for ProcessPdfWithOcrTask {
+    type Output = OcrPdfResult;
+    type JsValue = OcrPdfResult;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let options = self.options.take();
+        catch_panic(
+            "process_pdf_with_ocr",
+            panic::AssertUnwindSafe(move || process_pdf_with_ocr_impl(&bytes, options)),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Process a PDF with selective OCR on the libuv thread pool.
+///
+/// OCR defaults to Auto, which only loads PDFium, ONNX Runtime, and the OCR
+/// model if native extraction routes at least one page. The input buffer is
+/// copied before the promise is returned and is safe to reuse immediately.
+#[napi(ts_return_type = "Promise<OcrPdfResult>")]
+pub fn process_pdf_with_ocr(
+    buffer: Buffer,
+    options: Option<OcrOptions>,
+) -> AsyncTask<ProcessPdfWithOcrTask> {
+    AsyncTask::new(ProcessPdfWithOcrTask {
+        bytes: buffer.to_vec(),
+        options,
     })
 }
 

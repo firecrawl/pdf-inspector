@@ -1,6 +1,6 @@
 [package]
 name = "pdf-inspector"
-version = "1.14.2"
+version = "1.15.0"
 edition = "2021"
 autobins = false
 authors = ["Firecrawl Team"]
@@ -80,7 +80,7 @@ tempfile = "3.3"
 
 [features]
 default = []
-python = ["pyo3"]
+python = ["pyo3", "ocr"]
 vision = []
 model-cache = ["vision", "dep:dirs", "dep:fs2", "dep:sha2", "dep:windows-sys"]
 model-download = ["model-cache", "dep:ureq"]

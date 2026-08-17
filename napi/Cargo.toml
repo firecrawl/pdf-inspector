@@ -1,13 +1,13 @@
 [package]
 name = "pdf-inspector-napi"
-version = "1.14.2"
+version = "1.15.0"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-pdf-inspector = { path = ".." }
+pdf-inspector = { path = "..", features = ["ocr"] }
 napi = { version = "3.0.0", features = ["serde-json"] }
 napi-derive = "3.0.0"
 

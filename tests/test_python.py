@@ -78,6 +78,50 @@ class TestProcessPdfBytes:
 
 
 # ---------------------------------------------------------------------------
+# process_pdf_with_ocr / process_pdf_with_ocr_bytes
+# ---------------------------------------------------------------------------
+
+
+class TestProcessPdfWithOcr:
+    def test_off_mode_has_full_provenance_without_external_runtimes(self):
+        result = pdf_inspector.process_pdf_with_ocr(
+            fixture_path("thermo-freon12.pdf"), mode="off"
+        )
+        assert result.page_count == 3
+        assert len(result.pages) == 3
+        assert result.pages_routed_to_ocr == []
+        assert all(page.provenance.source == "native" for page in result.pages)
+        assert all(page.provenance.ocr_model is None for page in result.pages)
+        assert result.markdown
+        assert "OcrPdfResult" in repr(result)
+
+    def test_auto_mode_skips_external_runtimes_for_clean_text(self):
+        result = pdf_inspector.process_pdf_with_ocr_bytes(
+            fixture_bytes("thermo-freon12.pdf")
+        )
+        assert result.pages_routed_to_ocr == []
+        assert result.render_time_ms == 0
+        assert result.ocr_time_ms == 0
+
+    def test_selected_pages_are_one_indexed(self):
+        result = pdf_inspector.process_pdf_with_ocr(
+            fixture_path("thermo-freon12.pdf"), mode="off", page_numbers=[2]
+        )
+        assert [page.page_number for page in result.pages] == [2]
+
+    def test_rejects_invalid_options(self):
+        with pytest.raises(ValueError, match="mode must be"):
+            pdf_inspector.process_pdf_with_ocr(
+                fixture_path("thermo-freon12.pdf"), mode="sometimes"
+            )
+        with pytest.raises(ValueError, match="page 0"):
+            pdf_inspector.process_pdf_with_ocr(
+                fixture_path("thermo-freon12.pdf"),
+                mode="off",
+                page_numbers=[0],
+            )
+
+# ---------------------------------------------------------------------------
 # detect_pdf / detect_pdf_bytes
 # ---------------------------------------------------------------------------
 

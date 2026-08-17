@@ -383,6 +383,10 @@ shape; `Force` renders every selected page. OCR uses the existing deterministic
 table, column, reading-order, and Markdown assembly path; no learned layout
 model is included.
 
+The [OCR runtime setup guide](https://github.com/firecrawl/pdf-inspector/blob/main/docs/ocr-runtime.md)
+lists the pinned PDFium and ONNX Runtime builds, environment variables, model
+cache behavior, and the error boundary downstream hosted fallbacks should use.
+
 For ambiguous mixed pages, `Auto` privately retains clean native fragments
 instead of discarding them when OCR is selected. After recognition it compares
 script-agnostic text quality, OCR confidence, character overlap, and material

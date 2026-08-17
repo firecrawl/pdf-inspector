@@ -1,6 +1,6 @@
 # pdf-inspector
 
-Fast PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Python bindings via [PyO3](https://pyo3.rs) for the [pdf-inspector](https://github.com/firecrawl/pdf-inspector) Rust library.
+Fast PDF classification, text extraction, and selective OCR. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts clean native and OCR results to Markdown. Python bindings via [PyO3](https://pyo3.rs) for the [pdf-inspector](https://github.com/firecrawl/pdf-inspector) Rust library.
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
@@ -10,7 +10,8 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **Markdown conversion** — headings, lists, code blocks, bold/italic, URL linking, and dual-mode table detection (PDF drawing ops + text-alignment heuristics).
 - **Layout-aware extraction** — multi-column reading order, position and font info per text item, RTL support.
 - **Robust text decoding** — CID/Type0 fonts via ToUnicode CMaps, plus automatic flagging of broken encodings so callers can fall back to OCR.
-- **Lightweight** — native Rust core, no ML models, no external services; ships type stubs.
+- **Selective OCR** — `auto` routes only pages rejected by native extraction; `force` OCRs every selected page; `off` keeps the result/provenance contract without external runtime work.
+- **External artifacts** — the wheel embeds no OCR models, PDFium, or ONNX Runtime; clean `auto` requests never load or download them.
 
 ## Benchmark
 
@@ -38,6 +39,14 @@ Prebuilt wheels cover CPython ≥3.8 on Linux (x86_64, aarch64), macOS (Intel, A
 pip install maturin
 maturin develop --release
 ```
+
+OCR calls that route work require compatible PDFium and ONNX Runtime shared
+libraries. Set `PDFIUM_LIB_PATH` and `ORT_DYLIB_PATH` when they are not on the
+platform library search path. The pinned OCR model set is downloaded and
+checksum-verified on the first routed page; use `offline=True` with a warm
+cache or `model_directory` to prohibit network access. See the
+[OCR runtime setup guide](https://github.com/firecrawl/pdf-inspector/blob/main/docs/ocr-runtime.md)
+for pinned downloads, supported platforms, and hosted-fallback behavior.
 
 ## Usage
 
@@ -81,6 +90,19 @@ for page in result.pages:
 # Restrict to specific 0-indexed pages (preserves caller order)
 result = pdf_inspector.extract_pages_markdown("document.pdf", pages=[0, 2])
 
+# One-call selective OCR. This releases the GIL while processing.
+ocr = pdf_inspector.process_pdf_with_ocr("document.pdf")
+for page in ocr.pages:
+    print(page.page_number, page.provenance.source)
+
+# Restrict OCR processing to 1-indexed PDF pages and prohibit downloads.
+ocr = pdf_inspector.process_pdf_with_ocr(
+    "document.pdf",
+    page_numbers=[1, 3],
+    model_directory="/opt/models/pp-ocrv6-small",
+    offline=True,
+)
+
 # Structure-tree elements from tagged PDFs (empty list when untagged).
 # Pages are 1-indexed to match TextItem.page, so (page, mcid) joins directly
 # against extract_text_with_positions — e.g. to recover real heading levels:
@@ -99,6 +121,8 @@ headings = [
 |---|---|
 | `process_pdf(path, pages=None)` | Full processing (detect + extract + markdown) |
 | `process_pdf_bytes(data, pages=None)` | Full processing from bytes |
+| `process_pdf_with_ocr(path, **options)` | Native extraction + selective OCR with provenance |
+| `process_pdf_with_ocr_bytes(data, **options)` | Native extraction + selective OCR from bytes |
 | `detect_pdf(path)` | Fast detection only (returns PdfResult) |
 | `detect_pdf_bytes(data)` | Fast detection from bytes |
 | `classify_pdf(path)` | Lightweight classification (returns PdfClassification) |
@@ -136,6 +160,45 @@ class PdfResult:                     # process_pdf / detect_pdf
 class PageOcrReasons:                # per-page OCR diagnostics
     page: int                        # 1-indexed
     reasons: list[str]               # machine-readable reason identifiers
+
+class OcrModelIdentity:
+    name: str                        # model family/name
+    revision: str                    # immutable artifact-set revision
+
+class OcrTimings:                    # per-page processing stages
+    render_ms: int
+    ocr_ms: int
+    assembly_ms: int
+
+class OcrPageProvenance:
+    page_number: int                 # 1-indexed
+    source: Literal["native", "ocr", "fused"]
+    ocr_model: OcrModelIdentity | None
+    render_dpi: float | None
+    ocr_confidence: float | None
+    timings: OcrTimings
+    warnings: list[str]
+    hosted_recommended: bool
+
+class OcrPageResult:
+    page_number: int                 # 1-indexed
+    markdown: str
+    provenance: OcrPageProvenance
+
+class OcrPdfResult:                  # process_pdf_with_ocr / bytes
+    markdown: str
+    pages: list[OcrPageResult]
+    page_count: int
+    pages_recommended_for_ocr: list[int]
+    pages_routed_to_ocr: list[int]
+    pages_recommending_hosted: list[int]
+    ocr_reasons_by_page: list[PageOcrReasons]
+    pages_with_tables: list[int]
+    pages_with_columns: list[int]
+    is_complex: bool
+    processing_time_ms: int
+    render_time_ms: int
+    ocr_time_ms: int
 
 class PdfClassification:             # classify_pdf
     pdf_type: str

@@ -85,6 +85,107 @@ impl PyPageOcrReasons {
     }
 }
 
+/// Exact OCR model identity retained in page provenance.
+#[pyclass(name = "OcrModelIdentity")]
+#[derive(Clone)]
+pub struct PyOcrModelIdentity {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub revision: String,
+}
+
+/// Per-page OCR processing timings.
+#[pyclass(name = "OcrTimings")]
+#[derive(Clone)]
+pub struct PyOcrTimings {
+    #[pyo3(get)]
+    pub render_ms: u64,
+    #[pyo3(get)]
+    pub ocr_ms: u64,
+    #[pyo3(get)]
+    pub assembly_ms: u64,
+}
+
+/// Source, model, confidence, and fallback metadata for one page.
+#[pyclass(name = "OcrPageProvenance")]
+#[derive(Clone)]
+pub struct PyOcrPageProvenance {
+    /// 1-indexed page number.
+    #[pyo3(get)]
+    pub page_number: u32,
+    /// "native", "ocr", or "fused".
+    #[pyo3(get)]
+    pub source: String,
+    #[pyo3(get)]
+    pub ocr_model: Option<PyOcrModelIdentity>,
+    #[pyo3(get)]
+    pub render_dpi: Option<f32>,
+    #[pyo3(get)]
+    pub ocr_confidence: Option<f32>,
+    #[pyo3(get)]
+    pub timings: PyOcrTimings,
+    #[pyo3(get)]
+    pub warnings: Vec<String>,
+    #[pyo3(get)]
+    pub hosted_recommended: bool,
+}
+
+/// Final Markdown and provenance for one page.
+#[pyclass(name = "OcrPageResult")]
+#[derive(Clone)]
+pub struct PyOcrPageResult {
+    /// 1-indexed page number.
+    #[pyo3(get)]
+    pub page_number: u32,
+    #[pyo3(get)]
+    pub markdown: String,
+    #[pyo3(get)]
+    pub provenance: PyOcrPageProvenance,
+}
+
+/// Complete native/OCR Markdown output.
+#[pyclass(name = "OcrPdfResult")]
+#[derive(Clone)]
+pub struct PyOcrPdfResult {
+    #[pyo3(get)]
+    pub markdown: String,
+    #[pyo3(get)]
+    pub pages: Vec<PyOcrPageResult>,
+    #[pyo3(get)]
+    pub page_count: u32,
+    #[pyo3(get)]
+    pub pages_recommended_for_ocr: Vec<u32>,
+    #[pyo3(get)]
+    pub pages_routed_to_ocr: Vec<u32>,
+    #[pyo3(get)]
+    pub pages_recommending_hosted: Vec<u32>,
+    #[pyo3(get)]
+    pub ocr_reasons_by_page: Vec<PyPageOcrReasons>,
+    #[pyo3(get)]
+    pub pages_with_tables: Vec<u32>,
+    #[pyo3(get)]
+    pub pages_with_columns: Vec<u32>,
+    #[pyo3(get)]
+    pub is_complex: bool,
+    #[pyo3(get)]
+    pub processing_time_ms: u64,
+    #[pyo3(get)]
+    pub render_time_ms: u64,
+    #[pyo3(get)]
+    pub ocr_time_ms: u64,
+}
+
+#[pymethods]
+impl PyOcrPdfResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "OcrPdfResult(pages={}, routed_to_ocr={:?}, recommending_hosted={:?})",
+            self.page_count, self.pages_routed_to_ocr, self.pages_recommending_hosted
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Classification wrapper (lightweight)
 // ---------------------------------------------------------------------------
@@ -362,6 +463,101 @@ fn to_py_err(e: crate::PdfError) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+struct PythonOcrOptions {
+    mode: String,
+    page_numbers: Option<Vec<u32>>,
+    password: Option<String>,
+    dpi: f32,
+    minimum_confidence: f32,
+    hosted_recommendation_confidence: f32,
+    model_directory: Option<String>,
+    offline: bool,
+}
+
+fn build_ocr_options(binding: PythonOcrOptions) -> PyResult<crate::vision::OcrPdfOptions> {
+    let mode = match binding.mode.trim().to_ascii_lowercase().as_str() {
+        "off" => crate::vision::OcrMode::Off,
+        "auto" => crate::vision::OcrMode::Auto,
+        "force" => crate::vision::OcrMode::Force,
+        _ => {
+            return Err(PyValueError::new_err(
+                "mode must be 'off', 'auto', or 'force'",
+            ));
+        }
+    };
+
+    let mut options = crate::vision::OcrPdfOptions::new().mode(mode);
+    options.render.dpi = binding.dpi;
+    options.ocr.minimum_confidence = binding.minimum_confidence;
+    options.hosted_recommendation_confidence = binding.hosted_recommendation_confidence;
+    if let Some(pages) = binding.page_numbers {
+        options = options.page_numbers(pages);
+    }
+    if let Some(password) = binding.password {
+        options = options.password(password);
+    }
+    if let Some(directory) = binding.model_directory {
+        options.ocr.model_directory = Some(directory.into());
+    }
+    if binding.offline {
+        options.ocr.model_downloads = crate::vision::ModelDownloadPolicy::Offline;
+    }
+    Ok(options)
+}
+
+fn page_content_source_str(source: crate::vision::PageContentSource) -> String {
+    match source {
+        crate::vision::PageContentSource::Native => "native".into(),
+        crate::vision::PageContentSource::Ocr => "ocr".into(),
+        crate::vision::PageContentSource::Fused => "fused".into(),
+    }
+}
+
+fn to_py_ocr_result(result: crate::vision::OcrPdfResult) -> PyOcrPdfResult {
+    PyOcrPdfResult {
+        markdown: result.markdown,
+        pages: result
+            .pages
+            .into_iter()
+            .map(|page| {
+                let provenance = page.provenance;
+                PyOcrPageResult {
+                    page_number: page.page_number,
+                    markdown: page.markdown,
+                    provenance: PyOcrPageProvenance {
+                        page_number: provenance.page_number,
+                        source: page_content_source_str(provenance.source),
+                        ocr_model: provenance.ocr_model.map(|model| PyOcrModelIdentity {
+                            name: model.name,
+                            revision: model.revision,
+                        }),
+                        render_dpi: provenance.render_dpi,
+                        ocr_confidence: provenance.ocr_confidence,
+                        timings: PyOcrTimings {
+                            render_ms: provenance.timings.render_ms,
+                            ocr_ms: provenance.timings.ocr_ms,
+                            assembly_ms: provenance.timings.assembly_ms,
+                        },
+                        warnings: provenance.warnings,
+                        hosted_recommended: provenance.hosted_recommended,
+                    },
+                }
+            })
+            .collect(),
+        page_count: result.page_count,
+        pages_recommended_for_ocr: result.pages_recommended_for_ocr,
+        pages_routed_to_ocr: result.pages_routed_to_ocr,
+        pages_recommending_hosted: result.pages_recommending_hosted,
+        ocr_reasons_by_page: to_py_page_ocr_reasons(result.ocr_reasons_by_page),
+        pages_with_tables: result.pages_with_tables,
+        pages_with_columns: result.pages_with_columns,
+        is_complex: result.is_complex,
+        processing_time_ms: result.processing_time_ms,
+        render_time_ms: result.render_time_ms,
+        ocr_time_ms: result.ocr_time_ms,
+    }
+}
+
 fn item_type_str(t: &ItemType) -> String {
     match t {
         ItemType::Text => "text".into(),
@@ -500,6 +696,99 @@ fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResu
     }
     let result = crate::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
+}
+
+/// Process a PDF file through native extraction and selective OCR.
+///
+/// OCR defaults to ``auto`` and only initializes its external runtime and
+/// model when native quality signals route at least one page. Page numbers
+/// are 1-indexed. The GIL is released for the complete processing call.
+#[pyfunction]
+#[pyo3(signature = (
+    path,
+    *,
+    mode="auto",
+    page_numbers=None,
+    password=None,
+    dpi=150.0,
+    minimum_confidence=0.0,
+    hosted_recommendation_confidence=0.5,
+    model_directory=None,
+    offline=false
+))]
+#[allow(clippy::too_many_arguments)]
+fn process_pdf_with_ocr(
+    py: Python<'_>,
+    path: String,
+    mode: &str,
+    page_numbers: Option<Vec<u32>>,
+    password: Option<String>,
+    dpi: f32,
+    minimum_confidence: f32,
+    hosted_recommendation_confidence: f32,
+    model_directory: Option<String>,
+    offline: bool,
+) -> PyResult<PyOcrPdfResult> {
+    let options = build_ocr_options(PythonOcrOptions {
+        mode: mode.to_string(),
+        page_numbers,
+        password,
+        dpi,
+        minimum_confidence,
+        hosted_recommendation_confidence,
+        model_directory,
+        offline,
+    })?;
+    let result = py
+        .allow_threads(move || crate::vision::process_pdf_with_ocr(path, options))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(to_py_ocr_result(result))
+}
+
+/// Process PDF bytes through native extraction and selective OCR.
+///
+/// See [`process_pdf_with_ocr`] for options and result semantics.
+#[pyfunction]
+#[pyo3(signature = (
+    data,
+    *,
+    mode="auto",
+    page_numbers=None,
+    password=None,
+    dpi=150.0,
+    minimum_confidence=0.0,
+    hosted_recommendation_confidence=0.5,
+    model_directory=None,
+    offline=false
+))]
+#[allow(clippy::too_many_arguments)]
+fn process_pdf_with_ocr_bytes(
+    py: Python<'_>,
+    data: &[u8],
+    mode: &str,
+    page_numbers: Option<Vec<u32>>,
+    password: Option<String>,
+    dpi: f32,
+    minimum_confidence: f32,
+    hosted_recommendation_confidence: f32,
+    model_directory: Option<String>,
+    offline: bool,
+) -> PyResult<PyOcrPdfResult> {
+    let options = build_ocr_options(PythonOcrOptions {
+        mode: mode.to_string(),
+        page_numbers,
+        password,
+        dpi,
+        minimum_confidence,
+        hosted_recommendation_confidence,
+        model_directory,
+        offline,
+    })?;
+    let data = data.to_vec();
+    let result = py
+        .allow_threads(move || crate::vision::process_pdf_with_ocr_mem(&data, options))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(to_py_ocr_result(result))
 }
 
 /// Fast detection only — no text extraction or markdown.
@@ -704,6 +993,11 @@ fn extract_structure_elements_bytes(
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfResult>()?;
     m.add_class::<PyPageOcrReasons>()?;
+    m.add_class::<PyOcrModelIdentity>()?;
+    m.add_class::<PyOcrTimings>()?;
+    m.add_class::<PyOcrPageProvenance>()?;
+    m.add_class::<PyOcrPageResult>()?;
+    m.add_class::<PyOcrPdfResult>()?;
     m.add_class::<PyPdfClassification>()?;
     m.add_class::<PyTextItem>()?;
     m.add_class::<PyStructureElement>()?;
@@ -713,6 +1007,8 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPagesExtractionResult>()?;
     m.add_function(wrap_pyfunction!(process_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(process_pdf_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(process_pdf_with_ocr, m)?)?;
+    m.add_function(wrap_pyfunction!(process_pdf_with_ocr_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(detect_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(detect_pdf_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(classify_pdf, m)?)?;
