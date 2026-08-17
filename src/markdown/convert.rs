@@ -963,11 +963,18 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         // These should be on their own line followed by a paragraph break
         let struct_role = struct_roles.and_then(|roles| resolve_line_struct_role(line, roles));
 
-        // Determine if this line is code (struct-tree or font-based) for block accumulation
+        // Determine if this line is code (struct-tree or font-based) for
+        // block accumulation. Font-based detection only opens a block at a
+        // paragraph boundary: a mono-set line that continues an open prose
+        // paragraph is the producer smearing an inline code literal's style
+        // across a wrapped line (HTML-to-PDF exports do this), and fencing
+        // it would cut the sentence in three.
         let is_code_line = struct_role
             .as_ref()
             .is_some_and(|r| matches!(r, StructRole::Code))
-            || (options.detect_code && super::classify::line_is_monospace(line));
+            || (options.detect_code
+                && (in_code_block || !in_paragraph)
+                && super::classify::line_is_monospace(line));
 
         // Close code block when transitioning to non-code
         if in_code_block && !is_code_line {
@@ -1494,8 +1501,10 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
         }
 
-        // Detect code blocks by font
-        if options.detect_code {
+        // Detect code blocks by font. Only at a paragraph boundary — a
+        // mono-set line continuing an open prose paragraph is an inline
+        // code literal's style smeared across a wrapped line, not code.
+        if options.detect_code && !in_paragraph {
             let is_mono = super::classify::line_is_monospace(line);
             if is_mono {
                 if in_paragraph {
