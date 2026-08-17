@@ -328,7 +328,11 @@ impl TextLine {
         let mut resolved = vec![false; n];
         let mut run_start = 0usize;
         for i in 1..n {
-            if !Self::is_tight_word_continuation(&self.items[i - 1], &self.items[i]) {
+            if !Self::is_tight_word_continuation(
+                &self.items[i - 1],
+                &self.items[i],
+                self.adaptive_threshold,
+            ) {
                 Self::assign_run_underline(&self.items[run_start..i], &mut resolved[run_start..i]);
                 run_start = i;
             }
@@ -358,7 +362,16 @@ impl TextLine {
     /// word (a contraction split across fragments, e.g. "can" + "'t"),
     /// so always treating it as a boundary would reintroduce the same
     /// mid-word split this function exists to prevent.
-    fn is_tight_word_continuation(prev: &TextItem, curr: &TextItem) -> bool {
+    ///
+    /// Also requires agreement with `should_join_items` — the same
+    /// no-space decision the render loop itself uses to decide spacing.
+    /// A tight geometric gap alone isn't sufficient: `should_join_items`
+    /// deliberately treats some near-zero-gap pairs as separate words
+    /// regardless of geometry (CID fonts emit one word per operator with
+    /// gaps ≈ 0; a label ending in `:` followed by its value). Grouping
+    /// those as one run here would apply/drop underline across a real
+    /// word boundary the render loop itself inserts a space at.
+    fn is_tight_word_continuation(prev: &TextItem, curr: &TextItem, threshold: f32) -> bool {
         if prev.is_strikeout || curr.is_strikeout {
             return false;
         }
@@ -393,6 +406,9 @@ impl TextLine {
             .last()
             .is_some_and(is_join_punct)
         {
+            return false;
+        }
+        if !should_join_items(prev, curr, threshold) {
             return false;
         }
         true
@@ -646,6 +662,34 @@ mod formatting_tests {
         let result = line.text_with_formatting(false, false, true);
 
         assert_eq!(result, "<u>can't</u>");
+    }
+
+    #[test]
+    fn underline_grouping_agrees_with_should_join_items_on_cid_fonts() {
+        // Regression for a PR #408 review finding: the run-grouping
+        // check used only geometric contiguity, disagreeing with
+        // `should_join_items` (used by the render loop's own spacing
+        // decision) on CID fonts, which emit one word per text operator
+        // with gaps ≈ 0 between *separate* words — the tight-geometry
+        // check alone would have wrongly grouped these two genuinely
+        // distinct words ("Alpha " and "Beta") into a single underline
+        // run, applying/dropping underline across a real word boundary
+        // the render loop itself inserts a space at.
+        let mut alpha = item("Alpha", 45.0, 40.0, false);
+        alpha.font = "C2_0".to_string();
+        alpha.is_underline = true;
+        let mut beta = item("Beta", alpha.x + alpha.width, 40.0, false);
+        beta.font = "C2_0".to_string();
+        beta.is_underline = false;
+
+        let line = line(vec![alpha, beta]);
+        let result = line.text_with_formatting(false, false, true);
+
+        assert_eq!(
+            result, "<u>Alpha</u> Beta",
+            "CID-font word-per-operator items must stay separate words, not \
+             merge into one underline run just because their gap is near zero"
+        );
     }
 
     #[test]
