@@ -233,6 +233,12 @@ pub(crate) fn line_is_monospace(line: &crate::types::TextLine) -> bool {
 /// Check if font name indicates monospace
 pub(crate) fn is_monospace_font(font_name: &str) -> bool {
     let lower = font_name.to_lowercase();
+    // "Monotype" is a foundry prefix on proportional faces (Monotype
+    // Corsiva, Monotype Garamond) — it must not satisfy the generic "mono"
+    // token below.
+    if lower.contains("monotype") {
+        return false;
+    }
     let patterns = [
         "courier",
         "consolas",
@@ -256,6 +262,17 @@ pub(crate) fn is_monospace_font(font_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monotype_foundry_faces_are_not_monospace() {
+        // "Monotype" is a foundry prefix on proportional faces; the generic
+        // "mono" token must not classify them as code fonts.
+        assert!(!is_monospace_font("MonotypeCorsiva"));
+        assert!(!is_monospace_font("ABCDEF+Monotype-Garamond"));
+        assert!(is_monospace_font("RobotoMono-Regular"));
+        assert!(is_monospace_font("PTMono"));
+        assert!(is_monospace_font("Courier"));
+    }
 
     #[test]
     fn format_list_item_plain_bullet() {

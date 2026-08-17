@@ -877,6 +877,14 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     PositionedBlockKind::Image => inserted_images.contains(&(current_page, idx)),
                 };
                 if positioned_block_precedes_line(block, line) && !already_inserted {
+                    // Code lines buffer until their block closes; flush them
+                    // first so this block cannot jump ahead of code that
+                    // precedes it in reading order. A code line after the
+                    // block reopens a new fence naturally.
+                    if in_code_block {
+                        flush_code_block(&mut output, &mut pending_code);
+                        in_code_block = false;
+                    }
                     if in_paragraph {
                         output.push_str("\n\n");
                         in_paragraph = false;
