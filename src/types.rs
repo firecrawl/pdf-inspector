@@ -408,7 +408,16 @@ impl TextLine {
         {
             return false;
         }
-        if !should_join_items(prev, curr, threshold) {
+        // needs_space_between (what the render loop's spacing decision
+        // actually calls) treats a hyphenated join as "no space needed"
+        // independent of should_join_items's own verdict — should_join_items
+        // alone doesn't special-case hyphens. Without mirroring that here
+        // too, a hyphenated word split across items (e.g. "auto-" +
+        // "correct") could be wrongly treated as a run boundary even
+        // though the render loop itself joins them with no space.
+        let is_hyphen_join =
+            prev.text.trim_end().ends_with('-') || curr.text.trim_start().starts_with('-');
+        if !should_join_items(prev, curr, threshold) && !is_hyphen_join {
             return false;
         }
         true
@@ -662,6 +671,35 @@ mod formatting_tests {
         let result = line.text_with_formatting(false, false, true);
 
         assert_eq!(result, "<u>can't</u>");
+    }
+
+    #[test]
+    fn underline_grouping_preserves_hyphen_no_space_exception() {
+        // Regression for a PR #408 review finding: needs_space_between
+        // (what the render loop's own spacing decision actually calls)
+        // treats a hyphenated join as "no space needed" independent of
+        // should_join_items's own verdict — should_join_items alone
+        // doesn't special-case hyphens. A hyphenated word split across
+        // CID-font items (each word-per-operator, so should_join_items
+        // alone says "not joined" here) must still be grouped as one
+        // underline run, matching the render loop's own no-space join.
+        // "auto-" (5 chars incl. the hyphen, underlined) outweighs "fix"
+        // (3 chars, not underlined) in the majority vote, so a correctly
+        // grouped run resolves to underlined for the whole word.
+        let mut auto = item("auto-", 45.0, 40.0, false);
+        auto.font = "C2_0".to_string();
+        auto.is_underline = true;
+        let mut fix = item("fix", auto.x + auto.width, 30.0, false);
+        fix.font = "C2_0".to_string();
+        fix.is_underline = false;
+
+        let line = line(vec![auto, fix]);
+        let result = line.text_with_formatting(false, false, true);
+
+        assert_eq!(
+            result, "<u>auto-fix</u>",
+            "a hyphenated word must not be split into a separate underline run"
+        );
     }
 
     #[test]
