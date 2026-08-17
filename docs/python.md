@@ -20,6 +20,7 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 | Engine | Overall | Reading order | Tables (TEDS) | Headings | Speed |
 |---|---|---|---|---|---|
 | **pdf-inspector** | **0.875** | **0.915** | **0.814** | 0.788 | **0.470s** |
+| liteparse | 0.873 | 0.913 | 0.693 | **0.811** | 0.750s |
 | opendataloader | 0.831 | 0.902 | 0.489 | 0.739 | 2.569s |
 | pymupdf4llm | 0.735 | 0.886 | 0.401 | 0.424 | 17.117s |
 | markitdown | 0.589 | 0.844 | 0.273 | 0.000 | 16.165s |

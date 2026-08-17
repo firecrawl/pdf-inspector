@@ -30,11 +30,12 @@ Evaluated on the [opendataloader-bench](https://github.com/opendataloader-projec
 | Engine | Overall | Reading Order (NID) | Tables (TEDS) | Headings (MHS) | Speed (200 docs) |
 |---|---|---|---|---|---|
 | pdf-inspector | **0.875** | **0.915** | **0.814** | 0.788 | **0.470s** |
+| liteparse | 0.873 | 0.913 | 0.693 | **0.811** | 0.750s |
 | opendataloader | 0.831 | 0.902 | 0.489 | 0.739 | 2.569s |
 | pymupdf4llm | 0.735 | 0.886 | 0.401 | 0.424 | 17.117s |
 | markitdown | 0.589 | 0.844 | 0.273 | 0.000 | 16.165s |
 
-Results were refreshed on July 31, 2026, on an Apple M4 Pro. Engine versions were pdf-inspector 0.2.6, OpenDataLoader 2.2.1, PyMuPDF4LLM 0.2.0, and MarkItDown 0.1.5. Speed is the median of five alternating or rotating complete corpus runs after an excluded warm-up run, with each parser processing documents sequentially in a single process.
+Results were refreshed on July 31, 2026, on an Apple M4 Pro. Engine versions were pdf-inspector 0.2.6, LiteParse 2.10.1, OpenDataLoader 2.2.1, PyMuPDF4LLM 0.2.0, and MarkItDown 0.1.5. Speed is the median of five alternating or rotating complete corpus runs after an excluded warm-up run, with each parser processing documents sequentially in a single process.
 
 The complete parser configuration, per-document predictions, evaluator output, and generated charts are available in the [reproducible results branch](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results).
 
