@@ -1,0 +1,57 @@
+src/bin/pdf2md.rs
+  s_509f955ca4bd26::t_a8dfe1bb891264 318-320
+  s_509f955ca4bd26::t_99de8bb68ba465 226,228-229,232,262,326-333
+  s_509f955ca4bd26::t_d9778270ae1b6e 551
+  s_509f955ca4bd26::t_0700980b6fea0a 168-169,198
+  s_509f955ca4bd26::t_b965784d55a10b 227,510
+  s_509f955ca4bd26::t_ee001195848dec 263-264,314-317,321-325
+  s_509f955ca4bd26::t_4d770c6d5d2cd4 230-231,233-238,479-482,487-489,496-499,509,511-512,516,520,524,528,589
+src/vision/contracts.rs
+  s_509f955ca4bd26::t_62eee443523487 1
+  s_509f955ca4bd26::t_993cf075565e57 153,193
+docs/rust-api.md
+  s_509f955ca4bd26::t_3c60794d10b5b6 209-213,335-338,363,367,382-384,413-414,419,428,431-432
+  s_509f955ca4bd26::t_94f3c885e8b066 3
+  s_509f955ca4bd26::t_36e6d7ab6ec126 126,129,138-140,174-177
+src/vision/mod.rs
+  s_509f955ca4bd26::t_993cf075565e57 33-34
+src/vision/fusion.rs
+  s_509f955ca4bd26::t_0700980b6fea0a 1015
+  s_509f955ca4bd26::t_3714e338545bba 77,333,336,1070-1074
+src/vision/oar.rs
+  s_509f955ca4bd26::t_a55b6e4969c295 52-54
+  s_509f955ca4bd26::t_993cf075565e57 167
+tests/local_render_tests.rs
+  s_509f955ca4bd26::t_3c92e4993eed6b 8
+README.md
+  s_509f955ca4bd26::t_0a386b8a6ed441 21,24,164-175
+  s_509f955ca4bd26::t_94f3c885e8b066 8
+src/vision/pipeline.rs
+  s_509f955ca4bd26::t_a8dfe1bb891264 1226-1230
+  s_509f955ca4bd26::t_8c80d2d50116f7 62,75,89,105-109,135-136,214,223,1284-1285
+  s_509f955ca4bd26::t_3714e338545bba 377,387,393-394,460,479,845,972,1233-1237
+src/vision/routing.rs
+  s_509f955ca4bd26::t_3714e338545bba 109-113,275
+src/vision/pdfium.rs
+  s_509f955ca4bd26::t_a55b6e4969c295 52-53,55-60,92,99-100
+  s_509f955ca4bd26::t_114ee9143deb59 54
+tests/ocr_tests.rs
+  s_509f955ca4bd26::t_3c92e4993eed6b 23
+  s_509f955ca4bd26::t_3714e338545bba 209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "30dc3899684e4511d271e91f0a3ed8881f3e89a6",
+  "prompts": {},
+  "sessions": {
+    "s_509f955ca4bd26": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fedba-8db3-7521-9f16-05cccc9fa3fb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}
