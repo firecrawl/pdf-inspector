@@ -1,0 +1,36 @@
+docs/rust-api.md
+  s_509f955ca4bd26::t_643cac9d911ceb 140-145,248-274,276-309
+  s_509f955ca4bd26::t_9e44b917e1e6d2 275
+src/vision/models.rs
+  s_509f955ca4bd26::t_0041d269377af8 15,141-150,152-153,217-242,245,256-259,337-373,697-718,720-724,888-895,897-898,900-901,905-911,913-920,922-927
+  s_509f955ca4bd26::t_40162511769d70 151,246-253,719,896,899,912,921
+  s_509f955ca4bd26::t_0ff6c0676e24ec 427-428
+  s_509f955ca4bd26::t_78120bad433a5a 902-904
+src/vision/routing.rs
+  s_509f955ca4bd26::t_0041d269377af8 1-8,10-41,59-60,62-103,110-236,243-312,314-382
+  s_509f955ca4bd26::t_40162511769d70 9,104-109,237-242
+Cargo.toml
+  s_509f955ca4bd26::t_0041d269377af8 65-67,86
+src/vision/download.rs
+  s_509f955ca4bd26::t_0041d269377af8 1-50,52-84
+  s_509f955ca4bd26::t_40162511769d70 51
+src/vision/mod.rs
+  s_509f955ca4bd26::t_0041d269377af8 13-14,21-22,46-48
+  s_509f955ca4bd26::t_40162511769d70 33-34,37-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2c0d8e7142a70ea4fd3825ca77f969a416f62506",
+  "prompts": {},
+  "sessions": {
+    "s_509f955ca4bd26": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fedba-8db3-7521-9f16-05cccc9fa3fb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
