@@ -1,0 +1,68 @@
+src/markdown/convert.rs
+  s_3fa7a2abc03ac9::t_b3b03fe060d15a 705,711,1270
+  s_3fa7a2abc03ac9::t_955599d5e1b197 706-710,1271-1275
+src/markdown/mod.rs
+  s_3fa7a2abc03ac9::t_d08ea55834a1de 1092
+  s_3fa7a2abc03ac9::t_ecbfdd4dcf80ff 1058-1062
+src/lib.rs
+  s_3fa7a2abc03ac9::t_49bda2e2ea160c 37
+src/bin/pdf2md.rs
+  s_3fa7a2abc03ac9::t_ce57efe678ffc2 431,549,625
+  s_3fa7a2abc03ac9::t_2b63e0d32fcee0 409-411
+src/formula/mod.rs
+  s_3fa7a2abc03ac9::t_cc879656e14b2e 1001-1024,1026-1080
+  s_3fa7a2abc03ac9::t_5c7788b8e72af0 572-601
+  s_3fa7a2abc03ac9::t_d0dc0a79320251 511-515
+  s_3fa7a2abc03ac9::t_a0fc8cfb709b2d 308-350,361,363-368
+  s_3fa7a2abc03ac9::t_b20be6692000f7 1-39,43-56,81-83,107,115,117-121,128-129,134-135,144-145,151-157,159-161,163-171,188-199,242-272,300-307,369-374,376-377,379,381,383-396,423-510,516-520,522-524,526-545,549-557,565-568,673-678,680-682,684-712,729,737-777,782-795,804-859,861-911,1095-1115
+  s_3fa7a2abc03ac9::t_cfc62659709983 546-548
+  s_3fa7a2abc03ac9::t_f58975c0ef96ac 939
+  s_3fa7a2abc03ac9::t_da67f7b1a6b828 971
+  s_3fa7a2abc03ac9::t_0bfa095164b433 521,525
+  s_3fa7a2abc03ac9::t_3aee4f7ed4391f 558-564
+  s_3fa7a2abc03ac9::t_0474ab0f4414db 351-360,362
+  s_3fa7a2abc03ac9::t_f031e49413a96c 1081-1094
+  s_3fa7a2abc03ac9::t_4944b0620800e0 778-781
+  s_3fa7a2abc03ac9::t_b1df32cb3fb668 40-42,122-123,172-187
+  s_3fa7a2abc03ac9::t_9c2a22577c052f 141
+  s_3fa7a2abc03ac9::t_962d97aa66b711 959-970,972-1000
+  s_3fa7a2abc03ac9::t_8e1b91d468f714 916-938,940-942
+  s_3fa7a2abc03ac9::t_e66b58bf3ec677 200-241
+  s_3fa7a2abc03ac9::t_9e35e48204bff3 796-803
+  s_3fa7a2abc03ac9::t_5f393ec207a54c 860,912
+  s_3fa7a2abc03ac9::t_65de5f79700b8b 158,375
+  s_3fa7a2abc03ac9::t_41fadeb2eee444 626-630,639-642
+  s_3fa7a2abc03ac9::t_bb8af777c8c6c0 943-958
+  s_3fa7a2abc03ac9::t_458ce128b3ceed 730-736
+  s_3fa7a2abc03ac9::t_54542a523300d3 713-728
+  s_3fa7a2abc03ac9::t_987e5f8ef75e16 602-625,631-638,643-672,679
+  s_3fa7a2abc03ac9::t_f0cbe4e4cc1870 1025
+  s_3fa7a2abc03ac9::t_299b175f014378 136-140,142-143,146-150
+  s_3fa7a2abc03ac9::t_5e7240bd046e38 683
+  s_3fa7a2abc03ac9::t_f4dd3cb3ecefc5 273-299
+  s_3fa7a2abc03ac9::t_ccd3e0428b7cd1 57-80,84-106,108-114,116,124-127,130-133
+  s_3fa7a2abc03ac9::t_ead1ec6b15f4d8 397-422
+  s_3fa7a2abc03ac9::t_0a3534d80f4477 162
+  s_3fa7a2abc03ac9::t_6389663c3c9ebe 378,380,382
+src/formula/unicode_map.rs
+  s_3fa7a2abc03ac9::t_d04e1aa345837b 383-389
+  s_3fa7a2abc03ac9::t_b1df32cb3fb668 198-199
+  s_3fa7a2abc03ac9::t_1ad8d43a4cb745 1-191,282-382,390-391
+  s_3fa7a2abc03ac9::t_882baeb2ef9dfd 192-197,200-281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "001af960fc55aac93748613d3e77bde9714ec566",
+  "prompts": {},
+  "sessions": {
+    "s_3fa7a2abc03ac9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9bb20049-a216-4dbf-9154-e1bfc58f484d",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}
