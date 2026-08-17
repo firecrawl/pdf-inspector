@@ -1,0 +1,35 @@
+napi/package.json
+  s_509f955ca4bd26::t_46e3d5b38b6443 3,55-60
+napi/Cargo.lock
+  ai_agent 2092,2117
+pyproject.toml
+  s_509f955ca4bd26::t_46e3d5b38b6443 9
+napi/Cargo.toml
+  s_509f955ca4bd26::t_46e3d5b38b6443 3
+site/index.html
+  s_509f955ca4bd26::t_46e3d5b38b6443 978
+wasm/Cargo.toml
+  s_509f955ca4bd26::t_46e3d5b38b6443 3
+napi/bun.lock
+  ai_agent 11-16
+Cargo.toml
+  s_509f955ca4bd26::t_46e3d5b38b6443 3
+wasm/Cargo.lock
+  ai_agent 727,743
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "1a52a1733b2fe8076056a72915c7ad3898ecf860",
+  "prompts": {},
+  "sessions": {
+    "s_509f955ca4bd26": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fedba-8db3-7521-9f16-05cccc9fa3fb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
