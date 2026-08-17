@@ -31,8 +31,8 @@ overwrite one another.
 ## Published comparison protocol
 
 The public benchmark table was refreshed on July 31, 2026, on an Apple M4 Pro
-using pdf-inspector 0.2.6, LiteParse 2.10.1, OpenDataLoader 2.2.1,
-PyMuPDF4LLM 0.2.0, and MarkItDown 0.1.5. Every engine processed the same 200
+using pdf-inspector 0.2.6, OpenDataLoader 2.2.1, PyMuPDF4LLM 0.2.0, and
+MarkItDown 0.1.5. Every engine processed the same 200
 PDFs sequentially in a single process with OCR disabled. Reported speed is the
 median of five alternating or rotating complete corpus runs after an excluded
 warm-up run; quality scores come from the benchmark evaluator over all 200

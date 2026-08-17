@@ -180,6 +180,10 @@ jobs:
           test -n "$ort_path"
           echo "ORT_DYLIB_PATH=$ort_path" >> "$GITHUB_ENV"
 
+      - name: Configure isolated model cache
+        shell: bash
+        run: echo "PDF_INSPECTOR_MODEL_CACHE=$RUNNER_TEMP/pdf-inspector-models" >> "$GITHUB_ENV"
+
       - name: Build OCR CLI
         run: cargo build --features ocr --bin pdf2md
 
@@ -212,6 +216,12 @@ jobs:
           assert result["pages"][0]["markdown"].strip()
           assert "layout_ms" not in result["pages"][0]["timings"]
           PY
+
+      - name: Run OCR launch smoke set
+        shell: bash
+        run: |
+          export PDF_INSPECTOR_OCR_TEST_MODELS="$PDF_INSPECTOR_MODEL_CACHE/pp-ocrv6-small/oar-ocr-v0.7.0"
+          cargo test --features ocr --test ocr_tests -- --nocapture
 
       - name: Build Node binding
         working-directory: napi

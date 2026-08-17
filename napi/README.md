@@ -20,7 +20,6 @@ Built by [Firecrawl](https://firecrawl.dev) for hybrid OCR pipelines — extract
 | Engine | Overall | Reading order | Tables (TEDS) | Headings | Speed |
 |---|---|---|---|---|---|
 | **pdf-inspector** | **0.875** | **0.915** | **0.814** | 0.788 | **0.470s** |
-| liteparse | 0.873 | 0.913 | 0.693 | **0.811** | 0.750s |
 | opendataloader | 0.831 | 0.902 | 0.489 | 0.739 | 2.569s |
 | pymupdf4llm | 0.735 | 0.886 | 0.401 | 0.424 | 17.117s |
 | markitdown | 0.589 | 0.844 | 0.273 | 0.000 | 16.165s |
@@ -41,7 +40,9 @@ OCR calls that route work require compatible PDFium and ONNX Runtime shared
 libraries. Set `PDFIUM_LIB_PATH` and `ORT_DYLIB_PATH` when they are not on the
 platform library search path. The pinned OCR model set is downloaded and
 checksum-verified on the first routed page; use `offline: true` with a warm
-cache or `modelDirectory` to prohibit network access.
+cache or `modelDirectory` to prohibit network access. See the
+[OCR runtime setup guide](https://github.com/firecrawl/pdf-inspector/blob/main/docs/ocr-runtime.md)
+for pinned downloads, supported platforms, and hosted-fallback behavior.
 
 ## API
 
