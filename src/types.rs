@@ -164,6 +164,12 @@ impl TextLine {
 
         let single_char_threshold = self.adaptive_threshold;
 
+        // Resolve each item's *effective* underline up front, one run of
+        // tightly-continuous fragments at a time, rather than toggling the
+        // `<u>` tag per item as the render loop walks through. See
+        // resolve_underline_by_word_group's doc comment for why.
+        let effective_underline = self.resolve_underline_by_word_group(format_decorations);
+
         let mut result = String::new();
         let mut current_bold = false;
         let mut current_italic = false;
@@ -194,43 +200,6 @@ impl TextLine {
             // we push text_trimmed below (which strips it).
             let has_leading_space = text.starts_with(' ');
 
-            // True geometric contiguity with the previous item — tight
-            // enough that these two items are the same visual word split
-            // across positioned-text fragments, not merely two items
-            // `needs_space_between` happens to join without inserting a
-            // space. Some real documents kern punctuation just as tightly
-            // against the preceding word as a genuine same-word split, so
-            // geometry alone isn't enough (see the punctuation check
-            // below); this narrows out most unrelated no-space joins
-            // first (larger, deliberate letter-spacing gaps, real word
-            // gaps, etc.).
-            let is_tight_geometric_continuation = i > 0 && {
-                let prev_item = &self.items[i - 1];
-                prev_item.width > 0.0 && {
-                    let gap = item.x - (prev_item.x + prev_item.width);
-                    gap.abs() < prev_item.font_size * 0.02
-                }
-            };
-
-            // A trailing period/comma/etc. isn't part of the word before
-            // it, even when kerned touching it — closing punctuation is a
-            // legitimate style boundary regardless of geometric gap.
-            let curr_starts_with_join_punct = text_trimmed
-                .chars()
-                .next()
-                .is_some_and(|c| matches!(c, '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}' | '\''));
-
-            // Whether a space will separate this item from the previously
-            // rendered content — i.e. whether this item starts a new word
-            // rather than continuing the previous item's word with zero gap.
-            let is_word_boundary = i == 0
-                || result.is_empty()
-                || result.ends_with(' ')
-                || needs_space
-                || has_leading_space
-                || !is_tight_geometric_continuation
-                || curr_starts_with_join_punct;
-
             // Check for style changes. Source decorations are exclusive:
             // `<u>`/`<s>` content stays free of `**`/`*` markers — consumers
             // (and the eval harnesses this feeds) match tag content literally,
@@ -238,26 +207,7 @@ impl TextLine {
             // emitted as struck text because deletion is the stronger semantic
             // distinction in redline documents.
             let item_strikeout = format_decorations && item.is_strikeout;
-            let item_underline_raw = format_decorations && item.is_underline && !item_strikeout;
-            // Never toggle the underline tag on a non-word-boundary
-            // character. A single visual word can be split across several
-            // positioned items at the content-stream level, and the
-            // source PDF can carry the underline flag on only one
-            // fragment (e.g. an underline rectangle covering just the
-            // first fragment's width) — layout-level merging already
-            // refuses to combine such items across a style difference
-            // (see extractor::mod's merge_text_items), so they arrive
-            // here as adjacent, unmerged items with zero gap between
-            // them. Toggling `<u>` per-item in that case opens/closes the
-            // tag mid-word (`<u>We</u>alth`), which isn't formatting that
-            // was in the source. A same-word continuation instead
-            // inherits whichever underline state is already open. See
-            // #397.
-            let item_underline = if is_word_boundary {
-                item_underline_raw
-            } else {
-                current_underline
-            };
+            let item_underline = effective_underline[i] && !item_strikeout;
             let item_bold = format_bold && item.is_bold && !item_underline && !item_strikeout;
             let item_italic = format_italic && item.is_italic && !item_underline && !item_strikeout;
 
@@ -340,6 +290,130 @@ impl TextLine {
             }
         }
         result
+    }
+
+    /// Resolve each item's effective underline flag, one run of tightly
+    /// continuous fragments (a single visual word split across several
+    /// positioned-text items) at a time, instead of toggling `<u>` per
+    /// item as it's encountered.
+    ///
+    /// A single visual word can be split across several content-stream
+    /// text-showing operators, and the source PDF can carry the
+    /// underline flag on only one fragment — e.g. an underline rectangle
+    /// whose geometry happens to cover only part of a word's width, a
+    /// rendering artifact rather than intentional partial-word styling.
+    /// Layout-level merging (`extractor::mod`'s `merge_text_items`)
+    /// already refuses to combine such items across a style difference,
+    /// so they arrive here as adjacent, unmerged items.
+    ///
+    /// Deciding each fragment's tag independently produces `<u>We</u>alth`
+    /// for a word like "Wealth". A first attempt fixed that by having a
+    /// continuation fragment inherit whichever underline state was
+    /// already open while rendering — but that makes the *rendered*
+    /// result depend on which fragment in the run happens to carry the
+    /// flag: the same source pattern renders differently depending on
+    /// fragment order (flag on the first fragment extends underline onto
+    /// later ones; flag only on a later fragment gets silently dropped).
+    /// Grouping each run up front and deciding it once, by majority
+    /// character count across the whole run, removes that
+    /// order-dependence: the same run always resolves to the same
+    /// underline status regardless of which fragment(s) within it happen
+    /// to carry the flag. See #397.
+    fn resolve_underline_by_word_group(&self, format_decorations: bool) -> Vec<bool> {
+        let n = self.items.len();
+        if !format_decorations || n == 0 {
+            return vec![false; n];
+        }
+
+        let mut resolved = vec![false; n];
+        let mut run_start = 0usize;
+        for i in 1..n {
+            if !Self::is_tight_word_continuation(&self.items[i - 1], &self.items[i]) {
+                Self::assign_run_underline(&self.items[run_start..i], &mut resolved[run_start..i]);
+                run_start = i;
+            }
+        }
+        Self::assign_run_underline(&self.items[run_start..n], &mut resolved[run_start..n]);
+        resolved
+    }
+
+    /// True when `curr` continues the same visual word as `prev` — tight
+    /// enough geometric contiguity (direction-aware, so this also holds
+    /// for RTL text) that these are split fragments of one word rather
+    /// than merely two items a general prose-spacing heuristic happens to
+    /// join without inserting a space (punctuation attachment,
+    /// hyphenation, kerning — all unrelated reasons for "no space" that
+    /// are NOT "these are the same word").
+    ///
+    /// Strikeout is always a hard boundary: a struck-through fragment
+    /// must never inherit an underlined neighbor's status (that would
+    /// emit overlapping `<u>`/`<s>` spans), and by the same logic a
+    /// non-struck fragment must never be grouped with a struck one.
+    ///
+    /// A trailing/leading closing-punctuation character (on either side
+    /// of the join) is excluded even when geometrically touching — a
+    /// period right after a word isn't part of that word, regardless of
+    /// kerning. `'` is deliberately excluded from that punctuation set:
+    /// unlike `.`/`,`/etc., an apostrophe can legitimately sit *inside* a
+    /// word (a contraction split across fragments, e.g. "can" + "'t"),
+    /// so always treating it as a boundary would reintroduce the same
+    /// mid-word split this function exists to prevent.
+    fn is_tight_word_continuation(prev: &TextItem, curr: &TextItem) -> bool {
+        if prev.is_strikeout || curr.is_strikeout {
+            return false;
+        }
+        if prev.width <= 0.0 {
+            return false;
+        }
+        let gap = if prev.x <= curr.x {
+            curr.x - (prev.x + prev.width)
+        } else {
+            prev.x - (curr.x + curr.width)
+        };
+        if gap.abs() >= prev.font_size * 0.02 {
+            return false;
+        }
+        let is_join_punct = |c: char| matches!(c, '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}');
+        if curr.text.starts_with(' ') || prev.text.ends_with(' ') {
+            return false;
+        }
+        if curr
+            .text
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(is_join_punct)
+        {
+            return false;
+        }
+        if prev
+            .text
+            .trim_end()
+            .chars()
+            .last()
+            .is_some_and(is_join_punct)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Decide a run's group-level underline status by majority character
+    /// count (ties favor `false`, the conservative "don't fabricate
+    /// styling" default), then assign it to every item in the run.
+    fn assign_run_underline(run: &[TextItem], resolved: &mut [bool]) {
+        let mut underlined_chars = 0usize;
+        let mut plain_chars = 0usize;
+        for item in run {
+            let len = item.text.trim().chars().count();
+            if item.is_underline {
+                underlined_chars += len;
+            } else {
+                plain_chars += len;
+            }
+        }
+        let group_underline = underlined_chars > plain_chars;
+        resolved.fill(group_underline);
     }
 
     /// Determine if a space is needed between two items
@@ -482,6 +556,117 @@ mod formatting_tests {
         assert!(
             result.contains("Wealth"),
             "the word \"Wealth\" must render undivided, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn underline_word_group_resolution_is_order_independent() {
+        // Regression for a PR #408 review finding: serially inheriting
+        // "whichever underline state is already open" made the rendered
+        // result depend on which fragment in a run happened to carry the
+        // flag. Two equal-length fragments ("Wea" / "lth", tied 3 vs 3
+        // characters) with the flag on either side must resolve to the
+        // *same* output — majority-by-character-count ties favor `false`
+        // regardless of which side carried the flag.
+        let mut flag_first = item("Wea", 45.0, 60.0, false);
+        flag_first.is_underline = true;
+        let flag_first_rest = item("lth", flag_first.x + flag_first.width, 40.0, false);
+        let a = line(vec![flag_first, flag_first_rest]).text_with_formatting(false, false, true);
+
+        let flag_second = item("Wea", 45.0, 60.0, false);
+        let mut flag_second_rest = item("lth", flag_second.x + flag_second.width, 40.0, false);
+        flag_second_rest.is_underline = true;
+        let b = line(vec![flag_second, flag_second_rest]).text_with_formatting(false, false, true);
+
+        assert_eq!(
+            a, b,
+            "a tied same-word split must resolve identically regardless of \
+             which fragment carries the underline flag"
+        );
+        assert_eq!(a, "Wealth", "a tie should favor not-underlined");
+    }
+
+    #[test]
+    fn underline_strikeout_fragment_isolates_neighbors_from_its_own_flag() {
+        // Regression for a PR #408 review finding: without treating
+        // strikeout as a hard grouping boundary, a struck-through
+        // fragment's own (hidden, struck-out) underline flag could still
+        // sway the majority vote for its *neighboring* plain-text
+        // fragments — even though the struck fragment itself never
+        // renders `<u>` (the render loop always excludes underline on a
+        // struck item). Here the struck middle fragment is long and
+        // flagged, heavily outweighing its plain neighbors by character
+        // count; if it weren't a hard boundary, that flag would leak into
+        // the surrounding run and incorrectly underline the (visible,
+        // non-struck) "We" and "alth" fragments too.
+        let we = item("We", 45.0, 20.0, false);
+        let mut struck_middle = item("XXXXXXXX", we.x + we.width, 80.0, true);
+        struck_middle.is_underline = true;
+        let alth = item("alth", struck_middle.x + struck_middle.width, 40.0, false);
+
+        let line = line(vec![we, struck_middle, alth]);
+        let result = line.text_with_formatting(false, false, true);
+
+        assert!(
+            !result.contains("<u>We") && !result.contains("alth</u>"),
+            "a struck fragment's flag must not leak underline onto its plain \
+             neighbors, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn underline_run_ends_at_trailing_punctuation_on_the_previous_item() {
+        // Regression for a PR #408 review finding: the punctuation
+        // boundary check only looked at the *next* item's leading
+        // character. When the *previous* item's own text already ends
+        // with closing punctuation (e.g. it was merged into one item
+        // earlier in the pipeline), a tightly adjacent following
+        // fragment must still not be swept into the same underline run.
+        let mut sentence = item("Wealth.", 45.0, 70.0, false);
+        sentence.is_underline = true;
+        let extra = item("Extra", sentence.x + sentence.width, 50.0, false);
+
+        let line = line(vec![sentence, extra]);
+        let result = line.text_with_formatting(false, false, true);
+
+        assert_eq!(result, "<u>Wealth.</u>Extra");
+    }
+
+    #[test]
+    fn underline_apostrophe_does_not_split_a_contraction() {
+        // Regression for a PR #408 review finding: treating `'` as
+        // always a word boundary breaks contractions split across
+        // fragments (e.g. "can" + "'t") — reintroducing the exact
+        // mid-word toggle bug this PR fixes, just at the apostrophe.
+        let mut can = item("can", 45.0, 40.0, false);
+        can.is_underline = true;
+        let t = item("'t", can.x + can.width, 20.0, false);
+
+        let line = line(vec![can, t]);
+        let result = line.text_with_formatting(false, false, true);
+
+        assert_eq!(result, "<u>can't</u>");
+    }
+
+    #[test]
+    fn underline_word_continuation_is_direction_aware_for_rtl() {
+        // Regression for a PR #408 review finding: the geometric
+        // contiguity check was LTR-only (`curr.x - (prev.x + prev.width)`),
+        // which reports a large, non-tight gap for genuinely touching RTL
+        // fragments (positioned right-to-left, so curr.x < prev.x).
+        let mut prev = item("Weal", 100.0, 20.0, false);
+        prev.is_underline = true;
+        // RTL contiguity: curr's right edge (x + width) touches prev.x.
+        // Unequal fragment lengths (4 vs 2 chars) so the majority-by-char
+        // rule has a clear winner rather than a tie.
+        let curr = item("th", 80.0, 20.0, false);
+
+        let line = line(vec![prev, curr]);
+        let result = line.text_with_formatting(false, false, true);
+
+        assert_eq!(
+            result, "<u>Wealth</u>",
+            "RTL-contiguous fragments must still be grouped as one word"
         );
     }
 
