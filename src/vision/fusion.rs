@@ -423,7 +423,7 @@ fn unique_markdown_span(markdown: &str, span_text: &str) -> Option<(usize, usize
 }
 
 fn strip_list_marker(text: &str) -> Option<&str> {
-    const BULLETS: &[char] = &['•', '●', '○', '▪', '–', '—'];
+    const BULLETS: &[char] = &['•', '●', '○', '◦', '▪', '–', '—'];
     let trimmed = text.trim_start();
     let remainder = trimmed
         .strip_prefix(BULLETS)?
@@ -874,6 +874,22 @@ mod tests {
             1,
             vec![
                 positioned_span("• First item", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("Next paragraph", 10.0, 40.0, 190.0, 50.0),
+            ],
+            Some(0.9),
+        );
+
+        let recovered = preserve_ocr_line_breaks("- First item Next paragraph", &page);
+
+        assert_eq!(recovered, "- First item\n\nNext paragraph");
+    }
+
+    #[test]
+    fn line_break_recovery_accepts_white_bullet_list_markers() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("◦ First item", 10.0, 10.0, 190.0, 20.0),
                 positioned_span("Next paragraph", 10.0, 40.0, 190.0, 50.0),
             ],
             Some(0.9),
