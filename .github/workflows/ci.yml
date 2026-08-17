@@ -190,12 +190,21 @@ jobs:
       - name: Test PDFium runtime
         run: cargo test --features ocr --test local_render_tests
 
+      - name: Provision OCR model cache
+        shell: bash
+        run: |
+          target/debug/pdf2md \
+            tests/fixtures/scan_with_native_header_text.pdf \
+            --ocr force \
+            --json > /dev/null
+
       - name: Run OCR CLI
         shell: bash
         run: |
           target/debug/pdf2md \
             tests/fixtures/scan_with_native_header_text.pdf \
             --ocr auto \
+            --ocr-offline \
             --json > "$RUNNER_TEMP/ocr-result.json"
 
       - name: Validate OCR JSON contract
