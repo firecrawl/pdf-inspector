@@ -34,6 +34,7 @@ pub mod python;
 pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
+mod formula;
 pub mod glyph_names;
 pub mod markdown;
 pub mod process_mode;

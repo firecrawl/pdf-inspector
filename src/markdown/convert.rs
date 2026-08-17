@@ -702,6 +702,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
 
+    // Rewrite confident native math glyph runs into $...$ LaTeX
+    let lines = if options.formula_latex {
+        crate::formula::rewrite_math_runs(lines)
+    } else {
+        lines
+    };
+
     // Discover heading tiers for this document
     let heading_tiers = compute_heading_tiers(&lines, base_size);
 
@@ -1259,6 +1266,13 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
+
+    // Rewrite confident native math glyph runs into $...$ LaTeX
+    let lines = if options.formula_latex {
+        crate::formula::rewrite_math_runs(lines)
+    } else {
+        lines
+    };
 
     // Discover heading tiers for this document
     let heading_tiers = compute_heading_tiers(&lines, base_size);

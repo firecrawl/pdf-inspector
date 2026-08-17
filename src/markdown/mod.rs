@@ -1055,6 +1055,11 @@ pub struct MarkdownOptions {
     pub include_page_numbers: bool,
     /// Strip repeated headers/footers that appear on many pages
     pub strip_headers_footers: bool,
+    /// Rewrite native math glyph runs into `$...$` LaTeX (experimental).
+    /// Off by default: reconstruction is confidence-gated and structurally
+    /// flat, and downstream consumers matching on the original Unicode text
+    /// would see it replaced by LaTeX.
+    pub formula_latex: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -1084,6 +1089,7 @@ impl Default for MarkdownOptions {
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,
+            formula_latex: false,
         }
     }
 }
