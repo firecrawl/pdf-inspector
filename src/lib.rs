@@ -4334,8 +4334,11 @@ fn process_document(
                 ))
             };
 
-            let enc = !ocr_reasons_by_page.is_empty()
-                || text_quality.has_encoding_issues
+            let enc = ocr_reasons_by_page.values().any(|reasons| {
+                reasons
+                    .iter()
+                    .any(|reason| reason != OCR_REASON_CONTENT_OPERATION_LIMIT)
+            }) || text_quality.has_encoding_issues
                 || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
             (
                 md,
@@ -4407,6 +4410,22 @@ fn process_document(
         }
         pages_needing_ocr.sort_unstable();
     }
+    let operation_limit_pages: Vec<_> = text_quality_reasons_by_page
+        .iter()
+        .filter(|(_, reasons)| {
+            reasons
+                .iter()
+                .any(|reason| reason == OCR_REASON_CONTENT_OPERATION_LIMIT)
+        })
+        .map(|(page, _)| *page)
+        .collect();
+    for page in operation_limit_pages {
+        if !pages_needing_ocr.contains(&page) {
+            pages_needing_ocr.push(page);
+        }
+    }
+    pages_needing_ocr.sort_unstable();
+    pages_needing_ocr.dedup();
 
     // Detect sparse extraction: when a TEXT-BASED PDF produces very few
     // characters per page, the text is likely embedded in images/forms
