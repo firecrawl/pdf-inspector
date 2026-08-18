@@ -37,6 +37,7 @@ pub mod extractor;
 pub mod glyph_names;
 pub mod markdown;
 pub mod process_mode;
+mod stream_decode;
 pub mod structure_tree;
 pub mod tables;
 mod text_quality;

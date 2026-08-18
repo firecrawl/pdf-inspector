@@ -43,6 +43,10 @@ unicode-normalization = "0.1"
 # TrueType font parsing (for Identity-H CID font cmap extraction)
 ttf-parser = "0.25"
 
+# Incremental Flate inflate so detector scans can stop before a highly
+# compressible stream materializes a multi-gigabyte buffer.
+flate2 = "1.1"
+
 # Native builds keep lopdf's parallel parser and CLI logging. Browser WASM is
 # deliberately single-threaded so it works without cross-origin isolation.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
