@@ -2738,6 +2738,13 @@ fn try_banded_layout(
     struct BandPlan {
         band: YBand,
         columns: Vec<ColumnRegion>,
+        // The founding band's columns, untouched by merge widening. Merge
+        // candidates are compared against these: the widened union's gutter
+        // is the intersection of its constituents' gutters, and across a
+        // chain of one-directionally drifting bands that intersection can
+        // walk past GUTTER_TOLERANCE, rejecting a band identical to the
+        // founder. The run's column system is defined by its first band.
+        anchor_columns: Vec<ColumnRegion>,
     }
 
     let mut plans: Vec<BandPlan> = Vec::new();
@@ -2754,7 +2761,11 @@ fn try_banded_layout(
         } else {
             vec![]
         };
-        plans.push(BandPlan { band, columns });
+        plans.push(BandPlan {
+            band,
+            anchor_columns: columns.clone(),
+            columns,
+        });
     }
 
     let page_count = page_columns.len().max(1);
@@ -2784,7 +2795,9 @@ fn try_banded_layout(
     for (idx, plan) in plans.into_iter().enumerate() {
         if idx > 0 {
             if let Some(prev) = merged.last_mut() {
-                if columns_match(&prev.columns, &plan.columns) && !gap_has_content(gaps[idx - 1]) {
+                if columns_match(&prev.anchor_columns, &plan.columns)
+                    && !gap_has_content(gaps[idx - 1])
+                {
                     prev.band.y_bottom = plan.band.y_bottom;
                     for (pc, nc) in prev.columns.iter_mut().zip(&plan.columns) {
                         pc.x_min = pc.x_min.min(nc.x_min);
@@ -3170,6 +3183,46 @@ mod tests {
         assert!(
             order.find("LB00").unwrap() < order.find("RA00").unwrap(),
             "columns must flow through the empty gap (LB before RA): {order}"
+        );
+    }
+
+    #[test]
+    fn banded_layout_merge_anchors_on_founding_band() {
+        // Three bands in one flow: the founder, a band whose gutter sits
+        // ~22pt right of it (inside GUTTER_TOLERANCE), and a band identical
+        // to the founder. Matching against the founder's raw columns keeps
+        // the whole chain merged — union widening must never drift the run
+        // away from bands identical to its own first member.
+        let mut items = Vec::new();
+        let mut band = |y_top: f32, left_chars: usize, right_x: f32, tag: &str| {
+            for i in 0..12 {
+                let y = y_top - i as f32 * 14.0;
+                // Tag prefix is 5 chars ("LA00 "), padding keeps each
+                // band's left-column width — and so its gutter — exact.
+                items.push(make_item(
+                    1,
+                    50.0,
+                    y,
+                    &format!("L{tag}{i:02} {}", "x".repeat(left_chars - 6)),
+                ));
+                items.push(make_item(
+                    1,
+                    right_x,
+                    y,
+                    &format!("R{tag}{i:02} {}", "x".repeat(29)),
+                ));
+            }
+        };
+        band(700.0, 38, 330.0, "A"); // gutter mid ~304
+        band(460.0, 42, 352.0, "B"); // gutter mid ~327 (+23, inside tolerance)
+        band(220.0, 38, 330.0, "C"); // identical to founder
+        let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
+            .expect("multi-column bands on a single-column page must engage");
+        let order = joined_order(&lines);
+        assert!(
+            order.find("LC00").unwrap() < order.find("RA00").unwrap(),
+            "founder-identical band must stay in the founder's run \
+             (its left column reads before any right column): {order}"
         );
     }
 
