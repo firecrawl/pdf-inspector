@@ -620,7 +620,11 @@ fn extract_form_xobject_text_inner(
                                 y,
                                 width,
                                 height: rendered_size,
-                                font: current_font.clone(),
+                                font: crate::extractor::fonts::item_font_name(
+                                    &current_font,
+                                    base_font,
+                                )
+                                .to_string(),
                                 font_size: rendered_size,
                                 page: page_num,
                                 is_bold: is_bold_font(base_font) || desc_bold,
@@ -775,7 +779,11 @@ fn extract_form_xobject_text_inner(
                                     y,
                                     width,
                                     height: rendered_size,
-                                    font: current_font.clone(),
+                                    font: crate::extractor::fonts::item_font_name(
+                                        &current_font,
+                                        base_font,
+                                    )
+                                    .to_string(),
                                     font_size: rendered_size,
                                     page: page_num,
                                     is_bold: is_bold_font(base_font) || desc_bold,
