@@ -1,5 +1,6 @@
 //! Financial token splitting for consolidated value items.
 
+use crate::types::ItemType;
 use crate::types::TextItem;
 
 /// Check if a whitespace-separated token looks like a financial number.
@@ -81,7 +82,11 @@ fn try_split_financial_item_with_limits(
     item: &TextItem,
     width_font_multiple: f32,
     min_values: usize,
+    center_in_slot: bool,
 ) -> Option<Vec<TextItem>> {
+    if item.font_size <= 0.0 || !matches!(item.item_type, ItemType::Text) {
+        return None;
+    }
     if item.width <= item.font_size * width_font_multiple {
         return None;
     }
@@ -98,9 +103,10 @@ fn try_split_financial_item_with_limits(
     let sub_width = spacing * 0.9;
     let mut sub_items = Vec::with_capacity(values.len());
     for (i, val) in values.iter().enumerate() {
+        let slot_offset = if center_in_slot { spacing * 0.5 } else { 0.0 };
         sub_items.push(TextItem {
             text: val.clone(),
-            x: item.x + spacing * i as f32,
+            x: item.x + spacing * i as f32 + slot_offset,
             y: item.y,
             width: sub_width,
             height: item.height,
@@ -122,7 +128,7 @@ fn try_split_financial_item_with_limits(
 /// Criteria: width > font_size × 20, no alphabetic words, tokenization yields 3+ values.
 /// Creates sub-items with evenly-distributed X positions across the original item's span.
 pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>> {
-    try_split_financial_item_with_limits(item, 20.0, 3)
+    try_split_financial_item_with_limits(item, 20.0, 3, true)
 }
 
 /// Split a two-value item that physically crosses a ruled column boundary.
@@ -131,7 +137,7 @@ pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>>
 /// heuristic, so a word-space join across two cells is allowed to split even
 /// when it contains only two values.
 pub(crate) fn try_split_financial_item_across_rule(item: &TextItem) -> Option<Vec<TextItem>> {
-    try_split_financial_item_with_limits(item, 8.0, 2)
+    try_split_financial_item_with_limits(item, 8.0, 2, false)
 }
 
 #[cfg(test)]
@@ -170,5 +176,30 @@ mod tests {
         assert_eq!(split.len(), 2);
         assert_eq!(split[0].text, "236,480,212");
         assert_eq!(split[1].text, "10,024,724");
+    }
+
+    #[test]
+    fn ruled_boundary_splitter_rejects_form_fields() {
+        let mut item = numeric_pair_item();
+        item.font_size = 0.0;
+        assert!(try_split_financial_item_across_rule(&item).is_none());
+
+        item.font_size = 11.0;
+        item.item_type = ItemType::FormField;
+        assert!(try_split_financial_item_across_rule(&item).is_none());
+    }
+
+    #[test]
+    fn heuristic_and_ruled_splitters_use_their_original_slot_alignment() {
+        let mut heuristic_item = numeric_pair_item();
+        heuristic_item.text = "1 2 3".to_string();
+        heuristic_item.width = 230.0;
+        let heuristic_split = try_split_financial_item(&heuristic_item)
+            .expect("three wide values should use the heuristic splitter");
+        assert_eq!(heuristic_split[0].x, heuristic_item.x + 230.0 / 6.0);
+
+        let ruled_split = try_split_financial_item_across_rule(&numeric_pair_item())
+            .expect("a wide two-value item crossing a rule should split");
+        assert_eq!(ruled_split[0].x, numeric_pair_item().x);
     }
 }

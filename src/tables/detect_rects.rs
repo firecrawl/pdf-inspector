@@ -1531,7 +1531,7 @@ fn try_build_grid(
     }
 
     // Build table: assign text items to cells
-    let (mut cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (mut cells, item_indices) = assign_items_to_ruled_grid(items, &col_edges, &row_edges, page);
 
     // Consolidate vertically-merged cells: rects spanning multiple grid rows
     // should have their text collected into the first sub-row.
@@ -1684,6 +1684,25 @@ pub(crate) fn assign_items_to_grid(
     row_edges: &[f32],
     page: u32,
 ) -> (Vec<Vec<String>>, Vec<usize>) {
+    assign_items_to_grid_with_options(items, col_edges, row_edges, page, false)
+}
+
+pub(crate) fn assign_items_to_ruled_grid(
+    items: &[TextItem],
+    col_edges: &[f32],
+    row_edges: &[f32],
+    page: u32,
+) -> (Vec<Vec<String>>, Vec<usize>) {
+    assign_items_to_grid_with_options(items, col_edges, row_edges, page, true)
+}
+
+fn assign_items_to_grid_with_options(
+    items: &[TextItem],
+    col_edges: &[f32],
+    row_edges: &[f32],
+    page: u32,
+    allow_financial_splits: bool,
+) -> (Vec<Vec<String>>, Vec<usize>) {
     let num_cols = col_edges.len() - 1;
     let num_rows = row_edges.len() - 1;
 
@@ -1703,13 +1722,14 @@ pub(crate) fn assign_items_to_grid(
             continue;
         }
         let right = item.x + item.width;
-        let crosses_rule = col_edges
-            .get(1..col_edges.len().saturating_sub(1))
-            .is_some_and(|inner_edges| {
-                inner_edges
-                    .iter()
-                    .any(|&edge| item.x < edge && right > edge)
-            });
+        let crosses_rule = allow_financial_splits
+            && col_edges
+                .get(1..col_edges.len().saturating_sub(1))
+                .is_some_and(|inner_edges| {
+                    inner_edges
+                        .iter()
+                        .any(|&edge| item.x < edge && right > edge)
+                });
         if !crosses_rule {
             continue;
         }
@@ -1736,17 +1756,40 @@ pub(crate) fn assign_items_to_grid(
             .find(|&r| item.y >= row_edges[r + 1] - 2.0 && item.y <= row_edges[r] + 2.0);
 
         if let Some(r) = row {
-            let candidates = split_ranges[idx]
-                .clone()
-                .map(|range| split_items[range].iter().collect::<Vec<_>>())
-                .unwrap_or_else(|| vec![item]);
-            for candidate in candidates {
-                let cx = candidate.x + candidate.width / 2.0;
-                let col = (0..num_cols)
-                    .find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0);
+            if let Some(range) = split_ranges[idx].clone() {
+                let candidates: Vec<&TextItem> = split_items[range].iter().collect();
+                let placements: Vec<Option<usize>> = candidates
+                    .iter()
+                    .map(|candidate| {
+                        let cx = candidate.x + candidate.width / 2.0;
+                        (0..num_cols)
+                            .find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0)
+                    })
+                    .collect();
 
-                if let Some(c) = col {
-                    cell_items[r][c].push((idx, candidate));
+                if placements.iter().all(Option::is_some) {
+                    for (candidate, col) in candidates.into_iter().zip(placements) {
+                        let Some(c) = col else { continue };
+                        cell_items[r][c].push((idx, candidate));
+                    }
+                    indices.push(idx);
+                } else {
+                    // A split value outside every column is a bad split. Keep
+                    // the original item together so no value is silently removed.
+                    let cx = item.x + item.width / 2.0;
+                    if let Some(c) = (0..num_cols)
+                        .find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0)
+                    {
+                        cell_items[r][c].push((idx, item));
+                        indices.push(idx);
+                    }
+                }
+            } else {
+                let cx = item.x + item.width / 2.0;
+                if let Some(c) = (0..num_cols)
+                    .find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0)
+                {
+                    cell_items[r][c].push((idx, item));
                     indices.push(idx);
                 }
             }
@@ -2874,7 +2917,7 @@ fn detect_row_stripe_table_from_cell_rects(
         page_items.len()
     );
 
-    let (mut cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (mut cells, item_indices) = assign_items_to_ruled_grid(items, &col_edges, &row_edges, page);
 
     if item_indices.is_empty() {
         return None;
@@ -3508,7 +3551,7 @@ mod tests {
         let mut item = make_item("236,480,212 10,024,724", 367.05, 524.45, 11.0);
         item.width = 115.35;
 
-        let (cells, indices) = assign_items_to_grid(
+        let (cells, indices) = assign_items_to_ruled_grid(
             &[item],
             &[300.0, 356.4, 428.35, 485.85, 600.0],
             &[600.0, 500.0, 400.0],
@@ -3517,6 +3560,22 @@ mod tests {
 
         assert_eq!(cells[0][1], "236,480,212", "cells: {cells:?}");
         assert_eq!(cells[0][2], "10,024,724", "cells: {cells:?}");
+        assert_eq!(indices, vec![0]);
+    }
+
+    #[test]
+    fn consolidated_numeric_item_stays_together_in_inferred_grids() {
+        let mut item = make_item("236,480,212 10,024,724", 367.05, 524.45, 11.0);
+        item.width = 115.35;
+
+        let (cells, indices) = assign_items_to_grid(
+            &[item],
+            &[300.0, 356.4, 428.35, 485.85, 600.0],
+            &[600.0, 500.0, 400.0],
+            1,
+        );
+
+        assert_eq!(cells[0][1], "236,480,212 10,024,724", "cells: {cells:?}");
         assert_eq!(indices, vec![0]);
     }
 
