@@ -77,11 +77,12 @@ pub(crate) fn tokenize_financial_values(text: &str) -> Option<Vec<String>> {
     }
 }
 
-/// Try to split a consolidated financial item into individual sub-items.
-/// Criteria: width > font_size × 20, no alphabetic words, tokenization yields 3+ values.
-/// Creates sub-items with evenly-distributed X positions across the original item's span.
-pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>> {
-    if item.width <= item.font_size * 20.0 {
+fn try_split_financial_item_with_limits(
+    item: &TextItem,
+    width_font_multiple: f32,
+    min_values: usize,
+) -> Option<Vec<TextItem>> {
+    if item.width <= item.font_size * width_font_multiple {
         return None;
     }
     let text = &item.text;
@@ -89,7 +90,7 @@ pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>>
         return None;
     }
     let values = tokenize_financial_values(text)?;
-    if values.len() < 3 {
+    if values.len() < min_values {
         return None;
     }
     let n = values.len() as f32;
@@ -99,7 +100,7 @@ pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>>
     for (i, val) in values.iter().enumerate() {
         sub_items.push(TextItem {
             text: val.clone(),
-            x: item.x + spacing * i as f32 + spacing * 0.5,
+            x: item.x + spacing * i as f32,
             y: item.y,
             width: sub_width,
             height: item.height,
@@ -115,4 +116,59 @@ pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>>
         });
     }
     Some(sub_items)
+}
+
+/// Try to split a consolidated financial item into individual sub-items.
+/// Criteria: width > font_size × 20, no alphabetic words, tokenization yields 3+ values.
+/// Creates sub-items with evenly-distributed X positions across the original item's span.
+pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>> {
+    try_split_financial_item_with_limits(item, 20.0, 3)
+}
+
+/// Split a two-value item that physically crosses a ruled column boundary.
+///
+/// Ruled geometry supplies stronger evidence than the heuristic-table width
+/// heuristic, so a word-space join across two cells is allowed to split even
+/// when it contains only two values.
+pub(crate) fn try_split_financial_item_across_rule(item: &TextItem) -> Option<Vec<TextItem>> {
+    try_split_financial_item_with_limits(item, 8.0, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ItemType;
+
+    fn numeric_pair_item() -> TextItem {
+        TextItem {
+            text: "236,480,212 10,024,724".to_string(),
+            x: 367.0,
+            y: 524.0,
+            width: 115.0,
+            height: 11.0,
+            font: "TestFont".to_string(),
+            font_size: 11.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn heuristic_splitter_keeps_two_value_items_intact() {
+        assert!(try_split_financial_item(&numeric_pair_item()).is_none());
+    }
+
+    #[test]
+    fn ruled_boundary_splitter_splits_two_value_items() {
+        let split = try_split_financial_item_across_rule(&numeric_pair_item())
+            .expect("a wide two-value item crossing a rule should split");
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].text, "236,480,212");
+        assert_eq!(split[1].text, "10,024,724");
+    }
 }

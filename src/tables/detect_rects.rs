@@ -6,6 +6,7 @@ use log::debug;
 
 use crate::types::{PdfRect, TextItem};
 
+use super::financial::try_split_financial_item_across_rule;
 use super::Table;
 
 const DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS: usize = 8;
@@ -1691,24 +1692,69 @@ pub(crate) fn assign_items_to_grid(
         vec![vec![Vec::new(); num_cols]; num_rows];
     let mut indices = Vec::new();
 
+    // A TJ array can join two table values into one item when their gap is
+    // word-sized but smaller than the extractor's column-gap threshold. Split
+    // pure numeric items only when their geometry crosses a ruled boundary;
+    // values contained by one cell will be joined back together below.
+    let mut split_items = Vec::new();
+    let mut split_ranges = vec![None; items.len()];
+    for (idx, item) in items.iter().enumerate() {
+        if item.page != page || item.width <= 0.0 {
+            continue;
+        }
+        let right = item.x + item.width;
+        let crosses_rule = col_edges
+            .get(1..col_edges.len().saturating_sub(1))
+            .is_some_and(|inner_edges| {
+                inner_edges
+                    .iter()
+                    .any(|&edge| item.x < edge && right > edge)
+            });
+        if !crosses_rule {
+            continue;
+        }
+        if let Some(sub_items) = try_split_financial_item_across_rule(item) {
+            let start = split_items.len();
+            split_items.extend(sub_items);
+            debug!(
+                "split financial item across ruled column boundary: x={:.2} width={:.2} edge_count={} sub_count={}",
+                item.x,
+                item.width,
+                col_edges.len(),
+                split_items.len() - start
+            );
+            split_ranges[idx] = Some(start..split_items.len());
+        }
+    }
+
     for (idx, item) in items.iter().enumerate() {
         if item.page != page {
             continue;
         }
-        // Use item center for assignment
-        let cx = item.x + item.width / 2.0;
-        let cy = item.y;
-
-        // Find column: cx must be between col_edges[c] and col_edges[c+1]
-        let col = (0..num_cols).find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0);
         // Find row: cy must be between row_edges[r+1] (bottom) and row_edges[r] (top)
-        let row = (0..num_rows).find(|&r| cy >= row_edges[r + 1] - 2.0 && cy <= row_edges[r] + 2.0);
+        let row = (0..num_rows)
+            .find(|&r| item.y >= row_edges[r + 1] - 2.0 && item.y <= row_edges[r] + 2.0);
 
-        if let (Some(c), Some(r)) = (col, row) {
-            cell_items[r][c].push((idx, item));
-            indices.push(idx);
+        if let Some(r) = row {
+            let candidates = split_ranges[idx]
+                .clone()
+                .map(|range| split_items[range].iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![item]);
+            for candidate in candidates {
+                let cx = candidate.x + candidate.width / 2.0;
+                let col = (0..num_cols)
+                    .find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0);
+
+                if let Some(c) = col {
+                    cell_items[r][c].push((idx, candidate));
+                    indices.push(idx);
+                }
+            }
         }
     }
+
+    indices.sort_unstable();
+    indices.dedup();
 
     // Build cell strings: sort items within each cell by Y descending then X ascending
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(num_rows);
@@ -3455,6 +3501,23 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    #[test]
+    fn consolidated_numeric_item_crossing_rule_boundary_splits_cells() {
+        let mut item = make_item("236,480,212 10,024,724", 367.05, 524.45, 11.0);
+        item.width = 115.35;
+
+        let (cells, indices) = assign_items_to_grid(
+            &[item],
+            &[300.0, 356.4, 428.35, 485.85, 600.0],
+            &[600.0, 500.0, 400.0],
+            1,
+        );
+
+        assert_eq!(cells[0][1], "236,480,212", "cells: {cells:?}");
+        assert_eq!(cells[0][2], "10,024,724", "cells: {cells:?}");
+        assert_eq!(indices, vec![0]);
     }
 
     // --- is_chart_bar_cluster / detect_chart_regions ---

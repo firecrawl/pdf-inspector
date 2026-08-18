@@ -238,10 +238,14 @@ fn merge_numeric_adjacent_clusters(
                 (&info_b, &info_a)
             };
 
-            // Merge if the dense cluster is predominantly numeric (>50%)
-            // and the sparse cluster has at most 1/3 the items of the dense one.
-            let should_merge =
-                dense.numeric_frac > 0.50 && sparse.count <= dense.count / 2 && sparse.count <= 5;
+            // Merge if the dense cluster is predominantly numeric (>50%), the
+            // sparse cluster is header-like (non-numeric), and the sparse cluster
+            // has at most 1/3 the items of the dense one. Two numeric clusters
+            // are separate value columns even when one has fewer populated rows.
+            let should_merge = dense.numeric_frac > 0.50
+                && sparse.numeric_frac <= 0.50
+                && sparse.count <= dense.count / 2
+                && sparse.count <= 5;
 
             if should_merge {
                 log::debug!(
@@ -654,6 +658,58 @@ mod tests {
         let cols = find_column_boundaries(&items, TableDetectionMode::SmallFont);
         // Only the cluster at x=100 should survive
         assert!(cols.len() <= 1);
+    }
+
+    #[test]
+    fn test_merge_numeric_adjacent_clusters_keeps_numeric_clusters_separate() {
+        let mut items_data = vec![
+            make_item("100", 100.0, 500.0, 10.0),
+            make_item("200", 100.0, 480.0, 10.0),
+        ];
+        for row in 0..10 {
+            items_data.push(make_item(
+                &format!("3{:02}", row),
+                130.0,
+                460.0 - row as f32 * 20.0,
+                10.0,
+            ));
+        }
+        let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
+        let clusters = vec![vec![100.0, 100.0], vec![130.0; 10]];
+
+        let merged = merge_numeric_adjacent_clusters(clusters, &items, 25.0);
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "two predominantly numeric columns must remain separate"
+        );
+    }
+
+    #[test]
+    fn test_merge_numeric_adjacent_clusters_merges_header_with_numeric_data() {
+        let mut items_data = vec![
+            make_item("Value", 100.0, 500.0, 10.0),
+            make_item("(USD)", 100.0, 480.0, 10.0),
+        ];
+        for row in 0..10 {
+            items_data.push(make_item(
+                &format!("1{:02}", row),
+                130.0,
+                460.0 - row as f32 * 20.0,
+                10.0,
+            ));
+        }
+        let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
+        let clusters = vec![vec![100.0, 100.0], vec![130.0; 10]];
+
+        let merged = merge_numeric_adjacent_clusters(clusters, &items, 25.0);
+
+        assert_eq!(
+            merged.len(),
+            1,
+            "a sparse text header cluster should merge with its numeric data cluster"
+        );
     }
 
     // --- find_row_boundaries ---
