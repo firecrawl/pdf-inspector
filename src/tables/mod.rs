@@ -2143,12 +2143,13 @@ mod tests {
 
     #[test]
     fn test_large_data_table_not_rejected() {
-        let mut items = Vec::new();
         // Header row
-        items.push(make_item("Temp", 100.0, 800.0, 8.0));
-        items.push(make_item("Pressure", 200.0, 800.0, 8.0));
-        items.push(make_item("Volume", 300.0, 800.0, 8.0));
-        items.push(make_item("Enthalpy", 400.0, 800.0, 8.0));
+        let mut items = vec![
+            make_item("Temp", 100.0, 800.0, 8.0),
+            make_item("Pressure", 200.0, 800.0, 8.0),
+            make_item("Volume", 300.0, 800.0, 8.0),
+            make_item("Enthalpy", 400.0, 800.0, 8.0),
+        ];
 
         // 49 data rows
         for i in 1..50 {

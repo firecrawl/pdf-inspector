@@ -5242,11 +5242,11 @@ mod tests {
             "Arnes Lateral",
             "Arnes Sensor",
         ];
-        for r in 0..9 {
+        for (r, name) in names.iter().enumerate() {
             let y = 377.5 - 15.0 * r as f32;
             items.push(make_item(&(r + 1).to_string(), 396.0, y, 9.0));
             items.push(make_item("7701023403016", 410.0, y, 9.0));
-            items.push(make_item(names[r], 480.0, y, 9.0));
+            items.push(make_item(name, 480.0, y, 9.0));
             items.push(make_item("1", 680.0, y, 9.0));
         }
 
