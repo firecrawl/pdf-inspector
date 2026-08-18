@@ -4182,32 +4182,8 @@ fn test_type0_gbk_euc_h_without_tounicode_decodes_predefined_cmap() {
     let buf = synthetic_type0_predefined_cmap_pdf_without_tounicode(
         "GBK-EUC-H",
         "FZXBSJW--GB1-0",
-        content_bytes.clone(),
+        content_bytes,
     );
-    let parsed = lopdf::Document::load_mem(&buf).unwrap();
-    let type0_font = parsed
-        .objects
-        .values()
-        .filter_map(|object| object.as_dict().ok())
-        .find(|dictionary| {
-            dictionary
-                .get(b"Subtype")
-                .and_then(|subtype| subtype.as_name())
-                .is_ok_and(|subtype| subtype == b"Type0")
-        })
-        .expect("find Type0 font")
-        .clone();
-    let descendant = type0_font
-        .get(b"DescendantFonts")
-        .unwrap()
-        .as_array()
-        .unwrap()[0]
-        .as_reference()
-        .unwrap();
-    let cmaps = pdf_inspector::tounicode::FontCMaps::from_doc(&parsed);
-    let entry = cmaps.get_by_obj(descendant.0).expect("composed CMap");
-    assert_eq!(entry.primary.decode_cids(&[0xB6, 0xAB, 0xB7, 0xBD]), "东方");
-
     let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
     let combined: String = items.iter().map(|i| i.text.as_str()).collect();
     assert_eq!(
@@ -4227,32 +4203,8 @@ fn test_type0_unigb_ucs2_h_without_tounicode_decodes_unicode_codes() {
     let buf = synthetic_type0_predefined_cmap_pdf_without_tounicode(
         "UniGB-UCS2-H",
         "SimSun",
-        content_bytes.clone(),
+        content_bytes,
     );
-    let parsed = lopdf::Document::load_mem(&buf).unwrap();
-    let type0_font = parsed
-        .objects
-        .values()
-        .filter_map(|object| object.as_dict().ok())
-        .find(|dictionary| {
-            dictionary
-                .get(b"Subtype")
-                .and_then(|subtype| subtype.as_name())
-                .is_ok_and(|subtype| subtype == b"Type0")
-        })
-        .expect("find Type0 font")
-        .clone();
-    let descendant = type0_font
-        .get(b"DescendantFonts")
-        .unwrap()
-        .as_array()
-        .unwrap()[0]
-        .as_reference()
-        .unwrap();
-    let cmaps = pdf_inspector::tounicode::FontCMaps::from_doc(&parsed);
-    let entry = cmaps.get_by_obj(descendant.0).expect("composed CMap");
-    assert_eq!(entry.primary.decode_cids(&content_bytes), text);
-
     let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
     let combined: String = items.iter().map(|i| i.text.as_str()).collect();
     assert_eq!(

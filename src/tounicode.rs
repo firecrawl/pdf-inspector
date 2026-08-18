@@ -1677,6 +1677,43 @@ pub(crate) fn is_predefined_encoding_cmap(name: &[u8]) -> bool {
     name
 }
 
+/// Build a namespaced lookup key for a predefined Type0 encoding.
+///
+/// Multiple Type0 fonts can share both a CIDFont and an embedded font program
+/// while using different `/Encoding` CMaps. Unlike Identity encodings, their
+/// character-code mappings are not interchangeable, so the encoding and font
+/// identity must participate in the key. The high bit namespaces this synthetic
+/// key away from PDF object numbers used by other fallback CMaps.
+pub(crate) fn type0_predefined_cmap_lookup_key(
+    font_dict: &lopdf::Dictionary,
+    descendant_font: &Object,
+) -> Option<u32> {
+    let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
+    let Object::Reference(descendant) = descendant_font else {
+        return None;
+    };
+
+    let mut hash = 0x811c_9dcdu32;
+    let empty_base_font = [];
+    let base_font = font_dict
+        .get(b"BaseFont")
+        .ok()
+        .and_then(|value| value.as_name().ok())
+        .unwrap_or(&empty_base_font);
+    for value in [
+        encoding,
+        base_font,
+        &descendant.0.to_be_bytes(),
+        &descendant.1.to_be_bytes(),
+    ] {
+        for byte in value {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+    }
+    Some(hash | 0x8000_0000)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn builtin_cmap_file_exists(name: &str) -> bool {
     find_bcmaps_dir()
@@ -2513,13 +2550,21 @@ impl FontCMaps {
             });
 
             // The lookup key must match what get_font_file2_obj_num() returns:
-            // font file obj_num if present, else CIDFont dict obj_num
-            let lookup_key = font_file_ref
-                .map(|r| r.0)
-                .unwrap_or_else(|| match &desc_fonts[0] {
-                    Object::Reference(r) => r.0,
-                    _ => 0,
-                });
+            // a namespaced encoding identity for predefined CMaps, otherwise the
+            // font file obj_num or CIDFont dict obj_num.
+            let lookup_key = if !is_identity {
+                let Some(key) = type0_predefined_cmap_lookup_key(font_dict, &desc_fonts[0]) else {
+                    continue;
+                };
+                key
+            } else {
+                font_file_ref
+                    .map(|r| r.0)
+                    .unwrap_or_else(|| match &desc_fonts[0] {
+                        Object::Reference(r) => r.0,
+                        _ => 0,
+                    })
+            };
             if lookup_key == 0 || by_obj_num.contains_key(&lookup_key) {
                 continue;
             }
@@ -2924,6 +2969,7 @@ fn build_fallback_cmap_for_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     #[test]
     fn test_parse_bfchar_2byte() {
@@ -3777,6 +3823,60 @@ endbfrange
 
         assert_eq!(cmap.decode_cids(b"ABCD"), "ABCD");
         assert_eq!(cmap.decode_cids(b"AB\xb6\xabCD"), "AB\u{4E1C}CD");
+    }
+
+    #[test]
+    fn shared_cid_font_predefined_encodings_get_distinct_cmaps() {
+        let mut doc = Document::with_version("1.7");
+        let cid_system_info_id = doc.add_object(dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("GB1"),
+            "Supplement" => 2,
+        });
+        let cid_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "SimSun",
+            "CIDSystemInfo" => cid_system_info_id,
+        });
+
+        let gbk_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "SimSun",
+            "Encoding" => "GBK-EUC-H",
+            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+        });
+        let unigb_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "SimSun",
+            "Encoding" => "UniGB-UCS2-H",
+            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+        });
+
+        let mut fonts = std::collections::BTreeMap::new();
+        for (name, font_id) in [
+            (b"F1".to_vec(), gbk_font_id),
+            (b"F2".to_vec(), unigb_font_id),
+        ] {
+            fonts.insert(name, doc.get_dictionary(font_id).unwrap());
+        }
+        let gbk_font = doc.get_dictionary(gbk_font_id).unwrap().clone();
+        let unigb_font = doc.get_dictionary(unigb_font_id).unwrap().clone();
+        let descendant = Object::Reference(cid_font_id);
+        let gbk_key = type0_predefined_cmap_lookup_key(&gbk_font, &descendant).unwrap();
+        let unigb_key = type0_predefined_cmap_lookup_key(&unigb_font, &descendant).unwrap();
+        assert_ne!(gbk_key, unigb_key);
+        assert_ne!(gbk_key & 0x8000_0000, 0);
+        assert_ne!(unigb_key & 0x8000_0000, 0);
+
+        let mut by_obj_num = HashMap::new();
+        FontCMaps::collect_cmaps_from_fonts_inner(&fonts, &doc, &mut by_obj_num, false);
+        let gbk_entry = by_obj_num.get(&gbk_key).expect("GBK encoding CMap");
+        let unigb_entry = by_obj_num.get(&unigb_key).expect("UniGB encoding CMap");
+        assert!(gbk_entry.primary.char_map.len() > 20_000);
+        assert!(unigb_entry.primary.char_map.len() > 20_000);
     }
 
     #[test]

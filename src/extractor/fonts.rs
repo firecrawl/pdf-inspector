@@ -945,6 +945,9 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
         if desc_fonts.is_empty() {
             return None;
         }
+        if !is_identity {
+            return crate::tounicode::type0_predefined_cmap_lookup_key(font_dict, &desc_fonts[0]);
+        }
         let cid_font_dict = resolve_dict(doc, &desc_fonts[0])?;
         let font_descriptor = cid_font_dict
             .get(b"FontDescriptor")
