@@ -2693,6 +2693,15 @@ fn columns_match(a: &[ColumnRegion], b: &[ColumnRegion]) -> bool {
     })
 }
 
+// NOTE on merge unions: `detect_columns` returns contiguous partitions —
+// adjacent regions share their boundary coordinate — so merging two bands
+// whose boundaries disagree produces union partitions that overlap by the
+// disagreement. That zone is bounded by GUTTER_TOLERANCE, items inside it
+// are split by greatest-overlap bucketing proportionally, and a "reject
+// overlapping unions" guard is unimplementable against partitions: with
+// shared boundaries it degenerates to exact-equality matching and rejects
+// every legitimate merge.
+
 /// Band-segmented page layout: the region-segmentation path used when the
 /// page-level column model cannot represent the page.
 ///
@@ -3186,36 +3195,46 @@ mod tests {
         );
     }
 
+    /// Two-column band with a controllable gutter: the left column runs
+    /// `50..(50 + 6·left_chars)`, the right column starts at `right_x`.
+    /// The 6-char tag prefix ("LA00 x") is included in `left_chars`, so a
+    /// band's left-column width — and with it its gutter — is exact.
+    fn gutter_band(
+        items: &mut Vec<TextItem>,
+        y_top: f32,
+        left_chars: usize,
+        right_x: f32,
+        tag: &str,
+    ) {
+        for i in 0..12 {
+            let y = y_top - i as f32 * 14.0;
+            items.push(make_item(
+                1,
+                50.0,
+                y,
+                &format!("L{tag}{i:02} {}", "x".repeat(left_chars - 6)),
+            ));
+            items.push(make_item(
+                1,
+                right_x,
+                y,
+                &format!("R{tag}{i:02} {}", "x".repeat(29)),
+            ));
+        }
+    }
+
     #[test]
     fn banded_layout_merge_anchors_on_founding_band() {
-        // Three bands in one flow: the founder, a band whose gutter sits
-        // ~22pt right of it (inside GUTTER_TOLERANCE), and a band identical
-        // to the founder. Matching against the founder's raw columns keeps
-        // the whole chain merged — union widening must never drift the run
-        // away from bands identical to its own first member.
+        // Invariant lock (not a differential regression test — the pre-fix
+        // union also accepts this shape, since one merge keeps the union
+        // gutter within tolerance of both constituents): the founder, a
+        // band whose gutter sits ~23pt right of it, and a band identical to
+        // the founder must all flow as one run. The differential coverage
+        // for the anchor rule is banded_layout_rejects_creeping_drift.
         let mut items = Vec::new();
-        let mut band = |y_top: f32, left_chars: usize, right_x: f32, tag: &str| {
-            for i in 0..12 {
-                let y = y_top - i as f32 * 14.0;
-                // Tag prefix is 5 chars ("LA00 "), padding keeps each
-                // band's left-column width — and so its gutter — exact.
-                items.push(make_item(
-                    1,
-                    50.0,
-                    y,
-                    &format!("L{tag}{i:02} {}", "x".repeat(left_chars - 6)),
-                ));
-                items.push(make_item(
-                    1,
-                    right_x,
-                    y,
-                    &format!("R{tag}{i:02} {}", "x".repeat(29)),
-                ));
-            }
-        };
-        band(700.0, 38, 330.0, "A"); // gutter mid ~304
-        band(460.0, 42, 352.0, "B"); // gutter mid ~327 (+23, inside tolerance)
-        band(220.0, 38, 330.0, "C"); // identical to founder
+        gutter_band(&mut items, 700.0, 38, 330.0, "A"); // gutter mid ~304
+        gutter_band(&mut items, 460.0, 42, 352.0, "B"); // mid ~327 (+23)
+        gutter_band(&mut items, 220.0, 38, 330.0, "C"); // identical to founder
         let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
             .expect("multi-column bands on a single-column page must engage");
         let order = joined_order(&lines);
@@ -3223,6 +3242,27 @@ mod tests {
             order.find("LC00").unwrap() < order.find("RA00").unwrap(),
             "founder-identical band must stay in the founder's run \
              (its left column reads before any right column): {order}"
+        );
+    }
+
+    #[test]
+    fn banded_layout_rejects_creeping_drift() {
+        // The genuine drift regression: band C's gutter (mid ~340) is
+        // within tolerance of the moving union after A+B merge (mid ~316,
+        // the intersection of A's and B's gutters) but 36pt from the
+        // founder. Pre-anchor code admitted C into the run; matching
+        // against the founder's raw columns must reject it, so C reads as
+        // its own sequential band after the A+B run completes.
+        let mut items = Vec::new();
+        gutter_band(&mut items, 700.0, 38, 330.0, "A"); // gutter mid ~304
+        gutter_band(&mut items, 460.0, 42, 352.0, "B"); // mid ~327 (+23)
+        gutter_band(&mut items, 220.0, 45, 360.0, "C"); // mid ~340 (+36)
+        let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
+            .expect("multi-column bands on a single-column page must engage");
+        let order = joined_order(&lines);
+        assert!(
+            order.find("RA00").unwrap() < order.find("LC00").unwrap(),
+            "a band beyond tolerance of the founder must not join its run: {order}"
         );
     }
 
