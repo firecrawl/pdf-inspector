@@ -635,7 +635,12 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
         }
     }
 
-    let is_parallel = !has_compact_header
+    // A compact header row is evidence for a real table — unless cross-row
+    // prose continuations outnumber the rows, which no genuine table
+    // produces: the "header" is then just two short line fragments at the
+    // top of parallel prose columns.
+    let header_blocks = has_compact_header && continuation_fragments < table.cells.len();
+    let is_parallel = !header_blocks
         && non_empty >= 5
         // Independent prose columns have asynchronous line/paragraph breaks;
         // a fully populated grid is positive evidence for a real descriptive
@@ -1375,7 +1380,6 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             chart_page_prose_column_split(&page_layout_items)
                 .filter(|&split_x| chart_spans_prose_split(region, split_x))
         });
-        let chart_prose_columns = chart_prose_split.is_some();
 
         // Check for side-by-side table layout using the original items. Sparse
         // numeric cells need table context before they can be distinguished
@@ -1616,10 +1620,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     if subset_items.len() < min_items {
                         return;
                     }
-                    // Keep body-font detection available on chart pages: a real
-                    // table can share the prose anchors. Reject only candidates
-                    // whose cells prove they are parallel prose fragments.
-                    let reject_parallel_prose = chart_prose_columns && !was_split;
+                    // Reject candidates whose cells prove they are parallel
+                    // prose fragments — the shape produced when the body-font
+                    // pass projects a multi-column text page onto one table
+                    // grid (two-column reference sections are the classic
+                    // case). The check needs internal transition evidence
+                    // (unterminated cells flowing into lowercase starts in
+                    // the same column), so genuine tables with long cells
+                    // pass. Band-split retries stay exempt: they exist for
+                    // tables that only assemble after recombining bands.
+                    let reject_parallel_prose = !was_split;
                     let tables = detect_tables_with_page_width(
                         subset_items,
                         base_size,
