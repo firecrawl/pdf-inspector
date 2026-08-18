@@ -462,15 +462,6 @@ fn try_xy_cut_split(
     ])
 }
 
-/// Check whether each proposed column contains paragraph-like content.
-///
-/// Groups items per column into rough lines by Y-proximity, then measures
-/// what fraction of those lines span a significant portion of the column
-/// width. Two-column prose (justified or ragged-right) produces lines that
-/// fill most of the column width. Tables, forms, and checklists produce
-/// short scattered items that don't.
-///
-/// Returns true only when *every* column passes a minimum prose density.
 /// A prose line must span at least this fraction of its column's width to
 /// count as "full" — shared by the gate's ratio and run measurements.
 const LINE_FILL_THRESHOLD: f32 = 0.45;
@@ -538,6 +529,18 @@ impl ProseLineStats {
     }
 }
 
+/// Check whether each proposed column contains paragraph-like content.
+///
+/// Groups items per column into rough lines by Y-proximity, then measures
+/// what fraction of those lines span a significant portion of the column
+/// width. Two-column prose (justified or ragged-right) produces lines that
+/// fill most of the column width. Tables, forms, and checklists produce
+/// short scattered items that don't. A column whose global ratio is diluted
+/// by a figure still qualifies through a sustained run of consecutive
+/// full-width lines at normal leading — a paragraph block scattered
+/// layouts cannot produce.
+///
+/// Returns true only when *every* column passes the prose evidence.
 fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
     const Y_TOL: f32 = 3.0; // y-proximity to group items into the same line
     const MIN_PROSE_RATIO: f32 = 0.40; // ≥40% of lines must be "full"...
