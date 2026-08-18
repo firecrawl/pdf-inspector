@@ -462,19 +462,95 @@ fn try_xy_cut_split(
     ])
 }
 
+/// A prose line must span at least this fraction of its column's width to
+/// count as "full" — shared by the gate's ratio and run measurements.
+const LINE_FILL_THRESHOLD: f32 = 0.45;
+
+/// Per-column line measurements backing the prose-evidence predicates in
+/// [`columns_have_prose`]: how many grouped lines exist, how many are
+/// "full" (span most of the column), the longest *vertically contiguous*
+/// run of full lines, and the item count per line.
+#[derive(Default)]
+struct ProseLineStats {
+    full_lines: usize,
+    total_lines: usize,
+    total_items: usize,
+    current_run: usize,
+    best_run: usize,
+    previous_line_y: Option<f32>,
+    previous_line_height: f32,
+}
+
+impl ProseLineStats {
+    /// A run only counts as a paragraph block while lines follow at normal
+    /// leading; a full line resuming after a figure-sized vertical gap
+    /// starts a new run rather than extending the previous one.
+    const MAX_LEADING_FACTOR: f32 = 2.5;
+
+    fn flush_line(&mut self, line_items: &[&TextItem], col: &ColumnRegion, col_width: f32) {
+        if line_items.is_empty() {
+            return;
+        }
+        self.total_lines += 1;
+        self.total_items += line_items.len();
+
+        let line_y = line_items[0].y;
+        let line_height = line_items
+            .iter()
+            .map(|i| i.height)
+            .fold(0.0_f32, f32::max)
+            .max(1.0);
+        if let Some(previous_y) = self.previous_line_y {
+            let leading = (previous_y - line_y).abs();
+            if leading > self.previous_line_height.max(line_height) * Self::MAX_LEADING_FACTOR {
+                self.current_run = 0;
+            }
+        }
+        self.previous_line_y = Some(line_y);
+        self.previous_line_height = line_height;
+
+        // Compute the span of text on this line within the column
+        let left = line_items
+            .iter()
+            .map(|i| i.x.max(col.x_min))
+            .fold(f32::INFINITY, f32::min);
+        let right = line_items
+            .iter()
+            .map(|i| (i.x + effective_width(i)).min(col.x_max))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let span = (right - left).max(0.0);
+        if span >= col_width * LINE_FILL_THRESHOLD {
+            self.full_lines += 1;
+            self.current_run += 1;
+            self.best_run = self.best_run.max(self.current_run);
+        } else {
+            self.current_run = 0;
+        }
+    }
+}
+
 /// Check whether each proposed column contains paragraph-like content.
 ///
 /// Groups items per column into rough lines by Y-proximity, then measures
 /// what fraction of those lines span a significant portion of the column
 /// width. Two-column prose (justified or ragged-right) produces lines that
 /// fill most of the column width. Tables, forms, and checklists produce
-/// short scattered items that don't.
+/// short scattered items that don't. A column whose global ratio is diluted
+/// by a figure still qualifies through a sustained run of consecutive
+/// full-width lines at normal leading — a paragraph block scattered
+/// layouts cannot produce.
 ///
-/// Returns true only when *every* column passes a minimum prose density.
+/// Returns true only when *every* column passes the prose evidence.
 fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
     const Y_TOL: f32 = 3.0; // y-proximity to group items into the same line
-    const LINE_FILL_THRESHOLD: f32 = 0.45; // line must span ≥45% of column width
-    const MIN_PROSE_RATIO: f32 = 0.40; // ≥40% of lines must be "full"
+    const MIN_PROSE_RATIO: f32 = 0.40; // ≥40% of lines must be "full"...
+                                       // ...or the column contains a sustained paragraph block: this many
+                                       // CONSECUTIVE full lines. A prose column hosting a figure + caption can
+                                       // fall under the global ratio (the fragments dilute it), but the
+                                       // scattered layouts this gate exists to reject — tables, TOCs,
+                                       // checklists, forms — cannot produce an unbroken block of full-width
+                                       // lines.
+    const MIN_PROSE_RUN: usize = 6;
     const MIN_LINES: usize = 8; // need enough lines to judge
     const MIN_COL_WIDTH: f32 = 120.0; // columns must be ≥120pt (not narrow sidebars/fragments)
     const MAX_AVG_ITEMS_PER_LINE: f32 = 3.5; // prose has 1-3 items/line; tables/forms have 4+
@@ -504,35 +580,9 @@ fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
         sorted.sort_by(|a, b| b.y.total_cmp(&a.y));
 
         // Group into lines by Y-proximity and measure fill + item count
-        let mut full_lines = 0usize;
-        let mut total_lines = 0usize;
-        let mut total_items_in_lines = 0usize;
+        let mut stats = ProseLineStats::default();
         let mut line_items: Vec<&TextItem> = Vec::new();
         let mut line_y = f32::NAN;
-
-        let flush_line = |line_items: &[&TextItem],
-                          full: &mut usize,
-                          total: &mut usize,
-                          total_items: &mut usize| {
-            if line_items.is_empty() {
-                return;
-            }
-            *total += 1;
-            *total_items += line_items.len();
-            // Compute the span of text on this line within the column
-            let left = line_items
-                .iter()
-                .map(|i| i.x.max(col.x_min))
-                .fold(f32::INFINITY, f32::min);
-            let right = line_items
-                .iter()
-                .map(|i| (i.x + effective_width(i)).min(col.x_max))
-                .fold(f32::NEG_INFINITY, f32::max);
-            let span = (right - left).max(0.0);
-            if span >= col_width * LINE_FILL_THRESHOLD {
-                *full += 1;
-            }
-        };
 
         for item in &sorted {
             if line_items.is_empty() || (line_y - item.y).abs() < Y_TOL {
@@ -541,35 +591,29 @@ fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
                 }
                 line_items.push(item);
             } else {
-                flush_line(
-                    &line_items,
-                    &mut full_lines,
-                    &mut total_lines,
-                    &mut total_items_in_lines,
-                );
+                stats.flush_line(&line_items, col, col_width);
                 line_items.clear();
                 line_y = item.y;
                 line_items.push(item);
             }
         }
-        flush_line(
-            &line_items,
-            &mut full_lines,
-            &mut total_lines,
-            &mut total_items_in_lines,
-        );
+        stats.flush_line(&line_items, col, col_width);
 
-        if total_lines < MIN_LINES {
+        if stats.total_lines < MIN_LINES {
             return false;
         }
 
+        let full_lines = stats.full_lines;
+        let total_lines = stats.total_lines;
+        let best_run = stats.best_run;
+        let total_items_in_lines = stats.total_items;
         let ratio = full_lines as f32 / total_lines as f32;
         let avg_items = total_items_in_lines as f32 / total_lines as f32;
         debug!(
-            "columns_have_prose: col [{:.0}..{:.0}] lines={} full={} ratio={:.2} avg_items={:.1}",
-            col.x_min, col.x_max, total_lines, full_lines, ratio, avg_items
+            "columns_have_prose: col [{:.0}..{:.0}] lines={} full={} ratio={:.2} run={} avg_items={:.1}",
+            col.x_min, col.x_max, total_lines, full_lines, ratio, best_run, avg_items
         );
-        if ratio < MIN_PROSE_RATIO {
+        if ratio < MIN_PROSE_RATIO && best_run < MIN_PROSE_RUN {
             return false;
         }
         // Tables and forms tend to have many small items per line (one per cell),
@@ -2565,6 +2609,85 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    #[test]
+    fn prose_gate_accepts_figure_diluted_column_via_run() {
+        // A prose column hosting a figure: 9 consecutive full-width lines
+        // (a paragraph block) followed by many short caption/figure
+        // fragments. The global full-line ratio falls under 40%, but the
+        // sustained run proves flowing prose.
+        let mut items: Vec<TextItem> = Vec::new();
+        for line in 0..9 {
+            // full-width prose line, ~230pt wide in a 250pt column
+            items.push(make_item(
+                1,
+                10.0,
+                700.0 - line as f32 * 14.0,
+                &"m".repeat(38),
+            ));
+        }
+        for line in 0..16 {
+            // short figure/caption fragments
+            items.push(make_item(1, 60.0, 560.0 - line as f32 * 14.0, "cap"));
+        }
+        let column = ColumnRegion {
+            x_min: 0.0,
+            x_max: 250.0,
+        };
+        let refs: Vec<&TextItem> = items.iter().collect();
+        assert!(columns_have_prose(&[column], &refs));
+    }
+
+    #[test]
+    fn prose_gate_run_requires_vertical_continuity() {
+        // Full-width lines separated by figure-sized vertical gaps are not
+        // a paragraph block: the run must reset across large leading, so a
+        // column of scattered wide labels stays rejected.
+        let mut items: Vec<TextItem> = Vec::new();
+        for line in 0..6 {
+            // Wide labels, sequence-consecutive but 90pt apart — far beyond
+            // normal leading. Without the continuity rule they would count
+            // as a 6-line paragraph block.
+            items.push(make_item(
+                1,
+                10.0,
+                720.0 - line as f32 * 90.0,
+                &"m".repeat(38),
+            ));
+        }
+        for line in 0..12 {
+            // Short fragments below, keeping total lines high and the
+            // global full-line ratio (6/18) under the 40% bar.
+            items.push(make_item(1, 60.0, 150.0 - line as f32 * 12.0, "box"));
+        }
+        let column = ColumnRegion {
+            x_min: 0.0,
+            x_max: 250.0,
+        };
+        let refs: Vec<&TextItem> = items.iter().collect();
+        assert!(!columns_have_prose(&[column], &refs));
+    }
+
+    #[test]
+    fn prose_gate_rejects_scattered_short_lines() {
+        // Checklist/form-like column: no sustained block of full lines and
+        // a low global ratio must still be rejected.
+        let mut items: Vec<TextItem> = Vec::new();
+        for line in 0..24 {
+            let text = if line % 4 == 0 {
+                "m".repeat(38)
+            } else {
+                "box".to_string()
+            };
+            items.push(make_item(1, 10.0, 700.0 - line as f32 * 14.0, &text));
+        }
+        let column = ColumnRegion {
+            x_min: 0.0,
+            x_max: 250.0,
+        };
+        let refs: Vec<&TextItem> = items.iter().collect();
+        assert!(!columns_have_prose(&[column], &refs));
     }
 
     /// Generate dense items in a horizontal zone across many Y positions.

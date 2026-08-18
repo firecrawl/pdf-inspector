@@ -31,6 +31,17 @@ use super::{
 /// Bounds live rendered-page memory while preserving small OCR batches.
 const OCR_PAGE_CHUNK_SIZE: usize = 4;
 
+/// Pages rendered and held in memory per OCR batch. A parallel engine gets
+/// three waves of work per batch so its workers are not starved at chunk
+/// barriers; a sequential engine keeps the small memory-bounding default.
+/// Engine-reported concurrency is a trait hook, so it is clamped before
+/// sizing anything from it — this helper exists to bound rendered-page
+/// memory and must not let an engine inflate it arbitrarily.
+fn ocr_page_chunk_size(engine_concurrency: usize) -> usize {
+    const MAX_ENGINE_CONCURRENCY: usize = 8;
+    (engine_concurrency.clamp(1, MAX_ENGINE_CONCURRENCY) * 3).max(OCR_PAGE_CHUNK_SIZE)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OcrEngineCacheKey {
     model_root: PathBuf,
@@ -443,7 +454,7 @@ where
     let mut render_time_ms = 0u64;
     let mut ocr_time_ms = 0u64;
 
-    for chunk in routed_pages.chunks(OCR_PAGE_CHUNK_SIZE) {
+    for chunk in routed_pages.chunks(ocr_page_chunk_size(engine.preferred_page_concurrency())) {
         let native_chunk = chunk
             .iter()
             .map(|page_number| {
@@ -926,6 +937,19 @@ pub enum OcrPipelineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_size_scales_with_engine_concurrency() {
+        // Sequential engines keep the memory-bounding default.
+        assert_eq!(ocr_page_chunk_size(1), OCR_PAGE_CHUNK_SIZE);
+        // Parallel engines get three waves of work per batch.
+        assert_eq!(ocr_page_chunk_size(3), 9);
+        assert_eq!(ocr_page_chunk_size(2), 6);
+        // Engine-reported concurrency is untrusted: clamp before sizing so a
+        // misbehaving engine cannot inflate rendered-page memory or overflow.
+        assert_eq!(ocr_page_chunk_size(0), OCR_PAGE_CHUNK_SIZE);
+        assert_eq!(ocr_page_chunk_size(usize::MAX), 24);
+    }
 
     struct TrackingRenderer {
         batches: Mutex<Vec<Vec<u32>>>,

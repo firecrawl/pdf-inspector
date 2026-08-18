@@ -237,6 +237,13 @@ pub trait OcrEngine: Send + Sync {
         pages: &[RenderedPage],
         options: &OcrOptions,
     ) -> Result<Vec<OcrPage>, Self::Error>;
+
+    /// Number of pages this engine can process concurrently in one
+    /// `recognize` call. The pipeline sizes its page batches from this so a
+    /// parallel engine is not starved by small chunks; `1` means sequential.
+    fn preferred_page_concurrency(&self) -> usize {
+        1
+    }
 }
 
 #[cfg(test)]

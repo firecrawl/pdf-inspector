@@ -1,11 +1,14 @@
 //! PP-OCRv6 Small implementation backed by OAR and ONNX Runtime.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use image::RgbImage;
 use oar_ocr::core::config::onnx::OrtSessionConfig;
-use oar_ocr::oarocr::{OAROCRBuilder, OAROCR};
+use oar_ocr::domain::tasks::TextDetectionConfig;
+use oar_ocr::oarocr::{EdgeProcessor, TextCroppingProcessor};
+use oar_ocr::predictors::{TextDetectionPredictor, TextRecognitionPredictor};
 use oar_ocr::processors::BoundingBox;
 use thiserror::Error;
 
@@ -70,15 +73,168 @@ pub enum OarOcrError {
     Backend(#[from] oar_ocr::core::OCRError),
 }
 
-/// CPU PP-OCRv6 Small engine using OAR's detection and recognition pipeline.
+/// Standard detection input cap. PP-OCR detection resizes each page so its
+/// longest side fits this before inference; it is the PaddleOCR default and
+/// is sufficient for ordinary body text at 150 DPI.
+const DETECTION_LIMIT_STANDARD: u32 = 960;
+
+/// Escalated detection input cap for dense fine-print pages. Beyond this the
+/// measured recall plateaus while inference cost keeps growing.
+const DETECTION_LIMIT_ESCALATED: u32 = 2560;
+
+/// Hard ceiling protecting detection from out-of-memory on giant renders.
+const DETECTION_MAXIMUM_SIDE: u32 = 4000;
+
+/// Escalate only for pages dense with small text: at least this many detected
+/// regions in the standard pass...
+const ESCALATION_MINIMUM_REGIONS: usize = 80;
+
+/// ...whose median height, at detection scale, is below this. Calibrated at
+/// `unclip_ratio` 2.0 (the expansion inflates measured heights, so this
+/// constant is coupled to [`detection_config`]): dense fine-print pages that
+/// gain from escalation measure 12.0–14.2 px with 144+ regions; the nearest
+/// non-gaining page above the region gate (an engineering drawing) measures
+/// 15.7 px, and prose/typewriter pages measure 14.5 px+ with too few
+/// regions to qualify at all.
+const ESCALATION_MAXIMUM_MEDIAN_HEIGHT: f32 = 15.0;
+
+/// One worker's model sessions: a standard-limit detector plus a recognizer,
+/// and that worker's own lazily built escalated-limit detector.
+/// Staged (detect, crop, recognize as separate calls) rather than OAROCR's
+/// combined `predict` so an escalated page replaces only its detection pass —
+/// recognition runs exactly once, on the final region set.
+struct OcrWorker {
+    detector: TextDetectionPredictor,
+    recognizer: TextRecognitionPredictor,
+    /// Built on this worker's first dense fine-print page. `None` inside the
+    /// cell records a failed build so it is not retried per page.
+    escalated: std::sync::OnceLock<Option<TextDetectionPredictor>>,
+}
+
+/// CPU PP-OCRv6 Small engine using OAR's detection and recognition components.
 ///
 /// Construction accepts only [`ModelPaths`] that have already passed
 /// pdf-inspector's manifest size and SHA-256 verification. OAR's independent
 /// model auto-download feature is deliberately not enabled.
-#[derive(Debug)]
 pub struct OarOcrEngine {
-    pipeline: OAROCR,
+    workers: Vec<OcrWorker>,
+    detection_path: PathBuf,
+    intra_threads: usize,
+    /// Present only when more than one worker exists; sized to match.
+    pool: Option<rayon::ThreadPool>,
     model: ModelIdentity,
+}
+
+impl std::fmt::Debug for OarOcrEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OarOcrEngine")
+            .field("workers", &self.workers.len())
+            .field("parallel", &self.pool.is_some())
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+/// Pages processed concurrently: one OAROCR pipeline (and its ONNX sessions)
+/// per worker, because oar-ocr serializes each session behind a mutex.
+/// Measured on CPU: workers beyond 3 stop scaling (memory-bandwidth bound)
+/// and each worker is fastest with 2 intra-op threads.
+fn pipeline_concurrency() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    (cores / 4).clamp(1, 3)
+}
+
+fn intra_threads_per_pipeline(concurrency: usize) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    if concurrency > 1 {
+        2
+    } else {
+        cores.min(4)
+    }
+}
+
+/// True when a standard-limit detection pass over a downscaled page shows
+/// dense, small text: the page deserves a second pass at the escalated limit.
+fn should_escalate_detection(
+    median_detection_height: f32,
+    region_count: usize,
+    downscale: f32,
+) -> bool {
+    downscale < 1.0
+        && region_count >= ESCALATION_MINIMUM_REGIONS
+        && median_detection_height < ESCALATION_MAXIMUM_MEDIAN_HEIGHT
+}
+
+/// Median detected-region height in detection-input pixels: original-image
+/// heights multiplied by the downscale detection applied.
+fn median_detection_height(heights: &mut [f32], downscale: f32) -> f32 {
+    if heights.is_empty() {
+        return f32::MAX;
+    }
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = heights.len() / 2;
+    let median = if heights.len().is_multiple_of(2) {
+        (heights[middle - 1] + heights[middle]) / 2.0
+    } else {
+        heights[middle]
+    };
+    median * downscale
+}
+
+/// Detection preprocessing config at a given input cap.
+///
+/// Supplying an explicit config suppresses OAROCR's "general" text-type
+/// overrides, so every field the override would have set must be pinned
+/// here to match what the combined pipeline ran with before the staged
+/// split: score 0.3 and box 0.6 (equal to [`TextDetectionConfig`]'s
+/// defaults) and unclip 2.0 (the default is 1.5 — leaving it would
+/// silently shrink detection-box expansion and risk clipping edge glyphs).
+fn detection_config(detection_limit: u32) -> TextDetectionConfig {
+    TextDetectionConfig {
+        limit_side_len: Some(detection_limit),
+        limit_type: Some(oar_ocr::processors::LimitType::Max),
+        max_side_len: Some(DETECTION_MAXIMUM_SIDE),
+        unclip_ratio: 2.0,
+        ..Default::default()
+    }
+}
+
+fn build_detector(
+    detection: &std::path::Path,
+    detection_limit: u32,
+    intra_threads: usize,
+) -> Result<TextDetectionPredictor, OarOcrError> {
+    Ok(TextDetectionPredictor::builder()
+        .with_config(detection_config(detection_limit))
+        .with_ort_config(ocr_session_config(intra_threads))
+        .build(detection)?)
+}
+
+fn build_workers(
+    detection: &std::path::Path,
+    recognition: &std::path::Path,
+    dictionary: &std::path::Path,
+    count: usize,
+    intra_threads: usize,
+) -> Result<Vec<OcrWorker>, OarOcrError> {
+    let mut workers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let detector = build_detector(detection, DETECTION_LIMIT_STANDARD, intra_threads)?;
+        let recognizer = TextRecognitionPredictor::builder()
+            .dict_path(dictionary)
+            .with_ort_config(ocr_session_config(intra_threads))
+            .build(recognition)?;
+        workers.push(OcrWorker {
+            detector,
+            recognizer,
+            escalated: std::sync::OnceLock::new(),
+        });
+    }
+    Ok(workers)
 }
 
 impl OarOcrEngine {
@@ -89,36 +245,169 @@ impl OarOcrEngine {
         let recognition = required_model(models, ModelArtifactKind::TextRecognition)?;
         let dictionary = required_model(models, ModelArtifactKind::CharacterDictionary)?;
 
-        let pipeline = OAROCRBuilder::new(detection, recognition, dictionary)
-            .ort_session(ocr_session_config())
-            // Document line crops often have very different widths. Keeping
-            // CPU recognition batches at one avoids padding every crop to the
-            // widest line, reducing both inference work and peak memory.
-            .region_batch_size(1)
-            .build()?;
+        let concurrency = pipeline_concurrency();
+        let intra_threads = intra_threads_per_pipeline(concurrency);
+        let workers = build_workers(
+            detection,
+            recognition,
+            dictionary,
+            concurrency,
+            intra_threads,
+        )?;
+        let pool = if concurrency > 1 {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(concurrency)
+                .build()
+                .ok()
+        } else {
+            None
+        };
         let model = ModelIdentity::new(models.manifest_id(), models.revision());
-        Ok(Self { pipeline, model })
+        Ok(Self {
+            workers,
+            detection_path: detection.to_path_buf(),
+            intra_threads,
+            pool,
+            model,
+        })
+    }
+
+    /// This worker's escalated-limit detector, built on first use.
+    fn escalated_detector<'w>(&self, worker: &'w OcrWorker) -> Option<&'w TextDetectionPredictor> {
+        worker
+            .escalated
+            .get_or_init(|| {
+                match build_detector(
+                    &self.detection_path,
+                    DETECTION_LIMIT_ESCALATED,
+                    self.intra_threads,
+                ) {
+                    Ok(detector) => Some(detector),
+                    Err(error) => {
+                        log::warn!(
+                            "escalated OCR detection unavailable, keeping standard pass: {error}"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Detects text regions for one page: a standard-limit pass first, then —
+    /// for pages the standard limit demonstrably under-resolves — a second
+    /// pass at the escalated limit whose boxes replace the first. Pages whose
+    /// render dwarfs even the escalated limit skip the standard pass outright.
+    fn detect_boxes(
+        &self,
+        page: &RenderedPage,
+        image: &Arc<RgbImage>,
+        worker: &OcrWorker,
+    ) -> Result<Vec<BoundingBox>, OarOcrError> {
+        let longest_side = page.width().max(page.height()) as f32;
+
+        // A page more than twice the standard limit loses over half its
+        // resolution before detection even runs; go straight to the escalated
+        // detector instead of paying a doomed standard pass.
+        if longest_side > (DETECTION_LIMIT_STANDARD * 2) as f32 {
+            if let Some(escalated) = self.escalated_detector(worker) {
+                log::debug!(
+                    "page {}: direct escalated detection (render {longest_side}px)",
+                    page.page(),
+                );
+                match detect_with(escalated, image, page.page()) {
+                    Ok(boxes) => return Ok(boxes),
+                    Err(error) => {
+                        // Same degradation as the adaptive branch below: a
+                        // failing escalated pass falls back to standard
+                        // detection instead of failing the page outright.
+                        // Return the standard boxes directly — the adaptive
+                        // trigger would only re-invoke the detector that
+                        // just failed (repeating an OOM on a dense page).
+                        log::warn!(
+                            "page {}: direct escalated detection failed, using standard pass: {error}",
+                            page.page()
+                        );
+                        return detect_with(&worker.detector, image, page.page());
+                    }
+                }
+            }
+        }
+
+        let detections = detect_with(&worker.detector, image, page.page())?;
+
+        // Dense fine-print pages (broadsheets, pricing sheets) lose most of
+        // their text when detection downscales them to the standard limit.
+        // When the standard pass shows many regions of tiny detection-scale
+        // height, rerun detection at the escalated limit.
+        let downscale = (DETECTION_LIMIT_STANDARD as f32 / longest_side).min(1.0);
+        let mut heights: Vec<f32> = detections.iter().map(polygon_height).collect();
+        let median = median_detection_height(&mut heights, downscale);
+        log::trace!(
+            "page {}: standard pass {} regions, median height {:.1}px at detection scale",
+            page.page(),
+            detections.len(),
+            median
+        );
+        if should_escalate_detection(median, detections.len(), downscale) {
+            log::debug!(
+                "page {}: escalating detection ({} regions, median height {:.1}px at detection scale)",
+                page.page(),
+                detections.len(),
+                median
+            );
+            if let Some(escalated) = self.escalated_detector(worker) {
+                match detect_with(escalated, image, page.page()) {
+                    Ok(escalated_boxes) => return Ok(escalated_boxes),
+                    Err(error) => {
+                        log::warn!(
+                            "page {}: escalated detection failed, keeping standard pass: {error}",
+                            page.page()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(detections)
     }
 
     fn recognize_page(
         &self,
         page: &RenderedPage,
         options: &OcrOptions,
+        worker: usize,
     ) -> Result<OcrPage, OarOcrError> {
         let started = Instant::now();
-        let image = rendered_page_to_rgb(page)?;
-        let result = self
-            .pipeline
-            .predict(vec![image])?
-            .into_iter()
-            .next()
-            .ok_or(OarOcrError::MissingPageResult { page: page.page() })?;
+        let worker = &self.workers[worker % self.workers.len()];
+        let image = Arc::new(rendered_page_to_rgb(page)?);
+        let boxes = self.detect_boxes(page, &image, worker)?;
+        // Reading order, matching what the combined pipeline produced.
+        let boxes = oar_ocr::processors::sort_quad_boxes(&boxes);
 
-        let mut spans = Vec::with_capacity(result.text_regions.len());
+        // Same rotation-aware cropping the combined pipeline uses.
+        let crops =
+            TextCroppingProcessor::new(true).process((Arc::clone(&image), boxes.clone()))?;
+        drop(image);
+
+        let recognizer = &worker.recognizer;
+        let mut spans = Vec::with_capacity(boxes.len());
         let mut invalid_geometry = 0usize;
         let mut missing_recognition = 0usize;
-        for region in result.text_regions {
-            let (Some(text), Some(confidence)) = (region.text, region.confidence) else {
+        for (bounding_box, crop) in boxes.iter().zip(crops) {
+            let Some(crop) = crop else {
+                invalid_geometry += 1;
+                continue;
+            };
+            // One crop per call: document line crops often have very
+            // different widths, and batching pads every crop to the widest
+            // line. Measured on CPU, batched recognition (even width-sorted)
+            // is 2–3× slower than per-crop calls.
+            let crop = Arc::try_unwrap(crop).unwrap_or_else(|shared| (*shared).clone());
+            let recognized = recognizer.predict(vec![crop])?;
+            let (Some(text), Some(confidence)) = (
+                recognized.texts.into_iter().next(),
+                recognized.scores.into_iter().next(),
+            ) else {
                 missing_recognition += 1;
                 continue;
             };
@@ -131,16 +420,21 @@ impl OarOcrEngine {
                 continue;
             }
 
-            let polygon = region.dt_poly.as_ref().unwrap_or(&region.bounding_box);
-            let Some(polygon) = bounding_box_to_quad(polygon, page.width(), page.height()) else {
+            let Some(polygon) = bounding_box_to_quad(bounding_box, page.width(), page.height())
+            else {
                 invalid_geometry += 1;
                 continue;
             };
             spans.push(OcrSpan {
-                text: text.to_string(),
+                text,
                 polygon,
                 confidence,
-                orientation_degrees: region.orientation_angle,
+                // The combined pipeline's orientation_angle came from the
+                // text-line-orientation classifier, a model this engine has
+                // never loaded — it was structurally None before the staged
+                // split too (the staged/combined A/B was byte-identical).
+                // Region rotation is still carried by the polygon itself.
+                orientation_degrees: None,
             });
         }
 
@@ -174,12 +468,42 @@ impl OarOcrEngine {
     }
 }
 
-fn ocr_session_config() -> OrtSessionConfig {
-    let available = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+/// Runs one detector over one page image and returns its region polygons.
+fn detect_with(
+    detector: &TextDetectionPredictor,
+    image: &Arc<RgbImage>,
+    page_number: u32,
+) -> Result<Vec<BoundingBox>, OarOcrError> {
+    let mut result = detector.predict(vec![(**image).clone()])?;
+    if result.detections.is_empty() {
+        return Err(OarOcrError::MissingPageResult { page: page_number });
+    }
+    Ok(result
+        .detections
+        .swap_remove(0)
+        .into_iter()
+        .map(|detection| detection.bbox)
+        .collect())
+}
+
+/// Vertical extent of a detection polygon in original-image pixels.
+fn polygon_height(polygon: &BoundingBox) -> f32 {
+    let mut min_y = f32::MAX;
+    let mut max_y = f32::MIN;
+    for point in &polygon.points {
+        min_y = min_y.min(point.y);
+        max_y = max_y.max(point.y);
+    }
+    if max_y > min_y {
+        max_y - min_y
+    } else {
+        0.0
+    }
+}
+
+fn ocr_session_config(intra_threads: usize) -> OrtSessionConfig {
     OrtSessionConfig::new()
-        .with_intra_threads(available.min(4))
+        .with_intra_threads(intra_threads.max(1))
         .with_inter_threads(1)
         .with_parallel_execution(false)
 }
@@ -226,10 +550,33 @@ impl OcrEngine for OarOcrEngine {
     ) -> Result<Vec<OcrPage>, Self::Error> {
         validate_options(options)?;
 
-        pages
-            .iter()
-            .map(|page| self.recognize_page(page, options))
-            .collect()
+        let Some(pool) = self.pool.as_ref().filter(|_| pages.len() > 1) else {
+            return pages
+                .iter()
+                .map(|page| self.recognize_page(page, options, 0))
+                .collect();
+        };
+        pool.install(|| {
+            use rayon::prelude::*;
+            pages
+                .par_iter()
+                .map(|page| {
+                    let worker = rayon::current_thread_index().unwrap_or(0);
+                    self.recognize_page(page, options, worker)
+                })
+                .collect()
+        })
+    }
+
+    fn preferred_page_concurrency(&self) -> usize {
+        // Without a pool, recognition runs sequentially regardless of worker
+        // count — report that honestly so the pipeline doesn't render
+        // oversized page batches for parallelism that isn't there.
+        if self.pool.is_some() {
+            self.workers.len()
+        } else {
+            1
+        }
     }
 }
 
@@ -376,10 +723,13 @@ mod tests {
 
     #[test]
     fn cpu_session_budget_is_bounded_for_small_ocr_models() {
-        let config = ocr_session_config();
+        let concurrency = pipeline_concurrency();
+        let config = ocr_session_config(intra_threads_per_pipeline(concurrency));
         assert!((1..=4).contains(&config.intra_threads.unwrap()));
         assert_eq!(config.inter_threads, Some(1));
         assert_eq!(config.parallel_execution, Some(false));
+        // Zero requests are clamped so a session always has a thread.
+        assert_eq!(ocr_session_config(0).intra_threads, Some(1));
     }
 
     fn page(format: RenderPixelFormat, stride: usize, pixels: Vec<u8>) -> RenderedPage {
@@ -492,5 +842,48 @@ mod tests {
                 .minimum_confidence(1.0)
         )
         .is_ok());
+    }
+
+    #[test]
+    fn escalation_fires_for_dense_fine_print_pages() {
+        // Measured cases (at unclip 2.0) that gain from escalation: dense
+        // tiled ad pages (12.3–14.2px, 158–286 regions) and a dense pricing
+        // sheet (12.0px, 144 regions), all downscaled by the standard limit.
+        assert!(should_escalate_detection(14.2, 186, 0.55));
+        assert!(should_escalate_detection(13.1, 286, 0.55));
+        assert!(should_escalate_detection(12.3, 158, 0.55));
+        assert!(should_escalate_detection(12.0, 144, 0.55));
+    }
+
+    #[test]
+    fn escalation_skips_ordinary_pages() {
+        // Academic prose: too few regions (and tall enough at unclip 2.0).
+        assert!(!should_escalate_detection(14.5, 47, 0.58));
+        // Engineering drawing: many regions but tall enough text.
+        assert!(!should_escalate_detection(15.7, 205, 0.58));
+        // Typewriter scan: tall text, few regions.
+        assert!(!should_escalate_detection(17.5, 77, 0.55));
+        // Page not downscaled at all: escalation cannot add pixels.
+        assert!(!should_escalate_detection(9.0, 300, 1.0));
+    }
+
+    #[test]
+    fn median_detection_height_scales_and_handles_empty() {
+        let mut heights = vec![30.0, 10.0, 20.0];
+        assert_eq!(median_detection_height(&mut heights, 0.5), 10.0);
+        // Even counts average the two middle values instead of picking the
+        // upper one, so borderline pages don't skew away from escalation.
+        let mut even = vec![10.0, 12.0, 14.0, 30.0];
+        assert_eq!(median_detection_height(&mut even, 1.0), 13.0);
+        let mut empty: Vec<f32> = Vec::new();
+        assert_eq!(median_detection_height(&mut empty, 0.5), f32::MAX);
+    }
+
+    #[test]
+    fn concurrency_derivations_stay_in_bounds() {
+        let concurrency = pipeline_concurrency();
+        assert!((1..=3).contains(&concurrency));
+        assert!(intra_threads_per_pipeline(2) == 2);
+        assert!((1..=4).contains(&intra_threads_per_pipeline(1)));
     }
 }
