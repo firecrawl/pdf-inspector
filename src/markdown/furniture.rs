@@ -27,10 +27,14 @@ use crate::types::TextLine;
 ///   pulling the run past the size cap or the gap inside it.
 /// - A block set larger than body text is a display title and stays, as
 ///   does anything past it.
-/// - Blocks with no alphabetic content ("1 / 1", folio ornaments) strip on
-///   isolation alone. A bottom block whose text starts with a digit but
-///   carries letters stays: a single-line footnote ("1 See ...") is
-///   indistinguishable from a footer credit by geometry.
+/// - Blocks with no alphabetic content strip only on the full page-indicator
+///   shape: a single short run set no larger than body text ("1 / 1", folio
+///   ornaments). Multi-cell numeric rows are form or table data and stay.
+/// - Marker-led blocks stay: digit or (digit) enumerations, symbol-marked
+///   footnotes ("† ..."), and single-lowercase-letter markers ("a See ...")
+///   are annotations that merely sit at the page edge.
+/// - Rows of three-plus item clusters stay: figure label rows and table rows
+///   share a baseline but are not one text run.
 /// - The block's total text must be short (<= 90 chars) and non-structural.
 fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
     const MIN_PAGE_LINES: usize = 8;
@@ -120,6 +124,7 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
             // or a numeric table row on an undetected borderless table —
             // never furniture. Real furniture is one text run, or two at
             // most (running title on one margin, folio on the other).
+            let mut max_clusters = 1usize;
             for &i in block {
                 let line = &lines[i];
                 let mut xs: Vec<(f32, f32)> = line
@@ -140,13 +145,19 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
                 if clusters >= 3 {
                     return None;
                 }
+                max_clusters = max_clusters.max(clusters);
             }
             let has_alpha = trimmed.chars().any(|c| c.is_alphabetic());
             if !has_alpha {
-                // Number-only display content (a cover-page year, a large
-                // date heading) is set well above body size; page indicators
-                // are set at or below it.
-                if block.iter().any(|&i| line_font(i) > body_size * 1.2) {
+                // A number-only block strips only on the full page-indicator
+                // shape: one text run, a handful of characters, set no
+                // larger than body text. Multi-cell numeric rows are form or
+                // table data, and number-only display content (a cover-page
+                // year) is set well above body size.
+                if max_clusters > 1
+                    || trimmed.chars().count() > 20
+                    || block.iter().any(|&i| line_font(i) > body_size * 1.2)
+                {
                     return None;
                 }
                 return Some(block.to_vec());
@@ -161,13 +172,21 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
             if is_structural_line(trimmed) {
                 return None;
             }
-            // A digit- or (digit)-led edge block is enumerated content —
-            // footnotes at the bottom, list/legal continuations at the top.
+            // Marker-led edge blocks are annotations, not furniture:
+            // digit- or (digit)-led enumerations (footnotes at the bottom,
+            // list/legal continuations at the top), symbol-marked footnotes
+            // ("† Estimates assume ..."), and single-lowercase-letter
+            // markers ("a See the appendix ..."). A capitalized one-letter
+            // word ("A Publication of ...") is prose, not a marker.
             let mut leading = trimmed.chars();
             let first = leading.next();
-            let digit_led = first.is_some_and(|c| c.is_ascii_digit())
-                || (first == Some('(') && leading.next().is_some_and(|c| c.is_ascii_digit()));
-            if digit_led {
+            let marker_led = first.is_some_and(|c| c.is_ascii_digit())
+                || (first == Some('(') && leading.next().is_some_and(|c| c.is_ascii_digit()))
+                || first.is_some_and(|c| matches!(c, '†' | '‡' | '§' | '¶' | '*'))
+                || trimmed.split_whitespace().next().is_some_and(|tok| {
+                    tok.chars().count() == 1 && tok.chars().all(|c| c.is_lowercase())
+                });
+            if marker_led {
                 return None;
             }
             Some(block.to_vec())
@@ -192,25 +211,6 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
         .collect()
 }
 
-/// Strip lines that repeat on many distinct pages (running headers/footers).
-///
-/// A line is considered a repeated header/footer if:
-/// 1. Its normalized text appears on `>= max(3, page_count * 30%)` distinct pages
-/// 2. It is at least 10 characters long
-/// 3. It doesn't look like a structural element (heading, list item)
-/// 4. It consistently appears in the top or bottom N distinct Y positions
-/// 5. Its Y positions across pages have low variance (consistent placement),
-///    distinguishing true headers/footers from table content that happens to
-///    land near page margins
-/// 6. It is not a decorative separator (repeated single character)
-///
-/// Additionally, TextLines at the same Y position on a page are grouped into
-/// "Y-bands." When any member of a Y-band is stripped, all siblings in that
-/// band are also stripped. This handles split column headers where individual
-/// fragments may not independently meet the frequency threshold.
-///
-/// Page numbers are stripped from line text before comparison, so headers like
-/// "Chapter 3 — Page 5" and "Chapter 3 — Page 6" are treated as the same text.
 /// Strip running headers and footers, choosing evidence by document length:
 /// three-plus pages prove furniture by cross-page repetition
 /// ([`strip_repeated_lines`]); shorter documents carry no repetition signal
@@ -271,6 +271,25 @@ fn is_decorative_separator(text: &str) -> bool {
     chars.all(|c| c == first)
 }
 
+/// Strip lines that repeat on many distinct pages (running headers/footers).
+///
+/// A line is considered a repeated header/footer if:
+/// 1. Its normalized text appears on `>= max(3, page_count * 30%)` distinct pages
+/// 2. It is at least 10 characters long
+/// 3. It doesn't look like a structural element (heading, list item)
+/// 4. It consistently appears in the top or bottom N distinct Y positions
+/// 5. Its Y positions across pages have low variance (consistent placement),
+///    distinguishing true headers/footers from table content that happens to
+///    land near page margins
+/// 6. It is not a decorative separator (repeated single character)
+///
+/// Additionally, TextLines at the same Y position on a page are grouped into
+/// "Y-bands." When any member of a Y-band is stripped, all siblings in that
+/// band are also stripped. This handles split column headers where individual
+/// fragments may not independently meet the frequency threshold.
+///
+/// Page numbers are stripped from line text before comparison, so headers like
+/// "Chapter 3 — Page 5" and "Chapter 3 — Page 6" are treated as the same text.
 fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
     if lines.is_empty() || page_count < 3 {
         return lines;
@@ -352,6 +371,12 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue;
         }
         let text = line.text();
+        // Structural checks must see the original text: normalization strips
+        // leading digits, so "1. Introduction" would otherwise lose the
+        // numbered-heading protection along with its number.
+        if is_structural_line(text.trim()) {
+            continue;
+        }
         let normalized = normalize_for_comparison(&text);
         if normalized.len() < 10 || is_decorative_separator(&normalized) {
             continue;
@@ -382,6 +407,9 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             .map(|&i| lines[i].text())
             .collect::<Vec<_>>()
             .join(" ");
+        if is_structural_line(coalesced.trim()) {
+            continue;
+        }
         let normalized = normalize_for_comparison(&coalesced);
         if normalized.len() < 10 || is_decorative_separator(&normalized) {
             continue;
@@ -674,6 +702,97 @@ mod tests {
             3,
             "multi-line footnote block must survive whole"
         );
+    }
+
+    #[test]
+    fn edge_furniture_keeps_two_cell_numeric_row() {
+        // Two numeric cells at the bottom edge: form or table data, not a
+        // page indicator, which is a single short run.
+        let mut lines = Vec::new();
+        body_page(&mut lines);
+        let mut items = Vec::new();
+        for (k, cell) in ["42.50", "38.20"].iter().enumerate() {
+            let mut item = make_item(cell, 10.0, None);
+            item.x = 50.0 + k as f32 * 200.0;
+            item.width = 40.0;
+            items.push(item);
+        }
+        lines.push(TextLine {
+            items,
+            y: 380.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        });
+        let result = strip_header_footer_lines(lines, 1);
+        assert!(
+            result.iter().any(|l| l.text().contains("42.50")),
+            "two-cell numeric row must survive as data"
+        );
+    }
+
+    #[test]
+    fn edge_furniture_keeps_symbol_and_letter_marked_footnotes() {
+        let mut lines = Vec::new();
+        body_page(&mut lines);
+        lines.push(make_line(
+            "† Estimates assume constant returns",
+            8.0,
+            1,
+            380.0,
+            None,
+        ));
+        let result = strip_header_footer_lines(lines, 1);
+        assert!(
+            result.iter().any(|l| l.text().contains("constant returns")),
+            "symbol-marked footnote must survive"
+        );
+
+        let mut lines = Vec::new();
+        body_page(&mut lines);
+        lines.push(make_line(
+            "a See the appendix for derivations",
+            8.0,
+            1,
+            380.0,
+            None,
+        ));
+        let result = strip_header_footer_lines(lines, 1);
+        assert!(
+            result.iter().any(|l| l.text().contains("appendix")),
+            "lowercase-letter-marked footnote must survive"
+        );
+    }
+
+    #[test]
+    fn repeated_numbered_heading_is_not_stripped() {
+        // The same numbered heading recurring on many pages must keep its
+        // structural protection: normalization strips the leading digit, so
+        // the check must run against the original text.
+        let mut lines = Vec::new();
+        for page in 1..=10u32 {
+            lines.push(make_line(
+                "1. Introduction to the method",
+                10.0,
+                page,
+                750.0,
+                None,
+            ));
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("unique body content words {page} {j} lorem ipsum dolor"),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 10);
+        let count = result
+            .iter()
+            .filter(|l| l.text().contains("Introduction to the method"))
+            .count();
+        assert_eq!(count, 10, "numbered headings must never be stripped");
     }
 
     #[test]
