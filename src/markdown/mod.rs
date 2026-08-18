@@ -9,6 +9,7 @@
 pub(crate) mod analysis;
 mod classify;
 mod convert;
+mod furniture;
 mod heading;
 mod postprocess;
 mod preprocess;
@@ -1149,7 +1150,7 @@ pub(crate) fn strip_repeated_header_footer_lines(
     lines: Vec<crate::types::TextLine>,
     page_count: u32,
 ) -> Vec<crate::types::TextLine> {
-    preprocess::strip_repeated_lines(lines, page_count)
+    furniture::strip_header_footer_lines(lines, page_count)
 }
 
 /// Convert positioned text items to markdown with structure detection
@@ -2106,7 +2107,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
-        preprocess::strip_repeated_lines(lines, document_page_count)
+        furniture::strip_header_footer_lines(lines, document_page_count)
     } else {
         lines
     };
