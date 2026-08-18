@@ -89,11 +89,14 @@ const DETECTION_MAXIMUM_SIDE: u32 = 4000;
 /// regions in the standard pass...
 const ESCALATION_MINIMUM_REGIONS: usize = 80;
 
-/// ...whose median height, at detection scale, is below this. Measured floor:
-/// broadsheet/fine-print pages that gain from escalation sit at 9.9–12.0 px;
-/// pages that do not (typewriter scans, academic prose, drawings) sit at
-/// 12.2 px and above.
-const ESCALATION_MAXIMUM_MEDIAN_HEIGHT: f32 = 13.0;
+/// ...whose median height, at detection scale, is below this. Calibrated at
+/// `unclip_ratio` 2.0 (the expansion inflates measured heights, so this
+/// constant is coupled to [`detection_config`]): dense fine-print pages that
+/// gain from escalation measure 12.0–14.2 px with 144+ regions; the nearest
+/// non-gaining page above the region gate (an engineering drawing) measures
+/// 15.7 px, and prose/typewriter pages measure 14.5 px+ with too few
+/// regions to qualify at all.
+const ESCALATION_MAXIMUM_MEDIAN_HEIGHT: f32 = 15.0;
 
 /// One worker's model sessions: a standard-limit detector plus a recognizer,
 /// and that worker's own lazily built escalated-limit detector.
@@ -182,14 +185,20 @@ fn median_detection_height(heights: &mut [f32], downscale: f32) -> f32 {
     median * downscale
 }
 
-/// Detection preprocessing config at a given input cap. The non-limit fields
-/// keep [`TextDetectionConfig`]'s defaults, which match what the combined
-/// OAROCR pipeline previously ran with (score 0.3, box 0.6, unclip 1.5).
+/// Detection preprocessing config at a given input cap.
+///
+/// Supplying an explicit config suppresses OAROCR's "general" text-type
+/// overrides, so every field the override would have set must be pinned
+/// here to match what the combined pipeline ran with before the staged
+/// split: score 0.3 and box 0.6 (equal to [`TextDetectionConfig`]'s
+/// defaults) and unclip 2.0 (the default is 1.5 — leaving it would
+/// silently shrink detection-box expansion and risk clipping edge glyphs).
 fn detection_config(detection_limit: u32) -> TextDetectionConfig {
     TextDetectionConfig {
         limit_side_len: Some(detection_limit),
         limit_type: Some(oar_ocr::processors::LimitType::Max),
         max_side_len: Some(DETECTION_MAXIMUM_SIDE),
+        unclip_ratio: 2.0,
         ..Default::default()
     }
 }
@@ -334,6 +343,12 @@ impl OarOcrEngine {
         let downscale = (DETECTION_LIMIT_STANDARD as f32 / longest_side).min(1.0);
         let mut heights: Vec<f32> = detections.iter().map(polygon_height).collect();
         let median = median_detection_height(&mut heights, downscale);
+        log::trace!(
+            "page {}: standard pass {} regions, median height {:.1}px at detection scale",
+            page.page(),
+            detections.len(),
+            median
+        );
         if should_escalate_detection(median, detections.len(), downscale) {
             log::debug!(
                 "page {}: escalating detection ({} regions, median height {:.1}px at detection scale)",
@@ -831,22 +846,23 @@ mod tests {
 
     #[test]
     fn escalation_fires_for_dense_fine_print_pages() {
-        // Measured cases that gain from escalation: broadsheet ad pages
-        // (median 10.0–12.0px, 151–294 regions) and a dense pricing sheet
-        // (9.9px, 142 regions), all downscaled by the standard limit.
-        assert!(should_escalate_detection(11.6, 182, 0.19));
-        assert!(should_escalate_detection(12.0, 185, 0.55));
-        assert!(should_escalate_detection(9.9, 142, 0.55));
+        // Measured cases (at unclip 2.0) that gain from escalation: dense
+        // tiled ad pages (12.3–14.2px, 158–286 regions) and a dense pricing
+        // sheet (12.0px, 144 regions), all downscaled by the standard limit.
+        assert!(should_escalate_detection(14.2, 186, 0.55));
+        assert!(should_escalate_detection(13.1, 286, 0.55));
+        assert!(should_escalate_detection(12.3, 158, 0.55));
+        assert!(should_escalate_detection(12.0, 144, 0.55));
     }
 
     #[test]
     fn escalation_skips_ordinary_pages() {
-        // Academic prose: small height but too few regions.
-        assert!(!should_escalate_detection(12.2, 47, 0.58));
+        // Academic prose: too few regions (and tall enough at unclip 2.0).
+        assert!(!should_escalate_detection(14.5, 47, 0.58));
         // Engineering drawing: many regions but tall enough text.
-        assert!(!should_escalate_detection(13.4, 205, 0.58));
+        assert!(!should_escalate_detection(15.7, 205, 0.58));
         // Typewriter scan: tall text, few regions.
-        assert!(!should_escalate_detection(17.0, 45, 0.55));
+        assert!(!should_escalate_detection(17.5, 77, 0.55));
         // Page not downscaled at all: escalation cannot add pixels.
         assert!(!should_escalate_detection(9.0, 300, 1.0));
     }
