@@ -234,7 +234,7 @@ pub(crate) fn detect_columns(
     // table-shaped split. Without this, the prose REMAINDER of a
     // table-bearing two-column page falls to single-column Y-sorting and
     // the columns interleave line by line.
-    if valleys.is_empty() && page_items.len() >= 100 {
+    if valleys.is_empty() && page_items.len() >= 30 {
         let rel_valleys = find_relative_valleys(
             &histogram,
             num_bins,
