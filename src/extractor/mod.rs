@@ -981,6 +981,8 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         return items;
     }
 
+    let narrow_column_boundaries = layout::narrow_prose_column_boundaries(&items);
+
     // Group items by (page, Y position) with 5pt tolerance
     let y_tolerance = 5.0;
     let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
@@ -1016,7 +1018,11 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
     let mut merged = Vec::new();
 
-    for (_, _, group, preserve_stream_order) in &ordered_line_groups {
+    for (page, _, group, preserve_stream_order) in &ordered_line_groups {
+        let narrow_boundaries = narrow_column_boundaries
+            .get(page)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
@@ -1060,6 +1066,9 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     break;
                 }
                 let gap = next.x - end_x;
+                if gap_crosses_narrow_column_boundary(end_x, next.x, narrow_boundaries) {
+                    break;
+                }
                 let x_gap_max = if *preserve_stream_order && is_standalone_bullet_text(&text) {
                     first.font_size * 1.2
                 } else {
@@ -1132,6 +1141,14 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     }
 
     merged
+}
+
+/// Whether an adjacent-run gap contains a detected narrow prose boundary.
+fn gap_crosses_narrow_column_boundary(left_end: f32, right_start: f32, boundaries: &[f32]) -> bool {
+    const EDGE_TOLERANCE: f32 = 0.25;
+    boundaries.iter().any(|boundary| {
+        left_end - EDGE_TOLERANCE <= *boundary && right_start + EDGE_TOLERANCE >= *boundary
+    })
 }
 
 /// Merge subscript/superscript items into their adjacent parent items.
@@ -3141,6 +3158,78 @@ mod tests {
             texts,
             vec!["ROLANDO T. ACOSTA, P.J.", "ANIL C. SINGH"],
             "column gap should keep the two names apart"
+        );
+    }
+
+    #[test]
+    fn merge_does_not_join_dense_columns_across_a_narrow_gutter() {
+        // At 9.5pt font, the old merge cutoff was 4.75pt. A 4.7pt gutter is
+        // below that cutoff, but its alignment across a dense prose body proves
+        // that it is a column boundary rather than the widest word space.
+        let mut items = Vec::new();
+        for row in 0..50 {
+            let y = 750.0 - row as f32 * 14.0;
+            items.push(make_item_fs("justify the left column", 40.0, y, 230.0, 9.5));
+            items.push(make_item_fs(
+                "justify the right column",
+                274.7,
+                y,
+                230.0,
+                9.5,
+            ));
+        }
+
+        let merged = merge_text_items(items);
+        assert_eq!(
+            merged.len(),
+            100,
+            "each column item must remain separate, got {} merged rows",
+            merged.len()
+        );
+    }
+
+    #[test]
+    fn merge_keeps_narrow_table_fragments_together() {
+        // The same 4.7pt gap in short, scattered table cells does not have
+        // full-body prose evidence. It must not become a merge-time column
+        // boundary and change table extraction.
+        let mut items = Vec::new();
+        for row in 0..50 {
+            let y = 750.0 - row as f32 * 14.0;
+            for (x, width) in [(40.0, 30.0), (71.0, 30.0), (105.7, 30.0), (136.7, 30.0)] {
+                items.push(make_item_fs("cell", x, y, width, 9.5));
+            }
+        }
+
+        let merged = merge_text_items(items);
+        assert_eq!(
+            merged.len(),
+            50,
+            "table rows should continue merging into one item per row, got {}",
+            merged.len()
+        );
+    }
+
+    #[test]
+    fn merge_does_not_split_moving_monospaced_word_gaps() {
+        // Code and equal-width text can contain word gaps of the same physical
+        // width. Unless the gap is vertically aligned across the body, it must
+        // not be interpreted as a column gutter.
+        let mut items = Vec::new();
+        for row in 0..50 {
+            let y = 750.0 - row as f32 * 14.0;
+            let first_width = 115.0 + (row % 5) as f32 * 7.0;
+            let second_x = 40.0 + first_width + 4.7;
+            items.push(make_item_fs("let_value", 40.0, y, first_width, 9.5));
+            items.push(make_item_fs("=input;", second_x, y, 115.0, 9.5));
+        }
+
+        let merged = merge_text_items(items);
+        assert_eq!(
+            merged.len(),
+            50,
+            "moving word gaps are not columns, got {} items",
+            merged.len()
         );
     }
 

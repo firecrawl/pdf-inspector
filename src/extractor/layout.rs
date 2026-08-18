@@ -25,6 +25,8 @@ pub(crate) fn detect_columns(
 ) -> Vec<ColumnRegion> {
     const BIN_WIDTH: f32 = 2.0;
     const MIN_GUTTER_WIDTH: f32 = 8.0;
+    const MIN_DENSE_PROSE_GUTTER_WIDTH: f32 = 4.0;
+    const MIN_DENSE_PROSE_ITEMS: usize = 100;
     const MIN_VERTICAL_SPAN_RATIO: f32 = 0.30;
     const MIN_ITEMS_PER_COLUMN: usize = 10;
     const NOISE_FRACTION: f32 = 0.15;
@@ -206,13 +208,15 @@ pub(crate) fn detect_columns(
         valleys.push((start, num_bins));
     }
 
-    // Filter valleys: must be wide enough and not at page margins
+    // Filter valleys: must be wide enough and not at page margins. Dense prose
+    // may use a narrower gutter than the general minimum, but that exception is
+    // validated below with both prose shape and full-body vertical evidence.
     let margin_threshold = page_width * 0.05;
-    let valleys: Vec<(usize, usize)> = valleys
+    let mut valleys: Vec<(usize, usize)> = valleys
         .into_iter()
         .filter(|&(start, end)| {
             let width_pts = (end - start) as f32 * bin_width;
-            if width_pts < MIN_GUTTER_WIDTH {
+            if width_pts < MIN_DENSE_PROSE_GUTTER_WIDTH {
                 return false;
             }
             // Valley center must not be within 5% of page edges
@@ -220,6 +224,54 @@ pub(crate) fn detect_columns(
             center_pts > margin_threshold && center_pts < (page_width - margin_threshold)
         })
         .collect();
+
+    let valley_width = |valley: &(usize, usize)| (valley.1 - valley.0) as f32 * bin_width;
+    if valleys
+        .iter()
+        .any(|valley| valley_width(valley) < MIN_GUTTER_WIDTH)
+    {
+        // Narrow empty gutters are the one case where a table column and a prose
+        // gutter have nearly indistinguishable geometry. Require a dense,
+        // table-free page, paragraph-shaped columns, and a gap that persists
+        // through most of the body before allowing the lower width limit.
+        if page_items.len() >= MIN_DENSE_PROSE_ITEMS && !page_has_table {
+            for center_assign in [true, false] {
+                let result = validate_and_build_columns(
+                    &valleys,
+                    &page_items,
+                    x_min,
+                    bin_width,
+                    x_max,
+                    MIN_ITEMS_PER_COLUMN,
+                    MIN_VERTICAL_SPAN_RATIO,
+                    page,
+                    center_assign,
+                );
+                if result.len() > 1
+                    && columns_have_prose(&result, &page_items)
+                    && narrow_valleys_have_body_support(
+                        &valleys,
+                        &result,
+                        &page_items,
+                        x_min,
+                        bin_width,
+                    )
+                {
+                    debug!(
+                        "page {}: dense prose narrow-gutter detection found {} columns",
+                        page,
+                        result.len()
+                    );
+                    return result;
+                }
+            }
+        }
+
+        // Keep the pre-existing conservative behavior unless the strong narrow
+        // gutter evidence above succeeded. In particular, table pages never use
+        // the reduced width threshold.
+        valleys.retain(|valley| valley_width(valley) >= MIN_GUTTER_WIDTH);
+    }
 
     // Fallback: if no absolute valleys found, try relative valley detection.
     // Justified text can leave gutter bins non-empty because item widths extend
@@ -333,6 +385,38 @@ pub(crate) fn detect_columns(
     }
 
     vec![ColumnRegion { x_min, x_max }]
+}
+
+/// Find narrow prose boundaries that text-run merging must not cross.
+///
+/// This is deliberately not a general replacement for downstream column
+/// grouping. It only exposes a two-column boundary when `detect_columns` has
+/// accepted a 4–8pt gutter and the physical body still supports it. Ordinary
+/// wide gutters already exceed the merge threshold and need no special case.
+pub(crate) fn narrow_prose_column_boundaries(items: &[TextItem]) -> HashMap<u32, Vec<f32>> {
+    let mut pages: Vec<u32> = items.iter().map(|item| item.page).collect();
+    pages.sort_unstable();
+    pages.dedup();
+
+    let mut boundaries = HashMap::new();
+    for page in pages {
+        let page_items: Vec<&TextItem> = items
+            .iter()
+            .filter(|item| item.page == page && crate::extractor::is_text_layout_item(item))
+            .collect();
+        let owned_items: Vec<TextItem> = page_items.iter().map(|item| (*item).clone()).collect();
+        let columns = detect_columns(&owned_items, page, false);
+        if columns.len() != 2 {
+            continue;
+        }
+
+        let boundary = columns[0].x_max;
+        if narrow_boundary_has_body_support(boundary, &page_items) {
+            boundaries.entry(page).or_insert_with(|| vec![boundary]);
+        }
+    }
+
+    boundaries
 }
 
 /// Simplified single-level XY-cut: find the largest horizontal gap between
@@ -540,6 +624,173 @@ impl ProseLineStats {
             self.current_run = 0;
         }
     }
+}
+
+/// Validate reduced-width histogram valleys against the physical text body.
+///
+/// A valley narrower than the normal gutter minimum is only accepted when it
+/// maps to a boundary emitted by the column builder and remains observable over
+/// most of the body's rows. This is what distinguishes a legal-gazette gutter
+/// from an aligned table-cell gap.
+fn narrow_valleys_have_body_support(
+    valleys: &[(usize, usize)],
+    columns: &[ColumnRegion],
+    page_items: &[&TextItem],
+    x_min: f32,
+    bin_width: f32,
+) -> bool {
+    let mut checked = 0usize;
+    for &(start, end) in valleys {
+        let width = (end - start) as f32 * bin_width;
+        if width >= 8.0 {
+            continue;
+        }
+
+        let expected_boundary = x_min + ((start + end) as f32 / 2.0) * bin_width;
+        let Some(boundary) = columns
+            .iter()
+            .map(|column| column.x_max)
+            .min_by(|left, right| left.total_cmp(right))
+            .filter(|boundary| (boundary - expected_boundary).abs() <= bin_width)
+        else {
+            return false;
+        };
+        if !narrow_boundary_has_body_support(boundary, page_items) {
+            return false;
+        }
+        checked += 1;
+    }
+    checked > 0
+}
+
+/// Return true when a 4–8pt boundary separates two prose-like sides over most
+/// of the body. Wide titles are excluded just as they are from the projection.
+fn narrow_boundary_has_body_support(boundary: f32, page_items: &[&TextItem]) -> bool {
+    const MIN_NARROW_GUTTER: f32 = 4.0;
+    const MAX_NARROW_GUTTER: f32 = 8.0;
+    const MIN_SIDE_ITEMS: usize = 20;
+    const MIN_VERTICAL_OVERLAP: f32 = 0.60;
+    const WIDE_ITEM_FRACTION: f32 = 0.60;
+
+    let Some((body_left, body_right)) =
+        page_items.iter().fold(None::<(f32, f32)>, |bounds, item| {
+            let right = item.x + effective_width(item);
+            if !item.x.is_finite() || !right.is_finite() {
+                return bounds;
+            }
+            Some(match bounds {
+                None => (item.x, right),
+                Some((left, right_max)) => (left.min(item.x), right_max.max(right)),
+            })
+        })
+    else {
+        return false;
+    };
+    let body_width = body_right - body_left;
+    if !body_width.is_finite() || body_width <= 0.0 {
+        return false;
+    }
+
+    let eligible: Vec<&TextItem> = page_items
+        .iter()
+        .copied()
+        .filter(|item| {
+            let right = item.x + effective_width(item);
+            item.x.is_finite()
+                && right.is_finite()
+                && effective_width(item) <= body_width * WIDE_ITEM_FRACTION
+        })
+        // A centered folio or full-width heading legitimately crosses the
+        // gutter. Exclude it from edge and row evidence, just as the projection
+        // excludes wide spanning lines. Body runs that already span both
+        // columns therefore still cannot manufacture support: the remaining
+        // non-spanning body rows must provide enough evidence on both sides.
+        .filter(|item| {
+            let right = item.x + effective_width(item);
+            !(item.x < boundary && right > boundary)
+        })
+        .collect();
+    let left_items: Vec<&TextItem> = eligible
+        .iter()
+        .copied()
+        .filter(|item| item.x + effective_width(item) / 2.0 <= boundary)
+        .collect();
+    let right_items: Vec<&TextItem> = eligible
+        .iter()
+        .copied()
+        .filter(|item| item.x + effective_width(item) / 2.0 > boundary)
+        .collect();
+    if left_items.len() < MIN_SIDE_ITEMS || right_items.len() < MIN_SIDE_ITEMS {
+        return false;
+    }
+
+    let left_gutter_edge = left_items
+        .iter()
+        .map(|item| item.x + effective_width(item))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let right_gutter_edge = right_items
+        .iter()
+        .map(|item| item.x)
+        .fold(f32::INFINITY, f32::min);
+    let physical_gutter = right_gutter_edge - left_gutter_edge;
+    eprintln!(
+        "boundary debug boundary={boundary} left={left_gutter_edge} right={right_gutter_edge} gutter={physical_gutter} left_items={} right_items={}",
+        left_items.len(),
+        right_items.len()
+    );
+    if physical_gutter < MIN_NARROW_GUTTER {
+        let blocker = left_items
+            .iter()
+            .copied()
+            .max_by(|a, b| (a.x + effective_width(a)).total_cmp(&(b.x + effective_width(b))));
+        let right_blocker = right_items
+            .iter()
+            .copied()
+            .min_by(|a, b| a.x.total_cmp(&b.x));
+        if let (Some(left), Some(right)) = (blocker, right_blocker) {
+            eprintln!(
+                "blockers left=({:.1}, {:.1}, {:.1}, {:?}) right=({:.1}, {:.1}, {:.1}, {:?})",
+                left.x,
+                effective_width(left),
+                left.y,
+                left.text,
+                right.x,
+                effective_width(right),
+                right.y,
+                right.text
+            );
+        }
+    }
+    if !(MIN_NARROW_GUTTER..MAX_NARROW_GUTTER).contains(&physical_gutter) {
+        return false;
+    }
+
+    let y_edge = |items: &[&TextItem], max: bool| {
+        items.iter().map(|item| item.y).fold(
+            if max {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            },
+            if max { f32::max } else { f32::min },
+        )
+    };
+    let left_top = y_edge(&left_items, false);
+    let left_bottom = y_edge(&left_items, true);
+    let right_top = y_edge(&right_items, false);
+    let right_bottom = y_edge(&right_items, true);
+    let body_top = left_top.min(right_top);
+    let body_bottom = left_bottom.max(right_bottom);
+    let body_span = body_bottom - body_top;
+    if body_span <= 0.0 {
+        return false;
+    }
+    let overlap = left_bottom.min(right_bottom) - left_top.max(right_top);
+    if overlap / body_span < MIN_VERTICAL_OVERLAP {
+        return false;
+    }
+
+    overlap / body_span >= MIN_VERTICAL_OVERLAP
 }
 
 /// Check whether each proposed column contains paragraph-like content.
@@ -3848,6 +4099,59 @@ mod tests {
         assert!(
             (280.0..=310.0).contains(&gutter),
             "Gutter at {gutter}, expected ~295"
+        );
+    }
+
+    #[test]
+    fn dense_prose_with_narrow_empty_gutter_is_detected() {
+        // Polish legal gazettes use justified columns whose physical gutter can
+        // be smaller than the old 8pt minimum. The gap is still empty and both
+        // sides are dense prose, so it is a column boundary rather than a word
+        // space.
+        let mut items = Vec::new();
+        for row in 0..50 {
+            let y = 750.0 - row as f32 * 14.0;
+            let mut left = make_item(1, 40.0, y, "Justified prose line");
+            left.width = 230.0;
+            let mut right = make_item(1, 274.7, y, "Justified prose line");
+            right.width = 230.0;
+            items.push(left);
+            items.push(right);
+        }
+
+        let cols = detect_columns(&items, 1, false);
+        assert_eq!(
+            cols.len(),
+            2,
+            "expected a 4.7pt prose gutter to split two columns, got {cols:?}"
+        );
+        assert!(
+            (270.0..=278.0).contains(&cols[0].x_max),
+            "boundary was {}, expected the 4.7pt gutter near 275",
+            cols[0].x_max
+        );
+    }
+
+    #[test]
+    fn narrow_table_gap_does_not_become_a_prose_column() {
+        // A borderless table can have the same nominal 4.7pt gap between two
+        // cell groups. Short, scattered cell fragments must not pass the prose
+        // gate just because the horizontal gap is aligned.
+        let mut items = Vec::new();
+        for row in 0..50 {
+            let y = 750.0 - row as f32 * 14.0;
+            for (x, width) in [(40.0, 30.0), (71.0, 30.0), (105.7, 30.0), (136.7, 30.0)] {
+                let mut item = make_item(1, x, y, "cell");
+                item.width = width;
+                items.push(item);
+            }
+        }
+
+        let cols = detect_columns(&items, 1, false);
+        assert_eq!(
+            cols.len(),
+            1,
+            "short table cells must not be split at a narrow aligned gap: {cols:?}"
         );
     }
 
