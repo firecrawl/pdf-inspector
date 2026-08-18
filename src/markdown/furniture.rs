@@ -181,7 +181,10 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
             let mut leading = trimmed.chars();
             let first = leading.next();
             let marker_led = first.is_some_and(|c| c.is_ascii_digit())
-                || (first == Some('(') && leading.next().is_some_and(|c| c.is_ascii_digit()))
+                || (first == Some('(')
+                    && leading
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit() || c.is_lowercase()))
                 || first.is_some_and(|c| matches!(c, '†' | '‡' | '§' | '¶' | '*'))
                 || trimmed.split_whitespace().next().is_some_and(|tok| {
                     tok.chars().count() == 1 && tok.chars().all(|c| c.is_lowercase())
@@ -482,6 +485,13 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue;
         }
         let text = line.text();
+        // Removal must apply the same original-text structural protection
+        // as candidate collection: a structural line can share a normalized
+        // key with a non-structural candidate once its leading number is
+        // normalized away.
+        if is_structural_line(text.trim()) {
+            continue;
+        }
         let normalized = normalize_for_comparison(&text);
         if candidates.contains(&normalized) {
             let first = first_page_individual.entry(normalized).or_insert(line.page);
@@ -535,6 +545,9 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             .map(|&i| lines[i].text())
             .collect::<Vec<_>>()
             .join(" ");
+        if is_structural_line(coalesced.trim()) {
+            continue;
+        }
         let normalized = normalize_for_comparison(&coalesced);
         if band_candidates.contains(&normalized) {
             let first = first_page_band.get(&normalized).copied().unwrap_or(0);
@@ -547,7 +560,9 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     }
 
     // (c) Y-band sibling propagation: if any member is removed, remove all
-    //     members (provided the band is at an edge position).
+    //     members (provided the band is at an edge position). Structural
+    //     siblings keep the same original-text protection as the direct
+    //     passes.
     for (&(page, _), indices) in &y_bands {
         let band_y = lines[indices[0]].y;
         if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
@@ -555,7 +570,9 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         }
         if indices.iter().any(|idx| removal_set.contains(idx)) {
             for &idx in indices {
-                removal_set.insert(idx);
+                if !is_structural_line(lines[idx].text().trim()) {
+                    removal_set.insert(idx);
+                }
             }
         }
     }
@@ -760,6 +777,74 @@ mod tests {
         assert!(
             result.iter().any(|l| l.text().contains("appendix")),
             "lowercase-letter-marked footnote must survive"
+        );
+    }
+
+    #[test]
+    fn edge_furniture_keeps_paren_letter_marker() {
+        let mut lines = Vec::new();
+        body_page(&mut lines);
+        lines.push(make_line(
+            "(a) See the statutory definitions above",
+            8.0,
+            1,
+            380.0,
+            None,
+        ));
+        let result = strip_header_footer_lines(lines, 1);
+        assert!(
+            result.iter().any(|l| l.text().contains("statutory")),
+            "(letter)-marked enumeration must survive"
+        );
+    }
+
+    #[test]
+    fn structural_line_survives_normalized_key_collision() {
+        // A running head on pages 1-4 normalizes to the same key as a
+        // numbered heading on page 5 (normalization strips the heading's
+        // leading digit). The heading's structural protection must hold in
+        // the removal pass, not just candidate collection.
+        let mut lines = Vec::new();
+        for page in 1..=4u32 {
+            lines.push(make_line(
+                ". Introduction extra words here",
+                10.0,
+                page,
+                750.0,
+                None,
+            ));
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("unique body content words {page} {j} lorem ipsum"),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+        lines.push(make_line(
+            "1. Introduction extra words here",
+            10.0,
+            5,
+            750.0,
+            None,
+        ));
+        for j in 0..20u32 {
+            lines.push(make_line(
+                &format!("unique body content words five {j} lorem ipsum"),
+                10.0,
+                5,
+                600.0 - j as f32 * 15.0,
+                None,
+            ));
+        }
+        let result = strip_repeated_lines(lines, 5);
+        assert!(
+            result
+                .iter()
+                .any(|l| l.text().contains("1. Introduction extra")),
+            "structural line must survive a normalized-key collision"
         );
     }
 
