@@ -4399,3 +4399,501 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         page.markdown
     );
 }
+
+// ---------------------------------------------------------------------------
+// Visual-order RTL text
+// ---------------------------------------------------------------------------
+
+/// Build a Type0/Identity-H PDF whose show-text runs hold `stored_lines`
+/// verbatim, one Tj per line.
+///
+/// Lines are stored exactly as given so each test can state the byte order a
+/// real producer would have written. The font maps every CID straight to the
+/// matching Unicode codepoint, so these tests exercise ordering only, not glyph
+/// decoding.
+fn synthetic_rtl_pdf(stored_lines: &[&str]) -> Vec<u8> {
+    synthetic_rtl_pdf_pages(&[stored_lines])
+}
+
+/// Multi-page variant: one entry per page.
+fn synthetic_rtl_pdf_pages(pages: &[&[&str]]) -> Vec<u8> {
+    synthetic_rtl_pdf_pages_impl(pages, false)
+}
+
+/// Multi-page variant built with per-glyph `TJ` position adjustments instead
+/// of one `Tj` per line, reproducing the construct behind this fix: `lines`
+/// are stored in ordinary logical order, and each glyph is walked leftward
+/// on the page by a `TJ` adjustment rather than by reversing the character
+/// sequence in the stream.
+///
+/// `synthetic_rtl_pdf_pages` above (single `Tj`, no adjustments) cannot
+/// encode this at the PDF level at all — `Tj` has no numeric-operand array.
+/// What it does *not* prove, contrary to an earlier version of this comment:
+/// with the small per-glyph steps used here, `extract_page_text_items`'s `TJ`
+/// handling (`content_stream.rs`) still collapses the whole array into one
+/// `TextItem`, identical to what the `Tj` path produces, because its
+/// sub-item-split and space-insertion checks only fire on a *negative*
+/// adjustment (`n_val < -threshold`) — a rightward jump. Genuine leftward RTL
+/// advances are positive under this codebase's sign convention (see
+/// `docs/evidence/rtl-visual-order/README.md`), so they never cross that
+/// threshold. The distinct thing this construct tests is the `TJ` numeric
+/// array itself: that per-glyph position operands are parsed and folded into
+/// item geometry rather than corrupting or reordering the interleaved string
+/// operands. `position_adjusted_logical_order_rtl_is_left_untouched` asserts
+/// on the resulting item's geometry, not just its text, to pin that down.
+fn synthetic_rtl_pdf_pages_position_adjusted(pages: &[&[&str]]) -> Vec<u8> {
+    synthetic_rtl_pdf_pages_impl(pages, true)
+}
+
+/// Glyph advance for every CID (no `/W` override) in
+/// [`synthetic_rtl_pdf_pages_position_adjusted`]'s font, and the line's
+/// starting x-coordinate when walking leftward from the right margin. Shared
+/// with the test that checks the extractor actually walked the `TJ`
+/// adjustments rather than discarding them.
+const POSITION_ADJUSTED_DW: i64 = 600;
+const POSITION_ADJUSTED_RIGHT_EDGE: i64 = 400;
+const POSITION_ADJUSTED_FONT_SIZE: f32 = 12.0;
+
+fn synthetic_rtl_pdf_pages_impl(pages: &[&[&str]], position_adjusted: bool) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let (dw, right_edge) = (POSITION_ADJUSTED_DW, POSITION_ADJUSTED_RIGHT_EDGE);
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let cid_font_id = doc.new_object_id();
+    let descriptor_id = doc.new_object_id();
+    let tounicode_id = doc.new_object_id();
+    let cid_system_info_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "AAAAAA+SyntheticRTL",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![cid_font_id.into()],
+            "ToUnicode" => tounicode_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        cid_system_info_id,
+        dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        cid_font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "AAAAAA+SyntheticRTL",
+            "CIDSystemInfo" => cid_system_info_id,
+            "FontDescriptor" => descriptor_id,
+            "DW" => dw,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        descriptor_id,
+        dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "AAAAAA+SyntheticRTL",
+            "Flags" => 4,
+            "FontBBox" => vec![Object::Integer(-100), Object::Integer(-100), 1000.into(), 1000.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 800,
+            "Descent" => Object::Integer(-200),
+            "CapHeight" => 700,
+            "StemV" => 80,
+        }
+        .into(),
+    );
+
+    // Identity ToUnicode over ASCII, the RTL blocks, and the Arabic
+    // presentation forms: CID == Unicode codepoint. ASCII must be mapped too —
+    // without spaces the extracted text has no word boundaries to score.
+    let cmap = b"/CIDInit /ProcSet findresource begin\n\
+12 dict begin\nbegincmap\n/CMapType 2 def\n\
+1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+4 beginbfrange\n<0020> <007E> <0020>\n<0590> <05FF> <0590>\n\
+<FB50> <FDFF> <FB50>\n<FE70> <FEFE> <FE70>\nendbfrange\n\
+endcmap\nend\nend"
+        .to_vec();
+    doc.objects
+        .insert(tounicode_id, Stream::new(dictionary! {}, cmap).into());
+
+    let mut page_ids = Vec::new();
+    for stored_lines in pages {
+        let mut operations = vec![Operation::new("BT", vec![])];
+        for (index, line) in stored_lines.iter().enumerate() {
+            let y = 700 - 20 * index as i64;
+            operations.push(Operation::new("Tf", vec!["F0".into(), 12.into()]));
+            if position_adjusted {
+                // Start at the line's right edge and walk left: TJ's numeric
+                // operand is subtracted from the pen position before the next
+                // glyph paints (ISO 32000-1 §9.4.3), so an adjustment of
+                // `2 * dw` nets a step of exactly `-dw` per glyph — this
+                // glyph's own advance plus one more glyph-width left. No
+                // character in the stream is reordered; only positioning
+                // makes the line read right-to-left.
+                operations.push(Operation::new(
+                    "Tm",
+                    vec![
+                        1.into(),
+                        0.into(),
+                        0.into(),
+                        1.into(),
+                        right_edge.into(),
+                        Object::Integer(y),
+                    ],
+                ));
+                let chars: Vec<char> = line.chars().collect();
+                let mut array = Vec::new();
+                for (i, ch) in chars.iter().enumerate() {
+                    let mut bytes = Vec::new();
+                    bytes.extend_from_slice(&(*ch as u32 as u16).to_be_bytes());
+                    array.push(Object::String(bytes, lopdf::StringFormat::Hexadecimal));
+                    if i + 1 != chars.len() {
+                        array.push(Object::Integer(2 * dw));
+                    }
+                }
+                operations.push(Operation::new("TJ", vec![Object::Array(array)]));
+            } else {
+                let mut bytes = Vec::new();
+                for ch in line.chars() {
+                    bytes.extend_from_slice(&(ch as u32 as u16).to_be_bytes());
+                }
+                // Tm, not Td: Td is relative to the current line start and
+                // would accumulate across lines.
+                operations.push(Operation::new(
+                    "Tm",
+                    vec![
+                        1.into(),
+                        0.into(),
+                        0.into(),
+                        1.into(),
+                        50.into(),
+                        Object::Integer(y),
+                    ],
+                ));
+                operations.push(Operation::new(
+                    "Tj",
+                    vec![Object::String(bytes, lopdf::StringFormat::Hexadecimal)],
+                ));
+            }
+        }
+        operations.push(Operation::new("ET", vec![]));
+
+        let content = Content { operations }.encode().unwrap();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F0" => font_id },
+            },
+            "Contents" => content_id,
+        });
+        page_ids.push(page_id);
+    }
+
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => page_ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>(),
+            "Count" => page_ids.len() as i64,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Hebrew words carrying enough word-final letters for a document-wide verdict,
+/// in correct logical spelling. Final forms end these words, never start them.
+const LOGICAL_LINES: &[&str] = &[
+    "שלום עולם",
+    "עורך דין",
+    "ארץ ישראל",
+    "כסף רב",
+    "זמן קצר",
+    "מספר זהות",
+];
+
+/// The same lines as a producer that pre-applies bidi stores them: pure-RTL
+/// lines come out as a straight character reversal.
+fn visually_stored(lines: &[&str]) -> Vec<String> {
+    lines.iter().map(|l| l.chars().rev().collect()).collect()
+}
+
+fn extracted_text(buf: &[u8]) -> String {
+    extract_text_with_positions_mem(buf)
+        .unwrap()
+        .iter()
+        .map(|i| i.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn assert_reads_logically(text: &str) {
+    for line in LOGICAL_LINES {
+        for word in line.split(' ') {
+            assert!(
+                text.contains(word),
+                "expected logical-order word {word:?} in extracted text: {text:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn visual_order_rtl_document_extracts_in_logical_order() {
+    let stored = visually_stored(LOGICAL_LINES);
+    let refs: Vec<&str> = stored.iter().map(String::as_str).collect();
+    let text = extracted_text(&synthetic_rtl_pdf(&refs));
+
+    assert_reads_logically(&text);
+    assert!(
+        !text.contains("םולש"),
+        "visual-order text survived extraction: {text:?}"
+    );
+}
+
+#[test]
+fn logical_order_rtl_document_is_left_untouched() {
+    // Already-logical Hebrew must never be flipped: this is the majority case
+    // and the one a blanket reversal would destroy.
+    let text = extracted_text(&synthetic_rtl_pdf(LOGICAL_LINES));
+
+    assert_reads_logically(&text);
+    assert!(
+        !text.contains("םולש"),
+        "logical-order text was reversed: {text:?}"
+    );
+}
+
+#[test]
+fn visual_order_document_keeps_embedded_ltr_runs_in_reading_order() {
+    // A visual-order producer lays the line out left-to-right but leaves
+    // embedded digits running LTR, so "שלום 123 עולם" is stored with the words
+    // reversed and "123" intact. Reversing the line wholesale would yield "321".
+    let text = extracted_text(&synthetic_rtl_pdf(&[
+        "םלוע 123 םולש",
+        "ןיד ךרוע",
+        "ץרא בר ףסכ",
+        "רצק ןמז",
+    ]));
+
+    assert!(
+        text.contains("שלום 123 עולם"),
+        "embedded LTR run was not preserved in reading order: {text:?}"
+    );
+}
+
+#[test]
+fn visual_order_verdict_does_not_double_reverse_arabic_presentation_forms() {
+    // Arabic stored as presentation forms is already restored per run by
+    // expand_ligatures. A Hebrew-driven document verdict must not flip it a
+    // second time, which would put it back into visual order.
+    // U+FEE3/U+FEAE are the initial/final forms of meem and reh; NFKC maps them
+    // to U+0645/U+0631.
+    let mut stored = visually_stored(LOGICAL_LINES);
+    stored.push("\u{FEAE}\u{FEE3}".to_string()); // visual order: reh then meem
+    let refs: Vec<&str> = stored.iter().map(String::as_str).collect();
+    let text = extracted_text(&synthetic_rtl_pdf(&refs));
+
+    assert_reads_logically(&text);
+    assert!(
+        text.contains("\u{0645}\u{0631}"),
+        "Arabic presentation forms were double-reversed: {text:?}"
+    );
+}
+
+#[test]
+fn too_little_evidence_leaves_the_document_alone() {
+    // One misplaced final form is not proof of anything — a mis-split run can
+    // produce it. Documents below the evidence floor are deliberately left as
+    // they are rather than flipped on a guess.
+    let text = extracted_text(&synthetic_rtl_pdf(&["םולש", "בית ספר", "מים רבים"]));
+
+    assert!(
+        text.contains("םולש"),
+        "document was flipped on a single misplaced final form: {text:?}"
+    );
+    assert!(
+        text.contains("בית ספר"),
+        "logical text was altered below the evidence floor: {text:?}"
+    );
+}
+
+/// End-to-end guard on a committed fixture: a one-page PDF whose content
+/// stream holds `LOGICAL_LINES` with every character reversed, exactly as a
+/// producer that pre-applies bidi writes them. Generated by
+/// `synthetic_rtl_pdf`, kept on disk so the regression can be reproduced
+/// straight from the CLI:
+///
+///   cargo run --bin pdf2md -- tests/fixtures/rtl_visual_order.pdf
+///
+/// Before this fix it emitted "םלוע םולש …" — every word spelled backwards.
+#[test]
+fn fixture_visual_order_rtl_pdf_extracts_in_logical_order() {
+    let result = process_pdf_with_options("tests/fixtures/rtl_visual_order.pdf", PdfOptions::new())
+        .expect("fixture should extract");
+
+    let md = result.markdown.unwrap_or_default();
+    assert_reads_logically(&md);
+    assert!(
+        !md.contains("םולש"),
+        "visual-order text survived extraction: {md:?}"
+    );
+}
+
+/// The real-world counter-example to "RTL text is always stored visually":
+/// a producer that keeps logical character order and lays the line out
+/// right-to-left with `TJ` position adjustments alone (see
+/// `synthetic_rtl_pdf_pages_position_adjusted`). This construct is
+/// observed in a production government PDF (see
+/// `docs/evidence/rtl-visual-order/`) and is exactly the case a document-wide
+/// unconditional reversal — as opposed to this fix's per-document
+/// orthographic evidence check — gets backwards, because it never looks past
+/// "does this string contain an RTL character."
+///
+/// Text-content assertions alone can't tell this apart from
+/// `logical_order_rtl_document_is_left_untouched` (single `Tj`, no `TJ`
+/// array): with these small per-glyph steps, both collapse to one `TextItem`
+/// holding the same string — see `synthetic_rtl_pdf_pages_position_adjusted`'s
+/// doc comment for why. So this also checks the item's geometry, which only
+/// the `TJ` path computes at all, to confirm the numeric adjustments were
+/// actually walked rather than silently dropped.
+#[test]
+fn position_adjusted_logical_order_rtl_is_left_untouched() {
+    let refs = LOGICAL_LINES;
+    let buf = synthetic_rtl_pdf_pages_position_adjusted(&[refs]);
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let text = items
+        .iter()
+        .map(|i| i.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert_reads_logically(&text);
+    assert!(
+        !text.contains("םולש"),
+        "position-adjusted logical-order text was reversed: {text:?}"
+    );
+
+    // First line: right-to-left `TJ` walk starting at POSITION_ADJUSTED_RIGHT_EDGE.
+    // Each glyph contributes its own `+advance` (DW/1000 * font_size), each of
+    // the N-1 gaps between them contributes `-2*advance` (the `2 * dw`
+    // adjustment in synthetic_rtl_pdf_pages_impl), netting a total width of
+    // `advance * (N - 2)` — see this test's doc comment for the derivation. A
+    // version that ignored the adjustments and used the font's plain advances
+    // would land at a different width; a version that mishandled the array
+    // could reorder or drop characters (already ruled out above) or zero the
+    // geometry outright.
+    let first_line = items
+        .iter()
+        .find(|i| i.text.contains("שלום"))
+        .unwrap_or_else(|| panic!("first line not found in items: {items:?}"));
+    let glyph_count = "שלום עולם".chars().count() as f32;
+    let advance = POSITION_ADJUSTED_DW as f32 / 1000.0 * POSITION_ADJUSTED_FONT_SIZE;
+    let expected_width = advance * (glyph_count - 2.0);
+    assert!(
+        (first_line.x - POSITION_ADJUSTED_RIGHT_EDGE as f32).abs() < 0.5,
+        "item x={} did not start at the TJ line's right-edge origin {}: TJ adjustments were not applied",
+        first_line.x,
+        POSITION_ADJUSTED_RIGHT_EDGE
+    );
+    assert!(
+        (first_line.width - expected_width).abs() < 0.5,
+        "item width={} did not match the accumulated per-glyph TJ displacement {}: adjustments were not walked",
+        first_line.width,
+        expected_width
+    );
+}
+
+/// End-to-end guard on a committed fixture: a one-page PDF whose content
+/// stream holds `LOGICAL_LINES` in logical character order, laid out
+/// right-to-left purely through `TJ` position adjustments — the same
+/// construct as `position_adjusted_logical_order_rtl_is_left_untouched`,
+/// kept on disk so the regression can be reproduced straight from the CLI:
+///
+///   cargo run --bin pdf2md -- tests/fixtures/rtl_logical_order.pdf
+///
+/// A blanket reversal (any document-wide "contains RTL characters" rule)
+/// turns this into "םלוע םולש …" — every word spelled backwards — even
+/// though the source order was already correct.
+#[test]
+fn fixture_logical_order_rtl_pdf_is_left_untouched() {
+    let result =
+        process_pdf_with_options("tests/fixtures/rtl_logical_order.pdf", PdfOptions::new())
+            .expect("fixture should extract");
+
+    let md = result.markdown.unwrap_or_default();
+    assert_reads_logically(&md);
+    assert!(
+        !md.contains("םולש"),
+        "position-adjusted logical-order text was reversed: {md:?}"
+    );
+}
+
+#[test]
+fn evidence_from_one_page_corrects_a_page_that_could_not_decide_alone() {
+    // The centrepiece of the fix: the verdict is document-wide. Page 1 carries
+    // enough misplaced final forms to clear the floor; page 2 holds visual-order
+    // Hebrew with no final letters at all, so on its own it would be left
+    // reversed. Both must come out logical.
+    let evidence_page = visually_stored(LOGICAL_LINES);
+    let evidence_refs: Vec<&str> = evidence_page.iter().map(String::as_str).collect();
+
+    // "בית ספר" / "משה" carry no word-final letters — zero evidence alone.
+    // Both must be non-palindromes, or the assertion below would hold whether
+    // or not the page was corrected.
+    let quiet_page = visually_stored(&["בית ספר", "משה"]);
+    let quiet_refs: Vec<&str> = quiet_page.iter().map(String::as_str).collect();
+
+    // Guard the premise: the quiet page really is undecidable by itself.
+    let alone = extracted_text(&synthetic_rtl_pdf(&quiet_refs));
+    assert!(
+        alone.contains("רפס תיב"),
+        "premise broken - the quiet page decided on its own: {alone:?}"
+    );
+
+    let text = extracted_text(&synthetic_rtl_pdf_pages(&[&evidence_refs, &quiet_refs]));
+    assert_reads_logically(&text);
+    assert!(
+        text.contains("בית ספר") && text.contains("משה"),
+        "page 2 was not corrected by page 1's evidence: {text:?}"
+    );
+}
+
+#[test]
+fn vocalized_rtl_text_still_yields_a_verdict() {
+    // Combining marks (niqqud) must not shatter words into unscorable single
+    // letters, or a vocalized document would carry no evidence at all.
+    let vocalized = visually_stored(&["שָׁלוֹם עוֹלָם", "עוֹרֵךְ דִּין", "אֶרֶץ", "כֶּסֶף", "זְמַן"]);
+    let refs: Vec<&str> = vocalized.iter().map(String::as_str).collect();
+    let text = extracted_text(&synthetic_rtl_pdf(&refs));
+
+    assert!(
+        text.contains("שָׁלוֹם") && text.contains("אֶרֶץ"),
+        "vocalized visual-order text was not restored: {text:?}"
+    );
+}

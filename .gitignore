@@ -23,6 +23,7 @@ Thumbs.db
 # Test files
 *.pdf
 !tests/fixtures/*.pdf
+!docs/evidence/rtl-visual-order/*.pdf
 
 # Build cache
 **/*.rs.bk

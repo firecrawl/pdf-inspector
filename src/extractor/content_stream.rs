@@ -151,6 +151,46 @@ pub(crate) fn extract_page_text_items(
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
+    let ((items, rects, lines), has_gid_fonts, coords_rotated, skipped_invisible) =
+        extract_page_text_items_unmerged(
+            doc,
+            page_id,
+            page_num,
+            font_cmaps,
+            include_invisible,
+            style_cache,
+            form_budget,
+        )?;
+    Ok((
+        merge_page_items(items, rects, lines),
+        has_gid_fonts,
+        coords_rotated,
+        skipped_invisible,
+    ))
+}
+
+/// Collapse a page's raw show-text runs into line-level items. Split out so
+/// document-wide passes that must see individual runs can act in between.
+pub(crate) fn merge_page_items(
+    items: Vec<TextItem>,
+    rects: Vec<PdfRect>,
+    lines: Vec<PdfLine>,
+) -> PageExtraction {
+    let items = super::merge_text_items(items);
+    let items = super::merge_subscript_items(items);
+    (items, rects, lines)
+}
+
+/// Extract a page's text runs *without* merging them into lines.
+pub(crate) fn extract_page_text_items_unmerged(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
+) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
@@ -1356,8 +1396,6 @@ pub(crate) fn extract_page_text_items(
         page_num,
     );
 
-    let items = super::merge_text_items(items);
-    let items = super::merge_subscript_items(items);
     Ok((
         (items, rects, lines),
         has_gid_fonts,

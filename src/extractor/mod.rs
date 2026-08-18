@@ -12,7 +12,7 @@ mod reading_order;
 pub(crate) mod underline;
 mod xobjects;
 
-use crate::text_utils::{is_cjk_char, is_rtl_text};
+use crate::text_utils::{is_cjk_char, is_rtl_text, VisualOrderEvidence};
 use crate::tounicode::FontCMaps;
 use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
@@ -21,7 +21,7 @@ use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items;
+use content_stream::{extract_page_text_items_unmerged, merge_page_items};
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -154,6 +154,14 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
 /// Per-page adaptive join thresholds from Canva-style letter-spacing detection.
 pub(crate) type PageThresholds = HashMap<u32, f32>;
 
+/// One extraction pass: its output plus the RTL order evidence gathered with it.
+type PagesExtraction = (
+    PageExtraction,
+    PageThresholds,
+    HashSet<u32>,
+    VisualOrderEvidence,
+);
+
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
 ///
 /// Also returns per-page adaptive join thresholds for Canva-style pages.
@@ -250,6 +258,18 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
 }
 
+/// Extract positioned text, restoring logical order for producers that wrote
+/// RTL text visually.
+///
+/// The verdict needs every page, but the correction must be applied to unmerged
+/// runs — before a document-wide view exists. So the first pass only gathers
+/// evidence, and the rare visual-order document is extracted once more with the
+/// verdict known.
+///
+/// Evidence comes from the pages actually extracted, so a `page_filter` narrows
+/// it: a selected page can fall below the floor that the whole document would
+/// clear. Widening it would mean extracting every page just to judge a one-page
+/// request, which costs more than the inconsistency is worth.
 fn extract_positioned_text_impl(
     doc: &Document,
     font_cmaps: &FontCMaps,
@@ -257,7 +277,36 @@ fn extract_positioned_text_impl(
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    let extract = |restore_order| {
+        extract_pages_once(
+            doc,
+            font_cmaps,
+            page_filter,
+            include_invisible,
+            required_pages,
+            restore_order,
+        )
+    };
+
+    let (extraction, thresholds, gid_pages, evidence) = extract(false)?;
+    if !evidence.is_visual_order() {
+        return Ok((extraction, thresholds, gid_pages));
+    }
+    debug!("document stores RTL text in visual order ({evidence:?}); re-extracting logically");
+    let (extraction, thresholds, gid_pages, _) = extract(true)?;
+    Ok((extraction, thresholds, gid_pages))
+}
+
+fn extract_pages_once(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+    include_invisible: bool,
+    required_pages: Option<&HashSet<u32>>,
+    restore_order: bool,
+) -> Result<PagesExtraction, PdfError> {
     let pages = doc.get_pages();
+    let mut evidence = VisualOrderEvidence::default();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
@@ -277,7 +326,7 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let page_result = extract_page_text_items(
+        let page_result = extract_page_text_items_unmerged(
             doc,
             page_id,
             *page_num,
@@ -286,7 +335,7 @@ fn extract_positioned_text_impl(
             &mut style_cache,
             &mut FormWalkBudget::new(),
         );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
+        let ((mut raw_items, rects, lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
             match page_result {
                 Ok(extraction) => extraction,
                 Err(error)
@@ -300,6 +349,15 @@ fn extract_positioned_text_impl(
                 }
                 Err(error) => return Err(error),
             };
+        // Both must see individual runs: evidence is counted per word, and the
+        // reversal is only correct before runs are merged into lines.
+        for item in &raw_items {
+            evidence.observe(&item.text);
+        }
+        if restore_order {
+            crate::text_utils::restore_logical_order(&mut raw_items);
+        }
+        let (mut items, mut rects, mut lines) = merge_page_items(raw_items, rects, lines);
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
@@ -438,6 +496,7 @@ fn extract_positioned_text_impl(
         (all_items, all_rects, all_lines),
         page_thresholds,
         gid_encoded_pages,
+        evidence,
     ))
 }
 
