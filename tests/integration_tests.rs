@@ -4059,7 +4059,11 @@ fn test_synthetic_type0_broken_tounicode_emits_fffd_not_latin1_mojibake() {
     );
 }
 
-fn synthetic_type0_gbk_euc_h_pdf_without_tounicode() -> Vec<u8> {
+fn synthetic_type0_predefined_cmap_pdf_without_tounicode(
+    encoding: &'static str,
+    base_font: &'static str,
+    content_bytes: Vec<u8>,
+) -> Vec<u8> {
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Document, Object, Stream};
 
@@ -4077,8 +4081,8 @@ fn synthetic_type0_gbk_euc_h_pdf_without_tounicode() -> Vec<u8> {
         dictionary! {
             "Type" => "Font",
             "Subtype" => "Type0",
-            "BaseFont" => "FZXBSJW--GB1-0",
-            "Encoding" => "GBK-EUC-H",
+            "BaseFont" => base_font,
+            "Encoding" => encoding,
             "DescendantFonts" => vec![cid_font_id.into()],
         }
         .into(),
@@ -4097,7 +4101,7 @@ fn synthetic_type0_gbk_euc_h_pdf_without_tounicode() -> Vec<u8> {
         dictionary! {
             "Type" => "Font",
             "Subtype" => "CIDFontType2",
-            "BaseFont" => "FZXBSJW--GB1-0",
+            "BaseFont" => base_font,
             "CIDSystemInfo" => cid_system_info_id,
             "FontDescriptor" => descriptor_id,
             "DW" => 1000,
@@ -4108,7 +4112,7 @@ fn synthetic_type0_gbk_euc_h_pdf_without_tounicode() -> Vec<u8> {
         descriptor_id,
         dictionary! {
             "Type" => "FontDescriptor",
-            "FontName" => "FZXBSJW--GB1-0",
+            "FontName" => base_font,
             "Flags" => 4,
             "FontBBox" => vec![Object::Integer(-100), Object::Integer(-100), 1000.into(), 1000.into()],
             "ItalicAngle" => 0,
@@ -4120,10 +4124,6 @@ fn synthetic_type0_gbk_euc_h_pdf_without_tounicode() -> Vec<u8> {
         .into(),
     );
 
-    // GBK-EUC-H character codes for 东方. These are not CIDs: the predefined
-    // encoding CMap must first map them into Adobe-GB1 CIDs, then the CID
-    // collection mapping converts those CIDs to Unicode.
-    let content_bytes = vec![0xB6, 0xAB, 0xB7, 0xBD];
     let operations = vec![
         Operation::new("BT", vec![]),
         Operation::new("Tf", vec!["F0".into(), 12.into()]),
@@ -4178,7 +4178,12 @@ fn synthetic_type0_gbk_euc_h_pdf_without_tounicode() -> Vec<u8> {
 
 #[test]
 fn test_type0_gbk_euc_h_without_tounicode_decodes_predefined_cmap() {
-    let buf = synthetic_type0_gbk_euc_h_pdf_without_tounicode();
+    let content_bytes = vec![0xB6, 0xAB, 0xB7, 0xBD];
+    let buf = synthetic_type0_predefined_cmap_pdf_without_tounicode(
+        "GBK-EUC-H",
+        "FZXBSJW--GB1-0",
+        content_bytes.clone(),
+    );
     let parsed = lopdf::Document::load_mem(&buf).unwrap();
     let type0_font = parsed
         .objects
@@ -4213,6 +4218,47 @@ fn test_type0_gbk_euc_h_without_tounicode_decodes_predefined_cmap() {
     // A one-operation fixture is intentionally too small to exercise the
     // detector's full-page heuristics; the assertions above cover the font
     // decoding failure reported by the issue.
+}
+
+#[test]
+fn test_type0_unigb_ucs2_h_without_tounicode_decodes_unicode_codes() {
+    let text = "电子发票 G342 郴州西";
+    let content_bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let buf = synthetic_type0_predefined_cmap_pdf_without_tounicode(
+        "UniGB-UCS2-H",
+        "SimSun",
+        content_bytes.clone(),
+    );
+    let parsed = lopdf::Document::load_mem(&buf).unwrap();
+    let type0_font = parsed
+        .objects
+        .values()
+        .filter_map(|object| object.as_dict().ok())
+        .find(|dictionary| {
+            dictionary
+                .get(b"Subtype")
+                .and_then(|subtype| subtype.as_name())
+                .is_ok_and(|subtype| subtype == b"Type0")
+        })
+        .expect("find Type0 font")
+        .clone();
+    let descendant = type0_font
+        .get(b"DescendantFonts")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .as_reference()
+        .unwrap();
+    let cmaps = pdf_inspector::tounicode::FontCMaps::from_doc(&parsed);
+    let entry = cmaps.get_by_obj(descendant.0).expect("composed CMap");
+    assert_eq!(entry.primary.decode_cids(&content_bytes), text);
+
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    let combined: String = items.iter().map(|i| i.text.as_str()).collect();
+    assert_eq!(
+        combined, text,
+        "UniGB-UCS2-H character codes should decode through Adobe-GB1 predefined CMaps"
+    );
 }
 
 // ============================================================================
