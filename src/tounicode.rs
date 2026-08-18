@@ -24,6 +24,8 @@ pub struct ToUnicodeCMap {
     pub ranges: Vec<(u16, u16, u32)>,
     /// Byte width of source codes (1 or 2), determined from codespace and CMap entries
     pub code_byte_length: u8,
+    /// Code spaces that can have different byte lengths in a mixed-width CMap.
+    code_spaces: Vec<EncodingCodeSpace>,
     /// When true, unmapped CIDs are interpreted as Unicode codepoints directly.
     /// Used as a last resort for Identity-H fonts without ToUnicode/cmap/glyph names.
     pub cid_passthrough: bool,
@@ -452,6 +454,29 @@ impl ToUnicodeCMap {
         let mut result = String::new();
         let mut unmapped_count = 0usize;
 
+        if self.has_variable_code_lengths() {
+            let mut total = 0usize;
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                total += 1;
+                let Some((consumed, code)) = self.match_code_space(&bytes[offset..]) else {
+                    unmapped_count += 1;
+                    offset += 1;
+                    continue;
+                };
+
+                match self.lookup(code) {
+                    Some(text) if !text.contains('\u{FFFD}') => result.push_str(&text),
+                    _ => unmapped_count += 1,
+                }
+                offset += consumed;
+            }
+            if total > 0 && unmapped_count > total / 2 {
+                return String::new();
+            }
+            return result;
+        }
+
         if self.code_byte_length == 1 {
             // Single-byte codes: each byte is a code
             for &b in bytes {
@@ -512,6 +537,33 @@ impl ToUnicodeCMap {
         }
 
         result
+    }
+
+    fn has_variable_code_lengths(&self) -> bool {
+        let mut lengths = self.code_spaces.iter().map(|space| space.byte_length);
+        let Some(first) = lengths.next() else {
+            return false;
+        };
+        lengths.any(|length| length != first)
+    }
+
+    fn match_code_space(&self, bytes: &[u8]) -> Option<(usize, u16)> {
+        let max_length = bytes.len().min(2);
+        for length in (1..=max_length).rev() {
+            let code = match length {
+                1 => u16::from(bytes[0]),
+                2 => u16::from_be_bytes([bytes[0], bytes[1]]),
+                _ => continue,
+            };
+            if self
+                .code_spaces
+                .iter()
+                .any(|space| space.byte_length == length as u8 && space.contains(code))
+            {
+                return Some((length, code));
+            }
+        }
+        None
     }
 
     /// Get the minimum source CID across all mappings (char_map + ranges).
@@ -1365,7 +1417,10 @@ impl<'a> BinaryCMapStream<'a> {
         loop {
             let b = self.read_byte().ok_or("unexpected EOF in bcmap")?;
             let last = (b & 0x80) == 0;
-            n = (n << 7) | (b & 0x7f) as u32;
+            n = n
+                .checked_mul(128)
+                .and_then(|shifted| shifted.checked_add(u32::from(b & 0x7f)))
+                .ok_or_else(|| "number outside 32-bit range in bcmap".to_string())?;
             if last {
                 break;
             }
@@ -1374,12 +1429,13 @@ impl<'a> BinaryCMapStream<'a> {
     }
 
     fn read_signed(&mut self) -> Result<i32, String> {
-        let number = self.read_number()? as i32;
-        Ok(if number & 1 == 0 {
-            number >> 1
+        let number = self.read_number()?;
+        let decoded = if number & 1 == 0 {
+            i64::from(number >> 1)
         } else {
-            !(number >> 1)
-        })
+            !(i64::from(number >> 1))
+        };
+        i32::try_from(decoded).map_err(|_| "signed number outside 32-bit range".to_string())
     }
 
     fn read_hex_number(&mut self, size: usize) -> Result<Vec<u8>, String> {
@@ -1442,13 +1498,17 @@ fn hex_to_u16(bytes: &[u8]) -> Option<u16> {
     u16::try_from(hex_to_u32(bytes)).ok()
 }
 
-fn inc_hex(value: &mut [u8]) {
+fn inc_hex(value: &mut [u8]) -> bool {
+    if value.iter().all(|&byte| byte == 0xff) {
+        return false;
+    }
     let mut carry = 1u16;
     for byte in value.iter_mut().rev() {
         carry += u16::from(*byte);
         *byte = (carry & 0xff) as u8;
         carry >>= 8;
     }
+    carry == 0
 }
 
 fn add_hex(a: &mut [u8], b: &[u8]) {
@@ -1483,9 +1543,23 @@ fn bytes_to_unicode_string(bytes: &[u8]) -> Option<String> {
 }
 
 #[derive(Debug, Clone)]
+struct EncodingCodeSpace {
+    start: u16,
+    end: u16,
+    byte_length: u8,
+}
+
+impl EncodingCodeSpace {
+    fn contains(&self, code: u16) -> bool {
+        self.start <= code && code <= self.end
+    }
+}
+
+#[derive(Debug, Clone)]
 struct EncodingCMap {
     map: HashMap<u16, u16>,
     code_byte_length: u8,
+    code_spaces: Vec<EncodingCodeSpace>,
     is_identity: bool,
 }
 
@@ -1518,6 +1592,7 @@ fn build_fallback_tounicode_from_encoding(
         return None;
     }
     cmap.code_byte_length = encoding.code_byte_length;
+    cmap.code_spaces = encoding.code_spaces;
     Some(cmap)
 }
 
@@ -1551,6 +1626,7 @@ fn build_encoding_cmap_from_font(
                 return Some(EncodingCMap {
                     map: HashMap::new(),
                     code_byte_length: 2,
+                    code_spaces: Vec::new(),
                     is_identity: true,
                 });
             }
@@ -1596,10 +1672,21 @@ fn read_cid(stream: &mut BinaryCMapStream<'_>) -> Result<u16, String> {
 /// PDF dictionary and must never be interpreted as filesystem paths.
 pub(crate) fn is_predefined_encoding_cmap(name: &[u8]) -> bool {
     let name = str::from_utf8(name).ok().map_or(false, |name| {
-        builtin_cmap_file_name(name)
-            .is_some_and(|file_name| read_builtin_cmap_file(&file_name).is_some())
+        builtin_cmap_file_name(name).is_some_and(|file_name| builtin_cmap_file_exists(&file_name))
     });
     name
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn builtin_cmap_file_exists(name: &str) -> bool {
+    find_bcmaps_dir()
+        .map(|dir| dir.join(name).is_file())
+        .unwrap_or(false)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn builtin_cmap_file_exists(name: &str) -> bool {
+    BUILTIN_CMAPS.get_file(name).is_some()
 }
 
 fn builtin_cmap_file_name(name: &str) -> Option<String> {
@@ -1690,6 +1777,7 @@ fn parse_encoding_cmap_stream(data: &[u8]) -> Option<EncodingCMap> {
     Some(EncodingCMap {
         map,
         code_byte_length,
+        code_spaces: Vec::new(),
         is_identity: false,
     })
 }
@@ -1831,6 +1919,7 @@ fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
     let mut map: HashMap<u16, u16> = HashMap::new();
     let mut assigned = 0usize;
     let mut max_code_size: u8 = 1;
+    let mut code_spaces = Vec::new();
     let mut use_cmap: Option<String> = None;
 
     while let Some(b) = stream.read_byte() {
@@ -1861,13 +1950,39 @@ fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
             // Codespace and notdef ranges do not contribute CID mappings, but
             // their differential operands must be consumed exactly.
             0 | 1 => {
+                let mut previous_end = Vec::new();
                 for item in 0..subitems {
-                    if item == 0 {
-                        let _ = stream.read_hex_bytes(data_size + 1)?;
+                    let start = if item == 0 {
+                        stream.read_hex_bytes(data_size + 1)?
                     } else {
-                        let _ = stream.read_hex_number(data_size)?;
+                        if previous_end.is_empty() || !inc_hex(&mut previous_end) {
+                            return Err("code range overflows in bcmap".to_string());
+                        }
+                        if !sequence {
+                            let delta = stream.read_hex_number(data_size)?;
+                            add_hex(&mut previous_end, &delta);
+                        }
+                        previous_end.clone()
+                    };
+
+                    let end_delta = stream.read_hex_number(data_size)?;
+                    let mut end = start.clone();
+                    add_hex(&mut end, &end_delta);
+                    if typ == 0 {
+                        let start_code = hex_to_u16(&start)
+                            .ok_or_else(|| "codespace start outside 16-bit range".to_string())?;
+                        let end_code = hex_to_u16(&end)
+                            .ok_or_else(|| "codespace end outside 16-bit range".to_string())?;
+                        if start_code > end_code {
+                            return Err("inverted codespace range in bcmap".to_string());
+                        }
+                        code_spaces.push(EncodingCodeSpace {
+                            start: start_code,
+                            end: end_code,
+                            byte_length: start.len() as u8,
+                        });
                     }
-                    let _ = stream.read_hex_number(data_size)?;
+                    previous_end = end;
                     if typ == 1 {
                         let _ = stream.read_number()?;
                     }
@@ -1881,7 +1996,9 @@ fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
                         previous_code = stream.read_hex_bytes(data_size + 1)?;
                         previous_cid = i64::from(read_cid(&mut stream)?);
                     } else {
-                        inc_hex(&mut previous_code);
+                        if !inc_hex(&mut previous_code) {
+                            return Err("code outside 16-bit range in cidchar".to_string());
+                        }
                         if !sequence {
                             let delta = stream.read_hex_number(data_size)?;
                             add_hex(&mut previous_code, &delta);
@@ -1905,7 +2022,9 @@ fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
                     if item == 0 {
                         start = stream.read_hex_bytes(data_size + 1)?;
                     } else {
-                        inc_hex(&mut end);
+                        if !inc_hex(&mut end) {
+                            return Err("range start outside 16-bit range".to_string());
+                        }
                         if sequence {
                             start.clone_from(&end);
                         } else {
@@ -1944,16 +2063,29 @@ fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
         let base = load_builtin_encoding_cmap(&name)?;
         let mut merged = base.map;
         merged.extend(map);
+        let mut merged_code_spaces = base.code_spaces;
+        merged_code_spaces.extend(code_spaces);
+        let code_byte_length = merged_code_spaces
+            .iter()
+            .map(|space| space.byte_length)
+            .max()
+            .unwrap_or(base.code_byte_length.max(max_code_size));
         return Ok(EncodingCMap {
             map: merged,
-            code_byte_length: base.code_byte_length.max(max_code_size),
+            code_byte_length,
+            code_spaces: merged_code_spaces,
             is_identity: false,
         });
     }
 
     Ok(EncodingCMap {
         map,
-        code_byte_length: max_code_size,
+        code_byte_length: code_spaces
+            .iter()
+            .map(|space| space.byte_length)
+            .max()
+            .unwrap_or(max_code_size),
+        code_spaces,
         is_identity: false,
     })
 }
@@ -3620,6 +3752,48 @@ endbfrange
         assert_eq!(encoding.map.get(&0xB6AB), Some(&1514));
         assert_eq!(encoding.map.get(&0xB7BD), Some(&1626));
         assert!(encoding.map.len() > 20_000);
+    }
+
+    #[test]
+    fn gbk_euc_h_preserves_mixed_width_code_spaces() {
+        let encoding = load_builtin_encoding_cmap("GBK-EUC-H").unwrap();
+        let lengths: HashSet<_> = encoding
+            .code_spaces
+            .iter()
+            .map(|space| space.byte_length)
+            .collect();
+
+        assert_eq!(lengths, HashSet::from([1, 2]));
+        assert_eq!(encoding.map.get(&0x42), Some(&847));
+
+        let mut cmap = ToUnicodeCMap::new();
+        cmap.char_map.insert(0x41, "A".to_string());
+        cmap.char_map.insert(0x42, "B".to_string());
+        cmap.char_map.insert(0x43, "C".to_string());
+        cmap.char_map.insert(0x44, "D".to_string());
+        cmap.char_map.insert(0xB6AB, "\u{4E1C}".to_string());
+        cmap.code_byte_length = encoding.code_byte_length;
+        cmap.code_spaces = encoding.code_spaces;
+
+        assert_eq!(cmap.decode_cids(b"ABCD"), "ABCD");
+        assert_eq!(cmap.decode_cids(b"AB\xb6\xabCD"), "AB\u{4E1C}CD");
+    }
+
+    #[test]
+    fn inc_hex_rejects_increment_past_the_16_bit_domain() {
+        let mut code = [0xff, 0xff];
+        assert!(!inc_hex(&mut code));
+        assert_eq!(code, [0xff, 0xff]);
+    }
+
+    #[test]
+    fn read_signed_decodes_high_unsigned_values_without_truncation() {
+        // 0x80000000 is a positive zigzag value; casting through i32 would
+        // incorrectly turn it into a negative delta.
+        let mut stream = BinaryCMapStream::new(&[0x88, 0x80, 0x80, 0x80, 0x00]);
+        assert_eq!(stream.read_signed().unwrap(), 1_073_741_824);
+        let mut overflowing = BinaryCMapStream::new(&[0x90, 0x80, 0x80, 0x80, 0x00]);
+        assert!(overflowing.read_signed().is_err());
     }
 
     #[test]
