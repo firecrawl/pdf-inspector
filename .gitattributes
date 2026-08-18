@@ -1,0 +1,2 @@
+*.pdf binary
+tests/snapshots/*.md text eol=lf

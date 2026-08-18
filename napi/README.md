@@ -10,7 +10,8 @@ Built by [Firecrawl](https://firecrawl.dev) for hybrid OCR pipelines — extract
 - **Region-based extraction** — pull text from bounding boxes with per-region quality checks (`needsOcr`).
 - **Layout-aware** — multi-column reading order, position and font info per text item, RTL support.
 - **Robust text decoding** — CID/Type0 fonts via ToUnicode CMaps, plus automatic flagging of broken encodings so callers can fall back to OCR.
-- **Lightweight** — native Rust core via napi-rs, no ML models, no external services; ~5–6 MB platform binary, TypeScript definitions included.
+- **Selective OCR** — `Auto` routes only pages rejected by native extraction and returns source/model provenance plus hosted-fallback recommendations.
+- **External artifacts** — the native package embeds no OCR models, PDFium, or ONNX Runtime; clean `Auto` requests never load or download them.
 
 ## Benchmark
 
@@ -36,7 +37,41 @@ bun add @firecrawl/pdf-inspector
 
 Prebuilt binaries for **Linux x64/ARM64** (glibc and musl/Alpine), **macOS ARM64**, and **Windows x64** — npm installs only the one matching your platform. No Rust toolchain needed.
 
+OCR calls that route work require compatible PDFium and ONNX Runtime shared
+libraries. Set `PDFIUM_LIB_PATH` and `ORT_DYLIB_PATH` when they are not on the
+platform library search path. The pinned OCR model set is downloaded and
+checksum-verified on the first routed page; use `offline: true` with a warm
+cache or `modelDirectory` to prohibit network access. See the
+[OCR runtime setup guide](https://github.com/firecrawl/pdf-inspector/blob/main/docs/ocr-runtime.md)
+for pinned downloads, supported platforms, and hosted-fallback behavior.
+
 ## API
+
+### `processPdfWithOcr(buffer: Buffer, options?: OcrOptions): Promise<OcrPdfResult>`
+
+Run native extraction first and OCR only the pages selected by its quality
+signals. The default mode is `Auto`; `Off` returns the same detailed result
+shape without external runtime work, and `Force` OCRs every selected page.
+The work runs on the libuv thread pool and never blocks Node's event loop.
+
+```typescript
+import { OcrMode, processPdfWithOcr } from '@firecrawl/pdf-inspector'
+
+const result = await processPdfWithOcr(pdf, {
+  mode: OcrMode.Auto,
+  pageNumbers: [1, 3], // 1-indexed
+})
+
+for (const page of result.pages) {
+  console.log(page.pageNumber, page.provenance.source)
+}
+console.log(result.pagesRoutedToOcr)
+console.log(result.pagesRecommendingHosted)
+```
+
+For offline deployments, pass `modelDirectory` and `offline: true`. Other
+controls include `dpi`, `minimumConfidence`,
+`hostedRecommendationConfidence`, and `password`.
 
 ### `classifyPdf(buffer: Buffer): PdfClassification`
 
@@ -123,6 +158,22 @@ interface RegionText {
   text: string
   needsOcr: boolean         // true when text is unreliable
   ocrReason?: string        // "suspected_garbled_text" when known
+}
+
+interface OcrPdfResult {
+  markdown: string
+  pages: OcrPageResult[]              // 1-indexed pages + provenance
+  pageCount: number
+  pagesRecommendedForOcr: number[]
+  pagesRoutedToOcr: number[]
+  pagesRecommendingHosted: number[]
+  ocrReasonsByPage: PageOcrReasons[]
+  pagesWithTables: number[]
+  pagesWithColumns: number[]
+  isComplex: boolean
+  processingTimeMs: number
+  renderTimeMs: number
+  ocrTimeMs: number
 }
 ```
 

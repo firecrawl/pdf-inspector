@@ -43,6 +43,7 @@ mod text_quality;
 pub mod text_utils;
 pub mod tounicode;
 pub mod types;
+pub mod vision;
 
 pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
@@ -465,8 +466,44 @@ pub fn extract_pages_markdown_mem(
     buffer: &[u8],
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        None,
+        &MarkdownOptions::default(),
+        false,
+        false,
+    )
+    .map(|(result, _)| result)
+}
+
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+pub(crate) fn extract_pages_markdown_mem_for_ocr(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+    markdown_options: &MarkdownOptions,
+) -> Result<(PagesExtractionResult, u32), PdfError> {
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        password,
+        markdown_options,
+        markdown_options.strip_headers_footers,
+        true,
+    )
+}
+
+fn extract_pages_markdown_mem_impl(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+    markdown_options: &MarkdownOptions,
+    strip_repeated_headers_footers: bool,
+    preserve_ocr_candidates: bool,
+) -> Result<(PagesExtractionResult, u32), PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
@@ -509,6 +546,11 @@ pub fn extract_pages_markdown_mem(
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
+    let repeated_header_footer_items = if strip_repeated_headers_footers {
+        repeated_header_footer_item_keys(&all_items, &page_thresholds, &chart_regions, page_count)
+    } else {
+        HashSet::new()
+    };
 
     // When caller doesn't specify pages, return every page in document order.
     let all_pages: Vec<u32>;
@@ -544,7 +586,10 @@ pub fn extract_pages_markdown_mem(
         let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
             .iter()
             .zip(&page_number_removal_mask)
-            .filter(|(item, _)| item.page == page_1idx)
+            .filter(|(item, _)| {
+                item.page == page_1idx
+                    && !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(*item))
+            })
             .map(|(item, remove)| (item.clone(), *remove))
             .unzip();
 
@@ -581,7 +626,7 @@ pub fn extract_pages_markdown_mem(
             base_font_size: Some(font_stats.most_common_size),
             include_page_numbers: false,
             strip_headers_footers: false,
-            ..MarkdownOptions::default()
+            ..markdown_options.clone()
         };
 
         let md = if has_text_quality_issue {
@@ -634,20 +679,143 @@ pub fn extract_pages_markdown_mem(
 
         results.push(PageMarkdown {
             page: page_0idx,
-            markdown: if needs_ocr { String::new() } else { md },
+            // The public native extractor continues to suppress unreliable
+            // text. The OCR orchestrator retains clean partial text
+            // internally so it can compare/fuse it with OCR before deciding
+            // what is safe to return.
+            markdown: if needs_ocr && !preserve_ocr_candidates {
+                String::new()
+            } else {
+                md
+            },
             needs_ocr,
             ocr_reason,
         });
     }
 
-    Ok(PagesExtractionResult {
-        pages: results,
-        pages_with_tables: complexity.pages_with_tables,
-        pages_with_columns: complexity.pages_with_columns,
-        pages_needing_ocr,
-        ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
-        is_complex: complexity.is_complex,
-    })
+    Ok((
+        PagesExtractionResult {
+            pages: results,
+            pages_with_tables: complexity.pages_with_tables,
+            pages_with_columns: complexity.pages_with_columns,
+            pages_needing_ocr,
+            ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
+            is_complex: complexity.is_complex,
+        },
+        page_count,
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HeaderFooterItemKey {
+    page: u32,
+    x: u32,
+    y: u32,
+    text: String,
+}
+
+impl From<&TextItem> for HeaderFooterItemKey {
+    fn from(item: &TextItem) -> Self {
+        Self {
+            page: item.page,
+            x: item.x.to_bits(),
+            y: item.y.to_bits(),
+            text: item.text.clone(),
+        }
+    }
+}
+
+fn repeated_header_footer_item_keys(
+    items: &[TextItem],
+    page_thresholds: &HashMap<u32, f32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    page_count: u32,
+) -> HashSet<HeaderFooterItemKey> {
+    let candidates = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.item_type,
+                types::ItemType::Text | types::ItemType::FormField
+            )
+        })
+        .cloned()
+        .collect();
+    let lines = extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
+        candidates,
+        page_thresholds,
+        &HashSet::new(),
+        chart_regions,
+    );
+    let all_items: HashSet<_> = lines
+        .iter()
+        .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
+        .collect();
+    let kept = markdown::strip_repeated_header_footer_lines(lines, page_count);
+    let kept_items: HashSet<_> = kept
+        .iter()
+        .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
+        .collect();
+    all_items.difference(&kept_items).cloned().collect()
+}
+
+#[cfg(all(test, feature = "ocr", not(target_arch = "wasm32")))]
+mod ocr_header_footer_tests {
+    use super::*;
+
+    fn item(page: u32, text: &str, y: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x: 10.0,
+            y,
+            width: 120.0,
+            height: 10.0,
+            font: "Test".to_string(),
+            font_size: 10.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: types::ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn local_pipeline_prefilters_document_wide_repeated_headers() {
+        let mut items = Vec::new();
+        let mut thresholds = HashMap::new();
+        for page in 1..=3 {
+            items.push(item(page, "Repeated report header", 800.0));
+            for line in 0..12 {
+                items.push(item(
+                    page,
+                    &format!("Page {page} paragraph {line} unique content"),
+                    700.0 - line as f32 * 40.0,
+                ));
+            }
+            thresholds.insert(page, 0.1);
+        }
+
+        let removed = repeated_header_footer_item_keys(&items, &thresholds, &HashMap::new(), 3);
+        assert_eq!(removed.len(), 2);
+        for page in 1..=3 {
+            assert_eq!(
+                removed.contains(&HeaderFooterItemKey::from(&item(
+                    page,
+                    "Repeated report header",
+                    800.0,
+                ))),
+                page > 1,
+            );
+            assert!(!removed.contains(&HeaderFooterItemKey::from(&item(
+                page,
+                &format!("Page {page} paragraph 5 unique content"),
+                500.0,
+            ))));
+        }
+    }
 }
 
 /// Path-based wrapper for [`extract_pages_markdown_mem`].
@@ -833,7 +1001,10 @@ pub fn extract_text_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        // Extract text items for this page
+        // Extract text items for this page. The Form XObject budget is shared
+        // with the invisible-layer retry below so one page cannot consume two
+        // full expansion budgets.
+        let mut form_budget = extractor::FormWalkBudget::new();
         let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
@@ -842,6 +1013,7 @@ pub fn extract_text_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                &mut form_budget,
             )?;
         // OCR-layer fallback: scanned pages often carry their text as an
         // invisible (Tr 3) layer behind the page raster. The visible-only
@@ -870,6 +1042,7 @@ pub fn extract_text_in_regions_mem(
                     &font_cmaps,
                     true,
                     &mut style_cache,
+                    &mut form_budget,
                 )
             {
                 let inv_alnum = non_placeholder_alnum(&inv_items);
@@ -1052,6 +1225,7 @@ pub fn extract_tables_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                &mut extractor::FormWalkBudget::new(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -1363,6 +1537,7 @@ pub fn detect_vector_grid_in_region_mem(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
+            &mut extractor::FormWalkBudget::new(),
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
@@ -1557,6 +1732,7 @@ mod vector_grid_tests {
                 &cmaps,
                 false,
                 &mut crate::extractor::FontStyleCache::new(),
+                &mut crate::extractor::FormWalkBudget::new(),
             )
             .unwrap();
 
@@ -1600,6 +1776,7 @@ mod vector_grid_tests {
                 &cmaps,
                 false,
                 &mut crate::extractor::FontStyleCache::new(),
+                &mut crate::extractor::FormWalkBudget::new(),
             )
             .unwrap();
 
@@ -2337,6 +2514,7 @@ pub fn extract_tables_with_structure_cells_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                &mut extractor::FormWalkBudget::new(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -3139,6 +3317,7 @@ fn detect_tsr_quality_issue(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
+            &mut extractor::FormWalkBudget::new(),
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {

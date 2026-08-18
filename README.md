@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/pdf-inspector.svg)](https://pypi.org/project/pdf-inspector/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Fast Rust library for PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Includes bindings for [Python](docs/python.md), [Node.js](napi/README.md), and [browser WebAssembly](wasm/README.md).
+Fast Rust library for PDF classification and text extraction. By default it detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown without OCR. Native Rust and CLI consumers can opt into selective OCR. Includes bindings for [Python](docs/python.md), [Node.js](napi/README.md), and [browser WebAssembly](wasm/README.md).
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
@@ -18,9 +18,10 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **CID font support** — ToUnicode CMap decoding for Type0/Identity-H fonts, UTF-16BE, UTF-8, and Latin-1 encodings.
 - **Multi-column layout** — Automatic detection of newspaper-style columns, sequential reading order, and RTL text support.
 - **Encoding issue detection** — Automatically flags broken font encodings so callers can fall back to OCR.
+- **Selective OCR** — Rust, CLI, Python, and Node can render only pages that need OCR, run PP-OCRv6 Small locally, and preserve per-page provenance and hosted-fallback recommendations.
 - **Single document load** — The document is parsed once and shared between detection and extraction, avoiding redundant I/O.
 - **Browser WebAssembly** — Run the same Rust parser locally in browsers and Web Workers, with embedded CMaps and no server round trip.
-- **Lightweight** — Pure Rust, no ML models, no external services. Single dependency on `lopdf` for PDF parsing.
+- **Lightweight by default** — The default Rust and browser builds remain pure extraction. Native Python and Node packages include the OCR integration, but PDFium, ONNX Runtime, and model files remain external and are touched only when a page is routed to OCR.
 
 ## Benchmark
 
@@ -47,8 +48,7 @@ Use the [paired benchmark harness](docs/benchmarking.md) to compare two local bu
 ### Python
 
 ```bash
-pip install maturin
-maturin develop --release
+pip install pdf-inspector
 ```
 
 ```python
@@ -57,6 +57,10 @@ import pdf_inspector
 result = pdf_inspector.process_pdf("document.pdf")
 print(result.pdf_type)   # "text_based", "scanned", "image_based", "mixed"
 print(result.markdown)   # Markdown string or None
+
+# Selective OCR; clean text PDFs do not load the external OCR runtime.
+ocr = pdf_inspector.process_pdf_with_ocr("document.pdf")
+print(ocr.pages_routed_to_ocr)
 ```
 
 > Full API reference: [docs/python.md](docs/python.md)
@@ -69,11 +73,15 @@ npm install @firecrawl/pdf-inspector
 
 ```javascript
 import { readFileSync } from 'fs';
-import { processPdf, classifyPdf } from '@firecrawl/pdf-inspector';
+import { processPdf, processPdfWithOcr } from '@firecrawl/pdf-inspector';
 
-const result = processPdf(readFileSync('document.pdf'));
+const pdf = readFileSync('document.pdf');
+const result = processPdf(pdf);
 console.log(result.pdfType);   // "TextBased", "Scanned", "ImageBased", "Mixed"
 console.log(result.markdown);  // Markdown string or null
+
+const ocr = await processPdfWithOcr(pdf); // selective OCR, off the event loop
+console.log(ocr.pagesRoutedToOcr);
 ```
 
 > Full API reference: [napi/README.md](napi/README.md)
@@ -159,6 +167,23 @@ detect-pdf document.pdf --json
 # Detection + layout analysis (tables, columns)
 detect-pdf document.pdf --analyze --json
 ```
+
+Rust and CLI consumers opt into OCR at build time:
+
+```bash
+cargo install pdf-inspector --features ocr --bin pdf2md
+PDFIUM_LIB_PATH=/path/to/libpdfium ORT_DYLIB_PATH=/path/to/libonnxruntime \
+  pdf2md scan.pdf --ocr auto --json
+```
+
+The OCR JSON envelope is versioned and reports routed pages, per-page source
+and confidence, warnings, and pages recommended for the hosted document
+pipeline. Native Python and Node packages expose the same pipeline without a
+source-build feature. All native entry points still require separately
+installed PDFium and ONNX Runtime libraries only when OCR is routed. See the
+[OCR runtime setup guide](docs/ocr-runtime.md) for pinned downloads, platform
+support, model-cache behavior, and hosted-fallback integration. See the
+[Rust API guide](docs/rust-api.md#complete-ocr-api) for lower-level controls.
 
 From a source checkout, use `cargo run --bin pdf2md -- document.pdf` or `cargo run --bin detect-pdf -- document.pdf` instead.
 

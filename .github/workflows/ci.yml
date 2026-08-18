@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test
@@ -68,8 +71,11 @@ jobs:
         with:
           key: clippy
 
-      - name: Run clippy
+      - name: Run default clippy
         run: cargo clippy -- -D warnings
+
+      - name: Run OCR clippy
+        run: cargo clippy --features ocr -- -D warnings
 
   build:
     name: Build
@@ -92,6 +98,183 @@ jobs:
 
       - name: Build
         run: cargo build --release --verbose
+
+  ocr:
+    name: OCR (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ocr-${{ matrix.os }}
+
+      - name: Test optional OCR feature
+        run: cargo test --features ocr
+
+  ocr-runtime:
+    name: OCR runtime smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ocr-runtime
+          workspaces: |
+            . -> target
+            napi -> target
+
+      - name: Install PDFium
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/firecrawl-pdfium-linux-x64.tgz"
+          directory="$RUNNER_TEMP/firecrawl-pdfium"
+          curl --fail --location --silent --show-error \
+            https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-linux-x64.tgz \
+            --output "$archive"
+          echo "6248189e07bbc33cdeb31976c539a88614307c8a19f3276dbd018efbe5b4a2a2  $archive" | sha256sum --check
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          pdfium_path="$(find "$directory" -type f -name 'libpdfium.so' -print -quit)"
+          test -n "$pdfium_path"
+          echo "PDFIUM_LIB_PATH=$pdfium_path" >> "$GITHUB_ENV"
+
+      - name: Install ONNX Runtime
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.27.0.tgz"
+          directory="$RUNNER_TEMP/onnxruntime"
+          curl --fail --location --silent --show-error \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz \
+            --output "$archive"
+          echo "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f  $archive" | sha256sum --check
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          ort_path="$(find "$directory" -type f -name 'libonnxruntime.so*' -print -quit)"
+          test -n "$ort_path"
+          echo "ORT_DYLIB_PATH=$ort_path" >> "$GITHUB_ENV"
+
+      - name: Configure isolated model cache
+        shell: bash
+        run: echo "PDF_INSPECTOR_MODEL_CACHE=$RUNNER_TEMP/pdf-inspector-models" >> "$GITHUB_ENV"
+
+      - name: Build OCR CLI
+        run: cargo build --features ocr --bin pdf2md
+
+      - name: Test PDFium runtime
+        run: cargo test --features ocr --test local_render_tests
+
+      - name: Provision OCR model cache
+        shell: bash
+        run: |
+          target/debug/pdf2md \
+            tests/fixtures/scan_with_native_header_text.pdf \
+            --ocr force \
+            --json > /dev/null
+
+      - name: Run OCR CLI
+        shell: bash
+        run: |
+          target/debug/pdf2md \
+            tests/fixtures/scan_with_native_header_text.pdf \
+            --ocr auto \
+            --ocr-offline \
+            --json > "$RUNNER_TEMP/ocr-result.json"
+
+      - name: Validate OCR JSON contract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "ocr-result.json").read_text()
+          )
+          assert result["schema_version"] == 1
+          assert result["pages_routed_to_ocr"] == [1]
+          assert result["pages_recommending_hosted"] == []
+          assert result["pages"][0]["source"] in {"ocr", "fused"}
+          assert result["pages"][0]["markdown"].strip()
+          assert "layout_ms" not in result["pages"][0]["timings"]
+          PY
+
+      - name: Run OCR launch smoke set
+        shell: bash
+        run: |
+          export PDF_INSPECTOR_OCR_TEST_MODELS="$PDF_INSPECTOR_MODEL_CACHE/pp-ocrv6-small/oar-ocr-v0.7.0"
+          cargo test --features ocr --test ocr_tests -- --nocapture
+
+      - name: Build Node binding
+        working-directory: napi
+        run: |
+          bun install --frozen-lockfile
+          bunx napi build --platform --release
+
+      - name: Run Node OCR binding
+        shell: bash
+        run: |
+          node --input-type=module - <<'JS'
+          import { readFileSync } from 'node:fs'
+          import { processPdfWithOcr } from './napi/index.js'
+
+          const pdf = readFileSync('tests/fixtures/scan_with_native_header_text.pdf')
+          const result = await processPdfWithOcr(pdf, { offline: true })
+          if (JSON.stringify(result.pagesRoutedToOcr) !== '[1]') throw new Error('unexpected OCR route')
+          if (result.pagesRecommendingHosted.length !== 0) throw new Error('unexpected hosted recommendation')
+          if (!['Ocr', 'Fused'].includes(result.pages[0].provenance.source)) throw new Error('unexpected source')
+          if (!result.pages[0].markdown.trim()) throw new Error('empty OCR markdown')
+          JS
+
+      - name: Build and install Python binding
+        shell: bash
+        run: |
+          python -m pip install 'maturin>=1,<2'
+          maturin build --release --out "$RUNNER_TEMP/python-wheels"
+          python -m pip install "$RUNNER_TEMP"/python-wheels/*.whl
+
+      - name: Run Python OCR binding
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pdf_inspector
+
+          result = pdf_inspector.process_pdf_with_ocr(
+              "tests/fixtures/scan_with_native_header_text.pdf",
+              offline=True,
+          )
+          assert result.pages_routed_to_ocr == [1]
+          assert result.pages_recommending_hosted == []
+          assert result.pages[0].provenance.source in {"ocr", "fused"}
+          assert result.pages[0].markdown.strip()
+          PY
 
   wasm:
     name: WebAssembly
