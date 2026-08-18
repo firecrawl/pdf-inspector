@@ -183,15 +183,12 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
             // by ')' — "(1)", "(12)", "(a)", "(iv)". Parenthetical prose
             // ("(all amounts in thousands)") is not a marker.
             let paren_marker = trimmed.strip_prefix('(').is_some_and(|rest| {
-                let marker: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric())
-                    .collect();
+                let marker: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
                 !marker.is_empty()
                     && marker.chars().count() <= 3
                     && marker
                         .chars()
-                        .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+                        .all(|c| c.is_ascii_digit() || c.is_lowercase())
                     && rest[marker.len()..].starts_with(')')
             });
             let marker_led = first.is_some_and(|c| c.is_ascii_digit())
@@ -866,6 +863,26 @@ mod tests {
                 .iter()
                 .any(|l| l.text().contains("1. Introduction extra")),
             "structural line must survive a normalized-key collision"
+        );
+    }
+
+    #[test]
+    fn edge_furniture_keeps_unicode_paren_marker() {
+        // Greek-letter footnote markers are lowercase too: "(α)" earns the
+        // same protection as "(a)".
+        let mut lines = Vec::new();
+        body_page(&mut lines);
+        lines.push(make_line(
+            "(α) See the appendix for the derivation",
+            8.0,
+            1,
+            380.0,
+            None,
+        ));
+        let result = strip_header_footer_lines(lines, 1);
+        assert!(
+            result.iter().any(|l| l.text().contains("appendix")),
+            "Unicode lowercase paren marker must survive"
         );
     }
 
