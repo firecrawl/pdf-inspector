@@ -18,7 +18,7 @@ use crate::types::TextLine;
 /// and typographic evidence instead, and only strips where that evidence is
 /// strong; anything ambiguous stays:
 ///
-/// - A page needs enough body to judge (>= 8 lines). One block per edge is
+/// - A page needs enough body to judge (more than 8 lines). One block per edge is
 ///   considered: the run of up to 2 lines from the page edge at normal
 ///   leading. Runs of 3+ lines are body-sized content and stay whole.
 /// - Isolation: the edge block must sit a clear gap (1.8x the page's median
@@ -50,7 +50,9 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
     let mut removal: HashSet<usize> = HashSet::new();
     for indices in pages.values_mut() {
         indices.sort_by(|&a, &b| lines[b].y.total_cmp(&lines[a].y));
-        if indices.len() < MIN_PAGE_LINES {
+        // Strictly more than the floor: on a page at the minimum, the two
+        // edge blocks could remove up to half the content.
+        if indices.len() <= MIN_PAGE_LINES {
             continue;
         }
 
@@ -186,12 +188,10 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
                 let marker: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
                 !marker.is_empty()
                     && marker.chars().count() <= 3
-                    && marker
-                        .chars()
-                        .all(|c| c.is_ascii_digit() || c.is_lowercase())
+                    && marker.chars().all(|c| c.is_numeric() || c.is_lowercase())
                     && rest[marker.len()..].starts_with(')')
             });
-            let marker_led = first.is_some_and(|c| c.is_ascii_digit())
+            let marker_led = first.is_some_and(|c| c.is_numeric())
                 || paren_marker
                 || first.is_some_and(|c| matches!(c, '†' | '‡' | '§' | '¶' | '*'))
                 || trimmed.split_whitespace().next().is_some_and(|tok| {
@@ -262,12 +262,11 @@ fn is_structural_line(text: &str) -> bool {
     let t = text.trim_start();
     let mut chars = t.chars();
     let first = chars.next();
-    let numbered =
-        first.is_some_and(|c| c.is_ascii_digit()) && (t.contains(". ") || t.contains(") "));
+    let numbered = first.is_some_and(|c| c.is_numeric()) && (t.contains(". ") || t.contains(") "));
     // Parenthesized enumerations ("(4) The Secretary ...") are numbered
     // structural lines with the marker wrapped.
     let paren_numbered =
-        first == Some('(') && chars.next().is_some_and(|c| c.is_ascii_digit()) && t.contains(") ");
+        first == Some('(') && chars.next().is_some_and(|c| c.is_numeric()) && t.contains(") ");
     t.starts_with('#')
         || t.starts_with("- ")
         || t.starts_with("* ")
@@ -377,6 +376,20 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         let y_bucket = (line.y * 10.0).round() as i32;
         y_bands.entry((line.page, y_bucket)).or_default().push(idx);
     }
+
+    // A band with a structural member is one physical row of content: the
+    // whole row is protected, because removing only the plain fragments
+    // would leave a mangled half-row. Every removal path below honors this.
+    let protected_bands: HashSet<(u32, i32)> = y_bands
+        .iter()
+        .filter(|(_, indices)| {
+            indices
+                .iter()
+                .any(|&idx| is_structural_line(lines[idx].text().trim()))
+        })
+        .map(|(&key, _)| key)
+        .collect();
+    let band_key = |line: &TextLine| -> (u32, i32) { (line.page, (line.y * 10.0).round() as i32) };
 
     // Build frequency maps using normalize_for_comparison.
     // Individual line text -> distinct pages
@@ -501,8 +514,9 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         // Removal must apply the same original-text structural protection
         // as candidate collection: a structural line can share a normalized
         // key with a non-structural candidate once its leading number is
-        // normalized away.
-        if is_structural_line(text.trim()) {
+        // normalized away. Protection extends to the line's whole Y-band —
+        // one physical row — so a heading's row-mates are not half-removed.
+        if protected_bands.contains(&band_key(line)) {
             continue;
         }
         let normalized = normalize_for_comparison(&text);
@@ -543,8 +557,8 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         }
     }
     // Second pass: mark for removal (skip first page)
-    for (&(page, _), indices) in &y_bands {
-        if indices.len() < 2 {
+    for (&(page, y_bucket), indices) in &y_bands {
+        if indices.len() < 2 || protected_bands.contains(&(page, y_bucket)) {
             continue;
         }
         let band_y = lines[indices[0]].y;
@@ -565,32 +579,27 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if band_candidates.contains(&normalized) {
             let first = first_page_band.get(&normalized).copied().unwrap_or(0);
             if page > first {
-                // Per-member protection: the coalesced text can read as
-                // non-structural while an individual sibling is structural
-                // (a heading fragment banded with a plain fragment).
                 for &idx in &sorted_indices {
-                    if !is_structural_line(lines[idx].text().trim()) {
-                        removal_set.insert(idx);
-                    }
+                    removal_set.insert(idx);
                 }
             }
         }
     }
 
     // (c) Y-band sibling propagation: if any member is removed, remove all
-    //     members (provided the band is at an edge position). Structural
-    //     siblings keep the same original-text protection as the direct
-    //     passes.
-    for (&(page, _), indices) in &y_bands {
+    //     members (provided the band is at an edge position and the band is
+    //     not structurally protected).
+    for (&(page, y_bucket), indices) in &y_bands {
+        if protected_bands.contains(&(page, y_bucket)) {
+            continue;
+        }
         let band_y = lines[indices[0]].y;
         if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
             continue;
         }
         if indices.iter().any(|idx| removal_set.contains(idx)) {
             for &idx in indices {
-                if !is_structural_line(lines[idx].text().trim()) {
-                    removal_set.insert(idx);
-                }
+                removal_set.insert(idx);
             }
         }
     }
@@ -887,6 +896,26 @@ mod tests {
     }
 
     #[test]
+    fn edge_furniture_keeps_unicode_digit_marker() {
+        // Arabic-Indic digits are digits: "(١)" earns the same protection
+        // as "(1)".
+        let mut lines = Vec::new();
+        body_page(&mut lines);
+        lines.push(make_line(
+            "(١) See the appendix for the derivation",
+            8.0,
+            1,
+            380.0,
+            None,
+        ));
+        let result = strip_header_footer_lines(lines, 1);
+        assert!(
+            result.iter().any(|l| l.text().contains("appendix")),
+            "Unicode digit paren marker must survive"
+        );
+    }
+
+    #[test]
     fn edge_furniture_strips_parenthetical_prose_footer() {
         // Parenthetical lowercase PROSE is not a footnote marker: only a
         // short "(a)"/"(12)"-style token closed by ')' earns protection.
@@ -945,6 +974,14 @@ mod tests {
                 .count(),
             10,
             "structural band sibling must survive on every page"
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("Journal of Applied Testing"))
+                .count(),
+            10,
+            "the structural member protects its whole physical row"
         );
     }
 
