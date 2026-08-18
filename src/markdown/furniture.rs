@@ -178,13 +178,24 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
             // ("† Estimates assume ..."), and single-lowercase-letter
             // markers ("a See the appendix ..."). A capitalized one-letter
             // word ("A Publication of ...") is prose, not a marker.
-            let mut leading = trimmed.chars();
-            let first = leading.next();
+            let first = trimmed.chars().next();
+            // A parenthesized marker is a short digit/lowercase token closed
+            // by ')' — "(1)", "(12)", "(a)", "(iv)". Parenthetical prose
+            // ("(all amounts in thousands)") is not a marker.
+            let paren_marker = trimmed.strip_prefix('(').is_some_and(|rest| {
+                let marker: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                !marker.is_empty()
+                    && marker.chars().count() <= 3
+                    && marker
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+                    && rest[marker.len()..].starts_with(')')
+            });
             let marker_led = first.is_some_and(|c| c.is_ascii_digit())
-                || (first == Some('(')
-                    && leading
-                        .next()
-                        .is_some_and(|c| c.is_ascii_digit() || c.is_lowercase()))
+                || paren_marker
                 || first.is_some_and(|c| matches!(c, '†' | '‡' | '§' | '¶' | '*'))
                 || trimmed.split_whitespace().next().is_some_and(|tok| {
                     tok.chars().count() == 1 && tok.chars().all(|c| c.is_lowercase())
@@ -557,8 +568,13 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if band_candidates.contains(&normalized) {
             let first = first_page_band.get(&normalized).copied().unwrap_or(0);
             if page > first {
+                // Per-member protection: the coalesced text can read as
+                // non-structural while an individual sibling is structural
+                // (a heading fragment banded with a plain fragment).
                 for &idx in &sorted_indices {
-                    removal_set.insert(idx);
+                    if !is_structural_line(lines[idx].text().trim()) {
+                        removal_set.insert(idx);
+                    }
                 }
             }
         }
@@ -850,6 +866,68 @@ mod tests {
                 .iter()
                 .any(|l| l.text().contains("1. Introduction extra")),
             "structural line must survive a normalized-key collision"
+        );
+    }
+
+    #[test]
+    fn edge_furniture_strips_parenthetical_prose_footer() {
+        // Parenthetical lowercase PROSE is not a footnote marker: only a
+        // short "(a)"/"(12)"-style token closed by ')' earns protection.
+        let mut lines = Vec::new();
+        body_page(&mut lines);
+        lines.push(make_line(
+            "(all amounts in thousands of dollars)",
+            8.0,
+            1,
+            380.0,
+            None,
+        ));
+        let result = strip_header_footer_lines(lines, 1);
+        assert!(
+            !result.iter().any(|l| l.text().contains("thousands")),
+            "parenthetical prose footer must still strip"
+        );
+    }
+
+    #[test]
+    fn band_removal_spares_structural_sibling() {
+        // A repeated edge Y-band pairs a plain fragment with a structural
+        // sibling; the coalesced text reads non-structural, but the sibling
+        // itself must survive removal.
+        let mut lines = Vec::new();
+        for page in 1..=10u32 {
+            lines.push(make_line(
+                "Journal of Applied Testing",
+                10.0,
+                page,
+                750.0,
+                None,
+            ));
+            lines.push(make_line(
+                "1. Introduction overview",
+                10.0,
+                page,
+                750.0,
+                None,
+            ));
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("unique body content words {page} {j} lorem ipsum"),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 10);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("1. Introduction overview"))
+                .count(),
+            10,
+            "structural band sibling must survive on every page"
         );
     }
 
