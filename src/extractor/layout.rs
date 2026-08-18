@@ -227,9 +227,14 @@ pub(crate) fn detect_columns(
     // than the peaks on either side.
     // Only attempt this for dense pages (>=100 items) — sparse pages with shallow
     // histogram dips are likely not multi-column.
-    // Skip on pages with detected tables — table column gaps look like gutters
-    // in the histogram but the table pipeline already handles reading order.
-    if valleys.is_empty() && page_items.len() >= 100 && !page_has_table {
+    //
+    // Pages with detected tables take this path too: the table's items have
+    // already left the flow by the time grouping runs, so a table cannot
+    // fake a gutter here, and the prose gate below rejects any residual
+    // table-shaped split. Without this, the prose REMAINDER of a
+    // table-bearing two-column page falls to single-column Y-sorting and
+    // the columns interleave line by line.
+    if valleys.is_empty() && page_items.len() >= 100 {
         let rel_valleys = find_relative_valleys(
             &histogram,
             num_bins,
