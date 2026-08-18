@@ -1,0 +1,46 @@
+tests/snapshots/real-estate-pricing.md
+  s_3fa7a2abc03ac9::t_e8603c8cbb42e8 26-29
+  s_3fa7a2abc03ac9::t_09de1eee492bd4 5,7-17
+src/extractor/layout.rs
+  s_3fa7a2abc03ac9::t_dd3474b95f1788 2749-2756
+  s_3fa7a2abc03ac9::t_4c701027f45964 3017-3020,3029-3033,3039-3049,3054-3059,3061-3089,3102-3120,3122-3193,3198-3228,3230-3232
+  s_3fa7a2abc03ac9::t_eb2baaaee8969c 2371
+  s_3fa7a2abc03ac9::t_7040650f5eee50 3194-3197
+  s_3fa7a2abc03ac9::t_b8db2d039c03ac 2348
+  s_3fa7a2abc03ac9::t_aaa20b3272c70b 2678,2688-2694,2698,2741-2745
+  s_3fa7a2abc03ac9::t_ab6fe9d5c5ec1e 2435-2437
+  s_3fa7a2abc03ac9::t_895e76f4b90d40 2762,3021-3028,3090-3101
+  s_3fa7a2abc03ac9::t_dbaa2b7ac0af90 2298-2315,2318,2344-2347,2349-2352,2357
+  s_3fa7a2abc03ac9::t_bc92a46bf7fa72 2584-2585
+  s_3fa7a2abc03ac9::t_29249b02e64614 3034-3038,3050-3053,3060
+  s_3fa7a2abc03ac9::t_9b45da12b9eb25 3229
+  s_3fa7a2abc03ac9::t_3bb1e8b8440457 3121
+  s_3fa7a2abc03ac9::t_edd4ec0b203a49 1924-1946,1951-1970
+  s_3fa7a2abc03ac9::t_3c2f41a3544e12 2554-2583,2586-2623,2625-2630,2632-2634,2643-2677,2679-2687,2695-2697,2699-2708,2714-2740,2746-2748,2757-2761,2763-2781,2792,2794-2797,2799-2803,2815-2821
+  s_3fa7a2abc03ac9::t_c2856a58c020d7 2453-2461
+  s_3fa7a2abc03ac9::t_275026ab68b817 2782-2791,2793
+  s_3fa7a2abc03ac9::t_c9bc575730cc6b 2798
+  s_3fa7a2abc03ac9::t_bd702524127e84 1947-1950
+  s_3fa7a2abc03ac9::t_5ddd9bff73719e 2272-2293,2295-2296
+  s_3fa7a2abc03ac9::t_02b28f1fadf3ca 2452
+  s_3fa7a2abc03ac9::t_9d41bad9e531c2 2316-2317,2319-2343
+  s_3fa7a2abc03ac9::t_9fbb8315b6f68b 2709-2713
+  s_3fa7a2abc03ac9::t_5ca6f3f37a7ca1 2624,2631,2635-2642
+  s_3fa7a2abc03ac9::t_3e3fb246c22c6e 2804-2814
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c7b4f8c68ef0f8f94e86853f42aba3091c210651",
+  "prompts": {},
+  "sessions": {
+    "s_3fa7a2abc03ac9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9bb20049-a216-4dbf-9154-e1bfc58f484d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
