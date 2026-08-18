@@ -252,15 +252,20 @@ fn normalize_for_comparison(s: &str) -> String {
 /// Returns true if the line looks like a list item or heading (should not be stripped).
 fn is_structural_line(text: &str) -> bool {
     let t = text.trim_start();
+    let mut chars = t.chars();
+    let first = chars.next();
+    let numbered =
+        first.is_some_and(|c| c.is_ascii_digit()) && (t.contains(". ") || t.contains(") "));
+    // Parenthesized enumerations ("(4) The Secretary ...") are numbered
+    // structural lines with the marker wrapped.
+    let paren_numbered =
+        first == Some('(') && chars.next().is_some_and(|c| c.is_ascii_digit()) && t.contains(") ");
     t.starts_with('#')
         || t.starts_with("- ")
         || t.starts_with("* ")
         || t.starts_with("• ")
-        || t.chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-            && (t.contains(". ") || t.contains(") "))
+        || numbered
+        || paren_numbered
 }
 
 /// Returns true if a line consists entirely of a single repeated character
@@ -381,7 +386,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue;
         }
         let normalized = normalize_for_comparison(&text);
-        if normalized.len() < 10 || is_decorative_separator(&normalized) {
+        if normalized.chars().count() < 10 || is_decorative_separator(&normalized) {
             continue;
         }
         freq.entry(normalized.clone())
@@ -414,7 +419,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue;
         }
         let normalized = normalize_for_comparison(&coalesced);
-        if normalized.len() < 10 || is_decorative_separator(&normalized) {
+        if normalized.chars().count() < 10 || is_decorative_separator(&normalized) {
             continue;
         }
         band_freq
@@ -845,6 +850,67 @@ mod tests {
                 .iter()
                 .any(|l| l.text().contains("1. Introduction extra")),
             "structural line must survive a normalized-key collision"
+        );
+    }
+
+    #[test]
+    fn repetition_length_floor_counts_chars_not_bytes() {
+        // A six-character CJK line is 18 UTF-8 bytes: byte counting would
+        // let it past the ten-character minimum and classify the repeated
+        // short heading as furniture.
+        let mut lines = Vec::new();
+        for page in 1..=10u32 {
+            lines.push(make_line("第一章序論", 10.0, page, 750.0, None));
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("unique body content words {page} {j} lorem ipsum"),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 10);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("第一章"))
+                .count(),
+            10,
+            "short CJK line must stay under the character-count floor"
+        );
+    }
+
+    #[test]
+    fn repeated_paren_numbered_line_is_not_stripped() {
+        let mut lines = Vec::new();
+        for page in 1..=10u32 {
+            lines.push(make_line(
+                "(1) Sign and date the enclosed form",
+                10.0,
+                page,
+                750.0,
+                None,
+            ));
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("unique body content words {page} {j} lorem ipsum"),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 10);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("Sign and date"))
+                .count(),
+            10,
+            "(digit) enumerations are structural and must never be stripped"
         );
     }
 
