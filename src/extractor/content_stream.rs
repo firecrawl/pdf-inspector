@@ -1356,7 +1356,14 @@ pub(crate) fn extract_page_text_items(
         page_num,
     );
 
-    let items = super::merge_text_items(items);
+    let table_pages = if super::layout::has_narrow_prose_candidate(&items, page_num)
+        && page_has_data_table(&items, &rects, &lines, page_num)
+    {
+        std::collections::HashSet::from([page_num])
+    } else {
+        std::collections::HashSet::new()
+    };
+    let items = super::merge_text_items_with_table_pages(items, &table_pages);
     let items = super::merge_subscript_items(items);
     Ok((
         (items, rects, lines),
@@ -1364,6 +1371,40 @@ pub(crate) fn extract_page_text_items(
         coords_rotated,
         skipped_invisible,
     ))
+}
+
+fn page_has_data_table(
+    items: &[crate::types::TextItem],
+    rects: &[crate::types::PdfRect],
+    lines: &[crate::types::PdfLine],
+    page: u32,
+) -> bool {
+    let has_data_table = |tables: &[crate::tables::Table]| {
+        tables
+            .iter()
+            .any(|table| table.kind == crate::tables::TableKind::Data)
+    };
+    let (rect_tables, _) = crate::tables::detect_tables_from_rects(items, rects, page);
+    if has_data_table(&rect_tables) {
+        return true;
+    }
+    let line_tables = crate::tables::detect_tables_from_lines(items, lines, page);
+    if has_data_table(&line_tables) {
+        return true;
+    }
+
+    let mut font_sizes: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for item in items {
+        let bits = item.font_size.to_bits();
+        *font_sizes.entry(bits).or_insert(0) += 1;
+    }
+    let base_size = font_sizes
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(bits, _)| f32::from_bits(bits))
+        .unwrap_or(10.0);
+    let heuristic_tables = crate::tables::detect_tables(items, base_size, false);
+    has_data_table(&heuristic_tables)
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.

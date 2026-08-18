@@ -976,18 +976,34 @@ fn trimmed_suffix(next: &TextItem) -> &str {
     next.text.trim()
 }
 
+#[cfg(test)]
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
-    if items.is_empty() {
-        return items;
-    }
+    let narrow_column_boundaries = layout::narrow_prose_column_boundaries(&items, &HashSet::new());
+    merge_text_items_with_boundaries(&items, &narrow_column_boundaries)
+}
 
-    let narrow_column_boundaries = layout::narrow_prose_column_boundaries(&items);
+pub(crate) fn merge_text_items_with_table_pages(
+    items: Vec<TextItem>,
+    table_pages: &HashSet<u32>,
+) -> Vec<TextItem> {
+    let narrow_column_boundaries =
+        layout::narrow_prose_column_boundaries(items.as_slice(), table_pages);
+    merge_text_items_with_boundaries(&items, &narrow_column_boundaries)
+}
+
+fn merge_text_items_with_boundaries(
+    items: &[TextItem],
+    narrow_column_boundaries: &HashMap<u32, Vec<f32>>,
+) -> Vec<TextItem> {
+    if items.is_empty() {
+        return Vec::new();
+    }
 
     // Group items by (page, Y position) with 5pt tolerance
     let y_tolerance = 5.0;
     let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
 
-    for item in &items {
+    for item in items {
         let found = line_groups
             .iter_mut()
             .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
@@ -3169,14 +3185,8 @@ mod tests {
         let mut items = Vec::new();
         for row in 0..50 {
             let y = 750.0 - row as f32 * 14.0;
-            items.push(make_item_fs("justify the left column", 40.0, y, 230.0, 9.5));
-            items.push(make_item_fs(
-                "justify the right column",
-                274.7,
-                y,
-                230.0,
-                9.5,
-            ));
+            items.push(make_item_fs("justifytheleftcolumn", 40.0, y, 230.0, 9.5));
+            items.push(make_item_fs("justifytherightcolumn", 274.7, y, 230.0, 9.5));
         }
 
         let merged = merge_text_items(items);
@@ -3186,6 +3196,21 @@ mod tests {
             "each column item must remain separate, got {} merged rows",
             merged.len()
         );
+    }
+
+    #[test]
+    fn narrow_prose_boundaries_honor_table_page_state() {
+        let mut items = Vec::new();
+        for row in 0..50 {
+            let y = 750.0 - row as f32 * 14.0;
+            items.push(make_item_fs("justifytheleftcolumn", 40.0, y, 230.0, 9.5));
+            items.push(make_item_fs("justifytherightcolumn", 274.7, y, 230.0, 9.5));
+        }
+
+        let prose = layout::narrow_prose_column_boundaries(&items, &HashSet::new());
+        let table = layout::narrow_prose_column_boundaries(&items, &HashSet::from([1]));
+        assert_eq!(prose.len(), 1);
+        assert!(table.is_empty());
     }
 
     #[test]

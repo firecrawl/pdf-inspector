@@ -23,6 +23,23 @@ pub(crate) fn detect_columns(
     page: u32,
     page_has_table: bool,
 ) -> Vec<ColumnRegion> {
+    // Get items for this page. Strip Image placeholders — an image's left edge
+    // would otherwise count toward the column projection profile.
+    let page_items: Vec<&TextItem> = items
+        .iter()
+        .filter(|i| i.page == page && crate::extractor::is_text_layout_item(i))
+        .collect();
+    if page_items.is_empty() {
+        return vec![];
+    }
+    detect_columns_from_refs(&page_items, page, page_has_table)
+}
+
+fn detect_columns_from_refs(
+    page_items: &[&TextItem],
+    page: u32,
+    page_has_table: bool,
+) -> Vec<ColumnRegion> {
     const BIN_WIDTH: f32 = 2.0;
     const MIN_GUTTER_WIDTH: f32 = 8.0;
     const MIN_DENSE_PROSE_GUTTER_WIDTH: f32 = 4.0;
@@ -30,13 +47,6 @@ pub(crate) fn detect_columns(
     const MIN_VERTICAL_SPAN_RATIO: f32 = 0.30;
     const MIN_ITEMS_PER_COLUMN: usize = 10;
     const NOISE_FRACTION: f32 = 0.15;
-
-    // Get items for this page. Strip Image placeholders — an image's left edge
-    // would otherwise count toward the column projection profile.
-    let page_items: Vec<&TextItem> = items
-        .iter()
-        .filter(|i| i.page == page && crate::extractor::is_text_layout_item(i))
-        .collect();
 
     if page_items.is_empty() {
         return vec![];
@@ -170,7 +180,7 @@ pub(crate) fn detect_columns(
     let num_bins = ((page_width / bin_width).ceil() as usize).clamp(1, MAX_BINS);
     let mut histogram = vec![0u32; num_bins];
 
-    for item in &page_items {
+    for item in page_items {
         let w = effective_width(item);
         if w > wide_threshold {
             continue;
@@ -393,19 +403,27 @@ pub(crate) fn detect_columns(
 /// grouping. It only exposes a two-column boundary when `detect_columns` has
 /// accepted a 4–8pt gutter and the physical body still supports it. Ordinary
 /// wide gutters already exceed the merge threshold and need no special case.
-pub(crate) fn narrow_prose_column_boundaries(items: &[TextItem]) -> HashMap<u32, Vec<f32>> {
+pub(crate) fn narrow_prose_column_boundaries(
+    items: &[TextItem],
+    table_pages: &HashSet<u32>,
+) -> HashMap<u32, Vec<f32>> {
     let mut pages: Vec<u32> = items.iter().map(|item| item.page).collect();
     pages.sort_unstable();
     pages.dedup();
 
     let mut boundaries = HashMap::new();
     for page in pages {
+        if table_pages.contains(&page) {
+            continue;
+        }
+        if !has_narrow_prose_candidate(items, page) {
+            continue;
+        }
         let page_items: Vec<&TextItem> = items
             .iter()
             .filter(|item| item.page == page && crate::extractor::is_text_layout_item(item))
             .collect();
-        let owned_items: Vec<TextItem> = page_items.iter().map(|item| (*item).clone()).collect();
-        let columns = detect_columns(&owned_items, page, false);
+        let columns = detect_columns_from_refs(&page_items, page, false);
         if columns.len() != 2 {
             continue;
         }
@@ -417,6 +435,33 @@ pub(crate) fn narrow_prose_column_boundaries(items: &[TextItem]) -> HashMap<u32,
     }
 
     boundaries
+}
+
+pub(crate) fn has_narrow_prose_candidate(items: &[TextItem], page: u32) -> bool {
+    let page_items: Vec<&TextItem> = items
+        .iter()
+        .filter(|item| item.page == page && crate::extractor::is_text_layout_item(item))
+        .collect();
+    page_items.len() >= 100 && has_possible_narrow_gutter(&page_items)
+}
+
+fn has_possible_narrow_gutter(page_items: &[&TextItem]) -> bool {
+    let mut left_edges: Vec<f32> = page_items
+        .iter()
+        .filter_map(|item| item.x.is_finite().then_some(item.x))
+        .collect();
+    left_edges.sort_by(|a, b| a.total_cmp(b));
+
+    page_items.iter().any(|item| {
+        let end = item.x + effective_width(item);
+        if !end.is_finite() {
+            return false;
+        }
+        let next = left_edges.partition_point(|&left| left < end);
+        left_edges
+            .get(next)
+            .is_some_and(|&left| (4.0..8.0).contains(&(left - end)))
+    })
 }
 
 /// Simplified single-level XY-cut: find the largest horizontal gap between
@@ -733,7 +778,7 @@ fn narrow_boundary_has_body_support(boundary: f32, page_items: &[&TextItem]) -> 
         .map(|item| item.x)
         .fold(f32::INFINITY, f32::min);
     let physical_gutter = right_gutter_edge - left_gutter_edge;
-    eprintln!(
+    debug!(
         "boundary debug boundary={boundary} left={left_gutter_edge} right={right_gutter_edge} gutter={physical_gutter} left_items={} right_items={}",
         left_items.len(),
         right_items.len()
@@ -748,16 +793,14 @@ fn narrow_boundary_has_body_support(boundary: f32, page_items: &[&TextItem]) -> 
             .copied()
             .min_by(|a, b| a.x.total_cmp(&b.x));
         if let (Some(left), Some(right)) = (blocker, right_blocker) {
-            eprintln!(
-                "blockers left=({:.1}, {:.1}, {:.1}, {:?}) right=({:.1}, {:.1}, {:.1}, {:?})",
+            debug!(
+                "blockers left=({:.1}, {:.1}, {:.1}) right=({:.1}, {:.1}, {:.1})",
                 left.x,
                 effective_width(left),
                 left.y,
-                left.text,
                 right.x,
                 effective_width(right),
-                right.y,
-                right.text
+                right.y
             );
         }
     }
