@@ -173,7 +173,13 @@ fn median_detection_height(heights: &mut [f32], downscale: f32) -> f32 {
         return f32::MAX;
     }
     heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    heights[heights.len() / 2] * downscale
+    let middle = heights.len() / 2;
+    let median = if heights.len().is_multiple_of(2) {
+        (heights[middle - 1] + heights[middle]) / 2.0
+    } else {
+        heights[middle]
+    };
+    median * downscale
 }
 
 /// Detection preprocessing config at a given input cap. The non-limit fields
@@ -300,7 +306,18 @@ impl OarOcrEngine {
                     "page {}: direct escalated detection (render {longest_side}px)",
                     page.page(),
                 );
-                return detect_with(escalated, image, page.page());
+                match detect_with(escalated, image, page.page()) {
+                    Ok(boxes) => return Ok(boxes),
+                    Err(error) => {
+                        // Same degradation as the adaptive branch below: a
+                        // failing escalated pass falls back to standard
+                        // detection instead of failing the page outright.
+                        log::warn!(
+                            "page {}: direct escalated detection failed, using standard pass: {error}",
+                            page.page()
+                        );
+                    }
+                }
             }
         }
 
@@ -393,6 +410,11 @@ impl OarOcrEngine {
                 text,
                 polygon,
                 confidence,
+                // The combined pipeline's orientation_angle came from the
+                // text-line-orientation classifier, a model this engine has
+                // never loaded — it was structurally None before the staged
+                // split too (the staged/combined A/B was byte-identical).
+                // Region rotation is still carried by the polygon itself.
                 orientation_degrees: None,
             });
         }
@@ -829,6 +851,10 @@ mod tests {
     fn median_detection_height_scales_and_handles_empty() {
         let mut heights = vec![30.0, 10.0, 20.0];
         assert_eq!(median_detection_height(&mut heights, 0.5), 10.0);
+        // Even counts average the two middle values instead of picking the
+        // upper one, so borderline pages don't skew away from escalation.
+        let mut even = vec![10.0, 12.0, 14.0, 30.0];
+        assert_eq!(median_detection_height(&mut even, 1.0), 13.0);
         let mut empty: Vec<f32> = Vec::new();
         assert_eq!(median_detection_height(&mut empty, 0.5), f32::MAX);
     }
