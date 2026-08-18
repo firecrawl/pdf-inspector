@@ -923,7 +923,7 @@ fn is_ligature_char(ch: char) -> bool {
     )
 }
 
-/// Get the CMap lookup key for an Identity-H/V CID font without ToUnicode.
+/// Get the CMap lookup key for a Type0 font without ToUnicode.
 /// Returns the object number used by `collect_cmaps_from_fonts` to store the CMap:
 /// - FontFile2 or FontFile3 obj_num (for embedded font cmap)
 /// - CIDFont dict obj_num (for predefined CIDSystemInfo-based mapping)
@@ -936,7 +936,8 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
     // Type0 (CID) fonts
     if subtype == Some(b"Type0") {
         let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
-        if encoding != b"Identity-H" && encoding != b"Identity-V" {
+        let is_identity = encoding == b"Identity-H" || encoding == b"Identity-V";
+        if !is_identity && !crate::tounicode::is_predefined_encoding_cmap(encoding) {
             return None;
         }
         let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
@@ -945,22 +946,26 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
             return None;
         }
         let cid_font_dict = resolve_dict(doc, &desc_fonts[0])?;
-        let font_descriptor_obj = cid_font_dict.get(b"FontDescriptor").ok()?;
-        let font_descriptor = resolve_dict(doc, font_descriptor_obj)?;
+        let font_descriptor = cid_font_dict
+            .get(b"FontDescriptor")
+            .ok()
+            .and_then(|obj| resolve_dict(doc, obj));
 
         // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF)
-        if let Some(ff_ref) = font_descriptor
-            .get(b"FontFile2")
-            .ok()
-            .and_then(|o| o.as_reference().ok())
-            .or_else(|| {
-                font_descriptor
-                    .get(b"FontFile3")
-                    .ok()
-                    .and_then(|o| o.as_reference().ok())
-            })
-        {
-            return Some(ff_ref.0);
+        if let Some(font_descriptor) = font_descriptor {
+            if let Some(ff_ref) = font_descriptor
+                .get(b"FontFile2")
+                .ok()
+                .and_then(|o| o.as_reference().ok())
+                .or_else(|| {
+                    font_descriptor
+                        .get(b"FontFile3")
+                        .ok()
+                        .and_then(|o| o.as_reference().ok())
+                })
+            {
+                return Some(ff_ref.0);
+            }
         }
 
         // Fallback: use DescendantFonts[0] obj_num (for predefined CIDSystemInfo mapping)
