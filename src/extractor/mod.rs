@@ -115,7 +115,7 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
+    let (extraction, _thresholds, _gid_pages, _operation_limit_pages) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -142,7 +142,7 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
+    let (extraction, _thresholds, _gid_pages, _operation_limit_pages) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -161,7 +161,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, HashSet<u32>), PdfError> {
     extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None)
 }
 
@@ -172,7 +172,7 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, HashSet<u32>), PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
 }
 
@@ -181,7 +181,7 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, HashSet<u32>), PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
 }
 
@@ -190,7 +190,7 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, HashSet<u32>), PdfError> {
     let Some(required_pages) = page_filter else {
         return extract_positioned_text_impl(doc, font_cmaps, None, include_invisible, None);
     };
@@ -199,6 +199,7 @@ fn extract_positioned_text_with_folio_context_impl(
         (mut selected_items, mut selected_rects, mut selected_lines),
         mut page_thresholds,
         mut gid_encoded_pages,
+        mut operation_limit_pages,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -211,6 +212,7 @@ fn extract_positioned_text_with_folio_context_impl(
             (selected_items, selected_rects, selected_lines),
             page_thresholds,
             gid_encoded_pages,
+            operation_limit_pages,
         ));
     }
 
@@ -220,23 +222,29 @@ fn extract_positioned_text_with_folio_context_impl(
         .copied()
         .filter(|page| !required_pages.contains(page))
         .collect();
-    let ((context_items, context_rects, context_lines), context_thresholds, context_gid_pages) =
-        extract_positioned_text_impl(
-            doc,
-            font_cmaps,
-            Some(&context_pages),
-            include_invisible,
-            Some(required_pages),
-        )?;
+    let (
+        (context_items, context_rects, context_lines),
+        context_thresholds,
+        context_gid_pages,
+        context_operation_limit_pages,
+    ) = extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        Some(&context_pages),
+        include_invisible,
+        Some(required_pages),
+    )?;
     selected_items.extend(context_items);
     selected_rects.extend(context_rects);
     selected_lines.extend(context_lines);
     page_thresholds.extend(context_thresholds);
     gid_encoded_pages.extend(context_gid_pages);
+    operation_limit_pages.extend(context_operation_limit_pages);
     Ok((
         (selected_items, selected_rects, selected_lines),
         page_thresholds,
         gid_encoded_pages,
+        operation_limit_pages,
     ))
 }
 
@@ -246,7 +254,7 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     doc: &Document,
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, HashSet<u32>), PdfError> {
     extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
 }
 
@@ -256,13 +264,14 @@ fn extract_positioned_text_impl(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, HashSet<u32>), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
+    let mut operation_limit_pages: HashSet<u32> = HashSet::new();
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
@@ -286,20 +295,26 @@ fn extract_positioned_text_impl(
             &mut style_cache,
             &mut FormWalkBudget::new(),
         );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
-            match page_result {
-                Ok(extraction) => extraction,
-                Err(error)
-                    if required_pages.is_some_and(|required| !required.contains(page_num)) =>
-                {
-                    debug!(
-                        "page {}: skipping context-only extraction error: {}",
-                        page_num, error
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+        let (
+            (mut items, mut rects, mut lines),
+            has_gid_fonts,
+            coords_rotated,
+            _skipped_invisible,
+            skipped_operation_limit,
+        ) = match page_result {
+            Ok(extraction) => extraction,
+            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
+                debug!(
+                    "page {}: skipping context-only extraction error: {}",
+                    page_num, error
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if skipped_operation_limit {
+            operation_limit_pages.insert(*page_num);
+        }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
@@ -438,6 +453,7 @@ fn extract_positioned_text_impl(
         (all_items, all_rects, all_lines),
         page_thresholds,
         gid_encoded_pages,
+        operation_limit_pages,
     ))
 }
 
