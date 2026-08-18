@@ -312,10 +312,14 @@ impl OarOcrEngine {
                         // Same degradation as the adaptive branch below: a
                         // failing escalated pass falls back to standard
                         // detection instead of failing the page outright.
+                        // Return the standard boxes directly — the adaptive
+                        // trigger would only re-invoke the detector that
+                        // just failed (repeating an OOM on a dense page).
                         log::warn!(
                             "page {}: direct escalated detection failed, using standard pass: {error}",
                             page.page()
                         );
+                        return detect_with(&worker.detector, image, page.page());
                     }
                 }
             }
