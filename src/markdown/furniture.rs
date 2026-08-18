@@ -283,6 +283,21 @@ fn is_decorative_separator(text: &str) -> bool {
     chars.all(|c| c == first)
 }
 
+/// A Y-band's members in document order plus the row's coalesced,
+/// comparison-normalized text. Single source for band coalescing: the
+/// frequency build and both band passes must key on identical text.
+fn coalesced_band(lines: &[TextLine], indices: &[usize]) -> (Vec<usize>, String, String) {
+    let mut sorted = indices.to_vec();
+    sorted.sort();
+    let coalesced: String = sorted
+        .iter()
+        .map(|&i| lines[i].text())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized = normalize_for_comparison(&coalesced);
+    (sorted, coalesced, normalized)
+}
+
 /// Strip lines that repeat on many distinct pages (running headers/footers).
 ///
 /// A line is considered a repeated header/footer if:
@@ -431,17 +446,10 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
             continue;
         }
-        let mut sorted_indices = indices.clone();
-        sorted_indices.sort();
-        let coalesced: String = sorted_indices
-            .iter()
-            .map(|&i| lines[i].text())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let (_, coalesced, normalized) = coalesced_band(&lines, indices);
         if is_structural_line(coalesced.trim()) {
             continue;
         }
-        let normalized = normalize_for_comparison(&coalesced);
         if normalized.chars().count() < 10 || is_decorative_separator(&normalized) {
             continue;
         }
@@ -543,14 +551,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
             continue;
         }
-        let mut sorted_indices = indices.clone();
-        sorted_indices.sort();
-        let coalesced: String = sorted_indices
-            .iter()
-            .map(|&i| lines[i].text())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let normalized = normalize_for_comparison(&coalesced);
+        let (_, _, normalized) = coalesced_band(&lines, indices);
         if band_candidates.contains(&normalized) {
             let first = first_page_band.entry(normalized).or_insert(page);
             if page < *first {
@@ -567,17 +568,10 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
             continue;
         }
-        let mut sorted_indices = indices.clone();
-        sorted_indices.sort();
-        let coalesced: String = sorted_indices
-            .iter()
-            .map(|&i| lines[i].text())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let (sorted_indices, coalesced, normalized) = coalesced_band(&lines, indices);
         if is_structural_line(coalesced.trim()) {
             continue;
         }
-        let normalized = normalize_for_comparison(&coalesced);
         if band_candidates.contains(&normalized) {
             let first = first_page_band.get(&normalized).copied().unwrap_or(0);
             if page > first {
