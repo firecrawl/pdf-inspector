@@ -181,18 +181,8 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
             // markers ("a See the appendix ..."). A capitalized one-letter
             // word ("A Publication of ...") is prose, not a marker.
             let first = trimmed.chars().next();
-            // A parenthesized marker is a short digit/lowercase token closed
-            // by ')' — "(1)", "(12)", "(a)", "(iv)". Parenthetical prose
-            // ("(all amounts in thousands)") is not a marker.
-            let paren_marker = trimmed.strip_prefix('(').is_some_and(|rest| {
-                let marker: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
-                !marker.is_empty()
-                    && marker.chars().count() <= 3
-                    && marker.chars().all(|c| c.is_numeric() || c.is_lowercase())
-                    && rest[marker.len()..].starts_with(')')
-            });
             let marker_led = first.is_some_and(|c| c.is_numeric())
-                || paren_marker
+                || starts_with_paren_marker(trimmed)
                 || first.is_some_and(|c| matches!(c, '†' | '‡' | '§' | '¶' | '*'))
                 || trimmed.split_whitespace().next().is_some_and(|tok| {
                     tok.chars().count() == 1 && tok.chars().all(|c| c.is_lowercase())
@@ -248,31 +238,38 @@ fn normalize_whitespace(s: &str) -> String {
 /// both normalize to "Chapter 3 — Page".
 fn normalize_for_comparison(s: &str) -> String {
     let ws = normalize_whitespace(s);
-    let trimmed = ws
-        .trim_start_matches(|c: char| c.is_ascii_digit())
-        .trim_start();
+    let trimmed = ws.trim_start_matches(|c: char| c.is_numeric()).trim_start();
     let trimmed = trimmed
-        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .trim_end_matches(|c: char| c.is_numeric())
         .trim_end();
     trimmed.to_string()
 }
 
-/// Returns true if the line looks like a list item or heading (should not be stripped).
+/// A parenthesized annotation marker: a short (≤3 chars) token of digits or
+/// lowercase letters closed by ')' — "(1)", "(12)", "(a)", "(iv)", "(١)".
+/// Parenthetical prose ("(all amounts in thousands)") is not a marker.
+fn starts_with_paren_marker(text: &str) -> bool {
+    text.strip_prefix('(').is_some_and(|rest| {
+        let marker: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
+        !marker.is_empty()
+            && marker.chars().count() <= 3
+            && marker.chars().all(|c| c.is_numeric() || c.is_lowercase())
+            && rest[marker.len()..].starts_with(')')
+    })
+}
+
+/// Returns true if the line looks like a list item, heading, or marker-led
+/// annotation (should not be stripped).
 fn is_structural_line(text: &str) -> bool {
     let t = text.trim_start();
-    let mut chars = t.chars();
-    let first = chars.next();
-    let numbered = first.is_some_and(|c| c.is_numeric()) && (t.contains(". ") || t.contains(") "));
-    // Parenthesized enumerations ("(4) The Secretary ...") are numbered
-    // structural lines with the marker wrapped.
-    let paren_numbered =
-        first == Some('(') && chars.next().is_some_and(|c| c.is_numeric()) && t.contains(") ");
+    let numbered =
+        t.chars().next().is_some_and(|c| c.is_numeric()) && (t.contains(". ") || t.contains(") "));
     t.starts_with('#')
         || t.starts_with("- ")
         || t.starts_with("* ")
         || t.starts_with("• ")
         || numbered
-        || paren_numbered
+        || starts_with_paren_marker(t)
 }
 
 /// Returns true if a line consists entirely of a single repeated character
@@ -380,15 +377,20 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     // A band with a structural member is one physical row of content: the
     // whole row is protected, because removing only the plain fragments
     // would leave a mangled half-row. Every removal path below honors this.
-    let protected_bands: HashSet<(u32, i32)> = y_bands
-        .iter()
-        .filter(|(_, indices)| {
-            indices
-                .iter()
-                .any(|&idx| is_structural_line(lines[idx].text().trim()))
-        })
-        .map(|(&key, _)| key)
-        .collect();
+    // Protection covers the neighboring buckets too: same-row fragments can
+    // straddle a rounding boundary (y 100.04 and 100.06 land in different
+    // buckets), and a boundary must never split a row's protection.
+    let mut protected_bands: HashSet<(u32, i32)> = HashSet::new();
+    for (&(page, bucket), indices) in &y_bands {
+        if indices
+            .iter()
+            .any(|&idx| is_structural_line(lines[idx].text().trim()))
+        {
+            protected_bands.insert((page, bucket - 1));
+            protected_bands.insert((page, bucket));
+            protected_bands.insert((page, bucket + 1));
+        }
+    }
     let band_key = |line: &TextLine| -> (u32, i32) { (line.page, (line.y * 10.0).round() as i32) };
 
     // Build frequency maps using normalize_for_comparison.
@@ -1043,6 +1045,116 @@ mod tests {
                 .count(),
             10,
             "(digit) enumerations are structural and must never be stripped"
+        );
+    }
+
+    #[test]
+    fn repetition_normalizes_unicode_page_numbers() {
+        // A running header whose page number uses Arabic-Indic digits must
+        // normalize to the same key on every page, or repetition never
+        // reaches threshold and the furniture survives.
+        let digits = ["١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩", "١٠"];
+        let mut lines = Vec::new();
+        for page in 1..=10u32 {
+            lines.push(make_line(
+                &format!("Annual Review Overview {}", digits[(page - 1) as usize]),
+                10.0,
+                page,
+                750.0,
+                None,
+            ));
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("unique body content words {page} {j} lorem ipsum"),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 10);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("Annual Review Overview"))
+                .count(),
+            1,
+            "Unicode-numbered running header must strip to its first occurrence"
+        );
+    }
+
+    #[test]
+    fn repeated_paren_letter_annotation_is_not_stripped() {
+        let mut lines = Vec::new();
+        for page in 1..=10u32 {
+            lines.push(make_line(
+                "(a) See the appendix for details",
+                10.0,
+                page,
+                750.0,
+                None,
+            ));
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("unique body content words {page} {j} lorem ipsum"),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 10);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("See the appendix"))
+                .count(),
+            10,
+            "(letter) annotations are structural in the repetition path too"
+        );
+    }
+
+    #[test]
+    fn row_protection_survives_bucket_rounding_boundary() {
+        // The structural fragment and its row-mate sit 0.02pt apart across
+        // a rounding boundary (buckets 7501 and 7500); neighbor-bucket
+        // protection must still shield the plain fragment.
+        let mut lines = Vec::new();
+        for page in 1..=10u32 {
+            lines.push(make_line(
+                "1. Methods overview line",
+                10.0,
+                page,
+                750.06,
+                None,
+            ));
+            lines.push(make_line(
+                "plain sibling fragment text",
+                10.0,
+                page,
+                750.04,
+                None,
+            ));
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!("unique body content words {page} {j} lorem ipsum"),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 10);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("plain sibling fragment"))
+                .count(),
+            10,
+            "row-mates across a rounding boundary keep structural protection"
         );
     }
 
