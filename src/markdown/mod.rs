@@ -639,7 +639,7 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     // prose continuations outnumber the rows, which no genuine table
     // produces: the "header" is then just two short line fragments at the
     // top of parallel prose columns.
-    let header_blocks = has_compact_header && continuation_fragments < table.cells.len();
+    let header_blocks = has_compact_header && continuation_fragments <= table.cells.len();
     let is_parallel = !header_blocks
         && non_empty >= 5
         // Independent prose columns have asynchronous line/paragraph breaks;
@@ -2683,6 +2683,35 @@ mod tests {
             (0..6).collect(),
         );
         assert!(!is_parallel_prose_table(&data));
+
+        // A compact header row atop parallel prose columns: cross-row prose
+        // continuations outnumber the rows, so the header cannot save the
+        // candidate — this is page prose with two short fragments on top.
+        let headed_parallel_prose = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![340.0, 320.0, 300.0, 280.0, 260.0],
+            vec![
+                vec!["June 2023".into(), "Page 5".into()],
+                vec![
+                    "the committee reviewed the proposal and decided that the".into(),
+                    "funding for the second phase would continue subject to the".into(),
+                ],
+                vec![
+                    "implementation schedule should be extended by another".into(),
+                    "quarterly reviews established during the first phase of the".into(),
+                ],
+                vec![
+                    "six months to accommodate the revised procurement rules".into(),
+                    "".into(),
+                ],
+                vec![
+                    "adopted at the previous meeting of the governing board".into(),
+                    "participating institutions across the partner regions".into(),
+                ],
+            ],
+            (0..10).collect(),
+        );
+        assert!(is_parallel_prose_table(&headed_parallel_prose));
 
         let headed_text_table = crate::tables::Table::new(
             vec![90.0, 340.0],
