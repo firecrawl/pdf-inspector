@@ -2586,7 +2586,15 @@ fn split_into_y_bands(detection_items: &[TextItem]) -> (Vec<YBand>, Vec<(f32, f3
     // Same spanning-item threshold as the column histogram's exclusion rule.
     const WIDE_FRACTION: f32 = 0.6;
 
-    let (x_min, x_max) = detection_items
+    // Text items only throughout: an image placeholder is the very figure
+    // whose whitespace the cuts trace, so its box must not fill a gap (nor
+    // its edges set the wide-item scale).
+    let text_items: Vec<&TextItem> = detection_items
+        .iter()
+        .filter(|i| crate::extractor::is_text_layout_item(i))
+        .collect();
+
+    let (x_min, x_max) = text_items
         .iter()
         .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), i| {
             (lo.min(i.x), hi.max(i.x + effective_width(i)))
@@ -2608,7 +2616,7 @@ fn split_into_y_bands(detection_items: &[TextItem]) -> (Vec<YBand>, Vec<(f32, f3
     // pages it rescues — a measured reading-order regression with no
     // measured win. Revisit only with a discriminator stronger than line
     // geometry.
-    let mut intervals: Vec<(f32, f32)> = detection_items
+    let mut intervals: Vec<(f32, f32)> = text_items
         .iter()
         .filter(|i| effective_width(i) <= wide_threshold)
         .map(|i| (i.y + i.height.max(0.0), i.y))
@@ -2758,8 +2766,14 @@ fn try_banded_layout(
     }
 
     // Sorted baselines let each gap-content probe below run in O(log n)
-    // instead of rescanning every item per band pair.
-    let mut sorted_ys: Vec<f32> = page_items.iter().map(|i| i.y).collect();
+    // instead of rescanning every item per band pair. Text items only: an
+    // image placeholder in the gap IS the figure float whose flow-through
+    // the merge exists for, so it must not read as separator content.
+    let mut sorted_ys: Vec<f32> = page_items
+        .iter()
+        .filter(|i| crate::extractor::is_text_layout_item(i))
+        .map(|i| i.y)
+        .collect();
     sorted_ys.sort_by(|a, b| b.total_cmp(a));
     let gap_has_content = |gap: (f32, f32)| -> bool {
         let first_below_top = sorted_ys.partition_point(|&y| y >= gap.0);
@@ -3156,6 +3170,25 @@ mod tests {
         assert!(
             order.find("LB00").unwrap() < order.find("RA00").unwrap(),
             "columns must flow through the empty gap (LB before RA): {order}"
+        );
+    }
+
+    #[test]
+    fn banded_layout_merges_across_gap_holding_figure_placeholder() {
+        // The gap between two matching bands holds an image placeholder —
+        // that IS the figure float the merge exists for, so the columns
+        // must still flow through it.
+        let mut items = two_column_band(700.0, 12, "LA", "RA");
+        items.extend(two_column_band(460.0, 12, "LB", "RB"));
+        let mut figure = make_item(1, 100.0, 505.0, "[img]");
+        figure.item_type = ItemType::Image;
+        items.push(figure);
+        let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
+            .expect("multi-column bands on a single-column page must engage");
+        let order = joined_order(&lines);
+        assert!(
+            order.find("LB00").unwrap() < order.find("RA00").unwrap(),
+            "figure placeholder in the gap must not block the merge: {order}"
         );
     }
 
