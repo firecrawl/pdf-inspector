@@ -2597,6 +2597,17 @@ fn split_into_y_bands(detection_items: &[TextItem]) -> (Vec<YBand>, Vec<(f32, f3
     let wide_threshold = (x_max - x_min) * WIDE_FRACTION;
 
     // (top, bottom) glyph-box intervals of non-wide items, sorted top-first.
+    //
+    // The width test is deliberately per-item, so a separator emitted as
+    // several narrow word runs stays in occupancy and can suppress a cut (a
+    // missed engagement, never a corruption). Assembling same-baseline
+    // fragments into runs before the test was tried and measured: word-gap
+    // and gutter-gap distributions overlap in real documents, so assembled
+    // runs fused the two columns of narrow-guttered pages into page-wide
+    // "lines", emptied the occupancy, and disengaged banding on exactly the
+    // pages it rescues — a measured reading-order regression with no
+    // measured win. Revisit only with a discriminator stronger than line
+    // geometry.
     let mut intervals: Vec<(f32, f32)> = detection_items
         .iter()
         .filter(|i| effective_width(i) <= wide_threshold)
