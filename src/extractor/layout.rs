@@ -225,15 +225,18 @@ pub(crate) fn detect_columns(
     // Justified text can leave gutter bins non-empty because item widths extend
     // to the column edge. Look for local minima that are significantly lower
     // than the peaks on either side.
-    // Only attempt this for dense pages (>=100 items) — sparse pages with shallow
-    // histogram dips are likely not multi-column.
     //
-    // Pages with detected tables take this path too: the table's items have
-    // already left the flow by the time grouping runs, so a table cannot
-    // fake a gutter here, and the prose gate below rejects any residual
-    // table-shaped split. Without this, the prose REMAINDER of a
-    // table-bearing two-column page falls to single-column Y-sorting and
-    // the columns interleave line by line.
+    // The 30-item floor admits sparse pages: OCR'd multi-column pages arrive
+    // as few long line-runs and were falling to single-column Y-sorting.
+    // Below 30 items the histogram is too shallow for even the prose gate
+    // to judge a dip.
+    //
+    // Pages with detected tables take the relative-valley path too: the
+    // table's items have already left the flow by the time grouping runs,
+    // so a table cannot fake a gutter here, and the prose gate below
+    // rejects any residual table-shaped split. Without this, the prose
+    // REMAINDER of a table-bearing two-column page falls to single-column
+    // Y-sorting and the columns interleave line by line.
     if valleys.is_empty() && page_items.len() >= 30 {
         let rel_valleys = find_relative_valleys(
             &histogram,
@@ -275,9 +278,14 @@ pub(crate) fn detect_columns(
                 }
             }
         }
-        // Try XY-cut fallback before giving up
-        if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
-            return columns;
+        // Try XY-cut fallback before giving up. Unlike the relative-valley
+        // path above, XY-cut has no prose gate, so the table-page guard
+        // stays here: without it a table page whose valley candidate was
+        // just rejected could take an unvalidated split.
+        if !page_has_table {
+            if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
+                return columns;
+            }
         }
         return vec![ColumnRegion { x_min, x_max }];
     }
