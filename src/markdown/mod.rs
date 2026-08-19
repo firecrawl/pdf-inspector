@@ -9,6 +9,7 @@
 pub(crate) mod analysis;
 mod classify;
 mod convert;
+mod furniture;
 mod heading;
 mod postprocess;
 mod preprocess;
@@ -634,7 +635,12 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
         }
     }
 
-    let is_parallel = !has_compact_header
+    // A compact header row is evidence for a real table — unless cross-row
+    // prose continuations outnumber the rows, which no genuine table
+    // produces: the "header" is then just two short line fragments at the
+    // top of parallel prose columns.
+    let header_blocks = has_compact_header && continuation_fragments <= table.cells.len();
+    let is_parallel = !header_blocks
         && non_empty >= 5
         // Independent prose columns have asynchronous line/paragraph breaks;
         // a fully populated grid is positive evidence for a real descriptive
@@ -1149,7 +1155,7 @@ pub(crate) fn strip_repeated_header_footer_lines(
     lines: Vec<crate::types::TextLine>,
     page_count: u32,
 ) -> Vec<crate::types::TextLine> {
-    preprocess::strip_repeated_lines(lines, page_count)
+    furniture::strip_header_footer_lines(lines, page_count)
 }
 
 /// Convert positioned text items to markdown with structure detection
@@ -1374,7 +1380,6 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             chart_page_prose_column_split(&page_layout_items)
                 .filter(|&split_x| chart_spans_prose_split(region, split_x))
         });
-        let chart_prose_columns = chart_prose_split.is_some();
 
         // Check for side-by-side table layout using the original items. Sparse
         // numeric cells need table context before they can be distinguished
@@ -1615,10 +1620,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     if subset_items.len() < min_items {
                         return;
                     }
-                    // Keep body-font detection available on chart pages: a real
-                    // table can share the prose anchors. Reject only candidates
-                    // whose cells prove they are parallel prose fragments.
-                    let reject_parallel_prose = chart_prose_columns && !was_split;
+                    // Reject candidates whose cells prove they are parallel
+                    // prose fragments — the shape produced when the body-font
+                    // pass projects a multi-column text page onto one table
+                    // grid (two-column reference sections are the classic
+                    // case). The check needs internal transition evidence
+                    // (unterminated cells flowing into lowercase starts in
+                    // the same column), so genuine tables with long cells
+                    // pass. Band-split retries stay exempt: they exist for
+                    // tables that only assemble after recombining bands.
+                    let reject_parallel_prose = !was_split;
                     let tables = detect_tables_with_page_width(
                         subset_items,
                         base_size,
@@ -2106,7 +2117,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
-        preprocess::strip_repeated_lines(lines, document_page_count)
+        furniture::strip_header_footer_lines(lines, document_page_count)
     } else {
         lines
     };
@@ -2672,6 +2683,35 @@ mod tests {
             (0..6).collect(),
         );
         assert!(!is_parallel_prose_table(&data));
+
+        // A compact header row atop parallel prose columns: cross-row prose
+        // continuations outnumber the rows, so the header cannot save the
+        // candidate — this is page prose with two short fragments on top.
+        let headed_parallel_prose = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![340.0, 320.0, 300.0, 280.0, 260.0],
+            vec![
+                vec!["June 2023".into(), "Page 5".into()],
+                vec![
+                    "the committee reviewed the proposal and decided that the".into(),
+                    "funding for the second phase would continue subject to the".into(),
+                ],
+                vec![
+                    "implementation schedule should be extended by another".into(),
+                    "quarterly reviews established during the first phase of the".into(),
+                ],
+                vec![
+                    "six months to accommodate the revised procurement rules".into(),
+                    "".into(),
+                ],
+                vec![
+                    "adopted at the previous meeting of the governing board".into(),
+                    "participating institutions across the partner regions".into(),
+                ],
+            ],
+            (0..10).collect(),
+        );
+        assert!(is_parallel_prose_table(&headed_parallel_prose));
 
         let headed_text_table = crate::tables::Table::new(
             vec![90.0, 340.0],

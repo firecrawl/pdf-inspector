@@ -225,11 +225,19 @@ pub(crate) fn detect_columns(
     // Justified text can leave gutter bins non-empty because item widths extend
     // to the column edge. Look for local minima that are significantly lower
     // than the peaks on either side.
-    // Only attempt this for dense pages (>=100 items) — sparse pages with shallow
-    // histogram dips are likely not multi-column.
-    // Skip on pages with detected tables — table column gaps look like gutters
-    // in the histogram but the table pipeline already handles reading order.
-    if valleys.is_empty() && page_items.len() >= 100 && !page_has_table {
+    //
+    // The 30-item floor admits sparse pages: OCR'd multi-column pages arrive
+    // as few long line-runs and were falling to single-column Y-sorting.
+    // Below 30 items the histogram is too shallow for even the prose gate
+    // to judge a dip.
+    //
+    // Pages with detected tables take the relative-valley path too: the
+    // table's items have already left the flow by the time grouping runs,
+    // so a table cannot fake a gutter here, and the prose gate below
+    // rejects any residual table-shaped split. Without this, the prose
+    // REMAINDER of a table-bearing two-column page falls to single-column
+    // Y-sorting and the columns interleave line by line.
+    if valleys.is_empty() && page_items.len() >= 30 {
         let rel_valleys = find_relative_valleys(
             &histogram,
             num_bins,
@@ -270,9 +278,14 @@ pub(crate) fn detect_columns(
                 }
             }
         }
-        // Try XY-cut fallback before giving up
-        if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
-            return columns;
+        // Try XY-cut fallback before giving up. Unlike the relative-valley
+        // path above, XY-cut has no prose gate, so the table-page guard
+        // stays here: without it a table page whose valley candidate was
+        // just rejected could take an unvalidated split.
+        if !page_has_table {
+            if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
+                return columns;
+            }
         }
         return vec![ColumnRegion { x_min, x_max }];
     }
@@ -1921,6 +1934,53 @@ pub(crate) fn is_newspaper_layout(
     ratio > 0.5
 }
 
+/// Short dense prose columns: a genuine column set below
+/// [`is_newspaper_layout`]'s 15-line floor (three-column FAQ, the closing
+/// page of an article) whose lines fill their column widths is a set of
+/// independent text flows that must read column-by-column.
+///
+/// This is a *reading-order* refinement only — it deliberately lives outside
+/// `is_newspaper_layout` because the table pipeline uses that predicate as a
+/// veto when building borderless tables, and a long-celled table must keep
+/// both its row-wise reading and its extraction there. Borderless tables are
+/// also excluded here by construction: cell text leaves most of the column
+/// width empty, and every column must qualify, so a term/description pair
+/// keeps row-wise reading on its short side.
+///
+/// Deliberately stricter than `columns_have_prose` (60% fill on 60% of lines
+/// vs 45% fill with a ratio-or-run escape): that gate asks whether raw items
+/// justify *creating* a column split, where a false negative just keeps the
+/// single-column order; this one overrides the borderless-table defense on
+/// already-built columns, where a false positive reads a table column-wise
+/// and destroys its rows.
+fn short_prose_columns(per_column_lines: &[Vec<TextLine>], columns: &[ColumnRegion]) -> bool {
+    if per_column_lines.len() != columns.len() || columns.len() < 2 {
+        return false;
+    }
+    // Only the 5..15-line window: columns with more lines are the balance
+    // and Y-collision checks' jurisdiction in `is_newspaper_layout`.
+    let min_lines = per_column_lines.iter().map(|c| c.len()).min().unwrap_or(0);
+    if !(5..15).contains(&min_lines) {
+        return false;
+    }
+    per_column_lines.iter().zip(columns).all(|(lines, col)| {
+        let col_width = (col.x_max - col.x_min).max(1.0);
+        let full = lines
+            .iter()
+            .filter(|line| {
+                let left = line.items.iter().map(|i| i.x).fold(f32::INFINITY, f32::min);
+                let right = line
+                    .items
+                    .iter()
+                    .map(|i| i.x + effective_width(i))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                right - left >= col_width * 0.60
+            })
+            .count();
+        full * 10 >= lines.len() * 6
+    })
+}
+
 /// Split column lines into a core cluster and stragglers.
 /// The core is the largest group of consecutive lines separated by normal
 /// line spacing. Lines in other groups (header remnants, per-word items from
@@ -2222,16 +2282,92 @@ fn group_into_lines_with_thresholds_and_regions_impl(
             None => detect_columns(column_detection_items, page, table_pages.contains(&page)),
         };
 
-        if columns.len() <= 1 {
-            // Single column - use simple sorting
-            let lines = group_single_column(page_items, adaptive_threshold);
-            all_lines.extend(lines);
+        // Whether the page-level model found columns or not, band
+        // segmentation runs first: pages whose column structure changes
+        // vertically (newsletter bands, figure-split flows, a three-column
+        // strip inside a two-column page) cannot be represented by one
+        // full-height column set, and the projection either finds nothing or
+        // weaves the odd band's columns into the wrong buckets. It engages
+        // only on contradicting band evidence, so pages the flat model
+        // explains keep their current ordering. Chart pages are excluded
+        // because chart-internal text would seed phantom bands.
+        let banded = if chart_regions.contains_key(&page) {
+            None
         } else {
+            try_banded_layout(
+                &page_items,
+                column_detection_items,
+                &columns,
+                page,
+                table_pages.contains(&page),
+                adaptive_threshold,
+            )
+        };
+        if let Some(lines) = banded {
+            all_lines.extend(lines);
+        } else if columns.len() <= 1 {
+            all_lines.extend(group_single_column(page_items, adaptive_threshold));
+        } else {
+            all_lines.extend(order_multi_column_region(
+                page_items,
+                &columns,
+                adaptive_threshold,
+                page,
+            ));
+        }
+    }
+
+    all_lines
+}
+
+/// Order a multi-column region's items into reading order.
+///
+/// The core multi-column machinery: pre-mask spanning lines, bucket items
+/// into columns by horizontal overlap, group each column into lines, then
+/// emit newspaper (sequential columns) or tabular (Y-interleaved) ordering.
+///
+/// Whole-page entry: keeps every page-level defense (newspaper/tabular
+/// classification and straggler splitting) active.
+fn order_multi_column_region(
+    page_items: Vec<TextItem>,
+    columns: &[ColumnRegion],
+    adaptive_threshold: f32,
+    page: u32,
+) -> Vec<TextLine> {
+    order_columns_with_policy(page_items, columns, adaptive_threshold, page, false)
+}
+
+/// Banded-planner entry: the columns already passed the planner's prose
+/// validation for a Y-cohesive band, which replaces two page-level defenses
+/// that would misfire on a band — [`is_newspaper_layout`]'s line-count
+/// minimums (bands are shorter than pages, so a genuine two-column band
+/// would Y-interleave) and straggler splitting (a merged band deliberately
+/// flows across a figure gap, which splitting would undo). Only
+/// [`try_banded_layout`] may call this.
+fn order_validated_band(
+    page_items: Vec<TextItem>,
+    columns: &[ColumnRegion],
+    adaptive_threshold: f32,
+    page: u32,
+) -> Vec<TextLine> {
+    order_columns_with_policy(page_items, columns, adaptive_threshold, page, true)
+}
+
+fn order_columns_with_policy(
+    page_items: Vec<TextItem>,
+    columns: &[ColumnRegion],
+    adaptive_threshold: f32,
+    page: u32,
+    band_validated: bool,
+) -> Vec<TextLine> {
+    let mut all_lines = Vec::new();
+    {
+        {
             // Multi-column detected. Pre-mask lines that span the full page
             // width (titles, section headers, footers). These multi-item lines
             // would otherwise be split across column buckets, corrupting
             // newspaper detection and reading order.
-            let spanning_mask = identify_spanning_lines(&page_items, &columns);
+            let spanning_mask = identify_spanning_lines(&page_items, columns);
             let premasked_count = spanning_mask.iter().filter(|&&m| m).count();
             if premasked_count > 0 {
                 debug!(
@@ -2245,7 +2381,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
             let mut column_items: Vec<TextItem> = Vec::new();
 
             for (i, item) in page_items.into_iter().enumerate() {
-                if spanning_mask[i] || spans_multiple_columns(&item, &columns) {
+                if spanning_mask[i] || spans_multiple_columns(&item, columns) {
                     spanning_items.push(item);
                 } else {
                     column_items.push(item);
@@ -2309,7 +2445,9 @@ fn group_into_lines_with_thresholds_and_regions_impl(
             // Process spanning items as their own group
             let spanning_lines = group_single_column(spanning_items, adaptive_threshold);
 
-            let is_newspaper = is_newspaper_layout(&per_column_lines, &columns);
+            let is_newspaper = band_validated
+                || is_newspaper_layout(&per_column_lines, columns)
+                || short_prose_columns(&per_column_lines, columns);
             debug!(
                 "page {}: layout={}",
                 page,
@@ -2324,6 +2462,16 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                 let mut core_columns: Vec<Vec<TextLine>> = Vec::new();
                 let mut col_stragglers: Vec<Vec<TextLine>> = Vec::new();
                 for col in per_column_lines {
+                    if band_validated {
+                        // Banded regions are already Y-cohesive — and a
+                        // merged band deliberately flows across a figure
+                        // gap, which straggler-splitting would undo by
+                        // pushing the upper half into the Y-sorted "above"
+                        // bucket where the columns re-interleave.
+                        core_columns.push(col);
+                        col_stragglers.push(Vec::new());
+                        continue;
+                    }
                     let (core, stragglers) = split_column_stragglers(col);
                     core_columns.push(core);
                     col_stragglers.push(stragglers);
@@ -2414,6 +2562,321 @@ fn group_into_lines_with_thresholds_and_regions_impl(
     }
 
     all_lines
+}
+
+/// One horizontal slice of a page produced by [`split_into_y_bands`]. Items
+/// belong to the band whose `(y_bottom, y_top]` range contains their baseline.
+#[derive(Debug, Clone, Copy)]
+struct YBand {
+    y_top: f32,
+    y_bottom: f32,
+}
+
+impl YBand {
+    fn contains(&self, y: f32) -> bool {
+        y <= self.y_top && y > self.y_bottom
+    }
+}
+
+/// Split a page into horizontal bands at full-width whitespace gaps.
+///
+/// Occupancy is measured from non-wide items only: wide spanning items
+/// (headlines, captions) sit inside the very gaps this looks for and would
+/// otherwise weld independent bands together. Cut positions are gap
+/// midpoints; the first and last band extend to infinity so every item on
+/// the page lands in exactly one band.
+///
+/// Returns the bands top-first plus the `(gap_top, gap_bottom)` whitespace
+/// extent between each consecutive pair, or empty vectors when the page has
+/// no qualifying gap.
+fn split_into_y_bands(detection_items: &[TextItem]) -> (Vec<YBand>, Vec<(f32, f32)>) {
+    // A band gap must be clearly larger than ordinary line spacing: at least
+    // this floor, and at least LEADING_FACTOR times the page's median leading
+    // (measured between glyph boxes, so ordinary leading contributes only its
+    // whitespace portion).
+    const MIN_GAP: f32 = 14.0;
+    const LEADING_FACTOR: f32 = 1.4;
+    // Same spanning-item threshold as the column histogram's exclusion rule.
+    const WIDE_FRACTION: f32 = 0.6;
+
+    // Text items only throughout: an image placeholder is the very figure
+    // whose whitespace the cuts trace, so its box must not fill a gap (nor
+    // its edges set the wide-item scale).
+    let text_items: Vec<&TextItem> = detection_items
+        .iter()
+        .filter(|i| crate::extractor::is_text_layout_item(i))
+        .collect();
+
+    let (x_min, x_max) = text_items
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), i| {
+            (lo.min(i.x), hi.max(i.x + effective_width(i)))
+        });
+    if !(x_max - x_min).is_finite() {
+        return (vec![], vec![]);
+    }
+    let wide_threshold = (x_max - x_min) * WIDE_FRACTION;
+
+    // (top, bottom) glyph-box intervals of non-wide items, sorted top-first.
+    //
+    // The width test is deliberately per-item, so a separator emitted as
+    // several narrow word runs stays in occupancy and can suppress a cut (a
+    // missed engagement, never a corruption). Assembling same-baseline
+    // fragments into runs before the test was tried and measured: word-gap
+    // and gutter-gap distributions overlap in real documents, so assembled
+    // runs fused the two columns of narrow-guttered pages into page-wide
+    // "lines", emptied the occupancy, and disengaged banding on exactly the
+    // pages it rescues — a measured reading-order regression with no
+    // measured win. Revisit only with a discriminator stronger than line
+    // geometry.
+    let mut intervals: Vec<(f32, f32)> = text_items
+        .iter()
+        .filter(|i| effective_width(i) <= wide_threshold)
+        .map(|i| (i.y + i.height.max(0.0), i.y))
+        .filter(|(top, bottom)| top.is_finite() && bottom.is_finite())
+        .collect();
+    if intervals.len() < 10 {
+        return (vec![], vec![]);
+    }
+    intervals.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    let mut baselines: Vec<f32> = intervals.iter().map(|&(_, bottom)| bottom).collect();
+    baselines.sort_by(|a, b| b.total_cmp(a));
+    let mut steps: Vec<f32> = baselines
+        .windows(2)
+        .map(|w| w[0] - w[1])
+        .filter(|d| *d > 1.0)
+        .collect();
+    steps.sort_by(|a, b| a.total_cmp(b));
+    let median_leading = steps.get(steps.len() / 2).copied().unwrap_or(12.0);
+    let gap_threshold = (median_leading * LEADING_FACTOR).max(MIN_GAP);
+
+    // Sweep top-to-bottom, cutting where occupancy leaves a full-width gap.
+    let mut cuts: Vec<(f32, f32)> = Vec::new();
+    let mut largest_rejected = 0.0f32;
+    let mut run_bottom = intervals[0].1;
+    for &(top, bottom) in &intervals[1..] {
+        if run_bottom - top >= gap_threshold {
+            cuts.push((run_bottom, top));
+            run_bottom = bottom;
+        } else {
+            largest_rejected = largest_rejected.max(run_bottom - top);
+            run_bottom = run_bottom.min(bottom);
+        }
+    }
+    log::trace!(
+        "y-bands: {} intervals, leading {:.1}, threshold {:.1}, {} cuts, largest rejected gap {:.1}",
+        intervals.len(),
+        median_leading,
+        gap_threshold,
+        cuts.len(),
+        largest_rejected
+    );
+    if cuts.is_empty() {
+        return (vec![], vec![]);
+    }
+
+    let mut bands = Vec::with_capacity(cuts.len() + 1);
+    let mut top = f32::INFINITY;
+    for &(gap_top, gap_bottom) in &cuts {
+        bands.push(YBand {
+            y_top: top,
+            y_bottom: (gap_top + gap_bottom) / 2.0,
+        });
+        top = (gap_top + gap_bottom) / 2.0;
+    }
+    bands.push(YBand {
+        y_top: top,
+        y_bottom: f32::NEG_INFINITY,
+    });
+    (bands, cuts)
+}
+
+/// Two column sets match when they have the same multi-column count and each
+/// gutter midpoint lies within tolerance of its counterpart.
+fn columns_match(a: &[ColumnRegion], b: &[ColumnRegion]) -> bool {
+    const GUTTER_TOLERANCE: f32 = 25.0;
+    if a.len() != b.len() || a.len() < 2 {
+        return false;
+    }
+    std::iter::zip(a.windows(2), b.windows(2)).all(|(wa, wb)| {
+        let gutter_a = (wa[0].x_max + wa[1].x_min) / 2.0;
+        let gutter_b = (wb[0].x_max + wb[1].x_min) / 2.0;
+        (gutter_a - gutter_b).abs() <= GUTTER_TOLERANCE
+    })
+}
+
+// NOTE on merge unions: `detect_columns` returns contiguous partitions —
+// adjacent regions share their boundary coordinate — so merging two bands
+// whose boundaries disagree produces union partitions that overlap by the
+// disagreement. That zone is bounded by GUTTER_TOLERANCE, items inside it
+// are split by greatest-overlap bucketing proportionally, and a "reject
+// overlapping unions" guard is unimplementable against partitions: with
+// shared boundaries it degenerates to exact-equality matching and rejects
+// every legitimate merge.
+
+/// Band-segmented page layout: the region-segmentation path used when the
+/// page-level column model cannot represent the page.
+///
+/// Splits the page into horizontal bands at full-width whitespace gaps, runs
+/// column detection independently inside each band, and re-merges consecutive
+/// bands whose column geometry matches across an empty gap (aligned
+/// whitespace inside one continuous flow — a figure float — splits occupancy
+/// without changing the layout, and reading must continue down the columns
+/// rather than restart per band; a wide separator in the gap means
+/// independent stories, which stay separate bands).
+///
+/// Engages only when at least one band yields prose-validated columns whose
+/// count contradicts the page-level structure — a multi-column band on a page
+/// that read as single-column, or a band whose column count differs from the
+/// page-level count (whose projection would weave that band's columns into
+/// the wrong buckets). Gutter jitter alone never engages. Otherwise returns
+/// `None` and the caller keeps the page-level ordering, so pages the flat
+/// column model already explains are untouched.
+fn try_banded_layout(
+    page_items: &[TextItem],
+    detection_items: &[TextItem],
+    page_columns: &[ColumnRegion],
+    page: u32,
+    page_has_table: bool,
+    adaptive_threshold: f32,
+) -> Option<Vec<TextLine>> {
+    // Below this the page is too sparse for per-band column evidence.
+    const MIN_ITEMS: usize = 40;
+
+    if page_has_table || detection_items.len() < MIN_ITEMS {
+        return None;
+    }
+    // Band membership is a baseline comparison, so an item with non-finite Y
+    // would fall through every band and silently vanish from the output.
+    if page_items.iter().any(|i| !i.y.is_finite()) {
+        return None;
+    }
+    let (bands, gaps) = split_into_y_bands(detection_items);
+    if bands.len() < 2 {
+        return None;
+    }
+
+    struct BandPlan {
+        band: YBand,
+        columns: Vec<ColumnRegion>,
+        // The founding band's columns, untouched by merge widening. Merge
+        // candidates are compared against these: the widened union's gutter
+        // is the intersection of its constituents' gutters, and across a
+        // chain of one-directionally drifting bands that intersection can
+        // walk past GUTTER_TOLERANCE, rejecting a band identical to the
+        // founder. The run's column system is defined by its first band.
+        anchor_columns: Vec<ColumnRegion>,
+    }
+
+    let mut plans: Vec<BandPlan> = Vec::new();
+    for band in bands {
+        let band_detection: Vec<TextItem> = detection_items
+            .iter()
+            .filter(|i| band.contains(i.y))
+            .cloned()
+            .collect();
+        let columns = detect_columns(&band_detection, page, false);
+        let refs: Vec<&TextItem> = band_detection.iter().collect();
+        let columns = if columns.len() > 1 && columns_have_prose(&columns, &refs) {
+            columns
+        } else {
+            vec![]
+        };
+        plans.push(BandPlan {
+            band,
+            anchor_columns: columns.clone(),
+            columns,
+        });
+    }
+
+    let page_count = page_columns.len().max(1);
+    if !plans
+        .iter()
+        .any(|p| p.columns.len() > 1 && p.columns.len() != page_count)
+    {
+        return None;
+    }
+
+    // Sorted baselines let each gap-content probe below run in O(log n)
+    // instead of rescanning every item per band pair. Text items only: an
+    // image placeholder in the gap IS the figure float whose flow-through
+    // the merge exists for, so it must not read as separator content.
+    let mut sorted_ys: Vec<f32> = page_items
+        .iter()
+        .filter(|i| crate::extractor::is_text_layout_item(i))
+        .map(|i| i.y)
+        .collect();
+    sorted_ys.sort_by(|a, b| b.total_cmp(a));
+    let gap_has_content = |gap: (f32, f32)| -> bool {
+        let first_below_top = sorted_ys.partition_point(|&y| y >= gap.0);
+        first_below_top < sorted_ys.len() && sorted_ys[first_below_top] > gap.1
+    };
+
+    let mut merged: Vec<BandPlan> = Vec::new();
+    for (idx, plan) in plans.into_iter().enumerate() {
+        if idx > 0 {
+            if let Some(prev) = merged.last_mut() {
+                if columns_match(&prev.anchor_columns, &plan.columns)
+                    && !gap_has_content(gaps[idx - 1])
+                {
+                    prev.band.y_bottom = plan.band.y_bottom;
+                    for (pc, nc) in prev.columns.iter_mut().zip(&plan.columns) {
+                        pc.x_min = pc.x_min.min(nc.x_min);
+                        pc.x_max = pc.x_max.max(nc.x_max);
+                    }
+                    continue;
+                }
+            }
+        }
+        merged.push(plan);
+    }
+
+    debug!(
+        "page {}: banded layout: {} bands ({} multi-column)",
+        page,
+        merged.len(),
+        merged.iter().filter(|p| p.columns.len() > 1).count()
+    );
+
+    // Assign every item to its band in one pass: bands are top-first with
+    // strictly decreasing bottoms, so the first band whose bottom lies below
+    // the item's baseline is its home (same strict-bottom rule as
+    // `YBand::contains`).
+    let mut band_items: Vec<Vec<TextItem>> = (0..merged.len()).map(|_| Vec::new()).collect();
+    for item in page_items {
+        let idx = merged.partition_point(|p| p.band.y_bottom >= item.y);
+        band_items[idx.min(merged.len() - 1)].push(item.clone());
+    }
+
+    let mut out = Vec::new();
+    for (plan, items) in merged.iter().zip(band_items) {
+        if items.is_empty() {
+            continue;
+        }
+        if plan.columns.len() > 1 {
+            out.extend(order_validated_band(
+                items,
+                &plan.columns,
+                adaptive_threshold,
+                page,
+            ));
+        } else if page_count > 1 {
+            // No validated band structure of its own: order with the
+            // page-level columns so a dense band that merely failed the
+            // prose gate keeps the page's column reading instead of
+            // regressing to Y-interleave.
+            out.extend(order_multi_column_region(
+                items,
+                page_columns,
+                adaptive_threshold,
+                page,
+            ));
+        } else {
+            out.extend(group_single_column(items, adaptive_threshold));
+        }
+    }
+    Some(out)
 }
 
 /// Determine if Y-sorting should be used instead of stream order.
@@ -2609,6 +3072,312 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    /// A dense block of single-column prose lines at `x` starting from
+    /// `y_top`, one 32-char item per line, 14pt leading.
+    fn prose_block(x: f32, y_top: f32, lines: usize, tag: &str) -> Vec<TextItem> {
+        (0..lines)
+            .map(|i| {
+                make_item(
+                    1,
+                    x,
+                    y_top - i as f32 * 14.0,
+                    &format!("{tag}{i:02} word word word word word"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn y_bands_split_at_full_width_gap() {
+        // Two dense two-column blocks separated by ~50pt of whitespace →
+        // one cut. (Two columns keep individual items under the wide-item
+        // threshold, as on a real page.)
+        let mut items = two_column_band(700.0, 12, "TA", "TB");
+        items.extend(two_column_band(480.0, 12, "BA", "BB"));
+        let (bands, gaps) = split_into_y_bands(&items);
+        assert_eq!(bands.len(), 2, "one full-width gap must yield two bands");
+        assert_eq!(gaps.len(), 1);
+        // The cut must land between the blocks (below 546, above 492).
+        assert!(bands[0].y_bottom < 546.0 && bands[0].y_bottom > 492.0);
+    }
+
+    #[test]
+    fn y_bands_ignore_wide_separator_inside_gap() {
+        // A page-wide headline inside the whitespace gap must not weld the
+        // bands together: wide items are excluded from occupancy.
+        let mut items = two_column_band(700.0, 12, "TA", "TB");
+        items.extend(two_column_band(480.0, 12, "BA", "BB"));
+        // ~80 chars * 6pt = 480pt wide on a ~450pt-wide page → wide item
+        items.push(make_item(1, 50.0, 520.0, &"m".repeat(80)));
+        let (bands, _) = split_into_y_bands(&items);
+        assert_eq!(bands.len(), 2, "wide separator must not suppress the cut");
+    }
+
+    #[test]
+    fn y_bands_no_cut_in_continuous_text() {
+        let items = two_column_band(700.0, 30, "LL", "RR");
+        let (bands, _) = split_into_y_bands(&items);
+        assert!(bands.is_empty(), "uniform leading must produce no bands");
+    }
+
+    #[test]
+    fn columns_match_requires_count_and_gutter() {
+        let two = |g0: f32| {
+            vec![
+                ColumnRegion {
+                    x_min: 0.0,
+                    x_max: g0,
+                },
+                ColumnRegion {
+                    x_min: g0 + 20.0,
+                    x_max: 500.0,
+                },
+            ]
+        };
+        assert!(columns_match(&two(240.0), &two(250.0)));
+        assert!(!columns_match(&two(240.0), &two(320.0)));
+        assert!(!columns_match(&two(240.0), &[]));
+    }
+
+    /// Two-column band: `lines` prose lines per column, columns at x=50 and
+    /// x=310, ~190pt wide each.
+    fn two_column_band(y_top: f32, lines: usize, left_tag: &str, right_tag: &str) -> Vec<TextItem> {
+        let mut items = Vec::new();
+        for i in 0..lines {
+            let y = y_top - i as f32 * 14.0;
+            items.push(make_item(
+                1,
+                50.0,
+                y,
+                &format!("{left_tag}{i:02} {}", "x".repeat(26)),
+            ));
+            items.push(make_item(
+                1,
+                310.0,
+                y,
+                &format!("{right_tag}{i:02} {}", "x".repeat(26)),
+            ));
+        }
+        items
+    }
+
+    fn joined_order(lines: &[TextLine]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.items.iter())
+            .map(|i| i.text.split(' ').next().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[test]
+    fn banded_layout_orders_mismatched_band_sequentially() {
+        // Top band: two prose columns. Bottom band: single narrow block.
+        // The page-level model (single column) cannot represent this; the
+        // banded path must read left column, right column, then the bottom.
+        let mut items = two_column_band(700.0, 12, "L", "R");
+        items.extend(prose_block(150.0, 480.0, 16, "B"));
+        let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
+            .expect("contradicting band evidence must engage");
+        let order = joined_order(&lines);
+        let li = order.find("L00").unwrap();
+        let ri = order.find("R00").unwrap();
+        let bi = order.find("B0").unwrap();
+        assert!(li < ri && ri < bi, "expected L*, R*, B* order, got {order}");
+        assert!(
+            order.find("L11").unwrap() < ri,
+            "left column must complete before right column starts: {order}"
+        );
+    }
+
+    #[test]
+    fn banded_layout_merges_matching_bands_across_empty_gap() {
+        // Two two-column bands with identical gutters and nothing in the
+        // gap: a figure float inside one continuous flow. Reading must run
+        // each column through both bands, not restart per band.
+        let mut items = two_column_band(700.0, 12, "LA", "RA");
+        items.extend(two_column_band(460.0, 12, "LB", "RB"));
+        let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
+            .expect("multi-column bands on a single-column page must engage");
+        let order = joined_order(&lines);
+        assert!(
+            order.find("LB00").unwrap() < order.find("RA00").unwrap(),
+            "columns must flow through the empty gap (LB before RA): {order}"
+        );
+    }
+
+    /// Two-column band with a controllable gutter: the left column runs
+    /// `50..(50 + 6·left_chars)`, the right column starts at `right_x`.
+    /// The 6-char tag prefix ("LA00 x") is included in `left_chars`, so a
+    /// band's left-column width — and with it its gutter — is exact.
+    fn gutter_band(
+        items: &mut Vec<TextItem>,
+        y_top: f32,
+        left_chars: usize,
+        right_x: f32,
+        tag: &str,
+    ) {
+        for i in 0..12 {
+            let y = y_top - i as f32 * 14.0;
+            items.push(make_item(
+                1,
+                50.0,
+                y,
+                &format!("L{tag}{i:02} {}", "x".repeat(left_chars - 6)),
+            ));
+            items.push(make_item(
+                1,
+                right_x,
+                y,
+                &format!("R{tag}{i:02} {}", "x".repeat(29)),
+            ));
+        }
+    }
+
+    #[test]
+    fn banded_layout_merge_anchors_on_founding_band() {
+        // Invariant lock (not a differential regression test — the pre-fix
+        // union also accepts this shape, since one merge keeps the union
+        // gutter within tolerance of both constituents): the founder, a
+        // band whose gutter sits ~23pt right of it, and a band identical to
+        // the founder must all flow as one run. The differential coverage
+        // for the anchor rule is banded_layout_rejects_creeping_drift.
+        let mut items = Vec::new();
+        gutter_band(&mut items, 700.0, 38, 330.0, "A"); // gutter mid ~304
+        gutter_band(&mut items, 460.0, 42, 352.0, "B"); // mid ~327 (+23)
+        gutter_band(&mut items, 220.0, 38, 330.0, "C"); // identical to founder
+        let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
+            .expect("multi-column bands on a single-column page must engage");
+        let order = joined_order(&lines);
+        assert!(
+            order.find("LC00").unwrap() < order.find("RA00").unwrap(),
+            "founder-identical band must stay in the founder's run \
+             (its left column reads before any right column): {order}"
+        );
+    }
+
+    #[test]
+    fn banded_layout_rejects_creeping_drift() {
+        // The genuine drift regression: band C's gutter (mid ~340) is
+        // within tolerance of the moving union after A+B merge (mid ~316,
+        // the intersection of A's and B's gutters) but 36pt from the
+        // founder. Pre-anchor code admitted C into the run; matching
+        // against the founder's raw columns must reject it, so C reads as
+        // its own sequential band after the A+B run completes.
+        let mut items = Vec::new();
+        gutter_band(&mut items, 700.0, 38, 330.0, "A"); // gutter mid ~304
+        gutter_band(&mut items, 460.0, 42, 352.0, "B"); // mid ~327 (+23)
+        gutter_band(&mut items, 220.0, 45, 360.0, "C"); // mid ~340 (+36)
+        let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
+            .expect("multi-column bands on a single-column page must engage");
+        let order = joined_order(&lines);
+        assert!(
+            order.find("RA00").unwrap() < order.find("LC00").unwrap(),
+            "a band beyond tolerance of the founder must not join its run: {order}"
+        );
+    }
+
+    #[test]
+    fn banded_layout_merges_across_gap_holding_figure_placeholder() {
+        // The gap between two matching bands holds an image placeholder —
+        // that IS the figure float the merge exists for, so the columns
+        // must still flow through it.
+        let mut items = two_column_band(700.0, 12, "LA", "RA");
+        items.extend(two_column_band(460.0, 12, "LB", "RB"));
+        let mut figure = make_item(1, 100.0, 505.0, "[img]");
+        figure.item_type = ItemType::Image;
+        items.push(figure);
+        let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
+            .expect("multi-column bands on a single-column page must engage");
+        let order = joined_order(&lines);
+        assert!(
+            order.find("LB00").unwrap() < order.find("RA00").unwrap(),
+            "figure placeholder in the gap must not block the merge: {order}"
+        );
+    }
+
+    #[test]
+    fn banded_layout_keeps_bands_apart_across_separator() {
+        // Same two bands, but a page-wide headline sits in the gap:
+        // independent stories, so the top band completes before the bottom.
+        let mut items = two_column_band(700.0, 12, "LA", "RA");
+        items.extend(two_column_band(460.0, 12, "LB", "RB"));
+        items.push(make_item(1, 50.0, 505.0, &"m".repeat(80)));
+        let lines = try_banded_layout(&items, &items, &[], 1, false, 0.10)
+            .expect("multi-column bands on a single-column page must engage");
+        let order = joined_order(&lines);
+        assert!(
+            order.find("RA00").unwrap() < order.find("LB00").unwrap(),
+            "separator must keep bands sequential (RA before LB): {order}"
+        );
+    }
+
+    #[test]
+    fn short_prose_columns_read_newspaper() {
+        // Three balanced columns of 8 full-width prose lines each: below the
+        // 15-line floor, but every line fills its column, so these are
+        // independent text flows, not table rows.
+        let cols: Vec<ColumnRegion> = (0..3)
+            .map(|c| ColumnRegion {
+                x_min: c as f32 * 200.0,
+                x_max: c as f32 * 200.0 + 190.0,
+            })
+            .collect();
+        let per_column: Vec<Vec<TextLine>> = (0..3)
+            .map(|c| {
+                (0..8)
+                    .map(|i| {
+                        let y = 700.0 - i as f32 * 14.0;
+                        let item = make_item(1, c as f32 * 200.0 + 5.0, y, &"m".repeat(30));
+                        TextLine {
+                            y,
+                            page: 1,
+                            adaptive_threshold: 0.10,
+                            items: vec![item],
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        assert!(short_prose_columns(&per_column, &cols));
+        // The table pipeline's veto stays untouched: the shared newspaper
+        // predicate itself must keep rejecting this shape.
+        assert!(!is_newspaper_layout(&per_column, &cols));
+    }
+
+    #[test]
+    fn short_cell_columns_stay_tabular() {
+        // Term/description shape: the left column's lines are short cells.
+        // The all-columns prose requirement must keep row-wise reading.
+        let cols = vec![
+            ColumnRegion {
+                x_min: 0.0,
+                x_max: 190.0,
+            },
+            ColumnRegion {
+                x_min: 200.0,
+                x_max: 390.0,
+            },
+        ];
+        let make_col = |x: f32, text: &str| -> Vec<TextLine> {
+            (0..8)
+                .map(|i| {
+                    let y = 700.0 - i as f32 * 14.0;
+                    let item = make_item(1, x, y, text);
+                    TextLine {
+                        y,
+                        page: 1,
+                        adaptive_threshold: 0.10,
+                        items: vec![item],
+                    }
+                })
+                .collect()
+        };
+        let per_column = vec![make_col(5.0, "term"), make_col(205.0, &"m".repeat(30))];
+        assert!(!short_prose_columns(&per_column, &cols));
+        assert!(!is_newspaper_layout(&per_column, &cols));
     }
 
     #[test]
