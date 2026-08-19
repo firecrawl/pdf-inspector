@@ -3496,6 +3496,28 @@ fn test_extract_pages_markdown_basic() {
 }
 
 #[test]
+fn test_extract_pages_markdown_keeps_line_based_tables() {
+    // The per-page path (used by every `--ocr auto` run) once passed an
+    // empty line slice to markdown conversion, silently dropping every
+    // table that only the line-based detector finds. This fixture's table
+    // is rule-anchored: it must survive the pages API exactly as it does
+    // the whole-document API.
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+
+    let all_markdown: String = result
+        .pages
+        .iter()
+        .map(|p| p.markdown.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all_markdown.contains("|BIO|"),
+        "line-based table rows missing from pages API output"
+    );
+}
+
+#[test]
 fn test_extract_pages_markdown_uses_document_wide_folio_context() {
     let pdf = make_recurring_contextual_folio_pdf();
     let result = extract_pages_markdown_mem(&pdf, None).unwrap();

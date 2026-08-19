@@ -592,6 +592,12 @@ fn extract_pages_markdown_mem_impl(
             .cloned()
             .collect();
 
+        let page_lines: Vec<types::PdfLine> = all_lines
+            .iter()
+            .filter(|l| l.page == page_1idx)
+            .cloned()
+            .collect();
+
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
 
@@ -629,7 +635,7 @@ fn extract_pages_markdown_mem_impl(
                 page_items,
                 options,
                 &page_rects,
-                &[],
+                &page_lines,
                 markdown::MarkdownDocumentContext {
                     page_thresholds: &page_thresholds,
                     struct_roles: None,
