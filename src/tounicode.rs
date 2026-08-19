@@ -1671,7 +1671,7 @@ fn read_cid(stream: &mut BinaryCMapStream<'_>) -> Result<u16, String> {
 /// Unlike an embedded CMap stream, these names are selected from an untrusted
 /// PDF dictionary and must never be interpreted as filesystem paths.
 pub(crate) fn is_predefined_encoding_cmap(name: &[u8]) -> bool {
-    let name = str::from_utf8(name).ok().map_or(false, |name| {
+    let name = str::from_utf8(name).ok().is_some_and(|name| {
         builtin_cmap_file_name(name).is_some_and(|file_name| builtin_cmap_file_exists(&file_name))
     });
     name
@@ -1683,17 +1683,17 @@ pub(crate) fn is_predefined_encoding_cmap(name: &[u8]) -> bool {
 /// while using different `/Encoding` CMaps. Unlike Identity encodings, their
 /// character-code mappings are not interchangeable, so the encoding and font
 /// identity must participate in the key. The high bit namespaces this synthetic
-/// key away from PDF object numbers used by other fallback CMaps.
+/// 64-bit key away from PDF object numbers used by other fallback CMaps.
 pub(crate) fn type0_predefined_cmap_lookup_key(
     font_dict: &lopdf::Dictionary,
     descendant_font: &Object,
-) -> Option<u32> {
+) -> Option<u64> {
     let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
     let Object::Reference(descendant) = descendant_font else {
         return None;
     };
 
-    let mut hash = 0x811c_9dcdu32;
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let empty_base_font = [];
     let base_font = font_dict
         .get(b"BaseFont")
@@ -1707,11 +1707,11 @@ pub(crate) fn type0_predefined_cmap_lookup_key(
         &descendant.1.to_be_bytes(),
     ] {
         for byte in value {
-            hash ^= u32::from(*byte);
-            hash = hash.wrapping_mul(0x0100_0193);
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
-    Some(hash | 0x8000_0000)
+    Some(hash | 1u64 << 63)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1738,27 +1738,15 @@ fn parse_encoding_cmap_stream(data: &[u8]) -> Option<EncodingCMap> {
     let text = String::from_utf8_lossy(data);
     let mut src_hex_lengths: Vec<usize> = Vec::new();
     let mut codespace_byte_len: Option<u8> = None;
+    let mut code_spaces = Vec::new();
 
     if let Some(cs_start) = text.find("begincodespacerange") {
         let section_start = cs_start + "begincodespacerange".len();
         if let Some(cs_end) = text[section_start..].find("endcodespacerange") {
             let section = &text[section_start..section_start + cs_end];
-            let mut in_hex = false;
-            let mut hex_len = 0;
-            for c in section.chars() {
-                if c == '<' {
-                    in_hex = true;
-                    hex_len = 0;
-                } else if c == '>' {
-                    if in_hex && hex_len > 0 {
-                        let byte_len = (hex_len + 1) / 2;
-                        codespace_byte_len = Some(byte_len as u8);
-                    }
-                    in_hex = false;
-                } else if in_hex && c.is_ascii_hexdigit() {
-                    hex_len += 1;
-                }
-            }
+            let (byte_len, spaces) = parse_encoding_code_spaces(section);
+            codespace_byte_len = byte_len;
+            code_spaces = spaces;
         }
     }
 
@@ -1814,9 +1802,55 @@ fn parse_encoding_cmap_stream(data: &[u8]) -> Option<EncodingCMap> {
     Some(EncodingCMap {
         map,
         code_byte_length,
-        code_spaces: Vec::new(),
+        code_spaces,
         is_identity: false,
     })
+}
+
+fn parse_encoding_code_spaces(section: &str) -> (Option<u8>, Vec<EncodingCodeSpace>) {
+    let mut hex_strings = Vec::new();
+    let mut in_hex = false;
+    let mut hex = String::new();
+    for ch in section.chars() {
+        if ch == '<' {
+            in_hex = true;
+            hex.clear();
+        } else if ch == '>' {
+            if in_hex && !hex.is_empty() {
+                hex_strings.push(hex.clone());
+            }
+            in_hex = false;
+        } else if in_hex {
+            hex.push(ch);
+        }
+    }
+
+    let mut max_byte_len: Option<u8> = None;
+    let mut spaces = Vec::new();
+    for pair in hex_strings.chunks(2) {
+        let Some((start_hex, end_hex)) = pair.first().zip(pair.get(1)) else {
+            break;
+        };
+        if start_hex.len() != end_hex.len() || start_hex.len() > 4 {
+            continue;
+        }
+        let Some((start, end)) = parse_hex_u16(start_hex).zip(parse_hex_u16(end_hex)) else {
+            continue;
+        };
+        if start > end {
+            continue;
+        }
+
+        let byte_len = start_hex.len().div_ceil(2).max(1) as u8;
+        max_byte_len = max_byte_len.map_or(Some(byte_len), |current| Some(current.max(byte_len)));
+        spaces.push(EncodingCodeSpace {
+            start,
+            end,
+            byte_length: byte_len,
+        });
+    }
+
+    (max_byte_len, spaces)
 }
 
 fn parse_cidchar_section(
@@ -2292,7 +2326,7 @@ fn build_cmap_from_cid_system_info(
 #[derive(Debug, Default, Clone)]
 pub struct FontCMaps {
     /// Map of ToUnicode object number to CMap
-    by_obj_num: HashMap<u32, CMapEntry>,
+    by_obj_num: HashMap<u64, CMapEntry>,
 }
 
 /// Primary CMap plus optional alternative variants.
@@ -2331,7 +2365,7 @@ impl FontCMaps {
         page_filter: Option<&HashSet<u32>>,
         skip_truetype_fallback: bool,
     ) -> Self {
-        let mut by_obj_num: HashMap<u32, CMapEntry> = HashMap::new();
+        let mut by_obj_num: HashMap<u64, CMapEntry> = HashMap::new();
 
         for (page_num, &page_id) in doc.get_pages().iter() {
             if let Some(filter) = page_filter {
@@ -2363,7 +2397,7 @@ impl FontCMaps {
     fn collect_cmaps_from_fonts(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        by_obj_num: &mut HashMap<u64, CMapEntry>,
     ) {
         Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, false);
     }
@@ -2371,7 +2405,7 @@ impl FontCMaps {
     fn collect_cmaps_from_fonts_inner(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        by_obj_num: &mut HashMap<u64, CMapEntry>,
         skip_truetype_fallback: bool,
     ) {
         // First pass: collect ToUnicode CMaps
@@ -2384,7 +2418,7 @@ impl FontCMaps {
                 Some(r) => r,
                 None => continue,
             };
-            let obj_num = obj_ref.0;
+            let obj_num = u64::from(obj_ref.0);
             if by_obj_num.contains_key(&obj_num) {
                 continue;
             }
@@ -2405,7 +2439,7 @@ impl FontCMaps {
                     cmap.ranges.len()
                 );
                 let (mut primary, mut remapped) =
-                    try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+                    try_remap_subset_cmap(cmap, font_dict, doc, obj_ref.0);
 
                 // Only build expensive fallbacks when the primary CMap is sparse.
                 // build_fallback_cmap_for_type0 can take seconds on large embedded
@@ -2549,7 +2583,7 @@ impl FontCMaps {
                     })
             });
 
-            // The lookup key must match what get_font_file2_obj_num() returns:
+            // The lookup key must match what get_font_cmap_lookup_key() returns:
             // a namespaced encoding identity for predefined CMaps, otherwise the
             // font file obj_num or CIDFont dict obj_num.
             let lookup_key = if !is_identity {
@@ -2559,9 +2593,9 @@ impl FontCMaps {
                 key
             } else {
                 font_file_ref
-                    .map(|r| r.0)
+                    .map(|r| u64::from(r.0))
                     .unwrap_or_else(|| match &desc_fonts[0] {
-                        Object::Reference(r) => r.0,
+                        Object::Reference(r) => u64::from(r.0),
                         _ => 0,
                     })
             };
@@ -2716,7 +2750,7 @@ impl FontCMaps {
                 Some(r) => r,
                 None => continue,
             };
-            let lookup_key = ff_ref.0;
+            let lookup_key = u64::from(ff_ref.0);
             if by_obj_num.contains_key(&lookup_key) {
                 continue;
             }
@@ -2746,7 +2780,7 @@ impl FontCMaps {
     fn collect_cmaps_from_xobjects(
         doc: &Document,
         page_id: ObjectId,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        by_obj_num: &mut HashMap<u64, CMapEntry>,
     ) {
         let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
             Ok(r) => r,
@@ -2769,7 +2803,7 @@ impl FontCMaps {
     fn walk_xobject_fonts(
         resources: &lopdf::Dictionary,
         doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        by_obj_num: &mut HashMap<u64, CMapEntry>,
         visited: &mut HashSet<ObjectId>,
     ) {
         let xobject_dict = match resources.get(b"XObject") {
@@ -2832,7 +2866,11 @@ impl FontCMaps {
 
     /// Get a CMap by ToUnicode object number
     pub fn get_by_obj(&self, obj_num: u32) -> Option<&CMapEntry> {
-        self.by_obj_num.get(&obj_num)
+        self.by_obj_num.get(&u64::from(obj_num))
+    }
+
+    pub(crate) fn get_by_cmap_lookup_key(&self, lookup_key: u64) -> Option<&CMapEntry> {
+        self.by_obj_num.get(&lookup_key)
     }
 }
 
@@ -3826,6 +3864,31 @@ endbfrange
     }
 
     #[test]
+    fn embedded_encoding_cmap_preserves_mixed_width_code_spaces() {
+        let data = b"\
+            2 begincodespacerange\n\
+            <20> <7e>\n\
+            <8140> <fffc>\n\
+            endcodespacerange\n\
+            2 begincidchar\n\
+            <41> 1\n\
+            <8140> 2\n\
+            endcidchar\n";
+        let encoding = parse_encoding_cmap_stream(data).unwrap();
+        let lengths: HashSet<_> = encoding
+            .code_spaces
+            .iter()
+            .map(|space| space.byte_length)
+            .collect();
+
+        assert_eq!(lengths, HashSet::from([1, 2]));
+        assert_eq!(encoding.code_spaces[0].start, 0x20);
+        assert_eq!(encoding.code_spaces[0].end, 0x7e);
+        assert_eq!(encoding.code_spaces[1].start, 0x8140);
+        assert_eq!(encoding.code_spaces[1].end, 0xfffc);
+    }
+
+    #[test]
     fn shared_cid_font_predefined_encodings_get_distinct_cmaps() {
         let mut doc = Document::with_version("1.7");
         let cid_system_info_id = doc.add_object(dictionary! {
@@ -3868,8 +3931,8 @@ endbfrange
         let gbk_key = type0_predefined_cmap_lookup_key(&gbk_font, &descendant).unwrap();
         let unigb_key = type0_predefined_cmap_lookup_key(&unigb_font, &descendant).unwrap();
         assert_ne!(gbk_key, unigb_key);
-        assert_ne!(gbk_key & 0x8000_0000, 0);
-        assert_ne!(unigb_key & 0x8000_0000, 0);
+        assert_ne!(gbk_key & (1u64 << 63), 0);
+        assert_ne!(unigb_key & (1u64 << 63), 0);
 
         let mut by_obj_num = HashMap::new();
         FontCMaps::collect_cmaps_from_fonts_inner(&fonts, &doc, &mut by_obj_num, false);
@@ -3877,6 +3940,26 @@ endbfrange
         let unigb_entry = by_obj_num.get(&unigb_key).expect("UniGB encoding CMap");
         assert!(gbk_entry.primary.char_map.len() > 20_000);
         assert!(unigb_entry.primary.char_map.len() > 20_000);
+    }
+
+    #[test]
+    fn predefined_cmap_lookup_keys_do_not_use_a_narrow_hash() {
+        // These identities collide in the low 31 bits of 32-bit FNV-1a.
+        // A wider namespaced hash must keep both fonts addressable.
+        let gbk_font = dictionary! {
+            "Encoding" => Object::Name(b"GBK-EUC-H".to_vec()),
+            "BaseFont" => Object::Name(b"xiAzqv".to_vec()),
+        };
+        let unigb_font = dictionary! {
+            "Encoding" => Object::Name(b"UniGB-UCS2-H".to_vec()),
+            "BaseFont" => Object::Name(b"mzN86S".to_vec()),
+        };
+        let descendant = Object::Reference((12, 0));
+
+        let gbk_key = type0_predefined_cmap_lookup_key(&gbk_font, &descendant).unwrap();
+        let unigb_key = type0_predefined_cmap_lookup_key(&unigb_font, &descendant).unwrap();
+
+        assert_ne!(gbk_key, unigb_key);
     }
 
     #[test]
