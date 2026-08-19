@@ -1379,32 +1379,34 @@ fn page_has_data_table(
     lines: &[crate::types::PdfLine],
     page: u32,
 ) -> bool {
-    let has_data_table = |tables: &[crate::tables::Table]| {
-        tables
-            .iter()
-            .any(|table| table.kind == crate::tables::TableKind::Data)
+    // A small table can share a page with two prose columns. Suppressing the
+    // narrow-gutter protection for the whole page would stitch those columns;
+    // only a table carrying most of the page's layout items is page-dominant.
+    let has_dominant_data_table = |tables: &[crate::tables::Table]| {
+        let threshold = items.len().div_ceil(2);
+        tables.iter().any(|table| {
+            table.kind == crate::tables::TableKind::Data && table.item_indices.len() >= threshold
+        })
     };
-    let (rect_tables, _) = crate::tables::detect_tables_from_rects(items, rects, page);
-    if has_data_table(&rect_tables) {
-        return true;
-    }
-    let line_tables = crate::tables::detect_tables_from_lines(items, lines, page);
-    if has_data_table(&line_tables) {
-        return true;
+    if !rects.is_empty() {
+        let (rect_tables, _) = crate::tables::detect_tables_from_rects(items, rects, page);
+        if has_dominant_data_table(&rect_tables) {
+            return true;
+        }
     }
 
-    let mut font_sizes: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-    for item in items {
-        let bits = item.font_size.to_bits();
-        *font_sizes.entry(bits).or_insert(0) += 1;
+    if !lines.is_empty() {
+        let line_tables = crate::tables::detect_tables_from_lines(items, lines, page);
+        if has_dominant_data_table(&line_tables) {
+            return true;
+        }
     }
-    let base_size = font_sizes
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(bits, _)| f32::from_bits(bits))
-        .unwrap_or(10.0);
-    let heuristic_tables = crate::tables::detect_tables(items, base_size, false);
-    has_data_table(&heuristic_tables)
+
+    // Do not run the body-font heuristic here. On a dense multi-column page it
+    // can mistake the columns for a table, and the same expensive detector runs
+    // again in the downstream table pipeline. Structural rects/lines are the
+    // only stable preflight signal for merge-time protection.
+    false
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.
@@ -1556,6 +1558,25 @@ mod tests {
         }
     }
 
+    fn layout_item(text: &str, x: f32, y: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height: 9.5,
+            font: "Helvetica".to_string(),
+            font_size: 9.5,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: crate::types::ItemType::Text,
+            mcid: None,
+        }
+    }
+
     fn simple_doc_with_content(content: &[u8]) -> (lopdf::Document, lopdf::ObjectId) {
         use lopdf::{dictionary, Object, Stream};
 
@@ -1620,6 +1641,62 @@ mod tests {
         let mut rects = vec![rect(0.0, 0.0, 612.0, 792.0, 1); 3759];
         dedup_rects(&mut rects);
         assert_eq!(rects.len(), 1);
+    }
+
+    #[test]
+    fn narrow_prose_prefilter_does_not_run_a_whole_page_table_heuristic() {
+        let mut items = Vec::new();
+        for row in 0..50 {
+            let y = 750.0 - row as f32 * 14.0;
+            items.push(layout_item(
+                "justified body copy fills the left column",
+                40.0,
+                y,
+                230.0,
+            ));
+            items.push(layout_item(
+                "justified body copy fills the right column",
+                274.7,
+                y,
+                230.0,
+            ));
+        }
+
+        assert!(!page_has_data_table(&items, &[], &[], 1));
+    }
+
+    #[test]
+    fn small_data_table_does_not_suppress_narrow_prose_for_whole_page() {
+        let mut table_items = Vec::new();
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            let y = 700.0 - row as f32 * 20.0;
+            for col in 0..4 {
+                let x = 100.0 + col as f32 * 60.0;
+                rects.push(rect(x, y, 60.0, 20.0, 1));
+                table_items.push(layout_item("1234", x + 5.0, y + 5.0, 30.0));
+            }
+        }
+
+        let mut mixed = table_items.clone();
+        for row in 0..50 {
+            let y = 620.0 - row as f32 * 12.0;
+            mixed.push(layout_item(
+                "justified body copy fills the left column",
+                40.0,
+                y,
+                230.0,
+            ));
+            mixed.push(layout_item(
+                "justified body copy fills the right column",
+                274.7,
+                y,
+                230.0,
+            ));
+        }
+
+        assert!(page_has_data_table(&table_items, &rects, &[], 1));
+        assert!(!page_has_data_table(&mixed, &rects, &[], 1));
     }
 
     #[test]

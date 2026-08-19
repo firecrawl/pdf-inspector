@@ -248,7 +248,7 @@ fn detect_columns_from_refs(
             for center_assign in [true, false] {
                 let result = validate_and_build_columns(
                     &valleys,
-                    &page_items,
+                    page_items,
                     x_min,
                     bin_width,
                     x_max,
@@ -258,13 +258,9 @@ fn detect_columns_from_refs(
                     center_assign,
                 );
                 if result.len() > 1
-                    && columns_have_prose(&result, &page_items)
+                    && columns_have_prose(&result, page_items)
                     && narrow_valleys_have_body_support(
-                        &valleys,
-                        &result,
-                        &page_items,
-                        x_min,
-                        bin_width,
+                        &valleys, &result, page_items, x_min, bin_width,
                     )
                 {
                     debug!(
@@ -311,7 +307,7 @@ fn detect_columns_from_refs(
         if !rel_valleys.is_empty() {
             let result = validate_and_build_columns(
                 &rel_valleys,
-                &page_items,
+                page_items,
                 x_min,
                 bin_width,
                 x_max,
@@ -325,7 +321,7 @@ fn detect_columns_from_refs(
                 // Tables, forms, and checklists have short scattered items
                 // that create false gutter signals. Only commit to relative
                 // valley columns when both sides look like flowing prose.
-                if columns_have_prose(&result, &page_items) {
+                if columns_have_prose(&result, page_items) {
                     debug!(
                         "page {}: relative valley detection found {} columns",
                         page,
@@ -345,7 +341,7 @@ fn detect_columns_from_refs(
         // stays here: without it a table page whose valley candidate was
         // just rejected could take an unvalidated split.
         if !page_has_table {
-            if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
+            if let Some(columns) = try_xy_cut_split(page_items, x_min, x_max, page) {
                 return columns;
             }
         }
@@ -357,7 +353,7 @@ fn detect_columns_from_refs(
     // a degenerate split (one side empty).
     let result = validate_and_build_columns(
         &valleys,
-        &page_items,
+        page_items,
         x_min,
         bin_width,
         x_max,
@@ -371,7 +367,7 @@ fn detect_columns_from_refs(
     }
     let result = validate_and_build_columns(
         &valleys,
-        &page_items,
+        page_items,
         x_min,
         bin_width,
         x_max,
@@ -389,7 +385,7 @@ fn detect_columns_from_refs(
     // largest horizontal gap between item edges.  This is a simplified
     // single-level XY-cut inspired by opendataloader's XY-Cut++ algorithm.
     if page_items.len() >= 20 && !page_has_table {
-        if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
+        if let Some(columns) = try_xy_cut_split(page_items, x_min, x_max, page) {
             return columns;
         }
     }
