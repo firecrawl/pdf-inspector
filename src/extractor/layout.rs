@@ -2916,6 +2916,62 @@ fn should_use_y_sorting(items: &[TextItem]) -> bool {
     chaos_ratio > 0.4
 }
 
+/// Recognize the compact marker vocabulary used beside author names.
+///
+/// Script-sized letters are deliberately excluded: mathematical variables are
+/// also written above the baseline, but merging those runs changes formula and
+/// reading-order handling in existing documents.
+fn is_affiliation_marker(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().count() <= 4
+        && text.chars().all(|c| {
+            c.is_ascii_digit()
+                || c.is_ascii_punctuation()
+                || c.is_whitespace()
+                || matches!(c, '∗' | '†' | '‡' | '§' | '¶')
+        })
+}
+
+fn has_authorship_symbol(text: &str) -> bool {
+    text.chars()
+        .any(|c| matches!(c, '∗' | '*' | '†' | '‡' | '§' | '¶'))
+}
+
+fn continues_authorship_script_run(
+    last_line: &TextLine,
+    item: &TextItem,
+    y_diff: f32,
+    y_tolerance: f32,
+) -> bool {
+    let Some(first_item) = last_line.items.first() else {
+        return false;
+    };
+    let Some(last_item) = last_line.items.last() else {
+        return false;
+    };
+
+    let font_ratio = item.font_size / first_item.font_size;
+    let maximum_script_shift = (y_tolerance.max(first_item.font_size * 0.6)).max(0.0);
+    let horizontal_gap = item.x - (last_item.x + last_item.width);
+    let starts_or_continues_authorship_marker = has_authorship_symbol(item.text.trim())
+        || last_line
+            .items
+            .iter()
+            .any(|existing| has_authorship_symbol(existing.text.trim()));
+    // A real script run starts at (or within rounding of) the end of its
+    // parent run. A wider gap is the next affiliation entry, not a continuation
+    // of the preceding institution.
+    let maximum_script_gap = (1.0_f32).max(item.font_size.max(last_item.font_size) * 0.25);
+    let follows_line_end = horizontal_gap >= -1.0 && horizontal_gap <= maximum_script_gap;
+
+    follows_line_end
+        && item.x >= first_item.x
+        && is_affiliation_marker(item.text.trim())
+        && starts_or_continues_authorship_marker
+        && font_ratio <= 0.85
+        && y_diff <= maximum_script_shift
+}
+
 /// Group items from a single column into lines
 /// Uses heuristics to decide between PDF stream order and Y-position sorting.
 fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<TextLine> {
@@ -2937,7 +2993,7 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
 
     // Group items into lines
     let mut lines: Vec<TextLine> = Vec::new();
-    let y_tolerance = 3.0;
+    let y_tolerance: f32 = 3.0;
 
     for item in items {
         // Only check the most recent line for merging
@@ -2946,14 +3002,16 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
                 return false;
             }
             let y_diff = (last_line.y - item.y).abs();
-            if y_diff >= y_tolerance {
+            let continues_script_run =
+                continues_authorship_script_run(last_line, &item, y_diff, y_tolerance);
+            if y_diff >= y_tolerance && !continues_script_run {
                 return false;
             }
             // Check if this looks like a new line despite similar Y:
             // If items are at the same X position (left margin) but different Y,
             // they're vertically stacked lines, not the same line
             let has_y_change = y_diff > 0.5;
-            if has_y_change {
+            if has_y_change && !continues_script_run {
                 if let Some(first_item) = last_line.items.first() {
                     let at_same_x = (item.x - first_item.x).abs() < 5.0;
                     // If at same X (left margin) with Y change, it's likely a new line
@@ -3087,6 +3145,112 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn script_runs_stay_on_parent_line() {
+        let mut name = make_item(1, 100.0, 100.0, "Yichuan Wang");
+        name.font_size = 10.0;
+        name.width = 60.0;
+
+        let mut marker = make_item(1, 160.0, 103.7, "∗");
+        marker.font_size = 7.0;
+        marker.width = 4.0;
+        marker.is_italic = true;
+
+        let mut affiliation = make_item(1, 164.0, 103.7, "1");
+        affiliation.font_size = 7.0;
+        affiliation.width = 4.0;
+
+        let mut next_name = make_item(1, 175.0, 100.0, "Zhifei Li");
+        next_name.font_size = 10.0;
+        next_name.width = 38.0;
+
+        let lines = group_single_column(vec![name, marker, affiliation, next_name], 0.1);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].items.len(), 4);
+        assert_eq!(lines[0].y, 100.0);
+    }
+
+    #[test]
+    fn detached_smaller_run_does_not_join_parent_line() {
+        let mut parent = make_item(1, 100.0, 100.0, "Yichuan Wang");
+        parent.font_size = 10.0;
+        parent.width = 60.0;
+
+        let mut detached = make_item(1, 100.0, 104.0, "1");
+        detached.font_size = 7.0;
+        detached.width = 4.0;
+
+        let lines = group_single_column(vec![parent, detached], 0.1);
+
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn widely_offset_smaller_run_does_not_join_parent_line() {
+        let mut parent = make_item(1, 100.0, 100.0, "UC Berkeley");
+        parent.font_size = 10.0;
+        parent.width = 52.0;
+
+        let mut next_marker = make_item(1, 165.0, 103.7, "2");
+        next_marker.font_size = 7.0;
+        next_marker.width = 4.0;
+
+        let lines = group_single_column(vec![parent, next_marker], 0.1);
+
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn script_sized_variable_does_not_join_parent_line() {
+        let mut parent = make_item(1, 100.0, 100.0, "possible states is");
+        parent.font_size = 10.0;
+        parent.width = 70.0;
+
+        let mut variable = make_item(1, 170.0, 103.7, "N");
+        variable.font_size = 7.0;
+        variable.width = 4.0;
+        variable.is_italic = true;
+
+        let lines = group_single_column(vec![parent, variable], 0.1);
+
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn script_sized_numeric_exponent_does_not_join_parent_line() {
+        let mut parent = make_item(1, 100.0, 100.0, "a decimal digit is about 3");
+        parent.font_size = 10.0;
+        parent.width = 103.0;
+
+        let mut exponent = make_item(1, 203.0, 103.8, "13");
+        exponent.font_size = 7.4;
+        exponent.width = 3.7;
+
+        let lines = group_single_column(vec![parent, exponent], 0.1);
+
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn long_numeric_run_does_not_continue_authorship_marker() {
+        let mut name = make_item(1, 100.0, 100.0, "Yichuan Wang");
+        name.font_size = 10.0;
+        name.width = 60.0;
+
+        let mut marker = make_item(1, 160.0, 103.7, "∗");
+        marker.font_size = 7.0;
+        marker.width = 4.0;
+
+        let mut long_number = make_item(1, 164.0, 103.7, "12345");
+        long_number.font_size = 7.0;
+        long_number.width = 16.0;
+
+        let lines = group_single_column(vec![name, marker, long_number], 0.1);
+
+        assert_eq!(lines.len(), 2);
     }
 
     #[test]
