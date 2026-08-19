@@ -1785,7 +1785,8 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
     (has_images, total_area, has_template_image)
 }
 
-/// Computes both `(needs_ocr_for_template_image, has_vector_text)` for a
+/// Computes `(needs_ocr_for_template_image, has_undecodable_fonts,
+/// has_vector_text)` for a
 /// page from a single shared `analyze_page_content` pass — that call
 /// decompresses and scans every content stream (page + XObjects) plus
 /// image coverage, so `extract_pages_markdown_mem` must not invoke it
@@ -1827,10 +1828,21 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
 /// these pages to OCR, independent of any template-image check, since
 /// outlined glyphs can't be extracted as text at all.
 ///
+/// `has_undecodable_fonts` is true when the fonts actually used for text
+/// operators cannot be mapped back to Unicode — Identity-H/V without a
+/// ToUnicode CMap, or a page whose used fonts are all custom-encoded Type3
+/// without ToUnicode. This is the Phase-3 signal `detect_from_document`
+/// flags as `suspected_garbled_text` regardless of whole-document type.
+/// A custom Type3 Encoding can map every byte to a plausible ASCII letter
+/// (e.g. a Caesar-shifted alphabet), so the extracted text passes the
+/// cipher/CID/encoding heuristics `extract_pages_markdown_mem` applies to
+/// its own output — the font-resource signal is the only detector that
+/// cannot be spoofed by what the bytes happen to look like.
+///
 /// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
 /// the same gates classification needs elsewhere instead of treating the
 /// raw signals alone as sufficient — see #227/#231.
-pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool) {
+pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool, bool) {
     let analysis = analyze_page_content(doc, page_id);
 
     let needs_ocr_for_template_image = if !analysis.has_template_image {
@@ -1845,7 +1857,11 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool
         looks_like_scan || insufficient_text
     };
 
-    (needs_ocr_for_template_image, analysis.has_vector_text)
+    (
+        needs_ocr_for_template_image,
+        analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts,
+        analysis.has_vector_text,
+    )
 }
 
 /// Recursively collect image dimensions from XObject resources,
@@ -3100,7 +3116,7 @@ mod tests {
             analysis.unique_alphanum_chars >= 10,
             "sanity: masthead text is diverse, alphanum_low cannot fire"
         );
-        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        let (needs_ocr, _, _) = page_ocr_signals(&doc, page_id);
         assert!(
             needs_ocr,
             "template image + text below the pages_with_text floor is a scan"
@@ -3126,7 +3142,7 @@ mod tests {
             analysis.text_operator_count >= 10,
             "sanity: body text clears the floor"
         );
-        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        let (needs_ocr, _, _) = page_ocr_signals(&doc, page_id);
         assert!(
             !needs_ocr,
             "a text page with a background image must stay native"
