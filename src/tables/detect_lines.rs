@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crate::tables::Table;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
-use super::detect_rects::{assign_items_to_grid, snap_edges};
+use super::detect_rects::{assign_items_to_ruled_grid, snap_edges};
 
 const RULE_Y_TOLERANCE: f32 = 2.0;
 const RULE_JOIN_GAP: f32 = 6.0;
@@ -956,7 +956,8 @@ fn build_open_edge_grid_table_for_rules(
         return None;
     }
 
-    let (body_cells, mut item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (body_cells, mut item_indices) =
+        assign_items_to_ruled_grid(items, &col_edges, &row_edges, page);
     let column_count = col_edges.len() - 1;
     let occupied_body_rows = body_cells
         .iter()
@@ -1772,7 +1773,8 @@ fn detect_tables_from_lines_inner(
     );
 
     // Assign items to grid
-    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges_desc, page);
+    let (cells, item_indices) =
+        assign_items_to_ruled_grid(items, &col_edges, &row_edges_desc, page);
 
     // Require at least 2 non-empty rows
     let non_empty_rows = cells
