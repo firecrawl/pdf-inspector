@@ -1454,6 +1454,20 @@ impl<'a> BinaryCMapStream<'a> {
                 break;
             }
         }
+
+        // The 7-bit groups are stored most-significant first. Leading zero
+        // groups are harmless, but a nonzero group beyond the destination
+        // width must be rejected instead of being shifted out silently.
+        let output_bits = (size + 1).saturating_mul(8);
+        let highest_nonzero_group = stack.iter().position(|group| *group != 0);
+        if let Some(highest) = highest_nonzero_group {
+            let significant_bits = (stack.len() - highest - 1) * 7
+                + usize::from(8 - stack[highest].leading_zeros() as u8);
+            if significant_bits > output_bits {
+                return Err("hex number outside destination width in bcmap".to_string());
+            }
+        }
+
         let mut out = vec![0u8; size + 1];
         let mut buffer = 0u32;
         let mut buffer_size = 0u32;
@@ -3817,6 +3831,17 @@ endbfrange
         let result = parse_binary_cmap_encoding(&data);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_hex_number_rejects_operands_wider_than_destination() {
+        let mut widest = BinaryCMapStream::new(&[0x83, 0xff, 0x7f]);
+        assert_eq!(widest.read_hex_number(1).unwrap(), [0xff, 0xff]);
+
+        // 0x10000 needs 17 bits and cannot be represented as a two-byte
+        // differential operand. Its high bit must not be silently discarded.
+        let mut overflowing = BinaryCMapStream::new(&[0x84, 0x80, 0x00]);
+        assert!(overflowing.read_hex_number(1).is_err());
     }
 
     #[test]
