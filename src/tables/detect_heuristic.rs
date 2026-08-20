@@ -1432,8 +1432,86 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
     let num_cols = cells.first().map(|r| r.len()).unwrap_or(0);
     // A page-number TOC is a narrow list (title + page, optionally a leader
     // column). Wider grids are data tables, not contents.
-    if !(2..=3).contains(&num_cols) || cells.len() < 5 {
+    if !(2..=3).contains(&num_cols) || cells.len() < 2 {
         return false;
+    }
+    // 3-4 row fragments (a chapter's sections split into their own grid)
+    // carry less evidence than a full contents page, so they must be
+    // perfect: every last-column cell a page number, values strictly
+    // increasing, and every first-column cell a multi-word title.
+    // Leader-dot residue ("..19") only reads as a page number when the
+    // page column itself (or a dedicated dots-only leader cell) shows
+    // leader dots; an ellipsis inside a title is prose, and a leading
+    // period elsewhere is decimal notation that must not be stripped.
+    let page_col = num_cols - 1;
+    let has_leader_dots = cells.iter().any(|row| {
+        let page_cell_leader = row.get(page_col).is_some_and(|c| {
+            let t = c.trim();
+            t.starts_with("..") || t.starts_with('\u{2026}')
+        });
+        let dots_only_cell = row.iter().any(|c| {
+            let t = c.trim();
+            t.len() >= 2 && t.chars().all(|ch| ch == '.' || ch == '\u{2026}')
+        });
+        page_cell_leader || dots_only_cell
+    });
+    fn clean_page_cell(cell: &str, has_leader_dots: bool) -> &str {
+        if has_leader_dots {
+            cell.trim_start_matches(['.', '\u{2026}', ' '])
+        } else {
+            cell.trim()
+        }
+    }
+    if cells.len() < 5 {
+        let last_col = num_cols - 1;
+        let vals: Vec<u32> = cells
+            .iter()
+            .filter_map(|row| {
+                let cell = row.get(last_col).map(String::as_str).unwrap_or("");
+                page_number_value(clean_page_cell(cell, has_leader_dots))
+            })
+            .collect();
+        // A fragment row can lose its title to a neighboring grid; judge
+        // only the titles that are present.
+        let titles: Vec<&str> = cells
+            .iter()
+            .filter_map(|row| row.first())
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let titles_ok = titles.len() >= 2
+            && titles.iter().all(|c| {
+                c.split_whitespace().count() >= 2 && c.chars().any(|ch| ch.is_alphabetic())
+            });
+        // Short fragments carry little evidence: ascending numbers with
+        // multi-word labels also describe a small data summary. Require a
+        // contents-specific signal — every title carries genuine section
+        // syntax ("Section 6.3", "2.1.4 Methods", "4. A Jewel …") or the
+        // fragment shows leader dots. Years, IDs, and measurements do not
+        // qualify: a bare all-digit token only counts as an ordinal when
+        // it starts the title with a list-marker suffix, and dotted tokens
+        // must be multi-part section numbers with short groups.
+        let section_numbered = |title: &str| {
+            let mut words = title.split_whitespace();
+            let first = words.next().unwrap_or("");
+            let leading_ordinal = first.len() <= 4
+                && first.ends_with(['.', ')'])
+                && !first[..first.len() - 1].is_empty()
+                && first[..first.len() - 1].chars().all(|c| c.is_ascii_digit());
+            let dotted_section = title.split_whitespace().any(|tok| {
+                let tok = tok.trim_end_matches([':', '.']);
+                let groups: Vec<&str> = tok.split('.').collect();
+                groups.len() >= 2
+                    && groups.iter().all(|g| {
+                        !g.is_empty() && g.len() <= 3 && g.chars().all(|c| c.is_ascii_digit())
+                    })
+            });
+            leading_ordinal || dotted_section
+        };
+        if !has_leader_dots && !titles.iter().all(|t| section_numbered(t)) {
+            return false;
+        }
+        return vals.len() == cells.len() && titles_ok && vals.windows(2).all(|w| w[1] > w[0]);
     }
     let last = num_cols - 1;
 
@@ -1443,7 +1521,7 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
     // "Mineral | CEC" tables from real contents. Check the actual first row,
     // not the first non-empty one, so a blank header cell still rejects.
     let first_last = cells[0].get(last).map(|s| s.trim()).unwrap_or("");
-    if page_number_value(first_last).is_none() {
+    if page_number_value(clean_page_cell(first_last, has_leader_dots)).is_none() {
         return false;
     }
 
@@ -1456,7 +1534,7 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
             continue;
         }
         filled += 1;
-        if let Some(v) = page_number_value(cell) {
+        if let Some(v) = page_number_value(clean_page_cell(cell, has_leader_dots)) {
             page_vals.push(v);
         }
     }
@@ -2631,6 +2709,44 @@ mod tests {
             !detect_tables(&items, 12.0, false).is_empty(),
             "adjacent old/new fragments must retain the live revised cells"
         );
+    }
+
+    #[test]
+    fn small_toc_fragments_are_classified() {
+        // 3-row section fragment: multi-word titles, strictly ascending pages.
+        let rows = |v: &[(&str, &str)]| -> Vec<Vec<String>> {
+            v.iter()
+                .map(|(a, b)| vec![a.to_string(), b.to_string()])
+                .collect()
+        };
+        assert!(is_table_of_contents(&rows(&[
+            ("Section 4.1: Examining Relationships", "29"),
+            ("Section 4.2: Correlation Assumptions", "31"),
+            ("Section 4.3: Chapter Four Self-Test", "33"),
+        ])));
+        // 2-row fragment under the same strict rules.
+        assert!(is_table_of_contents(&rows(&[
+            ("Section 6.3 Repeated Measures ANOVA", "54"),
+            ("Section 6.4: Chapter Six Self-Test", "62"),
+        ])));
+        // Leader dots glued to the page number, one title lost to a
+        // neighboring grid.
+        assert!(is_table_of_contents(&rows(&[
+            ("4. A Jewel in the Austrian Crown.", "..19"),
+            ("5. Meeting the Relatives..", "..37"),
+            ("", "..41"),
+            ("7. To the Bottom of the World......", ".53"),
+        ])));
+        // Single-word labels with ascending numbers stay a data table.
+        assert!(!is_table_of_contents(&rows(&[
+            ("Total", "54"),
+            ("Margin", "62"),
+        ])));
+        // Non-ascending page cells stay a data table.
+        assert!(!is_table_of_contents(&rows(&[
+            ("Net income before adjustments", "54"),
+            ("Gross margin excluding one-offs", "42"),
+        ])));
     }
 
     #[test]
