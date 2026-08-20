@@ -696,6 +696,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let base_size = options
         .base_font_size
         .unwrap_or(font_stats.most_common_size);
+    let base_size = super::analysis::correct_base_size(&lines, base_size);
 
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
@@ -1286,6 +1287,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let base_size = options
         .base_font_size
         .unwrap_or(font_stats.most_common_size);
+    let base_size = super::analysis::correct_base_size(&lines, base_size);
 
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);

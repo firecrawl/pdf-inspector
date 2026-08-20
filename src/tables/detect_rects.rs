@@ -2082,6 +2082,10 @@ fn detect_row_stripe_table(
         debug!("  row-stripe rejected: dominant prose cell (chart/figure region over body text)");
         return None;
     }
+    if row_stripe_cells_are_prose(&cells) {
+        debug!("  row-stripe rejected: prose fragments behind stripes");
+        return None;
+    }
 
     let column_centers: Vec<f32> = (0..num_cols)
         .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
@@ -2126,6 +2130,39 @@ fn has_dominant_prose_cell(cells: &[Vec<String>]) -> bool {
         }
     }
     max_cell_words >= 60 && max_cell_words * 3 >= total_words
+}
+
+/// Stripes drawn behind flowing body text produce a grid of paragraph
+/// fragments: nearly every cell is long, multi-sentence prose. Real
+/// row-stripe tables (zebra-striped financial rows) carry short values.
+/// Mirrors the cell-rect prose-in-frame cap.
+fn row_stripe_cells_are_prose(cells: &[Vec<String>]) -> bool {
+    let num_cols = cells.iter().map(Vec::len).max().unwrap_or(0);
+    let mut counted = 0usize;
+    let mut total_chars = 0usize;
+    let mut sentence_cells = 0usize;
+    let mut sentence_columns = vec![false; num_cols];
+    for row in cells {
+        for (col, cell) in row.iter().enumerate() {
+            let t = cell.trim();
+            if t.is_empty() {
+                continue;
+            }
+            counted += 1;
+            total_chars += t.chars().count();
+            if t.split_whitespace().count() >= 10 && t.contains(['.', ',']) {
+                sentence_cells += 1;
+                sentence_columns[col] = true;
+            }
+        }
+    }
+    // Flowing text fills every column with sentences; a genuine striped
+    // narrative table (Q&A, requirements) keeps them in one description
+    // column beside short labels.
+    counted > 0
+        && total_chars / counted > 90
+        && sentence_cells * 2 >= counted
+        && sentence_columns.iter().filter(|&&v| v).count() >= 2
 }
 
 fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
@@ -3435,6 +3472,32 @@ fn cluster_x_positions(items: &[(usize, &TextItem)], min_threshold: f32) -> Vec<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn row_stripe_prose_fragments_are_rejected() {
+        let prose = vec![
+            vec![
+                "The other potentially invasive fouler is the tropical American species in low abundances near the harbor entrance today."
+                    .to_string(),
+                "Mytilopsis sallei and M. adamsi which has been recorded invasive in Singapore, Australia, Thailand among other regions of the coast."
+                    .to_string(),
+            ],
+            vec![
+                "Figure 3. Non-indigenous macrofoulers from Manila Bay with IAS, based on more intensive biofouling ecological monitoring efforts."
+                    .to_string(),
+                "Newer estimates on the number of possible IAS in Manila Bay is likely more than 30 species, when research started on this topic."
+                    .to_string(),
+            ],
+        ];
+        assert!(super::row_stripe_cells_are_prose(&prose));
+
+        let zebra = vec![
+            vec!["Revenue".to_string(), "$1,240".to_string()],
+            vec!["Cost of goods".to_string(), "$310".to_string()],
+            vec!["Net margin".to_string(), "24%".to_string()],
+        ];
+        assert!(!super::row_stripe_cells_are_prose(&zebra));
+    }
+
     use super::*;
     use crate::types::ItemType;
 
