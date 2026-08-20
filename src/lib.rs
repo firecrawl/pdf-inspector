@@ -4222,16 +4222,29 @@ fn find_standalone_keyword(buf: &[u8], start: usize, end: usize, keyword: &[u8])
         return None;
     }
 
-    buf[start..end]
-        .windows(keyword.len())
-        .position(|window| window == keyword)
-        .map(|relative_pos| start + relative_pos)
-        .filter(|&pos| {
-            (pos == 0 || buf[pos - 1].is_ascii_whitespace())
-                && buf
+    let mut pos = start;
+    while pos < end {
+        match buf[pos] {
+            byte if byte.is_ascii_whitespace() => pos += 1,
+            b'%' => {
+                while pos < end && !matches!(buf[pos], b'\n' | b'\r') {
+                    pos += 1;
+                }
+            }
+            _ => {
+                let before_ok = pos == 0 || buf[pos - 1].is_ascii_whitespace();
+                let after_ok = buf
                     .get(pos + keyword.len())
-                    .is_none_or(u8::is_ascii_whitespace)
-        })
+                    .is_none_or(u8::is_ascii_whitespace);
+                if before_ok && after_ok && buf[pos..end].starts_with(keyword) {
+                    return Some(pos);
+                }
+                pos += 1;
+            }
+        }
+    }
+
+    None
 }
 
 /// Finds the last standalone `xref` token in `buf` that is immediately
@@ -7882,6 +7895,13 @@ mod tests {
 
         let nested = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Metadata << /Root 9 0 R >> >>\nstartxref\n0\n%%EOF";
         assert!(!xref_trailer_has_root(nested, 0));
+    }
+
+    #[test]
+    fn trailer_keyword_detection_skips_comments_before_trailer() {
+        let buf = b"xref\n0 1\n0000000000 65535 f \n%% trailer placeholder\ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n0\n%%EOF";
+
+        assert!(xref_trailer_has_root(buf, 0));
     }
 
     #[test]
