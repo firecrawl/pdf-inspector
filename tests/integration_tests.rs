@@ -1233,7 +1233,7 @@ fn test_not_a_pdf_extract_text_mem() {
 /// This catches regressions where code changes silently alter extraction
 /// or markdown output. If a change is intentional, update the snapshot:
 ///   cargo run --release --bin pdf2md -- tests/fixtures/<name>.pdf > tests/snapshots/<name>.md
-fn assert_snapshot(fixture: &str) {
+fn assert_snapshot(fixture: &str) -> String {
     let fixture_path = format!("tests/fixtures/{}.pdf", fixture);
     let snapshot_path = format!("tests/snapshots/{}.md", fixture);
 
@@ -1278,6 +1278,8 @@ fn assert_snapshot(fixture: &str) {
             snapshot_path,
         );
     }
+
+    actual.to_string()
 }
 
 #[test]
@@ -1316,11 +1318,9 @@ fn test_snapshot_2013_app2() {
 /// logical order.
 #[test]
 fn test_snapshot_hebrew_visual_order() {
-    assert_snapshot("hebrew_visual_order");
-    let output = pdf_inspector::process_pdf("tests/fixtures/hebrew_visual_order.pdf")
-        .unwrap()
-        .markdown
-        .unwrap_or_default();
+    // The contains checks restate the intent independently of the snapshot
+    // file, so a bad snapshot refresh can't silently bless reversed output.
+    let output = assert_snapshot("hebrew_visual_order");
     assert!(
         output.contains("שלום עולם") && output.contains("דוח על הסיכונים"),
         "visual-order Hebrew must extract in logical order, got: {output}"
@@ -1333,11 +1333,7 @@ fn test_snapshot_hebrew_visual_order() {
 /// a codepoint-only trigger would corrupt them.
 #[test]
 fn test_snapshot_hebrew_logical_order() {
-    assert_snapshot("hebrew_logical_order");
-    let output = pdf_inspector::process_pdf("tests/fixtures/hebrew_logical_order.pdf")
-        .unwrap()
-        .markdown
-        .unwrap_or_default();
+    let output = assert_snapshot("hebrew_logical_order");
     assert!(
         output.contains("שלום עולם") && output.contains("דוח על הסיכונים"),
         "logical-order Hebrew must stay in logical order, got: {output}"

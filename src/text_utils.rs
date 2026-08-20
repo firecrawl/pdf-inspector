@@ -142,6 +142,28 @@ where
     rtl > 0 && rtl > ltr
 }
 
+/// Like `is_rtl_text`, but only strong (letter) RTL characters count.
+/// Arabic-Indic digits and numeric separators sit in the Arabic block yet are
+/// direction-neutral: a digit-only cell must keep left-to-right order, so it
+/// carries no RTL evidence here.
+pub(crate) fn is_strong_rtl_text<I, S>(texts: I) -> bool
+where
+    I: Iterator<Item = S>,
+    S: AsRef<str>,
+{
+    let (mut rtl, mut ltr) = (0u32, 0u32);
+    for t in texts {
+        for c in t.as_ref().chars() {
+            if is_rtl_char(c) && !is_arabic_indic_digit(c) && !is_arabic_numeric_separator(c) {
+                rtl += 1;
+            } else if c.is_alphabetic() && !is_cjk_char(c) {
+                ltr += 1;
+            }
+        }
+    }
+    rtl > 0 && rtl > ltr
+}
+
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
     if rtl {
@@ -329,6 +351,13 @@ fn is_arabic_indic_digit(c: char) -> bool {
     matches!(c, '\u{0660}'..='\u{0669}' | '\u{06F0}'..='\u{06F9}')
 }
 
+/// Arabic decimal (U+066B) and thousands (U+066C) separators — punctuation
+/// that lives inside numbers and must stay with the forward-ordered digit
+/// run around it.
+fn is_arabic_numeric_separator(c: char) -> bool {
+    matches!(c, '\u{066B}' | '\u{066C}')
+}
+
 fn is_forward_alnum(c: char) -> bool {
     c.is_ascii_alphanumeric() || is_arabic_indic_digit(c)
 }
@@ -355,16 +384,18 @@ fn reverse_visual_arabic(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut runs: Vec<(bool, String)> = Vec::new(); // (is_ltr, content)
 
+    let is_ltr_punct = |chars: &[char], i: usize| {
+        (chars[i].is_ascii_punctuation() || is_arabic_numeric_separator(chars[i]))
+            && is_adjacent_to_alnum(chars, i)
+    };
     let mut i = 0;
     while i < chars.len() {
-        let is_ltr = is_forward_alnum(chars[i])
-            || (chars[i].is_ascii_punctuation() && is_adjacent_to_alnum(&chars, i));
+        let is_ltr = is_forward_alnum(chars[i]) || is_ltr_punct(&chars, i);
 
         let mut run = String::new();
         while i < chars.len() {
             let c = chars[i];
-            let c_is_ltr = is_forward_alnum(c)
-                || (c.is_ascii_punctuation() && is_adjacent_to_alnum(&chars, i));
+            let c_is_ltr = is_forward_alnum(c) || is_ltr_punct(&chars, i);
             if c_is_ltr != is_ltr {
                 break;
             }
@@ -441,7 +472,7 @@ pub(crate) fn is_visual_rtl_candidate(text: &str) -> bool {
         return false;
     }
     text.chars()
-        .filter(|&c| is_rtl_char(c) && !is_arabic_indic_digit(c))
+        .filter(|&c| is_rtl_char(c) && !is_arabic_indic_digit(c) && !is_arabic_numeric_separator(c))
         .count()
         >= 2
         && is_rtl_text(std::iter::once(text))
@@ -1177,6 +1208,31 @@ mod tests {
         // a bare "٢٤" run must never be reversed into "٤٢"
         assert!(!is_visual_rtl_candidate("\u{0662}\u{0664}"));
         assert!(!is_visual_rtl_candidate("\u{0663}\u{0665},\u{0660}"));
+    }
+
+    #[test]
+    fn strong_rtl_text_ignores_arabic_digits() {
+        // Digit-only content is direction-neutral
+        assert!(!is_strong_rtl_text(["\u{0662}\u{0664}"].iter()));
+        assert!(!is_strong_rtl_text(
+            ["\u{0663}\u{0665}\u{066B}\u{0660}"].iter()
+        ));
+        // Letters still decide
+        assert!(is_strong_rtl_text(["\u{0645}\u{0631}\u{062D}"].iter()));
+        assert!(is_strong_rtl_text(
+            ["\u{05E9}\u{05DC}\u{05D5}\u{05DD}"].iter()
+        ));
+    }
+
+    #[test]
+    fn arabic_numeric_separators_stay_with_digits() {
+        // U+066B decimal / U+066C thousands separators live inside numbers:
+        // the whole number is one forward run and must not split or reverse.
+        let decimal = "\u{0663}\u{0665}\u{066B}\u{0660}"; // ٣٥٫٠
+        assert_eq!(reverse_visual_arabic(decimal), decimal);
+        assert!(!is_visual_rtl_candidate(decimal));
+        let thousands = "\u{0661}\u{066C}\u{0660}\u{0660}\u{0660}"; // ١٬٠٠٠
+        assert_eq!(reverse_visual_arabic(thousands), thousands);
     }
 
     #[test]

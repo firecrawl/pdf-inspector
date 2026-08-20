@@ -566,13 +566,15 @@ pub(crate) fn extract_page_text_items(
                                 // direction: forward paint order means the
                                 // string may be stored in visual order, a
                                 // mirrored matrix already paints right-to-left
-                                // (logical storage). Rotated matrices
-                                // (combined[0] ≈ 0) carry no horizontal
-                                // evidence and stay neutral.
-                                if combined[0] > 0.0 {
-                                    rtl_visual_candidates.push(items.len());
-                                } else if combined[0] < 0.0 {
-                                    rtl_logical_ops += 1;
+                                // (logical storage). Rotated matrices carry no
+                                // horizontal evidence and stay neutral — same
+                                // dominance test as the rotation votes above.
+                                if combined[0].abs() > combined[1].abs() {
+                                    if combined[0] > 0.0 {
+                                        rtl_visual_candidates.push(items.len());
+                                    } else {
+                                        rtl_logical_ops += 1;
+                                    }
                                 }
                             }
                             items.push(TextItem {
@@ -647,7 +649,13 @@ pub(crate) fn extract_page_text_items(
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
                                     let displacement = -n_val / 1000.0 * current_font_size;
-                                    if n_val > space_threshold {
+                                    // A true backtrack puts the pen behind the
+                                    // current segment's start — plain positive
+                                    // kerning never does.
+                                    if n_val > space_threshold
+                                        && !current_text.is_empty()
+                                        && total_width_ts + displacement < sub_start_width_ts
+                                    {
                                         backward_jump = true;
                                     }
                                     if !is_invisible
@@ -677,7 +685,13 @@ pub(crate) fn extract_page_text_items(
                                 Object::Real(n) => {
                                     let n_val = *n;
                                     let displacement = -n_val / 1000.0 * current_font_size;
-                                    if n_val > space_threshold {
+                                    // A true backtrack puts the pen behind the
+                                    // current segment's start — plain positive
+                                    // kerning never does.
+                                    if n_val > space_threshold
+                                        && !current_text.is_empty()
+                                        && total_width_ts + displacement < sub_start_width_ts
+                                    {
                                         backward_jump = true;
                                     }
                                     if !is_invisible
@@ -756,6 +770,13 @@ pub(crate) fn extract_page_text_items(
                                 .copied()
                                 .unwrap_or((false, false));
                             let scale_x = text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2];
+                            // Rotated matrices carry no horizontal evidence:
+                            // stay neutral unless the advance is x-dominant.
+                            let scale_y = text_matrix[0] * ctm[1] + text_matrix[1] * ctm[3];
+                            let horizontal_advance = scale_x.abs() > scale_y.abs();
+                            // The op-wide backtrack marker votes once per op,
+                            // not once per sub-run.
+                            let mut op_logical_voted = false;
                             for (text, start_w, end_w) in &sub_items {
                                 let offset_tm = [
                                     text_matrix[0],
@@ -773,11 +794,14 @@ pub(crate) fn extract_page_text_items(
                                 } else {
                                     0.0
                                 };
-                                if crate::text_utils::is_visual_rtl_candidate(text) {
+                                if horizontal_advance
+                                    && crate::text_utils::is_visual_rtl_candidate(text)
+                                {
                                     if scale_x > 0.0 && !backward_jump {
                                         rtl_visual_candidates.push(items.len());
-                                    } else if backward_jump || scale_x < 0.0 {
+                                    } else if !op_logical_voted {
                                         rtl_logical_ops += 1;
+                                        op_logical_voted = true;
                                     }
                                 }
                                 items.push(TextItem {
@@ -891,10 +915,12 @@ pub(crate) fn extract_page_text_items(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
-                            if crate::text_utils::is_visual_rtl_candidate(&text) {
+                            if crate::text_utils::is_visual_rtl_candidate(&text)
+                                && combined[0].abs() > combined[1].abs()
+                            {
                                 if combined[0] > 0.0 {
                                     rtl_visual_candidates.push(items.len());
-                                } else if combined[0] < 0.0 {
+                                } else {
                                     rtl_logical_ops += 1;
                                 }
                             }
@@ -2050,6 +2076,17 @@ end"#;
                 "logical run must not be reversed"
             );
         }
+    }
+
+    #[test]
+    fn rotated_hebrew_ops_stay_neutral() {
+        // 90°-rotated text matrix: the advance has no horizontal component,
+        // so the run carries no storage-order evidence and must pass through
+        // unreversed.
+        let content = b"BT /F1 12 Tf 0 1 -1 0 100 700 Tm <41424344> Tj ET";
+        let items = extract_hebrew_items(content);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, SHALOM_LOGICAL);
     }
 
     #[test]

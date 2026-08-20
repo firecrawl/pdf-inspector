@@ -463,8 +463,11 @@ pub fn detect_tables_from_struct_tree(
 
                 // Sort by Y (descending = top-to-bottom) then X in reading
                 // direction (ascending, or descending for RTL cells with
-                // embedded LTR phrases kept in screen order)
-                let rtl = crate::text_utils::is_rtl_text(cell_items.iter().map(|(_, i)| &i.text));
+                // embedded LTR phrases kept in screen order). Direction comes
+                // from strong RTL letters only — a digit-only cell split
+                // across items must not have its number reversed.
+                let rtl =
+                    crate::text_utils::is_strong_rtl_text(cell_items.iter().map(|(_, i)| &i.text));
                 cell_items.sort_by(|a, b| {
                     let (first, second) = if rtl { (b, a) } else { (a, b) };
                     b.1.y

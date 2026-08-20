@@ -1717,7 +1717,9 @@ pub(crate) fn assign_items_to_grid(
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(num_cols);
         for col_items in row_items.iter_mut() {
-            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|(_, i)| &i.text));
+            // Direction from strong RTL letters only — a digit-only cell
+            // split across items must not have its number reversed.
+            let rtl = crate::text_utils::is_strong_rtl_text(col_items.iter().map(|(_, i)| &i.text));
             col_items.sort_by(|a, b| {
                 b.1.y
                     .partial_cmp(&a.1.y)
