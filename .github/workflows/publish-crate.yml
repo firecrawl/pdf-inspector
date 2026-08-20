@@ -93,7 +93,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
 
       - name: Verify package
         run: cargo publish --dry-run

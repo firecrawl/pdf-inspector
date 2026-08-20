@@ -1,0 +1,10 @@
+# Pinned toolchain for local development and CI (maturin-action reads this
+# file too; the GitHub workflows pin the same version explicitly because
+# dtolnay/rust-toolchain exports RUSTUP_TOOLCHAIN, which overrides this file).
+#
+# Bump deliberately in its own PR: install the new version, run
+# `cargo clippy -- -D warnings` and `cargo clippy --features ocr -- -D warnings`,
+# fix new lints, then update the version here AND in .github/workflows/*.yml.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
