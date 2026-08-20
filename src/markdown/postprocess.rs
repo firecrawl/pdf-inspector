@@ -3,10 +3,20 @@
 use regex::Regex;
 
 use super::{MarkdownOptions, MarkdownProfile};
-use crate::text_utils::is_page_number_line;
+use crate::text_utils::{
+    is_arabic_char, is_hebrew_letter, is_page_number_line, is_visual_order_hebrew,
+    reverse_visual_rtl,
+};
 
 /// Clean up markdown output with post-processing
 pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> String {
+    // Runs before every other pass: the cleanups below match on punctuation and
+    // line shape, which only mean what they look like once the text is in
+    // logical order.
+    if options.fix_rtl_order {
+        text = restore_rtl_reading_order(&text);
+    }
+
     if options.profile == MarkdownProfile::Compact {
         // Dot-leader collapse saves tokens but changes source text, so it is
         // reserved for the explicit compact profile.
@@ -50,6 +60,135 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
     text.push('\n');
 
     text
+}
+
+/// Restore logical reading order for a document whose Hebrew was laid out
+/// visually.
+///
+/// The decision is made once for the whole document — see
+/// [`is_visual_order_hebrew`] — because a producer picks one ordering for the
+/// entire file, and deciding per line would flip some lines and not others.
+/// Documents already in logical order, and documents with no Hebrew, are
+/// returned untouched.
+///
+/// Arabic is out of scope: it is already restored per text item during
+/// extraction, so [`restore_rtl_line`] skips any line carrying it.
+fn restore_rtl_reading_order(text: &str) -> String {
+    if !is_visual_order_hebrew(text) {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&restore_rtl_line(line));
+    }
+    out
+}
+
+/// Restore one line, keeping markdown structure in place around the prose.
+fn restore_rtl_line(line: &str) -> String {
+    // Scoped to Hebrew, not RTL generally. Arabic reaches this point already
+    // in logical order — `expand_ligatures` restored it per text item during
+    // extraction — so reversing it here would undo that work. A line carrying
+    // both scripts is genuinely ambiguous, and is left alone.
+    if !line.chars().any(is_hebrew_letter) || line.chars().any(is_arabic_char) {
+        return line.to_string();
+    }
+
+    let trimmed = line.trim();
+    if is_table_row(trimmed) {
+        // An RTL table's leftmost visual column is its last logical one, so
+        // cell order reverses along with the text inside each cell.
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let cells: Vec<String> = inner.split('|').rev().map(reverse_segments).collect();
+        return format!("|{}|", cells.join("|"));
+    }
+
+    // Leading markers (heading hashes, list bullets, quote carets) are
+    // structure, not prose — reorder only what follows them.
+    let prose_start = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(prose_start);
+    let marker_len = leading_marker_len(rest);
+    let (marker, prose) = rest.split_at(marker_len);
+
+    format!("{indent}{marker}{}", reverse_segments(prose))
+}
+
+/// Reverse the text of a span while leaving inline markup where it sits.
+///
+/// Emphasis runs and `<u>` tags are emitted around text, not inside it, so
+/// reversing them along with the prose would produce `>u/<` and break the
+/// markup. Splitting on the tags and reversing only what lies between them
+/// keeps `<u>` wrapping the same words it wrapped before.
+fn reverse_segments(text: &str) -> String {
+    if !text.contains('<') && !text.contains('*') && !text.contains('`') {
+        return reverse_visual_rtl(text);
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut segment = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => {
+                // An HTML tag: copy it through verbatim.
+                out.push_str(&reverse_visual_rtl(&segment));
+                segment.clear();
+                out.push('<');
+                for tag_char in chars.by_ref() {
+                    out.push(tag_char);
+                    if tag_char == '>' {
+                        break;
+                    }
+                }
+            }
+            '*' | '`' => {
+                out.push_str(&reverse_visual_rtl(&segment));
+                segment.clear();
+                out.push(c);
+            }
+            _ => segment.push(c),
+        }
+    }
+    out.push_str(&reverse_visual_rtl(&segment));
+    out
+}
+
+/// Length of the leading markdown marker on a line, if any.
+fn leading_marker_len(s: &str) -> usize {
+    let bytes = s.as_bytes();
+
+    // Heading: one to six '#' followed by a space.
+    let hashes = bytes.iter().take_while(|&&b| b == b'#').count();
+    if (1..=6).contains(&hashes) && bytes.get(hashes) == Some(&b' ') {
+        return hashes + 1;
+    }
+
+    // Bullet list or block quote.
+    if matches!(bytes.first(), Some(b'-' | b'*' | b'+' | b'>')) && bytes.get(1) == Some(&b' ') {
+        return 2;
+    }
+
+    // Ordered list: digits followed by '. '.
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0 && bytes.get(digits) == Some(&b'.') && bytes.get(digits + 1) == Some(&b' ') {
+        return digits + 2;
+    }
+
+    0
+}
+
+/// A pipe-delimited table row, excluding the `|---|---|` separator whose
+/// dashes carry no text to reorder.
+fn is_table_row(trimmed: &str) -> bool {
+    if !(trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 2) {
+        return false;
+    }
+    !trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
 }
 
 /// Collapse runs of 2+ spaces to a single space within each line.
@@ -947,5 +1086,101 @@ mod tests {
     fn test_format_urls_no_urls() {
         let input = "No links here";
         assert_eq!(format_urls(input), input);
+    }
+
+    #[test]
+    fn rtl_visual_hebrew_restored() {
+        assert_eq!(restore_rtl_reading_order("םלוע םולש"), "שלום עולם");
+    }
+
+    #[test]
+    fn rtl_logical_hebrew_untouched() {
+        let input = "שלום עולם\n\nחשבונית מס 12345";
+        assert_eq!(restore_rtl_reading_order(input), input);
+    }
+
+    #[test]
+    fn rtl_pass_is_idempotent() {
+        let visual = "## םלוע םולש\n\nהקידבל טסקט הז";
+        let once = restore_rtl_reading_order(visual);
+        assert_eq!(restore_rtl_reading_order(&once), once);
+    }
+
+    #[test]
+    fn rtl_leaves_latin_documents_byte_identical() {
+        let input = "# Invoice 12345\n\n|Qty|Item|Total|\n|---|---|---|\n|1|Consulting|100.00|";
+        assert_eq!(restore_rtl_reading_order(input), input);
+    }
+
+    #[test]
+    fn rtl_preserves_heading_and_list_markers() {
+        // The marker stays on the left; only the prose after it is reordered.
+        assert_eq!(restore_rtl_reading_order("## םלוע םולש"), "## שלום עולם");
+        assert_eq!(restore_rtl_reading_order("- םלוע םולש"), "- שלום עולם");
+        assert_eq!(restore_rtl_reading_order("1. םלוע םולש"), "1. שלום עולם");
+    }
+
+    #[test]
+    fn rtl_table_reverses_cell_order_and_keeps_separator() {
+        // A visually-laid-out invoice row: rightmost visual column is the
+        // first logical one, so cell order reverses with the cell text.
+        let visual = "|םוכס|ריחמ|טוריפ|תומכ|\n|---|---|---|---|";
+        let expected = "|כמות|פירוט|מחיר|סכום|\n|---|---|---|---|";
+        assert_eq!(restore_rtl_reading_order(visual), expected);
+    }
+
+    #[test]
+    fn rtl_leaves_signal_free_text_alone() {
+        // Not one final form in this row, so the ordering is genuinely
+        // undecidable — leaving it as-is beats a coin flip that scrambles it.
+        let row = "|תומכ|ריחמ|";
+        assert_eq!(restore_rtl_reading_order(row), row);
+    }
+
+    #[test]
+    fn rtl_can_be_disabled() {
+        let visual = "םלוע םולש".to_string();
+        let options = MarkdownOptions {
+            fix_rtl_order: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            clean_markdown(visual.clone(), &options),
+            format!("{visual}\n")
+        );
+    }
+
+    #[test]
+    fn rtl_runs_through_clean_markdown_by_default() {
+        let visual = "םלוע םולש".to_string();
+        let result = clean_markdown(visual, &MarkdownOptions::default());
+        assert_eq!(result, "שלום עולם\n");
+    }
+
+    #[test]
+    fn rtl_never_reverses_arabic_twice() {
+        // Hebrew supplies the document-level signal; the Arabic line was
+        // already restored per item during extraction and must be left alone.
+        let doc = "םלוע םולש\n\n\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}";
+        let out = restore_rtl_reading_order(doc);
+        assert_eq!(out.lines().next().unwrap(), "שלום עולם");
+        assert_eq!(
+            out.lines().last().unwrap(),
+            "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"
+        );
+    }
+
+    #[test]
+    fn rtl_keeps_inline_markup_intact() {
+        let doc = "םלוע םולש\n\n<u>םלוע םולש</u>";
+        let out = restore_rtl_reading_order(doc);
+        assert_eq!(out.lines().last().unwrap(), "<u>שלום עולם</u>");
+    }
+
+    #[test]
+    fn rtl_keeps_emphasis_intact() {
+        let doc = "םלוע םולש\n\n**םלוע םולש**";
+        let out = restore_rtl_reading_order(doc);
+        assert_eq!(out.lines().last().unwrap(), "**שלום עולם**");
     }
 }

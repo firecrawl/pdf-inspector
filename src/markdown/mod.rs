@@ -1061,6 +1061,8 @@ pub struct MarkdownOptions {
     pub include_page_numbers: bool,
     /// Strip repeated headers/footers that appear on many pages
     pub strip_headers_footers: bool,
+    /// Restore logical reading order for Hebrew stored in visual order
+    pub fix_rtl_order: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -1090,6 +1092,9 @@ impl Default for MarkdownOptions {
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,
+            // On by default: visual-order Hebrew is unreadable and silently
+            // wrong, and the detector is a no-op on every other document.
+            fix_rtl_order: true,
         }
     }
 }

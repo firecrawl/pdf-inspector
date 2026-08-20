@@ -124,6 +124,67 @@ fn is_arabic_presentation_form(c: char) -> bool {
     matches!(c, '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFE}')
 }
 
+pub(crate) fn is_hebrew_letter(c: char) -> bool {
+    matches!(c, '\u{05D0}'..='\u{05EA}')
+}
+
+/// Arabic in any of its forms, including the presentation forms that mark
+/// visual-order storage.
+pub(crate) fn is_arabic_char(c: char) -> bool {
+    matches!(c,
+        '\u{0600}'..='\u{06FF}'   // Arabic
+        | '\u{0750}'..='\u{077F}' // Arabic Supplement
+        | '\u{08A0}'..='\u{08FF}' // Arabic Extended-A
+        | '\u{FB50}'..='\u{FDFF}' // Presentation Forms-A
+        | '\u{FE70}'..='\u{FEFE}' // Presentation Forms-B
+    )
+}
+
+/// Hebrew final forms (ך ם ן ף ץ), which are legal only as a word's last letter.
+fn is_hebrew_final_form(c: char) -> bool {
+    matches!(
+        c,
+        '\u{05DA}' | '\u{05DD}' | '\u{05DF}' | '\u{05E3}' | '\u{05E5}'
+    )
+}
+
+/// Detect Hebrew stored in visual (screen) order rather than logical order.
+///
+/// Arabic announces visual-order storage through presentation forms, so
+/// [`expand_ligatures`] can key off those per text item. Hebrew has no such
+/// marker — the same base codepoints (U+05D0-05EA) appear in both orderings —
+/// so the ordering has to be inferred from word shape instead.
+///
+/// The signal is Hebrew's five final forms: they may only end a word. When a
+/// producer lays glyphs out visually, extraction walks each word backwards and
+/// those letters surface at the *start* of words. Counting which end they land
+/// on separates the two orderings without a dictionary. Ties (including text
+/// with no final forms at all) report `false` so that ambiguous input is left
+/// untouched rather than scrambled.
+///
+/// Intended for whole-document text: a single word rarely carries enough
+/// signal, and a per-fragment decision would flip part of a page and not
+/// the rest.
+pub(crate) fn is_visual_order_hebrew(text: &str) -> bool {
+    let (mut at_start, mut at_end) = (0u32, 0u32);
+
+    for word in text.split(|c: char| !is_hebrew_letter(c)) {
+        let mut chars = word.chars();
+        let Some(first) = chars.next() else { continue };
+        let Some(last) = chars.next_back() else {
+            continue; // single-letter word: same char at both ends, no signal
+        };
+        if is_hebrew_final_form(first) {
+            at_start += 1;
+        }
+        if is_hebrew_final_form(last) {
+            at_end += 1;
+        }
+    }
+
+    at_start > at_end
+}
+
 pub(crate) fn is_rtl_text<I, S>(texts: I) -> bool
 where
     I: Iterator<Item = S>,
@@ -253,18 +314,21 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
     // visual (LTR screen) order. After NFKC normalization, reverse to restore
     // logical reading order.
     if had_presentation_forms {
-        result = reverse_visual_arabic(&result);
+        result = reverse_visual_rtl(&result);
     }
 
     result
 }
 
-/// Reverse visual-order Arabic text to logical order.
+/// Reverse visual-order RTL text to logical order.
 ///
 /// Pure RTL text (no ASCII alphanumerics) gets a simple character reversal.
 /// Mixed content (embedded numbers or Latin words) splits into LTR and non-LTR
 /// runs: run order is reversed, and only non-LTR runs are reversed internally.
-fn reverse_visual_arabic(text: &str) -> String {
+///
+/// Script-agnostic: used for Arabic (triggered per text item by presentation
+/// forms) and for Hebrew (triggered per document by [`is_visual_order_hebrew`]).
+pub(crate) fn reverse_visual_rtl(text: &str) -> String {
     // Check if there are any LTR runs (ASCII letters or digits)
     let has_ltr = text.chars().any(|c| c.is_ascii_alphanumeric());
 
@@ -928,21 +992,63 @@ mod tests {
     }
 
     #[test]
-    fn reverse_visual_arabic_pure_rtl() {
+    fn hebrew_visual_order_detected() {
+        // "שלום עולם" laid out visually: the final ם opens each word.
+        assert!(is_visual_order_hebrew("םלוע םולש"));
+        assert!(is_visual_order_hebrew("םלוע םולש הז טסקט הקידבל"));
+    }
+
+    #[test]
+    fn hebrew_logical_order_left_alone() {
+        // Same strings the right way round — final forms close their words.
+        assert!(!is_visual_order_hebrew("שלום עולם"));
+        assert!(!is_visual_order_hebrew("שלום עולם זה טקסט לבדיקה"));
+        assert!(!is_visual_order_hebrew(
+            "חשבונית מס 12345 | סך הכל לתשלום 100.00"
+        ));
+    }
+
+    #[test]
+    fn hebrew_without_final_forms_is_ambiguous() {
+        // No final form anywhere: no signal either way, so report logical and
+        // leave the text untouched rather than guess.
+        assert!(!is_visual_order_hebrew("תודה רבה"));
+        assert!(!is_visual_order_hebrew("הבר הדות"));
+    }
+
+    #[test]
+    fn non_hebrew_never_reports_visual() {
+        assert!(!is_visual_order_hebrew("Hello World 1234"));
+        assert!(!is_visual_order_hebrew(
+            "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"
+        )); // مرحبا
+        assert!(!is_visual_order_hebrew(""));
+    }
+
+    #[test]
+    fn hebrew_reversal_round_trips() {
+        let logical = "שלום עולם";
+        let visual: String = logical.chars().rev().collect();
+        assert!(is_visual_order_hebrew(&visual));
+        assert_eq!(reverse_visual_rtl(&visual), logical);
+    }
+
+    #[test]
+    fn reverse_visual_rtl_pure_rtl() {
         // Pure RTL: simple reversal
         let input = "\u{0628}\u{0627}"; // ba (visual order)
-        let result = reverse_visual_arabic(input);
+        let result = reverse_visual_rtl(input);
         assert_eq!(result, "\u{0627}\u{0628}"); // ab (logical order)
     }
 
     #[test]
-    fn reverse_visual_arabic_with_ltr_run() {
+    fn reverse_visual_rtl_with_ltr_run() {
         // Mixed: Arabic + embedded number "123" + Arabic
         // Visual order: أ 123 ب  → runs: [أ], [123], [ب]
         // Reversed runs: [ب], [123], [أ]
         // Non-LTR reversed internally: ب, 123, أ
         let input = "\u{0623}123\u{0628}";
-        let result = reverse_visual_arabic(input);
+        let result = reverse_visual_rtl(input);
         assert_eq!(result, "\u{0628}123\u{0623}");
     }
 
