@@ -1033,14 +1033,14 @@ fn detect_table_in_region(
         for col_items in row_items.iter_mut() {
             // Sort by X position (direction-aware). RTL direction comes from
             // strong RTL letters only — a digit-only cell split across items
-            // must not have its number reversed. RTL cells sort by baseline
-            // first so the by-baseline LTR restoration sees contiguous lines
-            // (matching the rect and structure-tree detectors).
+            // must not have its number reversed. RTL cells sort in baseline
+            // bands so wrapped lines stay contiguous for the embedded-LTR
+            // restoration (matching the rect and structure-tree detectors).
             let rtl = crate::text_utils::is_strong_rtl_text(col_items.iter().map(|i| &i.text));
             if rtl {
-                col_items.sort_by(|a, b| b.y.total_cmp(&a.y).then(b.x.total_cmp(&a.x)));
-                crate::text_utils::restore_embedded_ltr_runs_by_baseline(
+                crate::text_utils::sort_rtl_cell_items(
                     col_items,
+                    |i| i.x,
                     |i| i.y,
                     |i| i.text.as_str(),
                 );

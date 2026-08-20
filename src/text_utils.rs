@@ -143,9 +143,10 @@ where
 }
 
 /// Like `is_rtl_text`, but only strong (letter) RTL characters count.
-/// Arabic-Indic digits and numeric separators sit in the Arabic block yet are
-/// direction-neutral: a digit-only cell must keep left-to-right order, so it
-/// carries no RTL evidence here.
+/// Arabic-Indic digits, numeric separators, and combining marks sit in the
+/// RTL blocks yet carry no base direction of their own: a digit-only cell
+/// must keep left-to-right order, and vowel points must not out-vote the
+/// letters of a mixed-script cell.
 pub(crate) fn is_strong_rtl_text<I, S>(texts: I) -> bool
 where
     I: Iterator<Item = S>,
@@ -154,7 +155,7 @@ where
     let (mut rtl, mut ltr) = (0u32, 0u32);
     for t in texts {
         for c in t.as_ref().chars() {
-            if is_rtl_char(c) && !is_arabic_indic_digit(c) && !is_arabic_numeric_separator(c) {
+            if is_rtl_char(c) && c.is_alphabetic() {
                 rtl += 1;
             } else if c.is_alphabetic() && !is_cjk_char(c) {
                 ltr += 1;
@@ -162,6 +163,31 @@ where
         }
     }
     rtl > 0 && rtl > ltr
+}
+
+/// Sort a table cell's items into RTL reading order: baseline bands (2pt
+/// tolerance) run top-to-bottom, items within a band run right-to-left with
+/// embedded LTR phrases restored to screen order. Band-aware sorting keeps
+/// sub/superscript baseline jitter from breaking a line's X order, which a
+/// plain Y-then-X comparator would (`total_cmp` ties only on identical Y).
+pub(crate) fn sort_rtl_cell_items<T>(
+    items: &mut [T],
+    x_of: impl Fn(&T) -> f32,
+    y_of: impl Fn(&T) -> f32,
+    text_of: impl Fn(&T) -> &str,
+) {
+    items.sort_by(|a, b| y_of(b).total_cmp(&y_of(a)));
+    let mut start = 0;
+    while start < items.len() {
+        let y0 = y_of(&items[start]);
+        let mut end = start + 1;
+        while end < items.len() && (y_of(&items[end]) - y0).abs() <= 2.0 {
+            end += 1;
+        }
+        items[start..end].sort_by(|a, b| x_of(b).total_cmp(&x_of(a)));
+        restore_embedded_ltr_runs(&mut items[start..end], &text_of);
+        start = end;
+    }
 }
 
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
@@ -211,27 +237,6 @@ pub(crate) fn restore_embedded_ltr_runs<T>(items: &mut [T], text_of: impl Fn(&T)
             }
         }
         i = j;
-    }
-}
-
-/// Apply `restore_embedded_ltr_runs` within each stretch of consecutive
-/// same-baseline items (2pt tolerance), for item runs that may span wrapped
-/// lines — table cells, merged line groups. LTR fragments from different
-/// visual lines must never be reordered together.
-pub(crate) fn restore_embedded_ltr_runs_by_baseline<T>(
-    items: &mut [T],
-    y_of: impl Fn(&T) -> f32,
-    text_of: impl Fn(&T) -> &str,
-) {
-    let mut start = 0;
-    while start < items.len() {
-        let y0 = y_of(&items[start]);
-        let mut end = start + 1;
-        while end < items.len() && (y_of(&items[end]) - y0).abs() <= 2.0 {
-            end += 1;
-        }
-        restore_embedded_ltr_runs(&mut items[start..end], &text_of);
-        start = end;
     }
 }
 
@@ -1222,6 +1227,11 @@ mod tests {
         assert!(is_strong_rtl_text(
             ["\u{05E9}\u{05DC}\u{05D5}\u{05DD}"].iter()
         ));
+        // Combining marks carry no base direction: one pointed Hebrew letter
+        // must not out-vote a longer Latin word in a mixed cell
+        assert!(!is_strong_rtl_text(
+            ["Table", "\u{05D1}\u{05B8}\u{05C1}\u{0591}"].iter()
+        ));
     }
 
     #[test]
@@ -1366,19 +1376,30 @@ mod tests {
     }
 
     #[test]
-    fn restore_embedded_ltr_runs_by_baseline_respects_lines() {
-        // Two wrapped lines of an RTL cell, each ending with an LTR fragment.
-        // The fragments sit adjacent in the flattened order but belong to
-        // different visual lines — they must not be reordered together.
+    fn sort_rtl_cell_items_respects_lines_and_jitter() {
+        // Two wrapped lines of an RTL cell; the second line's items carry
+        // sub/superscript baseline jitter (within the 2pt band). Lines must
+        // stay separate top-to-bottom, each line must read right-to-left
+        // despite the jitter, and LTR fragments from different visual lines
+        // must never be reordered together.
         let mut items = vec![
-            (700.0f32, "\u{05E9}\u{05DC}".to_string()),
-            (700.0f32, "AB".to_string()),
-            (688.0f32, "CD".to_string()),
-            (688.0f32, "\u{05D5}\u{05DD}".to_string()),
+            (100.0f32, 688.0f32, "\u{05D5}\u{05DD}".to_string()),
+            (160.0f32, 688.9f32, "CD".to_string()),
+            (100.0f32, 700.0f32, "AB".to_string()),
+            (160.0f32, 700.0f32, "\u{05E9}\u{05DC}".to_string()),
         ];
-        restore_embedded_ltr_runs_by_baseline(&mut items, |(y, _)| *y, |(_, t)| t.as_str());
-        assert_eq!(items[1].1, "AB");
-        assert_eq!(items[2].1, "CD");
+        sort_rtl_cell_items(
+            &mut items,
+            |(x, _, _)| *x,
+            |(_, y, _)| *y,
+            |(_, _, t)| t.as_str(),
+        );
+        let texts: Vec<&str> = items.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["\u{05E9}\u{05DC}", "AB", "CD", "\u{05D5}\u{05DD}"],
+            "line 1 right-to-left, then line 2 right-to-left"
+        );
     }
 
     #[test]

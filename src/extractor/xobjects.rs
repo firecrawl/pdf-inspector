@@ -840,9 +840,10 @@ fn extract_form_xobject_text_inner(
                             // stay neutral unless the advance is x-dominant.
                             let scale_y = text_matrix[0] * ctm[1] + text_matrix[1] * ctm[3];
                             let horizontal_advance = scale_x.abs() > scale_y.abs();
-                            // The op-wide backtrack marker votes once per op,
-                            // not once per sub-run.
-                            let mut op_logical_voted = false;
+                            // The op-wide backtrack marker votes once per op —
+                            // per-sub-run geometry (mirrored matrices) still
+                            // votes per sub-run, symmetric with candidates.
+                            let mut op_backtrack_voted = false;
                             for (text, start_w, end_w) in &sub_items {
                                 let offset_tm = [
                                     text_matrix[0],
@@ -862,11 +863,15 @@ fn extract_form_xobject_text_inner(
                                 if horizontal_advance
                                     && crate::text_utils::is_visual_rtl_candidate(text)
                                 {
-                                    if scale_x > 0.0 && !backward_jump {
-                                        rtl_visual_candidates.push(items.len());
-                                    } else if !op_logical_voted {
+                                    if scale_x < 0.0 {
                                         *rtl_logical_ops += 1;
-                                        op_logical_voted = true;
+                                    } else if backward_jump {
+                                        if !op_backtrack_voted {
+                                            *rtl_logical_ops += 1;
+                                            op_backtrack_voted = true;
+                                        }
+                                    } else {
+                                        rtl_visual_candidates.push(items.len());
                                     }
                                 }
                                 items.push(TextItem {

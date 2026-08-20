@@ -1718,27 +1718,28 @@ pub(crate) fn assign_items_to_grid(
         let mut row_cells = Vec::with_capacity(num_cols);
         for col_items in row_items.iter_mut() {
             // Direction from strong RTL letters only — a digit-only cell
-            // split across items must not have its number reversed.
+            // split across items must not have its number reversed. RTL cells
+            // sort right-to-left in baseline bands with embedded LTR phrases
+            // kept in screen order.
             let rtl = crate::text_utils::is_strong_rtl_text(col_items.iter().map(|(_, i)| &i.text));
-            col_items.sort_by(|a, b| {
-                b.1.y
-                    .partial_cmp(&a.1.y)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| {
-                        let (first, second) = if rtl { (b, a) } else { (a, b) };
-                        first
-                            .1
-                            .x
-                            .partial_cmp(&second.1.x)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-            });
             if rtl {
-                crate::text_utils::restore_embedded_ltr_runs_by_baseline(
+                crate::text_utils::sort_rtl_cell_items(
                     col_items,
+                    |(_, i)| i.x,
                     |(_, i)| i.y,
                     |(_, i)| i.text.as_str(),
                 );
+            } else {
+                col_items.sort_by(|a, b| {
+                    b.1.y
+                        .partial_cmp(&a.1.y)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            a.1.x
+                                .partial_cmp(&b.1.x)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                });
             }
             let text = col_items
                 .iter()
