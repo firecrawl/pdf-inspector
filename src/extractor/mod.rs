@@ -2866,6 +2866,12 @@ mod tests {
         ));
         // Arabic letters with combining marks (NSM) → still RTL
         assert!(is_rtl_text(["\u{0645}\u{064E}\u{0631}\u{064D}"].iter()));
+        // Combining marks alone are NSM, not strong RTL, even though they are
+        // Other_Alphabetic: harakat-only and niqqud-only lines stay neutral
+        assert!(!is_rtl_text(["\u{064E}\u{064F}\u{0650}\u{0651}"].iter()));
+        assert!(!is_rtl_text(["\u{05B8}\u{05B4}\u{05BC}"].iter()));
+        // Marks + Arabic-Indic digits (the full weak-only mix) → still neutral
+        assert!(!is_rtl_text(["\u{0661}\u{064E}\u{0662}"].iter()));
     }
 
     #[test]
