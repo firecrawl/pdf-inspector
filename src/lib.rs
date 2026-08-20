@@ -3976,7 +3976,7 @@ fn find_recoverable_xref_table_start(buf: &[u8]) -> Option<usize> {
         let search_end = next_newer_table_pos;
         if newest.is_none() {
             newest = Some(pos);
-            newest_has_prev = xref_trailer_has_key_before(buf, pos, search_end, b"Prev");
+            newest_has_prev = xref_trailer_prev_points_backwards(buf, pos, search_end);
         } else if xref_trailer_has_key_before(buf, pos, search_end, b"Root") {
             return if newest_has_prev { newest } else { Some(pos) };
         }
@@ -3994,17 +3994,31 @@ fn xref_trailer_has_root(buf: &[u8], xref_pos: usize) -> bool {
 }
 
 fn xref_trailer_has_key_before(buf: &[u8], xref_pos: usize, search_end: usize, key: &[u8]) -> bool {
-    let Some(trailer_pos) = find_standalone_keyword(buf, xref_pos, search_end, b"trailer") else {
-        return false;
-    };
+    xref_trailer_top_level_token_before(buf, xref_pos, search_end, key).is_some()
+}
+
+fn xref_trailer_prev_points_backwards(buf: &[u8], xref_pos: usize, search_end: usize) -> bool {
+    xref_trailer_top_level_token_before(buf, xref_pos, search_end, b"Prev")
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|offset| offset < u64::try_from(xref_pos).unwrap_or(u64::MAX))
+}
+
+fn xref_trailer_top_level_token_before<'a>(
+    buf: &'a [u8],
+    xref_pos: usize,
+    search_end: usize,
+    key: &[u8],
+) -> Option<&'a [u8]> {
+    let trailer_pos = find_standalone_keyword(buf, xref_pos, search_end, b"trailer")?;
 
     let mut pos = trailer_pos + b"trailer".len();
     if pos >= search_end {
-        return false;
+        return None;
     }
     skip_pdf_whitespace_and_comments(buf, &mut pos, search_end);
 
-    pdf_dictionary_has_top_level_key(buf, pos, search_end, key)
+    pdf_dictionary_top_level_value_token(buf, pos, search_end, key)
 }
 
 fn skip_pdf_whitespace_and_comments(buf: &[u8], pos: &mut usize, end: usize) {
@@ -4029,19 +4043,24 @@ fn is_pdf_regular(byte: u8) -> bool {
         )
 }
 
-fn pdf_dictionary_has_top_level_key(buf: &[u8], mut pos: usize, end: usize, key: &[u8]) -> bool {
+fn pdf_dictionary_top_level_value_token<'a>(
+    buf: &'a [u8],
+    mut pos: usize,
+    end: usize,
+    key: &[u8],
+) -> Option<&'a [u8]> {
     if !buf[pos..end].starts_with(b"<<") {
-        return false;
+        return None;
     }
     pos += 2;
 
     loop {
         skip_pdf_whitespace_and_comments(buf, &mut pos, end);
         if pos >= end || buf[pos..end].starts_with(b">>") {
-            return false;
+            return None;
         }
         if buf.get(pos) != Some(&b'/') {
-            return false;
+            return None;
         }
         pos += 1;
         let name_start = pos;
@@ -4049,15 +4068,23 @@ fn pdf_dictionary_has_top_level_key(buf: &[u8], mut pos: usize, end: usize, key:
             pos += 1;
         }
         if &buf[name_start..pos] == key {
-            return true;
+            skip_pdf_whitespace_and_comments(buf, &mut pos, end);
+            if pos >= end || !is_pdf_regular(buf[pos]) {
+                return None;
+            }
+            let value_start = pos;
+            while pos < end && is_pdf_regular(buf[pos]) {
+                pos += 1;
+            }
+            return Some(&buf[value_start..pos]);
         }
 
         skip_pdf_whitespace_and_comments(buf, &mut pos, end);
         if pos >= end || buf[pos..end].starts_with(b">>") {
-            return false;
+            return None;
         }
         if !skip_pdf_dictionary_value(buf, &mut pos, end, 0) {
-            return false;
+            return None;
         }
     }
 }
@@ -7863,8 +7890,7 @@ mod tests {
         let mut amended = older.to_vec();
         amended.extend_from_slice(
             format!(
-                "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 2 /Prev {} >>\nstartxref\n0\n%%EOF",
-                older.len()
+                "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 2 /Prev 0 >>\nstartxref\n0\n%%EOF"
             )
             .as_bytes(),
         );
@@ -7873,6 +7899,21 @@ mod tests {
             find_recoverable_xref_table_start(&amended),
             Some(older.len()),
             "a rootless amended trailer with /Prev must keep its newest revisions reachable"
+        );
+    }
+
+    #[test]
+    fn recover_rejects_rootless_xref_whose_prev_points_forward() {
+        let older = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
+        let mut malformed = older.to_vec();
+        malformed.extend_from_slice(
+            b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 2 /Prev 999999 >>\nstartxref\n0\n%%EOF",
+        );
+
+        assert_eq!(
+            find_recoverable_xref_table_start(&malformed),
+            Some(0),
+            "a forward /Prev value is not a chain to the older root-bearing table"
         );
     }
 
