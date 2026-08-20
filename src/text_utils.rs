@@ -155,13 +155,14 @@ where
     let (mut rtl, mut ltr) = (0u32, 0u32);
     for t in texts {
         for c in t.as_ref().chars() {
-            // is_alphabetic alone is not enough: Unicode gives nikud and
-            // harakat the Other_Alphabetic property, so combining marks must
-            // be excluded explicitly (ccc != 0).
-            if is_rtl_char(c)
-                && c.is_alphabetic()
-                && unicode_normalization::char::canonical_combining_class(c) == 0
-            {
+            // Combining marks count toward NEITHER side: Unicode gives nikud
+            // and harakat the Other_Alphabetic property, so is_alphabetic
+            // alone would tally them — as RTL they'd out-vote Latin, as LTR
+            // they'd out-vote a vocalized RTL cell's own letters.
+            if unicode_normalization::char::canonical_combining_class(c) != 0 {
+                continue;
+            }
+            if is_rtl_char(c) && c.is_alphabetic() {
                 rtl += 1;
             } else if c.is_alphabetic() && !is_cjk_char(c) {
                 ltr += 1;
@@ -218,20 +219,35 @@ pub(crate) fn sort_line_items(items: &mut [TextItem]) {
 pub(crate) fn restore_embedded_ltr_runs<T>(items: &mut [T], text_of: impl Fn(&T) -> &str) {
     // An Arabic-Indic number split across items reads left-to-right even
     // though its digits live in the RTL blocks: rejoin maximal runs of
-    // ADJACENT digit-only items in screen order. They deliberately stay out
-    // of the Latin-phrase grouping below — the brackets and operators around
-    // an Arabic number belong to the surrounding RTL flow, unlike a Latin
-    // phrase's own brackets.
+    // ADJACENT digit items in screen order, bridging decimal/thousands
+    // delimiters — Arabic or ASCII — that sit inside or between the pieces.
+    // These runs deliberately stay out of the Latin-phrase grouping below:
+    // the brackets and operators around an Arabic number belong to the
+    // surrounding RTL flow, unlike a Latin phrase's own brackets.
+    let is_numeric_sep = |c: char| is_arabic_numeric_separator(c) || matches!(c, '.' | ',');
     let is_arabic_number_item = |t: &T| {
         let mut has_digit = false;
         for c in text_of(t).chars() {
             if is_arabic_indic_digit(c) {
                 has_digit = true;
-            } else if !is_arabic_numeric_separator(c) && !c.is_whitespace() {
+            } else if !is_numeric_sep(c) && !c.is_whitespace() {
                 return false;
             }
         }
         has_digit
+    };
+    // A delimiter emitted as its own item joins the number only when digit
+    // pieces flank it — a lone sentence period stays in the RTL flow.
+    let is_number_delim_item = |t: &T| {
+        let mut has_sep = false;
+        for c in text_of(t).chars() {
+            if is_numeric_sep(c) {
+                has_sep = true;
+            } else if !c.is_whitespace() {
+                return false;
+            }
+        }
+        has_sep
     };
     let mut i = 0;
     while i < items.len() {
@@ -240,8 +256,17 @@ pub(crate) fn restore_embedded_ltr_runs<T>(items: &mut [T], text_of: impl Fn(&T)
             continue;
         }
         let mut j = i + 1;
-        while j < items.len() && is_arabic_number_item(&items[j]) {
-            j += 1;
+        while j < items.len() {
+            if is_arabic_number_item(&items[j]) {
+                j += 1;
+            } else if is_number_delim_item(&items[j])
+                && j + 1 < items.len()
+                && is_arabic_number_item(&items[j + 1])
+            {
+                j += 2;
+            } else {
+                break;
+            }
         }
         if j - i >= 2 {
             items[i..j].reverse();
@@ -1273,6 +1298,11 @@ mod tests {
         assert!(!is_strong_rtl_text(
             ["AB", "\u{05D1}\u{05B8}\u{05B8}\u{05B8}\u{05B8}"].iter()
         ));
+        // ...and marks must not count as LTR either: a vocalized RTL cell
+        // (3 letters, 3 points) still out-votes a short Latin item
+        assert!(is_strong_rtl_text(
+            ["\u{05E9}\u{05B8}\u{05DC}\u{05B8}\u{05DD}\u{05B8}", "ab"].iter()
+        ));
     }
 
     #[test]
@@ -1416,6 +1446,30 @@ mod tests {
         restore_embedded_ltr_runs(&mut items, |s| s.as_str());
         assert_eq!(items[1], "\u{0662}");
         assert_eq!(items[2], "\u{0664}");
+    }
+
+    #[test]
+    fn restore_embedded_ltr_runs_bridges_number_delimiters() {
+        // "٢٤.٥" split around an ASCII decimal point: descending-X order is
+        // [٥][.][٢٤]; the delimiter is flanked by digit pieces, so the whole
+        // number rejoins in screen order.
+        let mut items = vec![
+            "\u{0665}".to_string(),
+            ".".to_string(),
+            "\u{0662}\u{0664}".to_string(),
+        ];
+        restore_embedded_ltr_runs(&mut items, |s| s.as_str());
+        assert_eq!(items, ["\u{0662}\u{0664}", ".", "\u{0665}"]);
+
+        // A lone period NOT flanked by a digit piece stays in the RTL flow
+        let mut items = vec![
+            "\u{0662}\u{0664}".to_string(),
+            ".".to_string(),
+            "\u{0645}\u{0631}".to_string(),
+        ];
+        restore_embedded_ltr_runs(&mut items, |s| s.as_str());
+        assert_eq!(items[0], "\u{0662}\u{0664}");
+        assert_eq!(items[1], ".");
     }
 
     #[test]
