@@ -1494,7 +1494,7 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
         let section_numbered = |title: &str| {
             let mut words = title.split_whitespace();
             let first = words.next().unwrap_or("");
-            let leading_ordinal = first.len() <= 3
+            let leading_ordinal = first.len() <= 4
                 && first.ends_with(['.', ')'])
                 && !first[..first.len() - 1].is_empty()
                 && first[..first.len() - 1].chars().all(|c| c.is_ascii_digit());

@@ -593,9 +593,21 @@ pub(crate) fn correct_base_size(lines: &[TextLine], base_size: f32) -> f32 {
             // even many of them — are short, so a heading-dense page
             // never accumulates wordy lines at the promoted size. Narrow
             // columns wrap body text to few words per physical line, so
-            // character mass counts as well.
+            // character mass also counts — but only for lines whose words
+            // mostly start lowercase (running prose); long Title Case or
+            // ALL-CAPS headings stay heading evidence.
             let trimmed = text.trim();
-            if trimmed.split_whitespace().count() >= 6 || trimmed.chars().count() >= 30 {
+            let words: Vec<&str> = trimmed.split_whitespace().collect();
+            let lowercase_words = words
+                .iter()
+                .filter(|w| {
+                    w.chars()
+                        .find(|c| c.is_alphabetic())
+                        .is_some_and(|c| c.is_lowercase())
+                })
+                .count();
+            let prose_shaped = trimmed.chars().count() >= 30 && lowercase_words * 2 >= words.len();
+            if words.len() >= 6 || prose_shaped {
                 *promoted_wordy.entry(key).or_insert(0) += 1;
             }
         }
