@@ -598,15 +598,18 @@ pub(crate) fn correct_base_size(lines: &[TextLine], base_size: f32) -> f32 {
             // ALL-CAPS headings stay heading evidence.
             let trimmed = text.trim();
             let words: Vec<&str> = trimmed.split_whitespace().collect();
-            let lowercase_words = words
+            // "Not uppercase" rather than "lowercase" so uncased scripts
+            // (CJK, etc.) count as prose-shaped too; Title Case and
+            // ALL-CAPS headings still fail the test.
+            let prose_words = words
                 .iter()
                 .filter(|w| {
                     w.chars()
                         .find(|c| c.is_alphabetic())
-                        .is_some_and(|c| c.is_lowercase())
+                        .is_some_and(|c| !c.is_uppercase())
                 })
                 .count();
-            let prose_shaped = trimmed.chars().count() >= 30 && lowercase_words * 2 >= words.len();
+            let prose_shaped = trimmed.chars().count() >= 30 && prose_words * 2 >= words.len();
             if words.len() >= 6 || prose_shaped {
                 *promoted_wordy.entry(key).or_insert(0) += 1;
             }
