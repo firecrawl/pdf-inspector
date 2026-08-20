@@ -75,7 +75,19 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
             continue;
         };
 
+        // Leader dots glued to the page number ("..19") still read as a
+        // page cell; the dots are the leader, not the value.
         let last_cell = trimmed[last_idx];
+        let last_cell = if last_cell.starts_with('.') || last_cell.starts_with('\u{2026}') {
+            let stripped = last_cell.trim_start_matches(['.', '\u{2026}', ' ']);
+            if !stripped.is_empty() && is_page_number_cell(stripped) {
+                stripped
+            } else {
+                last_cell
+            }
+        } else {
+            last_cell
+        };
         let last_is_page = is_page_number_cell(last_cell);
 
         let (title_cells, trailing) = if last_is_page && last_idx > 0 {

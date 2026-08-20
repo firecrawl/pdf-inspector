@@ -1345,8 +1345,10 @@ pub(crate) fn extract_text_from_operand(
             // Fallback: try UTF-16BE then Latin-1
             if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
                 let utf16: Vec<u16> = bytes[2..]
-                    .chunks_exact(2)
-                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| u16::from_be_bytes(*chunk))
                     .collect();
                 let text = String::from_utf16_lossy(&utf16);
                 if text.contains('\u{FFFD}') {
@@ -1364,8 +1366,10 @@ pub(crate) fn extract_text_from_operand(
                 let nulls = bytes.iter().filter(|&&b| b == 0).count();
                 if nulls * 4 > bytes.len() {
                     let utf16: Vec<u16> = bytes
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|chunk| u16::from_be_bytes(*chunk))
                         .collect();
                     let text = String::from_utf16_lossy(&utf16);
                     if score_text(&text) > 0 {

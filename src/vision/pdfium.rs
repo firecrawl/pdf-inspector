@@ -398,7 +398,7 @@ fn bgr_to_rgb_in_place(
     }
 
     for row in pixels.chunks_exact_mut(stride) {
-        for pixel in row[..row_bytes].chunks_exact_mut(3) {
+        for pixel in row[..row_bytes].as_chunks_mut::<3>().0 {
             pixel.swap(0, 2);
         }
     }

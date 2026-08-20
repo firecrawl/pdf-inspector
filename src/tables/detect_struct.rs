@@ -123,9 +123,7 @@ fn align_positions_to_columns(cell_xs: &[f32], columns: &[f32]) -> Vec<usize> {
     let mut dp = vec![vec![f32::INFINITY; columns.len() + 1]; cell_xs.len() + 1];
     let mut take = vec![vec![false; columns.len() + 1]; cell_xs.len() + 1];
 
-    for value in &mut dp[0] {
-        *value = 0.0;
-    }
+    dp[0].fill(0.0);
 
     for i in 1..=cell_xs.len() {
         for j in 1..=columns.len() {

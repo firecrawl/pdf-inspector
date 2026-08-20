@@ -560,6 +560,91 @@ pub(crate) fn compute_paragraph_threshold(lines: &[TextLine], base_size: f32) ->
 /// Discover distinct heading font-size tiers in the document.
 /// Returns tiers sorted largest-first (tier 0 = H1, tier 1 = H2, …).
 /// Sizes within 0.5pt are clustered into the same tier. Capped at 4 tiers.
+/// Correct a misestimated base font size. The provided base — including a
+/// `MarkdownOptions::base_font_size` value, which internal callers always
+/// derive from document-wide font statistics — is treated as a prior and
+/// only overridden by overwhelming page-local evidence. Item-count font
+/// stats let
+/// footnotes, captions, and folio text outvote the body on some pages;
+/// the tell is an implausible share of text lines clearing the 1.2x
+/// heading gate (real documents are mostly body text). When at least a
+/// third of the text lines would be "headings", the dominant promoted
+/// size IS the body — adopt it as the base.
+pub(crate) fn correct_base_size(lines: &[TextLine], base_size: f32) -> f32 {
+    let mut text_lines = 0usize;
+    let mut promoted: HashMap<i32, usize> = HashMap::new();
+    let mut promoted_wordy: HashMap<i32, usize> = HashMap::new();
+    for line in lines {
+        let text = line.text();
+        if text.trim().chars().filter(|c| c.is_alphabetic()).count() < 3 {
+            continue;
+        }
+        // Judge the line by its character-weighted dominant size (the same
+        // routine heading tiering uses): a small section-number or bullet
+        // prefix must not decide the line's size.
+        let Some(dominant_size) = super::heading::dominant_font_size(line) else {
+            continue;
+        };
+        text_lines += 1;
+        if dominant_size / base_size >= 1.2 {
+            let key = (dominant_size * 10.0).round() as i32;
+            *promoted.entry(key).or_insert(0) += 1;
+            // Body-style evidence: real body lines run long. Headings —
+            // even many of them — are short, so a heading-dense page
+            // never accumulates wordy lines at the promoted size. Narrow
+            // columns wrap body text to few words per physical line, so
+            // character mass also counts — but only for lines whose words
+            // mostly start lowercase (running prose); long Title Case or
+            // ALL-CAPS headings stay heading evidence.
+            let trimmed = text.trim();
+            let words: Vec<&str> = trimmed.split_whitespace().collect();
+            // "Not uppercase" rather than "lowercase" so uncased scripts
+            // (CJK, etc.) count as prose-shaped too; Title Case and
+            // ALL-CAPS headings still fail the test.
+            let prose_words = words
+                .iter()
+                .filter(|w| {
+                    w.chars()
+                        .find(|c| c.is_alphabetic())
+                        .is_some_and(|c| !c.is_uppercase())
+                })
+                .count();
+            let prose_shaped = trimmed.chars().count() >= 30 && prose_words * 2 >= words.len();
+            if words.len() >= 6 || prose_shaped {
+                *promoted_wordy.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    let promoted_total: usize = promoted.values().sum();
+    if text_lines < 8 || promoted_total * 3 < text_lines {
+        return base_size;
+    }
+    let corrected = promoted
+        .iter()
+        .max_by(|(size_a, count_a), (size_b, count_b)| {
+            count_a.cmp(count_b).then_with(|| size_b.cmp(size_a))
+        })
+        .map(|(size, _)| *size as f32 / 10.0)
+        .unwrap_or(base_size);
+    // Only adopt the new base when the promoted lines at that size mostly
+    // read like body text (long lines). A genuinely heading-dense page
+    // keeps its structure.
+    let key = (corrected * 10.0).round() as i32;
+    let wordy = promoted_wordy.get(&key).copied().unwrap_or(0);
+    let at_size = promoted.get(&key).copied().unwrap_or(0);
+    if wordy * 2 < at_size {
+        return base_size;
+    }
+    log::debug!(
+        "correct_base_size: {}/{} text lines clear the heading gate — base {} -> {}",
+        promoted_total,
+        text_lines,
+        base_size,
+        corrected
+    );
+    corrected
+}
+
 pub(crate) fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f32> {
     let mut heading_sizes: Vec<f32> = Vec::new();
 
@@ -688,6 +773,69 @@ pub(crate) fn detect_header_level(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correct_base_size_adopts_dominant_promoted_size() {
+        // Footnote-weighted stats picked 9pt, but the page's text is 11pt:
+        // an implausible share of lines clears the heading gate.
+        let mut lines: Vec<crate::types::TextLine> = Vec::new();
+        for i in 0..12 {
+            lines.push(line_of(
+                "body paragraph text continues along here nicely",
+                11.0,
+                false,
+                700.0 - 14.0 * i as f32,
+            ));
+        }
+        for i in 0..4 {
+            lines.push(line_of(
+                "footnote text",
+                9.0,
+                false,
+                100.0 - 11.0 * i as f32,
+            ));
+        }
+        assert_eq!(correct_base_size(&lines, 9.0), 11.0);
+    }
+
+    #[test]
+    fn correct_base_size_handles_narrow_wrapped_body() {
+        // Narrow columns wrap body text to few words per physical line;
+        // character mass must still read as body style.
+        let mut lines: Vec<crate::types::TextLine> = Vec::new();
+        for i in 0..12 {
+            lines.push(line_of(
+                "internationalization considerations",
+                11.0,
+                false,
+                700.0 - 14.0 * i as f32,
+            ));
+        }
+        for i in 0..4 {
+            lines.push(line_of(
+                "footnote text",
+                9.0,
+                false,
+                100.0 - 11.0 * i as f32,
+            ));
+        }
+        assert_eq!(correct_base_size(&lines, 9.0), 11.0);
+    }
+
+    #[test]
+    fn correct_base_size_keeps_ordinary_documents() {
+        let mut lines: Vec<crate::types::TextLine> = Vec::new();
+        lines.push(line_of("Chapter One Introduction", 16.0, true, 720.0));
+        for i in 0..14 {
+            lines.push(line_of(
+                "regular body text at the document base size",
+                10.0,
+                false,
+                690.0 - 13.0 * i as f32,
+            ));
+        }
+        assert_eq!(correct_base_size(&lines, 10.0), 10.0);
+    }
 
     fn line_of(text: &str, font_size: f32, bold: bool, y: f32) -> crate::types::TextLine {
         let item = crate::types::TextItem {

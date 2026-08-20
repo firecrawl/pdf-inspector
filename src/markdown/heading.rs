@@ -62,7 +62,7 @@ fn dominant_font(line: &TextLine) -> Option<String> {
 /// whole heading even though the title itself has the document's heading
 /// size. Character weighting makes the longer title win while preserving the
 /// exact size for ordinary one-item lines.
-fn dominant_font_size(line: &TextLine) -> Option<f32> {
+pub(super) fn dominant_font_size(line: &TextLine) -> Option<f32> {
     let mut weights: HashMap<i32, usize> = HashMap::new();
     for item in &line.items {
         let bucket = (item.font_size * 10.0).round() as i32;
