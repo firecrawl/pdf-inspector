@@ -155,7 +155,13 @@ where
     let (mut rtl, mut ltr) = (0u32, 0u32);
     for t in texts {
         for c in t.as_ref().chars() {
-            if is_rtl_char(c) && c.is_alphabetic() {
+            // is_alphabetic alone is not enough: Unicode gives nikud and
+            // harakat the Other_Alphabetic property, so combining marks must
+            // be excluded explicitly (ccc != 0).
+            if is_rtl_char(c)
+                && c.is_alphabetic()
+                && unicode_normalization::char::canonical_combining_class(c) == 0
+            {
                 rtl += 1;
             } else if c.is_alphabetic() && !is_cjk_char(c) {
                 ltr += 1;
@@ -210,6 +216,39 @@ pub(crate) fn sort_line_items(items: &mut [TextItem]) {
 /// pairs brackets with the text they enclose); other neutrals — sentence
 /// periods, commas — take the paragraph's RTL direction and stay put.
 pub(crate) fn restore_embedded_ltr_runs<T>(items: &mut [T], text_of: impl Fn(&T) -> &str) {
+    // An Arabic-Indic number split across items reads left-to-right even
+    // though its digits live in the RTL blocks: rejoin maximal runs of
+    // ADJACENT digit-only items in screen order. They deliberately stay out
+    // of the Latin-phrase grouping below — the brackets and operators around
+    // an Arabic number belong to the surrounding RTL flow, unlike a Latin
+    // phrase's own brackets.
+    let is_arabic_number_item = |t: &T| {
+        let mut has_digit = false;
+        for c in text_of(t).chars() {
+            if is_arabic_indic_digit(c) {
+                has_digit = true;
+            } else if !is_arabic_numeric_separator(c) && !c.is_whitespace() {
+                return false;
+            }
+        }
+        has_digit
+    };
+    let mut i = 0;
+    while i < items.len() {
+        if !is_arabic_number_item(&items[i]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < items.len() && is_arabic_number_item(&items[j]) {
+            j += 1;
+        }
+        if j - i >= 2 {
+            items[i..j].reverse();
+        }
+        i = j;
+    }
+
     let has_rtl = |t: &T| text_of(t).chars().any(is_rtl_char);
     let has_bracket = |t: &T| text_of(t).chars().any(|c| "()[]{}<>".contains(c));
     let mut i = 0;
@@ -1227,10 +1266,12 @@ mod tests {
         assert!(is_strong_rtl_text(
             ["\u{05E9}\u{05DC}\u{05D5}\u{05DD}"].iter()
         ));
-        // Combining marks carry no base direction: one pointed Hebrew letter
-        // must not out-vote a longer Latin word in a mixed cell
+        // Combining marks carry no base direction (Unicode marks nikud and
+        // harakat Other_Alphabetic, so is_alphabetic alone would count
+        // them): one heavily pointed Hebrew letter must not out-vote a
+        // longer Latin word in a mixed cell
         assert!(!is_strong_rtl_text(
-            ["Table", "\u{05D1}\u{05B8}\u{05C1}\u{0591}"].iter()
+            ["AB", "\u{05D1}\u{05B8}\u{05B8}\u{05B8}\u{05B8}"].iter()
         ));
     }
 
@@ -1359,6 +1400,22 @@ mod tests {
         assert_eq!(items[1], "(");
         assert_eq!(items[2], "KM1");
         assert_eq!(items[3], ")");
+    }
+
+    #[test]
+    fn restore_embedded_ltr_runs_rejoins_split_arabic_indic_numbers() {
+        // An Arabic-Indic number split across items sits in the RTL block
+        // but reads left-to-right: after the descending-X sort it must
+        // rejoin in screen order like Latin digits would.
+        let mut items = vec![
+            "\u{0645}\u{0631}".to_string(), // مر
+            "\u{0664}".to_string(),         // ٤
+            "\u{0662}".to_string(),         // ٢
+            "\u{062D}\u{0628}".to_string(), // حب
+        ];
+        restore_embedded_ltr_runs(&mut items, |s| s.as_str());
+        assert_eq!(items[1], "\u{0662}");
+        assert_eq!(items[2], "\u{0664}");
     }
 
     #[test]
