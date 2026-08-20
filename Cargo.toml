@@ -2,6 +2,9 @@
 name = "pdf-inspector"
 version = "1.15.0"
 edition = "2021"
+# Oldest compiler the crate builds on (slice::as_chunks). Independent of the
+# 1.98 pin in rust-toolchain.toml, which is what we develop and release with.
+rust-version = "1.88"
 autobins = false
 authors = ["Firecrawl Team"]
 description = "Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection"
