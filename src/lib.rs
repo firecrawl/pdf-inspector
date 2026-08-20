@@ -3900,7 +3900,7 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 /// at the cross-reference table — a single corrupted byte in the offset is
 /// enough. lopdf trusts that pointer outright and fails to load rather than
 /// searching for the real table, unlike pypdf/pdfium which both recover by
-/// locating it directly. This finds the real (classic, non-stream) `xref`
+/// locating it directly. This finds a recoverable (classic, non-stream) `xref`
 /// table by scanning for the keyword — validating that a plausible
 /// subsection header follows, not just any standalone "xref" token, since
 /// this crate processes untrusted input and a coincidental match inside
@@ -3912,11 +3912,17 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 /// transparently supersedes the broken one without needing to touch
 /// anything already in the file.
 ///
+/// Linearized PDFs commonly have two classic tables: the early table carries
+/// `/Root` and `/Prev`, while the final table contains only the remaining
+/// object entries. Preferring the newest table whose own trailer has `/Root`
+/// prevents the repair from selecting the rootless final table and reporting
+/// a zero-page document.
+///
 /// Doesn't cover cross-reference *streams* (`N 0 obj << /Type /XRef ...`,
 /// used by some PDF 1.5+ writers instead of a classic table) — recovering
 /// those needs the containing object's number, not just a byte offset.
 fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
-    let xref_pos = find_last_valid_xref_table_start(buf)?;
+    let xref_pos = find_recoverable_xref_table_start(buf)?;
 
     let mut repaired = Vec::with_capacity(buf.len() + 32);
     repaired.extend_from_slice(buf);
@@ -3927,34 +3933,100 @@ fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
     Some(repaired)
 }
 
+/// Returns classic xref starts from newest to oldest, filtered by the same
+/// subsection validation as the original single-table scan.
+fn valid_xref_table_starts(buf: &[u8]) -> Vec<usize> {
+    const KEYWORD: &[u8] = b"xref";
+    let mut starts = Vec::new();
+    let mut pos = buf.len().saturating_sub(KEYWORD.len());
+
+    loop {
+        if &buf[pos..pos + KEYWORD.len()] == KEYWORD
+            && (pos == 0 || buf[pos - 1].is_ascii_whitespace())
+            && buf
+                .get(pos + KEYWORD.len())
+                .is_none_or(u8::is_ascii_whitespace)
+            && looks_like_xref_subsection_header(buf, pos + KEYWORD.len())
+        {
+            starts.push(pos);
+        }
+        if pos == 0 {
+            return starts;
+        }
+        pos -= 1;
+    }
+}
+
+/// Prefer the newest classic table whose trailer directly names `/Root`; fall
+/// back to the newest valid table for unusual trailer layouts that the parser
+/// can still traverse.
+fn find_recoverable_xref_table_start(buf: &[u8]) -> Option<usize> {
+    let mut newest = None;
+    for pos in valid_xref_table_starts(buf) {
+        newest = newest.or(Some(pos));
+        if xref_trailer_has_root(buf, pos) {
+            return Some(pos);
+        }
+    }
+    newest
+}
+
+/// Checks the trailer immediately following a classic xref table for a root
+/// reference. Bounding the search at the following `startxref` prevents an
+/// unrelated `/Root` in a later object or stream from selecting the wrong
+/// table.
+fn xref_trailer_has_root(buf: &[u8], xref_pos: usize) -> bool {
+    let Some(trailer_pos) = find_standalone_keyword(buf, xref_pos, b"trailer") else {
+        return false;
+    };
+    let Some(startxref_pos) = find_standalone_keyword(buf, trailer_pos, b"startxref") else {
+        return false;
+    };
+    if startxref_pos <= trailer_pos {
+        return false;
+    }
+
+    let trailer = &buf[trailer_pos..startxref_pos];
+    let mut search_from = 0;
+    while let Some(relative_pos) = trailer[search_from..]
+        .windows(b"/Root".len())
+        .position(|window| window == b"/Root")
+    {
+        let after_name = search_from + relative_pos + b"/Root".len();
+        if trailer.get(after_name).is_none_or(u8::is_ascii_whitespace) {
+            return true;
+        }
+        search_from = search_from + relative_pos + 1;
+    }
+    false
+}
+
+fn find_standalone_keyword(buf: &[u8], start: usize, keyword: &[u8]) -> Option<usize> {
+    if start >= buf.len() {
+        return None;
+    }
+
+    buf[start..]
+        .windows(keyword.len())
+        .position(|window| window == keyword)
+        .map(|relative_pos| start + relative_pos)
+        .filter(|&pos| {
+            (pos == 0 || buf[pos - 1].is_ascii_whitespace())
+                && buf
+                    .get(pos + keyword.len())
+                    .is_none_or(u8::is_ascii_whitespace)
+        })
+}
+
 /// Finds the last standalone `xref` token in `buf` that is immediately
 /// followed by a plausible classic cross-reference subsection header
 /// (`<start-id> <count>`, e.g. "0 6") — the shape every real classic xref
 /// table starts with. A single reverse byte scan: O(n) even on a
 /// pathological buffer with many non-matching or non-standalone "xref"
 /// occurrences, unlike repeatedly re-searching a shrinking prefix.
+#[cfg(test)]
 fn find_last_valid_xref_table_start(buf: &[u8]) -> Option<usize> {
-    const KEYWORD: &[u8] = b"xref";
-    if buf.len() < KEYWORD.len() {
-        return None;
-    }
-    let mut pos = buf.len() - KEYWORD.len();
-    loop {
-        if &buf[pos..pos + KEYWORD.len()] == KEYWORD {
-            let before_ok = pos == 0 || buf[pos - 1].is_ascii_whitespace();
-            let after_ok = buf
-                .get(pos + KEYWORD.len())
-                .is_none_or(|c| c.is_ascii_whitespace());
-            if before_ok && after_ok && looks_like_xref_subsection_header(buf, pos + KEYWORD.len())
-            {
-                return Some(pos);
-            }
-        }
-        if pos == 0 {
-            return None;
-        }
-        pos -= 1;
-    }
+    valid_xref_table_starts(buf).into_iter().next()
 }
 
 /// Checks that `buf[pos..]` starts (after whitespace) with two
