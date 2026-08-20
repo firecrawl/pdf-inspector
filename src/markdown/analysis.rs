@@ -579,24 +579,23 @@ pub(crate) fn correct_base_size(lines: &[TextLine], base_size: f32) -> f32 {
         if text.trim().chars().filter(|c| c.is_alphabetic()).count() < 3 {
             continue;
         }
-        // Judge the line by its dominant item (most characters), not its
-        // first: a small section-number or bullet prefix must not decide
-        // the line's size.
-        let Some(dominant) = line
-            .items
-            .iter()
-            .max_by_key(|it| it.text.trim().chars().count())
-        else {
+        // Judge the line by its character-weighted dominant size (the same
+        // routine heading tiering uses): a small section-number or bullet
+        // prefix must not decide the line's size.
+        let Some(dominant_size) = super::heading::dominant_font_size(line) else {
             continue;
         };
         text_lines += 1;
-        if dominant.font_size / base_size >= 1.2 {
-            let key = (dominant.font_size * 10.0) as i32;
+        if dominant_size / base_size >= 1.2 {
+            let key = (dominant_size * 10.0).round() as i32;
             *promoted.entry(key).or_insert(0) += 1;
             // Body-style evidence: real body lines run long. Headings —
             // even many of them — are short, so a heading-dense page
-            // never accumulates wordy lines at the promoted size.
-            if text.split_whitespace().count() >= 6 {
+            // never accumulates wordy lines at the promoted size. Narrow
+            // columns wrap body text to few words per physical line, so
+            // character mass counts as well.
+            let trimmed = text.trim();
+            if trimmed.split_whitespace().count() >= 6 || trimmed.chars().count() >= 30 {
                 *promoted_wordy.entry(key).or_insert(0) += 1;
             }
         }
@@ -615,7 +614,7 @@ pub(crate) fn correct_base_size(lines: &[TextLine], base_size: f32) -> f32 {
     // Only adopt the new base when the promoted lines at that size mostly
     // read like body text (long lines). A genuinely heading-dense page
     // keeps its structure.
-    let key = (corrected * 10.0) as i32;
+    let key = (corrected * 10.0).round() as i32;
     let wordy = promoted_wordy.get(&key).copied().unwrap_or(0);
     let at_size = promoted.get(&key).copied().unwrap_or(0);
     if wordy * 2 < at_size {
@@ -768,6 +767,30 @@ mod tests {
         for i in 0..12 {
             lines.push(line_of(
                 "body paragraph text continues along here nicely",
+                11.0,
+                false,
+                700.0 - 14.0 * i as f32,
+            ));
+        }
+        for i in 0..4 {
+            lines.push(line_of(
+                "footnote text",
+                9.0,
+                false,
+                100.0 - 11.0 * i as f32,
+            ));
+        }
+        assert_eq!(correct_base_size(&lines, 9.0), 11.0);
+    }
+
+    #[test]
+    fn correct_base_size_handles_narrow_wrapped_body() {
+        // Narrow columns wrap body text to few words per physical line;
+        // character mass must still read as body style.
+        let mut lines: Vec<crate::types::TextLine> = Vec::new();
+        for i in 0..12 {
+            lines.push(line_of(
+                "internationalization considerations",
                 11.0,
                 false,
                 700.0 - 14.0 * i as f32,

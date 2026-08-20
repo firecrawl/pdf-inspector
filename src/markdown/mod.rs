@@ -690,22 +690,37 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     // list markers ("1.", "2)", …), the second the item text. Rendering
     // these as tables loses the list; the page flow keeps it.
     // A leading "1. | <text>" row is the list's own first item, not a
-    // table header — the compact-header protection must not treat it as
-    // one for the ordinal branches.
-    let first_row_is_ordinal = table
-        .cells
-        .iter()
-        .find(|row| row.iter().any(|cell| !cell.trim().is_empty()))
-        .and_then(|row| row.first())
-        .map(|first| {
-            let t = first.trim();
-            t.len() <= 4
-                && t.ends_with(['.', ')'])
-                && !t[..t.len() - 1].is_empty()
-                && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit())
-        })
-        .unwrap_or(false);
-    let ordinal_header_blocks = header_blocks && !first_row_is_ordinal;
+    // table header — but only when the whole first column actually has
+    // the list shape (mostly ordinal markers); a lone punctuation-styled
+    // rank must not disable the compact-header protection.
+    let is_ordinal_marker = |cell: &str| {
+        let t = cell.trim();
+        t.len() <= 4
+            && t.ends_with(['.', ')'])
+            && !t[..t.len() - 1].is_empty()
+            && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit())
+    };
+    let first_column_list_shape = {
+        let mut markers = 0usize;
+        let mut filled = 0usize;
+        for row in &table.cells {
+            let first = row.first().map(|s| s.trim()).unwrap_or("");
+            if first.is_empty() {
+                continue;
+            }
+            filled += 1;
+            if is_ordinal_marker(first)
+                || first
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(is_ordinal_marker)
+            {
+                markers += 1;
+            }
+        }
+        filled >= 4 && markers * 10 >= filled * 7
+    };
+    let ordinal_header_blocks = header_blocks && !first_column_list_shape;
     let ordinal_list =
         !ordinal_header_blocks && table.columns.len() == 2 && table.cells.len() >= 4 && {
             let mut markers = 0;

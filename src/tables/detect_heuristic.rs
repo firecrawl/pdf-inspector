@@ -1440,13 +1440,20 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
     // perfect: every last-column cell a page number, values strictly
     // increasing, and every first-column cell a multi-word title.
     // Leader-dot residue ("..19") only reads as a page number when the
-    // fragment actually shows leader dots somewhere; otherwise a leading
-    // period is decimal notation and must not be stripped.
+    // page column itself (or a dedicated dots-only leader cell) shows
+    // leader dots; an ellipsis inside a title is prose, and a leading
+    // period elsewhere is decimal notation that must not be stripped.
+    let page_col = num_cols - 1;
     let has_leader_dots = cells.iter().any(|row| {
-        row.iter().any(|c| {
+        let page_cell_leader = row.get(page_col).is_some_and(|c| {
             let t = c.trim();
-            t.starts_with("..") || t.starts_with('\u{2026}') || t.ends_with("..")
-        })
+            t.starts_with("..") || t.starts_with('\u{2026}')
+        });
+        let dots_only_cell = row.iter().any(|c| {
+            let t = c.trim();
+            t.len() >= 2 && t.chars().all(|ch| ch == '.' || ch == '\u{2026}')
+        });
+        page_cell_leader || dots_only_cell
     });
     fn clean_page_cell(cell: &str, has_leader_dots: bool) -> &str {
         if has_leader_dots {
@@ -1478,16 +1485,28 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
             });
         // Short fragments carry little evidence: ascending numbers with
         // multi-word labels also describe a small data summary. Require a
-        // contents-specific signal — every title carries a section-number
-        // token ("Section 6.3", "2.1.4 Methods", "4. A Jewel …") or the
-        // fragment shows leader dots.
+        // contents-specific signal — every title carries genuine section
+        // syntax ("Section 6.3", "2.1.4 Methods", "4. A Jewel …") or the
+        // fragment shows leader dots. Years, IDs, and measurements do not
+        // qualify: a bare all-digit token only counts as an ordinal when
+        // it starts the title with a list-marker suffix, and dotted tokens
+        // must be multi-part section numbers with short groups.
         let section_numbered = |title: &str| {
-            title.split_whitespace().any(|tok| {
+            let mut words = title.split_whitespace();
+            let first = words.next().unwrap_or("");
+            let leading_ordinal = first.len() <= 3
+                && first.ends_with(['.', ')'])
+                && !first[..first.len() - 1].is_empty()
+                && first[..first.len() - 1].chars().all(|c| c.is_ascii_digit());
+            let dotted_section = title.split_whitespace().any(|tok| {
                 let tok = tok.trim_end_matches([':', '.']);
-                !tok.is_empty()
-                    && tok.chars().all(|c| c.is_ascii_digit() || c == '.')
-                    && tok.chars().any(|c| c.is_ascii_digit())
-            })
+                let groups: Vec<&str> = tok.split('.').collect();
+                groups.len() >= 2
+                    && groups.iter().all(|g| {
+                        !g.is_empty() && g.len() <= 3 && g.chars().all(|c| c.is_ascii_digit())
+                    })
+            });
+            leading_ordinal || dotted_section
         };
         if !has_leader_dots && !titles.iter().all(|t| section_numbered(t)) {
             return false;
