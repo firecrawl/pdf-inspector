@@ -129,12 +129,19 @@ where
     I: Iterator<Item = S>,
     S: AsRef<str>,
 {
+    // Only letters vote: the RTL blocks embed weak-directionality characters
+    // (Arabic-Indic digits, number separators, combining marks) that are bidi
+    // class AN/NSM per UAX #9, not strong RTL — a digits-only line must stay
+    // neutral, matching how ASCII digits don't vote LTR.
     let (mut rtl, mut ltr) = (0u32, 0u32);
     for t in texts {
         for c in t.as_ref().chars() {
+            if !c.is_alphabetic() {
+                continue;
+            }
             if is_rtl_char(c) {
                 rtl += 1;
-            } else if c.is_alphabetic() && !is_cjk_char(c) {
+            } else if !is_cjk_char(c) {
                 ltr += 1;
             }
         }

@@ -2850,6 +2850,25 @@ mod tests {
     }
 
     #[test]
+    fn test_is_rtl_text_weak_chars_do_not_vote() {
+        // Arabic-Indic digits (U+0660-0669) are bidi class AN, not strong RTL:
+        // a digits-only line must stay neutral, like ASCII-digit lines.
+        assert!(!is_rtl_text(["\u{0661}\u{0662}\u{0663}"].iter()));
+        // Extended Arabic-Indic digits (U+06F0-06F9) likewise
+        assert!(!is_rtl_text(["\u{06F1}\u{06F2}\u{06F3}"].iter()));
+        // Arabic decimal/thousands separators (U+066B/U+066C) with digits
+        assert!(!is_rtl_text(
+            ["\u{0661}\u{066B}\u{0662}\u{0663}\u{066C}\u{0664}"].iter()
+        ));
+        // Arabic letters alongside Arabic-Indic digits → still RTL
+        assert!(is_rtl_text(
+            ["\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \u{0661}\u{0662}"].iter()
+        ));
+        // Arabic letters with combining marks (NSM) → still RTL
+        assert!(is_rtl_text(["\u{0645}\u{064E}\u{0631}\u{064D}"].iter()));
+    }
+
+    #[test]
     fn test_rtl_line_sorting() {
         let mut items = vec![
             TextItem {
