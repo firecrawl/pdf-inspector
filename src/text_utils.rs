@@ -159,7 +159,7 @@ where
             // and harakat the Other_Alphabetic property, so is_alphabetic
             // alone would tally them — as RTL they'd out-vote Latin, as LTR
             // they'd out-vote a vocalized RTL cell's own letters.
-            if unicode_normalization::char::canonical_combining_class(c) != 0 {
+            if is_combining_mark(c) {
                 continue;
             }
             if is_rtl_char(c) && c.is_alphabetic() {
@@ -170,6 +170,14 @@ where
         }
     }
     rtl > 0 && rtl > ltr
+}
+
+/// Combining marks by general category (Mn) or nonzero canonical combining
+/// class. Both signals are needed: Thaana vowel signs are Mn with ccc 0,
+/// while some reordering marks are not Mn.
+fn is_combining_mark(c: char) -> bool {
+    unicode_normalization::char::is_combining_mark(c)
+        || unicode_normalization::char::canonical_combining_class(c) != 0
 }
 
 /// Sort a table cell's items into RTL reading order: baseline bands (2pt
@@ -499,7 +507,7 @@ fn reverse_keeping_marks(text: &str) -> String {
     let mut i = chars.len();
     while i > 0 {
         i -= 1;
-        if i == 0 || unicode_normalization::char::canonical_combining_class(chars[i]) == 0 {
+        if i == 0 || !is_combining_mark(chars[i]) {
             out.extend(chars[i..end].iter().map(|&c| mirror_bracket(c)));
             end = i;
         }
@@ -1302,6 +1310,11 @@ mod tests {
         // (3 letters, 3 points) still out-votes a short Latin item
         assert!(is_strong_rtl_text(
             ["\u{05E9}\u{05B8}\u{05DC}\u{05B8}\u{05DD}\u{05B8}", "ab"].iter()
+        ));
+        // Thaana vowel signs are Mn with combining class 0 — still marks:
+        // they must not count as RTL letters
+        assert!(!is_strong_rtl_text(
+            ["ABC", "\u{078C}\u{07A6}\u{07A6}\u{07A6}"].iter()
         ));
     }
 
