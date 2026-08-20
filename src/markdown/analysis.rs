@@ -573,17 +573,32 @@ pub(crate) fn compute_paragraph_threshold(lines: &[TextLine], base_size: f32) ->
 pub(crate) fn correct_base_size(lines: &[TextLine], base_size: f32) -> f32 {
     let mut text_lines = 0usize;
     let mut promoted: HashMap<i32, usize> = HashMap::new();
+    let mut promoted_wordy: HashMap<i32, usize> = HashMap::new();
     for line in lines {
         let text = line.text();
         if text.trim().chars().filter(|c| c.is_alphabetic()).count() < 3 {
             continue;
         }
-        let Some(first) = line.items.first() else {
+        // Judge the line by its dominant item (most characters), not its
+        // first: a small section-number or bullet prefix must not decide
+        // the line's size.
+        let Some(dominant) = line
+            .items
+            .iter()
+            .max_by_key(|it| it.text.trim().chars().count())
+        else {
             continue;
         };
         text_lines += 1;
-        if first.font_size / base_size >= 1.2 {
-            *promoted.entry((first.font_size * 10.0) as i32).or_insert(0) += 1;
+        if dominant.font_size / base_size >= 1.2 {
+            let key = (dominant.font_size * 10.0) as i32;
+            *promoted.entry(key).or_insert(0) += 1;
+            // Body-style evidence: real body lines run long. Headings —
+            // even many of them — are short, so a heading-dense page
+            // never accumulates wordy lines at the promoted size.
+            if text.split_whitespace().count() >= 6 {
+                *promoted_wordy.entry(key).or_insert(0) += 1;
+            }
         }
     }
     let promoted_total: usize = promoted.values().sum();
@@ -597,6 +612,15 @@ pub(crate) fn correct_base_size(lines: &[TextLine], base_size: f32) -> f32 {
         })
         .map(|(size, _)| *size as f32 / 10.0)
         .unwrap_or(base_size);
+    // Only adopt the new base when the promoted lines at that size mostly
+    // read like body text (long lines). A genuinely heading-dense page
+    // keeps its structure.
+    let key = (corrected * 10.0) as i32;
+    let wordy = promoted_wordy.get(&key).copied().unwrap_or(0);
+    let at_size = promoted.get(&key).copied().unwrap_or(0);
+    if wordy * 2 < at_size {
+        return base_size;
+    }
     log::debug!(
         "correct_base_size: {}/{} text lines clear the heading gate — base {} -> {}",
         promoted_total,
@@ -743,7 +767,7 @@ mod tests {
         let mut lines: Vec<crate::types::TextLine> = Vec::new();
         for i in 0..12 {
             lines.push(line_of(
-                "body paragraph text continues here",
+                "body paragraph text continues along here nicely",
                 11.0,
                 false,
                 700.0 - 14.0 * i as f32,

@@ -1439,13 +1439,29 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
     // carry less evidence than a full contents page, so they must be
     // perfect: every last-column cell a page number, values strictly
     // increasing, and every first-column cell a multi-word title.
+    // Leader-dot residue ("..19") only reads as a page number when the
+    // fragment actually shows leader dots somewhere; otherwise a leading
+    // period is decimal notation and must not be stripped.
+    let has_leader_dots = cells.iter().any(|row| {
+        row.iter().any(|c| {
+            let t = c.trim();
+            t.starts_with("..") || t.starts_with('\u{2026}') || t.ends_with("..")
+        })
+    });
+    fn clean_page_cell(cell: &str, has_leader_dots: bool) -> &str {
+        if has_leader_dots {
+            cell.trim_start_matches(['.', '\u{2026}', ' '])
+        } else {
+            cell.trim()
+        }
+    }
     if cells.len() < 5 {
         let last_col = num_cols - 1;
         let vals: Vec<u32> = cells
             .iter()
             .filter_map(|row| {
                 let cell = row.get(last_col).map(String::as_str).unwrap_or("");
-                page_number_value(cell.trim_start_matches(['.', '\u{2026}', ' ']))
+                page_number_value(clean_page_cell(cell, has_leader_dots))
             })
             .collect();
         // A fragment row can lose its title to a neighboring grid; judge
@@ -1460,6 +1476,22 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
             && titles.iter().all(|c| {
                 c.split_whitespace().count() >= 2 && c.chars().any(|ch| ch.is_alphabetic())
             });
+        // Short fragments carry little evidence: ascending numbers with
+        // multi-word labels also describe a small data summary. Require a
+        // contents-specific signal — every title carries a section-number
+        // token ("Section 6.3", "2.1.4 Methods", "4. A Jewel …") or the
+        // fragment shows leader dots.
+        let section_numbered = |title: &str| {
+            title.split_whitespace().any(|tok| {
+                let tok = tok.trim_end_matches([':', '.']);
+                !tok.is_empty()
+                    && tok.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    && tok.chars().any(|c| c.is_ascii_digit())
+            })
+        };
+        if !has_leader_dots && !titles.iter().all(|t| section_numbered(t)) {
+            return false;
+        }
         return vals.len() == cells.len() && titles_ok && vals.windows(2).all(|w| w[1] > w[0]);
     }
     let last = num_cols - 1;
@@ -1470,7 +1502,7 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
     // "Mineral | CEC" tables from real contents. Check the actual first row,
     // not the first non-empty one, so a blank header cell still rejects.
     let first_last = cells[0].get(last).map(|s| s.trim()).unwrap_or("");
-    if page_number_value(first_last.trim_start_matches(['.', '\u{2026}', ' '])).is_none() {
+    if page_number_value(clean_page_cell(first_last, has_leader_dots)).is_none() {
         return false;
     }
 
@@ -1483,7 +1515,7 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
             continue;
         }
         filled += 1;
-        if let Some(v) = page_number_value(cell.trim_start_matches(['.', '\u{2026}', ' '])) {
+        if let Some(v) = page_number_value(clean_page_cell(cell, has_leader_dots)) {
             page_vals.push(v);
         }
     }

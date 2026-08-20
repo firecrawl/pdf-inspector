@@ -665,8 +665,23 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
                 && t.chars().filter(|c| c.is_alphabetic()).count() * 2 >= t.chars().count().max(1)
         })
         .count();
-    let word_fragment_grid = table.columns.len() >= 4
+    // Categorical grids repeat a small value vocabulary down their
+    // columns; flowing text almost never repeats a cell. A fully
+    // populated word grid is only rejected when its cells are almost all
+    // distinct AND the continuations strongly outnumber the rows.
+    let distinct_cells: std::collections::HashSet<String> = table
+        .cells
+        .iter()
+        .flatten()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    let mostly_distinct = distinct_cells.len() * 4 >= non_empty * 3;
+    let word_fragment_grid = !header_blocks
+        && table.columns.len() >= 4
         && non_empty >= 8
+        && (non_empty < table.cells.len() * table.columns.len()
+            || (mostly_distinct && continuation_fragments > table.cells.len() * 2))
         && single_token_alpha * 4 >= non_empty * 3
         && continuation_fragments >= 4
         && continuation_columns.iter().filter(|&&value| value).count() >= 2;
@@ -674,25 +689,43 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     // Numbered lists projected onto a two-column grid: the first column is
     // list markers ("1.", "2)", …), the second the item text. Rendering
     // these as tables loses the list; the page flow keeps it.
-    let ordinal_list = table.columns.len() == 2 && table.cells.len() >= 4 && {
-        let mut markers = 0;
-        let mut filled_first = 0;
-        for row in &table.cells {
-            let first = row.first().map(|s| s.trim()).unwrap_or("");
-            if first.is_empty() {
-                continue;
+    // A leading "1. | <text>" row is the list's own first item, not a
+    // table header — the compact-header protection must not treat it as
+    // one for the ordinal branches.
+    let first_row_is_ordinal = table
+        .cells
+        .iter()
+        .find(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+        .and_then(|row| row.first())
+        .map(|first| {
+            let t = first.trim();
+            t.len() <= 4
+                && t.ends_with(['.', ')'])
+                && !t[..t.len() - 1].is_empty()
+                && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit())
+        })
+        .unwrap_or(false);
+    let ordinal_header_blocks = header_blocks && !first_row_is_ordinal;
+    let ordinal_list =
+        !ordinal_header_blocks && table.columns.len() == 2 && table.cells.len() >= 4 && {
+            let mut markers = 0;
+            let mut filled_first = 0;
+            for row in &table.cells {
+                let first = row.first().map(|s| s.trim()).unwrap_or("");
+                if first.is_empty() {
+                    continue;
+                }
+                filled_first += 1;
+                let is_marker = first.len() <= 4
+                    && first.ends_with(['.', ')'])
+                    && first[..first.len() - 1].chars().all(|c| c.is_ascii_digit())
+                    && !first[..first.len() - 1].is_empty();
+                if is_marker {
+                    markers += 1;
+                }
             }
-            filled_first += 1;
-            let is_marker = first.len() <= 4
-                && first.ends_with(['.', ')'])
-                && first[..first.len() - 1].chars().all(|c| c.is_ascii_digit())
-                && !first[..first.len() - 1].is_empty();
-            if is_marker {
-                markers += 1;
-            }
-        }
-        filled_first >= 4 && markers * 10 >= filled_first * 7
-    };
+            filled_first >= 4 && markers * 10 >= filled_first * 7
+        };
 
     let is_parallel = !header_blocks
         && non_empty >= 5
@@ -727,45 +760,50 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     // Long prose cells are required: reference tables whose wrapped
     // entries continue in every column (short citation fragments) look
     // continuation-dominated too, but they never read as running text.
-    let continuation_dominated = not_fully_populated
+    let continuation_dominated = !header_blocks
+        && not_fully_populated
         && long_prose >= 4
         // ...and long prose must be a real share of the grid: a large data
         // table with a handful of wordy cells and many wrapped-cell
         // continuations is not a weave.
         && long_prose * 10 >= non_empty
-        && continuation_fragments >= table.cells.len().max(8)
+        // Continuations must strictly outnumber the rows (with an absolute
+        // floor), preserving the compact-header rule's spirit for every
+        // rejection branch.
+        && continuation_fragments > table.cells.len().max(7)
         && continuation_columns.iter().filter(|&&value| value).count() >= 3;
     // Numbered list items ("1. Restructuring ...") woven beside sidebar
     // fragments: the first column is a monotone ordinal-prefixed list.
-    let ordinal_prefix_list = table.columns.len() == 2 && table.cells.len() >= 4 && {
-        let mut values: Vec<u32> = Vec::new();
-        let mut filled_first = 0;
-        for row in &table.cells {
-            let first = row.first().map(|s| s.trim()).unwrap_or("");
-            if first.is_empty() {
-                continue;
-            }
-            filled_first += 1;
-            let mut parts = first.splitn(2, char::is_whitespace);
-            let marker = parts.next().unwrap_or("");
-            let rest = parts.next().unwrap_or("").trim();
-            if marker.len() <= 4
-                && marker.ends_with(['.', ')'])
-                && marker[..marker.len() - 1]
-                    .chars()
-                    .all(|c| c.is_ascii_digit())
-                && !marker[..marker.len() - 1].is_empty()
-                && rest.split_whitespace().count() >= 2
-            {
-                if let Ok(v) = marker[..marker.len() - 1].parse() {
-                    values.push(v);
+    let ordinal_prefix_list =
+        !ordinal_header_blocks && table.columns.len() == 2 && table.cells.len() >= 4 && {
+            let mut values: Vec<u32> = Vec::new();
+            let mut filled_first = 0;
+            for row in &table.cells {
+                let first = row.first().map(|s| s.trim()).unwrap_or("");
+                if first.is_empty() {
+                    continue;
+                }
+                filled_first += 1;
+                let mut parts = first.splitn(2, char::is_whitespace);
+                let marker = parts.next().unwrap_or("");
+                let rest = parts.next().unwrap_or("").trim();
+                if marker.len() <= 4
+                    && marker.ends_with(['.', ')'])
+                    && marker[..marker.len() - 1]
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                    && !marker[..marker.len() - 1].is_empty()
+                    && rest.split_whitespace().count() >= 2
+                {
+                    if let Ok(v) = marker[..marker.len() - 1].parse() {
+                        values.push(v);
+                    }
                 }
             }
-        }
-        filled_first >= 4
-            && values.len() * 10 >= filled_first * 7
-            && values.windows(2).all(|w| w[1] >= w[0])
-    };
+            filled_first >= 4
+                && values.len() * 10 >= filled_first * 7
+                && values.windows(2).all(|w| w[1] >= w[0])
+        };
     let is_parallel = is_parallel
         || word_fragment_grid
         || ordinal_list
