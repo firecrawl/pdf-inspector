@@ -178,7 +178,43 @@ fn collect_xobjects_from_dict(
     }
 }
 
-/// Extract text items from a Form XObject
+/// Text items extracted from a content stream together with the visual-order
+/// RTL evidence gathered while parsing them, for the page-level
+/// `fix_visual_order_rtl` pass: indexes of candidate items (see
+/// `is_visual_rtl_candidate`) and a count of logical-order show ops.
+pub(crate) struct ExtractedText {
+    pub(crate) items: Vec<TextItem>,
+    pub(crate) rtl_visual_candidates: Vec<usize>,
+    pub(crate) rtl_logical_ops: u32,
+}
+
+impl ExtractedText {
+    fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            rtl_visual_candidates: Vec::new(),
+            rtl_logical_ops: 0,
+        }
+    }
+
+    /// Append this extraction into a caller's accumulators, rebasing the
+    /// candidate indexes onto the caller's item vector. Keeping the rebase
+    /// here is what stops item and RTL-evidence bookkeeping from drifting
+    /// apart across the page/form extraction paths.
+    pub(crate) fn append_into(
+        self,
+        items: &mut Vec<TextItem>,
+        rtl_visual_candidates: &mut Vec<usize>,
+        rtl_logical_ops: &mut u32,
+    ) {
+        let base = items.len();
+        rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
+        *rtl_logical_ops += self.rtl_logical_ops;
+        items.extend(self.items);
+    }
+}
+
+/// Extract text items from a Form XObject.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_form_xobject_text(
     doc: &Document,
@@ -189,7 +225,7 @@ pub(crate) fn extract_form_xobject_text(
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
-) -> Vec<TextItem> {
+) -> ExtractedText {
     extract_form_xobject_text_inner(
         doc,
         form_id,
@@ -214,16 +250,16 @@ fn extract_form_xobject_text_inner(
     style_cache: &mut FontStyleCache,
     depth: u8,
     budget: &mut FormWalkBudget,
-) -> Vec<TextItem> {
-    let mut items = Vec::new();
+) -> ExtractedText {
+    let mut extracted = ExtractedText::new();
 
     if !budget.charge_invocation() {
-        return items;
+        return extracted;
     }
 
     // Get the Form XObject stream
     let Ok(Object::Stream(stream)) = doc.get_object(form_id) else {
-        return items;
+        return extracted;
     };
 
     // Decompress the content stream (fall back to raw bytes for uncompressed streams)
@@ -238,8 +274,11 @@ fn extract_form_xobject_text_inner(
         &content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
     ) else {
-        return items;
+        return extracted;
     };
+    let items = &mut extracted.items;
+    let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
+    let rtl_logical_ops = &mut extracted.rtl_logical_ops;
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict);
@@ -393,7 +432,7 @@ fn extract_form_xobject_text_inner(
                         match form_xobjects.get(&xobj_name) {
                             Some(XObjectType::Form(nested_id)) => {
                                 if depth < MAX_FORM_XOBJECT_DEPTH && !budget.exhausted() {
-                                    let nested_items = extract_form_xobject_text_inner(
+                                    extract_form_xobject_text_inner(
                                         doc,
                                         *nested_id,
                                         page_num,
@@ -403,8 +442,12 @@ fn extract_form_xobject_text_inner(
                                         style_cache,
                                         depth + 1,
                                         budget,
+                                    )
+                                    .append_into(
+                                        items,
+                                        rtl_visual_candidates,
+                                        rtl_logical_ops,
                                     );
-                                    items.extend(nested_items);
                                 }
                             }
                             Some(XObjectType::Image) => {
@@ -614,6 +657,17 @@ fn extract_form_xobject_text_inner(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
+                            if crate::text_utils::is_visual_rtl_candidate(&text) {
+                                // Forward paint order (positive device-space
+                                // advance) may be visual storage; a mirrored
+                                // matrix already paints right-to-left. Rotated
+                                // matrices (combined[0] ≈ 0) stay neutral.
+                                if combined[0] > 0.0 {
+                                    rtl_visual_candidates.push(items.len());
+                                } else if combined[0] < 0.0 {
+                                    *rtl_logical_ops += 1;
+                                }
+                            }
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x,
@@ -657,11 +711,18 @@ fn extract_form_xobject_text_inner(
                         let mut current_text = String::new();
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
+                        // Positive TJ offsets beyond a space width move the pen
+                        // backward past painted glyphs — logical-order RTL
+                        // producers position runs right-to-left this way.
+                        let mut backward_jump = false;
                         for element in array {
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
                                     let displacement = -n_val / 1000.0 * current_font_size;
+                                    if n_val > space_threshold {
+                                        backward_jump = true;
+                                    }
                                     if !fill_is_white
                                         && n_val < -column_gap_threshold
                                         && !current_text.is_empty()
@@ -688,6 +749,9 @@ fn extract_form_xobject_text_inner(
                                 Object::Real(n) => {
                                     let n_val = *n;
                                     let displacement = -n_val / 1000.0 * current_font_size;
+                                    if n_val > space_threshold {
+                                        backward_jump = true;
+                                    }
                                     if !fill_is_white
                                         && n_val < -column_gap_threshold
                                         && !current_text.is_empty()
@@ -773,6 +837,13 @@ fn extract_form_xobject_text_inner(
                                 } else {
                                     0.0
                                 };
+                                if crate::text_utils::is_visual_rtl_candidate(text) {
+                                    if scale_x > 0.0 && !backward_jump {
+                                        rtl_visual_candidates.push(items.len());
+                                    } else if backward_jump || scale_x < 0.0 {
+                                        *rtl_logical_ops += 1;
+                                    }
+                                }
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
                                     x,
@@ -807,7 +878,7 @@ fn extract_form_xobject_text_inner(
         }
     }
 
-    items
+    extracted
 }
 
 /// Get fonts from a Form XObject's Resources
@@ -955,6 +1026,7 @@ mod tests {
             &mut FontStyleCache::new(),
             budget,
         )
+        .items
     }
 
     #[test]

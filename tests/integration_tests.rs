@@ -1310,6 +1310,40 @@ fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
 }
 
+/// Base-Hebrew text stored in visual (screen left-to-right) order: each show
+/// op's characters are reversed relative to reading order and ops paint
+/// left-to-right across the line. Extraction must reverse each run back to
+/// logical order.
+#[test]
+fn test_snapshot_hebrew_visual_order() {
+    assert_snapshot("hebrew_visual_order");
+    let output = pdf_inspector::process_pdf("tests/fixtures/hebrew_visual_order.pdf")
+        .unwrap()
+        .markdown
+        .unwrap_or_default();
+    assert!(
+        output.contains("שלום עולם") && output.contains("דוח על הסיכונים"),
+        "visual-order Hebrew must extract in logical order, got: {output}"
+    );
+}
+
+/// Base-Hebrew text stored in logical (reading) order: each show op holds one
+/// word in reading order and successive ops are positioned right-to-left
+/// (the OCR-text-layer convention). Extraction must NOT reverse these runs —
+/// a codepoint-only trigger would corrupt them.
+#[test]
+fn test_snapshot_hebrew_logical_order() {
+    assert_snapshot("hebrew_logical_order");
+    let output = pdf_inspector::process_pdf("tests/fixtures/hebrew_logical_order.pdf")
+        .unwrap()
+        .markdown
+        .unwrap_or_default();
+    assert!(
+        output.contains("שלום עולם") && output.contains("דוח על הסיכונים"),
+        "logical-order Hebrew must stay in logical order, got: {output}"
+    );
+}
+
 /// First two pages of Shannon's "A Mathematical Theory of Communication"
 /// (1998 dvips 5.58 → Distiller 3 retypesetting). Canonical legacy-TeX PDF:
 /// non-embedded base-14 fonts with no /Widths (exercises the built-in AFM

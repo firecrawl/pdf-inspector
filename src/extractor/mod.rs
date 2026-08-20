@@ -1005,6 +1005,10 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
             group.sort_by(|a, b| b.x.total_cmp(&a.x));
+            // Embedded LTR phrases must recover screen order before merging
+            // bakes the concatenation in — later sort_line_items passes can
+            // no longer separate a merged item.
+            crate::text_utils::restore_embedded_ltr_runs(&mut group, |i| i.text.as_str());
         } else if !preserve_stream_order {
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
         }

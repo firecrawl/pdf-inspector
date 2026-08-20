@@ -156,6 +156,12 @@ pub(crate) fn extract_page_text_items(
     let mut clip_rects: Vec<PdfRect> = Vec::new();
     let mut lines: Vec<PdfLine> = Vec::new();
     let mut underline_lines: Vec<UnderlineLine> = Vec::new();
+    // Indexes of items whose raw decoded text is a multi-character RTL run
+    // that may be stored in visual order (see fix_visual_order_rtl), plus a
+    // count of show ops whose glyph progression walked right-to-left —
+    // evidence of logical-order storage.
+    let mut rtl_visual_candidates: Vec<usize> = Vec::new();
+    let mut rtl_logical_ops: u32 = 0;
 
     // Path construction state for m/l/h → S/s line extraction
     let mut path_subpath_start: Option<(f32, f32)> = None;
@@ -555,6 +561,20 @@ pub(crate) fn extract_page_text_items(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
+                            if crate::text_utils::is_visual_rtl_candidate(&text) {
+                                // combined[0] is the device-space advance
+                                // direction: forward paint order means the
+                                // string may be stored in visual order, a
+                                // mirrored matrix already paints right-to-left
+                                // (logical storage). Rotated matrices
+                                // (combined[0] ≈ 0) carry no horizontal
+                                // evidence and stay neutral.
+                                if combined[0] > 0.0 {
+                                    rtl_visual_candidates.push(items.len());
+                                } else if combined[0] < 0.0 {
+                                    rtl_logical_ops += 1;
+                                }
+                            }
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x,
@@ -618,11 +638,18 @@ pub(crate) fn extract_page_text_items(
                         let mut current_text = String::new();
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
+                        // Positive TJ offsets beyond a space width move the pen
+                        // backward past painted glyphs — logical-order RTL
+                        // producers position runs right-to-left this way.
+                        let mut backward_jump = false;
                         for element in array {
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
                                     let displacement = -n_val / 1000.0 * current_font_size;
+                                    if n_val > space_threshold {
+                                        backward_jump = true;
+                                    }
                                     if !is_invisible
                                         && n_val < -column_gap_threshold
                                         && !current_text.is_empty()
@@ -650,6 +677,9 @@ pub(crate) fn extract_page_text_items(
                                 Object::Real(n) => {
                                     let n_val = *n;
                                     let displacement = -n_val / 1000.0 * current_font_size;
+                                    if n_val > space_threshold {
+                                        backward_jump = true;
+                                    }
                                     if !is_invisible
                                         && n_val < -column_gap_threshold
                                         && !current_text.is_empty()
@@ -743,6 +773,13 @@ pub(crate) fn extract_page_text_items(
                                 } else {
                                     0.0
                                 };
+                                if crate::text_utils::is_visual_rtl_candidate(text) {
+                                    if scale_x > 0.0 && !backward_jump {
+                                        rtl_visual_candidates.push(items.len());
+                                    } else if backward_jump || scale_x < 0.0 {
+                                        rtl_logical_ops += 1;
+                                    }
+                                }
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
                                     x,
@@ -854,6 +891,13 @@ pub(crate) fn extract_page_text_items(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
+                            if crate::text_utils::is_visual_rtl_candidate(&text) {
+                                if combined[0] > 0.0 {
+                                    rtl_visual_candidates.push(items.len());
+                                } else if combined[0] < 0.0 {
+                                    rtl_logical_ops += 1;
+                                }
+                            }
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x,
@@ -921,7 +965,7 @@ pub(crate) fn extract_page_text_items(
                                 }
                                 XObjectType::Form(form_id) => {
                                     // Extract text from Form XObject
-                                    let form_items = extract_form_xobject_text(
+                                    extract_form_xobject_text(
                                         doc,
                                         *form_id,
                                         page_num,
@@ -930,8 +974,12 @@ pub(crate) fn extract_page_text_items(
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
+                                    )
+                                    .append_into(
+                                        &mut items,
+                                        &mut rtl_visual_candidates,
+                                        &mut rtl_logical_ops,
                                     );
-                                    items.extend(form_items);
                                 }
                             }
                         }
@@ -1339,6 +1387,10 @@ pub(crate) fn extract_page_text_items(
             rects = clip_rects;
         }
     }
+
+    // Reverse visual-order RTL runs while candidate indexes are still valid
+    // (merge_text_items below reshapes the item list).
+    crate::text_utils::fix_visual_order_rtl(&mut items, &rtl_visual_candidates, rtl_logical_ops);
 
     // Detect dominant text rotation and transform coordinates if needed.
     // Some PDFs embed landscape content in portrait pages using a rotated text
@@ -1898,6 +1950,123 @@ BT 30 700 Tm <41> Tj ET";
             .collect::<String>();
 
         assert_eq!(text, "XYX");
+    }
+
+    /// Build a one-page document whose F1 font maps bytes 41-44 to Hebrew
+    /// שלום letters (41→ש 42→ל 43→ו 44→ם) via ToUnicode, run extraction, and
+    /// return the items.
+    fn extract_hebrew_items(content: &[u8]) -> Vec<TextItem> {
+        use crate::tounicode::FontCMaps;
+        use lopdf::{dictionary, Object, Stream};
+
+        let cmap = br#"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Test-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+4 beginbfchar
+<41> <05E9>
+<42> <05DC>
+<43> <05D5>
+<44> <05DD>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end"#;
+        let mut doc = lopdf::Document::new();
+        let cmap_id = doc.add_object(Object::Stream(Stream::new(dictionary! {}, cmap.to_vec())));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "TestHebrew",
+            "ToUnicode" => Object::Reference(cmap_id),
+        });
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            content.to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog = dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        };
+        doc.add_object(catalog);
+
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        items
+    }
+
+    const SHALOM_LOGICAL: &str = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}"; // שלום
+
+    #[test]
+    fn visual_order_hebrew_ops_are_reversed() {
+        // Two show ops on one baseline painted left-to-right, each holding
+        // the visual (reversed) string — the shaped-visible-text convention.
+        let content = b"BT /F1 12 Tf 100 700 Tm <44434241> Tj 60 0 Td <44434241> Tj ET";
+        let items = extract_hebrew_items(content);
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(item.text, SHALOM_LOGICAL, "visual run must be reversed");
+        }
+    }
+
+    #[test]
+    fn logical_order_hebrew_ops_stay_logical() {
+        // Two show ops positioned right-to-left, each already in reading
+        // order — the OCR-text-layer convention. Must NOT be reversed.
+        let content = b"BT /F1 12 Tf 160 700 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
+        let items = extract_hebrew_items(content);
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(
+                item.text, SHALOM_LOGICAL,
+                "logical run must not be reversed"
+            );
+        }
+    }
+
+    #[test]
+    fn tj_backward_jump_marks_logical_storage() {
+        // A single TJ whose positive offset moves the pen backward past the
+        // painted glyphs: logical-order storage positioning runs
+        // right-to-left inside one op. No reversal.
+        let content = b"BT /F1 12 Tf 160 700 Tm [<41424344> 6000 <41424344>] TJ ET";
+        let items = extract_hebrew_items(content);
+        assert!(!items.is_empty());
+        for item in &items {
+            assert!(
+                item.text.contains(SHALOM_LOGICAL),
+                "backward-jump TJ must not be reversed: {:?}",
+                item.text
+            );
+        }
     }
 
     #[test]

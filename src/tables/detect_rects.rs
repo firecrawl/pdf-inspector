@@ -1710,21 +1710,34 @@ pub(crate) fn assign_items_to_grid(
         }
     }
 
-    // Build cell strings: sort items within each cell by Y descending then X ascending
+    // Build cell strings: sort items within each cell by Y descending then X
+    // in reading direction (ascending, or descending for RTL cells — same
+    // direction-awareness as the heuristic detector's cell join)
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(num_rows);
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(num_cols);
         for col_items in row_items.iter_mut() {
+            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|(_, i)| &i.text));
             col_items.sort_by(|a, b| {
                 b.1.y
                     .partial_cmp(&a.1.y)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| {
-                        a.1.x
-                            .partial_cmp(&b.1.x)
+                        let (first, second) = if rtl { (b, a) } else { (a, b) };
+                        first
+                            .1
+                            .x
+                            .partial_cmp(&second.1.x)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
             });
+            if rtl {
+                crate::text_utils::restore_embedded_ltr_runs_by_baseline(
+                    col_items,
+                    |(_, i)| i.y,
+                    |(_, i)| i.text.as_str(),
+                );
+            }
             let text = col_items
                 .iter()
                 .map(|(_, item)| item.text.trim())

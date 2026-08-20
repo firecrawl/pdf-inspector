@@ -1036,6 +1036,11 @@ fn detect_table_in_region(
             let rtl = is_rtl_text(col_items.iter().map(|i| &i.text));
             if rtl {
                 col_items.sort_by(|a, b| b.x.total_cmp(&a.x));
+                crate::text_utils::restore_embedded_ltr_runs_by_baseline(
+                    col_items,
+                    |i| i.y,
+                    |i| i.text.as_str(),
+                );
             } else {
                 col_items.sort_by(|a, b| a.x.total_cmp(&b.x));
             }
