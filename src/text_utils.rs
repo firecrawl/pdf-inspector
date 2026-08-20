@@ -321,35 +321,50 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
     result
 }
 
+/// Digits that fall inside the Arabic codepoint block but are stored and
+/// displayed left-to-right like ASCII digits (bidi class AN): Arabic-Indic
+/// (٠-٩) and Extended Arabic-Indic (۰-۹). Reversal must keep their runs
+/// intact — reversing them corrupts every number in the document.
+fn is_arabic_indic_digit(c: char) -> bool {
+    matches!(c, '\u{0660}'..='\u{0669}' | '\u{06F0}'..='\u{06F9}')
+}
+
+fn is_forward_alnum(c: char) -> bool {
+    c.is_ascii_alphanumeric() || is_arabic_indic_digit(c)
+}
+
 /// Reverse visual-order Arabic text to logical order.
 ///
-/// Pure RTL text (no ASCII alphanumerics) gets a simple character reversal.
-/// Mixed content (embedded numbers or Latin words) splits into LTR and non-LTR
-/// runs: run order is reversed, and only non-LTR runs are reversed internally.
+/// Pure RTL text (no forward-ordered alphanumerics) gets a simple character
+/// reversal. Mixed content (embedded numbers or Latin words) splits into LTR
+/// and non-LTR runs: run order is reversed, and only non-LTR runs are
+/// reversed internally.
 fn reverse_visual_arabic(text: &str) -> String {
-    // Check if there are any LTR runs (ASCII letters or digits)
-    let has_ltr = text.chars().any(|c| c.is_ascii_alphanumeric());
+    // Check if there are any LTR runs (Latin letters or digits of either
+    // numbering system)
+    let has_ltr = text.chars().any(is_forward_alnum);
 
     if !has_ltr {
         // Pure RTL: simple reversal
         return reverse_keeping_marks(text);
     }
 
-    // Mixed content: split into runs of LTR (ASCII alphanumeric + adjacent
-    // punctuation like '.', ',', '/', '-') vs non-LTR (Arabic + spaces + other).
+    // Mixed content: split into runs of LTR (forward-ordered alphanumerics +
+    // adjacent punctuation like '.', ',', '/', '-') vs non-LTR (Arabic +
+    // spaces + other).
     let chars: Vec<char> = text.chars().collect();
     let mut runs: Vec<(bool, String)> = Vec::new(); // (is_ltr, content)
 
     let mut i = 0;
     while i < chars.len() {
-        let is_ltr = chars[i].is_ascii_alphanumeric()
-            || (chars[i].is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
+        let is_ltr = is_forward_alnum(chars[i])
+            || (chars[i].is_ascii_punctuation() && is_adjacent_to_alnum(&chars, i));
 
         let mut run = String::new();
         while i < chars.len() {
             let c = chars[i];
-            let c_is_ltr = c.is_ascii_alphanumeric()
-                || (c.is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
+            let c_is_ltr = is_forward_alnum(c)
+                || (c.is_ascii_punctuation() && is_adjacent_to_alnum(&chars, i));
             if c_is_ltr != is_ltr {
                 break;
             }
@@ -406,10 +421,11 @@ fn mirror_bracket(c: char) -> char {
     }
 }
 
-/// Check if the character at `idx` is adjacent to an ASCII alphanumeric character.
-fn is_adjacent_to_ascii_alnum(chars: &[char], idx: usize) -> bool {
-    (idx > 0 && chars[idx - 1].is_ascii_alphanumeric())
-        || (idx + 1 < chars.len() && chars[idx + 1].is_ascii_alphanumeric())
+/// Check if the character at `idx` is adjacent to a forward-ordered
+/// alphanumeric character (ASCII or Arabic-Indic digit).
+fn is_adjacent_to_alnum(chars: &[char], idx: usize) -> bool {
+    (idx > 0 && is_forward_alnum(chars[idx - 1]))
+        || (idx + 1 < chars.len() && is_forward_alnum(chars[idx + 1]))
 }
 
 /// A decoded show-op string qualifies for geometric visual-order RTL fixing
@@ -417,11 +433,18 @@ fn is_adjacent_to_ascii_alnum(chars: &[char], idx: usize) -> bool {
 /// character reads the same in either storage order. Arabic presentation
 /// forms are excluded: their presence already triggers reversal inside
 /// `expand_ligatures`, so flagging them here would reverse twice.
+/// Arabic-Indic digits don't count toward the threshold: they're stored
+/// left-to-right in both conventions, so a bare number carries no evidence
+/// and must never be reversed.
 pub(crate) fn is_visual_rtl_candidate(text: &str) -> bool {
     if text.chars().any(is_arabic_presentation_form) {
         return false;
     }
-    text.chars().filter(|&c| is_rtl_char(c)).count() >= 2 && is_rtl_text(std::iter::once(text))
+    text.chars()
+        .filter(|&c| is_rtl_char(c) && !is_arabic_indic_digit(c))
+        .count()
+        >= 2
+        && is_rtl_text(std::iter::once(text))
 }
 
 /// Reverse multi-character RTL runs stored in visual (screen left-to-right)
@@ -1148,6 +1171,25 @@ mod tests {
         assert!(!is_visual_rtl_candidate("the word \u{05E9}\u{05DC} here"));
         // Pure Latin
         assert!(!is_visual_rtl_candidate("Hello"));
+        // Arabic-Indic digits are stored left-to-right in both conventions:
+        // a bare "٢٤" run must never be reversed into "٤٢"
+        assert!(!is_visual_rtl_candidate("\u{0662}\u{0664}"));
+        assert!(!is_visual_rtl_candidate("\u{0663}\u{0665},\u{0660}"));
+    }
+
+    #[test]
+    fn reverse_visual_arabic_keeps_arabic_indic_digit_runs() {
+        // Visual storage of "٢٤ ساعة" (24 hours): letters are reversed on
+        // screen but the digit run stays left-to-right, like ASCII digits.
+        let input = "\u{0629}\u{0639}\u{0627}\u{0633} \u{0662}\u{0664}"; // ةعاس ٢٤
+        let result = reverse_visual_arabic(input);
+        assert_eq!(
+            result,
+            "\u{0662}\u{0664} \u{0633}\u{0627}\u{0639}\u{0629}" // ٢٤ ساعة
+        );
+        // Decimal fragment with punctuation glued to digits stays intact
+        let decimal = "\u{0663}\u{0665},\u{0660}"; // ٣٥,٠
+        assert_eq!(reverse_visual_arabic(decimal), decimal);
     }
 
     fn make_rtl_item(text: &str, x: f32, y: f32) -> TextItem {
