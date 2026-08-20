@@ -223,6 +223,13 @@ fn argument_value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>,
         .transpose()
 }
 
+/// The non-OCR error envelope, mirroring `format_ocr_error_json`. Kept as a
+/// function so both `--json` exit paths escape identically and a test can pin
+/// the emitted object rather than the escaper alone.
+fn format_error_json(error: &str) -> String {
+    format!(r#"{{"error":"{}"}}"#, json_escape(error))
+}
+
 fn format_ocr_error_json(error: &str) -> String {
     format!(r#"{{"schema_version":1,"error":"{}"}}"#, json_escape(error))
 }
@@ -259,7 +266,7 @@ fn extract_items_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_items_json, format_items_json, format_ocr_error_json};
+    use super::{extract_items_json, format_error_json, format_items_json, format_ocr_error_json};
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     use super::{format_ocr_json, process_pdf_with_ocr, OcrPdfOptions};
     use pdf_inspector::extractor::ItemType;
@@ -330,6 +337,21 @@ mod tests {
         assert_eq!(
             format_ocr_error_json("bad \"value\""),
             r#"{"schema_version":1,"error":"bad \"value\""}"#
+        );
+    }
+
+    #[test]
+    fn convert_json_errors_are_escaped() {
+        // The conversion path interpolates its error straight into a JSON
+        // object. A PdfError message carrying a quote or a newline made that
+        // object unparseable for anything consuming --json.
+        let error = pdf_inspector::PdfError::Parse(
+            "missing required dictionary key \"Pages\"\nwhile loading catalog".to_string(),
+        );
+
+        assert_eq!(
+            format_error_json(&error.to_string()),
+            r#"{"error":"PDF parsing error: missing required dictionary key \"Pages\"\nwhile loading catalog"}"#
         );
     }
 }
@@ -597,7 +619,7 @@ fn main() {
         match extract_items_json(pdf_path, page_filter.as_ref(), password.as_deref()) {
             Ok(json) => println!("{}", json),
             Err(e) => {
-                println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));
+                println!("{}", format_error_json(&e.to_string()));
                 process::exit(1);
             }
         }
@@ -811,7 +833,7 @@ fn main() {
         }
         Err(e) => {
             if json_output {
-                println!(r#"{{"error":"{}"}}"#, e);
+                println!("{}", format_error_json(&e.to_string()));
             } else {
                 eprintln!("Error: {}", e);
             }
