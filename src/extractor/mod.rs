@@ -874,20 +874,24 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
 
     // Word gaps, if present, form a second mode above the letter-gap
     // cluster: split at the largest relative jump. Unimodal → one word.
+    let floor = largest_relative_gap_jump(&sorted, 1.4).unwrap_or(f32::INFINITY);
+    Some((end, floor * fs))
+}
+
+/// Find the midpoint between the two sorted gap classes with the largest
+/// relative jump, if that jump clears `minimum_jump`.
+fn largest_relative_gap_jump(sorted: &[f32], minimum_jump: f32) -> Option<f32> {
     let mut best_jump = 1.0f32;
-    let mut floor = f32::INFINITY;
+    let mut floor = None;
     for pair in sorted.windows(2) {
         let (lo, hi) = (pair[0].max(0.01), pair[1].max(0.01));
         let jump = hi / lo;
         if jump > best_jump {
             best_jump = jump;
-            floor = (lo + hi) / 2.0;
+            floor = Some((lo + hi) / 2.0);
         }
     }
-    if best_jump < 1.4 {
-        floor = f32::INFINITY;
-    }
-    Some((end, floor * fs))
+    (best_jump >= minimum_jump).then_some(floor?)
 }
 
 /// Recover mixed-case, multi-word tracking from a clearly bimodal gap series.
@@ -906,21 +910,12 @@ fn title_case_tracked_floor(
 ) -> Option<(usize, f32)> {
     let mut positive: Vec<f32> = gaps.iter().copied().filter(|gap| *gap > 0.08).collect();
     positive.sort_by(|a, b| a.total_cmp(b));
-    if positive.len() < 4 || positive[positive.len() / 2] <= 0.10 {
+    if positive.len() < 4 {
         return None;
     }
 
-    let mut best_jump = 1.0f32;
-    let mut floor = f32::INFINITY;
-    for pair in positive.windows(2) {
-        let (lo, hi) = (pair[0], pair[1]);
-        let jump = hi / lo;
-        if jump > best_jump {
-            best_jump = jump;
-            floor = (lo + hi) / 2.0;
-        }
-    }
-    if best_jump < 1.75 || positive.last().is_some_and(|last| *last - floor < 0.08) {
+    let floor = largest_relative_gap_jump(&positive, 1.75)?;
+    if positive.last().is_some_and(|last| *last - floor < 0.08) {
         return None;
     }
 
@@ -1414,6 +1409,20 @@ mod tests {
         let mut items = glyph_run("JohnDoe", 100.0, 9.0, 2.2);
         for item in items.iter_mut().skip(4) {
             item.x += 2.8;
+        }
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "John Doe");
+    }
+
+    #[test]
+    fn tracked_title_case_run_recovers_narrow_letter_gaps() {
+        // Uppercase junctions split at 0.08 em even when lowercase junctions
+        // remain below their 0.13-em threshold. The bimodal word gap must
+        // still recover the title-case words.
+        let mut items = glyph_run("JohnDoe", 100.0, 9.0, 1.1);
+        for item in items.iter_mut().skip(4) {
+            item.x += 2.1;
         }
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
