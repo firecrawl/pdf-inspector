@@ -15,6 +15,10 @@ use pdf_inspector::{
 use std::collections::HashSet;
 
 fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
+    make_page_pdf(content, &format!("/MediaBox [{media_box}]"))
+}
+
+fn make_page_pdf(content: &str, page_entries: &str) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
 
@@ -41,9 +45,7 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
         &mut pdf,
         &mut offsets,
         3,
-        &format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
-        ),
+        &format!("<< /Type /Page /Parent 2 0 R {page_entries} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
     );
 
     add_object(
@@ -525,6 +527,79 @@ fn test_digit_only_text_runs_are_preserved_in_markdown() {
         result.markdown.expect("markdown output").trim(),
         "A) The total of 730 seats was approved.\nB) let log 2 = a\nC) Control: The total of 730 seats was approved. let log 2 = a"
     );
+}
+
+#[test]
+fn test_sparse_off_page_text_is_clipped_for_all_page_rotations() {
+    let content = "BT /F1 10 Tf 1 0 0 1 60 700 Tm (VISIBLE-PAGE) Tj \
+                   1 0 0 1 -200 650 Tm (HIDDEN-OFF-PAGE) Tj ET";
+
+    for rotation in [0, 90, 180, 270] {
+        let pdf = make_page_pdf(
+            content,
+            &format!("/MediaBox [0 0 612 792] /CropBox [50 50 562 742] /Rotate {rotation}"),
+        );
+        let items = extract_text_with_positions_mem(&pdf)
+            .unwrap_or_else(|error| panic!("rotation {rotation}: extract text: {error}"));
+        let text = items
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            text.contains("VISIBLE-PAGE"),
+            "rotation {rotation}: visible text was dropped: {text}"
+        );
+        assert!(
+            !text.contains("HIDDEN-OFF-PAGE"),
+            "rotation {rotation}: sparse off-page text survived: {text}"
+        );
+    }
+}
+
+#[test]
+fn test_sparse_off_page_text_is_clipped_after_embedded_rotation_normalization() {
+    let content = "BT /F1 10 Tf 0 10 -10 0 60 100 Tm (VISIBLE-ROTATED) Tj \
+                   0 10 -10 0 -500 642 Tm (HIDDEN-ROTATED) Tj ET";
+    let pdf = make_page_pdf(content, "/MediaBox [0 0 612 792] /CropBox [50 50 562 742]");
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let text = items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        text.contains("VISIBLE-ROTATED"),
+        "visible normalized text was dropped: {text}"
+    );
+    assert!(
+        !text.contains("HIDDEN-ROTATED"),
+        "sparse normalized off-page text survived: {text}"
+    );
+}
+
+#[test]
+fn test_sparse_clipping_preserves_continuations_and_short_fragments() {
+    let content = "BT /F1 10 Tf 1 0 0 1 520 700 Tm (Visible) Tj \
+                   1 0 0 1 555 700 Tm (Continuation) Tj \
+                   1 0 0 1 -100 650 Tm (a) Tj \
+                   1 0 0 1 -80 650 Tm (b) Tj \
+                   1 0 0 1 -60 650 Tm (c) Tj ET";
+    let pdf = make_page_pdf(content, "/MediaBox [0 0 612 792] /CropBox [50 50 562 742]");
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let text = items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(text.contains("Visible"));
+    assert!(text.contains("Continuation"));
+    assert!(text.contains("a"));
+    assert!(text.contains("b"));
+    assert!(text.contains("c"));
 }
 
 // ============================================================================
