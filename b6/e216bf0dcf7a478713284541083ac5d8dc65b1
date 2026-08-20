@@ -1,0 +1,21 @@
+src/markdown/analysis.rs
+  s_3fa7a2abc03ac9::t_c17884d1ad47c7 596-598,600-610
+src/tables/detect_heuristic.rs
+  s_3fa7a2abc03ac9::t_c17884d1ad47c7 1497
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b6e216bf0dcf7a478713284541083ac5d8dc65b1",
+  "prompts": {},
+  "sessions": {
+    "s_3fa7a2abc03ac9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9bb20049-a216-4dbf-9154-e1bfc58f484d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
