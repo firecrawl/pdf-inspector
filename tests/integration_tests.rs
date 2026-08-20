@@ -15,6 +15,14 @@ use pdf_inspector::{
 use std::collections::HashSet;
 
 fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
+    make_text_pdf_with_font(
+        content,
+        media_box,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    )
+}
+
+fn make_text_pdf_with_font(content: &str, media_box: &str, font_body: &str) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
 
@@ -56,12 +64,7 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
             content
         ),
     );
-    add_object(
-        &mut pdf,
-        &mut offsets,
-        5,
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-    );
+    add_object(&mut pdf, &mut offsets, 5, font_body);
 
     let xref_start = pdf.len();
     pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
@@ -259,6 +262,46 @@ fn make_digit_run_repro_pdf() -> Vec<u8> {
 1 0 0 1 72 720 Tm (C\) Control: The total of 730 seats was approved. let log 2 = a) Tj
 ET"#;
     make_text_pdf(content, "0 0 595 842")
+}
+
+fn make_mixed_case_tracked_text_pdf() -> Vec<u8> {
+    let lines = [
+        (750.0, "John Doe"),
+        (720.0, "Software Engineer"),
+        (690.0, "Senior Software Engineer"),
+    ];
+    let mut content = String::from("BT\n/F1 18 Tf\n");
+
+    // A simple font with almost-uniform 500-unit advances. The lone 800-unit
+    // `w` makes the following positioning gap negative, so the merge pass keeps
+    // `wa` together while spacing the other glyph pairs. The resulting mixed
+    // 1-2 character fragments defeat the existing strict `x y z` repair.
+    let mut widths = vec!["500"; 91]; // codes 32..=122
+    widths[(b'w' as usize) - 32] = "800";
+    let font_body = format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 122 /Widths [{}] >>",
+        widths.join(" ")
+    );
+
+    for (y, line) in lines {
+        let mut x = 72.0;
+        for character in line.chars() {
+            if character != ' ' {
+                content.push_str(&format!("1 0 0 1 {x:.1} {y:.1} Tm ({character}) Tj\n"));
+            }
+            // 0.70 em advance leaves a 0.20 em tracking gap after normal
+            // glyphs; a word adds another 0.28 em without exceeding the 0.5 em
+            // run-break limit.
+            if character == ' ' {
+                x += 5.0;
+            } else {
+                x += 12.6;
+            }
+        }
+    }
+
+    content.push_str("ET");
+    make_text_pdf_with_font(&content, "0 0 595 842", &font_body)
 }
 
 fn truncate_eof_marker(mut pdf: Vec<u8>) -> Vec<u8> {
@@ -524,6 +567,28 @@ fn test_digit_only_text_runs_are_preserved_in_markdown() {
     assert_eq!(
         result.markdown.expect("markdown output").trim(),
         "A) The total of 730 seats was approved.\nB) let log 2 = a\nC) Control: The total of 730 seats was approved. let log 2 = a"
+    );
+}
+
+#[test]
+fn test_mixed_case_tracked_text_rejoins_words() {
+    let pdf = make_mixed_case_tracked_text_pdf();
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    assert!(
+        items.iter().any(|item| item.text == "John Doe"),
+        "tracked title-case glyphs should merge into words, got {items:?}"
+    );
+
+    let result = process_pdf_mem(&pdf).expect("convert PDF to markdown");
+    let markdown = result.markdown.expect("markdown output");
+    assert!(
+        markdown.lines().any(|line| line.contains("John Doe")),
+        "tracked resume text should preserve words, got {markdown}"
+    );
+    assert!(
+        !markdown.contains("J o h n"),
+        "letter tracking must not split every glyph into a word: {markdown}"
     );
 }
 
