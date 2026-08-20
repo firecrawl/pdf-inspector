@@ -1721,7 +1721,7 @@ pub(crate) fn assign_items_to_grid(
             // split across items must not have its number reversed. RTL cells
             // sort right-to-left in baseline bands with embedded LTR phrases
             // kept in screen order.
-            let rtl = crate::text_utils::is_strong_rtl_text(col_items.iter().map(|(_, i)| &i.text));
+            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|(_, i)| &i.text));
             if rtl {
                 crate::text_utils::sort_rtl_cell_items(
                     col_items,

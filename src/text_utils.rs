@@ -151,36 +151,6 @@ where
     rtl > 0 && rtl > ltr
 }
 
-/// Like `is_rtl_text`, but only strong (letter) RTL characters count.
-/// Arabic-Indic digits, numeric separators, and combining marks sit in the
-/// RTL blocks yet carry no base direction of their own: a digit-only cell
-/// must keep left-to-right order, and vowel points must not out-vote the
-/// letters of a mixed-script cell.
-pub(crate) fn is_strong_rtl_text<I, S>(texts: I) -> bool
-where
-    I: Iterator<Item = S>,
-    S: AsRef<str>,
-{
-    let (mut rtl, mut ltr) = (0u32, 0u32);
-    for t in texts {
-        for c in t.as_ref().chars() {
-            // Combining marks count toward NEITHER side: Unicode gives nikud
-            // and harakat the Other_Alphabetic property, so is_alphabetic
-            // alone would tally them — as RTL they'd out-vote Latin, as LTR
-            // they'd out-vote a vocalized RTL cell's own letters.
-            if is_combining_mark(c) {
-                continue;
-            }
-            if is_rtl_char(c) && c.is_alphabetic() {
-                rtl += 1;
-            } else if c.is_alphabetic() && !is_cjk_char(c) {
-                ltr += 1;
-            }
-        }
-    }
-    rtl > 0 && rtl > ltr
-}
-
 /// Combining marks by general category (Mn) or nonzero canonical combining
 /// class. Both signals are needed: Thaana vowel signs are Mn with ccc 0,
 /// while some reordering marks are not Mn.
@@ -1297,32 +1267,21 @@ mod tests {
     }
 
     #[test]
-    fn strong_rtl_text_ignores_arabic_digits() {
-        // Digit-only content is direction-neutral
-        assert!(!is_strong_rtl_text(["\u{0662}\u{0664}"].iter()));
-        assert!(!is_strong_rtl_text(
-            ["\u{0663}\u{0665}\u{066B}\u{0660}"].iter()
-        ));
-        // Letters still decide
-        assert!(is_strong_rtl_text(["\u{0645}\u{0631}\u{062D}"].iter()));
-        assert!(is_strong_rtl_text(
-            ["\u{05E9}\u{05DC}\u{05D5}\u{05DD}"].iter()
-        ));
-        // Combining marks carry no base direction (Unicode marks nikud and
-        // harakat Other_Alphabetic, so is_alphabetic alone would count
-        // them): one heavily pointed Hebrew letter must not out-vote a
-        // longer Latin word in a mixed cell
-        assert!(!is_strong_rtl_text(
+    fn rtl_text_direction_ignores_marks_on_both_sides() {
+        // Marks must not count as RTL: one heavily pointed Hebrew letter
+        // must not out-vote a longer Latin word in a mixed cell
+        assert!(!is_rtl_text(
             ["AB", "\u{05D1}\u{05B8}\u{05B8}\u{05B8}\u{05B8}"].iter()
         ));
-        // ...and marks must not count as LTR either: a vocalized RTL cell
-        // (3 letters, 3 points) still out-votes a short Latin item
-        assert!(is_strong_rtl_text(
+        // ...and marks must not count as LTR either (they carry
+        // Other_Alphabetic): a vocalized RTL cell (3 letters, 3 points)
+        // still out-votes a short Latin item
+        assert!(is_rtl_text(
             ["\u{05E9}\u{05B8}\u{05DC}\u{05B8}\u{05DD}\u{05B8}", "ab"].iter()
         ));
         // Thaana vowel signs are Mn with combining class 0 — still marks:
         // they must not count as RTL letters
-        assert!(!is_strong_rtl_text(
+        assert!(!is_rtl_text(
             ["ABC", "\u{078C}\u{07A6}\u{07A6}\u{07A6}"].iter()
         ));
     }

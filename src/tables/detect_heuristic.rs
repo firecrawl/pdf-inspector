@@ -1036,7 +1036,7 @@ fn detect_table_in_region(
             // must not have its number reversed. RTL cells sort in baseline
             // bands so wrapped lines stay contiguous for the embedded-LTR
             // restoration (matching the rect and structure-tree detectors).
-            let rtl = crate::text_utils::is_strong_rtl_text(col_items.iter().map(|i| &i.text));
+            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|i| &i.text));
             if rtl {
                 crate::text_utils::sort_rtl_cell_items(
                     col_items,
