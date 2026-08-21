@@ -986,9 +986,22 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
 
     for item in &items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
+        let found = line_groups.iter_mut().find(|(pg, y, group)| {
+            if *pg != item.page {
+                return false;
+            }
+            let dy = (item.y - *y).abs();
+            if dy < y_tolerance {
+                return true;
+            }
+            // A script rides up to half an em off the baseline, which the flat
+            // tolerance clips from 12pt up. Widen it only for a short run that
+            // touches a larger neighbour, capped below the tightest sane
+            // leading, so ordinary line spacing still separates lines.
+            dy < (group[0].font_size * 0.6).min(7.0)
+                && is_script_text(&item.text)
+                && group.iter().any(|m| is_adjacent_script(m, item))
+        });
         if let Some((_, _, group)) = found {
             group.push(item);
         } else {
@@ -1021,6 +1034,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     let mut merged = Vec::new();
 
     for (_, _, group, preserve_stream_order) in &ordered_line_groups {
+        let line_max_font_size = group.iter().map(|i| i.font_size).fold(0.0_f32, f32::max);
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
@@ -1047,6 +1061,15 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 // full-size initial (see helper).
                 if (next.font_size - first.font_size).abs() > first.font_size * MERGE_FONT_SIZE_BAND
                     && !small_caps_join
+                {
+                    break;
+                }
+                // Glyphs of one run share a baseline. Among the script-sized
+                // runs, a neighbour set a fraction of an em lower is a stacked
+                // fraction's denominator ("1" over "3"), not the next
+                // character.
+                if first.font_size < line_max_font_size * 0.85
+                    && (next.y - first.y).abs() > first.font_size * 0.25
                 {
                     break;
                 }
@@ -1151,19 +1174,36 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
     // Group items by (page, approximate Y) with generous tolerance to capture
     // both the parent line and the subscript/superscript offset.
-    let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<TextItem>)> = Vec::new();
+    //
+    // Fractions are flagged before grouping: a numerator and its denominator
+    // straddle the baseline and land in different groups.
+    let fraction_numerator: Vec<bool> = (0..items.len())
+        .map(|i| starts_stacked_fraction(&items, i))
+        .collect();
 
-    for item in items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
+    let y_tolerance = 5.0;
+    let mut line_groups: Vec<ScriptLineGroup> = Vec::new();
+
+    for (item, is_fraction) in items.into_iter().zip(fraction_numerator) {
+        let found = line_groups.iter_mut().find(|(pg, y, group)| {
+            if *pg != item.page {
+                return false;
+            }
+            let dy = (item.y - *y).abs();
+            if dy < y_tolerance {
+                return true;
+            }
+            // Same widening as merge_text_items.
+            dy < (group[0].0.font_size * 0.6).min(7.0)
+                && is_script_text(&item.text)
+                && group.iter().any(|(m, _)| is_adjacent_script(m, &item))
+        });
         if let Some((_, _, group)) = found {
-            group.push(item);
+            group.push((item, is_fraction));
         } else {
             let page = item.page;
             let y = item.y;
-            line_groups.push((page, y, vec![item]));
+            line_groups.push((page, y, vec![(item, is_fraction)]));
         }
     }
 
@@ -1171,13 +1211,13 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
     for (_, _, mut group) in line_groups {
         // Sort by X position
-        group.sort_by(|a, b| a.x.total_cmp(&b.x));
+        group.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
 
         // Find the dominant (most common) font size in this group
-        let max_fs = group.iter().map(|i| i.font_size).fold(0.0_f32, f32::max);
+        let max_fs = group.iter().map(|i| i.0.font_size).fold(0.0_f32, f32::max);
 
         if max_fs < 1.0 {
-            result.extend(group);
+            result.extend(group.into_iter().map(|(item, _)| item));
             continue;
         }
 
@@ -1185,11 +1225,25 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
         // Walk through items and merge subscripts into their preceding parent
         let mut merged: Vec<TextItem> = Vec::new();
-        for item in group {
-            if item.font_size < sub_threshold
-                && item.font_size > 0.0
-                && item.text.len() <= 4
-                && item.text.chars().all(|c| c.is_ascii_digit())
+        let mut pending_numerator = false;
+        for (item, is_fraction_numerator) in group {
+            // Rejoin the halves of a stacked fraction the layout split across
+            // two baselines, so "3" + "1" over "3" reads as "3 1/3".
+            if pending_numerator {
+                pending_numerator = false;
+                if let Some(numerator) = merged.last_mut() {
+                    numerator.text.push('/');
+                    numerator.text.push_str(&item.text);
+                    numerator.width = (item.x + item.width - numerator.x).max(numerator.width);
+                    continue;
+                }
+            }
+            if is_fraction_numerator {
+                pending_numerator = true;
+                merged.push(item);
+                continue;
+            }
+            if item.font_size < sub_threshold && item.font_size > 0.0 && is_script_text(&item.text)
             {
                 // This is a candidate numeric subscript/superscript (e.g. "2" in H₂O).
                 // Only merge purely numeric text to avoid false positives with small
@@ -1204,6 +1258,16 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                         .chars()
                         .last()
                         .is_some_and(|c| c.is_alphabetic());
+                    // A digit carries an exponent only when the script is
+                    // raised; a lowered script always follows a letter, which
+                    // the clause above already admits.
+                    let ends_with_digit = parent
+                        .text
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_ascii_digit());
+                    let scripted_digit =
+                        ends_with_digit && item.y > parent.y + parent.font_size * 0.15;
                     // Strikeout boundaries block the merge (a struck word
                     // must not extend its strike over a live footnote digit,
                     // and a struck digit must not lose its own mark). An
@@ -1214,7 +1278,10 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     let marks_ok = parent.is_strikeout == item.is_strikeout
                         && (parent.is_underline == item.is_underline
                             || (parent.is_underline && !item.is_underline));
-                    if parent.font_size >= sub_threshold && ends_with_letter && marks_ok {
+                    if parent.font_size >= sub_threshold
+                        && (ends_with_letter || scripted_digit)
+                        && marks_ok
+                    {
                         let parent_right = parent.x + parent.width;
                         let gap = item.x - parent_right;
                         // Subscripts must be tightly adjacent (within ~1pt)
@@ -1244,17 +1311,70 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     result
 }
 
-/// Map ASCII digits to their Unicode superscript (`raised`) or subscript
-/// forms. Callers guarantee digit-only input (see `merge_subscript_items`);
-/// anything else passes through unchanged.
+/// Text a script may consist of: digits, optionally signed. An exponent is
+/// `-3` as often as `3`, and an ionic charge is `2+`; restricting to bare
+/// digits drops both.
+/// Page, anchor baseline, and the line's items each flagged as a stacked
+/// fraction's numerator.
+type ScriptLineGroup = (u32, f32, Vec<(TextItem, bool)>);
+
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A raised small digit whose next neighbour is an equally small digit sitting
+/// lower at the same X is a stacked fraction's numerator ("3 1/3"), not an
+/// exponent.
+fn starts_stacked_fraction(items: &[TextItem], idx: usize) -> bool {
+    let Some(numerator) = items.get(idx) else {
+        return false;
+    };
+    let Some(next) = items.get(idx + 1) else {
+        return false;
+    };
+    let drop = numerator.y - next.y;
+    (next.font_size - numerator.font_size).abs() <= numerator.font_size * 0.25
+        && drop > 0.0
+        && drop < numerator.font_size * 1.3
+        && (next.x - numerator.x).abs() < numerator.font_size
+        && is_digits(&numerator.text)
+        && is_digits(&next.text)
+}
+
+/// A script is set smaller than, and touches, the glyph it rides on. An
+/// isolated small run (a chart axis label) touches nothing.
+fn is_adjacent_script(parent: &TextItem, item: &TextItem) -> bool {
+    if item.font_size >= parent.font_size * 0.85 {
+        return false;
+    }
+    let reach = parent.font_size * 0.35;
+    (item.x - (parent.x + parent.width)).abs() < reach
+        || (parent.x - (item.x + item.width)).abs() < reach
+}
+
+fn is_script_text(text: &str) -> bool {
+    const SIGNS: [char; 4] = ['-', '+', '\u{2212}', '\u{2013}'];
+    let core = text.trim_matches(|c| SIGNS.contains(&c));
+    !core.is_empty()
+        && core.len() <= 4
+        && core.chars().all(|c| c.is_ascii_digit())
+        && text.len() - core.len() <= 1
+}
+
+/// Map a script to its Unicode superscript (`raised`) or subscript forms.
+/// Callers guarantee `is_script_text`; anything else passes through unchanged.
 fn map_script_digits(text: &str, raised: bool) -> String {
     const SUP: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
     const SUB: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
     text.chars()
-        .map(|c| match c.to_digit(10) {
-            Some(d) if raised => SUP[d as usize],
-            Some(d) => SUB[d as usize],
-            None => c,
+        .map(|c| match (c.to_digit(10), c, raised) {
+            (Some(d), _, true) => SUP[d as usize],
+            (Some(d), _, false) => SUB[d as usize],
+            (None, '-' | '\u{2212}' | '\u{2013}', true) => '\u{207B}',
+            (None, '-' | '\u{2212}' | '\u{2013}', false) => '\u{208B}',
+            (None, '+', true) => '\u{207A}',
+            (None, '+', false) => '\u{208A}',
+            _ => c,
         })
         .collect()
 }
@@ -3379,5 +3499,58 @@ mod tests {
         ];
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_subscript_items_exponent_on_digit() {
+        // 10⁻³: the exponent is raised and signed, and its parent is a number
+        let items = vec![
+            make_item_fs("10", 78.0, 499.0, 11.0, 10.0),
+            make_item_fs("-3", 89.0, 503.5, 5.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "10⁻³");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_rise_beyond_flat_tolerance() {
+        // A 12pt run raises its superscript past the flat 5pt line tolerance
+        let items = vec![
+            make_item_fs("x", 72.0, 700.0, 6.7, 12.0),
+            make_item_fs("2", 78.7, 705.0, 4.0, 8.0),
+            make_item_fs(" done", 82.7, 700.0, 28.0, 12.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "x²");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_stacked_fraction_rejoins() {
+        // "3 1/3": the numerator rides above the denominator at the same X, so
+        // it is a fraction, not an exponent
+        let items = vec![
+            make_item_fs("about 3", 60.0, 499.0, 30.0, 8.0),
+            make_item_fs("1", 91.0, 502.0, 2.3, 4.7),
+            make_item_fs("3", 91.0, 497.0, 2.3, 4.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "about 3");
+        assert_eq!(merged[1].text, "1/3");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_chart_axis() {
+        // Stacked axis labels are small digits too, but touch nothing and sit
+        // an axis tick apart
+        let items = vec![
+            make_item_fs("12", 40.0, 700.0, 6.0, 6.0),
+            make_item_fs("10", 40.0, 670.0, 6.0, 6.0),
+            make_item_fs("8", 43.0, 640.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 3);
     }
 }
