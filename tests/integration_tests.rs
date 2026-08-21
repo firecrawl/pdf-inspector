@@ -10,7 +10,7 @@ use pdf_inspector::{
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
     process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
-    PdfType, TextItem,
+    PdfType, ProcessMode, TextItem,
 };
 use std::collections::HashSet;
 
@@ -1148,6 +1148,57 @@ fn test_process_pdf_mem_repairs_truncated_eof_marker() {
             .unwrap_or_default()
             .contains("Hello World"),
         "repaired PDF should still extract text"
+    );
+}
+
+#[test]
+fn test_process_pdf_mem_suppressed_extraction_has_zero_confidence() {
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let result = process_pdf_mem(&buf).unwrap();
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "suppressed undecodable text should not claim usable markdown"
+    );
+    assert!(result.pages_needing_ocr.contains(&1));
+    assert_eq!(
+        result.confidence, 0.0,
+        "a TextBased result with no usable markdown must not claim certainty"
+    );
+}
+
+#[test]
+fn test_process_pdf_mem_analyze_mode_retains_detection_confidence() {
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let result =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().mode(ProcessMode::Analyze)).unwrap();
+
+    assert_eq!(result.markdown, None);
+    assert_eq!(
+        result.confidence, 1.0,
+        "Analyze mode intentionally omits markdown and keeps detector confidence"
+    );
+}
+
+#[test]
+fn test_process_pdf_mem_sparse_usable_text_retains_confidence() {
+    let result = process_pdf_mem(&make_minimal_text_pdf()).unwrap();
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(result
+        .markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Hello World"));
+    assert_eq!(
+        result.confidence, 1.0,
+        "sparse but usable text should retain TextBased confidence"
     );
 }
 
