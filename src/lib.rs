@@ -4224,24 +4224,18 @@ fn find_standalone_keyword(buf: &[u8], start: usize, end: usize, keyword: &[u8])
 
     let mut pos = start;
     while pos < end {
-        match buf[pos] {
-            byte if byte.is_ascii_whitespace() => pos += 1,
-            b'%' => {
-                while pos < end && !matches!(buf[pos], b'\n' | b'\r') {
-                    pos += 1;
-                }
-            }
-            _ => {
-                let before_ok = pos == 0 || buf[pos - 1].is_ascii_whitespace();
-                let after_ok = buf
-                    .get(pos + keyword.len())
-                    .is_none_or(u8::is_ascii_whitespace);
-                if before_ok && after_ok && buf[pos..end].starts_with(keyword) {
-                    return Some(pos);
-                }
-                pos += 1;
-            }
+        skip_pdf_whitespace_and_comments(buf, &mut pos, end);
+        if pos >= end {
+            break;
         }
+
+        let after_ok = buf
+            .get(pos + keyword.len())
+            .is_none_or(u8::is_ascii_whitespace);
+        if after_ok && buf[pos..end].starts_with(keyword) {
+            return Some(pos);
+        }
+        pos += 1;
     }
 
     None
