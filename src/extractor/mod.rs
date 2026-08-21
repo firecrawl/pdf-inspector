@@ -3091,7 +3091,7 @@ mod tests {
 
     #[test]
     fn test_tabular_layout_detection() {
-        // Sparse columns (<15 lines) → tabular, not newspaper
+        // Sparse 4-column layout (<15 lines per column) → tabular, not newspaper
         let make_line = |y: f32, x: f32, page: u32| TextLine {
             y,
             page,
@@ -3100,7 +3100,7 @@ mod tests {
                 text: "text".into(),
                 x,
                 y,
-                width: 100.0,
+                width: 50.0,
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
@@ -3119,20 +3119,34 @@ mod tests {
             .map(|i| make_line(700.0 - i as f32 * 14.0, 50.0, 1))
             .collect();
         let col2: Vec<TextLine> = (0..5)
+            .map(|i| make_line(700.0 - i as f32 * 14.0, 150.0, 1))
+            .collect();
+        let col3: Vec<TextLine> = (0..5)
+            .map(|i| make_line(700.0 - i as f32 * 14.0, 250.0, 1))
+            .collect();
+        let col4: Vec<TextLine> = (0..5)
             .map(|i| make_line(700.0 - i as f32 * 14.0, 350.0, 1))
             .collect();
 
         let cols = vec![
             ColumnRegion {
                 x_min: 0.0,
-                x_max: 300.0,
+                x_max: 120.0,
             },
             ColumnRegion {
-                x_min: 300.0,
-                x_max: 600.0,
+                x_min: 120.0,
+                x_max: 220.0,
+            },
+            ColumnRegion {
+                x_min: 220.0,
+                x_max: 320.0,
+            },
+            ColumnRegion {
+                x_min: 320.0,
+                x_max: 420.0,
             },
         ];
-        assert!(!is_newspaper_layout(&[col1, col2], &cols));
+        assert!(!is_newspaper_layout(&[col1, col2, col3, col4], &cols));
     }
 
     fn make_item_fs(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextItem {

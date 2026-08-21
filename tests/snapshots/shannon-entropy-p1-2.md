@@ -40,4 +40,3 @@ a decimal digit is about 3 13 bits. A digit wheel on a desk computing machine ha
 4. The *receiver* ordinarily performs the inverse operation of that done by the transmitter, reconstructing the message from the signal.
 5. The *destination* is the person (or thing) for whom the message is intended. We wish to consider certain general problems involving communication systems. To do this it is first
 necessary to represent the various elements involved as mathematical entities, suitably idealized from their
-
