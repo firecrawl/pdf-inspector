@@ -1,0 +1,158 @@
+name: Publish Go native library
+
+# Unlike the npm/PyPI/crates.io workflows, there's no package registry for
+# Go modules — `go get` fetches source straight from GitHub. This workflow's
+# job is narrower: cross-build the prebuilt cgo native library per platform
+# and attach it to a GitHub Release, so pdfinspector/internal/fetchnative's
+# `go generate` step (see go/pdfinspector/pdfinspector.go) has something to
+# download. Building from source with `cargo build --release` in go/ always
+# remains a fallback that needs no release at all.
+#
+# Tagged `go/vX.Y.Z` — the standard Go convention for a module that lives in
+# a repository subdirectory (see https://go.dev/ref/mod#vcs-version).
+
+on:
+  push:
+    branches: [main]
+    paths: ['go/Cargo.toml']
+  # Manual fallback: retry a release that failed partway (per-asset
+  # already-uploaded checks make re-runs idempotent).
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: Check version change
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Check if version changed
+        id: check
+        run: |
+          NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("go/Cargo.toml").read_text())["package"]["version"])')
+          TAG="go/v$NEW_VERSION"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch: releasing $TAG"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          OLD_VERSION=$(git show HEAD~1:go/Cargo.toml | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
+          echo "old=$OLD_VERSION new=$NEW_VERSION"
+          if [ "$NEW_VERSION" != "$OLD_VERSION" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "$TAG already has a release — skipping (per-asset checks below still cover partial re-runs)"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-14
+            target: darwin-arm64
+          - os: macos-15-intel
+            target: darwin-x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
+        with:
+          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            go -> target
+          key: publish-go-${{ matrix.target }}
+
+      - name: Build native library
+        run: cargo build --manifest-path go/Cargo.toml --release --verbose
+
+      - name: Package archive
+        shell: bash
+        run: |
+          staging="$RUNNER_TEMP/pdf-inspector-go-${{ matrix.target }}"
+          mkdir -p "$staging"
+          # Only the dynamic library ships: cgo LDFLAGS link against it at
+          # runtime via -rpath (see go/pdfinspector/pdfinspector.go); the
+          # staticlib output is a much larger build-from-source-only artifact.
+          cp go/target/release/libpdf_inspector_go.{so,dylib} "$staging" 2>/dev/null || true
+          test -n "$(ls -A "$staging")" # fail loudly if neither .so nor .dylib was produced
+          tar -czf "pdf-inspector-go-${{ matrix.target }}.tar.gz" -C "$staging" .
+
+      - name: Upload archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: pdf-inspector-go-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download all archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Compute checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > checksums.txt
+
+      - name: List release assets
+        run: ls -la dist/
+
+      - name: Create or update release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check-version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" *.tar.gz checksums.txt --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" *.tar.gz checksums.txt \
+              --repo "${{ github.repository }}" \
+              --title "Go native library $TAG" \
+              --notes "Prebuilt libpdf_inspector_go for the Go binding (go/pdfinspector). Fetched automatically by \`go generate ./...\`; see go/README.md."
+          fi

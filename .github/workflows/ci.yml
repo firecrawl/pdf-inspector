@@ -301,6 +301,47 @@ jobs:
           assert result.pages[0].markdown.strip()
           PY
 
+  go:
+    name: Go binding (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
+        with:
+          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+
+      - name: Install Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: "1.22"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            go -> target
+          key: go-${{ matrix.os }}
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path go/Cargo.toml -- --check
+
+      - name: Lint
+        run: cargo clippy --manifest-path go/Cargo.toml --release -- -D warnings
+
+      - name: Build native library
+        run: cargo build --manifest-path go/Cargo.toml --release --verbose
+
+      - name: Run Go tests
+        working-directory: go/pdfinspector
+        run: go test ./... -v
+
   wasm:
     name: WebAssembly
     runs-on: blacksmith-4vcpu-ubuntu-2404

@@ -8,6 +8,15 @@
 // operations an OCR-routing pipeline needs: classify to decide whether a
 // PDF's text layer is trustworthy enough to skip OCR, then extract the text
 // if so.
+//
+// Run `go generate ./...` before building on a supported platform
+// (darwin/arm64, darwin/amd64, linux/amd64, linux/arm64) to fetch a
+// prebuilt native library instead of requiring a local Rust toolchain; it
+// no-ops if one is already built. On other platforms, or if you'd rather
+// build from source, run `cargo build --release` in go/ (or `make native`)
+// directly — see go/README.md.
+//
+//go:generate go run ./internal/fetchnative
 package pdfinspector
 
 /*
