@@ -279,9 +279,14 @@ pub(crate) fn detect_from_document(
             analysis_cache.insert(*page_num, analysis.clone());
 
             // Early exit: if this page is non-text (insufficient meaningful text
-            // but has images), this PDF won't be purely TextBased.
+            // but has images), this PDF won't be purely TextBased. A page that
+            // clears the character-volume floor is text-bearing despite its low
+            // operator count, so it must not trigger the break — otherwise a
+            // dense one-operator text page ahead of a scanned page would end
+            // sampling with text_ratio 1.0 and misclassify the document.
             if allow_early_exit
-                && (analysis.text_operator_count < config.min_text_ops_per_page
+                && ((analysis.text_operator_count < config.min_text_ops_per_page
+                    && !page_has_dense_decodable_text(&analysis))
                     || is_image_dominated
                     || analysis.unique_text_chars < 5)
                 && (analysis.has_images || analysis.has_template_image)
@@ -1659,12 +1664,7 @@ fn collect_text_chars_before(
         }
         // k now points at '('; collect bytes between (k+1..j)
         if depth == 0 && k + 1 < j {
-            for &ch in &content[k + 1..j] {
-                if !ch.is_ascii_whitespace() {
-                    unique_chars.insert(ch);
-                    *total_chars += 1;
-                }
-            }
+            collect_literal_string_chars(&content[k + 1..j], unique_chars, total_chars);
         }
     } else if closing == b'>' {
         // Hex string: scan backward for '<'
@@ -1725,12 +1725,7 @@ fn collect_text_chars_before(
                         }
                     }
                     // collect bytes from start..m
-                    for &ch in &content[start..m] {
-                        if !ch.is_ascii_whitespace() {
-                            unique_chars.insert(ch);
-                            *total_chars += 1;
-                        }
-                    }
+                    collect_literal_string_chars(&content[start..m], unique_chars, total_chars);
                 } else if content[m] == b'<' {
                     let hex_start = m + 1;
                     m += 1;
@@ -1760,6 +1755,67 @@ fn collect_text_chars_before(
                 m += 1;
             }
         }
+    }
+}
+
+/// Collect the characters a PDF literal string actually renders, decoding
+/// escape sequences per the spec (7.3.4.2) so escape bytes never inflate the
+/// tally. `\n`/`\r`/`\t`/`\b`/`\f` decode to their control characters, `\ddd`
+/// consumes up to three octal digits for one byte, `\\`/`\(`/`\)` yield the
+/// escaped byte, a backslash before a real newline is a line continuation
+/// producing nothing, and any other escaped byte stands for itself. Counting
+/// raw bytes here would let a run of escape sequences with no visible glyphs
+/// (e.g. hundreds of `\n`) clear the character-volume floor and wrongly
+/// suppress OCR on a scanned page.
+fn collect_literal_string_chars(
+    bytes: &[u8],
+    unique_chars: &mut HashSet<u8>,
+    total_chars: &mut u64,
+) {
+    let mut count = |ch: u8| {
+        if !ch.is_ascii_whitespace() && ch != 0x08 {
+            unique_chars.insert(ch);
+            *total_chars += 1;
+        }
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' {
+            count(b);
+            i += 1;
+            continue;
+        }
+        // Escape sequence; a trailing lone backslash produces nothing.
+        i += 1;
+        let Some(&esc) = bytes.get(i) else { break };
+        match esc {
+            b'n' => count(b'\n'),
+            b'r' => count(b'\r'),
+            b't' => count(b'\t'),
+            b'b' => count(0x08),
+            b'f' => count(0x0C),
+            b'0'..=b'7' => {
+                let mut val: u16 = 0;
+                let mut digits = 0;
+                while digits < 3 && i < bytes.len() && bytes[i].is_ascii_digit() && bytes[i] < b'8'
+                {
+                    val = val * 8 + u16::from(bytes[i] - b'0');
+                    i += 1;
+                    digits += 1;
+                }
+                count((val & 0xFF) as u8);
+                continue;
+            }
+            b'\n' | b'\r' => {
+                // Line continuation: backslash-newline renders nothing.
+                if esc == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            other => count(other),
+        }
+        i += 1;
     }
 }
 
@@ -3363,6 +3419,131 @@ mod tests {
             result.pages_needing_ocr
         );
         assert!(!result.ocr_recommended);
+    }
+
+    /// One dense one-operator text page (with background image) followed by
+    /// one image-only scanned page.
+    fn dense_then_scan_doc() -> (Document, u32) {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        let body = "Each page carries a full paragraph of genuine decodable \
+                    text packed into a single text-showing operator, the way a \
+                    right-to-left run is commonly emitted, which gives a small \
+                    operator count over a large real character volume that any \
+                    extractor recovers cleanly without optical recognition.";
+        let mut kids = Vec::new();
+        for page_has_text in [true, false] {
+            let image_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => Object::Name(b"Image".to_vec()),
+                    "Width" => Object::Integer(1500),
+                    "Height" => Object::Integer(2383),
+                },
+                Vec::new(),
+            )));
+            let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => Object::Name(b"Form".to_vec()),
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+                    },
+                },
+                b"1500 0 0 2383 0 0 cm /Im0 Do".to_vec(),
+            )));
+            let content = if page_has_text {
+                format!("q /Fm0 Do Q BT /F1 12 Tf ({body}) Tj ET")
+            } else {
+                "q /Fm0 Do Q".to_string()
+            };
+            let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {},
+                content.into_bytes(),
+            )));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 1500.into(), 2383.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                    "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) },
+                },
+                "Contents" => Object::Reference(content_id),
+            });
+            kids.push(Object::Reference(page_id));
+        }
+        let count = kids.len() as u32;
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => Object::Integer(count as i64),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, count)
+    }
+
+    #[test]
+    fn test_early_exit_dense_text_page_does_not_end_sampling() {
+        // Review regression: under EarlyExit, a dense one-operator text page
+        // (with a background image) must not trigger the early break — it is
+        // text-bearing. If it broke, sampling would stop at page 1 with
+        // text_ratio 1.0 and the scanned page 2 would never be seen, turning a
+        // mixed document into TextBased with no OCR pages.
+        let (doc, page_count) = dense_then_scan_doc();
+        let config = DetectionConfig {
+            strategy: ScanStrategy::EarlyExit,
+            ..DetectionConfig::default()
+        };
+        let result = detect_from_document(&doc, page_count, &config).unwrap();
+        assert_ne!(
+            result.pdf_type,
+            PdfType::TextBased,
+            "the scanned second page must be seen and prevent TextBased"
+        );
+    }
+
+    #[test]
+    fn test_escape_sequences_do_not_clear_char_floor() {
+        // Review regression: literal-string escape sequences render no visible
+        // glyphs, so a run of `\n` escapes must not count toward the
+        // character-volume floor and rescue a scanned page from OCR.
+        let escapes = "\\n".repeat((MIN_DECODABLE_TEXT_CHARS as usize) / 2 + 20);
+        let (doc, page_id) = masthead_scan_page(&[escapes.as_str()]);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.text_char_count < MIN_DECODABLE_TEXT_CHARS,
+            "escape bytes must not count as rendered characters ({} counted)",
+            analysis.text_char_count
+        );
+        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        assert!(
+            needs_ocr,
+            "a scan whose only text is escape sequences must still route to OCR"
+        );
+    }
+
+    #[test]
+    fn test_octal_escapes_count_one_char_each() {
+        let mut unique = HashSet::new();
+        let mut total = 0u64;
+        // "\101\102\103" is "ABC"; "\)" and "\\" are one char each; "\n" none.
+        collect_literal_string_chars(b"\\101\\102\\103\\)\\\\\\n", &mut unique, &mut total);
+        assert_eq!(total, 5, "three octal chars plus two escaped delimiters");
+        assert!(unique.contains(&b'A') && unique.contains(&b')') && unique.contains(&b'\\'));
     }
 
     // ---------- P2 tests: Form XObject font traversal ----------
