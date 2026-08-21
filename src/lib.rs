@@ -4229,10 +4229,11 @@ fn find_standalone_keyword(buf: &[u8], start: usize, end: usize, keyword: &[u8])
             break;
         }
 
+        let before_ok = pos == start || buf[pos - 1].is_ascii_whitespace();
         let after_ok = buf
             .get(pos + keyword.len())
             .is_none_or(u8::is_ascii_whitespace);
-        if after_ok && buf[pos..end].starts_with(keyword) {
+        if before_ok && after_ok && buf[pos..end].starts_with(keyword) {
             return Some(pos);
         }
         pos += 1;
@@ -7896,6 +7897,16 @@ mod tests {
         let buf = b"xref\n0 1\n0000000000 65535 f \n%% trailer placeholder\ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n0\n%%EOF";
 
         assert!(xref_trailer_has_root(buf, 0));
+    }
+
+    #[test]
+    fn standalone_keyword_requires_leading_token_boundary() {
+        let buf = b"xtrailer\n";
+        assert_eq!(
+            find_standalone_keyword(buf, 0, buf.len(), b"trailer"),
+            None,
+            "a keyword embedded in a larger token must not match"
+        );
     }
 
     #[test]
