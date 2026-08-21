@@ -841,16 +841,78 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     is_parallel
 }
 
-fn positioned_table(
-    table: &crate::tables::Table,
-    chart_order: Option<ChartProseOrder>,
-) -> PositionedMarkdown {
-    PositionedMarkdown::new(
-        table.rows.first().copied().unwrap_or(0.0),
-        table.columns.first().copied().unwrap_or(0.0),
-        crate::tables::table_to_markdown(table),
-        chart_order,
-    )
+#[derive(Clone, Copy)]
+enum TableOutputMode {
+    Markdown,
+    #[cfg(feature = "ocr")]
+    CompleteTables,
+}
+
+struct TableDetectionOutput {
+    mode: TableOutputMode,
+    pages_with_detected_tables: HashSet<u32>,
+    pages_with_tables: HashSet<u32>,
+    markdown_by_page: HashMap<u32, Vec<PositionedMarkdown>>,
+    #[cfg(feature = "ocr")]
+    complete_tables: Vec<(u32, crate::tables::Table)>,
+}
+
+impl TableDetectionOutput {
+    fn new(mode: TableOutputMode) -> Self {
+        Self {
+            mode,
+            pages_with_detected_tables: HashSet::new(),
+            pages_with_tables: HashSet::new(),
+            markdown_by_page: HashMap::new(),
+            #[cfg(feature = "ocr")]
+            complete_tables: Vec::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        page: u32,
+        table: &crate::tables::Table,
+        chart_order: Option<ChartProseOrder>,
+    ) {
+        self.pages_with_detected_tables.insert(page);
+        match self.mode {
+            TableOutputMode::Markdown => {
+                self.pages_with_tables.insert(page);
+                self.markdown_by_page
+                    .entry(page)
+                    .or_default()
+                    .push(PositionedMarkdown::new(
+                        table.rows.first().copied().unwrap_or(0.0),
+                        table.columns.first().copied().unwrap_or(0.0),
+                        crate::tables::table_to_markdown(table),
+                        chart_order,
+                    ));
+            }
+            #[cfg(feature = "ocr")]
+            TableOutputMode::CompleteTables => {
+                if crate::tables::is_complete_data_table(table) {
+                    self.pages_with_tables.insert(page);
+                    self.complete_tables.push((page, table.clone()));
+                }
+            }
+        }
+    }
+
+    fn has_tables_on_page(&self, page: u32) -> bool {
+        self.pages_with_tables.contains(&page)
+    }
+
+    fn has_detected_tables_on_page(&self, page: u32) -> bool {
+        self.pages_with_detected_tables.contains(&page)
+    }
+}
+
+#[derive(Default)]
+struct MarkdownConversionOutput {
+    markdown: String,
+    #[cfg(feature = "ocr")]
+    detected_tables: Vec<(u32, crate::tables::Table)>,
 }
 
 /// Derive a side-by-side split from rect hint regions.
@@ -1399,6 +1461,64 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     pdf_lines: &[crate::types::PdfLine],
     context: MarkdownDocumentContext<'_>,
 ) -> String {
+    convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        rects,
+        pdf_lines,
+        context,
+        TableOutputMode::Markdown,
+    )
+    .markdown
+}
+
+/// Run the ordinary Markdown table pipeline but return only structurally
+/// complete data tables. Supplemental OCR uses this to keep detector behavior
+/// identical without parsing the serialized Markdown back into tables.
+#[cfg(feature = "ocr")]
+pub(crate) fn complete_table_markdown_from_items(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    document_page_count: u32,
+) -> String {
+    let conversion = convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        &[],
+        &[],
+        MarkdownDocumentContext {
+            page_thresholds: &HashMap::new(),
+            struct_roles: None,
+            struct_tables: &[],
+            page_count: document_page_count,
+            prefiltered_page_number_pages: None,
+            prefiltered_page_number_mask: None,
+            precomputed_chart_regions: None,
+        },
+        TableOutputMode::CompleteTables,
+    );
+    let mut output = String::new();
+    for (_, table) in conversion.detected_tables {
+        let markdown = crate::tables::table_to_markdown(&table);
+        if markdown.is_empty() {
+            continue;
+        }
+        if !output.is_empty() && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        output.push_str(&markdown);
+    }
+    output
+}
+
+fn convert_items_with_rects_lines_and_table_output(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+    context: MarkdownDocumentContext<'_>,
+    table_output_mode: TableOutputMode,
+) -> MarkdownConversionOutput {
     use crate::tables::{
         content_width, detect_tables_from_lines, detect_tables_from_rects,
         detect_tables_from_struct_tree, detect_tables_with_page_width, try_build_rect_guided_table,
@@ -1416,7 +1536,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     } = context;
 
     if items.is_empty() {
-        return String::new();
+        return MarkdownConversionOutput::default();
     }
 
     // Table detection must retain the original collection because short
@@ -1472,7 +1592,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Detect tables on each page
     let mut table_items: HashSet<usize> = HashSet::new();
-    let mut page_tables: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
+    let mut table_output = TableDetectionOutput::new(table_output_mode);
 
     // Running headers/footers repeat verbatim at the same position on many
     // pages. When such a block wraps a long title over aligned lines, the
@@ -1687,10 +1807,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push(positioned_table(table, chart_prose_order));
+                    table_output.record(page, table, chart_prose_order);
                 }
             }
 
@@ -1714,10 +1831,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         }
                     }
                 }
-                page_tables
-                    .entry(page)
-                    .or_default()
-                    .push(positioned_table(table, chart_prose_order));
+                table_output.record(page, table, chart_prose_order);
             }
 
             // 2. Line-based detection on unclaimed items (when rects didn't find tables)
@@ -1732,10 +1846,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push(positioned_table(table, chart_prose_order));
+                    table_output.record(page, table, chart_prose_order);
                 }
             }
 
@@ -1771,10 +1882,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                                 }
                             }
                         }
-                        page_tables
-                            .entry(page)
-                            .or_default()
-                            .push(positioned_table(&table, chart_prose_order));
+                        table_output.record(page, &table, chart_prose_order);
                         for &band_idx in &inside_map {
                             rect_claimed.insert(band_idx);
                         }
@@ -1832,10 +1940,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                                 }
                             }
                         }
-                        page_tables
-                            .entry(page)
-                            .or_default()
-                            .push(positioned_table(&table, chart_prose_order));
+                        table_output.record(page, &table, chart_prose_order);
                     }
                 };
 
@@ -1897,10 +2002,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push(positioned_table(&table, chart_prose_order));
+                    table_output.record(page, &table, chart_prose_order);
                 }
             }
         }
@@ -1908,7 +2010,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // 5. Thin-rect border synthesis: last resort for PDFs that draw table
         //    borders as thin filled rectangles (common in spreadsheet exports).
         //    Only runs when ALL other methods found nothing on this page.
-        if !page_tables.contains_key(&page) {
+        if !table_output.has_detected_tables_on_page(page) {
             let page_rects: Vec<&crate::types::PdfRect> =
                 rects.iter().filter(|r| r.page == page).collect();
             let mut synth_lines: Vec<crate::types::PdfLine> = Vec::new();
@@ -1959,10 +2061,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             table_items.insert(global_idx);
                         }
                     }
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push(positioned_table(table, chart_prose_order));
+                    table_output.record(page, table, chart_prose_order);
                 }
             }
         }
@@ -1971,7 +2070,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // any band, retry heuristic detection with all items as a single band.
         // This catches borderless tables whose text-column alignment was
         // misclassified as page-layout columns.
-        if was_split && !page_tables.contains_key(&page) && !merged_band.0.is_empty() {
+        if was_split && !table_output.has_tables_on_page(page) && !merged_band.0.is_empty() {
             let (ref band_items, ref band_index_map, _, _) = merged_band;
             log::debug!(
                 "page {}: merged-band retry ({} items, was_split={})",
@@ -2028,13 +2127,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         }
                     }
                 }
-                page_tables
-                    .entry(page)
-                    .or_default()
-                    .push(positioned_table(table, chart_prose_order));
+                table_output.record(page, table, chart_prose_order);
             }
         }
     }
+
+    #[cfg(feature = "ocr")]
+    let mut detected_tables = table_output.complete_tables;
+    #[cfg(feature = "ocr")]
+    detected_tables.sort_by_key(|(page, _)| *page);
+    let mut page_tables = table_output.markdown_by_page;
 
     // Images are also removed before line grouping, so give them the same
     // logical chart-page position as tables before reinsertion.
@@ -2293,7 +2395,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // Convert to markdown, inserting tables and images at appropriate positions
     let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
     band_split_page_set.extend(page_chart_prose_splits.keys().copied());
-    to_markdown_from_lines_with_tables_and_images(
+    let markdown = to_markdown_from_lines_with_tables_and_images(
         lines,
         options,
         page_tables,
@@ -2301,7 +2403,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         &page_chart_map,
         &band_split_page_set,
         effective_struct_roles,
-    )
+    );
+    MarkdownConversionOutput {
+        markdown,
+        #[cfg(feature = "ocr")]
+        detected_tables,
+    }
 }
 
 #[cfg(test)]
@@ -2309,6 +2416,35 @@ mod tests {
     use super::*;
     use analysis::detect_header_level;
     use classify::{is_code_like, is_list_item};
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn complete_table_output_marks_only_pages_with_emitted_tables() {
+        let mut output = TableDetectionOutput::new(TableOutputMode::CompleteTables);
+        let incomplete = crate::tables::Table::new(
+            vec![100.0, 200.0],
+            vec![300.0],
+            vec![vec!["header a".into(), "header b".into()]],
+            vec![0, 1],
+        );
+        output.record(1, &incomplete, None);
+        assert!(output.has_detected_tables_on_page(1));
+        assert!(!output.has_tables_on_page(1));
+        assert!(output.complete_tables.is_empty());
+
+        let complete = crate::tables::Table::new(
+            vec![100.0, 200.0],
+            vec![300.0, 280.0],
+            vec![
+                vec!["header a".into(), "header b".into()],
+                vec!["value a".into(), "value b".into()],
+            ],
+            vec![0, 1, 2, 3],
+        );
+        output.record(1, &complete, None);
+        assert!(output.has_tables_on_page(1));
+        assert_eq!(output.complete_tables.len(), 1);
+    }
 
     #[test]
     fn test_is_list_item() {

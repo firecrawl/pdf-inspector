@@ -14,6 +14,8 @@ mod contracts;
 mod download;
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 mod fusion;
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+mod image_analysis;
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 mod models;
 #[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]

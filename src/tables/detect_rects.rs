@@ -549,6 +549,23 @@ pub fn detect_tables_from_rects(
         page_rects.push((x, y, w, h));
     }
 
+    // Some generators repeat a page-sized clipping/fill rectangle for nearly
+    // every content operation. When those duplicates overwhelmingly dominate
+    // the drawing geometry, they manufacture full-page X/Y edges and make
+    // every synthetic grid cell appear covered. Remove only that strong
+    // duplicate-background shape; a minority of page fills can coexist with
+    // genuine cell geometry and must remain available to the detectors.
+    let normalized_rects =
+        without_page_backgrounds(&page_rects, PageBackgroundRemoval::Overwhelming);
+    if normalized_rects.len() < page_rects.len() {
+        debug!(
+            "page {}: removed {} overwhelming page-background rects",
+            page,
+            page_rects.len() - normalized_rects.len()
+        );
+        page_rects = normalized_rects;
+    }
+
     // Remove rects that are much wider than typical cell rects — these are
     // page-spanning clipping paths or row-spanning background fills that
     // would add spurious X-edges and corrupt the grid.  We use the median
@@ -680,7 +697,8 @@ pub fn detect_tables_from_rects(
                 // re-cluster the remaining geometry, and evaluate valid table
                 // candidates as a competing hypothesis before the chart
                 // rejection wins.
-                let normalized = without_dominant_page_backgrounds(&group_rects);
+                let normalized =
+                    without_page_backgrounds(&group_rects, PageBackgroundRemoval::Repeated);
                 let normalized_table = (normalized.len() < group_rects.len())
                     .then(|| {
                         cluster_rects(&normalized, 3.0, 6)
@@ -829,13 +847,15 @@ pub fn detect_tables_from_rects(
         // (row stripes don't overlap so each is its own cluster of 1),
         // try all page rects directly as a row-stripe table.
         // Require ≥15 rects and ≥10 result rows to avoid decorative fill false positives.
-        if tables.is_empty() && clusters.is_empty() && page_rects.len() >= 15 {
-            if let Some(table) = detect_row_stripe_table(items, &page_rects, page) {
+        let row_stripe_rects =
+            without_page_backgrounds(&page_rects, PageBackgroundRemoval::Repeated);
+        if tables.is_empty() && clusters.is_empty() && row_stripe_rects.len() >= 15 {
+            if let Some(table) = detect_row_stripe_table(items, &row_stripe_rects, page) {
                 if table.rows.len() >= 10 {
                     debug!(
                         "page {}: row-stripe fallback succeeded ({} rects, {} rows)",
                         page,
-                        page_rects.len(),
+                        row_stripe_rects.len(),
                         table.rows.len()
                     );
                     tables.push(table);
@@ -2232,11 +2252,22 @@ fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
     long_dense_cells * 2 >= dense_count
 }
 
-/// Remove repeated page-scale fills from a chart-like cluster so the actual
-/// cell/bar geometry can be evaluated independently. A small number of
-/// coincident origin frames may be meaningful table structure, so repetition
-/// only becomes normalization evidence when it dominates the cluster.
-fn without_dominant_page_backgrounds(rects: &[(f32, f32, f32, f32)]) -> Vec<(f32, f32, f32, f32)> {
+#[derive(Clone, Copy)]
+enum PageBackgroundRemoval {
+    /// Repeated page fills interfere with chart-vs-grid classification even
+    /// when real cell geometry remains the majority.
+    Repeated,
+    /// Top-level normalization is more conservative: page fills must comprise
+    /// at least 75% of all useful drawing rectangles.
+    Overwhelming,
+}
+
+/// Apply the shared page-scale classification and removal policy used by the
+/// top-level detector and chart recovery.
+fn without_page_backgrounds(
+    rects: &[(f32, f32, f32, f32)],
+    policy: PageBackgroundRemoval,
+) -> Vec<(f32, f32, f32, f32)> {
     let x_max = rects
         .iter()
         .map(|&(x, _, width, _)| x + width)
@@ -2245,13 +2276,16 @@ fn without_dominant_page_backgrounds(rects: &[(f32, f32, f32, f32)]) -> Vec<(f32
         .iter()
         .map(|&(_, y, _, height)| y + height)
         .fold(0.0_f32, f32::max);
-    let is_page_scale = |&(x, y, width, height): &(f32, f32, f32, f32)| {
+    let is_page_scale = |&&(x, y, width, height): &&(f32, f32, f32, f32)| {
         x < 5.0 && y < 5.0 && width >= x_max * 0.9 && height >= y_max * 0.9
     };
+    let page_scale_count = rects.iter().filter(is_page_scale).count();
 
-    if rects.iter().filter(|rect| is_page_scale(rect)).count()
-        < DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS
-    {
+    let meets_policy = match policy {
+        PageBackgroundRemoval::Repeated => true,
+        PageBackgroundRemoval::Overwhelming => page_scale_count * 4 >= rects.len() * 3,
+    };
+    if page_scale_count < DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS || !meets_policy {
         return rects.to_vec();
     }
 
@@ -2358,7 +2392,8 @@ fn is_repeated_cell_grid(group_rects: &[(f32, f32, f32, f32)]) -> bool {
 
 fn repeated_cell_grid_overrides_bar_hypothesis(group_rects: &[(f32, f32, f32, f32)]) -> bool {
     is_repeated_cell_grid(group_rects)
-        && without_dominant_page_backgrounds(group_rects).len() == group_rects.len()
+        && without_page_backgrounds(group_rects, PageBackgroundRemoval::Repeated).len()
+            == group_rects.len()
 }
 
 /// Detect horizontal segmented stacks from aligned rows of touching rects.
@@ -3600,11 +3635,134 @@ mod tests {
 
         let mut dominant = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
         dominant.push(cell);
-        assert_eq!(without_dominant_page_backgrounds(&dominant), vec![cell]);
+        assert_eq!(
+            without_page_backgrounds(&dominant, PageBackgroundRemoval::Repeated),
+            vec![cell]
+        );
 
         let mut incidental = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS - 1];
         incidental.push(cell);
-        assert_eq!(without_dominant_page_backgrounds(&incidental), incidental);
+        assert_eq!(
+            without_page_backgrounds(&incidental, PageBackgroundRemoval::Repeated),
+            incidental
+        );
+    }
+
+    #[test]
+    fn overwhelming_page_backgrounds_are_removed_before_grid_detection() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; 12];
+        rects.extend([
+            PdfRect {
+                x: 70.0,
+                y: 320.0,
+                width: 240.0,
+                height: 260.0,
+                page: 1,
+            },
+            PdfRect {
+                x: 330.0,
+                y: 400.0,
+                width: 200.0,
+                height: 48.0,
+                page: 1,
+            },
+            PdfRect {
+                x: 115.0,
+                y: 70.0,
+                width: 150.0,
+                height: 12.0,
+                page: 1,
+            },
+        ]);
+        let items = vec![
+            make_item("body prose", 70.0, 700.0, 10.0),
+            make_item("continued body prose", 300.0, 620.0, 10.0),
+            make_item("Figure 6", 340.0, 430.0, 9.0),
+            make_item("caption", 410.0, 410.0, 9.0),
+            make_item("footnote", 120.0, 74.0, 8.0),
+        ];
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(
+            tables.is_empty(),
+            "duplicate page backgrounds must not manufacture a full-page table"
+        );
+    }
+
+    #[test]
+    fn minority_page_backgrounds_preserve_real_cell_grid() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        let mut items = Vec::new();
+        for row in 0..4 {
+            for col in 0..3 {
+                rects.push(PdfRect {
+                    x: 100.0 + col as f32 * 100.0,
+                    y: 600.0 - row as f32 * 24.0,
+                    width: 100.0,
+                    height: 24.0,
+                    page: 1,
+                });
+                items.push(make_item(
+                    "42",
+                    110.0 + col as f32 * 100.0,
+                    607.0 - row as f32 * 24.0,
+                    9.0,
+                ));
+            }
+        }
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert_eq!(tables.len(), 1, "a real repeated cell grid must survive");
+        assert_eq!(tables[0].rows.len(), 4);
+        assert_eq!(tables[0].columns.len(), 3);
+    }
+
+    #[test]
+    fn minority_page_backgrounds_do_not_expand_row_stripe_fallback() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        let mut items = Vec::new();
+        for row in 0..25 {
+            let y = 200.0 + row as f32 * 20.0;
+            rects.push(PdfRect {
+                x: 40.0,
+                y,
+                width: 510.0,
+                height: 16.0,
+                page: 1,
+            });
+            items.push(make_item(&format!("row {row}"), 60.0, y + 5.0, 9.0));
+            items.push(make_item(&format!("value {row}"), 320.0, y + 5.0, 9.0));
+        }
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert_eq!(tables.len(), 1, "the row-stripe table should survive");
+        assert_eq!(
+            tables[0].rows.len(),
+            25,
+            "page fills must not add full-page rows to the fallback grid"
+        );
+        assert_eq!(tables[0].columns.len(), 2);
     }
 
     #[test]

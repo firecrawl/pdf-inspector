@@ -10,6 +10,7 @@ use crate::tables::Table;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use super::detect_rects::{assign_items_to_grid, snap_edges};
+use super::grid::join_cell_items;
 
 const RULE_Y_TOLERANCE: f32 = 2.0;
 const RULE_JOIN_GAP: f32 = 6.0;
@@ -1201,6 +1202,223 @@ fn derive_columns_from_horizontal_segments(horizontals: &[(f32, f32, f32)]) -> O
     Some(qualifying)
 }
 
+/// Build independently scoped grids when several horizontal-segment tables
+/// share a page.
+///
+/// The legacy implicit-grid path derives its row and column edges from every
+/// horizontal segment on the page. Stacked tables with different spans can
+/// therefore be joined through the prose between them, while the combined
+/// endpoint frequency drops real outer columns. Logical rule spans already
+/// identify the independent bands; validate each band through the same legacy
+/// grid path before allowing the scoped set to compete with the page-wide grid.
+fn build_independent_segment_grid_tables(
+    items: &[TextItem],
+    horizontals: &[HorizontalRule],
+    page: u32,
+) -> Vec<Table> {
+    let logical_rules = merge_horizontal_segments(horizontals);
+    let rule_runs: Vec<Vec<HorizontalRule>> = group_rules_by_span(&logical_rules)
+        .into_iter()
+        .flat_map(|span_group| split_independent_rule_runs(&span_group, items, page))
+        .filter(|rules| rules.len() >= 3)
+        .collect();
+    if rule_runs.len() < 2 {
+        return Vec::new();
+    }
+
+    let scopes: Vec<(f32, f32, f32, f32)> = rule_runs
+        .iter()
+        .map(|rules| {
+            let x_left = rules
+                .iter()
+                .map(|rule| rule.1)
+                .fold(f32::INFINITY, f32::min);
+            let y_bottom = rules
+                .iter()
+                .map(|rule| rule.0)
+                .fold(f32::INFINITY, f32::min);
+            let x_right = rules
+                .iter()
+                .map(|rule| rule.2)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let y_top = rules
+                .iter()
+                .map(|rule| rule.0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            (x_left, y_bottom, x_right, y_top)
+        })
+        .collect();
+    // Local density is safe for truly stacked bands. Overlapping bands can be
+    // side-by-side fragments of one wide table, so preserve the page-wide
+    // density check that rejects those partial hypotheses.
+    let use_scoped_density = scopes.iter().enumerate().all(|(index, left)| {
+        scopes[index + 1..]
+            .iter()
+            .all(|right| left.3.min(right.3) - left.1.max(right.1) <= RULE_Y_TOLERANCE)
+    });
+
+    let mut tables = Vec::new();
+    for (rules, scope) in rule_runs.into_iter().zip(scopes) {
+        let (x_left, y_bottom, x_right, y_top) = scope;
+
+        let scoped_lines: Vec<PdfLine> = horizontals
+            .iter()
+            .filter(|&&(y, x_min, x_max)| {
+                y >= y_bottom - RULE_Y_TOLERANCE
+                    && y <= y_top + RULE_Y_TOLERANCE
+                    && x_min >= x_left - RULE_JOIN_GAP
+                    && x_max <= x_right + RULE_JOIN_GAP
+            })
+            .map(|&(y, x_min, x_max)| PdfLine {
+                x1: x_min,
+                y1: y,
+                x2: x_max,
+                y2: y,
+                page,
+            })
+            .collect();
+        let detected = if use_scoped_density {
+            detect_segment_grid_in_scope(items, &scoped_lines, page, scope)
+        } else {
+            detect_tables_from_lines_inner(items, &scoped_lines, page, false, false)
+        };
+        tables.extend(detected.into_iter().map(|table| {
+            refine_segment_grid_text_rows(items, &rules, page, &table).unwrap_or(table)
+        }));
+    }
+
+    let tables = select_non_overlapping_hypotheses(tables);
+    if tables.len() < 2 {
+        return Vec::new();
+    }
+    log::debug!(
+        "detect_lines p{}: recovered {} independent horizontal-segment grids",
+        page,
+        tables.len()
+    );
+    tables
+}
+
+/// Run one independent segment-grid hypothesis against only the text in its
+/// physical band, then translate the detector's local item indices back to the
+/// caller's collection. Keeping this adaptation outside the legacy detector
+/// avoids adding a second density mode to every line-table strategy.
+fn detect_segment_grid_in_scope(
+    items: &[TextItem],
+    lines: &[PdfLine],
+    page: u32,
+    (x_left, y_bottom, x_right, y_top): (f32, f32, f32, f32),
+) -> Vec<Table> {
+    let scoped_indices: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            let center_x = item.x + item.width.max(0.0) / 2.0;
+            item.page == page
+                && center_x >= x_left - RULE_JOIN_GAP
+                && center_x <= x_right + RULE_JOIN_GAP
+                && item.y >= y_bottom - RULE_Y_TOLERANCE
+                && item.y <= y_top + RULE_Y_TOLERANCE
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let scoped_items: Vec<TextItem> = scoped_indices
+        .iter()
+        .map(|&index| items[index].clone())
+        .collect();
+    let mut tables = detect_tables_from_lines_inner(&scoped_items, lines, page, false, false);
+    for table in &mut tables {
+        for index in &mut table.item_indices {
+            *index = scoped_indices[*index];
+        }
+    }
+    tables
+}
+
+/// Replace broad physical row bands with repeated text baselines when the
+/// segment grid proves the columns but only sparse booktabs-style rules were
+/// painted for the rows.
+fn refine_segment_grid_text_rows(
+    items: &[TextItem],
+    rules: &[HorizontalRule],
+    page: u32,
+    table: &Table,
+) -> Option<Table> {
+    let column_count = table.columns.len().saturating_sub(1);
+    if column_count < 2 {
+        return None;
+    }
+    let anchored_rows = collect_anchored_rows(items, rules, page);
+    if anchored_rows.len() <= table.cells.len() || anchored_rows.len() > 80 {
+        return None;
+    }
+
+    let mut cell_items = vec![vec![Vec::new(); column_count]; anchored_rows.len()];
+    let mut item_indices = Vec::new();
+    for (row_index, (_, row_items)) in anchored_rows.iter().enumerate() {
+        for (item_index, item) in row_items {
+            let center_x = item.x + item.width.max(0.0) / 2.0;
+            let Some(column) = (0..column_count).find(|&index| {
+                center_x >= table.columns[index] - RULE_Y_TOLERANCE
+                    && center_x <= table.columns[index + 1] + RULE_Y_TOLERANCE
+            }) else {
+                continue;
+            };
+            cell_items[row_index][column].push(*item);
+            item_indices.push(*item_index);
+        }
+    }
+
+    let cells: Vec<Vec<String>> = cell_items
+        .iter_mut()
+        .map(|row| {
+            row.iter_mut()
+                .map(|items| {
+                    if crate::text_utils::is_rtl_text(items.iter().map(|item| &item.text)) {
+                        crate::text_utils::sort_rtl_cell_items(
+                            items,
+                            |item| item.x,
+                            |item| item.y,
+                            |item| item.text.as_str(),
+                        );
+                    } else {
+                        items.sort_by(|left, right| left.x.total_cmp(&right.x));
+                    }
+                    join_cell_items(items)
+                })
+                .collect()
+        })
+        .collect();
+
+    // Wrapped prose inside a wide cell can expose many baselines without any
+    // row schema. Require repeated baselines that independently populate at
+    // least half of the physical columns before treating baselines as rows.
+    let min_dense_columns = column_count.div_ceil(2).max(2);
+    let dense_rows = cells
+        .iter()
+        .filter(|row| row.iter().filter(|cell| !cell.is_empty()).count() >= min_dense_columns)
+        .count();
+    if dense_rows < 3 || dense_rows * 2 < cells.len() {
+        return None;
+    }
+
+    item_indices.sort_unstable();
+    item_indices.dedup();
+    log::debug!(
+        "detect_lines p{}: refined segment grid from {} physical rows to {} text rows ({} dense)",
+        page,
+        table.cells.len(),
+        cells.len(),
+        dense_rows
+    );
+    Some(Table::new(
+        table.columns.clone(),
+        anchored_rows.iter().map(|(y, _)| *y).collect(),
+        cells,
+        item_indices,
+    ))
+}
+
 /// Detect tables from line segments on a given page.
 ///
 /// Lines are classified as horizontal or vertical, snapped into grid edges,
@@ -1543,6 +1761,7 @@ fn detect_tables_from_lines_inner(
         return Vec::new();
     }
     let mut alternatives = Vec::new();
+    let mut independent_segment_tables = Vec::new();
     if allow_alternatives {
         if let Some(table) = build_dense_row_anchor_table(items, &horizontals, &verticals, page) {
             alternatives.push(table);
@@ -1553,6 +1772,11 @@ fn detect_tables_from_lines_inner(
             &verticals,
             page,
         ));
+        if verticals.len() < 2 {
+            independent_segment_tables =
+                build_independent_segment_grid_tables(items, &horizontals, page);
+            alternatives.extend(independent_segment_tables.iter().cloned());
+        }
     }
     // Booktabs and response-form tables commonly draw horizontal rules only.
     // Their rules describe table bands, not row/cell boundaries, so infer
@@ -1815,7 +2039,7 @@ fn detect_tables_from_lines_inner(
     // The grid must capture a meaningful portion of the page's text items.
     // Chart/graph grids on textbook pages capture scattered labels but miss
     // the bulk of the page content (explanatory text, problem statements).
-    let page_item_count = items.iter().filter(|i| i.page == page).count();
+    let page_item_count = items.iter().filter(|item| item.page == page).count();
     if page_item_count > 0 {
         let capture_ratio = item_indices.len() as f32 / page_item_count as f32;
         // If the grid captures less than 20% of items, it's not a real table
@@ -1860,16 +2084,23 @@ fn detect_tables_from_lines_inner(
         page, num_rows, num_cols, item_indices.len(), page_item_count, non_empty_rows, cols_with_content
     );
 
-    select_table_hypothesis(
-        vec![Table::new(
-            col_edges,
-            row_edges_desc[..num_rows].to_vec(),
-            cells,
-            item_indices,
-        )],
-        alternatives,
-        page,
-    )
+    let legacy_table = Table::new(
+        col_edges,
+        row_edges_desc[..num_rows].to_vec(),
+        cells,
+        item_indices,
+    );
+    let legacy_tables = if overlaps_multiple_tables(&legacy_table, &independent_segment_tables) {
+        log::debug!(
+            "detect_lines p{}: rejected page-wide grid spanning multiple independent segment grids",
+            page
+        );
+        Vec::new()
+    } else {
+        vec![legacy_table]
+    };
+
+    select_table_hypothesis(legacy_tables, alternatives, page)
 }
 
 #[cfg(test)]
@@ -2671,6 +2902,191 @@ mod tests {
             t.cells.len()
         );
         assert_eq!(t.cells[0].len(), 3, "expected 3 columns");
+    }
+
+    #[test]
+    fn test_stacked_horizontal_segment_grids_are_scoped_independently() {
+        let table_specs = [
+            (
+                [700.0, 675.0, 570.0],
+                [60.0, 145.0, 250.0, 360.0],
+                [687.0, 660.0, 640.0, 620.0, 600.0, 580.0],
+                "upper",
+            ),
+            (
+                [450.0, 425.0, 315.0],
+                [80.0, 190.0, 320.0, 500.0],
+                [437.0, 410.0, 390.0, 370.0, 350.0, 325.0],
+                "lower",
+            ),
+        ];
+        let mut lines = Vec::new();
+        let mut items = Vec::new();
+        for (row_edges, col_edges, text_rows, label) in table_specs {
+            for y in row_edges {
+                for pair in col_edges.windows(2) {
+                    lines.push(make_hline(y, pair[0], pair[1], 1));
+                }
+            }
+            for (row, y) in text_rows.into_iter().enumerate() {
+                for (column, x_pair) in col_edges.windows(2).enumerate() {
+                    let x = (x_pair[0] + x_pair[1]) / 2.0;
+                    items.push(make_item(&format!("{label}-{row}-{column}"), x, y, 1));
+                }
+            }
+        }
+        // A scoped table must compete against text in its own rule band, not
+        // unrelated prose elsewhere on a dense page.
+        for index in 0..160 {
+            items.push(make_item(
+                &format!("outside prose {index}"),
+                550.0,
+                790.0 - index as f32 * 4.0,
+                1,
+            ));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].cells.len(), 6);
+        assert_eq!(tables[0].cells[0].len(), 3);
+        assert_eq!(tables[0].cells[0][0], "upper-0-0");
+        assert_eq!(tables[1].cells.len(), 6);
+        assert_eq!(tables[1].cells[0].len(), 3);
+        assert_eq!(tables[1].cells[0][0], "lower-0-0");
+    }
+
+    #[test]
+    fn test_one_segment_grid_plus_decorative_rules_does_not_enable_split_recovery() {
+        let row_edges = [700.0, 665.0, 615.0, 570.0];
+        let col_edges = [60.0, 145.0, 250.0, 360.0];
+        let mut horizontals = Vec::new();
+        for y in row_edges {
+            for pair in col_edges.windows(2) {
+                horizontals.push((y, pair[0], pair[1]));
+            }
+        }
+        horizontals.extend([
+            (450.0, 40.0, 220.0),
+            (410.0, 55.0, 260.0),
+            (365.0, 75.0, 300.0),
+        ]);
+        let mut items = Vec::new();
+        for (row, y_pair) in row_edges.windows(2).enumerate() {
+            let y = (y_pair[0] + y_pair[1]) / 2.0;
+            for (column, x_pair) in col_edges.windows(2).enumerate() {
+                let x = (x_pair[0] + x_pair[1]) / 2.0;
+                items.push(make_item(&format!("cell-{row}-{column}"), x, y, 1));
+            }
+        }
+
+        assert!(build_independent_segment_grid_tables(&items, &horizontals, 1).is_empty());
+    }
+
+    #[test]
+    fn test_side_by_side_segment_grids_do_not_enable_stacked_recovery() {
+        let row_edges = [700.0, 665.0, 615.0, 570.0];
+        let table_columns = [[60.0, 110.0, 160.0], [180.0, 230.0, 280.0]];
+        let mut horizontals = Vec::new();
+        let mut items = Vec::new();
+        for col_edges in table_columns {
+            for &y in &row_edges {
+                for pair in col_edges.windows(2) {
+                    horizontals.push((y, pair[0], pair[1]));
+                }
+            }
+            for (row, y_pair) in row_edges.windows(2).enumerate() {
+                let y = (y_pair[0] + y_pair[1]) / 2.0;
+                for (column, x_pair) in col_edges.windows(2).enumerate() {
+                    let x = (x_pair[0] + x_pair[1]) / 2.0;
+                    items.push(make_item(&format!("cell-{row}-{column}"), x, y, 1));
+                }
+            }
+        }
+        for index in 0..60 {
+            items.push(make_item(
+                &format!("outside prose {index}"),
+                350.0,
+                790.0 - index as f32 * 4.0,
+                1,
+            ));
+        }
+
+        assert!(build_independent_segment_grid_tables(&items, &horizontals, 1).is_empty());
+    }
+
+    #[test]
+    fn test_single_column_continuations_do_not_refine_physical_rows() {
+        let columns = vec![60.0, 160.0, 260.0, 360.0];
+        let rules = vec![
+            (500.0, 60.0, 360.0),
+            (475.0, 60.0, 360.0),
+            (350.0, 60.0, 360.0),
+        ];
+        let mut items = vec![
+            make_item("Description", 80.0, 487.0, 1),
+            make_item("Amount", 180.0, 487.0, 1),
+            make_item("Status", 280.0, 487.0, 1),
+        ];
+        for (index, y) in [460.0, 440.0, 420.0, 400.0, 380.0].into_iter().enumerate() {
+            items.push(make_item(&format!("wrapped line {index}"), 80.0, y, 1));
+        }
+        let physical = Table::new(
+            columns,
+            vec![500.0, 475.0],
+            vec![
+                vec!["Description".into(), "Amount".into(), "Status".into()],
+                vec!["wrapped body".into(), String::new(), String::new()],
+            ],
+            (0..items.len()).collect(),
+        );
+
+        assert!(refine_segment_grid_text_rows(&items, &rules, 1, &physical).is_none());
+    }
+
+    #[test]
+    fn text_row_refinement_skips_items_outside_column_bands() {
+        let columns = vec![60.0, 160.0, 260.0];
+        let rules = vec![(500.0, 60.0, 260.0), (400.0, 60.0, 260.0)];
+        let mut items = vec![make_item("margin note", 30.0, 480.0, 1)];
+        for (row, y) in [480.0, 460.0, 440.0].into_iter().enumerate() {
+            items.push(make_item(&format!("label-{row}"), 80.0, y, 1));
+            items.push(make_item(&format!("value-{row}"), 180.0, y, 1));
+        }
+        let physical = Table::new(
+            columns,
+            vec![500.0],
+            vec![vec!["label".into(), "value".into()]],
+            Vec::new(),
+        );
+
+        let refined = refine_segment_grid_text_rows(&items, &rules, 1, &physical)
+            .expect("an out-of-band item must not abort otherwise valid refinement");
+        assert_eq!(refined.cells.len(), 3);
+        assert_eq!(refined.cells[0], ["label-0", "value-0"]);
+        assert!(!refined.item_indices.contains(&0));
+    }
+
+    #[test]
+    fn text_row_refinement_joins_rtl_fragments_in_reading_order() {
+        let columns = vec![60.0, 160.0, 260.0];
+        let rules = vec![(500.0, 60.0, 260.0), (400.0, 60.0, 260.0)];
+        let mut items = Vec::new();
+        for y in [480.0, 460.0, 440.0] {
+            items.push(make_item("שתיים", 80.0, y, 1));
+            items.push(make_item("אחד", 120.0, y, 1));
+            items.push(make_item("1", 180.0, y, 1));
+        }
+        let physical = Table::new(
+            columns,
+            vec![500.0],
+            vec![vec!["header".into(), "value".into()]],
+            Vec::new(),
+        );
+
+        let refined = refine_segment_grid_text_rows(&items, &rules, 1, &physical)
+            .expect("repeated RTL rows should refine");
+        assert_eq!(refined.cells[0][0], "אחד שתיים");
     }
 
     #[test]
