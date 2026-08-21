@@ -59,6 +59,21 @@ pub fn table_to_markdown(table: &Table) -> String {
     output
 }
 
+/// True when a detected data table survives formatting cleanup with a header,
+/// at least one body row, and at least two columns.
+///
+/// Supplemental OCR uses this at the structured-table boundary so incomplete
+/// detections cannot modify an otherwise clean native page.
+#[cfg(any(test, feature = "ocr"))]
+pub(crate) fn is_complete_data_table(table: &Table) -> bool {
+    if table.kind != TableKind::Data {
+        return false;
+    }
+
+    let (cleaned_cells, _) = clean_table_cells(&table.cells);
+    cleaned_cells.len() >= 2 && cleaned_cells.first().is_some_and(|row| row.len() >= 2)
+}
+
 /// Render a table-of-contents as a flat per-row text block.
 ///
 /// Each row becomes one line: non-empty cells joined with spaces, and the
@@ -910,6 +925,29 @@ mod tests {
         let md = table_to_markdown(&table);
         assert!(md.contains("|Only|"));
         assert!(md.contains("|---|"));
+    }
+
+    #[test]
+    fn complete_data_table_requires_header_body_and_two_columns() {
+        let complete = Table {
+            columns: vec![100.0, 200.0, 300.0],
+            rows: vec![500.0, 480.0, 460.0],
+            cells: vec![
+                vec!["Metric".into(), "Value".into()],
+                vec!["Accuracy".into(), "95%".into()],
+            ],
+            item_indices: vec![],
+            kind: TableKind::Data,
+        };
+        assert!(is_complete_data_table(&complete));
+
+        let mut single_row = complete.clone();
+        single_row.cells.truncate(1);
+        assert!(!is_complete_data_table(&single_row));
+
+        let mut toc = complete;
+        toc.kind = TableKind::Toc;
+        assert!(!is_complete_data_table(&toc));
     }
 
     #[test]

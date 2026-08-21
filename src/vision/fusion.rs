@@ -5,9 +5,12 @@ use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::markdown::{to_markdown_from_items_with_rects_and_page_count, MarkdownOptions};
+use crate::markdown::{
+    complete_table_markdown_from_items, to_markdown_from_items_with_rects_and_page_count,
+    MarkdownOptions,
+};
 use crate::text_quality::{detect_encoding_issues, is_cid_garbage, is_garbage_text};
-use crate::types::{ItemType, TextItem};
+use crate::types::{ItemType, PdfRect, TextItem};
 use crate::PageMarkdown;
 
 use super::{
@@ -124,6 +127,16 @@ pub(crate) struct NativeFallbackCandidate {
     origin: NativeCandidateOrigin,
 }
 
+/// How OCR output for a routed page may participate in final fusion.
+#[derive(Debug, Clone)]
+pub(crate) enum OcrFusionRoute {
+    /// The page requires ordinary full-page OCR replacement or adaptive fusion.
+    FullPage,
+    /// The native page is clean; only tables detected inside these image
+    /// regions may be appended.
+    SupplementalRegions(Vec<PdfRect>),
+}
+
 impl NativeFallbackCandidate {
     /// True when an independent native recovery is substantial enough to
     /// cancel OCR for recoverable font/vector routing reasons.
@@ -193,16 +206,19 @@ pub fn fuse_ocr_pages(
     document_page_count: u32,
     options: &OcrFusionOptions,
 ) -> Result<FusedPages, OcrFusionError> {
+    let routes = full_page_routes(ocr_run);
     fuse_ocr_pages_impl(
         native_pages,
         ocr_run,
         document_page_count,
         options,
         &BTreeMap::new(),
+        &routes,
     )
 }
 
 /// OCR-pipeline fusion with trustworthy partial native candidates.
+#[cfg(test)]
 pub(crate) fn fuse_ocr_pages_adaptive(
     native_pages: &[PageMarkdown],
     ocr_run: &OcrRun,
@@ -210,12 +226,41 @@ pub(crate) fn fuse_ocr_pages_adaptive(
     options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
 ) -> Result<FusedPages, OcrFusionError> {
+    let routes = full_page_routes(ocr_run);
     fuse_ocr_pages_impl(
         native_pages,
         ocr_run,
         document_page_count,
         options,
         native_candidates,
+        &routes,
+    )
+}
+
+fn full_page_routes(ocr_run: &OcrRun) -> BTreeMap<u32, OcrFusionRoute> {
+    ocr_run
+        .pages
+        .iter()
+        .map(|page| (page.rendered.page(), OcrFusionRoute::FullPage))
+        .collect()
+}
+
+/// OCR-pipeline fusion with an explicit route mode for every processed page.
+pub(crate) fn fuse_ocr_pages_adaptive_with_routes(
+    native_pages: &[PageMarkdown],
+    ocr_run: &OcrRun,
+    document_page_count: u32,
+    options: &OcrFusionOptions,
+    native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
+    routes: &BTreeMap<u32, OcrFusionRoute>,
+) -> Result<FusedPages, OcrFusionError> {
+    fuse_ocr_pages_impl(
+        native_pages,
+        ocr_run,
+        document_page_count,
+        options,
+        native_candidates,
+        routes,
     )
 }
 
@@ -225,6 +270,7 @@ fn fuse_ocr_pages_impl(
     document_page_count: u32,
     options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
+    routes: &BTreeMap<u32, OcrFusionRoute>,
 ) -> Result<FusedPages, OcrFusionError> {
     validate_options(options)?;
 
@@ -273,13 +319,35 @@ fn fuse_ocr_pages_impl(
                     ));
                 }
                 warnings.extend(local.ocr.warnings.iter().cloned());
-                let ocr_markdown = to_markdown_from_items_with_rects_and_page_count(
-                    ocr_items,
-                    options.markdown.clone(),
-                    &[],
-                    document_page_count,
-                );
-                let ocr_markdown = preserve_ocr_line_breaks(&ocr_markdown, local);
+                let route = routes
+                    .get(&page_number)
+                    .ok_or(OcrFusionError::MissingOcrRoute { page: page_number })?;
+                let ocr_markdown = match route {
+                    OcrFusionRoute::SupplementalRegions(regions) => {
+                        let region_items = items_inside_regions(ocr_items, regions);
+                        let table_markdown = complete_table_markdown_from_items(
+                            region_items,
+                            options.markdown.clone(),
+                            document_page_count,
+                        );
+                        if table_markdown.is_empty() {
+                            warnings.push(
+                                "image-region OCR found no valid table; kept native content"
+                                    .to_string(),
+                            );
+                        }
+                        table_markdown
+                    }
+                    OcrFusionRoute::FullPage => {
+                        let markdown = to_markdown_from_items_with_rects_and_page_count(
+                            ocr_items,
+                            options.markdown.clone(),
+                            &[],
+                            document_page_count,
+                        );
+                        preserve_ocr_line_breaks(&markdown, local)
+                    }
+                };
                 let (markdown, source, adaptive_recommends_hosted) = if let Some(candidate) =
                     native_candidates
                         .get(&page_number)
@@ -716,6 +784,24 @@ fn is_markdown_table_line(line: &str) -> bool {
     trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.matches('|').count() >= 2
 }
 
+fn items_inside_regions(items: Vec<TextItem>, regions: &[PdfRect]) -> Vec<TextItem> {
+    items
+        .into_iter()
+        .filter(|item| {
+            let center_x = item.x + item.width / 2.0;
+            let center_y = item.y + item.height / 2.0;
+            regions.iter().any(|region| {
+                const EDGE_TOLERANCE_PT: f32 = 2.0;
+                item.page == region.page
+                    && center_x >= region.x - EDGE_TOLERANCE_PT
+                    && center_x <= region.x + region.width + EDGE_TOLERANCE_PT
+                    && center_y >= region.y - EDGE_TOLERANCE_PT
+                    && center_y <= region.y + region.height + EDGE_TOLERANCE_PT
+            })
+        })
+        .collect()
+}
+
 fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) {
     let native_keys = comparison_units(native);
     let mut addition_keys = Vec::new();
@@ -948,6 +1034,12 @@ pub enum OcrFusionError {
         /// Unexpected 1-indexed page number.
         page: u32,
     },
+    /// OCR input did not have an explicit full-page or supplemental route.
+    #[error("OCR page {page} has no fusion route")]
+    MissingOcrRoute {
+        /// Unrouted 1-indexed page number.
+        page: u32,
+    },
     /// Render resolution is non-finite or non-positive.
     #[error("render DPI must be positive and finite, got {value}")]
     InvalidRenderDpi {
@@ -1049,6 +1141,190 @@ mod tests {
 
     fn native_candidate(markdown: &str) -> NativeFallbackCandidate {
         assess_native_candidate(markdown.to_string(), NativeCandidateOrigin::Extractor).unwrap()
+    }
+
+    #[test]
+    fn supplemental_image_ocr_keeps_native_text_without_a_valid_table() {
+        let native = [native(0, "Native article text\n", false)];
+        let run = run(vec![routed_page(
+            1,
+            vec![positioned_span(
+                "Figure-only OCR label",
+                20.0,
+                20.0,
+                180.0,
+                35.0,
+            )],
+            Some(0.95),
+        )]);
+        let routes = BTreeMap::from([(
+            1,
+            OcrFusionRoute::SupplementalRegions(vec![PdfRect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+                page: 1,
+            }]),
+        )]);
+
+        let result = fuse_ocr_pages_adaptive_with_routes(
+            &native,
+            &run,
+            1,
+            &OcrFusionOptions::new(),
+            &BTreeMap::new(),
+            &routes,
+        )
+        .unwrap();
+
+        assert_eq!(result.pages[0].markdown, "Native article text\n");
+        assert_eq!(result.pages[0].provenance.source, PageContentSource::Native);
+        assert!(result.pages[0].provenance.warnings[0].contains("no valid table"));
+    }
+
+    #[test]
+    fn supplemental_image_ocr_fuses_a_table_inside_the_region() {
+        let native = [native(0, "Native article text\n", false)];
+        let mut spans = Vec::new();
+        for (row, (left, right)) in [
+            ("Metric", "Value"),
+            ("Accuracy", "95%"),
+            ("Recall", "93%"),
+            ("Precision", "96%"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let top = 10.0 + row as f32 * 20.0;
+            spans.push(positioned_span(left, 10.0, top, 80.0, top + 10.0));
+            spans.push(positioned_span(right, 110.0, top, 180.0, top + 10.0));
+        }
+        let run = run(vec![routed_page(1, spans, Some(0.95))]);
+        let routes = BTreeMap::from([(
+            1,
+            OcrFusionRoute::SupplementalRegions(vec![PdfRect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+                page: 1,
+            }]),
+        )]);
+
+        let result = fuse_ocr_pages_adaptive_with_routes(
+            &native,
+            &run,
+            1,
+            &OcrFusionOptions::new(),
+            &BTreeMap::new(),
+            &routes,
+        )
+        .unwrap();
+
+        assert_eq!(result.pages[0].provenance.source, PageContentSource::Fused);
+        assert!(result.pages[0].markdown.contains("|Metric|Value|"));
+        assert!(result.pages[0].markdown.contains("|Accuracy|95%|"));
+        assert_eq!(
+            result.pages[0].markdown.matches("Native article").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn supplemental_table_detection_requires_multiple_rows() {
+        let items = vec![
+            TextItem {
+                text: "Metric".to_string(),
+                x: 10.0,
+                y: 40.0,
+                width: 50.0,
+                height: 10.0,
+                font: "OCR".to_string(),
+                font_tag: String::new(),
+                font_size: 10.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            },
+            TextItem {
+                text: "Value".to_string(),
+                x: 110.0,
+                y: 40.0,
+                width: 50.0,
+                height: 10.0,
+                font: "OCR".to_string(),
+                font_tag: String::new(),
+                font_size: 10.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            },
+        ];
+
+        let mut options = MarkdownOptions::default();
+        options.base_font_size = Some(10.0);
+        assert!(complete_table_markdown_from_items(items, options, 1).is_empty());
+    }
+
+    #[test]
+    fn supplemental_image_ocr_filters_spans_by_region_center() {
+        let items = vec![
+            TextItem {
+                text: "inside".to_string(),
+                x: 10.0,
+                y: 10.0,
+                width: 20.0,
+                height: 10.0,
+                font: "OCR".to_string(),
+                font_tag: String::new(),
+                font_size: 10.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            },
+            TextItem {
+                text: "outside".to_string(),
+                x: 120.0,
+                y: 10.0,
+                width: 20.0,
+                height: 10.0,
+                font: "OCR".to_string(),
+                font_tag: String::new(),
+                font_size: 10.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            },
+        ];
+        let regions = [PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            page: 1,
+        }];
+
+        let filtered = items_inside_regions(items, &regions);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].text, "inside");
     }
 
     #[test]

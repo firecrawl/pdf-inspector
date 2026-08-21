@@ -16,9 +16,10 @@ use crate::{
 };
 
 use super::fusion::{
-    assess_native_candidate, fuse_ocr_pages_adaptive, NativeCandidateOrigin,
-    NativeFallbackCandidate,
+    assess_native_candidate, fuse_ocr_pages_adaptive_with_routes, NativeCandidateOrigin,
+    NativeFallbackCandidate, OcrFusionRoute,
 };
+use super::image_analysis::region_has_document_like_ink;
 use super::oar::onnx_runtime_library_path;
 use super::pdfium::PdfiumTextPage;
 use super::{
@@ -243,12 +244,15 @@ pub fn process_pdf_with_ocr_mem(
 
     let mut page_markdown_options = options.markdown.clone();
     page_markdown_options.include_page_numbers = false;
-    let (mut native, page_count) = crate::extract_pages_markdown_mem_for_ocr(
+    let extraction = crate::extract_pages_markdown_mem_for_ocr(
         buffer,
         selected_pages_zero_indexed.as_deref(),
         options.password.as_deref(),
         &page_markdown_options,
     )?;
+    let mut native = extraction.result;
+    let page_count = extraction.page_count;
+    let extracted_supplemental_regions = extraction.supplemental_ocr_regions;
     if let Some(invalid) = selected_pages
         .as_ref()
         .and_then(|pages| pages.iter().copied().find(|page| *page > page_count))
@@ -283,7 +287,17 @@ pub fn process_pdf_with_ocr_mem(
         }
     }
 
-    let mut routed = initially_routed.clone();
+    let mut fusion_routes: BTreeMap<u32, OcrFusionRoute> = initially_routed
+        .iter()
+        .map(|page| (*page, OcrFusionRoute::FullPage))
+        .collect();
+    if options.ocr.mode == OcrMode::Auto {
+        for (&page, regions) in &extracted_supplemental_regions {
+            fusion_routes
+                .entry(page)
+                .or_insert_with(|| OcrFusionRoute::SupplementalRegions(regions.clone()));
+        }
+    }
     let mut renderer = None;
     let mut recovered_natively = BTreeSet::new();
     if options.ocr.mode == OcrMode::Auto {
@@ -294,7 +308,7 @@ pub fn process_pdf_with_ocr_mem(
         native_probe_pages.extend(
             native_candidates
                 .keys()
-                .filter(|page| routed.contains(page))
+                .filter(|page| fusion_routes.contains_key(page))
                 .copied(),
         );
         if !native_probe_pages.is_empty() {
@@ -331,6 +345,13 @@ pub fn process_pdf_with_ocr_mem(
                     native_page.markdown = candidate.markdown().to_string();
                     native_page.needs_ocr = false;
                     native_candidates.remove(&page.page);
+                    if let Some(route) =
+                        route_after_native_recovery(page.page, &extracted_supplemental_regions)
+                    {
+                        fusion_routes.insert(page.page, route);
+                    } else {
+                        fusion_routes.remove(&page.page);
+                    }
                     recovered_natively.insert(page.page);
                 } else {
                     match native_candidates.entry(page.page) {
@@ -345,16 +366,40 @@ pub fn process_pdf_with_ocr_mem(
                     }
                 }
             }
-            routed.retain(|page| !recovered_natively.contains(page));
         }
     }
 
+    let supplemental_preflight_ms = if options.ocr.mode == OcrMode::Auto
+        && fusion_routes
+            .values()
+            .any(|route| matches!(route, OcrFusionRoute::SupplementalRegions(_)))
+    {
+        let native_renderer = match renderer {
+            Some(renderer) => renderer,
+            None => PdfiumRenderer::load()?,
+        };
+        let elapsed = filter_supplemental_routes_by_pixels(
+            &native_renderer,
+            buffer,
+            options.password.as_deref(),
+            &options.render,
+            &mut fusion_routes,
+        )?;
+        renderer = Some(native_renderer);
+        elapsed
+    } else {
+        0
+    };
+
+    // Derive the renderer input once, after every route mutation, so the
+    // route map remains the single source of truth throughout planning.
+    let routed: Vec<u32> = fusion_routes.keys().copied().collect();
     let fusion_options = OcrFusionOptions::new()
         .markdown(page_markdown_options)
         .render_dpi(options.render.dpi)
         .hosted_recommendation_confidence(options.hosted_recommendation_confidence);
     let mut fused = if routed.is_empty() {
-        fuse_ocr_pages_adaptive(
+        fuse_ocr_pages_adaptive_with_routes(
             &native.pages,
             &OcrRun {
                 pages: Vec::new(),
@@ -364,6 +409,7 @@ pub fn process_pdf_with_ocr_mem(
             page_count,
             &fusion_options,
             &native_candidates,
+            &fusion_routes,
         )?
     } else {
         // Resolve the native renderer before any network request so a missing
@@ -385,8 +431,12 @@ pub fn process_pdf_with_ocr_mem(
             page_count,
             &fusion_options,
             &native_candidates,
+            &fusion_routes,
         )?
     };
+    fused.render_time_ms = fused
+        .render_time_ms
+        .saturating_add(supplemental_preflight_ms);
     for page in &mut fused.pages {
         if recovered_natively.contains(&page.page_number) {
             page.provenance
@@ -427,6 +477,56 @@ pub fn process_pdf_with_ocr_mem(
     })
 }
 
+fn route_after_native_recovery(
+    page: u32,
+    supplemental_regions: &BTreeMap<u32, Vec<crate::types::PdfRect>>,
+) -> Option<OcrFusionRoute> {
+    supplemental_regions
+        .get(&page)
+        .cloned()
+        .map(OcrFusionRoute::SupplementalRegions)
+}
+
+/// Keep supplemental OCR lazy by cheaply checking rendered image regions for
+/// document-like foreground ink before the model store or OCR engine is
+/// touched. Full-page routes already have native extraction evidence and are
+/// never filtered here.
+fn filter_supplemental_routes_by_pixels(
+    renderer: &PdfiumRenderer,
+    pdf_bytes: &[u8],
+    password: Option<&str>,
+    render_options: &RenderOptions,
+    routes: &mut BTreeMap<u32, OcrFusionRoute>,
+) -> Result<u64, OcrPipelineError> {
+    let pages: Vec<u32> = routes
+        .iter()
+        .filter_map(|(&page, route)| {
+            matches!(route, OcrFusionRoute::SupplementalRegions(_)).then_some(page)
+        })
+        .collect();
+    if pages.is_empty() {
+        return Ok(0);
+    }
+
+    let started = Instant::now();
+    let mut preflight_options = render_options.clone();
+    preflight_options.dpi = preflight_options.dpi.min(96.0);
+    for chunk in pages.chunks(OCR_PAGE_CHUNK_SIZE) {
+        let rendered = renderer.render_pages(pdf_bytes, chunk, password, &preflight_options)?;
+        for page in rendered {
+            let Some(OcrFusionRoute::SupplementalRegions(regions)) = routes.get_mut(&page.page())
+            else {
+                continue;
+            };
+            regions.retain(|region| region_has_document_like_ink(&page, region));
+        }
+    }
+    routes.retain(|_, route| {
+        !matches!(route, OcrFusionRoute::SupplementalRegions(regions) if regions.is_empty())
+    });
+    Ok(elapsed_ms(started))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_and_fuse_ocr_chunks<R, O>(
     renderer: &R,
@@ -440,6 +540,7 @@ fn run_and_fuse_ocr_chunks<R, O>(
     document_page_count: u32,
     fusion_options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
+    fusion_routes: &BTreeMap<u32, OcrFusionRoute>,
 ) -> Result<FusedPages, OcrPipelineError>
 where
     R: PageRenderer,
@@ -475,12 +576,13 @@ where
             render_options,
             ocr_options,
         )?;
-        let fused = fuse_ocr_pages_adaptive(
+        let fused = fuse_ocr_pages_adaptive_with_routes(
             &native_chunk,
             &run,
             document_page_count,
             fusion_options,
             native_candidates,
+            fusion_routes,
         )?;
         render_time_ms = render_time_ms.saturating_add(fused.render_time_ms);
         ocr_time_ms = ocr_time_ms.saturating_add(fused.ocr_time_ms);
@@ -492,7 +594,7 @@ where
 
     let native_only = select_native_pages(native_pages, |page| !routed.contains(&page));
     if !native_only.is_empty() {
-        let fused = fuse_ocr_pages_adaptive(
+        let fused = fuse_ocr_pages_adaptive_with_routes(
             &native_only,
             &OcrRun {
                 pages: Vec::new(),
@@ -502,6 +604,7 @@ where
             document_page_count,
             fusion_options,
             native_candidates,
+            fusion_routes,
         )?;
         for page in fused.pages {
             pages_by_number.insert(page.page_number, page);
@@ -1082,6 +1185,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let routed_pages = (1..=10).collect::<Vec<_>>();
+        let routes = routed_pages
+            .iter()
+            .map(|&page| (page, OcrFusionRoute::FullPage))
+            .collect();
         let ocr_options = OcrOptions::new().mode(OcrMode::Force);
 
         let fused = run_and_fuse_ocr_chunks(
@@ -1096,6 +1203,7 @@ mod tests {
             10,
             &OcrFusionOptions::new(),
             &BTreeMap::new(),
+            &routes,
         )
         .unwrap();
 
@@ -1135,6 +1243,30 @@ mod tests {
         ];
 
         assert_eq!(native_recovery_candidates(&routed, &reasons), vec![1, 3]);
+    }
+
+    #[test]
+    fn native_recovery_retains_supplemental_image_regions() {
+        let region = crate::types::PdfRect {
+            x: 10.0,
+            y: 20.0,
+            width: 200.0,
+            height: 120.0,
+            page: 2,
+        };
+        let supplemental = BTreeMap::from([(2, vec![region.clone()])]);
+
+        let route = route_after_native_recovery(2, &supplemental).unwrap();
+        let OcrFusionRoute::SupplementalRegions(regions) = route else {
+            panic!("native recovery must leave image regions on a supplemental route");
+        };
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].x, region.x);
+        assert_eq!(regions[0].y, region.y);
+        assert_eq!(regions[0].width, region.width);
+        assert_eq!(regions[0].height, region.height);
+        assert_eq!(regions[0].page, region.page);
+        assert!(route_after_native_recovery(1, &supplemental).is_none());
     }
 
     #[test]
@@ -1312,15 +1444,15 @@ mod tests {
         assert!(public.pages[0].needs_ocr);
         assert!(public.pages[0].markdown.trim().is_empty());
 
-        let (ocr, _) = crate::extract_pages_markdown_mem_for_ocr(
+        let ocr = crate::extract_pages_markdown_mem_for_ocr(
             &bytes,
             None,
             None,
             &MarkdownOptions::default(),
         )
         .unwrap();
-        assert!(ocr.pages[0].needs_ocr);
-        assert!(ocr.pages[0]
+        assert!(ocr.result.pages[0].needs_ocr);
+        assert!(ocr.result.pages[0]
             .markdown
             .contains("Order Detail Report by Account"));
     }

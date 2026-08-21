@@ -22,6 +22,9 @@ pub(crate) use detect_lines::{
 pub(crate) use detect_rects::cluster_rects;
 pub use detect_rects::{detect_chart_regions, detect_tables_from_rects, RectHintRegion};
 pub use detect_struct::detect_tables_from_struct_tree;
+#[cfg(any(test, feature = "ocr"))]
+#[cfg(feature = "ocr")]
+pub(crate) use format::is_complete_data_table;
 pub use format::table_to_markdown;
 pub use structured::{cells_to_markdown, StructuredCell};
 
