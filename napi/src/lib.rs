@@ -2,7 +2,6 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use std::collections::HashSet;
 use std::panic;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +113,13 @@ pub struct TextItem {
     /// `page`/`mcid` pairs from [`extractStructureElements`] to attach
     /// structure-tree roles (headings, paragraphs, …) in tagged PDFs.
     pub mcid: Option<i64>,
+    /// Structure-tree role resolved from `mcid` for tagged PDFs — the standard
+    /// structure type name ("H1".."H6", "P", "Note", "Caption", "Figure", …),
+    /// or a custom tag resolved through the document's role map. `None` when
+    /// the PDF is untagged, the page has no structure tree, or the item is not
+    /// part of marked content. Lets callers separate body text from footnotes
+    /// (`Note`), running headers, and marginalia without a manual join.
+    pub role: Option<String>,
 }
 
 /// A page's regions for text extraction: (page_index_0based, bboxes).
@@ -481,22 +487,15 @@ pub fn extract_text_with_positions(
 ) -> Result<Vec<TextItem>> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("extract_text_with_positions", move || {
-        let items = match pages {
-            Some(p) => {
-                let page_set: HashSet<u32> = p.into_iter().collect();
-                pdf_inspector::extractor::extract_text_with_positions_mem_pages(
-                    &bytes,
-                    Some(&page_set),
-                )
-                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?
-            }
-            None => pdf_inspector::extractor::extract_text_with_positions_mem(&bytes)
-                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?,
-        };
+        let items = pdf_inspector::extract_text_with_positions_with_roles_mem(
+            &bytes,
+            pages.as_deref(),
+        )
+        .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?;
 
         Ok(items
             .into_iter()
-            .map(|item| {
+            .map(|(item, role)| {
                 let (item_type, link_url) = convert_item_type(&item.item_type);
                 TextItem {
                     text: item.text,
@@ -514,6 +513,7 @@ pub fn extract_text_with_positions(
                     item_type,
                     link_url,
                     mcid: item.mcid,
+                    role,
                 }
             })
             .collect())

@@ -239,6 +239,107 @@ fn make_minimal_text_pdf() -> Vec<u8> {
     )
 }
 
+/// Build a minimal tagged (Structure Tree) PDF with two marked-content
+/// sequences: body text tagged `/P` (MCID 0) and a footnote tagged `/Note`
+/// (MCID 1). Used to verify that positioned text items carry both their
+/// Marked Content ID and the role resolved from the structure tree, so callers
+/// can separate footnote/marginal text from body text.
+fn make_tagged_note_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    // Two marked-content sequences. The BDC property dict carries the MCID
+    // that links each run back to a structure element.
+    let content = "BT /F1 12 Tf 1 0 0 1 72 700 Tm /P <</MCID 0>> BDC (Body paragraph text) Tj EMC ET\n\
+                   BT /F1 8 Tf 1 0 0 1 72 60 Tm /Note <</MCID 1>> BDC (Editor footnote text) Tj EMC ET";
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R /StructParents 0 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        "<< /Type /StructTreeRoot /K [7 0 R] >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        7,
+        "<< /Type /StructElem /S /Document /P 6 0 R /K [8 0 R 9 0 R] >>",
+    );
+    // Body paragraph → /P, links MCID 0 on the page.
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        8,
+        "<< /Type /StructElem /S /P /P 7 0 R /Pg 3 0 R /K 0 >>",
+    );
+    // Footnote → /Note, links MCID 1 on the page.
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        9,
+        "<< /Type /StructElem /S /Note /P 7 0 R /Pg 3 0 R /K 1 >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
 fn make_digit_run_repro_pdf() -> Vec<u8> {
     let content = r#"BT
 /F1 12 Tf
@@ -1517,6 +1618,67 @@ fn test_extract_structure_elements_tagged_pdf() {
     assert!(page1.iter().all(|e| e.page == 1));
     let full_page1_count = elements.iter().filter(|e| e.page == 1).count();
     assert_eq!(page1.len(), full_page1_count);
+}
+
+#[test]
+fn test_positioned_items_carry_resolved_role_tagged() {
+    // A synthetic tagged PDF with body text (/P, MCID 0) and a footnote
+    // (/Note, MCID 1). The positioned-text-with-roles API must surface both
+    // the MCID and the role resolved from the structure tree, so callers can
+    // tell the editor's footnote apart from the author's body text.
+    let pdf = make_tagged_note_pdf();
+    let items = pdf_inspector::extract_text_with_positions_with_roles_mem(&pdf, None)
+        .expect("extract positioned text with roles");
+
+    // Body run (MCID 0) resolves to "P"; every item carrying MCID 0 does so.
+    let body: Vec<_> = items.iter().filter(|(it, _)| it.mcid == Some(0)).collect();
+    assert!(
+        !body.is_empty(),
+        "should extract the body marked-content run"
+    );
+    assert!(
+        body.iter().all(|(_, role)| role.as_deref() == Some("P")),
+        "body text (MCID 0) should resolve to role P, got {:?}",
+        body.iter().map(|(_, r)| r).collect::<Vec<_>>()
+    );
+
+    // Footnote run (MCID 1) resolves to "Note".
+    let note: Vec<_> = items.iter().filter(|(it, _)| it.mcid == Some(1)).collect();
+    assert!(
+        !note.is_empty(),
+        "should extract the footnote marked-content run"
+    );
+    assert!(
+        note.iter().all(|(_, role)| role.as_deref() == Some("Note")),
+        "footnote text (MCID 1) should resolve to role Note, got {:?}",
+        note.iter().map(|(_, r)| r).collect::<Vec<_>>()
+    );
+
+    // The body and footnote are separable by role — the whole point of the
+    // feature: recovered body text is non-empty and the two regions differ.
+    let note_text: String = note.iter().map(|(it, _)| it.text.as_str()).collect();
+    let body_text: String = body.iter().map(|(it, _)| it.text.as_str()).collect();
+    assert!(
+        body_text.contains("Body"),
+        "body region should recover body text, got {body_text:?}"
+    );
+    assert!(
+        note_text.contains("footnote"),
+        "note region should recover footnote text, got {note_text:?}"
+    );
+}
+
+#[test]
+fn test_positioned_items_role_none_untagged() {
+    // An untagged PDF has no structure tree, so every item's role is None.
+    let pdf = make_minimal_text_pdf();
+    let items = pdf_inspector::extract_text_with_positions_with_roles_mem(&pdf, None)
+        .expect("extract positioned text with roles");
+    assert!(!items.is_empty(), "untagged PDF should still extract text");
+    assert!(
+        items.iter().all(|(_, role)| role.is_none()),
+        "untagged PDF items should have no resolved role"
+    );
 }
 
 #[test]

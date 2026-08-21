@@ -94,6 +94,15 @@ assert.ok(
 );
 console.log('  extractTextWithPositions mcid: OK');
 
+// role: resolved struct-tree role — undefined on untagged PDFs, a non-empty
+// structure type name (H1, P, Note, …) on tagged marked content
+assert.ok(items.every(i => i.role === undefined || typeof i.role === 'string'));
+assert.ok(
+  taggedItems.some(i => typeof i.role === 'string' && i.role.length > 0),
+  'tagged PDF text items should carry resolved struct-tree roles',
+);
+console.log('  extractTextWithPositions role: OK');
+
 // --- extractStructureElements ---
 console.log('Testing extractStructureElements...');
 const structureElements = extractStructureElements(taggedFixture);
