@@ -580,6 +580,13 @@ struct PageAnalysis {
     /// CID-encoded text with ToUnicode produces low unique_alphanum_chars in raw
     /// bytes but is fully decodable — this flag prevents misclassifying it as a scan.
     has_decodable_text_fonts: bool,
+    /// Whether any USED font on the page cannot decode to Unicode (Identity-H/V
+    /// without ToUnicode or fallback, Type3 without ToUnicode, or a font whose
+    /// definition couldn't be resolved). `text_char_count` is a page-wide tally
+    /// with no per-font attribution, so the dense-text floor must not fire when
+    /// part of that volume may be garbage — see
+    /// [`page_has_dense_decodable_text`].
+    has_undecodable_text_fonts: bool,
 }
 
 /// Minimum-evidence floor (#213): the volume of decodable characters a page
@@ -599,12 +606,17 @@ const MIN_DECODABLE_TEXT_CHARS: u64 = 200;
 
 /// Whether a page carries enough genuine, decodable text that the sparse-text
 /// scan heuristics must not condemn it to OCR — the #213 minimum-evidence
-/// floor. True only when the page both has fonts that decode to Unicode and
-/// draws at least [`MIN_DECODABLE_TEXT_CHARS`] characters, so it never rescues
-/// a scan (no real text) or an undecodable-font page (garbled bytes), only a
-/// dense text layer that happens to arrive in very few operators.
+/// floor. True only when the page has fonts that decode to Unicode, every used
+/// font decodes (the char tally is page-wide, so one undecodable font would
+/// let garbage volume pose as text — a 300-char garbled Identity-H body plus a
+/// five-char Helvetica header must not qualify), and at least
+/// [`MIN_DECODABLE_TEXT_CHARS`] characters are drawn. It therefore never
+/// rescues a scan (no real text) or a page whose volume may be garbled, only a
+/// dense decodable text layer that happens to arrive in very few operators.
 fn page_has_dense_decodable_text(a: &PageAnalysis) -> bool {
-    a.has_decodable_text_fonts && a.text_char_count >= MIN_DECODABLE_TEXT_CHARS
+    a.has_decodable_text_fonts
+        && !a.has_undecodable_text_fonts
+        && a.text_char_count >= MIN_DECODABLE_TEXT_CHARS
 }
 
 /// Explain *why* a page needs OCR, from its content analysis. Priority:
@@ -938,6 +950,11 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let has_decodable_text_fonts =
         text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
 
+    // Whether ANY used font cannot decode — gates the dense-text floor, whose
+    // page-wide char tally cannot tell decodable volume from garbled volume.
+    let has_undecodable_text_fonts =
+        text_ops > 0 && used_fonts_include_undecodable_text(&used_font_ids, &font_map, doc);
+
     PageAnalysis {
         text_operator_count: text_ops,
         has_images,
@@ -953,6 +970,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_only_type3_fonts,
         font_change_count: font_changes,
         has_decodable_text_fonts,
+        has_undecodable_text_fonts,
     }
 }
 
@@ -1320,6 +1338,48 @@ fn used_fonts_have_decodable_text(
                 if identity_h_font_has_fallback(&info.dict, doc) {
                     return true;
                 }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Usage-based check: does the page use at least one font whose text cannot be
+/// decoded to Unicode? Undecodable means Identity-H/V without ToUnicode or an
+/// embedded-cmap fallback, Type3 without ToUnicode, or a used font whose
+/// definition couldn't be resolved at all (treated as undecodable because its
+/// output can't be vouched for).
+///
+/// This is NOT the negation of [`used_fonts_have_decodable_text`]: a page can
+/// have both a decodable and an undecodable font. The dense-text floor
+/// ([`page_has_dense_decodable_text`]) needs this distinction because its
+/// character tally is page-wide — with any undecodable font in play, part of
+/// that volume may be garbage, so the floor must not vouch for it.
+fn used_fonts_include_undecodable_text(
+    used_font_ids: &HashSet<ObjectId>,
+    font_map: &HashMap<ObjectId, FontInfo>,
+    doc: &Document,
+) -> bool {
+    for id in used_font_ids {
+        let Some(info) = font_map.get(id) else {
+            return true;
+        };
+        if info.has_tounicode {
+            continue;
+        }
+        match info.subtype.as_deref() {
+            Some(b"Type0") => {
+                let is_identity = matches!(
+                    info.encoding.as_deref(),
+                    Some(b"Identity-H") | Some(b"Identity-V")
+                );
+                if is_identity && !identity_h_font_has_fallback(&info.dict, doc) {
+                    return true;
+                }
+            }
+            Some(b"Type3") => {
+                return true;
             }
             _ => {}
         }
@@ -3533,6 +3593,113 @@ mod tests {
         assert!(
             needs_ocr,
             "a scan whose only text is escape sequences must still route to OCR"
+        );
+    }
+
+    #[test]
+    fn test_dense_garbled_volume_with_small_decodable_font_not_rescued() {
+        // Review regression: the dense-text floor's character tally is
+        // page-wide. A page whose volume is drawn by an undecodable
+        // Identity-H font must not be rescued from OCR just because a tiny
+        // decodable font (a header line) is also present on the page.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let image_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Image".to_vec()),
+                "Width" => Object::Integer(1500),
+                "Height" => Object::Integer(2383),
+            },
+            Vec::new(),
+        )));
+        let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+                },
+            },
+            b"1500 0 0 2383 0 0 cm /Im0 Do".to_vec(),
+        )));
+        // F1: undecodable Identity-H (no ToUnicode, no fallback) carrying the
+        // bulk of the page's character volume as 2-byte CIDs.
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Mystery".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        // F2: decodable Helvetica drawing only a short header.
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        // 150 x CID 0x0641 = 300 counted non-null bytes, well past the floor.
+        let hex_body = "0641".repeat(150);
+        let content =
+            format!("q /Fm0 Do Q BT /F2 8 Tf (Morning Post) Tj /F1 12 Tf <{hex_body}> Tj ET");
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content.into_bytes(),
+        )));
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 1500.into(), 2383.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(bad_font_id),
+                        "F2" => Object::Reference(good_font_id),
+                    },
+                    "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) },
+                },
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.text_char_count >= MIN_DECODABLE_TEXT_CHARS,
+            "sanity: raw volume clears the floor ({})",
+            analysis.text_char_count
+        );
+        assert!(
+            analysis.has_decodable_text_fonts,
+            "sanity: the header font is decodable"
+        );
+        assert!(
+            analysis.has_undecodable_text_fonts,
+            "sanity: the body font is undecodable"
+        );
+        assert!(
+            !page_has_dense_decodable_text(&analysis),
+            "garbled volume plus a small decodable font must not qualify as dense decodable text"
+        );
+        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        assert!(
+            needs_ocr,
+            "a scan whose volume is undecodable must still route to OCR"
         );
     }
 
