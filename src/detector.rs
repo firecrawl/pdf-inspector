@@ -239,7 +239,12 @@ pub(crate) fn detect_from_document(
             } else {
                 config.min_text_ops_per_page
             };
-            if analysis.text_operator_count >= effective_min_ops
+            // A page counts as text-bearing when it shows enough text
+            // operators OR packs a substantial volume of decodable characters
+            // into few operators (#213 minimum-evidence floor). The remaining
+            // guards still exclude vector-outlined and undecodable pages.
+            if (analysis.text_operator_count >= effective_min_ops
+                || page_has_dense_decodable_text(&analysis))
                 && !is_image_dominated
                 && analysis.unique_text_chars >= 5
                 && !analysis.has_vector_text
@@ -260,7 +265,8 @@ pub(crate) fn detect_from_document(
             // When a page has decodable fonts and enough text ops, treat it
             // as having real text regardless of raw byte diversity.
             let alphanum_ok = analysis.unique_alphanum_chars < 10
-                && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
+                && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10)
+                && !page_has_dense_decodable_text(&analysis);
             if analysis.has_template_image
                 && (analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_ok)
             {
@@ -399,21 +405,30 @@ pub(crate) fn detect_from_document(
                 // (single full-page image) rather than figures alongside text.
                 // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars
                 // in raw bytes but are fully decodable — don't treat as scan.
+                // A page dense with decodable text is a real text layer even
+                // when it arrives in very few operators (#213); the sparse-text
+                // scan signals below must not fire on it.
+                let dense_text = page_has_dense_decodable_text(&analysis);
                 let alphanum_low = analysis.unique_alphanum_chars < 10
-                    && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
+                    && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10)
+                    && !dense_text;
                 let looks_like_scan =
                     analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
                 // A template-image page below the `pages_with_text` floor is
                 // a scan with incidental chrome (masthead, stamp, date line)
                 // even when that chrome is diverse, decodable text — keep
-                // this in sync with `page_ocr_signals`.
+                // this in sync with `page_ocr_signals`. The dense-text floor
+                // exempts a genuine text page whose glyphs are packed into few
+                // operators.
                 let sparse_text_over_scan = analysis.has_template_image
-                    && analysis.text_operator_count < config.min_text_ops_per_page.max(10);
+                    && analysis.text_operator_count < config.min_text_ops_per_page.max(10)
+                    && !dense_text;
                 if (analysis.has_template_image && looks_like_scan)
                     || analysis.has_vector_text
                     || sparse_text_over_scan
                     || (analysis.text_operator_count < config.min_text_ops_per_page
-                        && analysis.has_images)
+                        && analysis.has_images
+                        && !dense_text)
                 {
                     ocr_pages.push(page_num);
                 }
@@ -533,6 +548,12 @@ struct PageAnalysis {
     image_count: u32,
     /// Number of unique non-whitespace text characters found in string operands
     unique_text_chars: u32,
+    /// Total (not unique) non-whitespace characters drawn by text-show
+    /// operators. High even when a page uses few `Tj`/`TJ` operators, so it
+    /// distinguishes a dense text layer packed into one `TJ` array (common for
+    /// RTL/Arabic) from a near-empty scan carrying only a masthead — the
+    /// minimum-evidence floor from #213.
+    text_char_count: u64,
     /// Number of unique ASCII alphanumeric bytes (letters + digits) in string operands
     unique_alphanum_chars: u32,
     /// Number of path construction/painting ops (m, l, c, h, f, re, etc.)
@@ -554,6 +575,31 @@ struct PageAnalysis {
     /// CID-encoded text with ToUnicode produces low unique_alphanum_chars in raw
     /// bytes but is fully decodable — this flag prevents misclassifying it as a scan.
     has_decodable_text_fonts: bool,
+}
+
+/// Minimum-evidence floor (#213): the volume of decodable characters a page
+/// must draw for its text layer to count as real on its own, regardless of how
+/// few text-show operators carried it.
+///
+/// The sparse-text scan heuristics use `text_operator_count` as a stand-in for
+/// text volume, which collapses to near zero when a typesetter emits a whole
+/// line or paragraph as one `TJ` array — the norm for RTL/Arabic runs. A
+/// 25-page Arabic journal with a complete text layer was misread as a scan and
+/// routed to OCR because each page showed only a handful of operators (#213).
+/// A newspaper masthead or date line over a genuine scan is a few dozen
+/// characters; a body page of prose is many hundreds. This threshold sits well
+/// above the former and comfortably below the latter, so it rescues real text
+/// pages without letting incidental scan chrome pose as a text layer.
+const MIN_DECODABLE_TEXT_CHARS: u64 = 200;
+
+/// Whether a page carries enough genuine, decodable text that the sparse-text
+/// scan heuristics must not condemn it to OCR — the #213 minimum-evidence
+/// floor. True only when the page both has fonts that decode to Unicode and
+/// draws at least [`MIN_DECODABLE_TEXT_CHARS`] characters, so it never rescues
+/// a scan (no real text) or an undecodable-font page (garbled bytes), only a
+/// dense text layer that happens to arrive in very few operators.
+fn page_has_dense_decodable_text(a: &PageAnalysis) -> bool {
+    a.has_decodable_text_fonts && a.text_char_count >= MIN_DECODABLE_TEXT_CHARS
 }
 
 /// Explain *why* a page needs OCR, from its content analysis. Priority:
@@ -746,6 +792,12 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut path_ops = 0u32;
     let mut font_changes = 0u32;
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
+    // Total non-whitespace characters drawn by text-show operators across the
+    // page (and its Form XObjects). Unlike `text_operator_count`, this does not
+    // collapse a whole line packed into one `TJ` array down to a single unit —
+    // it is the minimum-evidence signal (#213) that a page carries a real text
+    // layer even when its glyphs arrive in very few operators.
+    let mut total_text_chars = 0u64;
     // Collect font ObjectIds (not names) to avoid cross-scope name collisions.
     // Each content stream resolves its Tf font names against its own resource
     // dictionary, producing the correct underlying font ObjectId.
@@ -772,9 +824,10 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
-            let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
+            let (ops, imgs, paths, fonts) = scan_content_for_text_operators_counted(
                 &content,
                 &mut all_unique_chars,
+                &mut total_text_chars,
                 &mut page_font_names,
             );
             text_ops += ops;
@@ -809,6 +862,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 resources,
                 &mut visited,
                 &mut all_unique_chars,
+                &mut total_text_chars,
                 &mut used_font_ids,
                 &mut font_map,
             );
@@ -826,6 +880,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     resources,
                     &mut visited,
                     &mut all_unique_chars,
+                    &mut total_text_chars,
                     &mut used_font_ids,
                     &mut font_map,
                 );
@@ -885,6 +940,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,
+        text_char_count: total_text_chars,
         unique_alphanum_chars,
         path_op_count: path_ops,
         has_vector_text,
@@ -1271,6 +1327,7 @@ fn scan_xobjects_in_resources(
     resources: &lopdf::Dictionary,
     visited: &mut HashSet<ObjectId>,
     unique_chars: &mut HashSet<u8>,
+    total_chars: &mut u64,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
 ) -> (u32, u32, u32, u32) {
@@ -1308,9 +1365,10 @@ fn scan_xobjects_in_resources(
                         .unwrap_or_else(|_| stream.content.clone());
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
-                    let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
+                    let (ops, imgs, paths, fonts) = scan_content_for_text_operators_counted(
                         &content,
                         unique_chars,
+                        total_chars,
                         &mut xobj_font_names,
                     );
                     text_ops += ops;
@@ -1343,6 +1401,7 @@ fn scan_xobjects_in_resources(
                             res,
                             visited,
                             unique_chars,
+                            total_chars,
                             used_font_ids,
                             font_map,
                         );
@@ -1373,9 +1432,29 @@ fn scan_xobjects_in_resources(
 ///
 /// Returns (text_op_count, image_count, path_op_count, font_change_count).
 /// Unique non-whitespace text characters are collected into `unique_chars`.
+///
+/// Thin wrapper over [`scan_content_for_text_operators_counted`] that discards
+/// the total-character-volume tally. Kept so the many unit tests that only care
+/// about operator counts stay unchanged.
+#[cfg(test)]
 fn scan_content_for_text_operators(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
+    used_font_names: &mut HashSet<Vec<u8>>,
+) -> (u32, u32, u32, u32) {
+    scan_content_for_text_operators_counted(content, unique_chars, &mut 0, used_font_names)
+}
+
+/// Like [`scan_content_for_text_operators`] but also accumulates the total
+/// number of non-whitespace characters drawn by text-show operators into
+/// `total_chars`. Operator count alone understates text volume when a
+/// typesetter packs a whole line or paragraph into a single `TJ` array — the
+/// norm for RTL/Arabic runs — so the char tally is the minimum-evidence
+/// signal (#213) that keeps such pages from looking like near-empty scans.
+fn scan_content_for_text_operators_counted(
+    content: &[u8],
+    unique_chars: &mut HashSet<u8>,
+    total_chars: &mut u64,
     used_font_names: &mut HashSet<Vec<u8>>,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
@@ -1412,7 +1491,7 @@ fn scan_content_for_text_operators(
                     && preceding_operand_closer(content, i, operand_floor)
                 {
                     text_ops += 1;
-                    collect_text_chars_before(content, i, unique_chars, operand_floor);
+                    collect_text_chars_before(content, i, unique_chars, total_chars, operand_floor);
                     operand_floor = i;
                 }
             } else if next == b'f' {
@@ -1548,6 +1627,7 @@ fn collect_text_chars_before(
     content: &[u8],
     op_pos: usize,
     unique_chars: &mut HashSet<u8>,
+    total_chars: &mut u64,
     floor: usize,
 ) {
     // Walk backward past whitespace to find the closing delimiter
@@ -1582,6 +1662,7 @@ fn collect_text_chars_before(
             for &ch in &content[k + 1..j] {
                 if !ch.is_ascii_whitespace() {
                     unique_chars.insert(ch);
+                    *total_chars += 1;
                 }
             }
         }
@@ -1610,6 +1691,7 @@ fn collect_text_chars_before(
                         let byte = (h << 4) | l;
                         if byte != 0 && byte != b' ' && byte != b'\t' && byte != b'\n' {
                             unique_chars.insert(byte);
+                            *total_chars += 1;
                         }
                     }
                 }
@@ -1646,6 +1728,7 @@ fn collect_text_chars_before(
                     for &ch in &content[start..m] {
                         if !ch.is_ascii_whitespace() {
                             unique_chars.insert(ch);
+                            *total_chars += 1;
                         }
                     }
                 } else if content[m] == b'<' {
@@ -1668,6 +1751,7 @@ fn collect_text_chars_before(
                                 let byte = (h << 4) | l;
                                 if byte != 0 && byte != b' ' && byte != b'\t' && byte != b'\n' {
                                     unique_chars.insert(byte);
+                                    *total_chars += 1;
                                 }
                             }
                         }
@@ -1836,12 +1920,17 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool
     let needs_ocr_for_template_image = if !analysis.has_template_image {
         false
     } else {
+        // A page dense with decodable text carries a real text layer even when
+        // it draws few operators (#213); neither scan signal may fire on it.
+        let dense_text = page_has_dense_decodable_text(&analysis);
         let alphanum_low = analysis.unique_alphanum_chars < 10
-            && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
+            && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10)
+            && !dense_text;
         let looks_like_scan =
             analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
-        let insufficient_text =
-            analysis.text_operator_count < DetectionConfig::default().min_text_ops_per_page.max(10);
+        let insufficient_text = analysis.text_operator_count
+            < DetectionConfig::default().min_text_ops_per_page.max(10)
+            && !dense_text;
         looks_like_scan || insufficient_text
     };
 
@@ -3133,6 +3222,147 @@ mod tests {
             !needs_ocr,
             "a text page with a background image must stay native"
         );
+    }
+
+    #[test]
+    fn test_dense_text_in_one_op_over_scan_stays_native() {
+        // #213 regression: a genuine text page whose body is packed into a
+        // single Tj/TJ — as right-to-left / Arabic runs are routinely emitted —
+        // draws only one text-show operator. The sparse-operator scan
+        // heuristics used to condemn it to OCR even though the text layer is
+        // complete and decodable. The character-volume floor rescues it.
+        let body = "The complete body of this page is drawn by a single \
+                    text-showing operator, exactly as a right-to-left run is \
+                    commonly emitted, so the operator count is one while the \
+                    real character volume runs to several hundred and the text \
+                    layer extracts perfectly without any optical recognition.";
+        let (doc, page_id) = masthead_scan_page(&[body]);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.has_template_image,
+            "sanity: full-page image present"
+        );
+        assert!(
+            analysis.text_operator_count < 10,
+            "sanity: text arrives in fewer ops than the floor ({} ops)",
+            analysis.text_operator_count
+        );
+        assert!(
+            analysis.text_char_count >= MIN_DECODABLE_TEXT_CHARS,
+            "sanity: real character volume clears the floor ({} chars)",
+            analysis.text_char_count
+        );
+        assert!(
+            analysis.has_decodable_text_fonts,
+            "sanity: Helvetica is decodable"
+        );
+        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        assert!(
+            !needs_ocr,
+            "a dense decodable text layer must stay native even in one operator"
+        );
+    }
+
+    /// Builds an `num_pages`-page document where every page has a full-page
+    /// background image (inside a Form XObject) plus a complete, decodable text
+    /// layer packed into a single text-show operator — the shape of the Arabic
+    /// journal in #213.
+    fn dense_text_scan_doc(num_pages: usize) -> (Document, u32) {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        let body = "Each page carries a full paragraph of genuine decodable \
+                    text packed into a single text-showing operator, the way a \
+                    right-to-left run is commonly emitted, which gives a small \
+                    operator count over a large real character volume that any \
+                    extractor recovers cleanly without optical recognition.";
+        let mut kids = Vec::new();
+        for _ in 0..num_pages {
+            let image_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => Object::Name(b"Image".to_vec()),
+                    "Width" => Object::Integer(1500),
+                    "Height" => Object::Integer(2383),
+                },
+                Vec::new(),
+            )));
+            let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => Object::Name(b"Form".to_vec()),
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+                    },
+                },
+                b"1500 0 0 2383 0 0 cm /Im0 Do".to_vec(),
+            )));
+            let content = format!("q /Fm0 Do Q BT /F1 12 Tf ({body}) Tj ET");
+            let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {},
+                content.into_bytes(),
+            )));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 1500.into(), 2383.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                    "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) },
+                },
+                "Contents" => Object::Reference(content_id),
+            });
+            kids.push(Object::Reference(page_id));
+        }
+        let count = kids.len() as u32;
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => Object::Integer(count as i64),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, count)
+    }
+
+    #[test]
+    fn test_dense_text_journal_not_routed_to_ocr() {
+        // #213 regression at the document level: a multi-page journal whose
+        // pages each have a full-page background image plus a complete text
+        // layer packed into one operator must classify as TextBased — not
+        // Mixed/ImageBased — and flag no pages for OCR. Before the
+        // character-volume floor the sparse operator count made every page look
+        // like a scan, inverting the library's purpose for Arabic corpora.
+        let (doc, page_count) = dense_text_scan_doc(5);
+        let config = DetectionConfig {
+            strategy: ScanStrategy::Full,
+            ..DetectionConfig::default()
+        };
+        let result = detect_from_document(&doc, page_count, &config).unwrap();
+        assert_eq!(
+            result.pdf_type,
+            PdfType::TextBased,
+            "dense decodable text must classify TextBased, got {:?} (ocr pages {:?})",
+            result.pdf_type,
+            result.pages_needing_ocr
+        );
+        assert!(
+            result.pages_needing_ocr.is_empty(),
+            "no page should need OCR, got {:?}",
+            result.pages_needing_ocr
+        );
+        assert!(!result.ocr_recommended);
     }
 
     // ---------- P2 tests: Form XObject font traversal ----------
