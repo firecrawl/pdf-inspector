@@ -8,6 +8,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI does not need test debug symbols. Disabling them trims link time and
+  # keeps the cross-platform Cargo caches substantially smaller.
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+# Superseded PR revisions provide no useful signal and otherwise compete with
+# the larger cross-platform matrix for runner and cache bandwidth.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -15,7 +24,7 @@ permissions:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -38,7 +47,7 @@ jobs:
 
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -56,7 +65,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -78,11 +87,15 @@ jobs:
         run: cargo clippy --features ocr -- -D warnings
 
   build:
-    name: Build
-    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - os: macos-latest
+            runner: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -101,11 +114,17 @@ jobs:
 
   ocr:
     name: OCR (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - os: macos-latest
+            runner: blacksmith-6vcpu-macos-15
+          - os: windows-latest
+            runner: blacksmith-8vcpu-windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -124,7 +143,7 @@ jobs:
 
   ocr-runtime:
     name: OCR runtime smoke
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -232,11 +251,24 @@ jobs:
           export PDF_INSPECTOR_OCR_TEST_MODELS="$PDF_INSPECTOR_MODEL_CACHE/pp-ocrv6-small/oar-ocr-v0.7.0"
           cargo test --features ocr --test ocr_tests -- --nocapture
 
-      - name: Build Node binding
-        working-directory: napi
+      # The bindings use independent Cargo target directories. Build them at
+      # the same time so this smoke job is bounded by the slower binding build
+      # instead of paying for both release builds serially.
+      - name: Build Node and Python bindings
+        shell: bash
         run: |
-          bun install --frozen-lockfile
-          bunx napi build --platform --release
+          (
+            cd napi
+            bun install --frozen-lockfile
+            bunx napi build --platform --release
+          ) &
+          node_build_pid=$!
+
+          python -m pip install 'maturin>=1,<2'
+          maturin build --release --out "$RUNNER_TEMP/python-wheels"
+
+          wait "$node_build_pid"
+          python -m pip install "$RUNNER_TEMP"/python-wheels/*.whl
 
       - name: Run Node OCR binding
         shell: bash
@@ -252,13 +284,6 @@ jobs:
           if (!['Ocr', 'Fused'].includes(result.pages[0].provenance.source)) throw new Error('unexpected source')
           if (!result.pages[0].markdown.trim()) throw new Error('empty OCR markdown')
           JS
-
-      - name: Build and install Python binding
-        shell: bash
-        run: |
-          python -m pip install 'maturin>=1,<2'
-          maturin build --release --out "$RUNNER_TEMP/python-wheels"
-          python -m pip install "$RUNNER_TEMP"/python-wheels/*.whl
 
       - name: Run Python OCR binding
         shell: bash
@@ -278,7 +303,7 @@ jobs:
 
   wasm:
     name: WebAssembly
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

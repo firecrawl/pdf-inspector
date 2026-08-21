@@ -3531,20 +3531,15 @@ fn test_extract_pages_markdown_basic() {
 fn test_extract_pages_markdown_keeps_line_based_tables() {
     // The per-page path (used by every `--ocr auto` run) once passed an
     // empty line slice to markdown conversion, silently dropping every
-    // table that only the line-based detector finds. This fixture's table
-    // is rule-anchored: it must survive the pages API exactly as it does
-    // the whole-document API.
-    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+    // table that only the line-based detector finds. Keep this synthetic
+    // table to four text items so the heuristic detector cannot qualify it
+    // (it requires at least six); the vector rules are the only structural
+    // evidence available to the pages API.
+    let buf = synthetic_vector_grid_pdf(false);
     let result = extract_pages_markdown_mem(&buf, None).unwrap();
 
-    let all_markdown: String = result
-        .pages
-        .iter()
-        .map(|p| p.markdown.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
     assert!(
-        all_markdown.contains("|BIO|"),
+        result.pages[0].markdown.contains("|A1|B1|"),
         "line-based table rows missing from pages API output"
     );
 }
