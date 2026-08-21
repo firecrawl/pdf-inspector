@@ -869,8 +869,19 @@ pub fn extract_structure_elements_mem(
 ) -> Result<Vec<StructureElement>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let Some(tree) = structure_tree::StructTree::from_doc(&doc) else {
-        return Ok(Vec::new());
+    Ok(structure_elements_from_doc(&doc, pages))
+}
+
+/// Resolve structure-tree element references from an already-loaded document.
+///
+/// Returns an empty list when the document is not tagged. Shared by
+/// [`extract_structure_elements_mem`] and
+/// [`extract_text_with_positions_with_roles_mem`] so a document parsed once
+/// can feed both the struct-tree walk and the positioned-text walk without a
+/// second load/parse.
+fn structure_elements_from_doc(doc: &Document, pages: Option<&[u32]>) -> Vec<StructureElement> {
+    let Some(tree) = structure_tree::StructTree::from_doc(doc) else {
+        return Vec::new();
     };
     let page_ids = doc.get_pages();
     let roles = tree.mcid_to_roles(&page_ids);
@@ -888,7 +899,7 @@ pub fn extract_structure_elements_mem(
         })
         .collect();
     elements.sort_unstable_by_key(|e| (e.page, e.mcid));
-    Ok(elements)
+    elements
 }
 
 /// Path-based wrapper for [`extract_structure_elements_mem`].
@@ -924,17 +935,21 @@ pub fn extract_text_with_positions_with_roles_mem(
     buffer: &[u8],
     pages: Option<&[u32]>,
 ) -> Result<Vec<(TextItem, Option<String>)>, PdfError> {
-    let items = match pages {
-        Some(p) => {
-            let page_set: HashSet<u32> = p.iter().copied().collect();
-            extractor::extract_text_with_positions_mem_pages(buffer, Some(&page_set))?
-        }
-        None => extractor::extract_text_with_positions_mem(buffer)?,
-    };
+    validate_pdf_bytes(buffer)?;
+    // Load and parse the document once, then feed both the positioned-text
+    // walk and the struct-tree role walk from the same parsed `Document`
+    // (both otherwise go through `load_document_from_mem`, so sharing one load
+    // is equivalent and avoids parsing the PDF twice).
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+
+    let page_filter: Option<HashSet<u32>> = pages.map(|p| p.iter().copied().collect());
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let ((items, _rects, _lines), _thresholds, _gid_pages) =
+        extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter.as_ref())?;
 
     // Resolve (page, mcid) → role from the struct tree. Untagged PDFs yield an
     // empty map, so every item's role falls through to `None`.
-    let role_map: HashMap<(u32, i64), String> = extract_structure_elements_mem(buffer, pages)?
+    let role_map: HashMap<(u32, i64), String> = structure_elements_from_doc(&doc, pages)
         .into_iter()
         .map(|e| ((e.page, e.mcid), e.role))
         .collect();
