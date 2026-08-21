@@ -10,7 +10,12 @@ name = "pdf_inspector_go"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-pdf-inspector = { path = ".." }
+# `ocr` matches napi/Cargo.toml and pyproject.toml's `python` feature: PDFium
+# and ONNX Runtime are loaded dynamically at runtime (see the root
+# Cargo.toml's `firecrawl-pdfium`/`ort` comments), so enabling this here does
+# not link or download anything at build time — only `OcrMode::Auto`/`Force`
+# calls need those libraries present on the host at runtime.
+pdf-inspector = { path = "..", features = ["ocr"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

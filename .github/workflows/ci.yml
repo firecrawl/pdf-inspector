@@ -340,7 +340,7 @@ jobs:
 
       - name: Run Go tests
         working-directory: go/pdfinspector
-        run: go test ./... -v
+        run: go test -race ./... -v
 
   wasm:
     name: WebAssembly

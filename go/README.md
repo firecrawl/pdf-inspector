@@ -4,9 +4,17 @@ Go bindings for [pdf-inspector](https://github.com/firecrawl/pdf-inspector)'s PD
 
 ## Scope
 
-This binding's document-processing surface matches the Node/Python bindings: classify, detect, and fully process a PDF (Markdown included); extract plain text, positioned text, per-page Markdown, or region-scoped text/tables; read a tagged PDF's structure tree; and recover table structure from an externally-supplied TSR model's output (`ExtractTablesWithStructure` and friends).
+This binding's document-processing surface matches Node's (and exceeds Python's — Python doesn't expose `extract_tables_in_regions`, `detect_vector_grid_in_region`, or the `extract_tables_with_structure` family): classify, detect, and fully process a PDF (Markdown included); extract plain text, positioned text, per-page Markdown, or region-scoped text/tables; read a tagged PDF's structure tree; recover table structure from an externally-supplied TSR model's output; and selective OCR (`ProcessPdfWithOcr`).
 
-**Not covered: OCR** (`vision`/`processPdfWithOcr` in Node/Python). This is a deliberate scope line, not an oversight: OCR loads PDFium and an ONNX Runtime backend *dynamically at runtime* (see the core crate's `ocr` feature — neither is bundled or linked at build time), which means enabling it here would mean (a) building `go/src/lib.rs` with Cargo's `ocr` feature, materially increasing the native library's build time and dependency surface, and (b) extending `go/Makefile`/`publish-go.yml`/`fetchnative` with the same PDFium/ONNX-Runtime-path plumbing `ci.yml`'s `ocr-runtime` job does for the Rust CLI and Node/Python bindings. That's a real, separable piece of work rather than an extension of the existing ABI pattern — worth its own PR if there's demand, rather than folding it in here silently.
+### OCR
+
+`go/Cargo.toml` builds against the core crate's `ocr` feature, the same way `napi/Cargo.toml` and `pyproject.toml`'s `python` feature do. That doesn't pull in a heavier build or link a native OCR library by default: PDFium and the ONNX Runtime backend are loaded *dynamically at runtime* (see the root `Cargo.toml`'s `firecrawl-pdfium`/`ort` comments), so `cargo build --release` in `go/` succeeds with or without either present. They're only required on the host **at runtime** when `OcrMode` is `"auto"` or `"force"` and at least one page is actually routed to OCR:
+
+- **PDFium** (page rasterization): point `PDFIUM_LIB_PATH` at `libpdfium.{so,dylib,dll}`, same as the core crate's own tests/CI (see `.github/workflows/ci.yml`'s `ocr-runtime` job for how it's fetched).
+- **ONNX Runtime** (OCR inference): point `ORT_DYLIB_PATH` at `libonnxruntime.{so,dylib,dll}`.
+- **Model artifacts**: downloaded automatically to a local cache by default; set `OcrOptions.Offline: true` plus `OcrOptions.ModelDirectory` to run without network access, or `PDF_INSPECTOR_MODEL_CACHE` to relocate the cache.
+
+`OcrMode: "off"` (the value used in this package's own tests) never touches any of the above — native extraction always runs first regardless of mode, and `"off"` just skips rendering and inference, which is why it's safe to exercise `ProcessPdfWithOcr`'s full result/provenance contract in CI without provisioning PDFium/ONNX Runtime at all.
 
 ## Building
 
@@ -41,6 +49,14 @@ go test ./...
 The Go package's cgo directives (`go/pdfinspector/pdfinspector.go`) find the library via `${SRCDIR}`-relative flags, so no environment variables or system install step are needed. `${SRCDIR}` resolves relative to the Go source file, so this works from any working directory as long as the two directories stay in this relative layout. The `-Wl,-rpath` flag embeds that same path into the built test/binary so it can find the dynamic library at runtime without `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH`. This has been verified on macOS (arm64) and Linux (x64/arm64, via CI); Windows DLL search-path handling is untested and not covered by the prebuilt-library workflow.
 
 CI (`.github/workflows/ci.yml`'s `go` job) builds and tests this binding from source on every push/PR, so both paths are exercised: source builds continuously, prebuilt downloads whenever a release is cut.
+
+## Testing
+
+`go test -race ./...` in `go/pdfinspector` (as CI runs it) covers, beyond one-shot happy-path calls per function:
+
+- **Every fixture PDF in `tests/fixtures/`** (`TestCorpus_*`): `Classify`/`ExtractText` against all of them, not just the couple of curated fixtures the per-function tests use — a panic crossing the cgo boundary fails loudly here even on a fixture no unit test happens to touch.
+- **Concurrent callers** (`TestConcurrentCalls`): several goroutines calling into the library at once, under the race detector — cgo calls release the calling goroutine's OS thread, so this genuinely exercises the underlying Rust library in parallel, not just interleaved Go-side scheduling.
+- **Password-protected PDFs** (`TestProcessPdfWithOcr_EncryptedDocument_*`): wrong/missing password rejected, correct password decrypts — via `ProcessPdfWithOcr(..., Mode: OcrOff)`, since that's the only entry point in this package that accepts a password (see the OCR API section).
 
 ## API
 
@@ -130,6 +146,20 @@ For hybrid pipelines that already run an external table-structure-recognition mo
 - `ExtractTablesWithStructure` returns one Markdown pipe-table string per input.
 - `ExtractTablesWithStructureCells` returns the resolved `[]StructuredCell` per input (row/col/span/header/text/bbox) for callers that want to drive their own rendering.
 - `ExtractTablesWithStructureAuto` is the auto-fallback variant: it detects known TSR pathologies (phantom rows, multi-row content merged into one cell) and falls back to heuristic table extraction on flagged inputs, reporting which path produced each result via `TableExtractionResult.FallbackReason`.
+
+### `ProcessPdfWithOcr(data []byte, options *OcrOptions) (*OcrPdfResult, error)`
+
+Processes a PDF through native extraction with selective OCR — pass `nil` for `options` to run with every default (`OcrAuto`, 150 DPI, online model downloads). Native extraction always runs first; `OcrAuto` renders and runs OCR only on pages flagged as needing it, `OcrForce` runs it on every selected page, and `OcrOff` never touches the renderer or OCR engine (see "OCR" under Scope for what `OcrAuto`/`OcrForce` need available at runtime).
+
+```go
+result, err := pdfinspector.ProcessPdfWithOcr(data, &pdfinspector.OcrOptions{
+    Mode: pdfinspector.OcrAuto,
+})
+fmt.Println(result.PagesRoutedToOCR)         // 1-indexed
+fmt.Println(result.Pages[0].Provenance.Source) // "native" | "ocr" | "fused"
+```
+
+`OcrOptions.PageNumbers` and every result page number are **1-indexed** — the one place in this package that departs from the 0-indexed convention everything else uses, because it mirrors `OcrPdfOptions`'s own convention on the Rust side rather than `PdfOptions`'s. `OcrOptions.Password` decrypts an encrypted PDF; it's the only place in this package a password can be supplied at all, matching Node/Python (their plain `process_pdf` doesn't accept one either — only the OCR entry point does).
 
 ## Design notes
 

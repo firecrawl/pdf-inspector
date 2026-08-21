@@ -1,9 +1,11 @@
 package pdfinspector
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -375,5 +377,187 @@ func TestExtractTablesWithStructureAuto_SimpleGrid(t *testing.T) {
 	}
 	if len(results) != 1 {
 		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+}
+
+// --- ProcessPdfWithOcr ---
+//
+// Mode "off" exercises the complete result/provenance contract without
+// loading external PDFium, ONNX Runtime, or model artifacts — mirroring
+// napi/test.mjs's approach to testing this surface in CI.
+
+func TestProcessPdfWithOcr_ModeOff(t *testing.T) {
+	result, err := ProcessPdfWithOcr(textFixture(t), &OcrOptions{Mode: OcrOff})
+	if err != nil {
+		t.Fatalf("ProcessPdfWithOcr: %v", err)
+	}
+	if result.PageCount != 3 {
+		t.Errorf("PageCount = %d, want 3", result.PageCount)
+	}
+	if len(result.Pages) != 3 {
+		t.Fatalf("len(Pages) = %d, want 3", len(result.Pages))
+	}
+	if len(result.PagesRoutedToOCR) != 0 {
+		t.Errorf("PagesRoutedToOCR = %v, want empty with mode off", result.PagesRoutedToOCR)
+	}
+	for _, page := range result.Pages {
+		if page.Provenance.Source != SourceNative {
+			t.Errorf("page %d Source = %q, want %q with mode off", page.PageNumber, page.Provenance.Source, SourceNative)
+		}
+		if page.Provenance.OcrModel != nil {
+			t.Errorf("page %d OcrModel = %+v, want nil with mode off", page.PageNumber, page.Provenance.OcrModel)
+		}
+	}
+	if strings.TrimSpace(result.Markdown) == "" {
+		t.Error("Markdown is empty")
+	}
+}
+
+func TestProcessPdfWithOcr_DefaultOptionsIsAuto(t *testing.T) {
+	// Auto must preserve the lightweight native path for clean text PDFs:
+	// no page should be routed to OCR and no render/OCR time should be spent.
+	result, err := ProcessPdfWithOcr(textFixture(t), nil)
+	if err != nil {
+		t.Fatalf("ProcessPdfWithOcr: %v", err)
+	}
+	if len(result.PagesRoutedToOCR) != 0 {
+		t.Errorf("PagesRoutedToOCR = %v, want empty for a clean text PDF", result.PagesRoutedToOCR)
+	}
+	if result.RenderTimeMs != 0 || result.OcrTimeMs != 0 {
+		t.Errorf("RenderTimeMs=%d OcrTimeMs=%d, want both 0 when nothing was routed to OCR", result.RenderTimeMs, result.OcrTimeMs)
+	}
+}
+
+func TestProcessPdfWithOcr_PageNumbersIs1Indexed(t *testing.T) {
+	result, err := ProcessPdfWithOcr(textFixture(t), &OcrOptions{
+		Mode:        OcrOff,
+		PageNumbers: []uint32{2},
+	})
+	if err != nil {
+		t.Fatalf("ProcessPdfWithOcr: %v", err)
+	}
+	if len(result.Pages) != 1 || result.Pages[0].PageNumber != 2 {
+		t.Errorf("Pages = %+v, want exactly page 2", result.Pages)
+	}
+}
+
+func TestProcessPdfWithOcr_InvalidPageNumber_ReturnsError(t *testing.T) {
+	_, err := ProcessPdfWithOcr(textFixture(t), &OcrOptions{
+		Mode:        OcrOff,
+		PageNumbers: []uint32{0}, // 1-indexed: 0 is out of range
+	})
+	if err == nil {
+		t.Fatal("ProcessPdfWithOcr with page 0: want error, got nil")
+	}
+}
+
+func TestProcessPdfWithOcr_InvalidMode_ReturnsError(t *testing.T) {
+	_, err := ProcessPdfWithOcr(textFixture(t), &OcrOptions{Mode: "bogus"})
+	if err == nil {
+		t.Fatal("ProcessPdfWithOcr with an invalid mode: want error, got nil")
+	}
+}
+
+// --- Password-protected PDFs ---
+//
+// ProcessPdfWithOcr is currently the only function in this package whose
+// options accept a password (matching napi/Python: the plain ProcessPdf
+// entry point does not expose one either). Mode "off" keeps this a native
+// decrypt-and-extract test with no OCR runtime dependency.
+
+func TestProcessPdfWithOcr_EncryptedDocument_WrongPassword_ReturnsError(t *testing.T) {
+	data := fixture(t, "encrypted-secret123.pdf")
+	_, err := ProcessPdfWithOcr(data, &OcrOptions{Mode: OcrOff})
+	if err == nil {
+		t.Fatal("ProcessPdfWithOcr on an encrypted PDF with no password: want error, got nil")
+	}
+}
+
+func TestProcessPdfWithOcr_EncryptedDocument_CorrectPassword_Decrypts(t *testing.T) {
+	data := fixture(t, "encrypted-secret123.pdf")
+	result, err := ProcessPdfWithOcr(data, &OcrOptions{Mode: OcrOff, Password: "secret123"})
+	if err != nil {
+		t.Fatalf("ProcessPdfWithOcr with correct password: %v", err)
+	}
+	if strings.TrimSpace(result.Markdown) == "" {
+		t.Error("Markdown is empty after decrypting with the correct password")
+	}
+}
+
+// --- Concurrency ---
+//
+// cgo calls release the calling goroutine's OS thread for the duration of
+// the call, so concurrent callers can genuinely run the underlying Rust
+// library in parallel. This guards against shared mutable state (e.g. a
+// global cache) in the Rust side introducing data races.
+
+func TestConcurrentCalls(t *testing.T) {
+	data := textFixture(t)
+	tagged := taggedFixture(t)
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines*3)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := Classify(data); err != nil {
+				errs <- fmt.Errorf("Classify: %w", err)
+			}
+			if _, err := ProcessPdf(data, nil); err != nil {
+				errs <- fmt.Errorf("ProcessPdf: %w", err)
+			}
+			if _, err := ExtractStructureElements(tagged, nil); err != nil {
+				errs <- fmt.Errorf("ExtractStructureElements: %w", err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+// --- Corpus smoke test ---
+//
+// Runs Classify and ExtractText against every fixture PDF in the repo
+// (encrypted, malformed-edge-case, scanned, tagged, table-heavy, etc.) to
+// catch panics or crashes the per-function unit tests above — which each
+// exercise only one or two curated fixtures — would not. A well-formed
+// error is an acceptable outcome for any given fixture; a panic or hang is
+// not.
+
+func TestCorpus_ClassifyAndExtractTextDoNotPanic(t *testing.T) {
+	dir := filepath.Join("..", "..", "tests", "fixtures")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read fixtures dir: %v", err)
+	}
+
+	tested := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".pdf") {
+			continue
+		}
+		name := entry.Name()
+		tested++
+		t.Run(name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatalf("read %s: %v", name, err)
+			}
+			// Errors are fine (encrypted/malformed fixtures are expected to
+			// fail); a panic crossing the cgo boundary is not, and would
+			// abort the whole test binary rather than fail gracefully here.
+			_, _ = Classify(data)
+			_, _ = ExtractText(data)
+		})
+	}
+	if tested == 0 {
+		t.Fatal("no .pdf fixtures found — fixture directory path may be wrong")
 	}
 }

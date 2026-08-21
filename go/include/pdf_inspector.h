@@ -49,6 +49,18 @@ char *pdfinspector_process_pdf(const unsigned char *data, size_t len,
  * as pdfinspector_process_pdf with markdown always null. No params. */
 char *pdfinspector_detect_pdf(const unsigned char *data, size_t len);
 
+/* Process a PDF through native extraction with selective OCR. params_json
+ * (all fields optional, defaulting to mode "auto"): {"mode":
+ * "off"|"auto"|"force", "page_numbers": [1, 2], "password": "...",
+ * "dpi": 150.0, "minimum_confidence": 0.0,
+ * "hosted_recommendation_confidence": 0.5, "model_directory": "...",
+ * "offline": false}. page_numbers is 1-indexed. "off" exercises the full
+ * result/provenance contract without requiring PDFium or an ONNX Runtime
+ * library; "auto"/"force" need those available on the host at runtime (see
+ * go/README.md). */
+char *pdfinspector_process_pdf_with_ocr(const unsigned char *data, size_t len,
+                                         const char *params_json);
+
 /* Extract per-page markdown with layout classification metadata.
  * params_json: {"pages": [0, 2]} (0-indexed, NULL/{} for every page). */
 char *pdfinspector_extract_pages_markdown(const unsigned char *data,

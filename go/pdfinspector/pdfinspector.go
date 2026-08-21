@@ -206,6 +206,121 @@ type StructuredCell struct {
 	PagePtBbox [4]float32 `json:"page_pt_bbox"`
 }
 
+// OcrMode controls whether/when [ProcessPdfWithOcr] renders and runs OCR on
+// a page. The zero value ("") is treated as "auto" by the Rust side.
+type OcrMode string
+
+const (
+	// OcrOff never rasterizes or runs OCR; only native PDF text is used.
+	// Exercises the full ProcessPdfWithOcr result/provenance contract
+	// without requiring PDFium or an ONNX Runtime library to be present.
+	OcrOff OcrMode = "off"
+	// OcrAuto (the default) renders and runs OCR only on pages pdf-inspector's
+	// native pass flags as needing it.
+	OcrAuto OcrMode = "auto"
+	// OcrForce renders and runs OCR on every selected page, including pages
+	// with usable native text.
+	OcrForce OcrMode = "force"
+)
+
+// PageContentSource identifies which pass produced a page's final content.
+type PageContentSource string
+
+const (
+	SourceNative PageContentSource = "native"
+	SourceOCR    PageContentSource = "ocr"
+	SourceFused  PageContentSource = "fused"
+)
+
+// OcrOptions configures [ProcessPdfWithOcr]. The zero value runs with mode
+// "auto" and every other core default (150 DPI, minimum confidence 0.0,
+// hosted-recommendation threshold 0.5, online model downloads).
+type OcrOptions struct {
+	// Mode defaults to [OcrAuto] when empty.
+	Mode OcrMode `json:"mode,omitempty"`
+	// PageNumbers is 1-indexed; nil processes every page.
+	PageNumbers []uint32 `json:"page_numbers,omitempty"`
+	// Password decrypts an encrypted PDF, same as elsewhere in this package.
+	Password string `json:"password,omitempty"`
+	// Dpi is the page rasterization resolution used when a page is routed
+	// to OCR. Nil means "use the core default" (150 DPI).
+	Dpi *float32 `json:"dpi,omitempty"`
+	// MinimumConfidence drops OCR spans below this inclusive 0-1 threshold.
+	// Nil means "use the core default" (0.0). A pointer, not a bare
+	// float32, so an explicit 0.0 is distinguishable from "unset" — the
+	// core default for this field happens to be 0.0, but
+	// HostedRecommendationConfidence's is not, and both should behave the
+	// same way for the same reason.
+	MinimumConfidence *float32 `json:"minimum_confidence,omitempty"`
+	// HostedRecommendationConfidence recommends Firecrawl's hosted pipeline
+	// for pages whose OCR confidence falls below this inclusive 0-1
+	// threshold despite native extraction flagging them as needing OCR.
+	// Nil means "use the core default" (0.5).
+	HostedRecommendationConfidence *float32 `json:"hosted_recommendation_confidence,omitempty"`
+	// ModelDirectory points at an offline OCR model set.
+	ModelDirectory string `json:"model_directory,omitempty"`
+	// Offline disables model downloads, requiring ModelDirectory or a warm
+	// model cache.
+	Offline bool `json:"offline,omitempty"`
+}
+
+// OcrModelIdentity is the exact OCR model identity retained in page
+// provenance.
+type OcrModelIdentity struct {
+	Name     string `json:"name"`
+	Revision string `json:"revision"`
+}
+
+// OcrTimings carries per-page OCR processing timings, in milliseconds.
+type OcrTimings struct {
+	RenderMs   uint64 `json:"render_ms"`
+	OcrMs      uint64 `json:"ocr_ms"`
+	AssemblyMs uint64 `json:"assembly_ms"`
+}
+
+// OcrPageProvenance carries source, model, confidence, and fallback
+// metadata for one page of an [OcrPdfResult].
+type OcrPageProvenance struct {
+	PageNumber uint32            `json:"page_number"` // 1-indexed
+	Source     PageContentSource `json:"source"`
+	OcrModel   *OcrModelIdentity `json:"ocr_model"`
+	RenderDpi  *float32          `json:"render_dpi"`
+	// OcrConfidence is nil unless Source is [SourceOCR] or [SourceFused].
+	OcrConfidence *float32   `json:"ocr_confidence"`
+	Timings       OcrTimings `json:"timings"`
+	Warnings      []string   `json:"warnings"`
+	// HostedRecommended is true when this lightweight local path detected a
+	// case better suited to Firecrawl's hosted document pipeline.
+	HostedRecommended bool `json:"hosted_recommended"`
+}
+
+// OcrPageResult is the final Markdown and provenance for one page.
+type OcrPageResult struct {
+	PageNumber uint32            `json:"page_number"` // 1-indexed
+	Markdown   string            `json:"markdown"`
+	Provenance OcrPageProvenance `json:"provenance"`
+}
+
+// OcrPdfResult is the result of [ProcessPdfWithOcr]: complete native/OCR
+// Markdown output plus per-page provenance and routing metadata.
+type OcrPdfResult struct {
+	Markdown                string           `json:"markdown"`
+	Pages                   []OcrPageResult  `json:"pages"`
+	PageCount               uint32           `json:"page_count"`
+	PagesRecommendedForOCR  []uint32         `json:"pages_recommended_for_ocr"` // 1-indexed
+	PagesRoutedToOCR        []uint32         `json:"pages_routed_to_ocr"`       // 1-indexed
+	PagesRecommendingHosted []uint32         `json:"pages_recommending_hosted"` // 1-indexed
+	OcrReasonsByPage        []PageOcrReasons `json:"ocr_reasons_by_page"`
+	PagesWithTables         []uint32         `json:"pages_with_tables"`  // 1-indexed
+	PagesWithColumns        []uint32         `json:"pages_with_columns"` // 1-indexed
+	IsComplex               bool             `json:"is_complex"`
+	ProcessingTimeMs        uint64           `json:"processing_time_ms"`
+	// RenderTimeMs and OcrTimeMs are both zero when no page was routed to OCR
+	// (e.g. Mode is [OcrOff], or Auto/Force routed nothing).
+	RenderTimeMs uint64 `json:"render_time_ms"`
+	OcrTimeMs    uint64 `json:"ocr_time_ms"`
+}
+
 // TableExtractionResult is one result from [ExtractTablesWithStructureAuto].
 type TableExtractionResult struct {
 	Markdown string `json:"markdown"`
@@ -288,6 +403,12 @@ type tableExtractionEnvelope struct {
 	Error   *string                 `json:"error"`
 }
 
+type ocrPdfEnvelope struct {
+	Ok     bool          `json:"ok"`
+	Result *OcrPdfResult `json:"result"`
+	Error  *string       `json:"error"`
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -365,6 +486,36 @@ func DetectPdf(data []byte) (*PdfResult, error) {
 	}
 	if env.Result == nil {
 		return nil, errors.New("pdfinspector: detect_pdf reported ok with no result")
+	}
+	return env.Result, nil
+}
+
+// ProcessPdfWithOcr processes a PDF through native extraction with
+// selective OCR. Native extraction always runs first; [OcrAuto] renders and
+// runs OCR only on pages the native pass flags, [OcrForce] runs it on every
+// selected page, and [OcrOff] never touches the renderer or OCR engine at
+// all — useful for exercising this function's full result/provenance
+// contract without PDFium or an ONNX Runtime library present.
+//
+// Pass nil for options to run with every default ([OcrAuto], 150 DPI,
+// online model downloads). [OcrAuto]/[OcrForce] need PDFium and an ONNX
+// Runtime library available on the host at runtime — see go/README.md's
+// OCR section for how to make those available.
+func ProcessPdfWithOcr(data []byte, options *OcrOptions) (*OcrPdfResult, error) {
+	if options == nil {
+		options = &OcrOptions{}
+	}
+	var env ocrPdfEnvelope
+	if err := call(data, options, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_process_pdf_with_ocr(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	if env.Result == nil {
+		return nil, errors.New("pdfinspector: process_pdf_with_ocr reported ok with no result")
 	}
 	return env.Result, nil
 }

@@ -21,14 +21,16 @@
 //! the mirrored envelope/result shapes and `params.rs` for the request
 //! shapes.
 //!
-//! Scope: this now covers the same document-processing surface as the
-//! `napi`/Python bindings (process/detect/classify, per-page markdown,
-//! positioned text, structure-tree elements, region-based extraction, and
-//! TSR-hybrid table structure recovery). It does **not** cover OCR
-//! (`vision`/`process_pdf_with_ocr`): that feature loads PDFium and an ONNX
-//! Runtime backend dynamically at runtime rather than bundling them, which
-//! is a meaningfully larger distribution surface for a cgo binding (see
-//! go/README.md's "Scope" section) and is left as a deliberate follow-up.
+//! Scope: this covers the same document-processing surface as the
+//! `napi`/Python bindings, including OCR (`vision::process_pdf_with_ocr_mem`,
+//! built the same way napi/Python do — via Cargo's `ocr` feature, see
+//! go/Cargo.toml). PDFium and an ONNX Runtime backend are loaded
+//! dynamically at runtime rather than linked at build time (see the root
+//! Cargo.toml's `firecrawl-pdfium`/`ort` comments), so this crate builds the
+//! same way with or without those libraries present; they're only needed on
+//! the host at runtime when `OcrMode::Auto`/`Force` actually routes a page
+//! to OCR (see go/README.md's OCR section for how a Go caller supplies
+//! their paths).
 
 mod params;
 mod results;
@@ -40,11 +42,11 @@ use std::panic;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use params::{PageRegionsParams, PagesParams, TsrInputsParams, VectorGridParams};
+use params::{OcrOptions, PageRegionsParams, PagesParams, TsrInputsParams, VectorGridParams};
 use results::{
-    ClassifyEnvelope, MarkdownStringsEnvelope, PageRegionTextsEnvelope, PagesExtractionEnvelope,
-    PdfResultEnvelope, StructureElementsEnvelope, StructuredCellsEnvelope, TableExtractionEnvelope,
-    TextEnvelope, TextItemsEnvelope, VectorGridEnvelope,
+    ClassifyEnvelope, MarkdownStringsEnvelope, OcrPdfEnvelope, PageRegionTextsEnvelope,
+    PagesExtractionEnvelope, PdfResultEnvelope, StructureElementsEnvelope, StructuredCellsEnvelope,
+    TableExtractionEnvelope, TextEnvelope, TextItemsEnvelope, VectorGridEnvelope,
 };
 
 // ---------------------------------------------------------------------------
@@ -220,6 +222,46 @@ pub unsafe extern "C" fn pdfinspector_detect_pdf(data: *const u8, len: usize) ->
     to_json_cstring(&match outcome {
         Ok(result) => PdfResultEnvelope::ok(result),
         Err(error) => PdfResultEnvelope::err(error),
+    })
+}
+
+/// Process a PDF through native extraction with selective OCR.
+/// `params_json` (all fields optional, defaulting to `mode: "auto"`):
+/// `{"mode": "off"|"auto"|"force", "page_numbers": [1, 2], "password": "...",
+/// "dpi": 150.0, "minimum_confidence": 0.0,
+/// "hosted_recommendation_confidence": 0.5, "model_directory": "...",
+/// "offline": false}`. `page_numbers` is 1-indexed.
+///
+/// Native extraction always runs first; `"auto"` renders and runs OCR only
+/// on pages the native pass flags. `"off"` never touches the renderer,
+/// model cache, or OCR engine — it takes the same option/error/provenance
+/// contract as `"auto"`/`"force"` but always reports `source: "native"`,
+/// which makes it useful for exercising this function's shape without
+/// requiring PDFium or an ONNX Runtime library to be present. See
+/// go/README.md's OCR section for how to make those available for
+/// `"auto"`/`"force"`.
+///
+/// # Safety
+/// `data` must point to a valid, readable buffer of at least `len` bytes
+/// (or `len` must be 0). `params_json`, if non-null, must point to a valid
+/// NUL-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn pdfinspector_process_pdf_with_ocr(
+    data: *const u8,
+    len: usize,
+    params_json: *const c_char,
+) -> *mut c_char {
+    let bytes = slice_from_raw(data, len);
+    let outcome = catch_panic(|| {
+        let params: OcrOptions = parse_params(params_json)?;
+        let options = params.into_core()?;
+        pdf_inspector::vision::process_pdf_with_ocr_mem(bytes, options)
+            .map(Into::into)
+            .map_err(|e| e.to_string())
+    });
+    to_json_cstring(&match outcome {
+        Ok(result) => OcrPdfEnvelope::ok(result),
+        Err(error) => OcrPdfEnvelope::err(error),
     })
 }
 
