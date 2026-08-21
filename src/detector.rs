@@ -818,11 +818,10 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // Collect font ObjectIds (not names) to avoid cross-scope name collisions.
     // Each content stream resolves its Tf font names against its own resource
     // dictionary, producing the correct underlying font ObjectId.
-    let mut used_font_ids: HashSet<ObjectId> = HashSet::new();
-
-    // Build font map keyed by ObjectId: collects FontInfo for all fonts from
-    // page-level Resources + Form XObject Resources.
-    let mut font_map: HashMap<ObjectId, FontInfo> = HashMap::new();
+    // Fonts that actually drew text (current at a show operator) are tracked
+    // separately from Tf selections: a font merely selected by Tf contributes
+    // no character volume, so only showing fonts gate the dense-text floor.
+    let mut fonts_used = FontUsage::default();
 
     // Get content streams for this page — these use the page's resource dict
     let content_streams = doc.get_page_contents(page_id);
@@ -841,12 +840,15 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
+            let mut page_attribution = TextShowAttribution::default();
             let (ops, imgs, paths, fonts) = scan_content_for_text_operators_counted(
                 &content,
                 &mut all_unique_chars,
                 &mut total_text_chars,
                 &mut page_font_names,
+                &mut page_attribution,
             );
+            fonts_used.shows_text_without_font |= page_attribution.shows_text_without_font;
             text_ops += ops;
             image_count += imgs;
             path_ops += paths;
@@ -862,8 +864,19 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     *resource_dict,
                     resource_ids,
                     &page_font_names,
-                    &mut used_font_ids,
+                    &mut fonts_used.used_ids,
                 );
+                resolve_with_shadowing(
+                    doc,
+                    *resource_dict,
+                    resource_ids,
+                    &page_attribution.showing_font_names,
+                    &mut fonts_used.showing_ids,
+                );
+            } else if !page_attribution.showing_font_names.is_empty() {
+                // Text was drawn but the page has no resource dict to resolve
+                // its fonts against — the volume cannot be vouched for.
+                fonts_used.shows_text_without_font = true;
             }
         }
     }
@@ -873,15 +886,14 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     if let Some((resource_dict, resource_ids)) = page_resources {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
-            collect_fonts_from_resource_dict(doc, resources, &mut font_map);
+            collect_fonts_from_resource_dict(doc, resources, &mut fonts_used.map);
             let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
                 doc,
                 resources,
                 &mut visited,
                 &mut all_unique_chars,
                 &mut total_text_chars,
-                &mut used_font_ids,
-                &mut font_map,
+                &mut fonts_used,
             );
             text_ops += ops;
             image_count += imgs;
@@ -891,15 +903,14 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                collect_fonts_from_resource_dict(doc, resources, &mut font_map);
+                collect_fonts_from_resource_dict(doc, resources, &mut fonts_used.map);
                 let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
                     doc,
                     resources,
                     &mut visited,
                     &mut all_unique_chars,
                     &mut total_text_chars,
-                    &mut used_font_ids,
-                    &mut font_map,
+                    &mut fonts_used,
                 );
                 text_ops += ops;
                 image_count += imgs;
@@ -936,24 +947,32 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.
     // Only consider fonts actually USED by Tf operators in content streams (P1 fix),
     // and include fonts from Form XObject Resources (P2 fix).
-    let has_identity_h_no_tounicode =
-        text_ops > 0 && used_fonts_have_identity_h_no_tounicode(&used_font_ids, &font_map, doc);
+    let has_identity_h_no_tounicode = text_ops > 0
+        && used_fonts_have_identity_h_no_tounicode(&fonts_used.used_ids, &fonts_used.map, doc);
 
     // Check for Type3-only fonts — glyph bitmaps without Unicode mapping.
     // Uses the usage-based font set for accuracy.
-    let has_only_type3_fonts = text_ops > 0 && used_fonts_are_only_type3(&used_font_ids, &font_map);
+    let has_only_type3_fonts =
+        text_ops > 0 && used_fonts_are_only_type3(&fonts_used.used_ids, &fonts_used.map);
 
     // Check if the page has fonts that can decode text to Unicode.
     // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars in raw
     // bytes but are fully decodable — we need this to avoid false scan detection.
     // Only considers fonts actually USED via Tf operators (P1 + P2 fix).
     let has_decodable_text_fonts =
-        text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
+        text_ops > 0 && used_fonts_have_decodable_text(&fonts_used.used_ids, &fonts_used.map, doc);
 
-    // Whether ANY used font cannot decode — gates the dense-text floor, whose
-    // page-wide char tally cannot tell decodable volume from garbled volume.
-    let has_undecodable_text_fonts =
-        text_ops > 0 && used_fonts_include_undecodable_text(&used_font_ids, &font_map, doc);
+    // Whether any font that actually drew text cannot decode (or drew text
+    // that can't be attributed to a resolvable font) — gates the dense-text
+    // floor, whose page-wide char tally cannot tell decodable volume from
+    // garbled volume.
+    let has_undecodable_text_fonts = text_ops > 0
+        && (fonts_used.shows_text_without_font
+            || showing_fonts_include_undecodable_text(
+                &fonts_used.showing_ids,
+                &fonts_used.map,
+                doc,
+            ));
 
     PageAnalysis {
         text_operator_count: text_ops,
@@ -1323,68 +1342,89 @@ fn used_fonts_have_decodable_text(
     font_map: &HashMap<ObjectId, FontInfo>,
     doc: &Document,
 ) -> bool {
-    for id in used_font_ids {
-        let Some(info) = font_map.get(id) else {
-            continue;
-        };
-        if info.has_tounicode {
-            return true;
-        }
-        match info.subtype.as_deref() {
-            Some(b"Type1") | Some(b"TrueType") | Some(b"MMType1") => {
-                return true;
-            }
-            Some(b"Type0") => {
-                if identity_h_font_has_fallback(&info.dict, doc) {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-    false
+    used_font_ids.iter().any(|id| {
+        font_map
+            .get(id)
+            .is_some_and(|info| font_decodability(info, doc) == FontDecodability::Decodable)
+    })
 }
 
-/// Usage-based check: does the page use at least one font whose text cannot be
-/// decoded to Unicode? Undecodable means Identity-H/V without ToUnicode or an
-/// embedded-cmap fallback, Type3 without ToUnicode, or a used font whose
-/// definition couldn't be resolved at all (treated as undecodable because its
-/// output can't be vouched for).
+/// How a single font's output relates to Unicode. Shared verdict for the
+/// any-font check ([`used_fonts_have_decodable_text`]) and the no-undecodable
+/// gate ([`showing_fonts_include_undecodable_text`]) so the two cannot drift.
+#[derive(PartialEq)]
+enum FontDecodability {
+    /// ToUnicode, standard Type1/TrueType/MMType1 encoding, or an embedded
+    /// cmap fallback — the text decodes.
+    Decodable,
+    /// Identity-H/V without ToUnicode or fallback, or Type3 without ToUnicode
+    /// — the codes cannot map to Unicode; extraction yields garbage.
+    Undecodable,
+    /// Anything else (e.g. a Type0 with a predefined CMap but no ToUnicode and
+    /// no embedded fallback): not vouched for, but not proven garbage either.
+    Unknown,
+}
+
+fn font_decodability(info: &FontInfo, doc: &Document) -> FontDecodability {
+    if info.has_tounicode {
+        return FontDecodability::Decodable;
+    }
+    match info.subtype.as_deref() {
+        Some(b"Type1") | Some(b"TrueType") | Some(b"MMType1") => FontDecodability::Decodable,
+        Some(b"Type0") => {
+            if identity_h_font_has_fallback(&info.dict, doc) {
+                FontDecodability::Decodable
+            } else if matches!(
+                info.encoding.as_deref(),
+                Some(b"Identity-H") | Some(b"Identity-V")
+            ) {
+                FontDecodability::Undecodable
+            } else {
+                FontDecodability::Unknown
+            }
+        }
+        Some(b"Type3") => FontDecodability::Undecodable,
+        _ => FontDecodability::Unknown,
+    }
+}
+
+/// Usage-based check: does any font that actually DREW text on the page fail
+/// to decode to Unicode? Judged over the fonts current at text-show operators
+/// (not every `Tf` selection — a selected-but-unused font contributes no
+/// character volume), with a font whose definition couldn't be resolved
+/// treated as undecodable because its output can't be vouched for.
 ///
 /// This is NOT the negation of [`used_fonts_have_decodable_text`]: a page can
 /// have both a decodable and an undecodable font. The dense-text floor
 /// ([`page_has_dense_decodable_text`]) needs this distinction because its
 /// character tally is page-wide — with any undecodable font in play, part of
 /// that volume may be garbage, so the floor must not vouch for it.
-fn used_fonts_include_undecodable_text(
-    used_font_ids: &HashSet<ObjectId>,
+fn showing_fonts_include_undecodable_text(
+    showing_font_ids: &HashSet<ObjectId>,
     font_map: &HashMap<ObjectId, FontInfo>,
     doc: &Document,
 ) -> bool {
-    for id in used_font_ids {
-        let Some(info) = font_map.get(id) else {
-            return true;
-        };
-        if info.has_tounicode {
-            continue;
-        }
-        match info.subtype.as_deref() {
-            Some(b"Type0") => {
-                let is_identity = matches!(
-                    info.encoding.as_deref(),
-                    Some(b"Identity-H") | Some(b"Identity-V")
-                );
-                if is_identity && !identity_h_font_has_fallback(&info.dict, doc) {
-                    return true;
-                }
-            }
-            Some(b"Type3") => {
-                return true;
-            }
-            _ => {}
-        }
-    }
-    false
+    showing_font_ids.iter().any(|id| {
+        font_map
+            .get(id)
+            .is_none_or(|info| font_decodability(info, doc) == FontDecodability::Undecodable)
+    })
+}
+
+/// Font usage accumulated across a page's content streams and Form XObjects:
+/// which fonts were selected (`Tf`), which actually drew text, whether any
+/// text couldn't be attributed to a resolvable font, and the collected font
+/// definitions.
+#[derive(Default)]
+struct FontUsage {
+    /// Fonts selected by `Tf`, resolved per scope to ObjectIds.
+    used_ids: HashSet<ObjectId>,
+    /// Fonts current at a text-show operator, resolved per scope.
+    showing_ids: HashSet<ObjectId>,
+    /// Text was drawn with no attributable, resolvable font.
+    shows_text_without_font: bool,
+    /// FontInfo per ObjectId, from page and XObject resource dicts.
+    map: HashMap<ObjectId, FontInfo>,
 }
 
 fn scan_xobjects_in_resources(
@@ -1393,8 +1433,7 @@ fn scan_xobjects_in_resources(
     visited: &mut HashSet<ObjectId>,
     unique_chars: &mut HashSet<u8>,
     total_chars: &mut u64,
-    used_font_ids: &mut HashSet<ObjectId>,
-    font_map: &mut HashMap<ObjectId, FontInfo>,
+    fonts_used: &mut FontUsage,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
@@ -1430,12 +1469,15 @@ fn scan_xobjects_in_resources(
                         .unwrap_or_else(|_| stream.content.clone());
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
+                    let mut xobj_attribution = TextShowAttribution::default();
                     let (ops, imgs, paths, fonts) = scan_content_for_text_operators_counted(
                         &content,
                         unique_chars,
                         total_chars,
                         &mut xobj_font_names,
+                        &mut xobj_attribution,
                     );
+                    fonts_used.shows_text_without_font |= xobj_attribution.shows_text_without_font;
                     text_ops += ops;
                     image_count += imgs;
                     path_ops += paths;
@@ -1457,9 +1499,20 @@ fn scan_xobjects_in_resources(
                     if let Some(res) = xobj_res {
                         // Resolve font names against the XObject's own resource dict
                         // (P1 fix: scoped resolution, not global name-based lookup)
-                        resolve_font_names_to_ids(doc, res, &xobj_font_names, used_font_ids);
+                        resolve_font_names_to_ids(
+                            doc,
+                            res,
+                            &xobj_font_names,
+                            &mut fonts_used.used_ids,
+                        );
+                        resolve_font_names_to_ids(
+                            doc,
+                            res,
+                            &xobj_attribution.showing_font_names,
+                            &mut fonts_used.showing_ids,
+                        );
                         // Collect font definitions from this scope
-                        collect_fonts_from_resource_dict(doc, res, font_map);
+                        collect_fonts_from_resource_dict(doc, res, &mut fonts_used.map);
                         // Recurse into nested XObjects
                         let (ops2, imgs2, paths2, fonts2) = scan_xobjects_in_resources(
                             doc,
@@ -1467,13 +1520,17 @@ fn scan_xobjects_in_resources(
                             visited,
                             unique_chars,
                             total_chars,
-                            used_font_ids,
-                            font_map,
+                            fonts_used,
                         );
                         text_ops += ops2;
                         image_count += imgs2;
                         path_ops += paths2;
                         font_changes += fonts2;
+                    } else if !xobj_attribution.showing_font_names.is_empty() {
+                        // Text was drawn but there is no resource dict to
+                        // resolve its fonts against — the volume cannot be
+                        // vouched for.
+                        fonts_used.shows_text_without_font = true;
                     }
                 }
                 Some(b"Image") => {
@@ -1507,7 +1564,28 @@ fn scan_content_for_text_operators(
     unique_chars: &mut HashSet<u8>,
     used_font_names: &mut HashSet<Vec<u8>>,
 ) -> (u32, u32, u32, u32) {
-    scan_content_for_text_operators_counted(content, unique_chars, &mut 0, used_font_names)
+    scan_content_for_text_operators_counted(
+        content,
+        unique_chars,
+        &mut 0,
+        used_font_names,
+        &mut TextShowAttribution::default(),
+    )
+}
+
+/// Which fonts actually DRAW text in a content stream, as opposed to merely
+/// being selected by a `Tf`. The dense-text floor gate must judge only fonts
+/// that contributed to the page's character tally — an undecodable font that
+/// is selected but never shows text adds no volume and must not veto the
+/// rescue.
+#[derive(Default)]
+struct TextShowAttribution {
+    /// Raw names of fonts that were current when a text-show operator ran.
+    showing_font_names: HashSet<Vec<u8>>,
+    /// A text-show operator ran with no preceding `Tf` in this stream (font
+    /// inherited from outer graphics state) — the volume cannot be attributed,
+    /// so its decodability cannot be vouched for.
+    shows_text_without_font: bool,
 }
 
 /// Like [`scan_content_for_text_operators`] but also accumulates the total
@@ -1516,12 +1594,15 @@ fn scan_content_for_text_operators(
 /// typesetter packs a whole line or paragraph into a single `TJ` array — the
 /// norm for RTL/Arabic runs — so the char tally is the minimum-evidence
 /// signal (#213) that keeps such pages from looking like near-empty scans.
+/// Fonts current at each show operator are recorded into `attribution`.
 fn scan_content_for_text_operators_counted(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
     total_chars: &mut u64,
     used_font_names: &mut HashSet<Vec<u8>>,
+    attribution: &mut TextShowAttribution,
 ) -> (u32, u32, u32, u32) {
+    let mut current_font: Option<Vec<u8>> = None;
     let mut text_ops = 0u32;
     let image_count = 0u32;
     let mut path_ops = 0u32;
@@ -1557,6 +1638,12 @@ fn scan_content_for_text_operators_counted(
                 {
                     text_ops += 1;
                     collect_text_chars_before(content, i, unique_chars, total_chars, operand_floor);
+                    match &current_font {
+                        Some(name) => {
+                            attribution.showing_font_names.insert(name.clone());
+                        }
+                        None => attribution.shows_text_without_font = true,
+                    }
                     operand_floor = i;
                 }
             } else if next == b'f' {
@@ -1574,7 +1661,8 @@ fn scan_content_for_text_operators_counted(
                     || content[i + 2] == b'/'
                 {
                     if let Some(name) = extract_font_name_before_tf(content, i, operand_floor) {
-                        used_font_names.insert(name);
+                        used_font_names.insert(name.clone());
+                        current_font = Some(name);
                         font_changes += 1;
                         operand_floor = i;
                     }
@@ -3701,6 +3789,106 @@ mod tests {
             needs_ocr,
             "a scan whose volume is undecodable must still route to OCR"
         );
+    }
+
+    #[test]
+    fn test_selected_but_unused_undecodable_font_does_not_veto_rescue() {
+        // Review regression: a font merely selected by `Tf` draws nothing, so
+        // an undecodable font that never shows text must not veto the
+        // dense-text floor when all the actual volume comes from a decodable
+        // font.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let image_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Image".to_vec()),
+                "Width" => Object::Integer(1500),
+                "Height" => Object::Integer(2383),
+            },
+            Vec::new(),
+        )));
+        let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+                },
+            },
+            b"1500 0 0 2383 0 0 cm /Im0 Do".to_vec(),
+        )));
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Mystery".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        let body = "All of this page's character volume is drawn by the \
+                    decodable font in a single text-showing operator, while the \
+                    undecodable font is selected once and never used again, so \
+                    the minimum-evidence floor must still rescue this page from \
+                    the sparse-operator scan heuristics without hesitation.";
+        // /F1 (undecodable) is selected but shows nothing; /F2 draws the body.
+        let content = format!("q /Fm0 Do Q BT /F1 12 Tf /F2 12 Tf ({body}) Tj ET");
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content.into_bytes(),
+        )));
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 1500.into(), 2383.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(bad_font_id),
+                        "F2" => Object::Reference(good_font_id),
+                    },
+                    "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) },
+                },
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.text_char_count >= MIN_DECODABLE_TEXT_CHARS,
+            "sanity: volume clears the floor ({})",
+            analysis.text_char_count
+        );
+        assert!(
+            !analysis.has_undecodable_text_fonts,
+            "an undecodable font that never draws must not poison the page"
+        );
+        assert!(
+            page_has_dense_decodable_text(&analysis),
+            "the floor must rescue a page whose whole volume is decodable"
+        );
+        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        assert!(!needs_ocr, "the page must stay native");
     }
 
     #[test]
