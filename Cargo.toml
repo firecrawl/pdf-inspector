@@ -1,6 +1,6 @@
 [package]
 name = "pdf-inspector"
-version = "1.16.0"
+version = "1.17.0"
 edition = "2021"
 # Oldest compiler the crate builds on (slice::as_chunks). Independent of the
 # 1.98 pin in rust-toolchain.toml, which is what we develop and release with.
