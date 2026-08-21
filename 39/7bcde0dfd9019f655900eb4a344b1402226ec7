@@ -1,0 +1,35 @@
+wasm/Cargo.toml
+  s_83f065935b372e::t_6311e4b589ccce 3
+pyproject.toml
+  s_83f065935b372e::t_6311e4b589ccce 9
+wasm/Cargo.lock
+  ai_agent 727,743
+napi/package.json
+  s_83f065935b372e::t_6311e4b589ccce 3,55-60
+napi/Cargo.toml
+  s_83f065935b372e::t_6311e4b589ccce 3
+napi/Cargo.lock
+  ai_agent 2092,2117
+napi/bun.lock
+  ai_agent 11-16
+site/index.html
+  s_83f065935b372e::t_6311e4b589ccce 978
+Cargo.toml
+  s_83f065935b372e::t_6311e4b589ccce 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "397bcde0dfd9019f655900eb4a344b1402226ec7",
+  "prompts": {},
+  "sessions": {
+    "s_83f065935b372e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca7dc737-9d10-4a4a-b67a-504729d1601b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
