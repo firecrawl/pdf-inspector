@@ -1,12 +1,12 @@
 # pdf-inspector Go binding
 
-Go bindings for [pdf-inspector](https://github.com/firecrawl/pdf-inspector)'s PDF classification and text extraction, via [cgo](https://pkg.go.dev/cmd/cgo) against the same native Rust core the [Node.js](../napi) and Python bindings use.
-
-Built for OCR-routing pipelines — classify a PDF's text layer, extract locally when it's trustworthy, fall back to OCR only when it isn't.
+Go bindings for [pdf-inspector](https://github.com/firecrawl/pdf-inspector)'s PDF classification, text extraction, Markdown conversion, and table structure recovery, via [cgo](https://pkg.go.dev/cmd/cgo) against the same native Rust core the [Node.js](../napi) and Python bindings use.
 
 ## Scope
 
-This is a v1: `Classify` and `ExtractText` only, covering the core "should I OCR this?" decision and the plain-text payload once the answer is no. The Node binding's fuller surface — `processPdf`/markdown extraction, region-based extraction, table structure recovery, vector-grid detection — is not exposed here yet. Adding it means extending `go/src/lib.rs` with the same JSON-envelope pattern used for the two functions below; happy to follow up if there's interest.
+This binding's document-processing surface matches the Node/Python bindings: classify, detect, and fully process a PDF (Markdown included); extract plain text, positioned text, per-page Markdown, or region-scoped text/tables; read a tagged PDF's structure tree; and recover table structure from an externally-supplied TSR model's output (`ExtractTablesWithStructure` and friends).
+
+**Not covered: OCR** (`vision`/`processPdfWithOcr` in Node/Python). This is a deliberate scope line, not an oversight: OCR loads PDFium and an ONNX Runtime backend *dynamically at runtime* (see the core crate's `ocr` feature — neither is bundled or linked at build time), which means enabling it here would mean (a) building `go/src/lib.rs` with Cargo's `ocr` feature, materially increasing the native library's build time and dependency surface, and (b) extending `go/Makefile`/`publish-go.yml`/`fetchnative` with the same PDFium/ONNX-Runtime-path plumbing `ci.yml`'s `ocr-runtime` job does for the Rust CLI and Node/Python bindings. That's a real, separable piece of work rather than an extension of the existing ABI pattern — worth its own PR if there's demand, rather than folding it in here silently.
 
 ## Building
 
@@ -44,14 +44,19 @@ CI (`.github/workflows/ci.yml`'s `go` job) builds and tests this binding from so
 
 ## API
 
-### `Classify(data []byte) (*Classification, error)`
-
-Classify a PDF as TextBased, Scanned, Mixed, or ImageBased (~10-50ms). Returns which pages need OCR.
+All functions take the PDF as `[]byte` — there is no path-based API; read the file yourself (`os.ReadFile`) first. Every function returns a Go `error` built from the Rust side's message on failure.
 
 ```go
 import "github.com/firecrawl/pdf-inspector/go/pdfinspector"
 
 data, _ := os.ReadFile("document.pdf")
+```
+
+### `Classify(data []byte) (*Classification, error)`
+
+Classify a PDF as TextBased, Scanned, Mixed, or ImageBased (~10-50ms). Returns which pages need OCR. This is the fastest call in the package — it skips text/Markdown extraction entirely — and is the right first call for an OCR-routing decision.
+
+```go
 result, err := pdfinspector.Classify(data)
 if err != nil {
     log.Fatal(err)
@@ -65,16 +70,72 @@ fmt.Println(result.Confidence)       // 0.875
 
 ### `ExtractText(data []byte) (string, error)`
 
-Extract a PDF's plain text (no layout or markdown formatting). Pair with `Classify` to decide first whether the text layer is worth trusting.
+Extract a PDF's plain text (no layout or Markdown formatting). Pair with `Classify` to decide first whether the text layer is worth trusting.
 
 ```go
 text, err := pdfinspector.ExtractText(data)
 ```
 
+### `ProcessPdf(data []byte, pages []uint32) (*PdfResult, error)`
+
+Full extraction: detect type, extract text, and convert to Markdown, in one document parse. `pages` is 0-indexed; pass `nil` for the whole document.
+
+```go
+result, err := pdfinspector.ProcessPdf(data, nil)
+fmt.Println(result.PdfType, result.PageCount, *result.Markdown)
+fmt.Println(result.IsComplexLayout, result.PagesWithTables, result.PagesWithColumns)
+```
+
+### `DetectPdf(data []byte) (*PdfResult, error)`
+
+Fast metadata-only detection — same result shape as `ProcessPdf`, with `Markdown` always `nil`. Use this over `Classify` when you also want `Title`, `ProcessingTimeMs`, or 1-indexed `PagesNeedingOCR`/`OcrReasonsByPage`.
+
+### `ExtractPagesMarkdown(data []byte, pages []uint32) (*PagesExtractionResult, error)`
+
+Per-page Markdown plus layout classification (tables, columns, OCR needs) from a single parse, letting callers mix direct extraction for simple pages with OCR for complex/scanned ones. `pages` is 0-indexed; `nil` returns every page in document order, otherwise results follow the order you pass in.
+
+```go
+result, err := pdfinspector.ExtractPagesMarkdown(data, []uint32{2, 0}) // caller order preserved
+for _, page := range result.Pages {
+    fmt.Println(page.Page, page.NeedsOCR, page.Markdown)
+}
+```
+
+### `ExtractTextWithPositions(data []byte, pages []uint32) ([]TextItem, error)`
+
+Text with position, font, and style metadata (bold/italic/underline/strikeout, bounding box). `pages` is 0-indexed; `nil` for every page. `TextItem.Mcid` is non-nil when the item is linked to a tagged PDF's structure tree (join against `ExtractStructureElements` on `(Page, Mcid)`).
+
+### `ExtractStructureElements(data []byte, pages []uint32) ([]StructureElement, error)`
+
+Structure-tree element references (page, MCID, role — `"H1"`.."H6", `"P"`, `"Table"`, `"TD"`, ...) from a tagged PDF. Returns an empty slice for untagged PDFs. `pages` is **1-indexed**, matching `TextItem.Page` (unlike every other `pages` parameter in this package, which is 0-indexed).
+
+### `ExtractTextInRegions` / `ExtractTablesInRegions(data []byte, pageRegions []PageRegions) ([]PageRegionTexts, error)`
+
+For hybrid OCR pipelines: a layout model detects regions in a rendered page image, and these extract the PDF's own text (or, for the tables variant, a Markdown pipe-table) from within each region — skipping OCR for text-based pages. Regions are 0-indexed pages, PDF points, top-left origin. Each result carries `NeedsOCR`, set when the extraction is unreliable (empty, GID-encoded fonts, garbage/encoding issues, or — for the tables variant — no detectable table).
+
+```go
+results, err := pdfinspector.ExtractTextInRegions(data, []pdfinspector.PageRegions{
+    {Page: 0, Regions: [][4]float32{{0, 0, 600, 100}}},
+})
+```
+
+### `DetectVectorGridInRegion(data []byte, pageIdx uint32, regionPdfPtBbox [4]float32, renderDpi float32) (*VectorGridDetection, error)`
+
+Detects a vector ruled-line / rectangle grid inside one page region without any external model — useful for tables whose structure is recoverable straight from the PDF's own drawing operators. Returns `(nil, nil)` when the region has no valid grid (as opposed to an `error`, which means the call itself failed).
+
+### `ExtractTablesWithStructure` / `ExtractTablesWithStructureCells` / `ExtractTablesWithStructureAuto(data []byte, inputs []TsrTableInput) (…, error)`
+
+For hybrid pipelines that already run an external table-structure-recognition model (e.g. SLANet) on rendered page crops: pass its structure tokens and cell bboxes in, and pdf-inspector lays out the cells and pulls each cell's text from the native PDF — no OCR involved.
+
+- `ExtractTablesWithStructure` returns one Markdown pipe-table string per input.
+- `ExtractTablesWithStructureCells` returns the resolved `[]StructuredCell` per input (row/col/span/header/text/bbox) for callers that want to drive their own rendering.
+- `ExtractTablesWithStructureAuto` is the auto-fallback variant: it detects known TSR pathologies (phantom rows, multi-row content merged into one cell) and falls back to heuristic table extraction on flagged inputs, reporting which path produced each result via `TableExtractionResult.FallbackReason`.
+
 ## Design notes
 
-- **Why JSON envelopes instead of a napi/UniFFI-style typed FFI layer?** Plain C has no object-marshaling story, so every exported function returns one owned, NUL-terminated JSON string (`{"ok":true,"result":{...}}` or `{"ok":false,"error":"..."}`) that the caller releases with `pdfinspector_free_string`. This keeps the ABI to three functions total with no struct layout to keep in sync across the FFI boundary, at the cost of a JSON encode/decode per call — negligible next to PDF parsing itself. The DTOs are duplicated (once in `go/src/lib.rs`, once in `go/pdfinspector/pdfinspector.go`) rather than generated; at 2 operations / ~5 fields each, the drift risk is small and is caught by `pdfinspector_test.go`, which exercises real fixtures through the full cgo round trip on every CI run.
+- **Why JSON envelopes instead of a napi/UniFFI-style typed FFI layer?** Plain C has no object-marshaling story, so every exported function returns one owned, NUL-terminated JSON string (`{"ok":true,"result":{...}}` / `{"ok":false,"error":"..."}`, or the analogous shape for that function's result field — see each function's doc comment in `go/src/lib.rs`) that the caller releases with `pdfinspector_free_string`. Two C argument shapes cover all thirteen operations — `(data, len)` for the two that take no options, `(data, len, params_json)` for everything else, where `params_json` is a single JSON-encoded parameter blob (see `go/src/params.rs`) — rather than growing a bespoke C parameter list per function. The cost is a JSON encode/decode per call, negligible next to PDF parsing itself.
+- **DTOs are duplicated** (once in `go/src/{params,results}.rs`, once in `go/pdfinspector/pdfinspector.go`) rather than generated. `pdfinspector_test.go` exercises every operation against real fixtures through the full cgo round trip on every CI run, so a field-shape mismatch between the two sides surfaces immediately as a decode error or a failing assertion rather than silently drifting.
 - **Why not reuse the in-flight UniFFI work (#255)?** That PR targets Swift/Kotlin specifically and isn't merged yet. This binding doesn't depend on it or conflict with it — if UniFFI's Go generator (`uniffi-bindgen-go`) ends up being the project's preferred multi-language story once #255/#182 settle, this hand-written ABI can be swapped out later without changing the Go-facing API surface.
 - Every entry point in `go/src/lib.rs` wraps its body in `catch_unwind`, mirroring `napi/src/lib.rs`'s `catch_panic` — a Rust panic unwinding across the FFI boundary is undefined behavior, so it's converted to an error result instead.
-- **cgo is a deliberate, inherent trade-off, not something this binding works around.** There's no pure-Go way to call into a Rust cdylib, so cross-compilation friction and slower builds are the cost of any Rust-backed Go binding. Some Go shops avoid cgo on principle; that's a reason to keep this binding's surface small (see Scope above), not a defect to fix here.
+- **cgo is a deliberate, inherent trade-off, not something this binding works around.** There's no pure-Go way to call into a Rust cdylib, so cross-compilation friction and slower builds are the cost of any Rust-backed Go binding. Some Go shops avoid cgo on principle; that's a fact of this approach, not a defect to fix here.
 - **Distribution and CI** are handled by `.github/workflows/ci.yml` (build-and-test on every push/PR, from source, on Linux and macOS) and `.github/workflows/publish-go.yml` (cross-builds prebuilt native libraries and attaches them to a `go/vX.Y.Z` GitHub Release whenever `go/Cargo.toml`'s version changes). There is still no registry-distributed, zero-toolchain `go get` experience the way Python/Node have per-platform packages — Go's module system has no binary-artifact mechanism to hook into — but `go generate` closes most of that gap on the four platforms CI publishes for.

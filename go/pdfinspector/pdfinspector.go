@@ -1,13 +1,20 @@
 // Package pdfinspector provides Go bindings to pdf-inspector's PDF
-// classification and text extraction, via cgo against the compiled Rust
-// library in go/ (see go/src/lib.rs for the C ABI, and go/README.md for how
-// to build it).
+// classification, text extraction, markdown conversion, and table
+// structure recovery, via cgo against the compiled Rust library in go/
+// (see go/src/lib.rs for the C ABI, and go/README.md for how to build it).
 //
-// Scope matches the current v1: [Classify] (fast, no text extraction) and
-// [ExtractText] (plain text, no layout/markdown). These are the two
-// operations an OCR-routing pipeline needs: classify to decide whether a
-// PDF's text layer is trustworthy enough to skip OCR, then extract the text
-// if so.
+// The surface mirrors the napi (Node.js) and Python bindings' core
+// document-processing API: classify/detect/process a PDF, extract text
+// (plain, positioned, per-page-markdown, or region-scoped), read a tagged
+// PDF's structure tree, and recover table structure from an externally
+// supplied TSR model's output. OCR (pdf-inspector's `vision` feature,
+// exposed as processPdfWithOcr in Node/Python) is intentionally not
+// covered — see "Scope" in go/README.md for why.
+//
+// Every function takes the PDF as `[]byte` (no filesystem access inside
+// the binding) and returns a Go error built from the Rust side's error
+// message on failure; there is no panic path across the FFI boundary (the
+// Rust side catches panics and reports them as errors instead).
 //
 // Run `go generate ./...` before building on a supported platform
 // (darwin/arm64, darwin/amd64, linux/amd64, linux/arm64) to fetch a
@@ -44,6 +51,14 @@ const (
 	Mixed      PdfType = "Mixed"
 )
 
+// PageOcrReasons carries machine-readable OCR reason identifiers for one
+// page. Which indexing convention `Page` uses depends on the containing
+// result — see each function's doc comment.
+type PageOcrReasons struct {
+	Page    uint32   `json:"page"`
+	Reasons []string `json:"reasons"`
+}
+
 // Classification is the result of [Classify]: enough information to decide
 // whether a PDF's text layer can be trusted, without extracting anything.
 type Classification struct {
@@ -55,6 +70,156 @@ type Classification struct {
 	// PdfType classification is correct.
 	Confidence float32 `json:"confidence"`
 }
+
+// PdfResult is the result of [ProcessPdf] and [DetectPdf]: the full
+// classification plus (for ProcessPdf) extracted Markdown.
+type PdfResult struct {
+	PdfType          PdfType `json:"pdf_type"`
+	Markdown         *string `json:"markdown"`
+	PageCount        uint32  `json:"page_count"`
+	ProcessingTimeMs uint64  `json:"processing_time_ms"`
+	// PagesNeedingOCR is 1-indexed here (unlike [Classification]'s
+	// 0-indexed field) — matches the core crate's PdfProcessResult.
+	PagesNeedingOCR   []uint32         `json:"pages_needing_ocr"`
+	OcrReasonsByPage  []PageOcrReasons `json:"ocr_reasons_by_page"`
+	Title             *string          `json:"title"`
+	Confidence        float32          `json:"confidence"`
+	IsComplexLayout   bool             `json:"is_complex_layout"`
+	PagesWithTables   []uint32         `json:"pages_with_tables"`
+	PagesWithColumns  []uint32         `json:"pages_with_columns"`
+	HasEncodingIssues bool             `json:"has_encoding_issues"`
+}
+
+// TextItem is a positioned, styled piece of extracted content: text, an
+// image placeholder, a hyperlink, or a form field.
+type TextItem struct {
+	Text        string  `json:"text"`
+	X           float32 `json:"x"`
+	Y           float32 `json:"y"`
+	Width       float32 `json:"width"`
+	Height      float32 `json:"height"`
+	Font        string  `json:"font"`
+	FontSize    float32 `json:"font_size"`
+	Page        uint32  `json:"page"` // 1-indexed
+	IsBold      bool    `json:"is_bold"`
+	IsItalic    bool    `json:"is_italic"`
+	IsUnderline bool    `json:"is_underline"`
+	IsStrikeout bool    `json:"is_strikeout"`
+	// ItemType is one of "text", "image", "link", or "form_field".
+	ItemType string `json:"item_type"`
+	// LinkURL is set when ItemType == "link", nil otherwise.
+	LinkURL *string `json:"link_url"`
+	// Mcid is the Marked Content ID linking this item to a tagged PDF's
+	// structure tree, when present.
+	Mcid *int64 `json:"mcid"`
+}
+
+// StructureElement is one marked-content reference from a tagged PDF's
+// structure tree, resolved to its page, MCID, and structure type name.
+type StructureElement struct {
+	Page uint32 `json:"page"` // 1-indexed, matches TextItem.Page
+	Mcid int64  `json:"mcid"`
+	Role string `json:"role"` // e.g. "H1".."H6", "P", "Table", "TD"
+}
+
+// PageMarkdown is one page's result from [ExtractPagesMarkdown].
+type PageMarkdown struct {
+	Page     uint32 `json:"page"` // 0-indexed
+	Markdown string `json:"markdown"`
+	// NeedsOCR is true when text on this page is unreliable (GID-encoded
+	// fonts, encoding issues, garbage text, or empty extraction).
+	NeedsOCR  bool    `json:"needs_ocr"`
+	OcrReason *string `json:"ocr_reason"`
+}
+
+// PagesExtractionResult is the result of [ExtractPagesMarkdown]: per-page
+// markdown plus document-wide layout classification.
+type PagesExtractionResult struct {
+	Pages            []PageMarkdown   `json:"pages"`
+	PagesWithTables  []uint32         `json:"pages_with_tables"`  // 1-indexed
+	PagesWithColumns []uint32         `json:"pages_with_columns"` // 1-indexed
+	PagesNeedingOCR  []uint32         `json:"pages_needing_ocr"`  // 1-indexed
+	OcrReasonsByPage []PageOcrReasons `json:"ocr_reasons_by_page"`
+	IsComplex        bool             `json:"is_complex"`
+}
+
+// RegionText is the result of extracting one bounding-box region.
+type RegionText struct {
+	Text string `json:"text"`
+	// NeedsOCR is true when the text should not be trusted (empty,
+	// GID-encoded fonts, garbage, encoding issues).
+	NeedsOCR  bool    `json:"needs_ocr"`
+	OcrReason *string `json:"ocr_reason"`
+}
+
+// PageRegionTexts is one page's region results, parallel to the
+// [PageRegions] entry that produced it.
+type PageRegionTexts struct {
+	Page    uint32       `json:"page"` // 0-indexed
+	Regions []RegionText `json:"regions"`
+}
+
+// PageRegions is one page's bounding-box regions to extract, for
+// [ExtractTextInRegions] and [ExtractTablesInRegions]. Coordinates are PDF
+// points with top-left origin.
+type PageRegions struct {
+	Page    uint32       `json:"page"` // 0-indexed
+	Regions [][4]float32 `json:"regions"`
+}
+
+// VectorGridDetection is the result of [DetectVectorGridInRegion]: a
+// TSR-compatible structure recovered from ruled lines or rectangles,
+// without any external model.
+type VectorGridDetection struct {
+	StructureTokens []string    `json:"structure_tokens"`
+	CellBboxes      [][]float32 `json:"cell_bboxes"`
+}
+
+// TsrTableInput pairs one externally-recovered table structure (e.g. from
+// an SLANet/TSR model run on a rendered crop) with the page region it came
+// from, for [ExtractTablesWithStructure] and its siblings. pdf-inspector
+// lays out the cells and pulls text from the native PDF — no OCR involved.
+type TsrTableInput struct {
+	Page uint32 `json:"page"` // 0-indexed
+	// CropPdfPtBbox is the crop's bbox on the page, PDF points, top-left origin.
+	CropPdfPtBbox [4]float32 `json:"crop_pdf_pt_bbox"`
+	// RenderDpi is the DPI the crop image was rendered at (e.g. 200.0).
+	RenderDpi float32 `json:"render_dpi"`
+	// StructureTokens are the raw structure tokens emitted by the TSR
+	// model, in document order.
+	StructureTokens []string `json:"structure_tokens"`
+	// CellBboxes has one bbox per cell (document order), each either a
+	// 4-element [x1,y1,x2,y2] or 8-element 4-corner polygon, in crop
+	// image-pixel space.
+	CellBboxes [][]float32 `json:"cell_bboxes"`
+}
+
+// StructuredCell is one resolved cell from [ExtractTablesWithStructureCells].
+type StructuredCell struct {
+	Row      int    `json:"row"` // 0-indexed grid row
+	Col      int    `json:"col"` // 0-indexed grid column
+	Rowspan  int    `json:"rowspan"`
+	Colspan  int    `json:"colspan"`
+	IsHeader bool   `json:"is_header"`
+	Text     string `json:"text"`
+	// PagePtBbox is [x1,y1,x2,y2] in page PDF-points, top-left origin.
+	PagePtBbox [4]float32 `json:"page_pt_bbox"`
+}
+
+// TableExtractionResult is one result from [ExtractTablesWithStructureAuto].
+type TableExtractionResult struct {
+	Markdown string `json:"markdown"`
+	// FallbackReason is nil when the TSR-hybrid path produced the markdown
+	// directly, or a short diagnostic label (e.g.
+	// "multi_row_in_cell_expanded", "phantom_empty_row") when a detected
+	// TSR pathology triggered in-place cell expansion or the heuristic
+	// fallback extractor.
+	FallbackReason *string `json:"fallback_reason"`
+}
+
+// ---------------------------------------------------------------------------
+// Envelopes (internal decode targets — see go/src/results.rs)
+// ---------------------------------------------------------------------------
 
 type classifyEnvelope struct {
 	Ok     bool            `json:"ok"`
@@ -68,23 +233,78 @@ type textEnvelope struct {
 	Error *string `json:"error"`
 }
 
+type pdfResultEnvelope struct {
+	Ok     bool       `json:"ok"`
+	Result *PdfResult `json:"result"`
+	Error  *string    `json:"error"`
+}
+
+type textItemsEnvelope struct {
+	Ok    bool       `json:"ok"`
+	Items []TextItem `json:"items"`
+	Error *string    `json:"error"`
+}
+
+type structureElementsEnvelope struct {
+	Ok       bool               `json:"ok"`
+	Elements []StructureElement `json:"elements"`
+	Error    *string            `json:"error"`
+}
+
+type pagesExtractionEnvelope struct {
+	Ok     bool                   `json:"ok"`
+	Result *PagesExtractionResult `json:"result"`
+	Error  *string                `json:"error"`
+}
+
+type pageRegionTextsEnvelope struct {
+	Ok      bool              `json:"ok"`
+	Results []PageRegionTexts `json:"results"`
+	Error   *string           `json:"error"`
+}
+
+type vectorGridEnvelope struct {
+	Ok     bool                 `json:"ok"`
+	Found  bool                 `json:"found"`
+	Result *VectorGridDetection `json:"result"`
+	Error  *string              `json:"error"`
+}
+
+type markdownStringsEnvelope struct {
+	Ok      bool     `json:"ok"`
+	Results []string `json:"results"`
+	Error   *string  `json:"error"`
+}
+
+type structuredCellsEnvelope struct {
+	Ok      bool               `json:"ok"`
+	Results [][]StructuredCell `json:"results"`
+	Error   *string            `json:"error"`
+}
+
+type tableExtractionEnvelope struct {
+	Ok      bool                    `json:"ok"`
+	Results []TableExtractionResult `json:"results"`
+	Error   *string                 `json:"error"`
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 // Classify inspects a PDF's bytes and reports its type, page count, which
 // 0-indexed pages need OCR, and a confidence score — without extracting any
 // text. Typically 10-50ms even on large documents, since it samples content
 // streams rather than fully parsing them.
 func Classify(data []byte) (*Classification, error) {
-	cData, cLen := cBytes(data)
-	defer freeCBytes(cData)
-
-	raw := C.pdfinspector_classify((*C.uchar)(cData), cLen)
-	defer C.pdfinspector_free_string(raw)
-
 	var env classifyEnvelope
-	if err := json.Unmarshal([]byte(C.GoString(raw)), &env); err != nil {
-		return nil, fmt.Errorf("pdfinspector: decode classify result: %w", err)
+	if err := callNoParams(data, &env, func(d *C.uchar, l C.size_t) *C.char {
+		return C.pdfinspector_classify(d, l)
+	}); err != nil {
+		return nil, err
 	}
 	if !env.Ok {
-		return nil, classifyError(env.Error)
+		return nil, wrapError(env.Error)
 	}
 	if env.Result == nil {
 		return nil, errors.New("pdfinspector: classify reported ok with no result")
@@ -96,18 +316,14 @@ func Classify(data []byte) (*Classification, error) {
 // markdown). Callers that need to know first whether the extracted text is
 // trustworthy should call [Classify] and check its Confidence/PdfType.
 func ExtractText(data []byte) (string, error) {
-	cData, cLen := cBytes(data)
-	defer freeCBytes(cData)
-
-	raw := C.pdfinspector_extract_text((*C.uchar)(cData), cLen)
-	defer C.pdfinspector_free_string(raw)
-
 	var env textEnvelope
-	if err := json.Unmarshal([]byte(C.GoString(raw)), &env); err != nil {
-		return "", fmt.Errorf("pdfinspector: decode extract_text result: %w", err)
+	if err := callNoParams(data, &env, func(d *C.uchar, l C.size_t) *C.char {
+		return C.pdfinspector_extract_text(d, l)
+	}); err != nil {
+		return "", err
 	}
 	if !env.Ok {
-		return "", classifyError(env.Error)
+		return "", wrapError(env.Error)
 	}
 	if env.Text == nil {
 		return "", errors.New("pdfinspector: extract_text reported ok with no text")
@@ -115,7 +331,251 @@ func ExtractText(data []byte) (string, error) {
 	return *env.Text, nil
 }
 
-func classifyError(msg *string) error {
+// ProcessPdf runs full extraction: detect type, extract text, and convert
+// to Markdown. Pass nil for pages to process every page; otherwise pages
+// are 0-indexed.
+func ProcessPdf(data []byte, pages []uint32) (*PdfResult, error) {
+	var env pdfResultEnvelope
+	if err := call(data, pagesParams{Pages: pages}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_process_pdf(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	if env.Result == nil {
+		return nil, errors.New("pdfinspector: process_pdf reported ok with no result")
+	}
+	return env.Result, nil
+}
+
+// DetectPdf runs fast detection only — no text extraction or Markdown
+// conversion. The result has the same shape as [ProcessPdf] with Markdown
+// always nil.
+func DetectPdf(data []byte) (*PdfResult, error) {
+	var env pdfResultEnvelope
+	if err := callNoParams(data, &env, func(d *C.uchar, l C.size_t) *C.char {
+		return C.pdfinspector_detect_pdf(d, l)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	if env.Result == nil {
+		return nil, errors.New("pdfinspector: detect_pdf reported ok with no result")
+	}
+	return env.Result, nil
+}
+
+// ExtractPagesMarkdown extracts per-page Markdown with layout
+// classification metadata (tables, columns, OCR needs) from a single
+// parse. Font statistics are computed from the full document so header
+// detection is consistent across pages. Pass nil for pages to return every
+// page in document order; otherwise pages are 0-indexed and results are
+// returned in the given order.
+func ExtractPagesMarkdown(data []byte, pages []uint32) (*PagesExtractionResult, error) {
+	var env pagesExtractionEnvelope
+	if err := call(data, pagesParams{Pages: pages}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_extract_pages_markdown(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	if env.Result == nil {
+		return nil, errors.New("pdfinspector: extract_pages_markdown reported ok with no result")
+	}
+	return env.Result, nil
+}
+
+// ExtractTextWithPositions extracts text with position and style
+// information (font, bold/italic/underline/strikeout, bounding box). Pass
+// nil for pages to return every page; otherwise pages are 0-indexed.
+func ExtractTextWithPositions(data []byte, pages []uint32) ([]TextItem, error) {
+	var env textItemsEnvelope
+	if err := call(data, pagesParams{Pages: pages}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_extract_text_with_positions(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	return env.Items, nil
+}
+
+// ExtractStructureElements reads a tagged PDF's structure tree and returns
+// one entry per marked-content reference (page, MCID, structure role).
+// Returns an empty slice for untagged PDFs. Pass nil for pages to return
+// every page; otherwise pages are 1-indexed, matching [TextItem.Page].
+func ExtractStructureElements(data []byte, pages []uint32) ([]StructureElement, error) {
+	var env structureElementsEnvelope
+	if err := call(data, pagesParams{Pages: pages}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_extract_structure_elements(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	return env.Elements, nil
+}
+
+// ExtractTextInRegions extracts text within bounding-box regions.
+//
+// For hybrid OCR pipelines: a layout model detects regions in rendered
+// page images, and this extracts the PDF text within those regions,
+// skipping OCR for text-based pages. Each result's NeedsOCR is set when
+// the extracted text is unreliable (empty, GID-encoded fonts, garbage,
+// encoding issues).
+func ExtractTextInRegions(data []byte, pageRegions []PageRegions) ([]PageRegionTexts, error) {
+	var env pageRegionTextsEnvelope
+	if err := call(data, pageRegionsParams{PageRegions: pageRegions}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_extract_text_in_regions(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	return env.Results, nil
+}
+
+// ExtractTablesInRegions extracts markdown tables within bounding-box
+// regions. Like [ExtractTextInRegions] but runs table detection on items
+// within each region: when a table is detected, Text is a markdown
+// pipe-table and NeedsOCR is false; otherwise Text is empty and NeedsOCR is
+// true so the caller can fall back to OCR.
+func ExtractTablesInRegions(data []byte, pageRegions []PageRegions) ([]PageRegionTexts, error) {
+	var env pageRegionTextsEnvelope
+	if err := call(data, pageRegionsParams{PageRegions: pageRegions}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_extract_tables_in_regions(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	return env.Results, nil
+}
+
+// DetectVectorGridInRegion detects a vector ruled-line / rectangle grid
+// inside one page region, for callers building their own TSR-hybrid
+// pipeline. pageIdx is 0-indexed; regionPdfPtBbox is [x1,y1,x2,y2] in PDF
+// points with top-left origin; renderDpi is the DPI of the crop image that
+// will consume the returned cell bboxes.
+//
+// Returns (nil, nil) when the region does not contain a valid vector grid.
+func DetectVectorGridInRegion(data []byte, pageIdx uint32, regionPdfPtBbox [4]float32, renderDpi float32) (*VectorGridDetection, error) {
+	params := vectorGridParams{
+		PageIdx:         pageIdx,
+		RegionPdfPtBbox: regionPdfPtBbox,
+		RenderDpi:       renderDpi,
+	}
+	var env vectorGridEnvelope
+	if err := call(data, params, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_detect_vector_grid_in_region(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	if !env.Found {
+		return nil, nil
+	}
+	return env.Result, nil
+}
+
+// ExtractTablesWithStructure extracts markdown tables using
+// externally-supplied structure recovery — typically a table-structure
+// recognition model's output run on rendered page crops. For each input,
+// this pairs structure tokens with cell bboxes (rowspan/colspan aware),
+// converts each cell bbox from crop image-pixels into page PDF points,
+// pulls the cell's text from the native PDF, and emits a markdown
+// pipe-table. Returns one markdown string per input, in input order.
+func ExtractTablesWithStructure(data []byte, inputs []TsrTableInput) ([]string, error) {
+	var env markdownStringsEnvelope
+	if err := call(data, tsrInputsParams{Inputs: inputs}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_extract_tables_with_structure(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	return env.Results, nil
+}
+
+// ExtractTablesWithStructureCells is the lower-level sibling of
+// [ExtractTablesWithStructure]: instead of rendering markdown, it returns
+// the resolved cells so callers can drive their own rendering, debug
+// overlays, or per-cell post-processing. Returns one []StructuredCell per
+// input, in input order.
+func ExtractTablesWithStructureCells(data []byte, inputs []TsrTableInput) ([][]StructuredCell, error) {
+	var env structuredCellsEnvelope
+	if err := call(data, tsrInputsParams{Inputs: inputs}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_extract_tables_with_structure_cells(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	return env.Results, nil
+}
+
+// ExtractTablesWithStructureAuto is the auto-fallback variant of
+// [ExtractTablesWithStructure]: it runs the TSR-hybrid path, checks the
+// resulting cells for known TSR detection pathologies (phantom rows,
+// multi-row content merged into a single cell), expands multi-row cells
+// in-place when possible, and otherwise falls back to heuristic table
+// extraction for inputs where the TSR path looks compromised. On clean
+// inputs this returns identical markdown to [ExtractTablesWithStructure];
+// on flagged inputs, FallbackReason identifies the recovery path used.
+func ExtractTablesWithStructureAuto(data []byte, inputs []TsrTableInput) ([]TableExtractionResult, error) {
+	var env tableExtractionEnvelope
+	if err := call(data, tsrInputsParams{Inputs: inputs}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
+		return C.pdfinspector_extract_tables_with_structure_auto(d, l, p)
+	}); err != nil {
+		return nil, err
+	}
+	if !env.Ok {
+		return nil, wrapError(env.Error)
+	}
+	return env.Results, nil
+}
+
+// ---------------------------------------------------------------------------
+// Request param shapes (internal — see go/src/params.rs for the Rust side)
+// ---------------------------------------------------------------------------
+
+type pagesParams struct {
+	Pages []uint32 `json:"pages,omitempty"`
+}
+
+type pageRegionsParams struct {
+	PageRegions []PageRegions `json:"page_regions,omitempty"`
+}
+
+type vectorGridParams struct {
+	PageIdx         uint32     `json:"page_idx"`
+	RegionPdfPtBbox [4]float32 `json:"region_pdf_pt_bbox"`
+	RenderDpi       float32    `json:"render_dpi"`
+}
+
+type tsrInputsParams struct {
+	Inputs []TsrTableInput `json:"inputs,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// cgo call plumbing
+// ---------------------------------------------------------------------------
+
+func wrapError(msg *string) error {
 	if msg == nil {
 		return errors.New("pdfinspector: unknown error")
 	}
@@ -139,4 +599,46 @@ func freeCBytes(p unsafe.Pointer) {
 	if p != nil {
 		C.free(p)
 	}
+}
+
+// callNoParams invokes one of the two-argument (data, len) ABI functions
+// and decodes its JSON envelope into out. `invoke` is a closure wrapping
+// the specific C.pdfinspector_* call — cgo function references cannot be
+// passed around as ordinary Go func values, only called directly, so each
+// exported function below supplies its own one-line closure.
+func callNoParams(data []byte, out any, invoke func(*C.uchar, C.size_t) *C.char) error {
+	cData, cLen := cBytes(data)
+	defer freeCBytes(cData)
+
+	raw := invoke((*C.uchar)(cData), cLen)
+	defer C.pdfinspector_free_string(raw)
+
+	if err := json.Unmarshal([]byte(C.GoString(raw)), out); err != nil {
+		return fmt.Errorf("pdfinspector: decode result: %w", err)
+	}
+	return nil
+}
+
+// call invokes one of the three-argument (data, len, params_json) ABI
+// functions and decodes its JSON envelope into out. params is marshaled to
+// JSON on the Go side — see go/src/params.rs for what each function
+// expects to find there. See callNoParams for why `invoke` is a closure.
+func call(data []byte, params any, out any, invoke func(*C.uchar, C.size_t, *C.char) *C.char) error {
+	cData, cLen := cBytes(data)
+	defer freeCBytes(cData)
+
+	paramsJSON, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("pdfinspector: encode params: %w", err)
+	}
+	cParams := C.CString(string(paramsJSON))
+	defer C.free(unsafe.Pointer(cParams))
+
+	raw := invoke((*C.uchar)(cData), cLen, cParams)
+	defer C.pdfinspector_free_string(raw)
+
+	if err := json.Unmarshal([]byte(C.GoString(raw)), out); err != nil {
+		return fmt.Errorf("pdfinspector: decode result: %w", err)
+	}
+	return nil
 }

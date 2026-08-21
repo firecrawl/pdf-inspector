@@ -19,28 +19,55 @@ func fixture(t *testing.T, name string) []byte {
 	return data
 }
 
-func TestClassify_TextBasedDocument(t *testing.T) {
-	data := fixture(t, "firecrawl_docs_tagged.pdf")
+func textFixture(t *testing.T) []byte {
+	return fixture(t, "thermo-freon12.pdf") // 3-page, TextBased
+}
 
-	result, err := Classify(data)
+func taggedFixture(t *testing.T) []byte {
+	return fixture(t, "firecrawl_docs_tagged.pdf")
+}
+
+// --- Classify ---
+
+func TestClassify_TextBasedDocument(t *testing.T) {
+	result, err := Classify(textFixture(t))
 	if err != nil {
 		t.Fatalf("Classify: %v", err)
 	}
 	if result.PdfType != TextBased {
 		t.Errorf("PdfType = %q, want %q", result.PdfType, TextBased)
 	}
-	if result.PageCount == 0 {
-		t.Error("PageCount = 0, want > 0")
+	if result.PageCount != 3 {
+		t.Errorf("PageCount = %d, want 3", result.PageCount)
 	}
 	if result.Confidence <= 0 {
 		t.Errorf("Confidence = %v, want > 0", result.Confidence)
 	}
 }
 
-func TestExtractText_TextBasedDocument(t *testing.T) {
-	data := fixture(t, "firecrawl_docs_tagged.pdf")
+func TestClassify_EncryptedDocument_ReturnsError(t *testing.T) {
+	data := fixture(t, "encrypted-secret123.pdf")
+	if _, err := Classify(data); err == nil {
+		t.Fatal("Classify on an encrypted PDF: want error, got nil")
+	}
+}
 
-	text, err := ExtractText(data)
+func TestClassify_InvalidInput_ReturnsError(t *testing.T) {
+	if _, err := Classify([]byte("not a pdf")); err == nil {
+		t.Fatal("Classify on non-PDF bytes: want error, got nil")
+	}
+}
+
+func TestClassify_EmptyInput_ReturnsError(t *testing.T) {
+	if _, err := Classify(nil); err == nil {
+		t.Fatal("Classify on empty input: want error, got nil")
+	}
+}
+
+// --- ExtractText ---
+
+func TestExtractText_TextBasedDocument(t *testing.T) {
+	text, err := ExtractText(textFixture(t))
 	if err != nil {
 		t.Fatalf("ExtractText: %v", err)
 	}
@@ -49,32 +76,304 @@ func TestExtractText_TextBasedDocument(t *testing.T) {
 	}
 }
 
-func TestClassify_EncryptedDocument_ReturnsError(t *testing.T) {
-	data := fixture(t, "encrypted-secret123.pdf")
-
-	_, err := Classify(data)
-	if err == nil {
-		t.Fatal("Classify on an encrypted PDF: want error, got nil")
-	}
-}
-
-func TestClassify_InvalidInput_ReturnsError(t *testing.T) {
-	_, err := Classify([]byte("not a pdf"))
-	if err == nil {
-		t.Fatal("Classify on non-PDF bytes: want error, got nil")
-	}
-}
-
-func TestClassify_EmptyInput_ReturnsError(t *testing.T) {
-	_, err := Classify(nil)
-	if err == nil {
-		t.Fatal("Classify on empty input: want error, got nil")
-	}
-}
-
 func TestExtractText_InvalidInput_ReturnsError(t *testing.T) {
-	_, err := ExtractText([]byte("not a pdf"))
-	if err == nil {
+	if _, err := ExtractText([]byte("not a pdf")); err == nil {
 		t.Fatal("ExtractText on non-PDF bytes: want error, got nil")
+	}
+}
+
+// --- ProcessPdf ---
+
+func TestProcessPdf_FullExtraction(t *testing.T) {
+	result, err := ProcessPdf(textFixture(t), nil)
+	if err != nil {
+		t.Fatalf("ProcessPdf: %v", err)
+	}
+	if result.PdfType != TextBased {
+		t.Errorf("PdfType = %q, want %q", result.PdfType, TextBased)
+	}
+	if result.PageCount != 3 {
+		t.Errorf("PageCount = %d, want 3", result.PageCount)
+	}
+	if result.Markdown == nil || strings.TrimSpace(*result.Markdown) == "" {
+		t.Error("Markdown is nil or empty, want non-empty markdown")
+	}
+}
+
+func TestProcessPdf_WithPages(t *testing.T) {
+	result, err := ProcessPdf(textFixture(t), []uint32{1})
+	if err != nil {
+		t.Fatalf("ProcessPdf: %v", err)
+	}
+	if result.Markdown == nil || strings.TrimSpace(*result.Markdown) == "" {
+		t.Error("Markdown is nil or empty when restricted to page 1")
+	}
+}
+
+func TestProcessPdf_InvalidInput_ReturnsError(t *testing.T) {
+	if _, err := ProcessPdf([]byte("not a pdf"), nil); err == nil {
+		t.Fatal("ProcessPdf on non-PDF bytes: want error, got nil")
+	}
+}
+
+// --- DetectPdf ---
+
+func TestDetectPdf_NoMarkdown(t *testing.T) {
+	result, err := DetectPdf(textFixture(t))
+	if err != nil {
+		t.Fatalf("DetectPdf: %v", err)
+	}
+	if result.PdfType != TextBased {
+		t.Errorf("PdfType = %q, want %q", result.PdfType, TextBased)
+	}
+	if result.PageCount != 3 {
+		t.Errorf("PageCount = %d, want 3", result.PageCount)
+	}
+	if result.Markdown != nil {
+		t.Errorf("Markdown = %v, want nil for detect-only", *result.Markdown)
+	}
+}
+
+// --- ExtractPagesMarkdown ---
+
+func TestExtractPagesMarkdown_AllPages(t *testing.T) {
+	result, err := ExtractPagesMarkdown(textFixture(t), nil)
+	if err != nil {
+		t.Fatalf("ExtractPagesMarkdown: %v", err)
+	}
+	if len(result.Pages) != 3 {
+		t.Fatalf("len(Pages) = %d, want 3", len(result.Pages))
+	}
+	for i, page := range result.Pages {
+		if page.Page != uint32(i) {
+			t.Errorf("Pages[%d].Page = %d, want %d", i, page.Page, i)
+		}
+	}
+}
+
+func TestExtractPagesMarkdown_PreservesCallerOrder(t *testing.T) {
+	result, err := ExtractPagesMarkdown(textFixture(t), []uint32{2, 0})
+	if err != nil {
+		t.Fatalf("ExtractPagesMarkdown: %v", err)
+	}
+	if len(result.Pages) != 2 {
+		t.Fatalf("len(Pages) = %d, want 2", len(result.Pages))
+	}
+	if result.Pages[0].Page != 2 || result.Pages[1].Page != 0 {
+		t.Errorf("Pages = [%d, %d], want [2, 0]", result.Pages[0].Page, result.Pages[1].Page)
+	}
+}
+
+// --- ExtractTextWithPositions ---
+
+func TestExtractTextWithPositions_AllPages(t *testing.T) {
+	items, err := ExtractTextWithPositions(textFixture(t), nil)
+	if err != nil {
+		t.Fatalf("ExtractTextWithPositions: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatal("ExtractTextWithPositions returned no items")
+	}
+	if items[0].ItemType == "" {
+		t.Error("first item has empty ItemType")
+	}
+}
+
+func TestExtractTextWithPositions_PageFilter(t *testing.T) {
+	items, err := ExtractTextWithPositions(textFixture(t), []uint32{1})
+	if err != nil {
+		t.Fatalf("ExtractTextWithPositions: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatal("ExtractTextWithPositions returned no items for page 1")
+	}
+	for _, item := range items {
+		if item.Page != 1 {
+			t.Errorf("item.Page = %d, want 1", item.Page)
+		}
+	}
+}
+
+func TestExtractTextWithPositions_Mcid(t *testing.T) {
+	items, err := ExtractTextWithPositions(taggedFixture(t), nil)
+	if err != nil {
+		t.Fatalf("ExtractTextWithPositions: %v", err)
+	}
+	found := false
+	for _, item := range items {
+		if item.Mcid != nil {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("tagged PDF text items should carry Marked Content IDs")
+	}
+}
+
+// --- ExtractStructureElements ---
+
+func TestExtractStructureElements_TaggedDocument(t *testing.T) {
+	elements, err := ExtractStructureElements(taggedFixture(t), nil)
+	if err != nil {
+		t.Fatalf("ExtractStructureElements: %v", err)
+	}
+	if len(elements) == 0 {
+		t.Fatal("ExtractStructureElements returned no elements for a tagged PDF")
+	}
+	sawH1 := false
+	for _, e := range elements {
+		if e.Role == "" {
+			t.Error("element has empty Role")
+		}
+		if e.Role == "H1" {
+			sawH1 = true
+		}
+	}
+	if !sawH1 {
+		t.Error("tagged fixture should surface H1 heading roles")
+	}
+}
+
+func TestExtractStructureElements_PageFilterIs1Indexed(t *testing.T) {
+	elements, err := ExtractStructureElements(taggedFixture(t), []uint32{1})
+	if err != nil {
+		t.Fatalf("ExtractStructureElements: %v", err)
+	}
+	if len(elements) == 0 {
+		t.Fatal("ExtractStructureElements returned no elements for page 1")
+	}
+	for _, e := range elements {
+		if e.Page != 1 {
+			t.Errorf("element.Page = %d, want 1", e.Page)
+		}
+	}
+}
+
+func TestExtractStructureElements_UntaggedDocument_ReturnsEmpty(t *testing.T) {
+	elements, err := ExtractStructureElements(textFixture(t), nil)
+	if err != nil {
+		t.Fatalf("ExtractStructureElements: %v", err)
+	}
+	if len(elements) != 0 {
+		t.Errorf("len(elements) = %d, want 0 for an untagged PDF", len(elements))
+	}
+}
+
+// --- ExtractTextInRegions / ExtractTablesInRegions ---
+
+func TestExtractTextInRegions(t *testing.T) {
+	results, err := ExtractTextInRegions(textFixture(t), []PageRegions{
+		{Page: 0, Regions: [][4]float32{{0, 0, 600, 100}}},
+	})
+	if err != nil {
+		t.Fatalf("ExtractTextInRegions: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if results[0].Page != 0 {
+		t.Errorf("results[0].Page = %d, want 0", results[0].Page)
+	}
+	if len(results[0].Regions) != 1 {
+		t.Fatalf("len(results[0].Regions) = %d, want 1", len(results[0].Regions))
+	}
+}
+
+func TestExtractTablesInRegions(t *testing.T) {
+	results, err := ExtractTablesInRegions(textFixture(t), []PageRegions{
+		{Page: 0, Regions: [][4]float32{{0, 0, 600, 800}}},
+	})
+	if err != nil {
+		t.Fatalf("ExtractTablesInRegions: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	// No assertion on NeedsOCR/table detection here: the fixture may or may
+	// not contain a detectable table. The call succeeding with the right
+	// shape is the contract under test.
+	if len(results[0].Regions) != 1 {
+		t.Fatalf("len(results[0].Regions) = %d, want 1", len(results[0].Regions))
+	}
+}
+
+// --- DetectVectorGridInRegion ---
+
+func TestDetectVectorGridInRegion_NoGridReturnsNil(t *testing.T) {
+	// A region with no ruled lines/rects should report "not found" rather
+	// than erroring.
+	grid, err := DetectVectorGridInRegion(textFixture(t), 0, [4]float32{0, 0, 10, 10}, 72)
+	if err != nil {
+		t.Fatalf("DetectVectorGridInRegion: %v", err)
+	}
+	if grid != nil {
+		t.Errorf("grid = %+v, want nil for an empty region", grid)
+	}
+}
+
+// --- ExtractTablesWithStructure family ---
+
+func TestExtractTablesWithStructure_EmptyInputs(t *testing.T) {
+	results, err := ExtractTablesWithStructure(textFixture(t), nil)
+	if err != nil {
+		t.Fatalf("ExtractTablesWithStructure: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("len(results) = %d, want 0 for no inputs", len(results))
+	}
+}
+
+func TestExtractTablesWithStructure_SimpleGrid(t *testing.T) {
+	input := TsrTableInput{
+		Page:            0,
+		CropPdfPtBbox:   [4]float32{0, 0, 200, 100},
+		RenderDpi:       72,
+		StructureTokens: []string{"<table>", "<tr>", "<td></td>", "<td></td>", "</tr>", "</table>"},
+		CellBboxes:      [][]float32{{0, 0, 100, 50}, {100, 0, 200, 50}},
+	}
+	results, err := ExtractTablesWithStructure(textFixture(t), []TsrTableInput{input})
+	if err != nil {
+		t.Fatalf("ExtractTablesWithStructure: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+}
+
+func TestExtractTablesWithStructureCells_SimpleGrid(t *testing.T) {
+	input := TsrTableInput{
+		Page:            0,
+		CropPdfPtBbox:   [4]float32{0, 0, 200, 100},
+		RenderDpi:       72,
+		StructureTokens: []string{"<table>", "<tr>", "<td></td>", "<td></td>", "</tr>", "</table>"},
+		CellBboxes:      [][]float32{{0, 0, 100, 50}, {100, 0, 200, 50}},
+	}
+	results, err := ExtractTablesWithStructureCells(textFixture(t), []TsrTableInput{input})
+	if err != nil {
+		t.Fatalf("ExtractTablesWithStructureCells: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if len(results[0]) != 2 {
+		t.Fatalf("len(results[0]) = %d, want 2 cells", len(results[0]))
+	}
+}
+
+func TestExtractTablesWithStructureAuto_SimpleGrid(t *testing.T) {
+	input := TsrTableInput{
+		Page:            0,
+		CropPdfPtBbox:   [4]float32{0, 0, 200, 100},
+		RenderDpi:       72,
+		StructureTokens: []string{"<table>", "<tr>", "<td></td>", "<td></td>", "</tr>", "</table>"},
+		CellBboxes:      [][]float32{{0, 0, 100, 50}, {100, 0, 200, 50}},
+	}
+	results, err := ExtractTablesWithStructureAuto(textFixture(t), []TsrTableInput{input})
+	if err != nil {
+		t.Fatalf("ExtractTablesWithStructureAuto: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
 	}
 }
