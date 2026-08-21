@@ -58,29 +58,29 @@ jobs:
     needs: check-version
     if: needs.check-version.outputs.changed == 'true'
     name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - runner: blacksmith-8vcpu-ubuntu-2404
             target: x86_64-unknown-linux-gnu
           # napi-cross builds gnu targets against an old glibc sysroot for
           # broad distro compatibility; musl targets cross-compile with
           # zig via cargo-zigbuild (napi's -x flag).
-          - os: ubuntu-latest
+          - runner: blacksmith-8vcpu-ubuntu-2404
             target: aarch64-unknown-linux-gnu
             build-flags: --use-napi-cross
             cflags: -D__ARM_ARCH=8
-          - os: ubuntu-latest
+          - runner: blacksmith-8vcpu-ubuntu-2404
             target: x86_64-unknown-linux-musl
             build-flags: -x
-          - os: ubuntu-latest
+          - runner: blacksmith-8vcpu-ubuntu-2404
             target: aarch64-unknown-linux-musl
             build-flags: -x
-          - os: macos-14
+          - runner: blacksmith-6vcpu-macos-15
             target: aarch64-apple-darwin
-          - os: windows-latest
+          - runner: blacksmith-8vcpu-windows-2025
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -154,22 +154,22 @@ jobs:
   smoke-test:
     name: Smoke test ${{ matrix.target }}
     needs: [check-version, build]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - runner: blacksmith-2vcpu-ubuntu-2404
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - runner: blacksmith-2vcpu-ubuntu-2404
             target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
+          - runner: blacksmith-2vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - runner: blacksmith-2vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-musl
-          - os: macos-14
+          - runner: blacksmith-6vcpu-macos-15
             target: aarch64-apple-darwin
-          - os: windows-latest
+          - runner: blacksmith-2vcpu-windows-2025
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

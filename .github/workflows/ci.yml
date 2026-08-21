@@ -319,7 +319,7 @@ jobs:
         with:
           workspaces: |
             wasm -> target
-          key: wasm
+          shared-key: wasm
 
       - name: Check WebAssembly bindings
         run: cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown

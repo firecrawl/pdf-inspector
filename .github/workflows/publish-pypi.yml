@@ -84,23 +84,23 @@ jobs:
     needs: check-version
     if: needs.check-version.outputs.changed == 'true' && needs.check-version.outputs.published == 'false'
     name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - runner: blacksmith-8vcpu-ubuntu-2404
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - runner: blacksmith-8vcpu-ubuntu-2404
             target: aarch64-unknown-linux-gnu
             docker-options: -e CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8
           # macos-13 was retired by GitHub; macos-15-intel is the remaining
           # Intel runner label (available through 2027).
-          - os: macos-15-intel
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
-          - os: macos-14
+          - runner: blacksmith-6vcpu-macos-15
             target: aarch64-apple-darwin
-          - os: windows-latest
+          - runner: blacksmith-8vcpu-windows-2025
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,6 +115,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
+          sccache: true
           # The manylinux AArch64 GCC omits this macro while preprocessing
           # ring's assembly. AArch64 is ARMv8 by definition.
           docker-options: ${{ matrix.docker-options }}
