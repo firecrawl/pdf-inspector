@@ -850,6 +850,7 @@ enum TableOutputMode {
 
 struct TableDetectionOutput {
     mode: TableOutputMode,
+    pages_with_detected_tables: HashSet<u32>,
     pages_with_tables: HashSet<u32>,
     markdown_by_page: HashMap<u32, Vec<PositionedMarkdown>>,
     #[cfg(feature = "ocr")]
@@ -860,6 +861,7 @@ impl TableDetectionOutput {
     fn new(mode: TableOutputMode) -> Self {
         Self {
             mode,
+            pages_with_detected_tables: HashSet::new(),
             pages_with_tables: HashSet::new(),
             markdown_by_page: HashMap::new(),
             #[cfg(feature = "ocr")]
@@ -873,9 +875,10 @@ impl TableDetectionOutput {
         table: &crate::tables::Table,
         chart_order: Option<ChartProseOrder>,
     ) {
-        self.pages_with_tables.insert(page);
+        self.pages_with_detected_tables.insert(page);
         match self.mode {
             TableOutputMode::Markdown => {
+                self.pages_with_tables.insert(page);
                 self.markdown_by_page
                     .entry(page)
                     .or_default()
@@ -889,6 +892,7 @@ impl TableDetectionOutput {
             #[cfg(feature = "ocr")]
             TableOutputMode::CompleteTables => {
                 if crate::tables::is_complete_data_table(table) {
+                    self.pages_with_tables.insert(page);
                     self.complete_tables.push((page, table.clone()));
                 }
             }
@@ -897,6 +901,10 @@ impl TableDetectionOutput {
 
     fn has_tables_on_page(&self, page: u32) -> bool {
         self.pages_with_tables.contains(&page)
+    }
+
+    fn has_detected_tables_on_page(&self, page: u32) -> bool {
+        self.pages_with_detected_tables.contains(&page)
     }
 }
 
@@ -2002,7 +2010,7 @@ fn convert_items_with_rects_lines_and_table_output(
         // 5. Thin-rect border synthesis: last resort for PDFs that draw table
         //    borders as thin filled rectangles (common in spreadsheet exports).
         //    Only runs when ALL other methods found nothing on this page.
-        if !table_output.has_tables_on_page(page) {
+        if !table_output.has_detected_tables_on_page(page) {
             let page_rects: Vec<&crate::types::PdfRect> =
                 rects.iter().filter(|r| r.page == page).collect();
             let mut synth_lines: Vec<crate::types::PdfLine> = Vec::new();
@@ -2408,6 +2416,35 @@ mod tests {
     use super::*;
     use analysis::detect_header_level;
     use classify::{is_code_like, is_list_item};
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn complete_table_output_marks_only_pages_with_emitted_tables() {
+        let mut output = TableDetectionOutput::new(TableOutputMode::CompleteTables);
+        let incomplete = crate::tables::Table::new(
+            vec![100.0, 200.0],
+            vec![300.0],
+            vec![vec!["header a".into(), "header b".into()]],
+            vec![0, 1],
+        );
+        output.record(1, &incomplete, None);
+        assert!(output.has_detected_tables_on_page(1));
+        assert!(!output.has_tables_on_page(1));
+        assert!(output.complete_tables.is_empty());
+
+        let complete = crate::tables::Table::new(
+            vec![100.0, 200.0],
+            vec![300.0, 280.0],
+            vec![
+                vec!["header a".into(), "header b".into()],
+                vec!["value a".into(), "value b".into()],
+            ],
+            vec![0, 1, 2, 3],
+        );
+        output.record(1, &complete, None);
+        assert!(output.has_tables_on_page(1));
+        assert_eq!(output.complete_tables.len(), 1);
+    }
 
     #[test]
     fn test_is_list_item() {

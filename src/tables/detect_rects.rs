@@ -847,13 +847,15 @@ pub fn detect_tables_from_rects(
         // (row stripes don't overlap so each is its own cluster of 1),
         // try all page rects directly as a row-stripe table.
         // Require ≥15 rects and ≥10 result rows to avoid decorative fill false positives.
-        if tables.is_empty() && clusters.is_empty() && page_rects.len() >= 15 {
-            if let Some(table) = detect_row_stripe_table(items, &page_rects, page) {
+        let row_stripe_rects =
+            without_page_backgrounds(&page_rects, PageBackgroundRemoval::Repeated);
+        if tables.is_empty() && clusters.is_empty() && row_stripe_rects.len() >= 15 {
+            if let Some(table) = detect_row_stripe_table(items, &row_stripe_rects, page) {
                 if table.rows.len() >= 10 {
                     debug!(
                         "page {}: row-stripe fallback succeeded ({} rects, {} rows)",
                         page,
-                        page_rects.len(),
+                        row_stripe_rects.len(),
                         table.rows.len()
                     );
                     tables.push(table);
@@ -3727,6 +3729,40 @@ mod tests {
         assert_eq!(tables.len(), 1, "a real repeated cell grid must survive");
         assert_eq!(tables[0].rows.len(), 4);
         assert_eq!(tables[0].columns.len(), 3);
+    }
+
+    #[test]
+    fn minority_page_backgrounds_do_not_expand_row_stripe_fallback() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        let mut items = Vec::new();
+        for row in 0..25 {
+            let y = 200.0 + row as f32 * 20.0;
+            rects.push(PdfRect {
+                x: 40.0,
+                y,
+                width: 510.0,
+                height: 16.0,
+                page: 1,
+            });
+            items.push(make_item(&format!("row {row}"), 60.0, y + 5.0, 9.0));
+            items.push(make_item(&format!("value {row}"), 320.0, y + 5.0, 9.0));
+        }
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert_eq!(tables.len(), 1, "the row-stripe table should survive");
+        assert_eq!(
+            tables[0].rows.len(),
+            25,
+            "page fills must not add full-page rows to the fallback grid"
+        );
+        assert_eq!(tables[0].columns.len(), 2);
     }
 
     #[test]

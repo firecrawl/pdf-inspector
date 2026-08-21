@@ -10,6 +10,7 @@ use crate::tables::Table;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use super::detect_rects::{assign_items_to_grid, snap_edges};
+use super::grid::join_cell_items;
 
 const RULE_Y_TOLERANCE: f32 = 2.0;
 const RULE_JOIN_GAP: f32 = 6.0;
@@ -1352,22 +1353,42 @@ fn refine_segment_grid_text_rows(
         return None;
     }
 
-    let mut cells = vec![vec![String::new(); column_count]; anchored_rows.len()];
+    let mut cell_items = vec![vec![Vec::new(); column_count]; anchored_rows.len()];
     let mut item_indices = Vec::new();
     for (row_index, (_, row_items)) in anchored_rows.iter().enumerate() {
         for (item_index, item) in row_items {
             let center_x = item.x + item.width.max(0.0) / 2.0;
-            let column = (0..column_count).find(|&index| {
+            let Some(column) = (0..column_count).find(|&index| {
                 center_x >= table.columns[index] - RULE_Y_TOLERANCE
                     && center_x <= table.columns[index + 1] + RULE_Y_TOLERANCE
-            })?;
-            if !cells[row_index][column].is_empty() {
-                cells[row_index][column].push(' ');
-            }
-            cells[row_index][column].push_str(item.text.trim());
+            }) else {
+                continue;
+            };
+            cell_items[row_index][column].push(*item);
             item_indices.push(*item_index);
         }
     }
+
+    let cells: Vec<Vec<String>> = cell_items
+        .iter_mut()
+        .map(|row| {
+            row.iter_mut()
+                .map(|items| {
+                    if crate::text_utils::is_rtl_text(items.iter().map(|item| &item.text)) {
+                        crate::text_utils::sort_rtl_cell_items(
+                            items,
+                            |item| item.x,
+                            |item| item.y,
+                            |item| item.text.as_str(),
+                        );
+                    } else {
+                        items.sort_by(|left, right| left.x.total_cmp(&right.x));
+                    }
+                    join_cell_items(items)
+                })
+                .collect()
+        })
+        .collect();
 
     // Wrapped prose inside a wide cell can expose many baselines without any
     // row schema. Require repeated baselines that independently populate at
@@ -3021,6 +3042,51 @@ mod tests {
         );
 
         assert!(refine_segment_grid_text_rows(&items, &rules, 1, &physical).is_none());
+    }
+
+    #[test]
+    fn text_row_refinement_skips_items_outside_column_bands() {
+        let columns = vec![60.0, 160.0, 260.0];
+        let rules = vec![(500.0, 60.0, 260.0), (400.0, 60.0, 260.0)];
+        let mut items = vec![make_item("margin note", 30.0, 480.0, 1)];
+        for (row, y) in [480.0, 460.0, 440.0].into_iter().enumerate() {
+            items.push(make_item(&format!("label-{row}"), 80.0, y, 1));
+            items.push(make_item(&format!("value-{row}"), 180.0, y, 1));
+        }
+        let physical = Table::new(
+            columns,
+            vec![500.0],
+            vec![vec!["label".into(), "value".into()]],
+            Vec::new(),
+        );
+
+        let refined = refine_segment_grid_text_rows(&items, &rules, 1, &physical)
+            .expect("an out-of-band item must not abort otherwise valid refinement");
+        assert_eq!(refined.cells.len(), 3);
+        assert_eq!(refined.cells[0], ["label-0", "value-0"]);
+        assert!(!refined.item_indices.contains(&0));
+    }
+
+    #[test]
+    fn text_row_refinement_joins_rtl_fragments_in_reading_order() {
+        let columns = vec![60.0, 160.0, 260.0];
+        let rules = vec![(500.0, 60.0, 260.0), (400.0, 60.0, 260.0)];
+        let mut items = Vec::new();
+        for y in [480.0, 460.0, 440.0] {
+            items.push(make_item("שתיים", 80.0, y, 1));
+            items.push(make_item("אחד", 120.0, y, 1));
+            items.push(make_item("1", 180.0, y, 1));
+        }
+        let physical = Table::new(
+            columns,
+            vec![500.0],
+            vec![vec!["header".into(), "value".into()]],
+            Vec::new(),
+        );
+
+        let refined = refine_segment_grid_text_rows(&items, &rules, 1, &physical)
+            .expect("repeated RTL rows should refine");
+        assert_eq!(refined.cells[0][0], "אחד שתיים");
     }
 
     #[test]
