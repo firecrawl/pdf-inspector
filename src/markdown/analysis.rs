@@ -845,6 +845,7 @@ mod tests {
             width: text.len() as f32 * font_size * 0.5,
             height: font_size,
             font: "Test".into(),
+            font_tag: String::new(),
             font_size,
             page: 1,
             is_bold: bold,

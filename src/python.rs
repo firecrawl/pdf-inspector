@@ -359,6 +359,8 @@ pub struct PyTextItem {
     #[pyo3(get)]
     pub font: String,
     #[pyo3(get)]
+    pub font_tag: String,
+    #[pyo3(get)]
     pub font_size: f32,
     #[pyo3(get)]
     pub page: u32,
@@ -577,6 +579,7 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             width: item.width,
             height: item.height,
             font: item.font,
+            font_tag: item.font_tag,
             font_size: item.font_size,
             page: item.page,
             is_bold: item.is_bold,

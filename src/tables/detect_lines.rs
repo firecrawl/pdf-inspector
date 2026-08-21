@@ -1885,6 +1885,7 @@ mod tests {
             width: 30.0,
             height: 10.0,
             font: "F1".into(),
+            font_tag: String::new(),
             font_size: 10.0,
             page,
             is_bold: false,

@@ -463,6 +463,7 @@ fn extract_form_xobject_text_inner(
                                     width,
                                     height,
                                     font: String::new(),
+                                    font_tag: String::new(),
                                     font_size: 0.0,
                                     page: page_num,
                                     is_bold: false,
@@ -682,6 +683,7 @@ fn extract_form_xobject_text_inner(
                                     base_font,
                                 )
                                 .to_string(),
+                                font_tag: current_font.clone(),
                                 font_size: rendered_size,
                                 page: page_num,
                                 is_bold: is_bold_font(base_font) || desc_bold,
@@ -885,6 +887,7 @@ fn extract_form_xobject_text_inner(
                                         base_font,
                                     )
                                     .to_string(),
+                                    font_tag: current_font.clone(),
                                     font_size: rendered_size,
                                     page: page_num,
                                     is_bold: is_bold_font(base_font) || desc_bold,
@@ -1065,6 +1068,17 @@ mod tests {
         let items = extract_form(&doc, root, &mut FormWalkBudget::new());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "X");
+    }
+
+    #[test]
+    fn form_items_carry_family_name_and_resource_tag() {
+        // Parity with content_stream.rs: `font` is the /BaseFont family
+        // name, `font_tag` the raw resource tag, in both parsers.
+        let (doc, root) = form_dag(1, 2);
+        let items = extract_form(&doc, root, &mut FormWalkBudget::new());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].font, "Helvetica");
+        assert_eq!(items[0].font_tag, "F1");
     }
 
     #[test]

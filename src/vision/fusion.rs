@@ -542,6 +542,7 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             width: rect.width,
             height: rect.height,
             font: "OCR".to_string(),
+            font_tag: String::new(),
             font_size: rect.height.max(1.0),
             page: page.rendered.page(),
             is_bold: false,

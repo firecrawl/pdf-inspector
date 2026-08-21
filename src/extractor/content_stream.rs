@@ -588,6 +588,7 @@ pub(crate) fn extract_page_text_items(
                                     base_font,
                                 )
                                 .to_string(),
+                                font_tag: current_font.clone(),
                                 font_size: rendered_size,
                                 page: page_num,
                                 is_bold: is_bold_font(base_font) || desc_bold,
@@ -820,6 +821,7 @@ pub(crate) fn extract_page_text_items(
                                         base_font,
                                     )
                                     .to_string(),
+                                    font_tag: current_font.clone(),
                                     font_size: rendered_size,
                                     page: page_num,
                                     is_bold: is_bold_font(base_font) || desc_bold,
@@ -940,6 +942,7 @@ pub(crate) fn extract_page_text_items(
                                     base_font,
                                 )
                                 .to_string(),
+                                font_tag: current_font.clone(),
                                 font_size: rendered_size,
                                 page: page_num,
                                 is_bold: is_bold_font(base_font) || desc_bold,
@@ -984,6 +987,7 @@ pub(crate) fn extract_page_text_items(
                                         width,
                                         height,
                                         font: String::new(),
+                                        font_tag: String::new(),
                                         font_size: 0.0,
                                         page: page_num,
                                         is_bold: false,
@@ -1101,6 +1105,7 @@ pub(crate) fn extract_page_text_items(
                                         base_font,
                                     )
                                     .to_string(),
+                                    font_tag: current_font.clone(),
                                     font_size: rendered_size,
                                     page: page_num,
                                     is_bold: is_bold_font(base_font) || desc_bold,
@@ -2055,6 +2060,18 @@ end"#;
     }
 
     const SHALOM_LOGICAL: &str = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}"; // שלום
+
+    #[test]
+    fn items_carry_family_name_and_resource_tag() {
+        // `font` is the resolved /BaseFont family name; `font_tag` keeps the
+        // raw page resource tag so consumers can partition by font program
+        // even when two resources share a family.
+        let content = b"BT /F1 12 Tf 100 700 Tm <44434241> Tj ET";
+        let items = extract_hebrew_items(content);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].font, "TestHebrew");
+        assert_eq!(items[0].font_tag, "F1");
+    }
 
     #[test]
     fn visual_order_hebrew_ops_are_reversed() {

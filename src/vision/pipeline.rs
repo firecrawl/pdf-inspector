@@ -1037,6 +1037,7 @@ mod tests {
             width,
             height,
             font: "PDFium native text".to_string(),
+            font_tag: String::new(),
             font_size: height,
             page: 1,
             is_bold: false,
