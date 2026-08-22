@@ -286,15 +286,22 @@ func TestExtractThenVerify_CatchesArchiveMissingHostLibrary(t *testing.T) {
 	}
 }
 
-// TestExtractThenVerify_DetectsStaleLibraryNotReplaced reproduces the
+// TestLibraryWasInstalled_DetectsStaleLibraryNotReplaced reproduces the
 // specific scenario alreadyBuilt(dir) alone can't catch: `-force`
 // re-extracting into a directory that *already has a valid library in
 // it* from a previous run, against a new archive that happens to omit
 // the expected file. alreadyBuilt(dir) reports the old file as if it
 // were fresh (it has no way to know it wasn't touched by this
-// extraction) -- only checking the returned extracted-names list against
-// hostLibraryName(), the way main() now does, can tell the two apart.
-func TestExtractThenVerify_DetectsStaleLibraryNotReplaced(t *testing.T) {
+// extraction).
+//
+// This calls libraryWasInstalled directly -- the exact function main()
+// uses to decide whether a download succeeded -- rather than re-deriving
+// the same two conditions in a parallel assertion here: a test that only
+// checks alreadyBuilt(dir) and separately checks the extracted-names list
+// would keep passing even if main() were changed to stop calling (or
+// stop trusting the result of) libraryWasInstalled, since neither
+// assertion actually exercises that function.
+func TestLibraryWasInstalled_DetectsStaleLibraryNotReplaced(t *testing.T) {
 	stale, err := os.ReadFile(filepath.Join("..", "..", "..", "target", "release", hostLibraryName()))
 	if err != nil {
 		t.Skipf("no built native library to use as a stale pre-existing file (run `cargo build --release` in go/ first): %v", err)
@@ -333,18 +340,108 @@ func TestExtractThenVerify_DetectsStaleLibraryNotReplaced(t *testing.T) {
 		t.Fatalf("extractTarGz: %v", err)
 	}
 
-	// The bug this test guards: alreadyBuilt(dir) is still true here,
-	// because the stale file from before this extraction is untouched.
+	// Sanity check on the scenario itself: the stale file from before
+	// this extraction is still sitting there untouched, so alreadyBuilt
+	// alone can't tell this apart from a successful install.
 	if !alreadyBuilt(dir) {
 		t.Fatal("alreadyBuilt() = false after this extraction, but the stale library should still be sitting there untouched -- test setup assumption is wrong")
 	}
-	// The fix: the extracted-names list is what actually proves this
-	// specific extraction did NOT produce/replace the expected file.
-	for _, name := range extracted {
-		if name == hostLibraryName() {
-			t.Fatalf("test archive should not contain %s, but extractTarGz reports it did", hostLibraryName())
-		}
+	// The actual regression this test guards: libraryWasInstalled must
+	// see through that and report false, since hostLibraryName() was
+	// never part of *this* extraction.
+	if libraryWasInstalled(extracted, dir) {
+		t.Error("libraryWasInstalled() = true, but the archive never contained the host library -- only a stale pre-existing one is present")
 	}
+}
+
+// TestLibraryWasInstalled_AcceptsFreshExtraction is the positive
+// counterpart to TestLibraryWasInstalled_DetectsStaleLibraryNotReplaced:
+// when the archive genuinely does contain the host library, and it
+// extracts to a valid file, libraryWasInstalled must accept it.
+func TestLibraryWasInstalled_AcceptsFreshExtraction(t *testing.T) {
+	real, err := os.ReadFile(filepath.Join("..", "..", "..", "target", "release", hostLibraryName()))
+	if err != nil {
+		t.Skipf("no built native library available (run `cargo build --release` in go/ first): %v", err)
+	}
+
+	var tarBuf bytes.Buffer
+	gz := gzip.NewWriter(&tarBuf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: hostLibraryName(), Mode: 0o755, Size: int64(len(real))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(real); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	extracted, err := extractTarGz(tarBuf.Bytes(), dir)
+	if err != nil {
+		t.Fatalf("extractTarGz: %v", err)
+	}
+	if !libraryWasInstalled(extracted, dir) {
+		t.Error("libraryWasInstalled() = false for an archive that genuinely contains a valid host library")
+	}
+}
+
+// TestIsCurrentFetch guards the version/target staleness check used by
+// main()'s skip decision: without it, alreadyBuilt(dir) alone can't
+// detect that go/Cargo.toml's version moved on since dir's library was
+// fetched, so `go generate` would keep linking a previous release's
+// library forever after a version bump.
+func TestIsCurrentFetch(t *testing.T) {
+	t.Run("no marker at all is trusted (locally built, or pre-marker fetch)", func(t *testing.T) {
+		dir := t.TempDir()
+		if !isCurrentFetch(dir, "1.2.3", "linux-x64") {
+			t.Error("isCurrentFetch() = false with no marker present; a locally-built library must never be second-guessed")
+		}
+	})
+
+	t.Run("matching marker is current", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := writeFetchMarker(dir, "1.2.3", "linux-x64"); err != nil {
+			t.Fatal(err)
+		}
+		if !isCurrentFetch(dir, "1.2.3", "linux-x64") {
+			t.Error("isCurrentFetch() = false for a marker matching the current version and target")
+		}
+	})
+
+	t.Run("version mismatch is stale", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := writeFetchMarker(dir, "1.2.3", "linux-x64"); err != nil {
+			t.Fatal(err)
+		}
+		if isCurrentFetch(dir, "1.3.0", "linux-x64") {
+			t.Error("isCurrentFetch() = true after a version bump; a stale download should be re-fetched")
+		}
+	})
+
+	t.Run("target mismatch is stale", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := writeFetchMarker(dir, "1.2.3", "linux-x64"); err != nil {
+			t.Fatal(err)
+		}
+		if isCurrentFetch(dir, "1.2.3", "linux-arm64") {
+			t.Error("isCurrentFetch() = true for a marker recorded for a different target")
+		}
+	})
+
+	t.Run("corrupt marker is not trusted", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(fetchMarkerPath(dir), []byte("not json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if isCurrentFetch(dir, "1.2.3", "linux-x64") {
+			t.Error("isCurrentFetch() = true for an unparseable marker file")
+		}
+	})
 }
 
 // TestExtractTarGzWithLimits_RejectsDecompressionBomb guards the

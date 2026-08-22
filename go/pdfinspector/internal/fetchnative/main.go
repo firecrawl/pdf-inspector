@@ -18,6 +18,7 @@ import (
 	"debug/elf"
 	"debug/macho"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -169,6 +170,82 @@ func matchesHostArch(path string) (bool, error) {
 	}
 }
 
+// libraryWasInstalled reports whether extractedNames -- the files
+// extractTarGz just wrote, as returned by that call -- included the
+// host's expected library, and that what's now at dir is a valid library
+// for this host's OS/architecture. This is the exact post-extraction
+// check main() relies on to accept a download; it's factored out here so
+// it can be exercised directly by tests, rather than only indirectly by
+// re-deriving the same two conditions in a parallel assertion.
+//
+// Checking alreadyBuilt(dir) alone isn't enough: with -force
+// re-extracting into a directory that already has a valid library in it,
+// an archive that omits the expected file would leave that old file
+// untouched, and alreadyBuilt would report it as if this run had just
+// produced it. Confirming the expected name was actually part of this
+// extraction first is what tells the two cases apart.
+func libraryWasInstalled(extractedNames []string, dir string) bool {
+	wasExtracted := false
+	for _, name := range extractedNames {
+		if name == hostLibraryName() {
+			wasExtracted = true
+			break
+		}
+	}
+	return wasExtracted && alreadyBuilt(dir)
+}
+
+// fetchMarker records which release fetchnative last downloaded into a
+// given directory, so a later run can tell a previously-fetched library
+// apart from one the user built locally with `cargo build --release`.
+//
+// alreadyBuilt(dir) alone can't detect a version bump: it only checks
+// that *a* valid library for this host's OS/architecture is present, not
+// which release it came from. Without this marker, bumping
+// go/Cargo.toml's version and re-running `go generate` would silently
+// keep linking the previous release's library forever, since the file on
+// disk still passes every check alreadyBuilt performs.
+type fetchMarker struct {
+	Version string `json:"version"`
+	Target  string `json:"target"`
+}
+
+func fetchMarkerPath(dir string) string {
+	return filepath.Join(dir, ".fetchnative-release.json")
+}
+
+func writeFetchMarker(dir, version, target string) error {
+	data, err := json.Marshal(fetchMarker{Version: version, Target: target})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(fetchMarkerPath(dir), data, 0o644)
+}
+
+// isCurrentFetch reports whether dir's marker (if any) matches the
+// release we'd fetch right now, i.e. whether a previous fetchnative
+// download in dir is still up to date.
+//
+// No marker at all is treated as current (return true): that's either a
+// library the user built themselves with `cargo build --release` -- which
+// this tool must never second-guess or refuse to use, fetchnative is a
+// convenience layered on top of that, not a replacement for it -- or one
+// fetched by a fetchnative build that predates this marker mechanism. A
+// marker that's present but corrupt, or that names a different
+// version/target than what we'd fetch now, means the file on disk is from
+// an earlier fetchnative run that's no longer current.
+func isCurrentFetch(dir, version, target string) bool {
+	data, err := os.ReadFile(fetchMarkerPath(dir))
+	if err != nil {
+		return true
+	}
+	var marker fetchMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return false
+	}
+	return marker.Version == version && marker.Target == target
+}
+
 // isMuslLinux reports whether the host's active C library is musl (e.g.
 // Alpine) rather than glibc. publish-go.yml only publishes glibc-linked
 // builds (its `build` job's Linux runners are Ubuntu-based, glibc either
@@ -220,22 +297,32 @@ func main() {
 		fail("resolve native library directory: %v", err)
 	}
 
+	// Computed up front, best-effort, so the skip decision below can tell
+	// a stale fetchnative download apart from a current one. Errors here
+	// (unsupported platform, unreadable go/Cargo.toml) are not fatal yet
+	// -- if there's nothing valid on disk we'll fail on them properly
+	// just below; if there IS already a valid library, we fall back to
+	// trusting it exactly as before, since there's no "current release"
+	// to compare against anyway.
+	suffix, suffixOK := targetSuffix(runtime.GOOS, runtime.GOARCH)
+	version, versionErr := releaseVersion()
+
 	if !*force && alreadyBuilt(dir) {
-		fmt.Printf("fetchnative: native library already present at %s, skipping\n", dir)
-		return
+		if versionErr != nil || !suffixOK || isCurrentFetch(dir, version, suffix) {
+			fmt.Printf("fetchnative: native library already present at %s, skipping\n", dir)
+			return
+		}
+		fmt.Printf("fetchnative: native library at %s was fetched for a different release; re-fetching\n", dir)
 	}
 
-	suffix, ok := targetSuffix(runtime.GOOS, runtime.GOARCH)
-	if !ok {
+	if !suffixOK {
 		fail("no prebuilt library published for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 	if isMuslLinux() {
 		fail("host appears to be musl-based Linux (e.g. Alpine); only glibc builds are published for linux/%s", runtime.GOARCH)
 	}
-
-	version, err := releaseVersion()
-	if err != nil {
-		fail("determine release version: %v", err)
+	if versionErr != nil {
+		fail("determine release version: %v", versionErr)
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
@@ -273,26 +360,20 @@ func main() {
 	// extractTarGz succeeding only means every file *in the archive*
 	// extracted cleanly -- it says nothing about whether the archive
 	// actually contained the library this host needs at all (e.g. a
-	// release published with the wrong asset under this name). Checking
-	// only alreadyBuilt(dir) afterwards isn't enough on its own: with
-	// -force re-extracting over a directory that already has a valid
-	// library in it, a bad archive that omits the expected file would
-	// leave that old file untouched, and alreadyBuilt would report it as
-	// if this run had just produced it. Confirm the expected file was
-	// actually *in this archive* first, then confirm what's on disk
-	// afterwards is valid -- both checks, not just the second one.
-	wasExtracted := false
-	for _, name := range extractedNames {
-		if name == hostLibraryName() {
-			wasExtracted = true
-			break
-		}
+	// release published with the wrong asset under this name). See
+	// libraryWasInstalled's doc comment for why alreadyBuilt(dir) alone
+	// isn't sufficient here.
+	if !libraryWasInstalled(extractedNames, dir) {
+		fail("extracted %s into %s, but %s was not part of the archive, or is not a valid %s/%s library afterwards -- the release archive may be missing the expected asset, or corrupt", archiveName, dir, hostLibraryName(), runtime.GOOS, runtime.GOARCH)
 	}
-	if !wasExtracted {
-		fail("extracted %s, but it did not contain %s at all -- the release archive may be missing the expected asset", archiveName, hostLibraryName())
-	}
-	if !alreadyBuilt(dir) {
-		fail("extracted %s into %s, but %s is missing or not a valid %s/%s library afterwards -- the release archive may be corrupt or mismatched", archiveName, dir, hostLibraryName(), runtime.GOOS, runtime.GOARCH)
+
+	if err := writeFetchMarker(dir, version, suffix); err != nil {
+		// The library itself downloaded and verified fine; failing to
+		// record which release it came from only means a future run
+		// might not notice a subsequent version bump as promptly as it
+		// otherwise would (see isCurrentFetch), not that anything is
+		// wrong with what's installed right now.
+		fmt.Fprintf(os.Stderr, "fetchnative: warning: could not record fetch marker in %s: %v\n", dir, err)
 	}
 
 	fmt.Printf("fetchnative: installed %s %s into %s\n", tag, suffix, dir)

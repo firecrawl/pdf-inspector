@@ -41,7 +41,7 @@ cd go
 make native   # or: cargo build --release
 ```
 
-This produces `go/target/release/libpdf_inspector_go.{dylib,so,a}`. Either option leaves the native library in the same place, so the rest of the workflow is identical:
+This produces `go/target/release/libpdf_inspector_go.{so,a}` on Linux or `libpdf_inspector_go.{dylib,a}` on macOS (the dynamic library plus a static library, never both dynamic-library extensions from the same build). Either option leaves the native library in the same place, so the rest of the workflow is identical:
 
 ```bash
 cd go/pdfinspector
