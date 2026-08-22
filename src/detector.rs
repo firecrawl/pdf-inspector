@@ -4136,6 +4136,109 @@ mod tests {
     }
 
     #[test]
+    fn test_font_persists_across_text_objects_per_spec() {
+        // cubic P2 finding (refuted): claimed the scanner must clear
+        // `current_font` when a new `BT` begins, so a later text object never
+        // inherits a font selected by an earlier one. Per ISO 32000-1 §9.3.1,
+        // the nine text state parameters (including the font set by `Tf`) are
+        // part of the graphics state and persist across `BT`/`ET` — only a
+        // matching `Q` after a `q` resets them. Only the text matrix and line
+        // matrix are reset by `BT` (§9.4.2). This repo's own extraction state
+        // machine (`extractor/content_stream.rs`) agrees: its `"BT"` arm resets
+        // only `text_matrix`/`line_matrix`, never `current_font`. A page that
+        // selects its font once and shows dense text across two separate `BT`
+        // blocks is legal PDF and must still clear the dense-text floor.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let image_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Image".to_vec()),
+                "Width" => Object::Integer(1500),
+                "Height" => Object::Integer(2383),
+            },
+            Vec::new(),
+        )));
+        let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+                },
+            },
+            b"1500 0 0 2383 0 0 cm /Im0 Do".to_vec(),
+        )));
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        let part_one = "The font for this page is selected exactly once, by a \
+                    single Tf back in the first text object, and this first \
+                    half of the dense body is shown right there so the floor \
+                    has an attributed font to work with from the very start.";
+        let part_two = "This second half of the body lives in its own BT ET \
+                    text object with no Tf of its own, because the PDF spec \
+                    keeps the font in the graphics state across text objects, \
+                    so it must still be attributed to the font selected earlier.";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            format!("q /Fm0 Do Q BT /F1 12 Tf ({part_one}) Tj ET BT ({part_two}) Tj ET")
+                .into_bytes(),
+        )));
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 1500.into(), 2383.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(good_font_id) },
+                    "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) },
+                },
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.text_char_count >= MIN_DECODABLE_TEXT_CHARS,
+            "sanity: the two-text-object body clears the floor ({})",
+            analysis.text_char_count
+        );
+        assert!(
+            !analysis.has_undecodable_text_fonts,
+            "the second BT/ET text object's show must be attributed to the \
+             font selected in the first text object, per ISO 32000-1 §9.3.1 \
+             — not counted as unattributable font-less text"
+        );
+        assert!(
+            page_has_dense_decodable_text(&analysis),
+            "dense text split across text objects (not just content streams) \
+             must still qualify for the rescue"
+        );
+        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        assert!(!needs_ocr, "the page must stay native");
+    }
+
+    #[test]
     fn test_octal_escapes_count_one_char_each() {
         let mut unique = HashSet::new();
         let mut total = 0u64;
