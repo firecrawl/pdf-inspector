@@ -2,7 +2,6 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use std::collections::HashSet;
 
 use crate::detector::PdfType;
 use crate::types::ItemType;
@@ -380,6 +379,14 @@ pub struct PyTextItem {
     /// structure-tree roles (headings, paragraphs, ...) in tagged PDFs.
     #[pyo3(get)]
     pub mcid: Option<i64>,
+    /// Structure-tree role resolved from mcid for tagged PDFs — the standard
+    /// structure type name ("H1".."H6", "P", "Note", "Caption", "Figure", ...),
+    /// or a custom tag resolved through the document's role map. None when the
+    /// PDF is untagged, the page has no structure tree, or the item is not part
+    /// of marked content. Lets callers separate body text from footnotes
+    /// ("Note"), running headers, and marginalia without a manual join.
+    #[pyo3(get)]
+    pub role: Option<String>,
 }
 
 #[pymethods]
@@ -569,10 +576,10 @@ fn item_type_str(t: &ItemType) -> String {
     }
 }
 
-fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
+fn convert_text_items(items: Vec<(crate::TextItem, Option<String>)>) -> Vec<PyTextItem> {
     items
         .into_iter()
-        .map(|item| PyTextItem {
+        .map(|(item, role)| PyTextItem {
             text: item.text,
             x: item.x,
             y: item.y,
@@ -588,6 +595,7 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             is_strikeout: item.is_strikeout,
             item_type: item_type_str(&item.item_type),
             mcid: item.mcid,
+            role,
         })
         .collect()
 }
@@ -846,13 +854,8 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(signature = (path, pages=None))]
 fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<Vec<PyTextItem>> {
-    let items = match pages {
-        Some(p) => {
-            let page_set: HashSet<u32> = p.into_iter().collect();
-            crate::extract_text_with_positions_pages(path, Some(&page_set)).map_err(to_py_err)?
-        }
-        None => crate::extract_text_with_positions(path).map_err(to_py_err)?,
-    };
+    let items =
+        crate::extract_text_with_positions_with_roles(path, pages.as_deref()).map_err(to_py_err)?;
     Ok(convert_text_items(items))
 }
 
@@ -863,14 +866,8 @@ fn extract_text_with_positions_bytes(
     data: &[u8],
     pages: Option<Vec<u32>>,
 ) -> PyResult<Vec<PyTextItem>> {
-    let items = match pages {
-        Some(p) => {
-            let page_set: HashSet<u32> = p.into_iter().collect();
-            crate::extractor::extract_text_with_positions_mem_pages(data, Some(&page_set))
-                .map_err(to_py_err)?
-        }
-        None => crate::extractor::extract_text_with_positions_mem(data).map_err(to_py_err)?,
-    };
+    let items = crate::extract_text_with_positions_with_roles_mem(data, pages.as_deref())
+        .map_err(to_py_err)?;
     Ok(convert_text_items(items))
 }
 

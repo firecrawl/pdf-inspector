@@ -259,6 +259,23 @@ class TestExtractTextWithPositions:
         )
         assert any(item.mcid is not None for item in tagged)
 
+    def test_role(self):
+        # Untagged fixture: role is always None
+        items = pdf_inspector.extract_text_with_positions(
+            fixture_path("thermo-freon12.pdf")
+        )
+        assert all(item.role is None for item in items)
+        # Tagged fixture: marked content carries resolved struct-tree roles
+        # (H1, P, ...) so callers can separate body text from other regions
+        # without a manual (page, mcid) join.
+        tagged = pdf_inspector.extract_text_with_positions(
+            fixture_path("firecrawl_docs_tagged.pdf")
+        )
+        assert all(
+            item.role is None or isinstance(item.role, str) for item in tagged
+        )
+        assert any(item.role == "H1" for item in tagged)
+
 
 # ---------------------------------------------------------------------------
 # extract_structure_elements / extract_structure_elements_bytes

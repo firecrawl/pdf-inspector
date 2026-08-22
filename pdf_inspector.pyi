@@ -104,6 +104,13 @@ class TextItem:
     the text is not part of marked content. Join with the (page, mcid) pairs
     from extract_structure_elements to attach structure-tree roles in tagged
     PDFs."""
+    role: Optional[str]
+    """Structure-tree role resolved from mcid for tagged PDFs — the standard
+    structure type name ("H1".."H6", "P", "Note", "Caption", "Figure", ...), or
+    a custom tag resolved through the document's role map. None when the PDF is
+    untagged, the page has no structure tree, or the item is not part of marked
+    content. Lets callers separate body text from footnotes ("Note"), running
+    headers, and marginalia without a manual join."""
 
 class StructureElement:
     """One structure-tree element reference from a tagged PDF."""

@@ -927,8 +927,19 @@ pub fn extract_structure_elements_mem(
 ) -> Result<Vec<StructureElement>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let Some(tree) = structure_tree::StructTree::from_doc(&doc) else {
-        return Ok(Vec::new());
+    Ok(structure_elements_from_doc(&doc, pages))
+}
+
+/// Resolve structure-tree element references from an already-loaded document.
+///
+/// Returns an empty list when the document is not tagged. Shared by
+/// [`extract_structure_elements_mem`] and
+/// [`extract_text_with_positions_with_roles_mem`] so a document parsed once
+/// can feed both the struct-tree walk and the positioned-text walk without a
+/// second load/parse.
+fn structure_elements_from_doc(doc: &Document, pages: Option<&[u32]>) -> Vec<StructureElement> {
+    let Some(tree) = structure_tree::StructTree::from_doc(doc) else {
+        return Vec::new();
     };
     let page_ids = doc.get_pages();
     let roles = tree.mcid_to_roles(&page_ids);
@@ -946,7 +957,7 @@ pub fn extract_structure_elements_mem(
         })
         .collect();
     elements.sort_unstable_by_key(|e| (e.page, e.mcid));
-    Ok(elements)
+    elements
 }
 
 /// Path-based wrapper for [`extract_structure_elements_mem`].
@@ -961,6 +972,69 @@ pub fn extract_structure_elements<P: AsRef<Path>>(
     validate_pdf_file(&path)?;
     let buffer = std::fs::read(path.as_ref())?;
     extract_structure_elements_mem(&buffer, pages)
+}
+
+/// Extract positioned text items paired with their resolved structure-tree
+/// role, from a PDF in memory.
+///
+/// Runs [`extract_text_with_positions_mem`] and, for tagged PDFs, resolves
+/// each item's [`TextItem::mcid`] to its structure type name ("H1".."H6",
+/// "P", "Note", "Caption", "Figure", …) via the document's `/StructTreeRoot`.
+/// This is the single-call form of joining [`extract_text_with_positions`]
+/// with [`extract_structure_elements`]: callers can separate body text from
+/// footnotes, running headers, and marginalia by role without doing the
+/// `(page, mcid)` join themselves.
+///
+/// The resolved role is `None` when the PDF is untagged, when the page has no
+/// structure tree, or when the item is not part of marked content (its
+/// `mcid` is `None`). Pass `Some(&[...])` with 1-indexed page numbers to
+/// restrict extraction to those pages, or `None` for the whole document.
+pub fn extract_text_with_positions_with_roles_mem(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+) -> Result<Vec<(TextItem, Option<String>)>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    // Load and parse the document once, then feed both the positioned-text
+    // walk and the struct-tree role walk from the same parsed `Document`
+    // (both otherwise go through `load_document_from_mem`, so sharing one load
+    // is equivalent and avoids parsing the PDF twice).
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+
+    let page_filter: Option<HashSet<u32>> = pages.map(|p| p.iter().copied().collect());
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let ((items, _rects, _lines), _thresholds, _gid_pages) =
+        extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter.as_ref())?;
+
+    // Resolve (page, mcid) → role from the struct tree. Untagged PDFs yield an
+    // empty map, so every item's role falls through to `None`.
+    let role_map: HashMap<(u32, i64), String> = structure_elements_from_doc(&doc, pages)
+        .into_iter()
+        .map(|e| ((e.page, e.mcid), e.role))
+        .collect();
+
+    Ok(items
+        .into_iter()
+        .map(|item| {
+            let role = item
+                .mcid
+                .and_then(|mcid| role_map.get(&(item.page, mcid)).cloned());
+            (item, role)
+        })
+        .collect())
+}
+
+/// Path-based wrapper for [`extract_text_with_positions_with_roles_mem`].
+///
+/// Reads the PDF from disk and extracts positioned text items paired with
+/// their resolved structure-tree role. Pass `None` for `pages` to return the
+/// whole document, or `Some(&[...])` to restrict to specific 1-indexed pages.
+pub fn extract_text_with_positions_with_roles<P: AsRef<Path>>(
+    path: P,
+    pages: Option<&[u32]>,
+) -> Result<Vec<(TextItem, Option<String>)>, PdfError> {
+    validate_pdf_file(&path)?;
+    let buffer = std::fs::read(path.as_ref())?;
+    extract_text_with_positions_with_roles_mem(&buffer, pages)
 }
 
 // =========================================================================
