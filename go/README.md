@@ -110,7 +110,7 @@ Fast metadata-only detection — same result shape as `ProcessPdf`, with `Markdo
 
 ### `ExtractPagesMarkdown(data []byte, pages []uint32) (*PagesExtractionResult, error)`
 
-Per-page Markdown plus layout classification (tables, columns, OCR needs) from a single parse, letting callers mix direct extraction for simple pages with OCR for complex/scanned ones. `pages` is 0-indexed; `nil` returns every page in document order, otherwise results follow the order you pass in.
+Per-page Markdown plus layout classification (tables, columns, OCR needs) from a single parse, letting callers mix direct extraction for simple pages with OCR for complex/scanned ones. `pages` is 0-indexed; `nil` returns every page in document order, otherwise results follow the order you pass in. The result's `PagesNeedingOCR`, `PagesWithTables`, and `PagesWithColumns` fields are **1-indexed**, unlike the `pages` argument.
 
 ```go
 result, err := pdfinspector.ExtractPagesMarkdown(data, []uint32{2, 0}) // caller order preserved
@@ -127,7 +127,7 @@ Text with position, font, and style metadata (bold/italic/underline/strikeout, b
 
 Structure-tree element references (page, MCID, role — `"H1"`.."H6", `"P"`, `"Table"`, `"TD"`, ...) from a tagged PDF. Returns an empty slice for untagged PDFs. `pages` is 1-indexed, matching `TextItem.Page`.
 
-**Indexing summary across this package** (it is not uniform — each function matches whichever core API it forwards to): 0-indexed for `ExtractPagesMarkdown`, `ExtractTextInRegions`/`ExtractTablesInRegions`, `DetectVectorGridInRegion`, and the `ExtractTablesWithStructure*` family; 1-indexed for `ProcessPdf`, `DetectPdf`'s/`ProcessPdf`'s `PagesNeedingOCR` result field, `ExtractTextWithPositions`, `ExtractStructureElements`, and `ProcessPdfWithOcr`'s `OcrOptions.PageNumbers`. `Classify`'s `PagesNeedingOCR` is the one 0-indexed exception among result fields (see its own doc comment). Check each function's doc comment above when in doubt.
+**Indexing summary across this package** (it is not uniform — each function matches whichever core API it forwards to): 0-indexed for `ExtractPagesMarkdown`'s `pages` argument, `ExtractTextInRegions`/`ExtractTablesInRegions`, `DetectVectorGridInRegion`, and the `ExtractTablesWithStructure*` family; 1-indexed for `ProcessPdf`, `DetectPdf`'s/`ProcessPdf`'s `PagesNeedingOCR` result field, `ExtractPagesMarkdown`'s own `PagesNeedingOCR`/`PagesWithTables`/`PagesWithColumns` result fields (despite its `pages` argument being 0-indexed), `ExtractTextWithPositions`, `ExtractStructureElements`, and `ProcessPdfWithOcr`'s `OcrOptions.PageNumbers`. `Classify`'s `PagesNeedingOCR` is the one 0-indexed exception among result fields (see its own doc comment). Check each function's doc comment above when in doubt.
 
 ### `ExtractTextInRegions` / `ExtractTablesInRegions(data []byte, pageRegions []PageRegions) ([]PageRegionTexts, error)`
 
