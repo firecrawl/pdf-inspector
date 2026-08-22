@@ -217,9 +217,7 @@ pub(crate) fn extract_page_text_items(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data = s
-                        .decompressed_content()
-                        .unwrap_or_else(|_| s.content.clone());
+                    let data = crate::safe_decompress::decompressed_or_raw(s);
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                     {
@@ -251,9 +249,7 @@ pub(crate) fn extract_page_text_items(
     let xobjects = get_page_xobjects(doc, page_id);
 
     // Get content
-    let content_data = doc
-        .get_page_content(page_id)
-        .map_err(|e| PdfError::Parse(e.to_string()))?;
+    let content_data = crate::safe_decompress::get_page_content_capped(doc, page_id, page_num)?;
 
     // Strip PDF comments (% to end of line) from the content stream.
     // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's

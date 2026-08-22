@@ -835,10 +835,14 @@ fn get_cid_to_gid_map(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Opti
     match obj {
         Object::Name(n) if n.as_slice() == b"Identity" => None,
         Object::Reference(r) => match doc.get_object(*r) {
-            Ok(Object::Stream(s)) => parse_cid_to_gid_stream(&s.decompressed_content().ok()?),
+            Ok(Object::Stream(s)) => parse_cid_to_gid_stream(
+                &crate::safe_decompress::decompressed_content_capped(s).ok()?,
+            ),
             _ => None,
         },
-        Object::Stream(s) => parse_cid_to_gid_stream(&s.decompressed_content().ok()?),
+        Object::Stream(s) => {
+            parse_cid_to_gid_stream(&crate::safe_decompress::decompressed_content_capped(s).ok()?)
+        }
         _ => None,
     }
 }
@@ -1535,7 +1539,9 @@ fn build_encoding_cmap_from_font(
             let obj = doc.get_object(*r).ok()?;
             parse_encoding_cmap_object(obj, doc)
         }
-        Object::Stream(s) => parse_encoding_cmap_stream(&s.decompressed_content().ok()?),
+        Object::Stream(s) => parse_encoding_cmap_stream(
+            &crate::safe_decompress::decompressed_content_capped(s).ok()?,
+        ),
         Object::Dictionary(_) => None,
         _ => None,
     }
@@ -1543,7 +1549,9 @@ fn build_encoding_cmap_from_font(
 
 fn parse_encoding_cmap_object(obj: &Object, doc: &Document) -> Option<EncodingCMap> {
     match obj {
-        Object::Stream(s) => parse_encoding_cmap_stream(&s.decompressed_content().ok()?),
+        Object::Stream(s) => parse_encoding_cmap_stream(
+            &crate::safe_decompress::decompressed_content_capped(s).ok()?,
+        ),
         Object::Reference(r) => {
             let obj = doc.get_object(*r).ok()?;
             parse_encoding_cmap_object(obj, doc)
@@ -2123,10 +2131,7 @@ impl FontCMaps {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let data = match stream.decompressed_content() {
-                Ok(d) => d,
-                Err(_) => stream.content.clone(),
-            };
+            let data = crate::safe_decompress::decompressed_or_raw(stream);
             if let Some(cmap) = ToUnicodeCMap::parse(&data) {
                 debug!(
                     "CMap obj={:<6} code_byte_length={} char_map={} ranges={}",
@@ -2292,10 +2297,7 @@ impl FontCMaps {
             // Try parsing embedded TrueType/OpenType cmap
             if let Some(ff_ref) = font_file_ref {
                 if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                    let data = match stream.decompressed_content() {
-                        Ok(d) => d,
-                        Err(_) => stream.content.clone(),
-                    };
+                    let data = crate::safe_decompress::decompressed_or_raw(stream);
                     if let Some(cmap) = build_cmap_from_truetype(&data) {
                         debug!(
                             "TrueType CMap obj={:<6} (embedded font) char_map={}",
@@ -2415,7 +2417,7 @@ impl FontCMaps {
                 continue;
             }
             if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                if let Ok(data) = stream.decompressed_content() {
+                if let Ok(data) = crate::safe_decompress::decompressed_content_capped(stream) {
                     if let Some(cmap) = build_simple_cmap_from_truetype(&data) {
                         debug!(
                             "Simple font cmap obj={:<6} (embedded font) char_map={}",
@@ -2588,7 +2590,7 @@ fn build_fallback_cmap_for_type0(
 
     if let Some(ff_ref) = font_file_ref {
         if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-            if let Ok(data) = stream.decompressed_content() {
+            if let Ok(data) = crate::safe_decompress::decompressed_content_capped(stream) {
                 if let Some(cmap) = build_cmap_from_truetype(&data) {
                     if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
                         if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
@@ -2647,7 +2649,7 @@ fn build_fallback_cmap_for_simple(
                 .and_then(|o| o.as_reference().ok())
         })?;
     if let Ok(stream) = doc.get_object(font_file_ref).and_then(Object::as_stream) {
-        if let Ok(data) = stream.decompressed_content() {
+        if let Ok(data) = crate::safe_decompress::decompressed_content_capped(stream) {
             if let Some(cmap) = build_simple_cmap_from_truetype(&data) {
                 debug!(
                     "Fallback simple font cmap (ToUnicode present) char_map={}",

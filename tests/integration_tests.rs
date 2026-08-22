@@ -4381,6 +4381,29 @@ fn test_extract_pages_markdown_ocrs_page_with_vector_outlined_text() {
     );
 }
 
+/// Regression for a PR #221 review finding: `get_page_content_capped`
+/// concatenated a page's multiple `/Contents` streams with no separator,
+/// unlike `lopdf::Document::get_page_content` (which it replaces), which
+/// joins them with a newline. A page split at an arbitrary token boundary
+/// can then have adjacent operators merge into one invalid token — this
+/// fixture's first content stream ends exactly at "Tj" and the second
+/// begins exactly at "ET", so without a joining newline they merge into
+/// the invalid operator "TjET", dropping the shown text.
+#[test]
+fn split_content_stream_without_separator_does_not_drop_text() {
+    let result = process_pdf_with_options(
+        "tests/fixtures/split_content_stream_no_separator.pdf",
+        PdfOptions::new(),
+    )
+    .expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Hello"),
+        "text split across two /Contents streams at a token boundary should \
+         still extract, got: {md:?}"
+    );
+}
+
 #[test]
 fn pdf_options_debug_redacts_password() {
     let opts = PdfOptions::new().password("secret123");
@@ -4447,4 +4470,61 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
          trustworthy, got: {:?}",
         page.markdown
     );
+}
+
+/// Regression for a maintainer review finding on PR #221: a content stream
+/// that exceeds the decompression-bomb cap must fail closed with a typed
+/// `PdfError::ResourceLimit`, not silently degrade to empty/partial
+/// markdown that looks like a successful extraction. Fixture is a page
+/// whose single content stream decompresses to ~70 MiB (past the 64 MiB
+/// per-stream cap) but compresses to ~70 KiB on disk (all zero bytes).
+#[test]
+fn oversized_content_stream_fails_closed_with_resource_limit_error() {
+    let result = process_pdf_with_options(
+        "tests/fixtures/oversized_content_stream.pdf",
+        PdfOptions::new(),
+    );
+    match result {
+        Err(PdfError::ResourceLimit { page, .. }) => {
+            assert_eq!(page, 1, "expected the error to name page 1");
+        }
+        other => panic!(
+            "expected Err(PdfError::ResourceLimit), got {other:?} — an oversized \
+             content stream must not silently succeed with partial/empty markdown"
+        ),
+    }
+}
+
+/// Regression for a bot review finding on PR #221: `process_document`'s
+/// "Mixed PDFs: extraction failure is non-fatal" fallback (`extracted.ok()`)
+/// discarded any error from extraction — including `PdfError::ResourceLimit`
+/// — treating a decompression-bomb-cap trip the same as a soft failure like
+/// garbled text. That let a Mixed-type page (real text + a large template
+/// image) with an oversized content stream silently succeed with partial
+/// markdown instead of failing closed. Fixture has real text (so it's not
+/// Scanned) plus a large declared-only image (so it classifies as Mixed)
+/// plus an oversized third content stream.
+#[test]
+fn mixed_pdf_with_oversized_content_stream_fails_closed() {
+    let cls = pdf_inspector::detector::detect_pdf_type_mem(
+        &std::fs::read("tests/fixtures/mixed_oversized_content_stream.pdf").unwrap(),
+    )
+    .expect("fixture should classify");
+    assert_eq!(
+        cls.pdf_type,
+        PdfType::Mixed,
+        "fixture must classify as Mixed to exercise the code path this test targets"
+    );
+
+    let result = process_pdf_with_options(
+        "tests/fixtures/mixed_oversized_content_stream.pdf",
+        PdfOptions::new(),
+    );
+    match result {
+        Err(PdfError::ResourceLimit { .. }) => {}
+        other => panic!(
+            "expected Err(PdfError::ResourceLimit), got {other:?} — a Mixed-type page's \
+             resource-limit failure must not be swallowed by the non-fatal-extraction fallback"
+        ),
+    }
 }

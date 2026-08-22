@@ -37,6 +37,7 @@ pub mod extractor;
 pub mod glyph_names;
 pub mod markdown;
 pub mod process_mode;
+mod safe_decompress;
 pub mod structure_tree;
 pub mod tables;
 mod text_quality;
@@ -4207,7 +4208,14 @@ fn process_document(
         }
     };
 
-    // For Mixed PDFs, extraction failure is non-fatal
+    // For Mixed PDFs, extraction failure is non-fatal *except* a resource
+    // limit — that must still fail closed rather than being swallowed into
+    // a silently-successful, partial/empty result the "non-fatal" fallback
+    // was designed for softer failures like garbled text, not a
+    // decompression-bomb guard tripping.
+    if matches!(extracted, Err(PdfError::ResourceLimit { .. })) {
+        return Err(extracted.unwrap_err());
+    }
     let extracted = if pdf_type == PdfType::Mixed {
         extracted.ok()
     } else {
@@ -6307,6 +6315,16 @@ fn compute_layout_complexity_with_chart_regions(
     }
 }
 
+/// Errors returned by this crate's public extraction/classification API.
+///
+/// Most variants indicate the input isn't a usable PDF (`NotAPdf`,
+/// `InvalidStructure`, `Encrypted`) or a lower-level failure while reading
+/// it (`Io`, `Parse`). [`PdfError::ResourceLimit`] is different: the input
+/// is a structurally valid PDF, but a decompressed stream (or a page's
+/// combined content streams) exceeded this crate's bounded-decompression
+/// size limit, guarding against decompression-bomb-style inputs. Callers
+/// that need to distinguish "not a PDF" from "hit a resource limit" should
+/// match on it explicitly rather than treating every `PdfError` the same.
 #[derive(Debug, thiserror::Error)]
 pub enum PdfError {
     #[error("IO error: {0}")]
@@ -6319,6 +6337,21 @@ pub enum PdfError {
     InvalidStructure,
     #[error("Not a PDF: {0}")]
     NotAPdf(String),
+    /// A decompressed stream (or a page's combined content streams)
+    /// exceeded the bounded-decompression size limit — see
+    /// `safe_decompress::MAX_DECOMPRESSED_STREAM_BYTES` /
+    /// `MAX_PAGE_CONTENT_BYTES`. Surfaced instead of silently returning
+    /// partial/truncated content, so a caller can't mistake an
+    /// incomplete result for a successful extraction.
+    #[error(
+        "resource limit exceeded on page {page}, object {object_id:?}: {resource} exceeds {limit_bytes} bytes"
+    )]
+    ResourceLimit {
+        page: u32,
+        object_id: lopdf::ObjectId,
+        resource: String,
+        limit_bytes: usize,
+    },
 }
 
 impl From<lopdf::Error> for PdfError {

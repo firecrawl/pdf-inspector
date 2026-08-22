@@ -1144,11 +1144,7 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
         .get_object(ff_ref)
         .and_then(lopdf::Object::as_stream)
         .ok()?;
-    Some(
-        stream
-            .decompressed_content()
-            .unwrap_or_else(|_| stream.content.clone()),
-    )
+    Some(crate::safe_decompress::decompressed_or_raw(stream))
 }
 
 /// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.

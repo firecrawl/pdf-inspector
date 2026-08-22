@@ -2646,11 +2646,92 @@ fn has_chart_bar_signature(
         || bar_family(|r| r.1, |r| r.3, |r| r.2, |r| r.0)
 }
 
+/// Above this many rects in a cluster, the expensive chart-signature checks
+/// become prohibitively costly on dense forms and checkbox grids. The cap
+/// leaves headroom for large multi-series charts while keeping pathological
+/// clusters well below their observed size.
+const MAX_CHART_CLUSTER_RECTS: usize = 500;
+
 fn is_chart_bar_cluster(
     items: &[TextItem],
     group_rects: &[(f32, f32, f32, f32)],
     page: u32,
 ) -> bool {
+    // has_chart_bar_signature is roughly cubic in cluster size (nested
+    // family/matched-pair scans per anchor rect), so a cluster past the cap
+    // can't run it directly. Rather than assuming "oversized => not a
+    // chart" — which was wrong for genuinely huge multi-series/stacked bar
+    // charts, routing them into expensive table-grid detection as garbage
+    // tables instead of being excluded — evaluate the same signature on a
+    // bucketed sample bounded to (at most) twice the cap. A real bar
+    // chart's repeated structure (spacing, height variation) survives
+    // subsampling; this keeps the worst case bounded at
+    // (2 * MAX_CHART_CLUSTER_RECTS)^3 — a fixed constant, not scaling with
+    // adversarial input size — regardless of how large the cluster is.
+    let sampled_owned: Vec<(f32, f32, f32, f32)>;
+    let group_rects = if group_rects.len() > MAX_CHART_CLUSTER_RECTS {
+        // Rects aren't guaranteed to be stored in spatial order, so a
+        // stride over raw encounter order could land disproportionately
+        // within one region of the chart. Copying and sorting the whole
+        // cluster first would fix that, but reintroduces input-sized
+        // allocation and O(n log n) work — not truly bounded against an
+        // adversarial cluster. Instead, bucket by position in a single
+        // O(n) pass with O(cap) memory (no full-size copy, no sort).
+        //
+        // has_chart_bar_signature checks both orientations — vertical
+        // bars (position axis x) and horizontal bars (position axis y).
+        // Horizontal bars share a common left edge (near-constant x,
+        // varying y), so bucketing by x alone would collapse them all
+        // into one bucket and lose the row signal entirely (and
+        // symmetrically for x-varying vertical bars if bucketed by y
+        // alone). Bucket by both axes, each into half the cap, and use
+        // their union — whichever orientation the cluster actually is
+        // keeps a representative spread along its real position axis.
+        fn bucket_by_axis(
+            rects: &[(f32, f32, f32, f32)],
+            axis: fn(&(f32, f32, f32, f32)) -> f32,
+            n_buckets: usize,
+        ) -> Vec<(f32, f32, f32, f32)> {
+            let (mut min_v, mut max_v) = (f32::INFINITY, f32::NEG_INFINITY);
+            for r in rects {
+                min_v = min_v.min(axis(r));
+                max_v = max_v.max(axis(r));
+            }
+            let span = max_v - min_v;
+            let mut buckets: Vec<Option<(f32, f32, f32, f32)>> = vec![None; n_buckets];
+            for &r in rects {
+                let bucket = if span > 0.0 {
+                    (((axis(&r) - min_v) / span) * (n_buckets - 1) as f32) as usize
+                } else {
+                    0
+                };
+                buckets[bucket.min(n_buckets - 1)].get_or_insert(r);
+            }
+            buckets.into_iter().flatten().collect()
+        }
+
+        // Give each axis the full cap rather than splitting the budget —
+        // halving it under-resolves whichever orientation the cluster
+        // actually is (a multi-series chart can need close to the full
+        // cap's worth of x-buckets just to keep each series distinct),
+        // and the *other* axis' pass contributes nothing useful when that
+        // axis is near-constant (e.g. y for a standard, non-stacked
+        // vertical chart). The union is still a hard, cluster-size-
+        // independent bound — at most 2x MAX_CHART_CLUSTER_RECTS, fixed
+        // regardless of how large the adversarial input is.
+        sampled_owned = bucket_by_axis(group_rects, |r| r.0, MAX_CHART_CLUSTER_RECTS)
+            .into_iter()
+            .chain(bucket_by_axis(
+                group_rects,
+                |r| r.1,
+                MAX_CHART_CLUSTER_RECTS,
+            ))
+            .collect();
+        &sampled_owned
+    } else {
+        group_rects
+    };
+
     let has_bar_signature = has_chart_bar_signature(items, group_rects, page);
 
     // A segmented horizontal chart can share most of its edges across rows.
@@ -5670,6 +5751,168 @@ mod tests {
             table.rows.len() <= 8,
             "table should have at most ~7 rows from group 1, got {}",
             table.rows.len()
+        );
+    }
+
+    /// Builds `n` vertical bars shaped to satisfy every check in
+    /// `bar_family` (spaced apart past the touching-gap threshold, strictly
+    /// increasing heights so no two bars pair up within tolerance, and one
+    /// numeric data-label item per bar) — a genuinely chart-like cluster,
+    /// not just "many rects". Used to prove the oversized-cluster bailout
+    /// test actually exercises the bailout, rather than incidentally
+    /// passing for an unrelated reason (touching rects, degenerate
+    /// geometry, or `numeric_or_empty` vacuously passing on no items).
+    #[allow(clippy::type_complexity)]
+    fn chart_shaped_cluster(n: usize) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+        let bw = 10.0;
+        let mut rects = Vec::with_capacity(n);
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = i as f32 * (bw * 2.0); // gap = bw, well past the bw*0.5 touching threshold
+            let height = 20.0 + i as f32 * 5.0; // strictly increasing: no two bars match within tolerance 3
+            rects.push((x, 0.0, bw, height));
+            items.push(make_item("5", x + 1.0, 5.0, 6.0)); // numeric data label inside the bar
+        }
+        (items, rects)
+    }
+
+    /// Mirrors `chart_shaped_cluster` but for horizontal bars: a common
+    /// left edge (x = 0 for every bar — the shared-x-position signature
+    /// this PR's bucket-sampling fix needs to handle), varying y
+    /// (position axis for horizontal bars), constant height (breadth),
+    /// and increasing width (length).
+    #[allow(clippy::type_complexity)]
+    fn horizontal_chart_shaped_cluster(n: usize) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+        let bh = 10.0;
+        let mut rects = Vec::with_capacity(n);
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            let y = i as f32 * (bh * 2.0); // gap = bh, well past the bh*0.5 touching threshold
+            let width = 20.0 + i as f32 * 5.0; // strictly increasing: no two bars match within tolerance 3
+            rects.push((0.0, y, width, bh));
+            items.push(make_item("5", width / 2.0, y + 1.0, 6.0)); // numeric data label inside the bar
+        }
+        (items, rects)
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_detects_genuine_horizontal_chart_above_max_size() {
+        // Horizontal bars share a common left edge (near-constant x,
+        // varying y) — bucketing the oversized-cluster sample by x alone
+        // would collapse every bar into one bucket and lose the row
+        // signal entirely. Bucketing by both x and y (and using the
+        // union) must still detect this as a chart.
+        let (items, oversized) = horizontal_chart_shaped_cluster(MAX_CHART_CLUSTER_RECTS + 1);
+        assert!(
+            is_chart_bar_cluster(&items, &oversized, 1),
+            "an oversized horizontal bar chart (common left edge) should still be detected as a chart"
+        );
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_detects_genuine_chart_below_cap() {
+        // Sanity check that `chart_shaped_cluster` actually produces a
+        // chart-shaped cluster per `bar_family`'s own rules, at a size well
+        // under MAX_CHART_CLUSTER_RECTS — establishes that the `false`
+        // result in the oversized test below can only come from the size
+        // bailout, not from this shape failing on its own merits.
+        let (items, rects) = chart_shaped_cluster(10);
+        assert!(
+            is_chart_bar_cluster(&items, &rects, 1),
+            "a spaced, varied-height, labeled bar cluster should be chart-like"
+        );
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_detects_genuine_chart_above_max_size_out_of_spatial_order() {
+        // Real rect lists aren't guaranteed to be stored in x-sorted
+        // (spatial) order — `chart_shaped_cluster`'s own output happens to
+        // already be x-sorted, which wouldn't exercise the sampling path
+        // on non-spatially-ordered input. Re-store as two blocks (all
+        // even-indexed bars, then all odd-indexed bars) rather than
+        // left-to-right, simulating two chart series stored
+        // series-by-series. The bucket-by-x-value sampling below depends
+        // only on each rect's own x, not on storage order, so this should
+        // be detected correctly regardless.
+        let (items, sorted_rects) = chart_shaped_cluster(MAX_CHART_CLUSTER_RECTS + 1);
+        let mut oversized: Vec<(f32, f32, f32, f32)> =
+            sorted_rects.iter().step_by(2).copied().collect();
+        oversized.extend(sorted_rects.iter().skip(1).step_by(2).copied());
+
+        assert!(
+            is_chart_bar_cluster(&items, &oversized, 1),
+            "an oversized chart-shaped cluster stored out of spatial order \
+             should still be detected as a chart"
+        );
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_detects_genuine_chart_above_max_size() {
+        // A cluster larger than MAX_CHART_CLUSTER_RECTS can't run the full
+        // (roughly cubic) chart-signature check directly, but a genuinely
+        // chart-shaped oversized cluster (e.g. a large multi-series/stacked
+        // bar chart) must still be recognized as a chart via the bounded
+        // strided sample — not blindly treated as "not a chart" and routed
+        // into table-grid detection as a garbage table. Same chart-shaped
+        // geometry the below-cap sibling test proves succeeds on its own
+        // merits, just past the cap.
+        let (items, oversized) = chart_shaped_cluster(MAX_CHART_CLUSTER_RECTS + 1);
+
+        assert!(
+            is_chart_bar_cluster(&items, &oversized, 1),
+            "an oversized but genuinely chart-shaped cluster should still be detected as a chart"
+        );
+    }
+
+    /// Builds `n` uniform, touching/near-touching rects with constant
+    /// height and no numeric labels — a dense checkbox/form grid, the
+    /// pathological case `MAX_CHART_CLUSTER_RECTS` exists to bound the cost
+    /// of, and genuinely not a chart (no data-driven height variation).
+    #[allow(clippy::type_complexity)]
+    fn dense_uniform_grid_cluster(n: usize) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+        let bw = 10.0;
+        let mut rects = Vec::with_capacity(n);
+        for i in 0..n {
+            rects.push((i as f32 * bw, 0.0, bw, bw)); // touching, uniform height
+        }
+        (Vec::new(), rects)
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_still_bounded_and_correct_on_oversized_dense_grid() {
+        // An oversized dense, uniform grid (no height variation, touching
+        // rects) must still resolve quickly (bounded by the strided sample,
+        // not the full cluster size) and correctly classify as not a chart.
+        let (items, oversized) = dense_uniform_grid_cluster(MAX_CHART_CLUSTER_RECTS * 4);
+
+        assert!(
+            !is_chart_bar_cluster(&items, &oversized, 1),
+            "a dense uniform grid must not be classified as a chart"
+        );
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_sampling_does_not_allocate_input_sized_buffers() {
+        // Review feedback on the sort-based sample: copying and sorting
+        // the whole cluster reintroduces input-sized allocation and
+        // O(n log n) work, defeating the point of bounding cost against an
+        // adversarial cluster size. The bucket-by-x-value approach must
+        // stay correct and complete promptly even at a cluster size far
+        // beyond anything a real chart would have (a few hundred thousand
+        // rects) — there's no strict timing assertion (flaky in CI), but a
+        // single-pass, O(cap)-memory implementation resolves this near
+        // instantly, while an O(n log n) full-copy-and-sort implementation
+        // would still complete but with meaningfully higher allocation.
+        // Uses the dense-grid shape (not chart_shaped_cluster): that
+        // helper's height formula grows without bound as n increases,
+        // which at this scale exceeds bar_family's own height-vs-width
+        // sanity threshold — a property of that test helper's geometry at
+        // an unrealistic size, unrelated to what this test verifies.
+        let n = MAX_CHART_CLUSTER_RECTS * 400;
+        let (items, oversized) = dense_uniform_grid_cluster(n);
+        assert!(
+            !is_chart_bar_cluster(&items, &oversized, 1),
+            "a dense uniform grid must not be classified as a chart, even at {n} rects"
         );
     }
 }

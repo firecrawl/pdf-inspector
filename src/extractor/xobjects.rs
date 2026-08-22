@@ -263,10 +263,7 @@ fn extract_form_xobject_text_inner(
     };
 
     // Decompress the content stream (fall back to raw bytes for uncompressed streams)
-    let content_data = match stream.decompressed_content() {
-        Ok(data) => data,
-        Err(_) => stream.content.clone(),
-    };
+    let content_data = crate::safe_decompress::decompressed_or_raw(stream);
 
     // Decode the content stream. Cap before lopdf materializes the operator
     // vector — the walk budget cannot help if decode itself allocates first.
@@ -311,9 +308,7 @@ fn extract_form_xobject_text_inner(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data = s
-                        .decompressed_content()
-                        .unwrap_or_else(|_| s.content.clone());
+                    let data = crate::safe_decompress::decompressed_or_raw(s);
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                     {
