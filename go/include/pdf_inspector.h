@@ -1,18 +1,50 @@
 /*
  * C ABI for pdf-inspector's Go binding.
  *
- * Every function below returns an owned, NUL-terminated JSON string that
- * the caller MUST release with pdfinspector_free_string. Passing NULL to
- * pdfinspector_free_string is a no-op; passing anything else is undefined
- * behavior, same as free().
+ * Every function below that returns `char *` returns an owned,
+ * NUL-terminated JSON string that the caller MUST release with
+ * pdfinspector_free_string (the one exception -- pdfinspector_free_string
+ * itself returns void). Passing NULL to pdfinspector_free_string is a
+ * no-op; passing anything else is undefined behavior, same as free().
  *
  * Two argument shapes cover every operation:
- *   - (data, len): operations with no options (classify, extract_text).
+ *   - (data, len): operations with no options (classify, extract_text,
+ *     detect_pdf -- three functions, not two; detect_pdf has no options to
+ *     configure, so it takes no params_json either).
  *   - (data, len, params_json): everything else. params_json is a
- *     NUL-terminated UTF-8 JSON string (NULL means "use every default");
+ *     NUL-terminated UTF-8 JSON string; NULL means "use every default" for
+ *     every function EXCEPT pdfinspector_detect_vector_grid_in_region,
+ *     whose three fields are all required (see its doc comment below);
  *     see go/src/params.rs for the accepted shape per function and
  *     go/src/results.rs for the returned envelope shape. Both are also
  *     documented on each function's doc comment in go/src/lib.rs.
+ *
+ * Every envelope has `ok` (bool) and, on failure, `error` (string). On
+ * success, the payload's field name is NOT uniformly `result` -- it
+ * matches whatever that operation conceptually returns:
+ *
+ *   Function                                    | success field(s)
+ *   ---------------------------------------------|----------------------
+ *   pdfinspector_classify                        | result
+ *   pdfinspector_extract_text                     | text
+ *   pdfinspector_process_pdf                      | result
+ *   pdfinspector_detect_pdf                       | result
+ *   pdfinspector_process_pdf_with_ocr             | result
+ *   pdfinspector_extract_pages_markdown           | result
+ *   pdfinspector_extract_text_with_positions      | items
+ *   pdfinspector_extract_structure_elements       | elements
+ *   pdfinspector_extract_text_in_regions          | results
+ *   pdfinspector_extract_tables_in_regions        | results
+ *   pdfinspector_detect_vector_grid_in_region     | found (bool) + result
+ *   pdfinspector_extract_tables_with_structure    | results
+ *   pdfinspector_extract_tables_with_structure_cells | results
+ *   pdfinspector_extract_tables_with_structure_auto  | results
+ *
+ * pdfinspector_detect_vector_grid_in_region is the one function with two
+ * success fields instead of one: `found` (`true`/`false`) disambiguates
+ * "no grid in this region" (`ok:true, found:false, result:null`) from a
+ * hard failure (`ok:false, error:"..."`), which collapsing to a single
+ * `result` field could not.
  *
  * This header is hand-written, not cbindgen-generated: the ABI surface is
  * intentionally small and JSON-payload-based, so there is no C struct
@@ -40,8 +72,9 @@ char *pdfinspector_classify(const unsigned char *data, size_t len);
 char *pdfinspector_extract_text(const unsigned char *data, size_t len);
 
 /* Process a PDF's bytes with full extraction: detect type, extract text,
- * and convert to Markdown. params_json: {"pages": [0, 2]} (0-indexed,
- * NULL/{} for every page). */
+ * and convert to Markdown. params_json: {"pages": [1, 3]} (1-indexed,
+ * matching PdfOptions::pages and Node/Python's process_pdf; NULL/{} for
+ * every page). */
 char *pdfinspector_process_pdf(const unsigned char *data, size_t len,
                                 const char *params_json);
 
@@ -68,7 +101,8 @@ char *pdfinspector_extract_pages_markdown(const unsigned char *data,
                                            const char *params_json);
 
 /* Extract text with position/style information. params_json: {"pages":
- * [0, 2]} (0-indexed, NULL/{} for every page). */
+ * [1, 3]} (1-indexed, matching the TextItem.page field the results carry;
+ * NULL/{} for every page). */
 char *pdfinspector_extract_text_with_positions(const unsigned char *data,
                                                 size_t len,
                                                 const char *params_json);
@@ -95,7 +129,10 @@ char *pdfinspector_extract_tables_in_regions(const unsigned char *data,
 
 /* Detect a vector ruled-line / rectangle grid inside one page region.
  * params_json: {"page_idx": 0, "region_pdf_pt_bbox": [x1,y1,x2,y2],
- * "render_dpi": 200.0}. Returns {"ok":true,"found":bool,"result":...}. */
+ * "render_dpi": 200.0} -- all three fields are REQUIRED (there is no
+ * sensible default for a region bbox or DPI); NULL/{} decodes but then
+ * fails with a "missing field" error, unlike every other params_json
+ * above. Returns {"ok":true,"found":bool,"result":...}. */
 char *pdfinspector_detect_vector_grid_in_region(const unsigned char *data,
                                                  size_t len,
                                                  const char *params_json);

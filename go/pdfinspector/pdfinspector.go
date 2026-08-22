@@ -3,13 +3,15 @@
 // structure recovery, via cgo against the compiled Rust library in go/
 // (see go/src/lib.rs for the C ABI, and go/README.md for how to build it).
 //
-// The surface mirrors the napi (Node.js) and Python bindings' core
-// document-processing API: classify/detect/process a PDF, extract text
-// (plain, positioned, per-page-markdown, or region-scoped), read a tagged
-// PDF's structure tree, and recover table structure from an externally
-// supplied TSR model's output. OCR (pdf-inspector's `vision` feature,
-// exposed as processPdfWithOcr in Node/Python) is intentionally not
-// covered — see "Scope" in go/README.md for why.
+// The surface mirrors the napi (Node.js) and Python bindings' full
+// document-processing API, including selective OCR: classify/detect/process
+// a PDF, extract text (plain, positioned, per-page-markdown, or
+// region-scoped), read a tagged PDF's structure tree, recover table
+// structure from an externally supplied TSR model's output, and run native
+// extraction with selective OCR via [ProcessPdfWithOcr]. PDFium and an ONNX
+// Runtime backend are loaded dynamically at runtime (not linked at build
+// time) and are only required on the host when OCR actually routes a page —
+// see "OCR" in go/README.md for how to make them available.
 //
 // Every function takes the PDF as `[]byte` (no filesystem access inside
 // the binding) and returns a Go error built from the Rust side's error
@@ -238,8 +240,11 @@ const (
 type OcrOptions struct {
 	// Mode defaults to [OcrAuto] when empty.
 	Mode OcrMode `json:"mode,omitempty"`
-	// PageNumbers is 1-indexed; nil processes every page.
-	PageNumbers []uint32 `json:"page_numbers,omitempty"`
+	// PageNumbers is 1-indexed; nil processes every page. No `omitempty`:
+	// see pagesParams.Pages's comment — an explicit non-nil empty slice
+	// must stay distinguishable from nil on the wire (`[]` vs `null`),
+	// which `omitempty` would collapse.
+	PageNumbers []uint32 `json:"page_numbers"`
 	// Password decrypts an encrypted PDF, same as elsewhere in this package.
 	Password string `json:"password,omitempty"`
 	// Dpi is the page rasterization resolution used when a page is routed
@@ -454,7 +459,11 @@ func ExtractText(data []byte) (string, error) {
 
 // ProcessPdf runs full extraction: detect type, extract text, and convert
 // to Markdown. Pass nil for pages to process every page; otherwise pages
-// are 0-indexed.
+// are **1-indexed** (matching Python's `process_pdf(path, pages=[1, 3, 5])`
+// and napi's `processPdf` — this is the one function besides
+// [ExtractTextWithPositions] and [ExtractStructureElements] where this
+// package departs from its usual 0-indexed convention, because it forwards
+// directly to the core crate's 1-indexed `PdfOptions::pages`).
 func ProcessPdf(data []byte, pages []uint32) (*PdfResult, error) {
 	var env pdfResultEnvelope
 	if err := call(data, pagesParams{Pages: pages}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
@@ -544,7 +553,10 @@ func ExtractPagesMarkdown(data []byte, pages []uint32) (*PagesExtractionResult, 
 
 // ExtractTextWithPositions extracts text with position and style
 // information (font, bold/italic/underline/strikeout, bounding box). Pass
-// nil for pages to return every page; otherwise pages are 0-indexed.
+// nil for pages to return every page; otherwise pages are **1-indexed**,
+// matching the [TextItem.Page] field the results carry (confirmed against
+// napi's own tested behavior: `extractTextWithPositions(buf, [1])` returns
+// items with `page === 1`).
 func ExtractTextWithPositions(data []byte, pages []uint32) ([]TextItem, error) {
 	var env textItemsEnvelope
 	if err := call(data, pagesParams{Pages: pages}, &env, func(d *C.uchar, l C.size_t, p *C.char) *C.char {
@@ -705,7 +717,12 @@ func ExtractTablesWithStructureAuto(data []byte, inputs []TsrTableInput) ([]Tabl
 // ---------------------------------------------------------------------------
 
 type pagesParams struct {
-	Pages []uint32 `json:"pages,omitempty"`
+	// No `omitempty`: the Rust side's field is `Option<Vec<u32>>`, so a Go
+	// nil slice marshals to JSON `null` (-> `None`, "every page") while an
+	// explicit non-nil empty slice marshals to `[]` (-> `Some(vec![])`,
+	// "no pages"). `omitempty` would collapse both to "field omitted",
+	// making an intentional empty selection indistinguishable from nil.
+	Pages []uint32 `json:"pages"`
 }
 
 type pageRegionsParams struct {

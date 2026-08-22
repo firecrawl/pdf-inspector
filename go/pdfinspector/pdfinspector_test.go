@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode"
 )
 
 func fixture(t *testing.T, name string) []byte {
@@ -112,6 +113,137 @@ func TestProcessPdf_WithPages(t *testing.T) {
 	}
 }
 
+// TestProcessPdf_PagesAre1Indexed cross-checks against ExtractPagesMarkdown
+// (definitively 0-indexed — see TestExtractPagesMarkdown_AllPages) to prove
+// ProcessPdf's "pages" parameter is 1-indexed, rather than just checking
+// that *some* filtering happened (which self-consistency checks alone
+// wouldn't catch an off-by-one on).
+func TestProcessPdf_PagesAre1Indexed(t *testing.T) {
+	data := textFixture(t) // thermo-freon12.pdf, 3 pages
+	perPage, err := ExtractPagesMarkdown(data, nil)
+	if err != nil {
+		t.Fatalf("ExtractPagesMarkdown: %v", err)
+	}
+	if len(perPage.Pages) < 3 {
+		t.Fatalf("fixture has %d pages, want >= 3 for this test", len(perPage.Pages))
+	}
+	firstPageSignature := distinctiveSubstring(t, perPage.Pages[0].Markdown)
+	thirdPageSignature := distinctiveSubstring(t, perPage.Pages[2].Markdown)
+
+	full, err := ProcessPdf(data, nil)
+	if err != nil {
+		t.Fatalf("ProcessPdf(nil): %v", err)
+	}
+	viaPage1, err := ProcessPdf(data, []uint32{1})
+	if err != nil {
+		t.Fatalf("ProcessPdf(pages=[1]): %v", err)
+	}
+	viaPage3, err := ProcessPdf(data, []uint32{3})
+	if err != nil {
+		t.Fatalf("ProcessPdf(pages=[3]): %v", err)
+	}
+
+	fullMd, md1, md3 := markdownOrEmpty(full), markdownOrEmpty(viaPage1), markdownOrEmpty(viaPage3)
+
+	// Positive: filtering to page 1/3 actually returns that specific
+	// page's content (proves 1-indexing, not just "some" content).
+	if !strings.Contains(md1, firstPageSignature) {
+		t.Errorf("ProcessPdf(pages=[1]) markdown does not contain page-0's (0-indexed) distinctive text %q — pages may not be 1-indexed", firstPageSignature)
+	}
+	if !strings.Contains(md3, thirdPageSignature) {
+		t.Errorf("ProcessPdf(pages=[3]) markdown does not contain page-2's (0-indexed) distinctive text %q — pages may not be 1-indexed", thirdPageSignature)
+	}
+
+	// Structural, fixture-content-agnostic: a single selected page must
+	// produce meaningfully less markdown than the whole 3-page document,
+	// proving the filter actually restricted output rather than the
+	// parameter being silently ignored. Deliberately not "page1 doesn't
+	// contain page3's word" — a real word repeating across pages (common
+	// in technical documents reusing the same jargon) would make that
+	// kind of check fail spuriously despite correct indexing.
+	if len(md1) >= len(fullMd) {
+		t.Errorf("ProcessPdf(pages=[1]) markdown length %d, want less than the full document's %d — the page filter may not be restricting output", len(md1), len(fullMd))
+	}
+	if len(md3) >= len(fullMd) {
+		t.Errorf("ProcessPdf(pages=[3]) markdown length %d, want less than the full document's %d — the page filter may not be restricting output", len(md3), len(fullMd))
+	}
+}
+
+// TestProcessPdf_EmptyPagesSliceSelectsNoPages guards against the
+// `omitempty` bug class: an explicit non-nil empty []uint32{} must be
+// distinguishable on the wire from nil (which selects every page), or the
+// two collapse to the same "field omitted" JSON and a caller can never
+// request "no pages".
+func TestProcessPdf_EmptyPagesSliceSelectsNoPages(t *testing.T) {
+	data := textFixture(t)
+	all, err := ProcessPdf(data, nil)
+	if err != nil {
+		t.Fatalf("ProcessPdf(nil): %v", err)
+	}
+	none, err := ProcessPdf(data, []uint32{})
+	if err != nil {
+		t.Fatalf("ProcessPdf([]uint32{}): %v", err)
+	}
+
+	allLen, noneLen := len(markdownOrEmpty(all)), len(markdownOrEmpty(none))
+	if noneLen >= allLen {
+		t.Errorf("ProcessPdf with an explicit empty pages slice produced markdown of length %d, want much less than the all-pages length %d — nil vs. empty-slice may have collapsed to the same thing", noneLen, allLen)
+	}
+}
+
+func markdownOrEmpty(r *PdfResult) string {
+	if r.Markdown == nil {
+		return ""
+	}
+	return *r.Markdown
+}
+
+// distinctiveSubstring picks the longest all-alphabetic word (>=8 letters)
+// on the page to use as a fingerprint for "this content came from this
+// specific page" in cross-checks between differently-indexed APIs. A
+// single word survives markdown re-rendering differences (heading-tier
+// classification depends on font-size statistics computed over whatever
+// page subset is in scope, so e.g. "### Foo" vs "**Foo**" for the same
+// text is expected and not a bug) in a way a multi-word phrase — which a
+// once-off trial of this test caught failing on, deep inside a large
+// numeric table subject to continuation-row-merging nuances — does not.
+func distinctiveSubstring(t *testing.T, markdown string) string {
+	t.Helper()
+	// Prefer a long word (less likely to coincidentally appear on every
+	// page of a technical document), but fall back to progressively
+	// shorter minimums rather than failing outright — an unrelated
+	// fixture or extraction change shouldn't be able to dead-end this
+	// helper just because the longest available word happens to be short.
+	for _, minLen := range []int{8, 6, 4} {
+		if word := longestAlphabeticWord(markdown, minLen); word != "" {
+			return word
+		}
+	}
+	t.Fatalf("could not find any alphabetic word (>=4 letters) in page markdown: %q", markdown)
+	return ""
+}
+
+func longestAlphabeticWord(markdown string, minLen int) string {
+	best := ""
+	for _, field := range strings.Fields(markdown) {
+		word := strings.Trim(field, "*#|_-.,:;()[]{}")
+		if len(word) < minLen {
+			continue
+		}
+		alphabetic := true
+		for _, r := range word {
+			if !unicode.IsLetter(r) {
+				alphabetic = false
+				break
+			}
+		}
+		if alphabetic && len(word) > len(best) {
+			best = word
+		}
+	}
+	return best
+}
+
 func TestProcessPdf_InvalidInput_ReturnsError(t *testing.T) {
 	if _, err := ProcessPdf([]byte("not a pdf"), nil); err == nil {
 		t.Fatal("ProcessPdf on non-PDF bytes: want error, got nil")
@@ -178,6 +310,37 @@ func TestExtractTextWithPositions_AllPages(t *testing.T) {
 	}
 	if items[0].ItemType == "" {
 		t.Error("first item has empty ItemType")
+	}
+}
+
+// TestExtractTextWithPositions_PagesAre1Indexed proves the "pages" filter
+// shares TextItem.Page's indexing space, rather than just checking the
+// self-consistent-but-not-necessarily-correct fact that returned items
+// happen to report the same page number passed in (which a filter that
+// silently no-ops, or one with a consistent off-by-one, could both satisfy
+// too — see TestExtractTextWithPositions_PageFilter for that weaker check).
+func TestExtractTextWithPositions_PagesAre1Indexed(t *testing.T) {
+	data := textFixture(t)
+	all, err := ExtractTextWithPositions(data, nil)
+	if err != nil {
+		t.Fatalf("ExtractTextWithPositions(nil): %v", err)
+	}
+	var wantPage1 int
+	for _, item := range all {
+		if item.Page == 1 {
+			wantPage1++
+		}
+	}
+	if wantPage1 == 0 {
+		t.Fatal("no unfiltered items report Page == 1; fixture assumption invalid")
+	}
+
+	filtered, err := ExtractTextWithPositions(data, []uint32{1})
+	if err != nil {
+		t.Fatalf("ExtractTextWithPositions(pages=[1]): %v", err)
+	}
+	if len(filtered) != wantPage1 {
+		t.Errorf("ExtractTextWithPositions(pages=[1]) returned %d items, want %d (the count of unfiltered items with Page == 1) — the filter's indexing may not match TextItem.Page's", len(filtered), wantPage1)
 	}
 }
 
@@ -481,6 +644,54 @@ func TestProcessPdfWithOcr_EncryptedDocument_CorrectPassword_Decrypts(t *testing
 	}
 	if strings.TrimSpace(result.Markdown) == "" {
 		t.Error("Markdown is empty after decrypting with the correct password")
+	}
+}
+
+// TestProcessPdfWithOcr_AutoMode_ScannedFixture exercises the real OCR
+// runtime path (PDFium rendering + ONNX Runtime inference), unlike every
+// other ProcessPdfWithOcr test in this file, which uses Mode: OcrOff (or
+// Auto on a clean text PDF that routes zero pages) specifically to avoid
+// needing PDFium/ONNX Runtime present. Skips itself unless both are
+// provisioned (PDFIUM_LIB_PATH / ORT_DYLIB_PATH set) — a plain local
+// `go test` will skip it, but `.github/workflows/ci.yml`'s `go` job
+// provisions both and runs it for real on both its Ubuntu and macOS
+// runners (with a dedicated cache-warming step first, since nothing else
+// pre-warms PDF_INSPECTOR_MODEL_CACHE in that job the way ocr-runtime's
+// CLI-based step does). That makes Go's real OCR coverage broader than
+// the rest of the project's: ocr-runtime is Ubuntu-only and is still the
+// only place the Rust CLI's, Node's, and Python's own OCR runtime paths
+// get tested at all.
+func TestProcessPdfWithOcr_AutoMode_ScannedFixture(t *testing.T) {
+	if os.Getenv("PDFIUM_LIB_PATH") == "" || os.Getenv("ORT_DYLIB_PATH") == "" {
+		t.Skip("PDFIUM_LIB_PATH/ORT_DYLIB_PATH not set; see ci.yml's ocr-runtime job")
+	}
+
+	// Offline is deliberately not set: unlike ocr-runtime's Node/Python
+	// steps, nothing pre-warms PDF_INSPECTOR_MODEL_CACHE for the `go` job
+	// specifically, so this needs to tolerate a cold cache by downloading
+	// the model over the network on first use. A warm cache (e.g. when
+	// this same test runs inside ocr-runtime, which does pre-warm it via
+	// the CLI) still short-circuits the download, so this works either way.
+	data := fixture(t, "scan_with_native_header_text.pdf")
+	result, err := ProcessPdfWithOcr(data, &OcrOptions{Mode: OcrAuto})
+	if err != nil {
+		t.Fatalf("ProcessPdfWithOcr: %v", err)
+	}
+	if got := result.PagesRoutedToOCR; len(got) != 1 || got[0] != 1 {
+		t.Errorf("PagesRoutedToOCR = %v, want [1]", got)
+	}
+	if len(result.PagesRecommendingHosted) != 0 {
+		t.Errorf("PagesRecommendingHosted = %v, want empty", result.PagesRecommendingHosted)
+	}
+	if len(result.Pages) == 0 {
+		t.Fatal("Pages is empty")
+	}
+	source := result.Pages[0].Provenance.Source
+	if source != SourceOCR && source != SourceFused {
+		t.Errorf("Pages[0].Provenance.Source = %q, want %q or %q", source, SourceOCR, SourceFused)
+	}
+	if strings.TrimSpace(result.Markdown) == "" {
+		t.Error("Markdown is empty")
 	}
 }
 

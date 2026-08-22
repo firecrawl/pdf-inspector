@@ -6,11 +6,28 @@
 
 use serde::Deserialize;
 
-/// Shared by every ABI call that supports an optional 0-indexed page
-/// filter (`process_pdf`, `extract_pages_markdown`,
-/// `extract_text_with_positions`, `extract_structure_elements`). Absent or
-/// `null` means "every page, in document order" — matching the core
-/// crate's own `Option<&[u32]>` convention.
+/// Shared by every ABI call that supports an optional page filter
+/// (`process_pdf`, `extract_pages_markdown`, `extract_text_with_positions`,
+/// `extract_structure_elements`). Absent or `null` means "every page, in
+/// document order".
+///
+/// Indexing is **not** uniform across these four callers — each function
+/// forwards the value straight to its own core API with no conversion, so
+/// each one's indexing matches whichever core function it calls, not a
+/// convention chosen by this ABI:
+/// - `extract_pages_markdown`, `extract_text_in_regions`/`extract_tables_in_regions`'s
+///   page fields: 0-indexed (`extract_pages_markdown_mem`'s own convention).
+/// - `process_pdf`: 1-indexed (`PdfOptions::pages`'s convention, matching
+///   Python's `process_pdf(path, pages=[1, 3, 5])` and napi's `processPdf`).
+/// - `extract_text_with_positions`: 1-indexed, matching the 1-indexed
+///   `TextItem.page` field the results carry (matches napi's tested
+///   behavior: `extractTextWithPositions(buf, [1])` returns items with
+///   `page === 1`).
+/// - `extract_structure_elements`: 1-indexed, matching `TextItem.page` for
+///   the same reason (see `extract_structure_elements_mem`'s own doc).
+///
+/// See each function's doc comment in `lib.rs` (and the Go-side function
+/// doc comments in `pdfinspector.go`) for the specific convention.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub(crate) struct PagesParams {

@@ -1,7 +1,8 @@
 # Convenience targets for the Go binding. Prefer `make native` over typing
 # out the cargo invocation — kept here (rather than only in the README) so
-# `go generate` (see pdfinspector/gen.go) has one canonical fallback command
-# to point users at when no prebuilt native library is available for their
+# `go generate` (the //go:generate directive in pdfinspector.go, which runs
+# pdfinspector/internal/fetchnative) has one canonical fallback command to
+# point users at when no prebuilt native library is available for their
 # platform.
 
 .PHONY: native fmt lint test clean

@@ -175,8 +175,9 @@ pub unsafe extern "C" fn pdfinspector_extract_text(data: *const u8, len: usize) 
 // ---------------------------------------------------------------------------
 
 /// Process a PDF's bytes with full extraction: detect type, extract text,
-/// and convert to Markdown. `params_json`: `{"pages": [0, 2]}` (0-indexed,
-/// omit or pass `{}`/null for every page).
+/// and convert to Markdown. `params_json`: `{"pages": [1, 3]}`
+/// (**1-indexed**, matching `PdfOptions::pages` and Node/Python's
+/// `process_pdf`/`processPdf`; omit or pass `{}`/null for every page).
 ///
 /// # Safety
 /// `data` must point to a valid, readable buffer of at least `len` bytes
@@ -292,7 +293,9 @@ pub unsafe extern "C" fn pdfinspector_extract_pages_markdown(
 }
 
 /// Extract text with position/style information. `params_json`: `{"pages":
-/// [0, 2]}` (0-indexed, omit for every page).
+/// [1, 3]}` (**1-indexed**, matching the `TextItem.page` field the results
+/// carry and napi's tested `extractTextWithPositions` behavior; omit for
+/// every page).
 ///
 /// # Safety
 /// `data` must point to a valid, readable buffer of at least `len` bytes
