@@ -3958,7 +3958,7 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 /// at the cross-reference table — a single corrupted byte in the offset is
 /// enough. lopdf trusts that pointer outright and fails to load rather than
 /// searching for the real table, unlike pypdf/pdfium which both recover by
-/// locating it directly. This finds the real (classic, non-stream) `xref`
+/// locating it directly. This finds a recoverable (classic, non-stream) `xref`
 /// table by scanning for the keyword — validating that a plausible
 /// subsection header follows, not just any standalone "xref" token, since
 /// this crate processes untrusted input and a coincidental match inside
@@ -3970,11 +3970,17 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 /// transparently supersedes the broken one without needing to touch
 /// anything already in the file.
 ///
+/// Linearized PDFs commonly have two classic tables: the early table carries
+/// `/Root` and `/Prev`, while the final table contains only the remaining
+/// object entries. Preferring the newest table whose own trailer has `/Root`
+/// prevents the repair from selecting the rootless final table and reporting
+/// a zero-page document.
+///
 /// Doesn't cover cross-reference *streams* (`N 0 obj << /Type /XRef ...`,
 /// used by some PDF 1.5+ writers instead of a classic table) — recovering
 /// those needs the containing object's number, not just a byte offset.
 fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
-    let xref_pos = find_last_valid_xref_table_start(buf)?;
+    let xref_pos = find_recoverable_xref_table_start(buf)?;
 
     let mut repaired = Vec::with_capacity(buf.len() + 32);
     repaired.extend_from_slice(buf);
@@ -3985,34 +3991,324 @@ fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
     Some(repaired)
 }
 
+/// Returns classic xref starts from newest to oldest, filtered by the same
+/// subsection validation as the original single-table scan.
+fn valid_xref_table_starts(buf: &[u8]) -> Vec<usize> {
+    const KEYWORD: &[u8] = b"xref";
+    let mut starts = Vec::new();
+    if buf.len() < KEYWORD.len() {
+        return starts;
+    }
+    let mut pos = buf.len().saturating_sub(KEYWORD.len());
+
+    loop {
+        if &buf[pos..pos + KEYWORD.len()] == KEYWORD
+            && (pos == 0 || buf[pos - 1].is_ascii_whitespace())
+            && buf
+                .get(pos + KEYWORD.len())
+                .is_none_or(u8::is_ascii_whitespace)
+            && looks_like_xref_subsection_header(buf, pos + KEYWORD.len())
+        {
+            starts.push(pos);
+        }
+        if pos == 0 {
+            return starts;
+        }
+        pos -= 1;
+    }
+}
+
+/// Prefer a root-bearing table that a reader can reach without losing newer
+/// object revisions. An amended file normally puts `/Root` in an older trailer
+/// and reaches it from the newest trailer through `/Prev`; in that case the
+/// newest table must remain the repair target. A linearized file instead has a
+/// root-bearing first table and a rootless final table without such a `/Prev`
+/// chain, so the first table is the useful target.
+fn find_recoverable_xref_table_start(buf: &[u8]) -> Option<usize> {
+    let starts = valid_xref_table_starts(buf);
+    let mut newest = None;
+    let mut newest_has_prev = false;
+    let mut next_newer_table_pos = buf.len();
+
+    for pos in starts {
+        let search_end = next_newer_table_pos;
+        if newest.is_none() {
+            newest = Some(pos);
+            newest_has_prev = xref_trailer_prev_points_backwards(buf, pos, search_end);
+        } else if xref_trailer_has_key_before(buf, pos, search_end, b"Root") {
+            return if newest_has_prev { newest } else { Some(pos) };
+        }
+        next_newer_table_pos = pos;
+    }
+    newest
+}
+
+/// Checks the trailer immediately following a classic xref table for a root
+/// reference. Dictionary parsing ignores comments, strings, and nested
+/// dictionaries, where `/Root` is not a top-level trailer key.
+#[cfg(test)]
+fn xref_trailer_has_root(buf: &[u8], xref_pos: usize) -> bool {
+    xref_trailer_has_key_before(buf, xref_pos, buf.len(), b"Root")
+}
+
+fn xref_trailer_has_key_before(buf: &[u8], xref_pos: usize, search_end: usize, key: &[u8]) -> bool {
+    xref_trailer_top_level_token_before(buf, xref_pos, search_end, key).is_some()
+}
+
+fn xref_trailer_prev_points_backwards(buf: &[u8], xref_pos: usize, search_end: usize) -> bool {
+    xref_trailer_top_level_token_before(buf, xref_pos, search_end, b"Prev")
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|offset| offset < u64::try_from(xref_pos).unwrap_or(u64::MAX))
+}
+
+fn xref_trailer_top_level_token_before<'a>(
+    buf: &'a [u8],
+    xref_pos: usize,
+    search_end: usize,
+    key: &[u8],
+) -> Option<&'a [u8]> {
+    let trailer_pos = find_standalone_keyword(buf, xref_pos, search_end, b"trailer")?;
+
+    let mut pos = trailer_pos + b"trailer".len();
+    if pos >= search_end {
+        return None;
+    }
+    skip_pdf_whitespace_and_comments(buf, &mut pos, search_end);
+
+    pdf_dictionary_top_level_value_token(buf, pos, search_end, key)
+}
+
+fn skip_pdf_whitespace_and_comments(buf: &[u8], pos: &mut usize, end: usize) {
+    while *pos < end {
+        match buf[*pos] {
+            byte if byte.is_ascii_whitespace() => *pos += 1,
+            b'%' => {
+                while *pos < end && !matches!(buf[*pos], b'\n' | b'\r') {
+                    *pos += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+fn is_pdf_regular(byte: u8) -> bool {
+    !byte.is_ascii_whitespace()
+        && !matches!(
+            byte,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
+}
+
+fn pdf_dictionary_top_level_value_token<'a>(
+    buf: &'a [u8],
+    mut pos: usize,
+    end: usize,
+    key: &[u8],
+) -> Option<&'a [u8]> {
+    if !buf[pos..end].starts_with(b"<<") {
+        return None;
+    }
+    pos += 2;
+
+    loop {
+        skip_pdf_whitespace_and_comments(buf, &mut pos, end);
+        if pos >= end || buf[pos..end].starts_with(b">>") {
+            return None;
+        }
+        if buf.get(pos) != Some(&b'/') {
+            return None;
+        }
+        pos += 1;
+        let name_start = pos;
+        while pos < end && is_pdf_regular(buf[pos]) {
+            pos += 1;
+        }
+        if &buf[name_start..pos] == key {
+            skip_pdf_whitespace_and_comments(buf, &mut pos, end);
+            if pos >= end || !is_pdf_regular(buf[pos]) {
+                return None;
+            }
+            let value_start = pos;
+            while pos < end && is_pdf_regular(buf[pos]) {
+                pos += 1;
+            }
+            return Some(&buf[value_start..pos]);
+        }
+
+        skip_pdf_whitespace_and_comments(buf, &mut pos, end);
+        if pos >= end || buf[pos..end].starts_with(b">>") {
+            return None;
+        }
+        if !skip_pdf_dictionary_value(buf, &mut pos, end, 0) {
+            return None;
+        }
+    }
+}
+
+fn skip_pdf_dictionary_value(buf: &[u8], pos: &mut usize, end: usize, depth: usize) -> bool {
+    skip_pdf_whitespace_and_comments(buf, pos, end);
+    match buf.get(*pos) {
+        Some(b'(' | b'<' | b'[' | b'/') => skip_pdf_object(buf, pos, end, depth),
+        _ => {
+            let mut saw_token = false;
+            loop {
+                skip_pdf_whitespace_and_comments(buf, pos, end);
+                match buf.get(*pos) {
+                    Some(byte) if is_pdf_regular(*byte) => {
+                        saw_token = true;
+                        while *pos < end && is_pdf_regular(buf[*pos]) {
+                            *pos += 1;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            saw_token
+        }
+    }
+}
+
+fn skip_pdf_object(buf: &[u8], pos: &mut usize, end: usize, depth: usize) -> bool {
+    const MAX_NESTING_DEPTH: usize = 64;
+    if depth > MAX_NESTING_DEPTH {
+        return false;
+    }
+
+    skip_pdf_whitespace_and_comments(buf, pos, end);
+    match buf.get(*pos) {
+        None => false,
+        Some(b'(') => {
+            *pos += 1;
+            let mut parentheses = 0usize;
+            while *pos < end {
+                match buf[*pos] {
+                    b'\\' => *pos = (*pos + 2).min(end),
+                    b'(' => {
+                        parentheses += 1;
+                        *pos += 1;
+                    }
+                    b')' => {
+                        if parentheses == 0 {
+                            *pos += 1;
+                            return true;
+                        }
+                        parentheses -= 1;
+                        *pos += 1;
+                    }
+                    _ => *pos += 1,
+                }
+            }
+            false
+        }
+        Some(b'<') if buf.get(*pos + 1) == Some(&b'<') => {
+            *pos += 2;
+            loop {
+                skip_pdf_whitespace_and_comments(buf, pos, end);
+                if *pos >= end {
+                    return false;
+                }
+                if buf[*pos..end].starts_with(b">>") {
+                    *pos += 2;
+                    return true;
+                }
+                if buf.get(*pos) != Some(&b'/') {
+                    return false;
+                }
+                *pos += 1;
+                while *pos < end && is_pdf_regular(buf[*pos]) {
+                    *pos += 1;
+                }
+                skip_pdf_whitespace_and_comments(buf, pos, end);
+                if *pos >= end || buf[*pos..end].starts_with(b">>") {
+                    return false;
+                }
+                if !skip_pdf_dictionary_value(buf, pos, end, depth + 1) {
+                    return false;
+                }
+            }
+        }
+        Some(b'<') => {
+            *pos += 1;
+            while *pos < end && buf[*pos] != b'>' {
+                *pos += 1;
+            }
+            if *pos < end {
+                *pos += 1;
+                true
+            } else {
+                false
+            }
+        }
+        Some(b'[') => {
+            *pos += 1;
+            loop {
+                skip_pdf_whitespace_and_comments(buf, pos, end);
+                if *pos >= end {
+                    return false;
+                }
+                if buf[*pos] == b']' {
+                    *pos += 1;
+                    return true;
+                }
+                if !skip_pdf_object(buf, pos, end, depth + 1) {
+                    return false;
+                }
+            }
+        }
+        Some(b'/') => {
+            *pos += 1;
+            while *pos < end && is_pdf_regular(buf[*pos]) {
+                *pos += 1;
+            }
+            true
+        }
+        Some(byte) if is_pdf_regular(*byte) => {
+            while *pos < end && is_pdf_regular(buf[*pos]) {
+                *pos += 1;
+            }
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+fn find_standalone_keyword(buf: &[u8], start: usize, end: usize, keyword: &[u8]) -> Option<usize> {
+    let end = end.min(buf.len());
+    if start >= end {
+        return None;
+    }
+
+    let mut pos = start;
+    while pos < end {
+        skip_pdf_whitespace_and_comments(buf, &mut pos, end);
+        if pos >= end {
+            break;
+        }
+
+        let before_ok = pos == start || buf[pos - 1].is_ascii_whitespace();
+        let after_ok = buf
+            .get(pos + keyword.len())
+            .is_none_or(u8::is_ascii_whitespace);
+        if before_ok && after_ok && buf[pos..end].starts_with(keyword) {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+
+    None
+}
+
 /// Finds the last standalone `xref` token in `buf` that is immediately
 /// followed by a plausible classic cross-reference subsection header
 /// (`<start-id> <count>`, e.g. "0 6") — the shape every real classic xref
 /// table starts with. A single reverse byte scan: O(n) even on a
 /// pathological buffer with many non-matching or non-standalone "xref"
 /// occurrences, unlike repeatedly re-searching a shrinking prefix.
+#[cfg(test)]
 fn find_last_valid_xref_table_start(buf: &[u8]) -> Option<usize> {
-    const KEYWORD: &[u8] = b"xref";
-    if buf.len() < KEYWORD.len() {
-        return None;
-    }
-    let mut pos = buf.len() - KEYWORD.len();
-    loop {
-        if &buf[pos..pos + KEYWORD.len()] == KEYWORD {
-            let before_ok = pos == 0 || buf[pos - 1].is_ascii_whitespace();
-            let after_ok = buf
-                .get(pos + KEYWORD.len())
-                .is_none_or(|c| c.is_ascii_whitespace());
-            if before_ok && after_ok && looks_like_xref_subsection_header(buf, pos + KEYWORD.len())
-            {
-                return Some(pos);
-            }
-        }
-        if pos == 0 {
-            return None;
-        }
-        pos -= 1;
-    }
+    valid_xref_table_starts(buf).into_iter().next()
 }
 
 /// Checks that `buf[pos..]` starts (after whitespace) with two
@@ -7669,6 +7965,72 @@ mod tests {
         // accepted as a real subsection header.
         let buf = b"xref\n0 6garbage\n%%EOF";
         assert_eq!(find_last_valid_xref_table_start(buf), None);
+    }
+
+    #[test]
+    fn find_xref_scan_does_not_panic_on_input_shorter_than_keyword() {
+        for buf in [b"".as_slice(), b"x", b"xr", b"xr@", b"xref"] {
+            valid_xref_table_starts(buf);
+        }
+    }
+
+    #[test]
+    fn trailer_root_detection_ignores_comments_and_nested_entries() {
+        let comment = b"xref\n0 1\n0000000000 65535 f \ntrailer\n%% /Root 9 0 R\n<< /Size 1 >>\nstartxref\n0\n%%EOF";
+        assert!(!xref_trailer_has_root(comment, 0));
+
+        let nested = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Metadata << /Root 9 0 R >> >>\nstartxref\n0\n%%EOF";
+        assert!(!xref_trailer_has_root(nested, 0));
+    }
+
+    #[test]
+    fn trailer_keyword_detection_skips_comments_before_trailer() {
+        let buf = b"xref\n0 1\n0000000000 65535 f \n%% trailer placeholder\ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n0\n%%EOF";
+
+        assert!(xref_trailer_has_root(buf, 0));
+    }
+
+    #[test]
+    fn standalone_keyword_requires_leading_token_boundary() {
+        let buf = b"xtrailer\n";
+        assert_eq!(
+            find_standalone_keyword(buf, 0, buf.len(), b"trailer"),
+            None,
+            "a keyword embedded in a larger token must not match"
+        );
+    }
+
+    #[test]
+    fn recover_prefers_newest_rootless_xref_when_prev_forms_chain() {
+        let older = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
+        let mut amended = older.to_vec();
+        amended.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 2 /Prev 0 >>\nstartxref\n0\n%%EOF"
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(
+            find_recoverable_xref_table_start(&amended),
+            Some(older.len()),
+            "a rootless amended trailer with /Prev must keep its newest revisions reachable"
+        );
+    }
+
+    #[test]
+    fn recover_rejects_rootless_xref_whose_prev_points_forward() {
+        let older = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
+        let mut malformed = older.to_vec();
+        malformed.extend_from_slice(
+            b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 2 /Prev 999999 >>\nstartxref\n0\n%%EOF",
+        );
+
+        assert_eq!(
+            find_recoverable_xref_table_start(&malformed),
+            Some(0),
+            "a forward /Prev value is not a chain to the older root-bearing table"
+        );
     }
 
     #[test]

@@ -4415,6 +4415,86 @@ fn test_process_pdf_recovers_corrupted_startxref_pointer() {
     );
 }
 
+fn make_padded_linearized_pdf() -> Vec<u8> {
+    fn first_xref(main_xref_offset: usize, offsets: &[usize; 7]) -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        out.extend_from_slice(b"6 0 obj\n<< /Linearized 1 /N 1 /O 1 /T 9999 >>\nendobj\n");
+        out.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for offset in &offsets[1..] {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 7 /Root 1 0 R /Prev {main_xref_offset:010} >>\n\
+                 startxref\n0\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    let mut offsets = [0usize; 7];
+    offsets[6] = b"%PDF-1.4\n".len();
+    let prefix_len = first_xref(0, &offsets).len();
+
+    let content = b"BT /F1 12 Tf 72 720 Td (Hello World) Tj ET";
+    let bodies = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            String::from_utf8_lossy(content)
+        )
+        .into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+
+    let mut body = Vec::new();
+    for (index, object_body) in bodies.iter().enumerate() {
+        offsets[index + 1] = prefix_len + body.len();
+        body.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        body.extend_from_slice(object_body);
+        body.extend_from_slice(b"\nendobj\n");
+    }
+
+    let main_xref_offset = prefix_len + body.len();
+    let mut pdf = first_xref(main_xref_offset, &offsets);
+    let first_xref_offset =
+        b"%PDF-1.4\n".len() + b"6 0 obj\n<< /Linearized 1 /N 1 /O 1 /T 9999 >>\nendobj\n".len();
+    debug_assert_eq!(pdf.len(), prefix_len);
+    pdf.extend_from_slice(&body);
+
+    pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for offset in &offsets[1..=5] {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 6 >>\nstartxref\n{first_xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    pdf.extend(std::iter::repeat_n(0u8, 600));
+    pdf
+}
+
+#[test]
+fn test_process_pdf_repairs_padded_linearized_xref_chain() {
+    let buf = make_padded_linearized_pdf();
+    let result = process_pdf_mem(&buf)
+        .expect("a padded linearized PDF should recover through its root-bearing xref");
+
+    assert_eq!(result.page_count, 1, "the root-bearing xref was not used");
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("Hello World")),
+        "the recovered page should retain its text, got {:?}",
+        result.markdown
+    );
+}
+
 /// Regression for #227: `extract_pages_markdown`'s per-page `needs_ocr`
 /// must agree with `classify_pdf`/`detect_pdf_type` on the same page. The
 /// fixture is a full-page raster "scan" with a single line of genuine
