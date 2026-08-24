@@ -2001,6 +2001,56 @@ fn test_extract_pages_mem_shifted_cipher_tounicode_needs_ocr() {
 }
 
 #[test]
+fn test_extract_pages_mem_reports_content_operation_limit() {
+    let mut content = Vec::with_capacity(4_200_002);
+    for _ in 0..2_100_000 {
+        content.extend_from_slice(b"q\n");
+    }
+    content.extend_from_slice(b"BT /F1 12 Tf 72 720 Td (Hello CAD) Tj ET\n");
+    let buf = make_text_pdf(
+        std::str::from_utf8(&content).expect("test content is ASCII"),
+        "0 0 612 792",
+    );
+
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(result.pages.len(), 1);
+    assert!(result.pages[0].needs_ocr);
+    assert!(result.pages[0].markdown.is_empty());
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        result.pages[0].ocr_reason.as_deref(),
+        Some(pdf_inspector::OCR_REASON_CONTENT_OPERATION_LIMIT)
+    );
+}
+
+#[test]
+fn test_process_pdf_mem_reports_operation_limit_without_encoding_issue() {
+    let mut content = Vec::with_capacity(4_200_002);
+    for _ in 0..2_100_000 {
+        content.extend_from_slice(b"q\n");
+    }
+    content.extend_from_slice(b"BT /F1 12 Tf 72 720 Td (Hello CAD) Tj ET\n");
+    let buf = make_text_pdf(
+        std::str::from_utf8(&content).expect("test content is ASCII"),
+        "0 0 612 792",
+    );
+
+    let result = process_pdf_mem(&buf).unwrap();
+
+    assert_eq!(result.page_count, 1);
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+    assert!(!result.has_encoding_issues);
+    assert_eq!(
+        result
+            .ocr_reasons_by_page
+            .iter()
+            .flat_map(|reason| reason.reasons.iter().cloned())
+            .collect::<Vec<_>>(),
+        vec![pdf_inspector::OCR_REASON_CONTENT_OPERATION_LIMIT.to_string()]
+    );
+}
+
+#[test]
 fn test_extract_regions_mem_multiple_regions_per_page() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
     let regions = extract_text_in_regions_mem(

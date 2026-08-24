@@ -1148,7 +1148,7 @@ mod tests {
         let (doc, page_id) = page_invoking_form(doc, root);
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
@@ -1178,7 +1178,7 @@ mod tests {
         let font_cmaps = FontCMaps::from_doc(&doc);
         // Root + leaf = 2 invocations on the first pass.
         let mut budget = FormWalkBudget::with_limits(2, MAX_FORM_XOBJECT_OPERATIONS);
-        let ((first, _, _), _, _, _) = extract_page_text_items(
+        let ((first, _, _), _, _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
@@ -1191,7 +1191,7 @@ mod tests {
         assert_eq!(first.iter().filter(|item| item.text == "X").count(), 1);
         assert!(!budget.was_truncated());
 
-        let ((second, _, _), _, _, _) = extract_page_text_items(
+        let ((second, _, _), _, _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
@@ -1261,7 +1261,7 @@ mod tests {
     fn form_items(form_content: &[u8]) -> Vec<TextItem> {
         let (doc, page_id) = doc_with_form_content(form_content);
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,

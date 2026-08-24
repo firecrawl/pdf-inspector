@@ -119,6 +119,13 @@ pub const OCR_REASON_NO_TEXT: &str = "no_text";
 /// rather than real text operators, so it cannot be extracted as characters.
 pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
 
+/// OCR reason: the page exceeded the bounded content-stream operator budget.
+///
+/// Extraction is skipped rather than decoding an unbounded operation vector.
+/// The reason is reported separately from `no_text` so callers can distinguish
+/// a safety limit from a genuinely empty page.
+pub const OCR_REASON_CONTENT_OPERATION_LIMIT: &str = "content_operation_limit";
+
 // =========================================================================
 // Result type
 // =========================================================================
@@ -516,7 +523,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, operation_limit_pages) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -621,6 +628,13 @@ fn extract_pages_markdown_mem_impl(
 
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
+        if operation_limit_pages.contains(&page_1idx) {
+            add_ocr_reason(
+                &mut ocr_reasons_by_page,
+                page_1idx,
+                OCR_REASON_CONTENT_OPERATION_LIMIT,
+            );
+        }
 
         // A page can extract cleanly (no decoding issues, non-empty text)
         // while still being fundamentally a scan: a full-page raster with
@@ -1062,7 +1076,7 @@ pub fn extract_text_in_regions_mem(
         // with the invisible-layer retry below so one page cannot consume two
         // full expansion budgets.
         let mut form_budget = extractor::FormWalkBudget::new();
-        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible) =
+        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible, _) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -1091,7 +1105,7 @@ pub fn extract_text_in_regions_mem(
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
         });
         if skipped_invisible && !has_visible_text {
-            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
+            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _, _)) =
                 extractor::content_stream::extract_page_text_items(
                     &doc,
                     page_id,
@@ -1274,7 +1288,7 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible) =
+        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible, _) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -1586,7 +1600,7 @@ pub fn detect_vector_grid_in_region_mem(
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
     let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible) =
+    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible, _) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -1781,7 +1795,7 @@ mod vector_grid_tests {
         let &page_id = pages.get(&1).unwrap();
         let needed: HashSet<u32> = HashSet::from([1]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible, _) =
             extract_page_text_items(
                 &doc,
                 page_id,
@@ -1825,7 +1839,7 @@ mod vector_grid_tests {
         let &page_id = pages.get(&page_num).unwrap();
         let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible, _) =
             extract_page_text_items(
                 &doc,
                 page_id,
@@ -2563,7 +2577,7 @@ pub fn extract_tables_with_structure_cells_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
+        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible, _) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -3366,7 +3380,7 @@ fn detect_tsr_quality_issue(
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
+    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible, _) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -4173,7 +4187,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4241,8 +4255,26 @@ fn process_document(
         text_quality_pages,
         text_quality_reasons_by_page,
     ) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
+        Some((
+            (items, rects, lines),
+            page_thresholds,
+            gid_encoded_pages,
+            operation_limit_pages,
+        )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
+            for page in operation_limit_pages {
+                if options
+                    .page_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.contains(&page))
+                {
+                    add_ocr_reason(
+                        &mut ocr_reasons_by_page,
+                        page,
+                        OCR_REASON_CONTENT_OPERATION_LIMIT,
+                    );
+                }
+            }
 
             // For TextBased PDFs with pages flagged for OCR (Identity-H or
             // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
@@ -4366,8 +4398,11 @@ fn process_document(
                 ))
             };
 
-            let enc = !ocr_reasons_by_page.is_empty()
-                || text_quality.has_encoding_issues
+            let enc = ocr_reasons_by_page.values().any(|reasons| {
+                reasons
+                    .iter()
+                    .any(|reason| reason != OCR_REASON_CONTENT_OPERATION_LIMIT)
+            }) || text_quality.has_encoding_issues
                 || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
             (
                 md,
@@ -4439,6 +4474,22 @@ fn process_document(
         }
         pages_needing_ocr.sort_unstable();
     }
+    let operation_limit_pages: Vec<_> = text_quality_reasons_by_page
+        .iter()
+        .filter(|(_, reasons)| {
+            reasons
+                .iter()
+                .any(|reason| reason == OCR_REASON_CONTENT_OPERATION_LIMIT)
+        })
+        .map(|(page, _)| *page)
+        .collect();
+    for page in operation_limit_pages {
+        if !pages_needing_ocr.contains(&page) {
+            pages_needing_ocr.push(page);
+        }
+    }
+    pages_needing_ocr.sort_unstable();
+    pages_needing_ocr.dedup();
 
     // Detect sparse extraction: when a TEXT-BASED PDF produces very few
     // characters per page, the text is likely embedded in images/forms
@@ -4478,8 +4529,9 @@ fn process_document(
         processing_time_ms: start.elapsed_ms(),
         pages_needing_ocr,
         ocr_reasons_by_page: {
-            // Detector reasons (scanned / no_text / vector_text / garbled) merged
-            // with the markdown-stage garbled detection, deduped per page.
+            // Detector reasons (scanned / no_text / vector_text / garbled)
+            // merged with extraction-stage operation-limit and garbled reasons,
+            // deduped per page.
             let mut merged = detection_ocr_reasons;
             merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
             page_ocr_reasons_vec(merged)

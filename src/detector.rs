@@ -62,6 +62,7 @@ pub struct PdfTypeResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Per-page explanation for `pages_needing_ocr`: 1-indexed page → reason
     /// codes (`scanned`, `no_text`, `vector_text`, `suspected_garbled_text`).
+    /// The extraction stage can additionally report `content_operation_limit`.
     /// Only contains pages that need OCR.
     pub ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>>,
 }

@@ -9,8 +9,12 @@ use crate::PdfError;
 use lopdf::content::Content;
 
 /// Maximum content-stream operators decoded for a page or a single Form
-/// XObject. Matches the previous post-decode skip threshold.
-pub(crate) const MAX_PAGE_OPERATIONS: usize = 1_000_000;
+/// XObject.
+///
+/// Dense but valid CAD/Revit pages have been observed with up to 1.31 million
+/// operators. Two million retains a hard allocation ceiling for pathological
+/// streams while leaving headroom for that document family.
+pub(crate) const MAX_PAGE_OPERATIONS: usize = 2_000_000;
 
 /// Decode `data` unless it contains more than `max_operations` operators.
 ///
@@ -28,7 +32,7 @@ pub(crate) fn decode_content_bounded(
         .map_err(|e| PdfError::Parse(e.to_string()))
 }
 
-fn content_exceeds_operation_limit(data: &[u8], max_operations: usize) -> bool {
+pub(crate) fn content_exceeds_operation_limit(data: &[u8], max_operations: usize) -> bool {
     count_content_operators(data, max_operations.saturating_add(1)) > max_operations
 }
 

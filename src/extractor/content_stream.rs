@@ -137,7 +137,8 @@ fn rise_adjusted(tm: &[f32; 6], rise: f32) -> [f32; 6] {
     ]
 }
 
-/// Returns `(page_extraction, has_gid_fonts, coords_rotated, skipped_invisible)`
+/// Returns `(page_extraction, has_gid_fonts, coords_rotated, skipped_invisible,
+/// skipped_operation_limit)`
 /// where `has_gid_fonts` indicates the page uses fonts with unresolvable
 /// gid-encoded glyphs and `skipped_invisible` reports that invisible (Tr 3)
 /// text was present but suppressed — callers can use it to decide whether an
@@ -150,7 +151,30 @@ pub(crate) fn extract_page_text_items(
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
-) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
+) -> Result<(PageExtraction, bool, bool, bool, bool), PdfError> {
+    extract_page_text_items_with_operation_limit(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        include_invisible,
+        style_cache,
+        form_budget,
+        super::content_decode::MAX_PAGE_OPERATIONS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extract_page_text_items_with_operation_limit(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
+    max_operations: usize,
+) -> Result<(PageExtraction, bool, bool, bool, bool), PdfError> {
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
@@ -260,20 +284,24 @@ pub(crate) fn extract_page_text_items(
     // Content::decode parser, causing it to skip operators like ET and Q.
     let content_data = strip_pdf_comments(&content_data);
 
-    let content = match super::content_decode::decode_content_bounded(
-        &content_data,
-        super::content_decode::MAX_PAGE_OPERATIONS,
-    )? {
-        Some(content) => content,
-        None => {
-            log::warn!(
-                "page {}: skipping extraction — content stream exceeds {} operations",
-                page_num,
-                super::content_decode::MAX_PAGE_OPERATIONS
-            );
-            return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
-        }
-    };
+    let content =
+        match super::content_decode::decode_content_bounded(&content_data, max_operations)? {
+            Some(content) => content,
+            None => {
+                log::warn!(
+                    "page {}: skipping extraction — content stream exceeds {} operations",
+                    page_num,
+                    max_operations
+                );
+                return Ok((
+                    (Vec::new(), Vec::new(), Vec::new()),
+                    false,
+                    false,
+                    false,
+                    true,
+                ));
+            }
+        };
 
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
@@ -1451,6 +1479,7 @@ pub(crate) fn extract_page_text_items(
         has_gid_fonts,
         coords_rotated,
         skipped_invisible,
+        false,
     ))
 }
 
@@ -1649,7 +1678,7 @@ mod tests {
 
         let (doc, page_id) = simple_doc_with_content(content);
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
@@ -1657,6 +1686,28 @@ mod tests {
             false,
             &mut FontStyleCache::new(),
             &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        items
+    }
+
+    fn extract_simple_items_with_operation_limit(
+        content: &[u8],
+        max_operations: usize,
+    ) -> Vec<TextItem> {
+        use crate::tounicode::FontCMaps;
+
+        let (doc, page_id) = simple_doc_with_content(content);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _, _) = extract_page_text_items_with_operation_limit(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+            max_operations,
         )
         .unwrap();
         items
@@ -1852,8 +1903,8 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
 
         let mut doc = lopdf::Document::new();
 
-        // "0 0 m\n" = 6 bytes per op, 1_100_000 ops → ~6.6 MB content stream
-        let ops_bytes = "0 0 m\n".repeat(1_100_000).into_bytes();
+        // "0 0 m\n" = 6 bytes per op; stay above the current CAD-capable bound.
+        let ops_bytes = "0 0 m\n".repeat(2_100_000).into_bytes();
         let stream = Stream::new(dictionary! {}, ops_bytes);
         let content_id = doc.add_object(Object::Stream(stream));
 
@@ -1889,7 +1940,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             &mut FormWalkBudget::new(),
         )
         .unwrap();
-        let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible) = result;
+        let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible, _) = result;
         assert!(items.is_empty());
         assert!(rects.is_empty());
         assert!(lines.is_empty());
@@ -1970,7 +2021,7 @@ BT 30 700 Tm <41> Tj ET";
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
@@ -2195,5 +2246,38 @@ end"#;
             items.is_empty(),
             "pages over the operator cap must not be decoded"
         );
+    }
+
+    #[test]
+    fn reported_cad_operation_count_preserves_text() {
+        // #307: real CAD pages were observed at 1.07M and 1.31M operators.
+        // Check the reported size against the production cap without asking
+        // the regression test to allocate and walk a 1.1M-operation vector.
+        let mut content = Vec::with_capacity(1_100_002);
+        for _ in 0..1_100_000 {
+            content.extend_from_slice(b"q\n");
+        }
+        content.extend_from_slice(b"BT /F1 12 Tf 72 720 Td (Hello CAD) Tj ET\n");
+        assert!(
+            !super::super::content_decode::content_exceeds_operation_limit(
+                &content,
+                super::super::content_decode::MAX_PAGE_OPERATIONS,
+            )
+        );
+
+        // Drive the same extraction path with a small cap: text below the cap
+        // survives, while the cap itself still fail-closes above it.
+        let mut small = b"BT /F1 12 Tf 72 720 Td (Hello CAD) Tj ET\n".to_vec();
+        small.extend_from_slice(&b"q\n".repeat(10));
+        let items = extract_simple_items_with_operation_limit(&small, 20);
+        let text = items
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<String>();
+        assert_eq!(text, "Hello CAD");
+
+        let mut over_limit = small.clone();
+        over_limit.extend_from_slice(&b"q\n".repeat(20));
+        assert!(extract_simple_items_with_operation_limit(&over_limit, 20).is_empty());
     }
 }
