@@ -851,7 +851,7 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
         && run_chars().any(is_spaceless_cjk);
     let all_caps = run_chars().all(|c| c.is_uppercase() || is_cjk_char(c) || !c.is_alphabetic());
     if !(spaceless_cjk || all_caps) {
-        return None;
+        return title_case_tracked_floor(group, start, end, &gaps, fs);
     }
 
     if gaps.len() >= MIN_GAPS {
@@ -874,20 +874,72 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
 
     // Word gaps, if present, form a second mode above the letter-gap
     // cluster: split at the largest relative jump. Unimodal → one word.
+    let floor = largest_relative_gap_jump(&sorted, 1.4).unwrap_or(f32::INFINITY);
+    Some((end, floor * fs))
+}
+
+/// Find the midpoint between the two sorted gap classes with the largest
+/// relative jump, if that jump clears `minimum_jump`.
+fn largest_relative_gap_jump(sorted: &[f32], minimum_jump: f32) -> Option<f32> {
     let mut best_jump = 1.0f32;
-    let mut floor = f32::INFINITY;
+    let mut floor = None;
     for pair in sorted.windows(2) {
         let (lo, hi) = (pair[0].max(0.01), pair[1].max(0.01));
         let jump = hi / lo;
         if jump > best_jump {
             best_jump = jump;
-            floor = (lo + hi) / 2.0;
+            floor = Some((lo + hi) / 2.0);
         }
     }
-    if best_jump < 1.4 {
-        floor = f32::INFINITY;
+    (best_jump >= minimum_jump).then_some(floor?)
+}
+
+/// Recover mixed-case, multi-word tracking from a clearly bimodal gap series.
+///
+/// Unlike all-caps display type, a uniformly spaced lowercase sequence is a
+/// legitimate way to list variables. A wide gap by itself is therefore not
+/// enough. Require the larger gaps to split the glyph run into at least two
+/// title-case words of three or more letters; the resulting shape (`John` +
+/// `Doe`) is much more specific than an intentionally spaced variable list.
+fn title_case_tracked_floor(
+    group: &[&TextItem],
+    start: usize,
+    end: usize,
+    gaps: &[f32],
+    font_size: f32,
+) -> Option<(usize, f32)> {
+    let mut positive: Vec<f32> = gaps.iter().copied().filter(|gap| *gap > 0.08).collect();
+    positive.sort_by(|a, b| a.total_cmp(b));
+    if positive.len() < 4 {
+        return None;
     }
-    Some((end, floor * fs))
+
+    let floor = largest_relative_gap_jump(&positive, 1.75)?;
+    if positive.last().is_some_and(|last| *last - floor < 0.08) {
+        return None;
+    }
+
+    let mut word_chars = Vec::new();
+    let mut current_chars = Vec::new();
+    for (index, item) in group[start..=end].iter().enumerate() {
+        let character = item.text.trim().chars().next()?;
+        current_chars.push(character);
+        if index < gaps.len() && gaps[index] > floor {
+            word_chars.push(std::mem::take(&mut current_chars));
+        }
+    }
+    word_chars.push(current_chars);
+
+    let title_word = |chars: &[char]| {
+        chars.len() >= 3
+            && chars.iter().all(|c| c.is_alphabetic())
+            && chars.first().is_some_and(|c| c.is_uppercase())
+            && chars[1..].iter().all(|c| c.is_lowercase())
+    };
+    if word_chars.len() < 2 || !word_chars.iter().all(|chars| title_word(chars)) {
+        return None;
+    }
+    Some((end, floor * font_size))
 }
 
 /// Fractional font-size band within which `merge_text_items` treats two runs as
@@ -1352,6 +1404,47 @@ mod tests {
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "IT IS OK");
+    }
+
+    #[test]
+    fn tracked_title_case_run_keeps_word_gaps() {
+        // Resume-style mixed-case tracking has the same two-gap modes as the
+        // all-caps case above, but only the title-case word shape is strong
+        // enough to override the deliberately conservative lowercase rule.
+        let mut items = glyph_run("JohnDoe", 100.0, 9.0, 2.2);
+        for item in items.iter_mut().skip(4) {
+            item.x += 2.8;
+        }
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "John Doe");
+    }
+
+    #[test]
+    fn tracked_title_case_run_recovers_narrow_letter_gaps() {
+        // Uppercase junctions split at 0.08 em even when lowercase junctions
+        // remain below their 0.13-em threshold. The bimodal word gap must
+        // still recover the title-case words.
+        let mut items = glyph_run("JohnDoe", 100.0, 9.0, 1.1);
+        for item in items.iter_mut().skip(4) {
+            item.x += 2.1;
+        }
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "John Doe");
+    }
+
+    #[test]
+    fn lowercase_bimodal_spaced_singles_keep_boundaries() {
+        // A bimodal gap alone is not sufficient for lowercase: this is still
+        // indistinguishable from an intentionally spaced variable sequence.
+        let mut items = glyph_run("abcdef", 100.0, 6.0, 2.2);
+        for item in items.iter_mut().skip(3) {
+            item.x += 2.8;
+        }
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "a b c d e f");
     }
 
     #[test]
