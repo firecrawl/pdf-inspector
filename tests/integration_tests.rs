@@ -4448,3 +4448,51 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         page.markdown
     );
 }
+
+/// Regression for #428: `extract_pages_markdown`'s per-page `needs_ocr`
+/// must also agree with `classify_pdf`/`detect_pdf_type` when the
+/// undecodable-font signal — not an image — is what makes the detector
+/// distrust the page. The fixture draws all page text through a Form XObject
+/// using a custom-encoded Type3 font with no ToUnicode map: the visible
+/// glyph programs render ordinary business text, while a native extractor
+/// that trusts the Encoding names reads a Caesar-shifted string. That output
+/// is clean ASCII with plausible word shapes, so the text-quality heuristics
+/// (cipher statistics, CID garbage, encoding issues) all pass on this short
+/// sample, while detection's font-resource check correctly flags the page as
+/// `suspected_garbled_text`. The extraction API must apply the same font
+/// signal instead of returning the wrong native text as trusted Markdown.
+#[test]
+fn test_extract_pages_markdown_agrees_with_classify_on_type3_custom_encoding() {
+    let buf = std::fs::read("tests/fixtures/type3_custom_encoding_no_tounicode.pdf").unwrap();
+
+    let cls = pdf_inspector::detector::detect_pdf_type_mem(&buf).expect("fixture should classify");
+    assert!(
+        cls.pages_needing_ocr.contains(&1),
+        "classify_pdf should flag page 1 as needing OCR (Type3 without ToUnicode), got: {:?}",
+        cls.pages_needing_ocr
+    );
+
+    let ext = extract_pages_markdown_mem(&buf, None).expect("fixture should extract");
+    let page = &ext.pages[0];
+    assert!(
+        page.needs_ocr,
+        "extract_pages_markdown must agree with classify_pdf that this page needs OCR"
+    );
+    assert!(
+        ext.pages_needing_ocr.contains(&1),
+        "the document-level OCR page list must include the flagged page, got: {:?}",
+        ext.pages_needing_ocr
+    );
+    assert_eq!(
+        page.ocr_reason.as_deref(),
+        Some(pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT),
+        "the detector-confirmed garble signal must be reported, got: {:?}",
+        page.ocr_reason
+    );
+    assert!(
+        page.markdown.is_empty(),
+        "a page flagged needs_ocr must not return the Type3 Encoding-name text \
+         as if extraction were trustworthy, got: {:?}",
+        page.markdown
+    );
+}

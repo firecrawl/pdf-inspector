@@ -634,12 +634,18 @@ fn extract_pages_markdown_mem_impl(
         // embedded-font body text elsewhere would otherwise still extract
         // non-empty, non-garbled markdown and miss OCR routing entirely.
         // detect_from_document's Mixed-type per-page routing always sends
-        // these pages to OCR; mirror that here too. Both signals share one
-        // analyze_page_content pass — see page_ocr_signals's doc comment.
-        let (has_template_image, has_vector_text) = lopdf_pages
+        // these pages to OCR; mirror that here too. Finally, a custom Type3
+        // Encoding can map every byte to a plausible ASCII letter while the
+        // glyph programs render entirely different text, so the markdown
+        // passes every text-quality heuristic — mirror detection's
+        // font-resource gate (Identity-H/Type3 without ToUnicode, its
+        // Phase-3 `suspected_garbled_text` signal) here too. See #428.
+        // All signals share one analyze_page_content pass — see
+        // page_ocr_signals's doc comment.
+        let (has_template_image, has_undecodable_fonts, has_vector_text) = lopdf_pages
             .get(&page_1idx)
             .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, false));
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -672,6 +678,13 @@ fn extract_pages_markdown_mem_impl(
         let has_decoding_issue = has_text_quality_issue
             || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
         if has_decoding_issue {
+            add_ocr_reason(
+                &mut ocr_reasons_by_page,
+                page_1idx,
+                OCR_REASON_SUSPECTED_GARBLED_TEXT,
+            );
+        }
+        if has_undecodable_fonts {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,
                 page_1idx,
