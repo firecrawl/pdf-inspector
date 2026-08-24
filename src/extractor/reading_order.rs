@@ -440,6 +440,7 @@ mod tests {
             width,
             height: 11.0,
             font: "F1".into(),
+            font_tag: String::new(),
             font_size: 11.0,
             page: 1,
             is_bold: false,

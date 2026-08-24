@@ -444,6 +444,14 @@ pub struct PagesExtractionResult {
     pub is_complex: bool,
 }
 
+pub(crate) struct InternalPagesExtraction {
+    pub(crate) result: PagesExtractionResult,
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) page_count: u32,
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) supplemental_ocr_regions: BTreeMap<u32, Vec<PdfRect>>,
+}
+
 /// Extract formatted markdown for pages of a PDF, with layout
 /// classification metadata.
 ///
@@ -474,7 +482,7 @@ pub fn extract_pages_markdown_mem(
         false,
         false,
     )
-    .map(|(result, _)| result)
+    .map(|extraction| extraction.result)
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -483,7 +491,7 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
-) -> Result<(PagesExtractionResult, u32), PdfError> {
+) -> Result<InternalPagesExtraction, PdfError> {
     extract_pages_markdown_mem_impl(
         buffer,
         pages,
@@ -501,7 +509,7 @@ fn extract_pages_markdown_mem_impl(
     markdown_options: &MarkdownOptions,
     strip_repeated_headers_footers: bool,
     preserve_ocr_candidates: bool,
-) -> Result<(PagesExtractionResult, u32), PdfError> {
+) -> Result<InternalPagesExtraction, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
@@ -565,6 +573,8 @@ fn extract_pages_markdown_mem_impl(
     let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
 
     for &page_0idx in pages_slice {
@@ -598,6 +608,23 @@ fn extract_pages_markdown_mem_impl(
             .filter(|r| r.page == page_1idx)
             .cloned()
             .collect();
+
+        let page_lines: Vec<types::PdfLine> = all_lines
+            .iter()
+            .filter(|l| l.page == page_1idx)
+            .cloned()
+            .collect();
+
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        {
+            let image_regions: Vec<PdfRect> = page_items
+                .iter()
+                .filter_map(supplemental_ocr_image_region)
+                .collect();
+            if !image_regions.is_empty() {
+                supplemental_ocr_regions.insert(page_1idx, image_regions);
+            }
+        }
 
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
@@ -636,7 +663,7 @@ fn extract_pages_markdown_mem_impl(
                 page_items,
                 options,
                 &page_rects,
-                &[],
+                &page_lines,
                 markdown::MarkdownDocumentContext {
                     page_thresholds: &page_thresholds,
                     struct_roles: None,
@@ -693,8 +720,8 @@ fn extract_pages_markdown_mem_impl(
         });
     }
 
-    Ok((
-        PagesExtractionResult {
+    Ok(InternalPagesExtraction {
+        result: PagesExtractionResult {
             pages: results,
             pages_with_tables: complexity.pages_with_tables,
             pages_with_columns: complexity.pages_with_columns,
@@ -702,8 +729,44 @@ fn extract_pages_markdown_mem_impl(
             ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
             is_complex: complexity.is_complex,
         },
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         page_count,
-    ))
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        supplemental_ocr_regions,
+    })
+}
+
+/// Image regions large enough to plausibly contain rasterized document
+/// structure such as a table. Logos, icons, and decorative rules remain below
+/// these physical-size gates. OCR still has to produce a valid table inside
+/// the region before any text is fused into a clean native page.
+#[cfg(any(test, all(feature = "ocr", not(target_arch = "wasm32"))))]
+fn supplemental_ocr_image_region(item: &TextItem) -> Option<PdfRect> {
+    const MIN_WIDTH_PT: f32 = 108.0;
+    const MIN_HEIGHT_PT: f32 = 72.0;
+    const MIN_AREA_PT2: f32 = 20_000.0;
+
+    if !matches!(item.item_type, types::ItemType::Image)
+        || !item.x.is_finite()
+        || !item.y.is_finite()
+        || !item.width.is_finite()
+        || !item.height.is_finite()
+    {
+        return None;
+    }
+    let x = item.x.min(item.x + item.width);
+    let y = item.y.min(item.y + item.height);
+    let width = item.width.abs();
+    let height = item.height.abs();
+    (width >= MIN_WIDTH_PT && height >= MIN_HEIGHT_PT && width * height >= MIN_AREA_PT2).then_some(
+        PdfRect {
+            x,
+            y,
+            width,
+            height,
+            page: item.page,
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -771,6 +834,7 @@ mod ocr_header_footer_tests {
             width: 120.0,
             height: 10.0,
             font: "Test".to_string(),
+            font_tag: String::new(),
             font_size: 10.0,
             page,
             is_bold: false,
@@ -5321,6 +5385,7 @@ mod text_cluster_column_undercount_tests {
             width: text.len() as f32 * 5.0,
             height: 10.0,
             font: "F".into(),
+            font_tag: String::new(),
             font_size: 10.0,
             page: 1,
             is_bold: false,
@@ -5597,6 +5662,7 @@ mod table_candidate_selection_tests {
             width: 50.0,
             height: 10.0,
             font: "F1".to_string(),
+            font_tag: String::new(),
             font_size: 10.0,
             page: 1,
             is_bold: false,
@@ -6427,6 +6493,7 @@ mod tests {
             width,
             height,
             font: "Helvetica".to_string(),
+            font_tag: String::new(),
             font_size: height,
             page: 1,
             is_bold: false,
@@ -6450,6 +6517,36 @@ mod tests {
             font: font.to_string(),
             ..test_text_item_on_page(page, text)
         }
+    }
+
+    fn test_image_item(width: f32, height: f32) -> TextItem {
+        TextItem {
+            item_type: ItemType::Image,
+            ..test_item("[Image]", 20.0, 30.0, width, height)
+        }
+    }
+
+    #[test]
+    fn supplemental_ocr_regions_require_substantial_physical_images() {
+        let substantial = supplemental_ocr_image_region(&test_image_item(200.0, 120.0)).unwrap();
+        assert_eq!(substantial.width, 200.0);
+        assert_eq!(substantial.height, 120.0);
+
+        assert!(supplemental_ocr_image_region(&test_image_item(100.0, 200.0)).is_none());
+        assert!(supplemental_ocr_image_region(&test_image_item(200.0, 60.0)).is_none());
+        assert!(supplemental_ocr_image_region(&test_image_item(120.0, 100.0)).is_none());
+        assert!(
+            supplemental_ocr_image_region(&test_item("text", 0.0, 0.0, 300.0, 300.0)).is_none()
+        );
+    }
+
+    #[test]
+    fn supplemental_ocr_regions_normalize_negative_image_dimensions() {
+        let region = supplemental_ocr_image_region(&test_image_item(-200.0, -120.0)).unwrap();
+        assert_eq!(region.x, -180.0);
+        assert_eq!(region.y, -90.0);
+        assert_eq!(region.width, 200.0);
+        assert_eq!(region.height, 120.0);
     }
 
     #[test]

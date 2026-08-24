@@ -123,9 +123,7 @@ fn align_positions_to_columns(cell_xs: &[f32], columns: &[f32]) -> Vec<usize> {
     let mut dp = vec![vec![f32::INFINITY; columns.len() + 1]; cell_xs.len() + 1];
     let mut take = vec![vec![false; columns.len() + 1]; cell_xs.len() + 1];
 
-    for value in &mut dp[0] {
-        *value = 0.0;
-    }
+    dp[0].fill(0.0);
 
     for i in 1..=cell_xs.len() {
         for j in 1..=columns.len() {
@@ -463,17 +461,31 @@ pub fn detect_tables_from_struct_tree(
                     matched_cells += 1;
                 }
 
-                // Sort by Y (descending = top-to-bottom) then X
-                cell_items.sort_by(|a, b| {
-                    b.1.y
-                        .partial_cmp(&a.1.y)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(
-                            a.1.x
-                                .partial_cmp(&b.1.x)
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
-                });
+                // Sort by Y (descending = top-to-bottom) then X in reading
+                // direction: ascending, or right-to-left in baseline bands
+                // for RTL cells (embedded LTR phrases keep screen order).
+                // Direction comes from strong RTL letters only — a digit-only
+                // cell split across items must not have its number reversed.
+                let rtl = crate::text_utils::is_rtl_text(cell_items.iter().map(|(_, i)| &i.text));
+                if rtl {
+                    crate::text_utils::sort_rtl_cell_items(
+                        &mut cell_items,
+                        |(_, i)| i.x,
+                        |(_, i)| i.y,
+                        |(_, i)| i.text.as_str(),
+                    );
+                } else {
+                    cell_items.sort_by(|a, b| {
+                        b.1.y
+                            .partial_cmp(&a.1.y)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(
+                                a.1.x
+                                    .partial_cmp(&b.1.x)
+                                    .unwrap_or(std::cmp::Ordering::Equal),
+                            )
+                    });
+                }
 
                 let text: String = cell_items
                     .iter()
@@ -582,6 +594,7 @@ mod tests {
             width: text.len() as f32 * 5.0,
             height: 10.0,
             font: "Test".to_string(),
+            font_tag: String::new(),
             font_size: 10.0,
             page,
             is_bold: false,

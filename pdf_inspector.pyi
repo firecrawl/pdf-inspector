@@ -97,6 +97,7 @@ class TextItem:
     width: float
     height: float
     font: str
+    font_tag: str
     font_size: float
     page: int
     is_bold: bool

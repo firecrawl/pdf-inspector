@@ -106,8 +106,21 @@ pub struct TextItem {
     pub width: f32,
     /// Height (approximated from font size)
     pub height: f32,
-    /// Font name
+    /// Font name: the `/BaseFont` family name ("ABCDEF+CMMI10"), which
+    /// identifies the actual face (see `extractor::fonts::item_font_name`
+    /// for the CID carve-out).
     pub font: String,
+    /// The raw font resource tag ("F2", "T22") the item's show operator
+    /// selected. This is exactly what `font` carried before 1.16.0, with
+    /// the same caveats: the tag's namespace is the enclosing page or Form
+    /// XObject's `/Resources` (the same tag on another page may name a
+    /// different face), and an item merged from multiple runs keeps the
+    /// first run's tag. Within one page it distinguishes font *programs*
+    /// that share a family name (two subsets of the same face keep
+    /// distinct tags), which family-keyed `font` cannot. Empty for items
+    /// that don't originate from a content-stream show operator (images,
+    /// links, form fields, OCR).
+    pub font_tag: String,
     /// Font size
     pub font_size: f32,
     /// Page number (1-indexed)
@@ -340,6 +353,7 @@ mod formatting_tests {
             width,
             height: 12.0,
             font: "F1".to_string(),
+            font_tag: String::new(),
             font_size: 12.0,
             page: 1,
             is_bold: false,

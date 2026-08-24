@@ -549,6 +549,23 @@ pub fn detect_tables_from_rects(
         page_rects.push((x, y, w, h));
     }
 
+    // Some generators repeat a page-sized clipping/fill rectangle for nearly
+    // every content operation. When those duplicates overwhelmingly dominate
+    // the drawing geometry, they manufacture full-page X/Y edges and make
+    // every synthetic grid cell appear covered. Remove only that strong
+    // duplicate-background shape; a minority of page fills can coexist with
+    // genuine cell geometry and must remain available to the detectors.
+    let normalized_rects =
+        without_page_backgrounds(&page_rects, PageBackgroundRemoval::Overwhelming);
+    if normalized_rects.len() < page_rects.len() {
+        debug!(
+            "page {}: removed {} overwhelming page-background rects",
+            page,
+            page_rects.len() - normalized_rects.len()
+        );
+        page_rects = normalized_rects;
+    }
+
     // Remove rects that are much wider than typical cell rects — these are
     // page-spanning clipping paths or row-spanning background fills that
     // would add spurious X-edges and corrupt the grid.  We use the median
@@ -680,7 +697,8 @@ pub fn detect_tables_from_rects(
                 // re-cluster the remaining geometry, and evaluate valid table
                 // candidates as a competing hypothesis before the chart
                 // rejection wins.
-                let normalized = without_dominant_page_backgrounds(&group_rects);
+                let normalized =
+                    without_page_backgrounds(&group_rects, PageBackgroundRemoval::Repeated);
                 let normalized_table = (normalized.len() < group_rects.len())
                     .then(|| {
                         cluster_rects(&normalized, 3.0, 6)
@@ -829,13 +847,15 @@ pub fn detect_tables_from_rects(
         // (row stripes don't overlap so each is its own cluster of 1),
         // try all page rects directly as a row-stripe table.
         // Require ≥15 rects and ≥10 result rows to avoid decorative fill false positives.
-        if tables.is_empty() && clusters.is_empty() && page_rects.len() >= 15 {
-            if let Some(table) = detect_row_stripe_table(items, &page_rects, page) {
+        let row_stripe_rects =
+            without_page_backgrounds(&page_rects, PageBackgroundRemoval::Repeated);
+        if tables.is_empty() && clusters.is_empty() && row_stripe_rects.len() >= 15 {
+            if let Some(table) = detect_row_stripe_table(items, &row_stripe_rects, page) {
                 if table.rows.len() >= 10 {
                     debug!(
                         "page {}: row-stripe fallback succeeded ({} rects, {} rows)",
                         page,
-                        page_rects.len(),
+                        row_stripe_rects.len(),
                         table.rows.len()
                     );
                     tables.push(table);
@@ -1710,21 +1730,37 @@ pub(crate) fn assign_items_to_grid(
         }
     }
 
-    // Build cell strings: sort items within each cell by Y descending then X ascending
+    // Build cell strings: sort items within each cell by Y descending then X
+    // in reading direction (ascending, or descending for RTL cells — same
+    // direction-awareness as the heuristic detector's cell join)
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(num_rows);
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(num_cols);
         for col_items in row_items.iter_mut() {
-            col_items.sort_by(|a, b| {
-                b.1.y
-                    .partial_cmp(&a.1.y)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| {
-                        a.1.x
-                            .partial_cmp(&b.1.x)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-            });
+            // Direction from strong RTL letters only — a digit-only cell
+            // split across items must not have its number reversed. RTL cells
+            // sort right-to-left in baseline bands with embedded LTR phrases
+            // kept in screen order.
+            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|(_, i)| &i.text));
+            if rtl {
+                crate::text_utils::sort_rtl_cell_items(
+                    col_items,
+                    |(_, i)| i.x,
+                    |(_, i)| i.y,
+                    |(_, i)| i.text.as_str(),
+                );
+            } else {
+                col_items.sort_by(|a, b| {
+                    b.1.y
+                        .partial_cmp(&a.1.y)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            a.1.x
+                                .partial_cmp(&b.1.x)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                });
+            }
             let text = col_items
                 .iter()
                 .map(|(_, item)| item.text.trim())
@@ -2082,6 +2118,10 @@ fn detect_row_stripe_table(
         debug!("  row-stripe rejected: dominant prose cell (chart/figure region over body text)");
         return None;
     }
+    if row_stripe_cells_are_prose(&cells) {
+        debug!("  row-stripe rejected: prose fragments behind stripes");
+        return None;
+    }
 
     let column_centers: Vec<f32> = (0..num_cols)
         .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
@@ -2126,6 +2166,39 @@ fn has_dominant_prose_cell(cells: &[Vec<String>]) -> bool {
         }
     }
     max_cell_words >= 60 && max_cell_words * 3 >= total_words
+}
+
+/// Stripes drawn behind flowing body text produce a grid of paragraph
+/// fragments: nearly every cell is long, multi-sentence prose. Real
+/// row-stripe tables (zebra-striped financial rows) carry short values.
+/// Mirrors the cell-rect prose-in-frame cap.
+fn row_stripe_cells_are_prose(cells: &[Vec<String>]) -> bool {
+    let num_cols = cells.iter().map(Vec::len).max().unwrap_or(0);
+    let mut counted = 0usize;
+    let mut total_chars = 0usize;
+    let mut sentence_cells = 0usize;
+    let mut sentence_columns = vec![false; num_cols];
+    for row in cells {
+        for (col, cell) in row.iter().enumerate() {
+            let t = cell.trim();
+            if t.is_empty() {
+                continue;
+            }
+            counted += 1;
+            total_chars += t.chars().count();
+            if t.split_whitespace().count() >= 10 && t.contains(['.', ',']) {
+                sentence_cells += 1;
+                sentence_columns[col] = true;
+            }
+        }
+    }
+    // Flowing text fills every column with sentences; a genuine striped
+    // narrative table (Q&A, requirements) keeps them in one description
+    // column beside short labels.
+    counted > 0
+        && total_chars / counted > 90
+        && sentence_cells * 2 >= counted
+        && sentence_columns.iter().filter(|&&v| v).count() >= 2
 }
 
 fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
@@ -2179,11 +2252,22 @@ fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
     long_dense_cells * 2 >= dense_count
 }
 
-/// Remove repeated page-scale fills from a chart-like cluster so the actual
-/// cell/bar geometry can be evaluated independently. A small number of
-/// coincident origin frames may be meaningful table structure, so repetition
-/// only becomes normalization evidence when it dominates the cluster.
-fn without_dominant_page_backgrounds(rects: &[(f32, f32, f32, f32)]) -> Vec<(f32, f32, f32, f32)> {
+#[derive(Clone, Copy)]
+enum PageBackgroundRemoval {
+    /// Repeated page fills interfere with chart-vs-grid classification even
+    /// when real cell geometry remains the majority.
+    Repeated,
+    /// Top-level normalization is more conservative: page fills must comprise
+    /// at least 75% of all useful drawing rectangles.
+    Overwhelming,
+}
+
+/// Apply the shared page-scale classification and removal policy used by the
+/// top-level detector and chart recovery.
+fn without_page_backgrounds(
+    rects: &[(f32, f32, f32, f32)],
+    policy: PageBackgroundRemoval,
+) -> Vec<(f32, f32, f32, f32)> {
     let x_max = rects
         .iter()
         .map(|&(x, _, width, _)| x + width)
@@ -2192,13 +2276,16 @@ fn without_dominant_page_backgrounds(rects: &[(f32, f32, f32, f32)]) -> Vec<(f32
         .iter()
         .map(|&(_, y, _, height)| y + height)
         .fold(0.0_f32, f32::max);
-    let is_page_scale = |&(x, y, width, height): &(f32, f32, f32, f32)| {
+    let is_page_scale = |&&(x, y, width, height): &&(f32, f32, f32, f32)| {
         x < 5.0 && y < 5.0 && width >= x_max * 0.9 && height >= y_max * 0.9
     };
+    let page_scale_count = rects.iter().filter(is_page_scale).count();
 
-    if rects.iter().filter(|rect| is_page_scale(rect)).count()
-        < DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS
-    {
+    let meets_policy = match policy {
+        PageBackgroundRemoval::Repeated => true,
+        PageBackgroundRemoval::Overwhelming => page_scale_count * 4 >= rects.len() * 3,
+    };
+    if page_scale_count < DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS || !meets_policy {
         return rects.to_vec();
     }
 
@@ -2305,7 +2392,8 @@ fn is_repeated_cell_grid(group_rects: &[(f32, f32, f32, f32)]) -> bool {
 
 fn repeated_cell_grid_overrides_bar_hypothesis(group_rects: &[(f32, f32, f32, f32)]) -> bool {
     is_repeated_cell_grid(group_rects)
-        && without_dominant_page_backgrounds(group_rects).len() == group_rects.len()
+        && without_page_backgrounds(group_rects, PageBackgroundRemoval::Repeated).len()
+            == group_rects.len()
 }
 
 /// Detect horizontal segmented stacks from aligned rows of touching rects.
@@ -3435,6 +3523,32 @@ fn cluster_x_positions(items: &[(usize, &TextItem)], min_threshold: f32) -> Vec<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn row_stripe_prose_fragments_are_rejected() {
+        let prose = vec![
+            vec![
+                "The other potentially invasive fouler is the tropical American species in low abundances near the harbor entrance today."
+                    .to_string(),
+                "Mytilopsis sallei and M. adamsi which has been recorded invasive in Singapore, Australia, Thailand among other regions of the coast."
+                    .to_string(),
+            ],
+            vec![
+                "Figure 3. Non-indigenous macrofoulers from Manila Bay with IAS, based on more intensive biofouling ecological monitoring efforts."
+                    .to_string(),
+                "Newer estimates on the number of possible IAS in Manila Bay is likely more than 30 species, when research started on this topic."
+                    .to_string(),
+            ],
+        ];
+        assert!(super::row_stripe_cells_are_prose(&prose));
+
+        let zebra = vec![
+            vec!["Revenue".to_string(), "$1,240".to_string()],
+            vec!["Cost of goods".to_string(), "$310".to_string()],
+            vec!["Net margin".to_string(), "24%".to_string()],
+        ];
+        assert!(!super::row_stripe_cells_are_prose(&zebra));
+    }
+
     use super::*;
     use crate::types::ItemType;
 
@@ -3446,6 +3560,7 @@ mod tests {
             width: text.len() as f32 * font_size * 0.5,
             height: font_size,
             font: "TestFont".to_string(),
+            font_tag: String::new(),
             font_size,
             page: 1,
             is_bold: false,
@@ -3520,11 +3635,134 @@ mod tests {
 
         let mut dominant = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
         dominant.push(cell);
-        assert_eq!(without_dominant_page_backgrounds(&dominant), vec![cell]);
+        assert_eq!(
+            without_page_backgrounds(&dominant, PageBackgroundRemoval::Repeated),
+            vec![cell]
+        );
 
         let mut incidental = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS - 1];
         incidental.push(cell);
-        assert_eq!(without_dominant_page_backgrounds(&incidental), incidental);
+        assert_eq!(
+            without_page_backgrounds(&incidental, PageBackgroundRemoval::Repeated),
+            incidental
+        );
+    }
+
+    #[test]
+    fn overwhelming_page_backgrounds_are_removed_before_grid_detection() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; 12];
+        rects.extend([
+            PdfRect {
+                x: 70.0,
+                y: 320.0,
+                width: 240.0,
+                height: 260.0,
+                page: 1,
+            },
+            PdfRect {
+                x: 330.0,
+                y: 400.0,
+                width: 200.0,
+                height: 48.0,
+                page: 1,
+            },
+            PdfRect {
+                x: 115.0,
+                y: 70.0,
+                width: 150.0,
+                height: 12.0,
+                page: 1,
+            },
+        ]);
+        let items = vec![
+            make_item("body prose", 70.0, 700.0, 10.0),
+            make_item("continued body prose", 300.0, 620.0, 10.0),
+            make_item("Figure 6", 340.0, 430.0, 9.0),
+            make_item("caption", 410.0, 410.0, 9.0),
+            make_item("footnote", 120.0, 74.0, 8.0),
+        ];
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(
+            tables.is_empty(),
+            "duplicate page backgrounds must not manufacture a full-page table"
+        );
+    }
+
+    #[test]
+    fn minority_page_backgrounds_preserve_real_cell_grid() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        let mut items = Vec::new();
+        for row in 0..4 {
+            for col in 0..3 {
+                rects.push(PdfRect {
+                    x: 100.0 + col as f32 * 100.0,
+                    y: 600.0 - row as f32 * 24.0,
+                    width: 100.0,
+                    height: 24.0,
+                    page: 1,
+                });
+                items.push(make_item(
+                    "42",
+                    110.0 + col as f32 * 100.0,
+                    607.0 - row as f32 * 24.0,
+                    9.0,
+                ));
+            }
+        }
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert_eq!(tables.len(), 1, "a real repeated cell grid must survive");
+        assert_eq!(tables[0].rows.len(), 4);
+        assert_eq!(tables[0].columns.len(), 3);
+    }
+
+    #[test]
+    fn minority_page_backgrounds_do_not_expand_row_stripe_fallback() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        let mut items = Vec::new();
+        for row in 0..25 {
+            let y = 200.0 + row as f32 * 20.0;
+            rects.push(PdfRect {
+                x: 40.0,
+                y,
+                width: 510.0,
+                height: 16.0,
+                page: 1,
+            });
+            items.push(make_item(&format!("row {row}"), 60.0, y + 5.0, 9.0));
+            items.push(make_item(&format!("value {row}"), 320.0, y + 5.0, 9.0));
+        }
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert_eq!(tables.len(), 1, "the row-stripe table should survive");
+        assert_eq!(
+            tables[0].rows.len(),
+            25,
+            "page fills must not add full-page rows to the fallback grid"
+        );
+        assert_eq!(tables[0].columns.len(), 2);
     }
 
     #[test]
@@ -5023,6 +5261,7 @@ mod tests {
                     width: 50.0,
                     height: 10.0,
                     font: String::new(),
+                    font_tag: String::new(),
                     font_size: 10.0,
                     page: 1,
                     is_bold: false,
@@ -5334,6 +5573,7 @@ mod tests {
                 width: 40.0,
                 height: 10.0,
                 font: String::new(),
+                font_tag: String::new(),
                 font_size: 10.0,
                 page: 1,
                 is_bold: false,

@@ -628,12 +628,17 @@ fn rendered_page_to_rgb(page: &RenderedPage) -> Result<RgbImage, OarOcrError> {
         match page.format() {
             RenderPixelFormat::Rgb8 => output.copy_from_slice(input),
             RenderPixelFormat::Rgba8 => {
-                for (rgba, rgb) in input.chunks_exact(4).zip(output.chunks_exact_mut(3)) {
+                for (rgba, rgb) in input
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(output.as_chunks_mut::<3>().0)
+                {
                     rgb.copy_from_slice(&rgba[..3]);
                 }
             }
             RenderPixelFormat::Gray8 => {
-                for (&gray, rgb) in input.iter().zip(output.chunks_exact_mut(3)) {
+                for (&gray, rgb) in input.iter().zip(output.as_chunks_mut::<3>().0) {
                     rgb.fill(gray);
                 }
             }

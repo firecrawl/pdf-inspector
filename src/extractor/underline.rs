@@ -704,6 +704,7 @@ mod tests {
             width,
             height: font_size,
             font: "F1".to_string(),
+            font_tag: String::new(),
             font_size,
             page: 1,
             is_bold: false,
