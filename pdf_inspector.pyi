@@ -154,12 +154,31 @@ class PagesExtractionResult:
     is_complex: bool
     """True if any page has tables or multi-column layout."""
 
-def process_pdf(path: str, pages: Optional[list[int]] = None) -> PdfResult:
-    """Process a PDF: detect type, extract text, convert to Markdown."""
+def process_pdf(
+    path: str,
+    pages: Optional[list[int]] = None,
+    *,
+    strip_headers_footers: bool = True,
+    remove_page_numbers: bool = True,
+) -> PdfResult:
+    """Process a PDF: detect type, extract text, convert to Markdown.
+
+    ``strip_headers_footers`` controls the evidence-based removal of running
+    headers and footers. ``remove_page_numbers`` controls the standalone
+    page-number text filter; folios resolved from positional evidence are
+    always removed because layout analysis depends on them.
+    """
     ...
 
-def process_pdf_bytes(data: bytes, pages: Optional[list[int]] = None) -> PdfResult:
-    """Process a PDF from bytes in memory."""
+def process_pdf_bytes(
+    data: bytes,
+    pages: Optional[list[int]] = None,
+    *,
+    strip_headers_footers: bool = True,
+    remove_page_numbers: bool = True,
+) -> PdfResult:
+    """Process a PDF from bytes in memory. See ``process_pdf`` for the
+    markdown keyword semantics."""
     ...
 
 def process_pdf_with_ocr(

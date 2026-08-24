@@ -677,26 +677,54 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
 // Public Python API
 // ---------------------------------------------------------------------------
 
-/// Process a PDF file: detect type, extract text, and convert to Markdown.
-#[pyfunction]
-#[pyo3(signature = (path, pages=None))]
-fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
+/// Build [`crate::PdfOptions`] from the shared `process_pdf` keyword set.
+fn build_process_options(
+    pages: Option<Vec<u32>>,
+    strip_headers_footers: bool,
+    remove_page_numbers: bool,
+) -> crate::PdfOptions {
+    let mut opts = crate::PdfOptions::new().markdown(crate::MarkdownOptions {
+        strip_headers_footers,
+        remove_page_numbers,
+        ..crate::MarkdownOptions::default()
+    });
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
+    opts
+}
+
+/// Process a PDF file: detect type, extract text, and convert to Markdown.
+///
+/// `strip_headers_footers` controls the evidence-based removal of running
+/// headers and footers. `remove_page_numbers` controls the standalone
+/// page-number text filter; folios resolved from positional evidence are
+/// always removed because layout analysis depends on them.
+#[pyfunction]
+#[pyo3(signature = (path, pages=None, *, strip_headers_footers=true, remove_page_numbers=true))]
+fn process_pdf(
+    path: &str,
+    pages: Option<Vec<u32>>,
+    strip_headers_footers: bool,
+    remove_page_numbers: bool,
+) -> PyResult<PyPdfResult> {
+    let opts = build_process_options(pages, strip_headers_footers, remove_page_numbers);
     let result = crate::process_pdf_with_options(path, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
 /// Process a PDF from bytes in memory.
+///
+/// See [`process_pdf`] for the markdown keyword semantics.
 #[pyfunction]
-#[pyo3(signature = (data, pages=None))]
-fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
-    if let Some(p) = pages {
-        opts = opts.pages(p);
-    }
+#[pyo3(signature = (data, pages=None, *, strip_headers_footers=true, remove_page_numbers=true))]
+fn process_pdf_bytes(
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+    strip_headers_footers: bool,
+    remove_page_numbers: bool,
+) -> PyResult<PyPdfResult> {
+    let opts = build_process_options(pages, strip_headers_footers, remove_page_numbers);
     let result = crate::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
