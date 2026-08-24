@@ -623,8 +623,10 @@ fn hex_to_unicode_string(hex: &str) -> Option<String> {
 
     if bytes.len().is_multiple_of(2) {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_be_bytes(*chunk))
             .collect();
         if let Ok(result) = String::from_utf16(&units) {
             if !result.is_empty() {
@@ -846,8 +848,8 @@ fn parse_cid_to_gid_stream(data: &[u8]) -> Option<Vec<u16>> {
         return None;
     }
     let mut map = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
-        map.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+    for chunk in data.as_chunks::<2>().0 {
+        map.push(u16::from_be_bytes(*chunk));
     }
     Some(map)
 }
@@ -1447,8 +1449,8 @@ fn bytes_to_unicode_string(bytes: &[u8]) -> Option<String> {
         return Some(bytes.iter().map(|&b| b as char).collect());
     }
     let mut out = String::new();
-    for chunk in bytes.chunks_exact(2) {
-        let cp = u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    for chunk in bytes.as_chunks::<2>().0 {
+        let cp = u16::from_be_bytes(*chunk) as u32;
         if let Some(ch) = char::from_u32(cp) {
             out.push(ch);
         }

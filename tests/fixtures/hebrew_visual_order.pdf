@@ -1,0 +1,72 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 6 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /TrueType /BaseFont /TestHebrew /FirstChar 32 /LastChar 76 /Widths [500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500] /ToUnicode 5 0 R >>
+endobj
+5 0 obj
+<< /Length 466 >>
+stream
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Test-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+13 beginbfchar
+<20> <0020>
+<41> <05E9>
+<42> <05DC>
+<43> <05D5>
+<44> <05DD>
+<45> <05E2>
+<46> <05D3>
+<47> <05D7>
+<48> <05D4>
+<49> <05E1>
+<4A> <05D9>
+<4B> <05DB>
+<4C> <05E0>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+endstream
+endobj
+6 0 obj
+<< /Length 134 >>
+stream
+BT /F1 12 Tf
+100 700 Td <44424345> Tj
+60 0 Td <44434241> Tj
+-110 -50 Td <444A4C434B4A4948> Tj
+70 0 Td <4245> Tj
+40 0 Td <474346> Tj
+ET
+endstream
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000549 00000 n 
+0000001066 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1251
+%%EOF
