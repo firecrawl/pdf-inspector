@@ -149,7 +149,9 @@ pub struct PdfProcessResult {
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
     /// Title from PDF metadata (if available).
     pub title: Option<String>,
-    /// Detection confidence score (0.0–1.0).
+    /// Confidence score for the returned result (0.0–1.0). In
+    /// [`ProcessMode::Full`], this is 0.0 when a TextBased PDF yields no
+    /// usable Markdown.
     pub confidence: f32,
     /// Layout complexity analysis (tables, multi-column detection).
     pub layout: LayoutComplexity,
@@ -4469,6 +4471,27 @@ fn process_document(
         None
     } else {
         markdown
+    };
+
+    // Full mode returns Markdown for a document classified as TextBased. If
+    // extraction-quality gates leave that output empty, retaining the
+    // detector's 1.0 confidence makes the silent-empty failure look certain to
+    // callers. Analyze mode intentionally omits Markdown, so its confidence
+    // remains the detector result.
+    let confidence = if options.mode == ProcessMode::Full
+        && pdf_type == PdfType::TextBased
+        && page_count > 0
+        && markdown
+            .as_ref()
+            .is_none_or(|markdown| markdown.trim().is_empty())
+    {
+        log::debug!(
+            "TextBased PDF produced no usable markdown — reducing confidence from {:.2} to 0",
+            confidence
+        );
+        0.0
+    } else {
+        confidence
     };
 
     Ok(PdfProcessResult {
