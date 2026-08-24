@@ -303,74 +303,80 @@ fn extract_positioned_text_impl(
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
-        // the page and poisons font statistics. Rotated pages are left alone
-        // — their item coordinates are already transformed out of box space.
-        let mut clipped_box: Option<(f32, f32, f32, f32)> = None;
-        if !coords_rotated {
-            if let Some((bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
-                const TOL: f32 = 6.0;
-                let outside = |it: &TextItem| {
-                    let cx = it.x + it.width / 2.0;
-                    !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
-                };
-                // Only clip when the off-page material reads as coherent text
-                // (neighboring-page paragraphs). Curved/rotated display text
-                // leaves short glyph fragments with artifact coordinates
-                // outside the box, and those must stay.
-                let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
-                // Judge by character mass: paragraphs are dominated by long
-                // word runs even when interleaved with short math fragments,
-                // while glyph-confetti is short items through and through.
-                let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
-                let wordy_chars: usize = off
-                    .iter()
-                    .map(|it| it.text.trim().chars().count())
-                    .filter(|&n| n >= 4)
-                    .sum();
-                // Genuine neighboring-page content is cleanly separated from
-                // on-page text. When an off-page item continues an on-page
-                // line (same baseline, near-adjacent x), the coordinates are
-                // artifacts of transforms we mis-model — don't clip those.
-                let straddles = off.iter().any(|o| {
-                    items.iter().any(|i| {
-                        !outside(i)
-                            && (i.y - o.y).abs() <= 2.0
-                            && (o.x - (i.x + i.width)).abs() <= 10.0
-                    })
-                });
-                let coherent =
-                    off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
-                if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
-                    let before = items.len();
-                    items.retain(|it| !outside(it));
-                    if items.len() < before {
-                        debug!(
-                            "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
-                            page_num,
-                            before - items.len(),
-                            bx0,
-                            by0,
-                            bx1,
-                            by1
-                        );
-                        // Only prune off-page geometry when off-page text
-                        // existed — same neighboring-page content.
-                        let overlaps = |x: f32, y: f32, w: f32, h: f32| {
-                            let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
-                            let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
-                            x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
-                        };
-                        rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
-                        clipped_box = Some((bx0, by0, bx1, by1));
-                        lines.retain(|l| {
-                            overlaps(
-                                l.x1.min(l.x2),
-                                l.y1.min(l.y2),
-                                (l.x2 - l.x1).abs(),
-                                (l.y2 - l.y1).abs(),
-                            )
-                        });
-                    }
+        // the page and poisons font statistics. If embedded rotated text was
+        // normalized above, normalize the visible box with the same transform.
+        let mut clipped_annotation_box: Option<(f32, f32, f32, f32)> = None;
+        if let Some(raw_box @ (bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
+            let (clip_x0, clip_y0, clip_x1, clip_y1) = if coords_rotated {
+                (by0, -bx1, by1, -bx0)
+            } else {
+                raw_box
+            };
+            const TOL: f32 = 6.0;
+            let outside = |it: &TextItem| {
+                let cx = it.x + it.width / 2.0;
+                !(cx >= clip_x0 - TOL
+                    && cx <= clip_x1 + TOL
+                    && it.y >= clip_y0 - TOL
+                    && it.y <= clip_y1 + TOL)
+            };
+            // Only clip when the off-page material reads as coherent text
+            // (neighboring-page paragraphs). Curved/rotated display text
+            // leaves short glyph fragments with artifact coordinates
+            // outside the box, and those must stay.
+            let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
+            // Judge by character mass: paragraphs are dominated by long
+            // word runs even when interleaved with short math fragments,
+            // while glyph-confetti is short items through and through.
+            let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
+            let wordy_chars: usize = off
+                .iter()
+                .map(|it| it.text.trim().chars().count())
+                .filter(|&n| n >= 4)
+                .sum();
+            // Genuine neighboring-page content is cleanly separated from
+            // on-page text. When an off-page item continues an on-page
+            // line (same baseline, near-adjacent x), the coordinates are
+            // artifacts of transforms we mis-model — don't clip those.
+            let straddles = off.iter().any(|o| {
+                items.iter().any(|i| {
+                    !outside(i) && (i.y - o.y).abs() <= 2.0 && (o.x - (i.x + i.width)).abs() <= 10.0
+                })
+            });
+            let coherent = wordy_chars * 2 >= total_chars.max(1) && !straddles;
+            if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
+                let before = items.len();
+                items.retain(|it| !outside(it));
+                if items.len() < before {
+                    debug!(
+                        "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
+                        page_num,
+                        before - items.len(),
+                        clip_x0,
+                        clip_y0,
+                        clip_x1,
+                        clip_y1
+                    );
+                    // Only prune off-page geometry when off-page text
+                    // existed — same neighboring-page content.
+                    let overlaps = |x: f32, y: f32, w: f32, h: f32| {
+                        let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
+                        let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
+                        x0 < clip_x1 + TOL
+                            && x1 > clip_x0 - TOL
+                            && y0 < clip_y1 + TOL
+                            && y1 > clip_y0 - TOL
+                    };
+                    rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
+                    clipped_annotation_box = Some(raw_box);
+                    lines.retain(|l| {
+                        overlaps(
+                            l.x1.min(l.x2),
+                            l.y1.min(l.y2),
+                            (l.x2 - l.x1).abs(),
+                            (l.y2 - l.y1).abs(),
+                        )
+                    });
                 }
             }
         }
@@ -415,7 +421,7 @@ fn extract_positioned_text_impl(
         // Extract hyperlinks from page annotations
         let mut links = extract_page_links(doc, page_id, *page_num);
         // Annotations from the neighboring page are off-box too.
-        if let Some((bx0, by0, bx1, by1)) = clipped_box {
+        if let Some((bx0, by0, bx1, by1)) = clipped_annotation_box {
             links.retain(|it| {
                 let cx = it.x + it.width / 2.0;
                 // Center-y, not it.y: link items carry an annotation rect,
