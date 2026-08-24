@@ -362,6 +362,7 @@ pub struct PyTextItem {
     pub font_tag: String,
     #[pyo3(get)]
     pub font_size: f32,
+    /// 0-indexed page number.
     #[pyo3(get)]
     pub page: u32,
     #[pyo3(get)]
@@ -399,7 +400,7 @@ impl PyTextItem {
 #[pyclass(name = "StructureElement")]
 #[derive(Clone)]
 pub struct PyStructureElement {
-    /// 1-indexed page number (matches TextItem.page).
+    /// 0-indexed page number (matches TextItem.page).
     #[pyo3(get)]
     pub page: u32,
     /// Marked Content ID from the page's content stream (matches
@@ -569,6 +570,20 @@ fn item_type_str(t: &ItemType) -> String {
     }
 }
 
+fn to_core_page_numbers(pages: Vec<u32>) -> PyResult<Vec<u32>> {
+    pages
+        .into_iter()
+        .map(|page| {
+            page.checked_add(1)
+                .ok_or_else(|| PyValueError::new_err("Page index is too large"))
+        })
+        .collect()
+}
+
+fn to_python_page_number(page: u32) -> u32 {
+    page.saturating_sub(1)
+}
+
 fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
     items
         .into_iter()
@@ -581,7 +596,7 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             font: item.font,
             font_tag: item.font_tag,
             font_size: item.font_size,
-            page: item.page,
+            page: to_python_page_number(item.page),
             is_bold: item.is_bold,
             is_italic: item.is_italic,
             is_underline: item.is_underline,
@@ -596,7 +611,7 @@ fn convert_structure_elements(elements: Vec<crate::StructureElement>) -> Vec<PyS
     elements
         .into_iter()
         .map(|e| PyStructureElement {
-            page: e.page,
+            page: to_python_page_number(e.page),
             mcid: e.mcid,
             role: e.role,
         })
@@ -843,12 +858,14 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 }
 
 /// Extract text with position information from a file.
+///
+/// `pages` and returned `TextItem.page` values are 0-indexed.
 #[pyfunction]
 #[pyo3(signature = (path, pages=None))]
 fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<Vec<PyTextItem>> {
     let items = match pages {
         Some(p) => {
-            let page_set: HashSet<u32> = p.into_iter().collect();
+            let page_set: HashSet<u32> = to_core_page_numbers(p)?.into_iter().collect();
             crate::extract_text_with_positions_pages(path, Some(&page_set)).map_err(to_py_err)?
         }
         None => crate::extract_text_with_positions(path).map_err(to_py_err)?,
@@ -857,6 +874,8 @@ fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<
 }
 
 /// Extract text with position information from bytes.
+///
+/// `pages` and returned `TextItem.page` values are 0-indexed.
 #[pyfunction]
 #[pyo3(signature = (data, pages=None))]
 fn extract_text_with_positions_bytes(
@@ -865,7 +884,7 @@ fn extract_text_with_positions_bytes(
 ) -> PyResult<Vec<PyTextItem>> {
     let items = match pages {
         Some(p) => {
-            let page_set: HashSet<u32> = p.into_iter().collect();
+            let page_set: HashSet<u32> = to_core_page_numbers(p)?.into_iter().collect();
             crate::extractor::extract_text_with_positions_mem_pages(data, Some(&page_set))
                 .map_err(to_py_err)?
         }
@@ -952,7 +971,7 @@ fn extract_pages_markdown_bytes(
 /// Extract structure-tree element references from a tagged PDF file.
 ///
 /// Parses the document's structure tree (when present) and returns one
-/// entry per marked-content reference, resolved to its 1-indexed page,
+/// entry per marked-content reference, resolved to its 0-indexed page,
 /// MCID, and structure type name ("H1".."H6", "P", "Table", ...). Returns
 /// an empty list when the PDF is not tagged.
 ///
@@ -962,7 +981,7 @@ fn extract_pages_markdown_bytes(
 ///
 /// Args:
 ///     path: Path to the PDF file.
-///     pages: Optional list of 1-indexed pages (matching TextItem.page).
+///     pages: Optional list of 0-indexed pages (matching TextItem.page).
 ///         When None (default), the whole document is returned.
 ///
 /// Returns:
@@ -973,6 +992,7 @@ fn extract_structure_elements(
     path: &str,
     pages: Option<Vec<u32>>,
 ) -> PyResult<Vec<PyStructureElement>> {
+    let pages = pages.map(to_core_page_numbers).transpose()?;
     let elements = crate::extract_structure_elements(path, pages.as_deref()).map_err(to_py_err)?;
     Ok(convert_structure_elements(elements))
 }
@@ -986,6 +1006,7 @@ fn extract_structure_elements_bytes(
     data: &[u8],
     pages: Option<Vec<u32>>,
 ) -> PyResult<Vec<PyStructureElement>> {
+    let pages = pages.map(to_core_page_numbers).transpose()?;
     let elements =
         crate::extract_structure_elements_mem(data, pages.as_deref()).map_err(to_py_err)?;
     Ok(convert_structure_elements(elements))

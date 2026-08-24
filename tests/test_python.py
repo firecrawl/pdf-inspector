@@ -221,12 +221,19 @@ class TestExtractTextWithPositions:
         assert isinstance(item.is_italic, bool)
         assert isinstance(item.item_type, str)
 
-    def test_with_pages(self):
+    def test_first_page_uses_zero_based_index(self):
         items = pdf_inspector.extract_text_with_positions(
-            fixture_path("thermo-freon12.pdf"), pages=[1]
+            fixture_path("thermo-freon12.pdf"), pages=[0]
         )
         assert len(items) > 0
-        assert all(item.page == 1 for item in items)
+        assert all(item.page == 0 for item in items)
+
+    def test_multiple_pages_use_zero_based_indexes(self):
+        items = pdf_inspector.extract_text_with_positions(
+            fixture_path("thermo-freon12.pdf"), pages=[0, 1]
+        )
+        assert len(items) > 0
+        assert {item.page for item in items} == {0, 1}
 
     def test_repr(self):
         items = pdf_inspector.extract_text_with_positions(
@@ -243,9 +250,9 @@ class TestExtractTextWithPositions:
 
     def test_bytes_with_pages(self):
         data = fixture_bytes("thermo-freon12.pdf")
-        items = pdf_inspector.extract_text_with_positions_bytes(data, pages=[1])
+        items = pdf_inspector.extract_text_with_positions_bytes(data, pages=[0])
         assert len(items) > 0
-        assert all(item.page == 1 for item in items)
+        assert all(item.page == 0 for item in items)
 
     def test_mcid(self):
         # Untagged fixture: mcid is None or int, never anything else
@@ -291,12 +298,12 @@ class TestExtractStructureElements:
         assert len(h1_text.strip()) > 0
 
     def test_with_pages(self):
-        # pages filter is 1-indexed, matching TextItem.page
+        # pages filter is 0-indexed, matching TextItem.page
         elements = pdf_inspector.extract_structure_elements(
-            fixture_path("firecrawl_docs_tagged.pdf"), pages=[1]
+            fixture_path("firecrawl_docs_tagged.pdf"), pages=[0]
         )
         assert len(elements) > 0
-        assert all(e.page == 1 for e in elements)
+        assert all(e.page == 0 for e in elements)
 
     def test_bytes(self):
         data = fixture_bytes("firecrawl_docs_tagged.pdf")
