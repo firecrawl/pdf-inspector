@@ -1300,6 +1300,11 @@ fn test_snapshot_td9264() {
 }
 
 #[test]
+fn test_snapshot_template_layout_band() {
+    assert_snapshot("template_layout_band");
+}
+
+#[test]
 fn test_snapshot_p1244() {
     assert_snapshot("p1244-1996");
 }

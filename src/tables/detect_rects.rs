@@ -2201,6 +2201,22 @@ fn row_stripe_cells_are_prose(cells: &[Vec<String>]) -> bool {
         && sentence_columns.iter().filter(|&&v| v).count() >= 2
 }
 
+/// A row that swallowed the page's flowing prose: paragraph-scale text
+/// holding at least half the table's total. The row-granular sibling of
+/// `has_dominant_prose_cell`: a template content band (one rect, no
+/// interior row edges) boxes a whole document section into a single
+/// giant row, and the columns carved from it split that prose into
+/// sub-threshold cells — every per-cell signal stays blind, only the
+/// row sum sees it.
+fn has_dominant_prose_row(cells: &[Vec<String>]) -> bool {
+    let row_chars: Vec<usize> = cells
+        .iter()
+        .map(|row| row.iter().map(|cell| cell.len()).sum())
+        .collect();
+    let total_chars: usize = row_chars.iter().sum();
+    row_chars.iter().any(|&n| n > 500 && n * 2 >= total_chars)
+}
+
 fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
     let Some(num_cols) = cells.first().map(|row| row.len()) else {
         return false;
@@ -2933,6 +2949,14 @@ fn detect_row_stripe_table_from_cell_rects(
             "  cell-rect collapsed {} wrapped description rows",
             collapsed_rows
         );
+    }
+
+    // Reject layout bands: a template content frame boxes flowing prose
+    // into one giant row. The paragraph-wall guard below only fires
+    // under 4 non-empty rows, which header chips above the band supply.
+    if has_dominant_prose_row(&cells) {
+        debug!("  cell-rect rejected: one row holds most of the text (layout band)");
+        return None;
     }
 
     // Validate: >=2 non-empty rows, >=25% density
@@ -3891,6 +3915,36 @@ mod tests {
         let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
         assert!(tables.is_empty());
         assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn layout_band_rejects_stripe_fallback() {
+        // A template content band (drawn several times) over a page
+        // background, with header chips above: the stripe fallback must
+        // not box the band's flowing prose into one giant table row.
+        let mut rects = vec![
+            (0.0, 0.0, 612.0, 792.0),
+            (0.0, 0.0, 612.0, 792.0),
+            (28.0, 730.0, 158.0, 22.0),
+            (28.0, 702.0, 158.0, 20.0),
+            (224.0, 702.0, 156.0, 20.0),
+        ];
+        for _ in 0..4 {
+            rects.push((27.6, 60.0, 534.2, 640.0)); // the content band
+        }
+        let mut items = vec![
+            make_item("Name", 35.0, 740.0, 10.0),
+            make_item("Objective", 35.0, 712.0, 10.0),
+            make_item("user@example.com", 230.0, 712.0, 10.0),
+        ];
+        let prose = "Goal: reduce the defect rate across the production \
+                     line. Action: build a supplier scorecard covering \
+                     quality, cost, and delivery with one dashboard. \
+                     Result: defect rate down 35 percent overall.";
+        for i in 0..8 {
+            items.push(make_item(prose, 35.0, 620.0 - i as f32 * 18.0, 10.0));
+        }
+        assert!(detect_row_stripe_table_from_cell_rects(&items, &rects, 1).is_none());
     }
 
     #[test]
