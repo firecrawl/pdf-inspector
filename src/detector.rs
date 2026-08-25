@@ -1830,7 +1830,7 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
 /// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
 /// the same gates classification needs elsewhere instead of treating the
 /// raw signals alone as sufficient — see #227/#231.
-pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool) {
+pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool, bool) {
     let analysis = analyze_page_content(doc, page_id);
 
     let needs_ocr_for_template_image = if !analysis.has_template_image {
@@ -1845,7 +1845,14 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool
         looks_like_scan || insufficient_text
     };
 
-    (needs_ocr_for_template_image, analysis.has_vector_text)
+    let has_painted_content =
+        analysis.has_images || analysis.path_op_count > 0 || analysis.text_operator_count > 0;
+
+    (
+        needs_ocr_for_template_image,
+        analysis.has_vector_text,
+        has_painted_content,
+    )
 }
 
 /// Recursively collect image dimensions from XObject resources,

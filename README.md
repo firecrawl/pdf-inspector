@@ -244,7 +244,7 @@ wasm/                   — Browser bindings (wasm-bindgen)
 3. Look for `Tj`/`TJ` (text operators) and `Do` (image operators) in content streams
 4. Classify based on text operator presence across sampled pages
 
-This detects 300+ page PDFs in milliseconds. The result includes `pages_needing_ocr` — a list of specific page numbers that lack text, enabling per-page OCR routing instead of all-or-nothing.
+This detects 300+ page PDFs in milliseconds. The result includes `pages_needing_ocr` — a list of specific page numbers that require OCR, enabling per-page OCR routing instead of all-or-nothing. Note that a page only requires OCR if it has some painted content (such as images or vector paths) but extraction failed to yield text items. Truly blank pages (no painted content and no extracted items) are not routed to OCR to avoid unnecessary OCR jobs.
 
 ### Scan strategies
 

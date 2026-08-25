@@ -636,10 +636,12 @@ fn extract_pages_markdown_mem_impl(
         // detect_from_document's Mixed-type per-page routing always sends
         // these pages to OCR; mirror that here too. Both signals share one
         // analyze_page_content pass — see page_ocr_signals's doc comment.
-        let (has_template_image, has_vector_text) = lopdf_pages
+        let (has_template_image, has_vector_text, has_painted_content) = lopdf_pages
             .get(&page_1idx)
             .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, false));
+
+        let is_empty_page_items = page_items.is_empty();
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -686,12 +688,16 @@ fn extract_pages_markdown_mem_impl(
         }
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 
-        let needs_ocr = ocr_reason.is_some()
-            || md.trim().is_empty()
-            || has_gid
-            || is_garbage_text(&md)
-            || has_template_image
-            || has_vector_text;
+        let needs_ocr = if !has_painted_content && is_empty_page_items {
+            false
+        } else {
+            ocr_reason.is_some()
+                || md.trim().is_empty()
+                || has_gid
+                || is_garbage_text(&md)
+                || has_template_image
+                || has_vector_text
+        };
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
