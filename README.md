@@ -290,7 +290,59 @@ PDF arrives
 ```
 
 This saves cost and latency for the majority of PDFs that are already text-based (reports, papers, invoices, legal docs).
+## PDF Detection Confidence and OCR Routing
 
+`pdf-inspector` classifies PDFs and returns a confidence score between `0.0` and `1.0`.
+
+The confidence score represents how strongly the detector believes the PDF matches the detected type. It is a classification confidence, not an OCR accuracy score.
+
+### Default OCR Routing Thresholds
+
+The default thresholds are:
+
+| Threshold | Default Value | Description |
+|-----------|---------------|-------------|
+| `text_based_min_confidence` | `0.85` | Minimum confidence required to classify a document as TextBased |
+| `needs_ocr_max_confidence` | `0.35` | Confidence below this value indicates OCR should be preferred |
+| `mixed_page_threshold` | `0.25` | Fraction of pages requiring different processing before classifying as Mixed |
+
+### How Classification Works
+
+- **TextBased**
+  - The PDF contains meaningful extractable text.
+  - Confidence is above the `text_based_min_confidence` threshold.
+  - OCR is generally not required.
+
+- **Scanned**
+  - The PDF contains scanned images without meaningful extractable text.
+  - OCR is recommended to extract content.
+
+- **ImageBased**
+  - The PDF contains image content or vector-based text that cannot be reliably extracted.
+  - OCR may be required.
+
+- **Mixed**
+  - The PDF contains a combination of text-based and image/scanned pages.
+  - Individual pages may have different OCR requirements.
+
+### Custom OCR Routing Thresholds
+
+Applications can override the default OCR routing behavior using `DetectionConfig`.
+
+Example:
+
+```rust
+use pdf_inspector::{DetectionConfig, OcrRoutingThresholds};
+
+let config = DetectionConfig {
+    ocr_thresholds: OcrRoutingThresholds {
+        text_based_min_confidence: 0.9,
+        needs_ocr_max_confidence: 0.25,
+        mixed_page_threshold: 0.3,
+    },
+    ..DetectionConfig::default()
+};
+```
 ## Debugging
 
 See [docs/debugging.md](docs/debugging.md) for `RUST_LOG` environment variable usage.
@@ -298,3 +350,5 @@ See [docs/debugging.md](docs/debugging.md) for `RUST_LOG` environment variable u
 ## License
 
 [MIT](LICENSE)
+
+

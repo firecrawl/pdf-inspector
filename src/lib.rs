@@ -47,7 +47,9 @@ pub mod vision;
 
 pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
-    detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
+    detect_pdf_type_with_config, DetectionConfig, PdfType, 
+    PdfTypeResult, ScanStrategy,OcrRoutingThresholds,
+
 };
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_mem,

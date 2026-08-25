@@ -1,6 +1,11 @@
 //! Integration tests for pdf-to-markdown library
 
-use pdf_inspector::detector::{estimate_page_count_from_bytes, DetectionConfig, ScanStrategy};
+use pdf_inspector::detector::{
+    estimate_page_count_from_bytes,
+    DetectionConfig,
+    OcrRoutingThresholds,
+    ScanStrategy
+};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::ItemType;
 use pdf_inspector::types::TextLine;
@@ -340,6 +345,7 @@ fn test_detection_config_custom() {
         strategy: ScanStrategy::Sample(10),
         min_text_ops_per_page: 5,
         text_page_ratio_threshold: 0.8,
+        ocr_thresholds: OcrRoutingThresholds::default(),
     };
     assert!(matches!(config.strategy, ScanStrategy::Sample(10)));
     assert_eq!(config.min_text_ops_per_page, 5);
@@ -1241,13 +1247,15 @@ fn assert_snapshot(fixture: &str) -> String {
 
     let result = pdf_inspector::process_pdf(&fixture_path)
         .unwrap_or_else(|e| panic!("Failed to process {}: {}", fixture_path, e));
-    let actual = result.markdown.unwrap_or_default();
-    let actual = actual.trim_end();
+    let actual = result.markdown.unwrap_or_default()
+    .trim_end()
+    .replace("\r\n", "\n");
 
-    let expected = std::fs::read_to_string(&snapshot_path)
-        .unwrap_or_else(|e| panic!("Failed to read snapshot {}: {}", snapshot_path, e));
-    let expected = expected.trim_end();
-
+let expected = std::fs::read_to_string(&snapshot_path)
+    .unwrap_or_else(|e| panic!("Failed to read snapshot {}: {}", snapshot_path, e))
+    .trim_end()
+    .replace("\r\n", "\n");
+    
     if actual != expected {
         // Show a helpful diff summary
         let actual_lines: Vec<&str> = actual.lines().collect();
@@ -1283,7 +1291,6 @@ fn assert_snapshot(fixture: &str) -> String {
 
     actual.to_string()
 }
-
 #[test]
 fn test_snapshot_nexo_price_en() {
     assert_snapshot("nexo-price-en");
@@ -4447,4 +4454,35 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
          trustworthy, got: {:?}",
         page.markdown
     );
+}
+
+#[test]
+fn test_default_ocr_thresholds() {
+    let thresholds = OcrRoutingThresholds::default();
+
+    assert_eq!(thresholds.text_based_min_confidence, 0.85);
+    assert_eq!(thresholds.needs_ocr_max_confidence, 0.35);
+    assert_eq!(thresholds.mixed_page_threshold, 0.25);
+}
+
+#[test]
+fn test_invalid_ocr_thresholds() {
+    let thresholds = OcrRoutingThresholds {
+        text_based_min_confidence: 0.2,
+        needs_ocr_max_confidence: 0.5,
+        mixed_page_threshold: 0.25,
+    };
+
+    assert!(thresholds.validate().is_err());
+}
+
+#[test]
+fn test_valid_custom_ocr_thresholds() {
+    let thresholds = OcrRoutingThresholds {
+        text_based_min_confidence: 0.9,
+        needs_ocr_max_confidence: 0.3,
+        mixed_page_threshold: 0.25,
+    };
+
+    assert!(thresholds.validate().is_ok());
 }
