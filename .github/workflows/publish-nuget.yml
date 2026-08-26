@@ -1,10 +1,14 @@
 name: Publish NuGet package
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('NuGet package dry run ({0})', github.ref_name)
+      || format('Publish NuGet package ({0})', github.ref_name) }}
 
 on:
   push:
     branches: [main]
     paths: ['dotnet/Directory.Build.props']
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -12,7 +16,7 @@ permissions:
 jobs:
   check-version:
     name: Check version change
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.check.outputs.changed }}
@@ -34,7 +38,18 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Package-only dry run for ${{ github.ref_name }} at ${{ github.sha }}"
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## NuGet package dry run"
+              echo
+              echo "- Ref: \`${{ github.ref_name }}\`"
+              echo "- Commit: \`${{ github.sha }}\`"
+              echo "- Version: \`$VERSION\`"
+              echo "- Result: the package will be built and uploaded as a workflow artifact; NuGet.org publishing is disabled."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           else
             OLD_VERSION=$(git show HEAD~1:dotnet/Directory.Build.props 2>/dev/null | python3 -c 'import re, sys; text=sys.stdin.read(); match=re.search(r"<Version>([^<]+)</Version>", text); print(match.group(1) if match else "")')
             if [ "$VERSION" = "$OLD_VERSION" ]; then
@@ -191,10 +206,16 @@ jobs:
             dist/*.nupkg
             dist/*.snupkg
           if-no-files-found: error
+          retention-days: 7
 
   publish:
     name: Publish to NuGet.org
     needs: [check-version, pack]
+    if: >-
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+      && needs.check-version.outputs.changed == 'true'
+      && needs.check-version.outputs.published == 'false'
     runs-on: ubuntu-latest
     environment: nuget
     permissions:

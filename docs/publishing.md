@@ -64,3 +64,16 @@ Configure a policy for `firecrawl/pdf-inspector`,
 the NuGet.org user/profile name in the `NUGET_USER` repository secret. The
 workflow assembles one package containing all supported RID-specific native
 libraries.
+
+### NuGet package-only dry run
+
+`publish-nuget.yml` can be run manually from the Actions page. Choose **Run
+workflow**, select the branch or commit to test, and start the run. A manual
+run:
+
+1. Builds and tests all four native RID libraries.
+2. Assembles and validates the complete `.nupkg`.
+3. Installs the package into the clean smoke project.
+4. Uploads the `.nupkg` and `.snupkg` in the `nuget-package` workflow artifact
+   for seven days.
+5. Skips the NuGet login and publish job unconditionally.
