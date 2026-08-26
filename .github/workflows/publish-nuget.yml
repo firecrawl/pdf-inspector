@@ -1,0 +1,218 @@
+name: Publish NuGet package
+
+on:
+  push:
+    branches: [main]
+    paths: ['dotnet/Directory.Build.props']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    name: Check version change
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      published: ${{ steps.check.outputs.published }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Check package version sync
+        run: python3 scripts/version.py --check
+
+      - name: Check package version
+        id: check
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'import re, pathlib; print(re.search(r"<Version>([^<]+)</Version>", pathlib.Path("dotnet/Directory.Build.props").read_text()).group(1))')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            OLD_VERSION=$(git show HEAD~1:dotnet/Directory.Build.props 2>/dev/null | python3 -c 'import re, sys; text=sys.stdin.read(); match=re.search(r"<Version>([^<]+)</Version>", text); print(match.group(1) if match else "")')
+            if [ "$VERSION" = "$OLD_VERSION" ]; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          STATUS=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            "https://api.nuget.org/v3-flatcontainer/firecrawl.pdfinspector/$VERSION/firecrawl.pdfinspector.$VERSION.nupkg")
+          if [ "$STATUS" = "200" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          elif [ "$STATUS" = "404" ]; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unexpected NuGet response: $STATUS" >&2
+            exit 1
+          fi
+
+  build-native:
+    name: Build ${{ matrix.rid }}
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true' && needs.check-version.outputs.published == 'false'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-gnu
+            rid: linux-x64
+            library: libpdf_inspector_dotnet.so
+          - runner: blacksmith-2vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-gnu
+            rid: linux-arm64
+            library: libpdf_inspector_dotnet.so
+          - runner: blacksmith-6vcpu-macos-15
+            target: aarch64-apple-darwin
+            rid: osx-arm64
+            library: libpdf_inspector_dotnet.dylib
+          - runner: blacksmith-8vcpu-windows-2025
+            target: x86_64-pc-windows-msvc
+            rid: win-x64
+            library: pdf_inspector_dotnet.dll
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+
+      - uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.1.0
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: dotnet/native -> target
+          key: publish-dotnet-${{ matrix.target }}
+
+      - name: Build native library
+        run: cargo build --release --locked --manifest-path dotnet/native/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Test managed package surface
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          export LD_LIBRARY_PATH="$PWD/dotnet/native/target/${{ matrix.target }}/release${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            export DYLD_LIBRARY_PATH="$PWD/dotnet/native/target/${{ matrix.target }}/release${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          fi
+          dotnet test dotnet/tests/Firecrawl.PdfInspector.Tests/Firecrawl.PdfInspector.Tests.csproj \
+            -c Release \
+            -p:BuildPdfInspectorNative=false
+
+      - name: Test managed package surface
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD\dotnet\native\target\${{ matrix.target }}\release;$env:PATH"
+          dotnet test dotnet\tests\Firecrawl.PdfInspector.Tests\Firecrawl.PdfInspector.Tests.csproj `
+            -c Release `
+            -p:BuildPdfInspectorNative=false
+
+      - name: Upload native library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dotnet-${{ matrix.rid }}
+          path: dotnet/native/target/${{ matrix.target }}/release/${{ matrix.library }}
+          if-no-files-found: error
+
+  pack:
+    name: Pack NuGet
+    needs: [check-version, build-native]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.1.0
+        with:
+          dotnet-version: '8.0.x'
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dotnet-win-x64
+          path: dotnet/runtimes/win-x64/native
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dotnet-linux-x64
+          path: dotnet/runtimes/linux-x64/native
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dotnet-linux-arm64
+          path: dotnet/runtimes/linux-arm64/native
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dotnet-osx-arm64
+          path: dotnet/runtimes/osx-arm64/native
+
+      - name: Pack
+        run: dotnet pack dotnet/src/Firecrawl.PdfInspector/Firecrawl.PdfInspector.csproj -c Release -o dist
+
+      - name: Inspect package
+        run: unzip -l dist/Firecrawl.PdfInspector.${{ needs.check-version.outputs.version }}.nupkg
+
+      - name: Smoke test installed package
+        shell: bash
+        run: |
+          mkdir package-smoke
+          cp dotnet/smoke/Firecrawl.PdfInspector.Smoke.csproj package-smoke/
+          cp dotnet/smoke/Program.cs package-smoke/
+          dotnet restore package-smoke/Firecrawl.PdfInspector.Smoke.csproj \
+            -p:Version=${{ needs.check-version.outputs.version }} \
+            --source "$PWD/dist" \
+            --source https://api.nuget.org/v3/index.json
+          dotnet run --project package-smoke/Firecrawl.PdfInspector.Smoke.csproj \
+            -c Release --no-restore \
+            -p:Version=${{ needs.check-version.outputs.version }} \
+            -- tests/fixtures/thermo-freon12.pdf
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nuget-package
+          path: |
+            dist/*.nupkg
+            dist/*.snupkg
+          if-no-files-found: error
+
+  publish:
+    name: Publish to NuGet.org
+    needs: [check-version, pack]
+    runs-on: ubuntu-latest
+    environment: nuget
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nuget-package
+          path: dist
+
+      - name: Authenticate to NuGet.org
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1
+        id: nuget
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Publish package
+        run: |
+          dotnet nuget push "dist/*.nupkg" --api-key "${{ steps.nuget.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          dotnet nuget push "dist/*.snupkg" --api-key "${{ steps.nuget.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate

@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/Firecrawl.PdfInspector/Firecrawl.PdfInspector.csproj" />
+  <Project Path="tests/Firecrawl.PdfInspector.Tests/Firecrawl.PdfInspector.Tests.csproj" />
+</Solution>

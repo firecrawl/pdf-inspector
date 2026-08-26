@@ -6,7 +6,8 @@ Every pdf-inspector distribution uses one shared semantic version:
 - Python package: `pdf-inspector`
 - Node package: `@firecrawl/pdf-inspector` and its platform packages
 - Browser package: `@firecrawl/pdf-inspector-wasm`
-- Internal NAPI and WASM Rust crates
+- .NET package: `Firecrawl.PdfInspector`
+- Internal NAPI, WASM, and .NET native Rust crates
 
 `Cargo.toml` is the canonical version source. Update every manifest and lockfile
 with:
@@ -28,7 +29,7 @@ CI and every publishing workflow run this check before building or publishing.
 1. Choose the next shared semantic version and run `scripts/version.py`.
 2. Review the manifest and lockfile changes in the version-bump pull request.
 3. Merge the pull request to `main`.
-4. The crates.io, PyPI, Node, and WASM workflows independently build and
+4. The crates.io, PyPI, Node, WASM, and NuGet workflows independently build and
    publish that version from the same commit.
 5. After all registries succeed, create one `v<version>` GitHub release that
    links to each package and describes changes since the previous shared tag.
@@ -46,6 +47,7 @@ its corresponding workflow:
 - PyPI: `publish-pypi.yml`, environment `pypi`
 - npm Node package: `publish.yml`
 - npm WASM package: `publish-wasm.yml`
+- NuGet: `publish-nuget.yml`, environment `nuget`
 
 The WASM package must exist before npm trusted publishing can be configured. If
 it ever needs to be bootstrapped again, build and inspect it before publishing:
@@ -55,3 +57,10 @@ wasm-pack build wasm --target web --scope firecrawl --out-dir pkg --release
 npm pack --dry-run ./wasm/pkg
 npm publish ./wasm/pkg --access public
 ```
+
+The NuGet workflow uses NuGet.org trusted publishing through `NuGet/login`.
+Configure a policy for `firecrawl/pdf-inspector`,
+`.github/workflows/publish-nuget.yml`, and the `nuget` environment, then store
+the NuGet.org user/profile name in the `NUGET_USER` repository secret. The
+workflow assembles one package containing all supported RID-specific native
+libraries.

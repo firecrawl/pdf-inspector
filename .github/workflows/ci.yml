@@ -63,6 +63,9 @@ jobs:
       - name: Check WASM formatting
         run: cargo fmt --manifest-path wasm/Cargo.toml -- --check
 
+      - name: Check .NET native formatting
+        run: cargo fmt --manifest-path dotnet/native/Cargo.toml -- --check
+
   clippy:
     name: Clippy
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -85,6 +88,9 @@ jobs:
 
       - name: Run OCR clippy
         run: cargo clippy --features ocr -- -D warnings
+
+      - name: Lint .NET native wrapper
+        run: cargo clippy --manifest-path dotnet/native/Cargo.toml -- -D warnings
 
   build:
     name: Build (${{ matrix.os }})
@@ -157,6 +163,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      - uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.1.0
+        with:
+          dotnet-version: '8.0.x'
+
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
@@ -168,6 +178,7 @@ jobs:
           workspaces: |
             . -> target
             napi -> target
+            dotnet/native -> target
 
       - name: Install PDFium
         shell: bash
@@ -254,7 +265,7 @@ jobs:
       # The bindings use independent Cargo target directories. Build them at
       # the same time so this smoke job is bounded by the slower binding build
       # instead of paying for both release builds serially.
-      - name: Build Node and Python bindings
+      - name: Build Node, Python, and .NET bindings
         shell: bash
         run: |
           (
@@ -264,10 +275,14 @@ jobs:
           ) &
           node_build_pid=$!
 
+          cargo build --release --manifest-path dotnet/native/Cargo.toml &
+          dotnet_build_pid=$!
+
           python -m pip install 'maturin>=1,<2'
           maturin build --release --out "$RUNNER_TEMP/python-wheels"
 
           wait "$node_build_pid"
+          wait "$dotnet_build_pid"
           python -m pip install "$RUNNER_TEMP"/python-wheels/*.whl
 
       - name: Run Node OCR binding
@@ -300,6 +315,17 @@ jobs:
           assert result.pages[0].provenance.source in {"ocr", "fused"}
           assert result.pages[0].markdown.strip()
           PY
+
+      - name: Run .NET OCR binding
+        shell: bash
+        env:
+          PDF_INSPECTOR_DOTNET_OCR_RUNTIME: "1"
+        run: |
+          export LD_LIBRARY_PATH="$PWD/dotnet/native/target/release${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          dotnet test dotnet/tests/Firecrawl.PdfInspector.Tests/Firecrawl.PdfInspector.Tests.csproj \
+            -c Release \
+            -p:BuildPdfInspectorNative=false \
+            --filter FullyQualifiedName~OcrAutoProcessesRoutedPageWhenRuntimeIsConfigured
 
   wasm:
     name: WebAssembly
@@ -335,3 +361,68 @@ jobs:
 
       - name: Test WebAssembly package
         run: wasm-pack test --node --release wasm
+
+  dotnet:
+    name: .NET (${{ matrix.rid }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-gnu
+            rid: linux-x64
+          - runner: blacksmith-2vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-gnu
+            rid: linux-arm64
+          - runner: blacksmith-6vcpu-macos-15
+            target: aarch64-apple-darwin
+            rid: osx-arm64
+          - runner: blacksmith-8vcpu-windows-2025
+            target: x86_64-pc-windows-msvc
+            rid: win-x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+
+      - uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.1.0
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: dotnet/native -> target
+          key: dotnet-${{ matrix.target }}
+
+      - name: Test native wrapper
+        run: cargo test --manifest-path dotnet/native/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Build native wrapper
+        run: cargo build --release --manifest-path dotnet/native/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Test managed binding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          export LD_LIBRARY_PATH="$PWD/dotnet/native/target/${{ matrix.target }}/release${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            export DYLD_LIBRARY_PATH="$PWD/dotnet/native/target/${{ matrix.target }}/release${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          fi
+          dotnet test dotnet/tests/Firecrawl.PdfInspector.Tests/Firecrawl.PdfInspector.Tests.csproj \
+            -c Release \
+            -p:BuildPdfInspectorNative=false
+
+      - name: Test managed binding
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD\dotnet\native\target\${{ matrix.target }}\release;$env:PATH"
+          dotnet test dotnet\tests\Firecrawl.PdfInspector.Tests\Firecrawl.PdfInspector.Tests.csproj `
+            -c Release `
+            -p:BuildPdfInspectorNative=false

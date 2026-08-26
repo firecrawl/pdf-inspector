@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>Firecrawl.PdfInspector</AssemblyName>
+    <RootNamespace>Firecrawl.PdfInspector</RootNamespace>
+    <Description>Fast native PDF classification and Markdown extraction powered by pdf-inspector.</Description>
+    <PackageId>Firecrawl.PdfInspector</PackageId>
+    <PackageTags>pdf;pdf-extraction;pdf-parser;text-extraction;ocr;rust;native</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\runtimes\**\*" Pack="true" PackagePath="runtimes\%(RecursiveDir)%(Filename)%(Extension)" />
+    <RequiredNativeAsset Include="..\..\runtimes\win-x64\native\pdf_inspector_dotnet.dll" />
+    <RequiredNativeAsset Include="..\..\runtimes\linux-x64\native\libpdf_inspector_dotnet.so" />
+    <RequiredNativeAsset Include="..\..\runtimes\linux-arm64\native\libpdf_inspector_dotnet.so" />
+    <RequiredNativeAsset Include="..\..\runtimes\osx-arm64\native\libpdf_inspector_dotnet.dylib" />
+  </ItemGroup>
+
+  <Target Name="ValidateNuGetNativeAssets"
+          BeforeTargets="GenerateNuspec"
+          Condition="'$(AllowIncompleteNativeAssets)' != 'true'">
+    <Error Condition="!Exists('%(RequiredNativeAsset.Identity)')"
+           Text="Cannot create Firecrawl.PdfInspector: missing required native asset %(RequiredNativeAsset.Identity). Build/download every supported RID artifact, or set AllowIncompleteNativeAssets=true only for a local diagnostic package." />
+  </Target>
+</Project>

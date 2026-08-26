@@ -33,16 +33,24 @@ TOML_VERSIONS = (
     ("Python package", Path("pyproject.toml"), "project"),
     ("NAPI crate", Path("napi/Cargo.toml"), "package"),
     ("WASM package", Path("wasm/Cargo.toml"), "package"),
+    ("NuGet native crate", Path("dotnet/native/Cargo.toml"), "package"),
 )
 LOCK_VERSIONS = (
     ("NAPI lock: core", Path("napi/Cargo.lock"), "pdf-inspector"),
     ("NAPI lock: binding", Path("napi/Cargo.lock"), "pdf-inspector-napi"),
     ("WASM lock: core", Path("wasm/Cargo.lock"), "pdf-inspector"),
     ("WASM lock: binding", Path("wasm/Cargo.lock"), "pdf-inspector-wasm"),
+    ("NuGet lock: core", Path("dotnet/native/Cargo.lock"), "pdf-inspector"),
+    (
+        "NuGet lock: binding",
+        Path("dotnet/native/Cargo.lock"),
+        "pdf-inspector-dotnet-native",
+    ),
 )
 SITE_WASM_VERSION = re.compile(
     r"(@firecrawl/pdf-inspector-wasm@)([^/\"]+)(/pdf_inspector_wasm\.js)"
 )
+DOTNET_VERSION = re.compile(r"(<Version>)([^<]+)(</Version>)")
 
 
 def _read_section_version(path: Path, section: str) -> str:
@@ -156,6 +164,14 @@ def _site_wasm_version(root: Path) -> str:
     return match.group(2)
 
 
+def _dotnet_version(root: Path) -> str:
+    text = (root / "dotnet/Directory.Build.props").read_text(encoding="utf-8")
+    match = DOTNET_VERSION.search(text)
+    if not match:
+        raise ValueError("Missing .NET version in dotnet/Directory.Build.props")
+    return match.group(2)
+
+
 def package_versions(root: Path = ROOT) -> dict[str, str]:
     versions = {
         label: _read_section_version(root / relative, section)
@@ -164,6 +180,7 @@ def package_versions(root: Path = ROOT) -> dict[str, str]:
     versions.update(_node_versions(root))
     versions.update(_bun_versions(root))
     versions["Website WASM module"] = _site_wasm_version(root)
+    versions["NuGet package"] = _dotnet_version(root)
     versions.update(
         {
             label: _read_lock_version(root / relative, package)
@@ -229,6 +246,15 @@ def set_versions(version: str, root: Path = ROOT) -> None:
     if count != 1:
         raise ValueError("Missing pinned WASM package URL in site/index.html")
     site_path.write_text(site_text, encoding="utf-8")
+
+    dotnet_path = root / "dotnet/Directory.Build.props"
+    dotnet_text = dotnet_path.read_text(encoding="utf-8")
+    dotnet_text, count = DOTNET_VERSION.subn(
+        rf"\g<1>{version}\g<3>", dotnet_text, count=1
+    )
+    if count != 1:
+        raise ValueError("Missing .NET version in dotnet/Directory.Build.props")
+    dotnet_path.write_text(dotnet_text, encoding="utf-8")
 
     for _, relative, package_name in LOCK_VERSIONS:
         _write_lock_version(root / relative, package_name, version)

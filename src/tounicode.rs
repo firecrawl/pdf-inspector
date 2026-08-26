@@ -6,12 +6,12 @@ use log::{debug, warn};
 use lopdf::{Document, Object, ObjectId};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "embedded-cmaps")))]
 use std::path::{Path, PathBuf};
 
 use crate::glyph_names::glyph_to_char;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "embedded-cmaps"))]
 static BUILTIN_CMAPS: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/external/bcmaps");
 
@@ -1214,7 +1214,7 @@ fn build_cmap_from_builtin_cmap(ordering: &str) -> Option<ToUnicodeCMap> {
     Some(cmap)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "embedded-cmaps")))]
 fn find_bcmaps_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("PDF_INSPECTOR_BCMAPS_DIR") {
         let p = PathBuf::from(dir);
@@ -1231,13 +1231,13 @@ fn find_bcmaps_dir() -> Option<PathBuf> {
     None
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "embedded-cmaps")))]
 fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
     let path = find_bcmaps_dir()?.join(name);
     std::fs::read(path).ok().map(Cow::Owned)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "embedded-cmaps"))]
 fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
     let file = BUILTIN_CMAPS.get_file(name)?;
     Some(Cow::Borrowed(file.contents()))
