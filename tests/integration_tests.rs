@@ -1833,6 +1833,38 @@ fn test_extract_regions_mem_recovers_invisible_ocr_layer() {
     );
 }
 
+/// A scanned page whose invisible (Tr 3) OCR layer is dense enough to push
+/// the classifier past the template-image threshold lands as TextBased, not
+/// Mixed. The invisible retry must still fire there: without it the document
+/// extracts zero text and is reported as needing OCR even though the exact
+/// text is already in the PDF (typical for OCRmyPDF/dense re-OCR output).
+#[test]
+fn test_process_pdf_mem_recovers_dense_invisible_layer_on_textbased() {
+    let lines: Vec<String> = (0..60)
+        .map(|i| format!("Invoice line {i} with amount {i} due for payment shortly"))
+        .collect();
+    let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let buf = make_pdf_with_custom_text_layer(3, None, Some(&refs), false);
+
+    let result = process_pdf_mem(&buf).expect("process dense invisible-layer PDF");
+    assert_eq!(
+        result.pdf_type,
+        PdfType::TextBased,
+        "dense overlay should classify as TextBased — if this starts failing, \
+         the fixture no longer exercises the TextBased retry path"
+    );
+    let markdown = result.markdown.as_deref().unwrap_or("");
+    assert!(
+        markdown.contains("Invoice line 42"),
+        "invisible OCR layer should be recovered for TextBased PDFs, got: {markdown:?}"
+    );
+    assert!(
+        result.pages_needing_ocr.is_empty(),
+        "recovered OCR layer must not flag pages for OCR, got: {:?}",
+        result.pages_needing_ocr
+    );
+}
+
 /// ANY visible text on the page — even a single short line — must block the
 /// invisible-layer adoption entirely: the invisible pass returns visible
 /// items too, so adopting it alongside visible text would duplicate the

@@ -4172,7 +4172,12 @@ fn process_document(
         // For Mixed/template PDFs: if normal extraction produces garbage text
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
-        if pdf_type == PdfType::Mixed {
+        // Scans with a dense OCR text overlay (e.g. OCRmyPDF output) carry
+        // enough text operators to be classified TextBased rather than Mixed,
+        // so a Mixed-only retry would never fire for them and extraction
+        // comes up empty. Widen the retry to TextBased, and also retry when
+        // extraction is suspiciously sparse for the page count.
+        if matches!(pdf_type, PdfType::Mixed | PdfType::TextBased) {
             if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
                 let sample: String = items
                     .iter()
@@ -4185,7 +4190,18 @@ fn process_document(
                     .take(200)
                     .map(|item| item.text.as_str())
                     .collect();
-                if is_garbage_text(&sample) || sample.trim().is_empty() {
+                // The sparseness floor (5 items/page, whole-document count)
+                // is deliberately conservative: a page with any real prose
+                // yields dozens of positioned items, while a scan whose only
+                // text survived as a handful of visible artifacts stays well
+                // under it. The retry is cheap relative to a false negative
+                // (the whole document reported as needing OCR), and the
+                // zero-visible-text gate in the invisible pass keeps it from
+                // ever duplicating visible text.
+                if is_garbage_text(&sample)
+                    || sample.trim().is_empty()
+                    || (items.len() as u32) < 5 * page_count
+                {
                     extractor::extract_positioned_text_include_invisible_with_folio_context(
                         &doc,
                         &font_cmaps,
