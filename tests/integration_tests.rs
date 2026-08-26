@@ -4448,3 +4448,56 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         page.markdown
     );
 }
+
+/// A borderless statement table whose last column is a single marker glyph that
+/// some rows draw invisibly (`Tr 3`, e.g. a flag toggled off in the template).
+/// Invisible text is correctly excluded from extraction, so those rows arrive
+/// with one fewer filled cell — which must not be read as wrapped overflow text
+/// and merged into the row above, silently dropping a record.
+#[test]
+fn rows_missing_an_invisible_marker_glyph_stay_separate() {
+    let mut content = String::from("BT /F1 7 Tf\n");
+    let rows = [
+        ("21/06 22:29", "BUNDL TECHNOLOGIES", "67.00", true),
+        ("24/06 17:04", "RAZ SwiggyBangalore", "262.00", true),
+        ("26/06 00:00", "10% CashBack Credit", "26.20", false),
+        ("06/07 14:16", "BPPY CC PAYMENT DP016187", "8889.00", false),
+        ("13/07 12:04", "PYU Instamart Grocery", "479.00", true),
+    ];
+    content.push_str("1 0 0 1 60 260 Tm (DATE & TIME) Tj\n");
+    content.push_str("1 0 0 1 160 260 Tm (TRANSACTION DESCRIPTION) Tj\n");
+    content.push_str("1 0 0 1 400 260 Tm (AMOUNT) Tj\n");
+    content.push_str("1 0 0 1 470 260 Tm (PI) Tj\n");
+    for (idx, (date, description, amount, marker_visible)) in rows.iter().enumerate() {
+        let y = 240 - (idx as i32) * 14;
+        content.push_str(&format!("1 0 0 1 60 {y} Tm ({date}) Tj\n"));
+        content.push_str(&format!("1 0 0 1 160 {y} Tm ({description}) Tj\n"));
+        content.push_str(&format!("1 0 0 1 400 {y} Tm ({amount}) Tj\n"));
+        // The marker is emitted on every row; only its rendering mode differs.
+        content.push_str(if *marker_visible { "0 Tr\n" } else { "3 Tr\n" });
+        content.push_str(&format!("1 0 0 1 470 {y} Tm (l) Tj\n"));
+        content.push_str("0 Tr\n");
+    }
+    content.push_str("ET\n");
+
+    let pdf = make_text_pdf(&content, "0 0 595 300");
+    let markdown = process_pdf_mem(&pdf)
+        .expect("fixture should convert")
+        .markdown
+        .expect("fixture should produce markdown");
+
+    for (date, description, amount, _) in rows.iter() {
+        assert!(
+            markdown.contains(description),
+            "row {date} ({amount}) lost its description:\n{markdown}"
+        );
+    }
+    // Each row must occupy its own line; a merge would put two dates together.
+    for line in markdown.lines() {
+        let dates_on_line = rows.iter().filter(|(date, ..)| line.contains(date)).count();
+        assert!(
+            dates_on_line <= 1,
+            "two transactions were merged onto one row:\n{line}\n\nfull output:\n{markdown}"
+        );
+    }
+}
