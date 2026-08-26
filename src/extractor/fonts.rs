@@ -923,20 +923,26 @@ fn is_ligature_char(ch: char) -> bool {
     )
 }
 
-/// Get the CMap lookup key for an Identity-H/V CID font without ToUnicode.
+/// Get the CMap lookup key for a Type0 CID font without ToUnicode.
 /// Returns the object number used by `collect_cmaps_from_fonts` to store the CMap:
-/// - FontFile2 or FontFile3 obj_num (for embedded font cmap)
-/// - CIDFont dict obj_num (for predefined CIDSystemInfo-based mapping)
+/// - CIDFont dict obj_num for Type0 fonts
+/// - FontFile2 or FontFile3 obj_num for simple fonts
+///
+/// Named Uni*-UCS2-* mappings are deliberately excluded: their encoding is a
+/// property of the parent Type0 font, so a shared FontFile is not a unique key.
 pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<u32> {
     let subtype = font_dict
         .get(b"Subtype")
         .ok()
         .and_then(|o| o.as_name().ok());
 
-    // Type0 (CID) fonts
+    // Identity-H/V mappings are keyed by the CIDFont, not the embedded font
+    // program: CIDSystemInfo and CIDToGIDMap can differ even when FontFile is
+    // shared. Named encodings use resource-scoped CMaps instead.
     if subtype == Some(b"Type0") {
         let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
-        if encoding != b"Identity-H" && encoding != b"Identity-V" {
+        let is_identity = encoding == b"Identity-H" || encoding == b"Identity-V";
+        if !is_identity {
             return None;
         }
         let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
@@ -944,26 +950,8 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
         if desc_fonts.is_empty() {
             return None;
         }
-        let cid_font_dict = resolve_dict(doc, &desc_fonts[0])?;
-        let font_descriptor_obj = cid_font_dict.get(b"FontDescriptor").ok()?;
-        let font_descriptor = resolve_dict(doc, font_descriptor_obj)?;
-
-        // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF)
-        if let Some(ff_ref) = font_descriptor
-            .get(b"FontFile2")
-            .ok()
-            .and_then(|o| o.as_reference().ok())
-            .or_else(|| {
-                font_descriptor
-                    .get(b"FontFile3")
-                    .ok()
-                    .and_then(|o| o.as_reference().ok())
-            })
-        {
-            return Some(ff_ref.0);
-        }
-
-        // Fallback: use DescendantFonts[0] obj_num (for predefined CIDSystemInfo mapping)
+        // Direct descendant dictionaries have no collision-free document key;
+        // the extraction path installs those under the concrete resource name.
         if let Object::Reference(r) = &desc_fonts[0] {
             return Some(r.0);
         }
