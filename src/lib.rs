@@ -532,7 +532,11 @@ fn extract_pages_markdown_mem_impl(
     // Per-page Markdown receives the original items plus these decisions so
     // table detection can retain legitimate numeric cells.
     let (filtered_items, removed_page_number_pages, page_number_removal_mask) =
-        extractor::filter_markdown_page_numbers_with_removed_pages(all_items.clone(), page_count);
+        extractor::filter_markdown_page_numbers_with_removed_pages(
+            all_items.clone(),
+            page_count,
+            &extractor::page_vertical_bounds(&doc),
+        );
 
     // Tables need the original numeric cells; columns use folio-cleaned
     // evidence so removed page numbers cannot create false layout metadata.
@@ -4333,6 +4337,7 @@ fn process_document(
                 items,
                 page_count,
                 options.page_filter.as_ref(),
+                &extractor::page_vertical_bounds(&doc),
             );
 
             let text_quality = analyze_text_quality(&items);
@@ -6136,9 +6141,14 @@ fn select_items_with_document_folio_context(
     all_items: Vec<types::TextItem>,
     page_count: u32,
     page_filter: Option<&HashSet<u32>>,
+    page_bounds: &std::collections::HashMap<u32, (f32, f32)>,
 ) -> FolioFilteredItems {
     let (all_layout_items, all_removed_pages, all_removal_mask) =
-        extractor::filter_markdown_page_numbers_with_removed_pages(all_items.clone(), page_count);
+        extractor::filter_markdown_page_numbers_with_removed_pages(
+            all_items.clone(),
+            page_count,
+            page_bounds,
+        );
     let selected_page = |page: u32| page_filter.is_none_or(|filter| filter.contains(&page));
 
     let (items, removal_mask) = all_items
@@ -6541,8 +6551,11 @@ mod tests {
             test_item("1", 25.0, 20.0, 12.0, 10.0),
             test_item("2", 520.0, 60.0, 12.0, 10.0),
         ];
-        let (filtered, _, _) =
-            extractor::filter_markdown_page_numbers_with_removed_pages(items.clone(), 1);
+        let (filtered, _, _) = extractor::filter_markdown_page_numbers_with_removed_pages(
+            items.clone(),
+            1,
+            &std::collections::HashMap::new(),
+        );
         assert!(filtered.is_empty());
 
         let filtered = compute_layout_complexity(&items, &filtered, &[], &[]);
@@ -6634,16 +6647,23 @@ mod tests {
             .filter(|item| item.page == 1)
             .cloned()
             .collect();
-        let (page_local_layout, _, _) =
-            extractor::filter_markdown_page_numbers_with_removed_pages(page_one_items.clone(), 4);
+        let (page_local_layout, _, _) = extractor::filter_markdown_page_numbers_with_removed_pages(
+            page_one_items.clone(),
+            4,
+            &std::collections::HashMap::new(),
+        );
         let page_local = compute_layout_complexity(&page_one_items, &page_local_layout, &[], &[]);
         assert!(
             page_local.pages_with_columns.contains(&1),
             "fixture must reproduce page-local folio column evidence"
         );
 
-        let selected =
-            select_items_with_document_folio_context(items, 4, Some(&HashSet::from([1])));
+        let selected = select_items_with_document_folio_context(
+            items,
+            4,
+            Some(&HashSet::from([1])),
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             selected
                 .removal_mask

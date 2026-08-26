@@ -2232,6 +2232,7 @@ fn convert_items_with_rects_lines_and_table_output(
         crate::extractor::filter_markdown_page_numbers_with_removed_pages(
             non_table_items.into_iter().map(|(_, item)| item).collect(),
             document_page_count,
+            &std::collections::HashMap::new(),
         )
         .0
     };
