@@ -8,10 +8,20 @@ debug/
 # Cargo lock (optional for libraries)
 Cargo.lock
 !/wasm/Cargo.lock
+!/dotnet/native/Cargo.lock
+
+# .NET build artifacts
+/dotnet/**/bin/
+/dotnet/**/obj/
+/dotnet/runtimes/
+/dotnet/artifacts/
+/dotnet/native/target/
+/dist/
 
 # IDE
 .idea/
 .vscode/
+.vs/
 *.swp
 *.swo
 *~

@@ -3,9 +3,10 @@
 [![Crates.io](https://img.shields.io/crates/v/pdf-inspector.svg)](https://crates.io/crates/pdf-inspector)
 [![npm](https://img.shields.io/npm/v/@firecrawl/pdf-inspector.svg)](https://www.npmjs.com/package/@firecrawl/pdf-inspector)
 [![PyPI](https://img.shields.io/pypi/v/pdf-inspector.svg)](https://pypi.org/project/pdf-inspector/)
+[![NuGet](https://img.shields.io/nuget/v/Firecrawl.PdfInspector.svg)](https://www.nuget.org/packages/Firecrawl.PdfInspector/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Fast Rust library for PDF classification and text extraction. By default it detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown without OCR. Native Rust and CLI consumers can opt into selective OCR. Includes bindings for [Python](docs/python.md), [Node.js](napi/README.md), and [browser WebAssembly](wasm/README.md).
+Fast Rust library for PDF classification and text extraction. By default it detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown without OCR. Native Rust and CLI consumers can opt into selective OCR. Includes bindings for [Python](docs/python.md), [Node.js](napi/README.md), [.NET](docs/dotnet.md), and [browser WebAssembly](wasm/README.md).
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
@@ -105,6 +106,26 @@ console.log(result.markdown);
 ```
 
 > Full API reference: [wasm/README.md](wasm/README.md)
+
+### .NET
+
+```bash
+dotnet add package Firecrawl.PdfInspector
+```
+
+```csharp
+using System;
+using System.IO;
+using Firecrawl.PdfInspector;
+
+var pdf = File.ReadAllBytes("document.pdf");
+var result = PdfInspector.ProcessPdf(pdf);
+
+Console.WriteLine(result.PdfType);
+Console.WriteLine(result.Markdown);
+```
+
+> Full API reference: [docs/dotnet.md](docs/dotnet.md)
 
 ### Rust
 

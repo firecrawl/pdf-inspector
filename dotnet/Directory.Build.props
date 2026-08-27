@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <Version>1.17.0</Version>
+    <Authors>Firecrawl Team</Authors>
+    <Company>Firecrawl</Company>
+    <RepositoryUrl>https://github.com/firecrawl/pdf-inspector</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/firecrawl/pdf-inspector</PackageProjectUrl>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+</Project>
