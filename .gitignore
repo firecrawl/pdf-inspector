@@ -16,6 +16,7 @@ Cargo.lock
 /dotnet/runtimes/
 /dotnet/artifacts/
 /dotnet/native/target/
+/dist/
 
 # IDE
 .idea/

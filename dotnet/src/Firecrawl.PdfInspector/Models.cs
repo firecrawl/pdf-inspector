@@ -87,6 +87,7 @@ public sealed class PdfProcessResult
 
     public ulong ProcessingTimeMs { get; set; }
 
+    /// <summary>1-indexed pages that need OCR.</summary>
     public uint[] PagesNeedingOcr { get; set; } = Array.Empty<uint>();
 
     public PageOcrReasons[] OcrReasonsByPage { get; set; } = Array.Empty<PageOcrReasons>();
@@ -152,6 +153,7 @@ public sealed class OcrTimings
 
 public sealed class OcrPageProvenance
 {
+    /// <summary>1-indexed PDF page number.</summary>
     public uint PageNumber { get; set; }
 
     public PageContentSource Source { get; set; }
@@ -171,6 +173,7 @@ public sealed class OcrPageProvenance
 
 public sealed class OcrPageResult
 {
+    /// <summary>1-indexed PDF page number.</summary>
     public uint PageNumber { get; set; }
 
     public string Markdown { get; set; } = string.Empty;
@@ -182,20 +185,26 @@ public sealed class OcrPdfResult
 {
     public string Markdown { get; set; } = string.Empty;
 
+    /// <summary>Page results whose PageNumber values are 1-indexed.</summary>
     public OcrPageResult[] Pages { get; set; } = Array.Empty<OcrPageResult>();
 
     public uint PageCount { get; set; }
 
+    /// <summary>1-indexed pages recommended for OCR by native extraction.</summary>
     public uint[] PagesRecommendedForOcr { get; set; } = Array.Empty<uint>();
 
+    /// <summary>1-indexed pages that were routed to OCR.</summary>
     public uint[] PagesRoutedToOcr { get; set; } = Array.Empty<uint>();
 
+    /// <summary>1-indexed pages recommended for hosted processing after local OCR.</summary>
     public uint[] PagesRecommendingHosted { get; set; } = Array.Empty<uint>();
 
     public PageOcrReasons[] OcrReasonsByPage { get; set; } = Array.Empty<PageOcrReasons>();
 
+    /// <summary>1-indexed pages containing tables.</summary>
     public uint[] PagesWithTables { get; set; } = Array.Empty<uint>();
 
+    /// <summary>1-indexed pages containing columns.</summary>
     public uint[] PagesWithColumns { get; set; } = Array.Empty<uint>();
 
     public bool IsComplex { get; set; }

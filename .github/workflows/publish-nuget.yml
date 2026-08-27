@@ -10,6 +10,10 @@ on:
     paths: ['dotnet/Directory.Build.props']
   workflow_dispatch: {}
 
+concurrency:
+  group: publish-nuget-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -33,19 +37,22 @@ jobs:
       - name: Check package version
         id: check
         shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           VERSION=$(python3 -c 'import re, pathlib; print(re.search(r"<Version>([^<]+)</Version>", pathlib.Path("dotnet/Directory.Build.props").read_text()).group(1))')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Package-only dry run for ${{ github.ref_name }} at ${{ github.sha }}"
+            echo "Package-only dry run for $REF_NAME at $COMMIT_SHA"
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "published=false" >> "$GITHUB_OUTPUT"
             {
               echo "## NuGet package dry run"
               echo
-              echo "- Ref: \`${{ github.ref_name }}\`"
-              echo "- Commit: \`${{ github.sha }}\`"
+              echo "- Ref: \`$REF_NAME\`"
+              echo "- Commit: \`$COMMIT_SHA\`"
               echo "- Version: \`$VERSION\`"
               echo "- Result: the package will be built and uploaded as a workflow artifact; NuGet.org publishing is disabled."
             } >> "$GITHUB_STEP_SUMMARY"

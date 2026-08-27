@@ -114,6 +114,8 @@ dotnet add package Firecrawl.PdfInspector
 ```
 
 ```csharp
+using System;
+using System.IO;
 using Firecrawl.PdfInspector;
 
 var pdf = File.ReadAllBytes("document.pdf");

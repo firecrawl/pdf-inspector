@@ -6,14 +6,14 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <BuildPdfInspectorNative Condition="'$(BuildPdfInspectorNative)' == ''">true</BuildPdfInspectorNative>
-    <PdfInspectorNativeRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\native'))</PdfInspectorNativeRoot>
+    <PdfInspectorNativeRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../native'))</PdfInspectorNativeRoot>
     <PdfInspectorNativeProfile Condition="'$(Configuration)' == 'Release'">release</PdfInspectorNativeProfile>
     <PdfInspectorNativeProfile Condition="'$(PdfInspectorNativeProfile)' == ''">debug</PdfInspectorNativeProfile>
     <PdfInspectorCargoFlags Condition="'$(Configuration)' == 'Release'">--release</PdfInspectorCargoFlags>
     <PdfInspectorNativeFile Condition="'$(OS)' == 'Windows_NT'">pdf_inspector_dotnet.dll</PdfInspectorNativeFile>
     <PdfInspectorNativeFile Condition="'$(OS)' != 'Windows_NT' and $([MSBuild]::IsOSPlatform('OSX'))">libpdf_inspector_dotnet.dylib</PdfInspectorNativeFile>
     <PdfInspectorNativeFile Condition="'$(PdfInspectorNativeFile)' == ''">libpdf_inspector_dotnet.so</PdfInspectorNativeFile>
-    <PdfInspectorNativePath>$(PdfInspectorNativeRoot)\target\$(PdfInspectorNativeProfile)\$(PdfInspectorNativeFile)</PdfInspectorNativePath>
+    <PdfInspectorNativePath>$(PdfInspectorNativeRoot)/target/$(PdfInspectorNativeProfile)/$(PdfInspectorNativeFile)</PdfInspectorNativePath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -35,7 +35,7 @@
           BeforeTargets="Build"
           Condition="'$(BuildPdfInspectorNative)' == 'true' and '$(OS)' != 'Windows_NT'">
     <Message Importance="high" Text="Building native pdf-inspector test library ($(PdfInspectorNativeProfile))..." />
-    <Exec Command="cargo build $(PdfInspectorCargoFlags) --locked --manifest-path &quot;$(PdfInspectorNativeRoot)\Cargo.toml&quot;" />
+    <Exec Command="cargo build $(PdfInspectorCargoFlags) --locked --manifest-path &quot;$(PdfInspectorNativeRoot)/Cargo.toml&quot;" />
   </Target>
 
   <Target Name="BuildPdfInspectorNativeLibraryWindows"

@@ -24,6 +24,8 @@ The package includes native libraries for:
 ## Extract Markdown
 
 ```csharp
+using System;
+using System.IO;
 using Firecrawl.PdfInspector;
 
 var pdf = File.ReadAllBytes("annual-report.pdf");
