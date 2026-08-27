@@ -50,13 +50,15 @@ jobs:
               echo "- Result: the package will be built and uploaded as a workflow artifact; NuGet.org publishing is disabled."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
-          else
-            OLD_VERSION=$(git show HEAD~1:dotnet/Directory.Build.props 2>/dev/null | python3 -c 'import re, sys; text=sys.stdin.read(); match=re.search(r"<Version>([^<]+)</Version>", text); print(match.group(1) if match else "")')
+          elif git cat-file -e HEAD~1:dotnet/Directory.Build.props 2>/dev/null; then
+            OLD_VERSION=$(git show HEAD~1:dotnet/Directory.Build.props | python3 -c 'import re, sys; text=sys.stdin.read(); match=re.search(r"<Version>([^<]+)</Version>", text); print(match.group(1) if match else "")')
             if [ "$VERSION" = "$OLD_VERSION" ]; then
               echo "changed=false" >> "$GITHUB_OUTPUT"
               echo "published=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 

@@ -11,8 +11,8 @@ Cargo.lock
 !/dotnet/native/Cargo.lock
 
 # .NET build artifacts
-**/bin/
-**/obj/
+/dotnet/**/bin/
+/dotnet/**/obj/
 /dotnet/runtimes/
 /dotnet/artifacts/
 /dotnet/native/target/
