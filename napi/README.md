@@ -35,7 +35,7 @@ npm install @firecrawl/pdf-inspector
 bun add @firecrawl/pdf-inspector
 ```
 
-Prebuilt binaries for **Linux x64/ARM64** (glibc and musl/Alpine), **macOS ARM64**, and **Windows x64** — npm installs only the one matching your platform. No Rust toolchain needed.
+Prebuilt binaries for **Linux x64/ARM64** (glibc and musl/Alpine), **macOS ARM64/x64**, and **Windows x64** — npm installs only the one matching your platform. No Rust toolchain needed.
 
 OCR calls that route work require compatible PDFium and ONNX Runtime shared
 libraries. Set `PDFIUM_LIB_PATH` and `ORT_DYLIB_PATH` when they are not on the
@@ -188,6 +188,7 @@ Prebuilt binaries ship as platform-specific packages installed automatically via
 | Linux    | ARM64 (glibc)       | `@firecrawl/pdf-inspector-linux-arm64-gnu` |
 | Linux    | ARM64 (musl/Alpine) | `@firecrawl/pdf-inspector-linux-arm64-musl` |
 | macOS    | ARM64               | `@firecrawl/pdf-inspector-darwin-arm64` |
+| macOS    | x64 (Intel)         | `@firecrawl/pdf-inspector-darwin-x64` |
 | Windows  | x64                 | `@firecrawl/pdf-inspector-win32-x64-msvc` |
 
 ## License
