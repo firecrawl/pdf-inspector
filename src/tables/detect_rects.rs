@@ -2572,9 +2572,21 @@ fn has_chart_bar_signature(
                       breadth: fn(&(f32, f32, f32, f32)) -> f32,
                       length: fn(&(f32, f32, f32, f32)) -> f32,
                       along: fn(&(f32, f32, f32, f32)) -> f32| {
+        // Everything below is a pure function of `bw`: the family is selected by
+        // breadth alone, and every later test reads only the family. Rect-dense pages
+        // repeat the same widths hundreds of times, and each repeat re-ran an O(n)
+        // family build plus an O(family^2) pairing scan — the cubic cost that makes
+        // this function 91% of conversion time on such a page. Evaluating one anchor
+        // per distinct breadth is the same answer: a repeat can only reproduce the
+        // earlier result, and that result was false, or `any` would already have
+        // stopped. Bit equality keeps it exact rather than merging near-equal widths.
+        let mut evaluated_breadths: HashSet<u32> = HashSet::new();
         group_rects.iter().any(|anchor| {
             let bw = breadth(anchor);
             if bw <= 0.0 {
+                return false;
+            }
+            if !evaluated_breadths.insert(bw.to_bits()) {
                 return false;
             }
             let family: Vec<&(f32, f32, f32, f32)> = group_rects
