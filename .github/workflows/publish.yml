@@ -80,6 +80,10 @@ jobs:
             build-flags: -x
           - runner: blacksmith-6vcpu-macos-15
             target: aarch64-apple-darwin
+          # macos-13 was retired by GitHub; macos-15-intel is the remaining
+          # Intel runner label (available through 2027).
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
           - runner: blacksmith-8vcpu-windows-2025
             target: x86_64-pc-windows-msvc
     steps:
@@ -169,6 +173,8 @@ jobs:
             target: aarch64-unknown-linux-musl
           - runner: blacksmith-6vcpu-macos-15
             target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
           - runner: blacksmith-2vcpu-windows-2025
             target: x86_64-pc-windows-msvc
     steps:
@@ -243,6 +249,7 @@ jobs:
                 "linux-arm64-gnu":  { os: ["linux"],  cpu: ["arm64"], libc: ["glibc"] },
                 "linux-arm64-musl": { os: ["linux"],  cpu: ["arm64"], libc: ["musl"] },
                 "darwin-arm64":     { os: ["darwin"], cpu: ["arm64"] },
+                "darwin-x64":       { os: ["darwin"], cpu: ["x64"] },
                 "win32-x64-msvc":   { os: ["win32"],  cpu: ["x64"] },
               }[suffix]
               if (!meta) {
