@@ -1111,7 +1111,7 @@ fn test_not_a_pdf_empty_buffer() {
 
 #[test]
 fn test_valid_pdf_header_not_rejected() {
-    // A truncated but valid PDF header should NOT produce NotAPdf —
+    // A truncated but valid PDF header should NOT produce NotAPdf,
     // it should fail with Parse or InvalidStructure instead.
     let truncated_pdf = b"%PDF-1.4\ntruncated content";
     let result = pdf_inspector::process_pdf_mem(truncated_pdf);
@@ -1331,7 +1331,7 @@ fn test_snapshot_hebrew_visual_order() {
 
 /// Base-Hebrew text stored in logical (reading) order: each show op holds one
 /// word in reading order and successive ops are positioned right-to-left
-/// (the OCR-text-layer convention). Extraction must NOT reverse these runs —
+/// (the OCR-text-layer convention). Extraction must NOT reverse these runs,
 /// a codepoint-only trigger would corrupt them.
 #[test]
 fn test_snapshot_hebrew_logical_order() {
@@ -1541,7 +1541,7 @@ fn test_identity_h_no_tounicode_suppresses_garbage() {
     // `is_cid_garbage` flagged. The Type0/CID guard in
     // `extract_text_from_operand` now emits one U+FFFD per CID instead of
     // mojibake; `detect_encoding_issues` trips on that and suppresses the
-    // markdown / flags the page for OCR — so we still pass this test, but
+    // markdown / flags the page for OCR, so we still pass this test, but
     // via the deliberate marker path rather than by accident.
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
 
@@ -1744,7 +1744,7 @@ fn make_pdf_with_custom_text_layer(
          /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> \
          /Contents 4 0 R >>",
     );
-    // Full-page raster, then the text layer in the requested render mode —
+    // Full-page raster, then the text layer in the requested render mode,
     // several lines so the OCR-layer gate's alnum floor (40) is well cleared.
     let mut content = String::from("q 612 0 0 792 0 0 cm /Im0 Do Q\n");
     let default_layer = [
@@ -1754,7 +1754,7 @@ fn make_pdf_with_custom_text_layer(
     ];
     let layer: &[&str] = layer_lines.unwrap_or(&default_layer);
     if quote_ops {
-        // Every line shown via `'` (move-to-next-line + show) — nothing on
+        // Every line shown via `'` (move-to-next-line + show), nothing on
         // this layer goes through Tj, pinning the `'` suppression path.
         content.push_str(&format!(
             "BT /F1 12 Tf {text_render_mode} Tr 16 TL 72 716 Td "
@@ -1815,7 +1815,7 @@ fn make_pdf_with_text_layer(text_render_mode: i32, visible_extra: Option<&str>) 
 
 /// A scanned page whose only text is an invisible (Tr 3) OCR layer behind
 /// the raster must serve that layer from the region extractor instead of
-/// reporting the region as needs_ocr — the exact text is already in the PDF.
+/// reporting the region as needs_ocr, the exact text is already in the PDF.
 #[test]
 fn test_extract_regions_mem_recovers_invisible_ocr_layer() {
     let buf = make_pdf_with_text_layer(3, None);
@@ -1833,7 +1833,7 @@ fn test_extract_regions_mem_recovers_invisible_ocr_layer() {
     );
 }
 
-/// ANY visible text on the page — even a single short line — must block the
+/// ANY visible text on the page, even a single short line, must block the
 /// invisible-layer adoption entirely: the invisible pass returns visible
 /// items too, so adopting it alongside visible text would duplicate the
 /// visible words. Strict zero-visible gate, no fuzzy dedupe.
@@ -1861,7 +1861,7 @@ fn test_extract_regions_mem_visible_text_blocks_invisible_layer() {
 }
 
 /// An invisible OCR layer shown entirely via the `'` show-text operator
-/// (move-to-next-line + show) must also be recovered — the skipped_invisible
+/// (move-to-next-line + show) must also be recovered, the skipped_invisible
 /// signal has to fire on every show-text path, not just Tj/TJ.
 #[test]
 fn test_extract_regions_mem_recovers_quote_operator_layer() {
@@ -1877,7 +1877,7 @@ fn test_extract_regions_mem_recovers_quote_operator_layer() {
 }
 
 /// An invisible layer below the 40-alnum floor (a stray watermark line)
-/// must NOT be adopted — the region keeps its needs_ocr fallback.
+/// must NOT be adopted, the region keeps its needs_ocr fallback.
 #[test]
 fn test_extract_regions_mem_tiny_invisible_layer_not_adopted() {
     let buf = make_pdf_with_custom_text_layer(3, None, Some(&["Scanned by ACME"]), false);
@@ -1888,7 +1888,7 @@ fn test_extract_regions_mem_tiny_invisible_layer_not_adopted() {
         "below-floor invisible layer must not be adopted, got: {:?}",
         region.text
     );
-    // Only the raster placeholder remains — needs_ocr stays whatever main
+    // Only the raster placeholder remains, needs_ocr stays whatever main
     // reports for placeholder-only regions (false today; downstream
     // pipelines route placeholder-only text to OCR themselves, and this PR
     // deliberately does not change that contract).
@@ -1923,7 +1923,7 @@ fn test_extract_regions_mem_garbage_invisible_layer_not_adopted() {
 }
 
 /// Punctuation-only visible text (zero alphanumerics) must ALSO block
-/// adoption — the gate is item-presence, not alphanumeric mass. (Real-world
+/// adoption, the gate is item-presence, not alphanumeric mass. (Real-world
 /// rationale: an invisible OCR layer transcribes the raster, so visible
 /// glyphs typically have invisible twins there; this fixture's layers are
 /// disjoint, so it pins the gate itself, not the duplication scenario.)
@@ -1946,7 +1946,7 @@ fn test_extract_regions_mem_punctuation_visible_blocks_invisible_layer() {
 }
 
 /// Regression guard: a normal visible-text page (render mode 0) is served
-/// once and only once — if the fallback ever mis-fired here and merged a
+/// once and only once, if the fallback ever mis-fired here and merged a
 /// second pass, the phrase would duplicate.
 #[test]
 fn test_extract_regions_mem_visible_layer_unchanged() {
@@ -2111,7 +2111,7 @@ fn test_collect_text_in_region_uses_rtl_sorting() {
 /// For each text-based fixture PDF, compare `extract_text_in_regions_mem` (fast path)
 /// against `process_pdf_mem` (normal path). If the fast path claims needs_ocr=false
 /// for a page, verify the extracted text has meaningful overlap with the normal
-/// markdown output — catching silent quality regressions.
+/// markdown output, catching silent quality regressions.
 #[test]
 fn test_extract_regions_fast_vs_normal_comparison() {
     let fixtures = [
@@ -2157,7 +2157,7 @@ fn test_extract_regions_fast_vs_normal_comparison() {
             }
 
             // If fast path flags needs_ocr but normal path didn't, that's overly
-            // conservative but not a bug — just worth knowing.
+            // conservative but not a bug, just worth knowing.
             if region.needs_ocr && !ocr_pages.contains(&(pr.page + 1)) {
                 eprintln!(
                     "INFO: {fixture} page {}: fast path says needs_ocr=true but normal path extracted fine (conservative, not a bug)",
@@ -2328,7 +2328,7 @@ fn test_extract_tables_in_regions_uses_line_grid() {
 // =========================================================================
 
 /// Build an 8-element 4-corner polygon `[x1,y1, x2,y1, x2,y2, x1,y2]` from
-/// an axis-aligned rect — matches the format SLANet emits for cell bboxes.
+/// an axis-aligned rect, matches the format SLANet emits for cell bboxes.
 fn poly(x1: f32, y1: f32, x2: f32, y2: f32) -> Vec<f32> {
     vec![x1, y1, x2, y1, x2, y2, x1, y2]
 }
@@ -2706,7 +2706,7 @@ fn test_extract_tables_with_structure_real_pdf_bits_pilani() {
     //   row 1 (data):   "BIO"          "8.23"
     //
     // The PDF page is US Letter (792pt tall). We render at 72 dpi so
-    // image-px maps 1:1 to PDF-pt — that lets us write cell bboxes in
+    // image-px maps 1:1 to PDF-pt, that lets us write cell bboxes in
     // the same units as our hand-measured page-pt coordinates.
     let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
 
@@ -3076,7 +3076,7 @@ fn test_auto_passes_through_clean_tsr_output() {
     .map(String::from)
     .collect();
     // Cells fit each visible row cleanly. Same shape as the existing
-    // dense-overlap regression test — TSR should produce clean output
+    // dense-overlap regression test, TSR should produce clean output
     // and the auto wrapper should pass through with no fallback.
     let cell_bboxes = vec![
         poly(10.0, 72.0, 100.0, 112.0),
@@ -3116,7 +3116,7 @@ fn test_auto_expands_multi_row_in_cell() {
     let buf = synthetic_dense_table_pdf();
     // TSR returns only 2 rows for what's actually 3 visible PDF rows.
     // Row 1's cells are tall enough to encompass both Oak Street and
-    // Boardwalk text — the FNBO row-undercount pattern.
+    // Boardwalk text, the FNBO row-undercount pattern.
     let tokens: Vec<String> = [
         "<table>",
         "<thead>",
@@ -3138,7 +3138,7 @@ fn test_auto_expands_multi_row_in_cell() {
     .collect();
     // Header row at top-left y=[88, 105] (covers "Branch Name"/"Deposits"
     // at native y=700, top-left y≈92-103). The "data" row at top-left
-    // y=[105, 145] is intentionally tall — covers BOTH the Oak Street
+    // y=[105, 145] is intentionally tall, covers BOTH the Oak Street
     // line (top-left y≈108-119) AND the Boardwalk line (y≈124-135).
     let cell_bboxes = vec![
         poly(10.0, 88.0, 100.0, 105.0),
@@ -3340,7 +3340,7 @@ fn test_auto_does_not_fire_on_legit_rowspan_cell() {
     let cell_bboxes = vec![
         poly(10.0, 88.0, 100.0, 105.0),
         poly(90.0, 88.0, 180.0, 105.0),
-        poly(10.0, 105.0, 100.0, 145.0), // rowspan=2 — covers both lines
+        poly(10.0, 105.0, 100.0, 145.0), // rowspan=2, covers both lines
         poly(90.0, 105.0, 180.0, 122.0), // row 1 only
         poly(90.0, 122.0, 180.0, 145.0), // row 2 only
     ];
@@ -3369,7 +3369,7 @@ fn test_auto_expands_when_heuristic_region_is_empty() {
     use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
 
     let buf = synthetic_dense_table_pdf();
-    // Same shape as the multi_row_in_cell regression — a tall data cell
+    // Same shape as the multi_row_in_cell regression, a tall data cell
     // that catches Oak Street + Boardwalk. The crop bbox we pass points
     // at a strip of the page that has NO text items, so the old heuristic
     // fallback would be empty. Expansion uses the cell bboxes directly.
@@ -3393,7 +3393,7 @@ fn test_auto_expands_when_heuristic_region_is_empty() {
     .map(String::from)
     .collect();
     // Cell bboxes overlap the actual PDF text (so multi_row_in_cell
-    // fires) — but the crop_pdf_pt_bbox we hand to the heuristic is a
+    // fires), but the crop_pdf_pt_bbox we hand to the heuristic is a
     // wholly-empty region of the page. The heuristic should return "".
     let cell_bboxes = vec![
         poly(10.0, 88.0, 100.0, 105.0),
@@ -4009,10 +4009,10 @@ fn synthetic_type0_broken_tounicode_pdf() -> Vec<u8> {
         .into(),
     );
 
-    // Intentionally malformed ToUnicode stream — just junk bytes. ToUnicode
+    // Intentionally malformed ToUnicode stream, just junk bytes. ToUnicode
     // CMap parsing will fail, so `font_cmaps.get_by_obj` returns None and
     // `has_cmap` stays false. The reference still exists in the font dict,
-    // so `font_tounicode_refs` contains the entry — but the new guard now
+    // so `font_tounicode_refs` contains the entry, but the new guard now
     // routes off `is_cid` from font_widths instead, which is robust to a
     // failed CMap parse.
     doc.objects.insert(
@@ -4181,7 +4181,7 @@ fn make_pdf_with_image(image_ctm: [f32; 6]) -> Vec<u8> {
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     );
     // 1×1 grayscale image; the single byte is mid-gray. Contents don't
-    // matter to the extractor — it only cares about the XObject's
+    // matter to the extractor, it only cares about the XObject's
     // /Subtype and the CTM at the `Do` operator.
     let image_pixel = [128u8];
     add_stream_object(
@@ -4268,7 +4268,7 @@ fn test_image_xobject_bbox_handles_rotated_ctm() {
 
 #[test]
 fn test_image_emission_does_not_change_default_markdown() {
-    // Default `MarkdownOptions::include_images = false` — adding image
+    // Default `MarkdownOptions::include_images = false`, adding image
     // emission MUST NOT make `extract_pages_markdown` start producing
     // `![Image: …]` placeholders for everyone. Existing callers that
     // upgrade should see no diff in their markdown.
@@ -4325,7 +4325,7 @@ fn encrypted_pdf_decrypts_with_correct_password() {
 /// Regression for the #231 review finding: `extract_pages_markdown`'s
 /// `has_template_image` check must be gated the same way
 /// `classify_pdf`/`detect_pdf_type` gates it (image_count <= 1, few text
-/// ops, low alphanumeric diversity) — not treated as sufficient on its
+/// ops, low alphanumeric diversity), not treated as sufficient on its
 /// own. The fixture is a real text page with substantial, richly varied
 /// body text (>=50 Tj ops) drawn over a full-bleed background image
 /// (e.g. letterhead/watermark). Before the fix, has_template_image alone
@@ -4354,7 +4354,7 @@ fn test_extract_pages_markdown_does_not_ocr_text_page_with_watermark_image() {
 /// Mixed-type per-page routing always sends vector-outlined-text pages to
 /// OCR (outlined glyphs can't be extracted as text). A page with massive
 /// path ops (outlined decorative text) plus a short genuine caption would
-/// extract that caption cleanly — non-empty, non-garbled — so the
+/// extract that caption cleanly, non-empty, non-garbled, so the
 /// existing empty/garbage-text checks alone couldn't catch it.
 #[test]
 fn test_extract_pages_markdown_ocrs_page_with_vector_outlined_text() {
@@ -4393,7 +4393,7 @@ fn pdf_options_debug_redacts_password() {
 }
 
 /// Regression for #228: a `startxref` pointer corrupted to point at the
-/// wrong byte offset (a single flipped digit — a real, common writer bug)
+/// wrong byte offset (a single flipped digit, a real, common writer bug)
 /// must not make the whole file unprocessable. The real classic xref table
 /// is still present and findable by scanning for the `xref` keyword; both
 /// pypdf and pdfium recover the same way. Before this fix, every entry
@@ -4418,7 +4418,7 @@ fn test_process_pdf_recovers_corrupted_startxref_pointer() {
 /// Regression for #227: `extract_pages_markdown`'s per-page `needs_ocr`
 /// must agree with `classify_pdf`/`detect_pdf_type` on the same page. The
 /// fixture is a full-page raster "scan" with a single line of genuine
-/// native text drawn over it (a header) — the native text extracts
+/// native text drawn over it (a header), the native text extracts
 /// perfectly cleanly (no decoding issues, non-empty), so a needs_ocr
 /// computation based on text-quality signals alone says `false`, while
 /// detection correctly sees a dominant background image and says the page
@@ -4446,5 +4446,155 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         "a page flagged needs_ocr must not return markdown as if extraction were \
          trustworthy, got: {:?}",
         page.markdown
+    );
+}
+
+/// Build a two-page "scan with an invisible OCR layer" PDF: every page draws
+/// a full-bleed raster image and then paints its text at render mode 3, the
+/// shape OCRmyPDF and similar re-OCR pipelines produce. `lines_per_page`
+/// controls how many `Tj` operators each page carries, which is what steers
+/// detection into `Mixed` (one page below the image-page text-operator floor,
+/// one above it).
+fn make_scan_with_invisible_ocr_layer(lines_per_page: [usize; 2]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    fn add_stream_object(
+        pdf: &mut Vec<u8>,
+        offsets: &mut Vec<usize>,
+        id: usize,
+        dict: &str,
+        stream_bytes: &[u8],
+    ) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(
+            format!("<< {} /Length {} >>\nstream\n", dict, stream_bytes.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(stream_bytes);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+    // Full-bleed image, then the OCR transcription at `3 Tr` (never painted).
+    fn page_content(lines: usize, first_line: usize) -> String {
+        let mut content = String::from("q 612 0 0 792 0 0 cm /Im0 Do Q\n");
+        for i in 0..lines {
+            content.push_str(&format!(
+                "BT /F1 12 Tf 3 Tr 72 {} Td \
+                 (Invisible OCR line {} transcribed from the scanned page) Tj ET\n",
+                700 - i * 20,
+                first_line + i
+            ));
+        }
+        content
+    }
+
+    // 1: catalog → 2: pages → 3/6: pages → 4/7: content streams
+    // 5: font → 8: image XObject (1×1 grayscale, scaled to the whole page)
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 8 0 R >> >> \
+         /Contents 4 0 R >>",
+    );
+    add_stream_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        "",
+        page_content(lines_per_page[0], 0).as_bytes(),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 8 0 R >> >> \
+         /Contents 7 0 R >>",
+    );
+    add_stream_object(
+        &mut pdf,
+        &mut offsets,
+        7,
+        "",
+        page_content(lines_per_page[1], 100).as_bytes(),
+    );
+    let image_pixel = [128u8];
+    add_stream_object(
+        &mut pdf,
+        &mut offsets,
+        8,
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8",
+        &image_pixel,
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// Regression for #466: the Mixed invisible-text retry samples the items
+/// from the normal extraction pass, and that sample must ignore
+/// `[Image: …]` placeholders. On a scan whose only visible content is a
+/// raster, the placeholders are the whole sample, non-empty and not
+/// garbage, so the retry that recovers the invisible (Tr 3) OCR layer was
+/// skipped and the document reported no extractable text. The crate already
+/// draws this line in `non_placeholder_alnum`: placeholders mark that pixels
+/// exist, not that text was read.
+#[test]
+fn test_mixed_ocr_retry_ignores_image_placeholders_in_the_sample() {
+    let pdf = make_scan_with_invisible_ocr_layer([6, 12]);
+
+    let detected = process_pdf_mem_with_options(&pdf, PdfOptions::detect_only())
+        .expect("fixture should classify");
+    assert_eq!(
+        detected.pdf_type,
+        PdfType::Mixed,
+        "fixture must exercise the Mixed retry path"
+    );
+
+    let result = process_pdf_mem(&pdf).expect("fixture should process");
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Invisible OCR line 0") && md.contains("Invisible OCR line 100"),
+        "the invisible OCR layer must be recovered on both pages, got: {md:?}"
     );
 }

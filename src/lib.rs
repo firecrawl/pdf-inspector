@@ -111,7 +111,7 @@ pub const OCR_REASON_SUSPECTED_GARBLED_TEXT: &str = "suspected_garbled_text";
 /// page) with no usable text layer.
 pub const OCR_REASON_SCANNED: &str = "scanned";
 
-/// OCR reason: the page has no extractable text and no image to OCR — blank,
+/// OCR reason: the page has no extractable text and no image to OCR, blank,
 /// or content the parser cannot reach.
 pub const OCR_REASON_NO_TEXT: &str = "no_text";
 
@@ -149,7 +149,7 @@ pub struct PdfProcessResult {
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
     /// Title from PDF metadata (if available).
     pub title: Option<String>,
-    /// Detection confidence score (0.0–1.0).
+    /// Detection confidence score (0.0-1.0).
     pub confidence: f32,
     /// Layout complexity analysis (tables, multi-column detection).
     pub layout: LayoutComplexity,
@@ -271,7 +271,7 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
     process_pdf_with_options(path, PdfOptions::new())
 }
 
-/// Fast metadata-only detection — no text extraction or markdown generation.
+/// Fast metadata-only detection, no text extraction or markdown generation.
 ///
 /// Equivalent to `process_pdf_with_options(path, PdfOptions::detect_only())`.
 pub fn detect_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError> {
@@ -288,7 +288,7 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
     let start = ProcessingTimer::start();
     validate_pdf_file(&path)?;
 
-    // Load the document once — shared by detection AND extraction.
+    // Load the document once, shared by detection AND extraction.
     let (doc, page_count) =
         load_document_from_path_with_password(&path, options.password.as_deref())?;
 
@@ -383,7 +383,7 @@ pub struct PdfClassification {
     pub page_count: u32,
     /// 0-indexed page numbers that need OCR (scanned/image pages).
     pub pages_needing_ocr: Vec<u32>,
-    /// Detection confidence score (0.0–1.0).
+    /// Detection confidence score (0.0-1.0).
     pub confidence: f32,
 }
 
@@ -626,7 +626,7 @@ fn extract_pages_markdown_mem_impl(
         // while still being fundamentally a scan: a full-page raster with
         // a little genuine native text drawn over it (a header, a stamp, a
         // cover-sheet annotation). Text-quality signals alone can't see
-        // that — consult the same "large background image" signal
+        // that, consult the same "large background image" signal
         // classify_pdf/detect_pdf_type already uses, so the two APIs can't
         // silently disagree on whether a page needs OCR. See #227.
         // Also covers vector-outlined text (glyphs drawn as paths, not
@@ -635,7 +635,7 @@ fn extract_pages_markdown_mem_impl(
         // non-empty, non-garbled markdown and miss OCR routing entirely.
         // detect_from_document's Mixed-type per-page routing always sends
         // these pages to OCR; mirror that here too. Both signals share one
-        // analyze_page_content pass — see page_ocr_signals's doc comment.
+        // analyze_page_content pass, see page_ocr_signals's doc comment.
         let (has_template_image, has_vector_text) = lopdf_pages
             .get(&page_1idx)
             .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
@@ -996,7 +996,7 @@ const OCR_LAYER_MIN_ALNUM: usize = 40;
 
 /// Alphanumeric mass of extracted items, ignoring raster placeholders.
 /// `[Image: ...]` items (ItemType::Image) are synthesized for image
-/// XObjects — they mark that pixels exist, not that text was read, so they
+/// XObjects, they mark that pixels exist, not that text was read, so they
 /// must not count as coverage.
 fn non_placeholder_alnum(items: &[TextItem]) -> usize {
     items
@@ -1010,15 +1010,15 @@ fn non_placeholder_alnum(items: &[TextItem]) -> usize {
 ///
 /// This is designed for hybrid OCR pipelines: a layout model detects regions
 /// in a rendered page image, and this function extracts the PDF text that
-/// falls within each region — avoiding GPU OCR for text-based pages.
+/// falls within each region, avoiding GPU OCR for text-based pages.
 ///
 /// Each region result includes a `needs_ocr` flag that is set when extraction
 /// quality is suspect (empty text, GID-encoded fonts, garbage/encoding issues).
 ///
 /// # Arguments
 ///
-/// * `buffer` — PDF file bytes
-/// * `page_regions` — list of `(page_number_0indexed, Vec<[x1, y1, x2, y2]>)`.
+/// * `buffer`, PDF file bytes
+/// * `page_regions`, list of `(page_number_0indexed, Vec<[x1, y1, x2, y2]>)`.
 ///   Coordinates are in **PDF points** with **top-left origin** (matching typical
 ///   layout model output after coordinate conversion).
 ///
@@ -1076,16 +1076,16 @@ pub fn extract_text_in_regions_mem(
         // invisible (Tr 3) layer behind the page raster. The visible-only
         // pass sees nothing there but `[Image: ...]` placeholders, so every
         // region on the page reports needs_ocr even though the exact text is
-        // embedded in the PDF — and this extractor then disagrees with the
+        // embedded in the PDF, and this extractor then disagrees with the
         // markdown path, which already retries Mixed PDFs with the invisible
         // layer included. Retry page-scoped, and only when (a) the first
-        // pass actually SKIPPED invisible text — blank pages and image-only
+        // pass actually SKIPPED invisible text, blank pages and image-only
         // scans without an OCR layer must not pay a second content-stream
-        // parse (review catch) — and (b) the page has NO visible text item
+        // parse (review catch), and (b) the page has NO visible text item
         // at all (punctuation counts, whitespace-only artifacts don't): an
         // invisible OCR layer transcribes the raster, so any visible glyph
         // has an invisible twin there and adoption would duplicate it
-        // (review catches — strict gate, no fuzzy dedupe). Adopt the retry
+        // (review catches, strict gate, no fuzzy dedupe). Adopt the retry
         // only when it contributes real, non-garbage text.
         let has_visible_text = items.iter().any(|it| {
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
@@ -1103,7 +1103,7 @@ pub fn extract_text_in_regions_mem(
                 )
             {
                 let inv_alnum = non_placeholder_alnum(&inv_items);
-                // Judge the WHOLE recovered layer, not a prefix — a broken
+                // Judge the WHOLE recovered layer, not a prefix, a broken
                 // OCR layer can hide its garbage past any fixed sample size
                 // (review catch).
                 let sample: String = inv_items
@@ -1151,7 +1151,7 @@ pub fn extract_text_in_regions_mem(
         // Exclusive item->region assignment: overlapping layout regions used
         // to extract shared items into EVERY region they touched (the
         // 1.5pt inclusion margin makes borders generous), duplicating whole
-        // lines in the final markdown on 21% of bench docs — and downstream
+        // lines in the final markdown on 21% of bench docs, and downstream
         // duplicate-handling sometimes dropped the variant holding a
         // sentence tail, turning duplication into content LOSS. Each item
         // now belongs to the single region with the largest overlap area;
@@ -1320,7 +1320,7 @@ pub fn extract_tables_in_regions_mem(
             // Note: we intentionally DO NOT bail on page_has_gid here.
             // The GID flag means some font on the page uses unresolvable
             // glyph IDs, but that font may only appear in a logo or
-            // header — not in the table region. Instead we let the
+            // header, not in the table region. Instead we let the
             // per-region text quality checks (is_garbage_text, is_cid_garbage,
             // detect_encoding_issues) reject based on the actual extracted
             // content. This avoids rejecting clean tables just because an
@@ -1445,7 +1445,7 @@ pub fn extract_tables_in_regions_mem(
                     // the visible text, so the region should fall back to
                     // OCR. `captured_only_a_fragment` compares captured
                     // chars against text the extractor saw, which is
-                    // symmetrically low under font-decode failure — this
+                    // symmetrically low under font-decode failure, this
                     // guard breaks that symmetry by comparing against
                     // bbox area, which is independent of extraction.
                     if source != TableCandidateSource::KeyValue
@@ -1852,7 +1852,7 @@ mod vector_grid_tests {
     /// for it, and the rect detector then admits a 10×2 fake table where
     /// every cell holds a sentence fragment ("I agree to comply...", "I",
     /// "It is the property owner's responsibility..."). This test asserts
-    /// the detector REJECTS that fake table — only the real 5×3 form data
+    /// the detector REJECTS that fake table, only the real 5×3 form data
     /// table (TYPE / SIZE / SETBACKS) should survive. See pdf-evals PR #30
     /// for the original score regression that surfaced this.
     #[test]
@@ -2005,7 +2005,7 @@ mod vector_grid_tests {
         assert!(!detected.cell_bboxes.is_empty());
     }
 
-    /// Regression for `greencomp_competence.pdf` — a 2-column "Area / Competence"
+    /// Regression for `greencomp_competence.pdf`, a 2-column "Area / Competence"
     /// glossary with a green-shaded header row and plain (line-drawn) body cells.
     /// Mirrors the production failure cohort #1 (Contractions glossary) and #6
     /// (BIO 350 course header): a few colored header rects sit in a horizontal
@@ -2040,7 +2040,7 @@ mod vector_grid_tests {
         );
     }
 
-    /// Regression for `upstage_key_functions.pdf` — a 4-column "Service Stage /
+    /// Regression for `upstage_key_functions.pdf`, a 4-column "Service Stage /
     /// Function Name / Explanation / Expected Benefit" table with a blue-shaded
     /// header band plus alternating row backgrounds. Mirrors production crops
     /// #2 (Parameter / Value with alternating blue rows) and #7 (Spanish XML
@@ -2071,7 +2071,7 @@ mod vector_grid_tests {
         );
     }
 
-    /// Regression for `wired_header_data_misalign.pdf` — a single page from a
+    /// Regression for `wired_header_data_misalign.pdf`, a single page from a
     /// parts catalog with a 4-column wire-bordered table (`Item | EAN | Nombre
     /// | Cant`). Column headers are centered/right-aligned inside their cells
     /// while data is left-aligned, so cluster_x_positions merges or drops
@@ -2495,7 +2495,7 @@ fn extracted_bbox_to_page_top_left(
 /// The structure tokens and bboxes are typically produced by an external
 /// table-structure recognition model (e.g. SLANet on PaddleOCR) running on
 /// a rendered crop of the page. pdf-inspector uses the structure to lay out
-/// the cells and pulls the cell text from the native PDF — no OCR involved.
+/// the cells and pulls the cell text from the native PDF, no OCR involved.
 #[derive(Debug, Clone)]
 pub struct TsrTableInput {
     /// 0-indexed page number where the crop was taken from.
@@ -2523,7 +2523,7 @@ pub struct TsrTableInput {
 ///    awareness.
 /// 2. Converts each cell bbox from crop image-pixels into page PDF-points.
 /// 3. Pulls the cell's text by overlap-testing PDF text items inside that
-///    bbox — same primitives used by [`extract_text_in_regions_mem`].
+///    bbox, same primitives used by [`extract_text_in_regions_mem`].
 ///
 /// Returns one `Vec<StructuredCell>` per input, in input order. Each cell
 /// carries its (row, col, rowspan, colspan, is_header) metadata, the
@@ -2588,7 +2588,7 @@ pub fn extract_tables_with_structure_cells_mem(
     for input in inputs {
         let page_1idx = input.page + 1;
         let Some(items) = items_by_page.get(&page_1idx) else {
-            // Out-of-range page or page with no extractable text — emit empty.
+            // Out-of-range page or page with no extractable text, emit empty.
             results.push(Vec::new());
             continue;
         };
@@ -2714,13 +2714,13 @@ pub fn extract_tables_with_structure_cells_mem(
         }
 
         // Build per-cell text from the assigned tokens. Markdown cells must
-        // be one line — collapse line breaks from the line-grouping pass.
+        // be one line, collapse line breaks from the line-grouping pass.
         for (cell_idx, matched) in per_cell_items.into_iter().enumerate() {
             cells[cell_idx].text = collect_text_from_matched_items(matched, adaptive_threshold)
                 .replace(['\n', '\r'], " ");
         }
 
-        // Stage 2: orphan assignment — tokens that didn't land in any cell
+        // Stage 2: orphan assignment, tokens that didn't land in any cell
         // during stage 1 get assigned to their nearest *empty* cell,
         // clamped by a plausibility cap derived from cell geometry.
         //
@@ -2751,8 +2751,8 @@ pub fn extract_tables_with_structure_cells_mem(
 /// token, with each token's `x` / `width` estimated from the original item's
 /// effective width and the token's character offset.
 ///
-/// PDFs often render an entire row's content as a single Tj — e.g.
-/// "Marshall Islands 0.9 0.9 0.9" — producing one wide TextItem whose
+/// PDFs often render an entire row's content as a single Tj, e.g.
+/// "Marshall Islands 0.9 0.9 0.9", producing one wide TextItem whose
 /// center sits in only one of the model-emitted cells. Per-item routing
 /// then parks the whole row in that one cell. Splitting on whitespace
 /// gives each word its own approximate position so per-cell routing can
@@ -2762,7 +2762,7 @@ pub fn extract_tables_with_structure_cells_mem(
 /// The character-width estimate is `effective_width / char_count`.
 /// `effective_width` returns the explicit `item.width` when known and
 /// otherwise falls back to `char_count * font_size * 0.5`. Either way the
-/// estimate is uniform across the item — fine for routing, since we only
+/// estimate is uniform across the item, fine for routing, since we only
 /// need to know which cell each token's center lands in, not its exact
 /// position. Single-token items collapse to a one-element vector
 /// equivalent to the input item, making this a no-op for the common case.
@@ -2812,7 +2812,7 @@ fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
 }
 
 /// Compute plausibility caps for the orphan-assignment pass. Returns
-/// `(cap_x, cap_y)` — the maximum x/y distance from a text item's center
+/// `(cap_x, cap_y)`, the maximum x/y distance from a text item's center
 /// to a candidate empty cell's bbox before the candidate is rejected.
 ///
 /// Caps are derived from cell geometry so they scale with the table:
@@ -2849,7 +2849,7 @@ fn tsr_assignment_caps(cells: &[tables::StructuredCell]) -> (f32, f32) {
 /// For each text item that wasn't claimed by any cell during stage 1,
 /// find the nearest *empty* cell within `(cap_x, cap_y)` of the item's
 /// center and append the item's text to that cell. Cells that already
-/// have content are skipped — stage 2 only fills, never augments.
+/// have content are skipped, stage 2 only fills, never augments.
 ///
 /// Distance is point-to-rect: 0 if the item center is inside the cell's
 /// bbox, else the axis-aligned gap to the nearest edge. Both x-gap and
@@ -2870,11 +2870,11 @@ fn tsr_assign_orphan_items(
     if cap_x <= 0.0 || cap_y <= 0.0 {
         return;
     }
-    // Y-tolerance for "same line as a previous orphan" — multi-token branch
+    // Y-tolerance for "same line as a previous orphan", multi-token branch
     // names like "Blue Valley Parkway" are 3 separate text items and should
     // all stack into the same cell. But two orphans on different rows of
     // the PDF (different y values) targeting the same empty cell should
-    // NOT merge — that produces the "Mitchell Woonsocket" / "Shawnee Blue
+    // NOT merge, that produces the "Mitchell Woonsocket" / "Shawnee Blue
     // Valley Parkway" run-on cells. Half a row of slack is conservative.
     let y_tolerance = (cap_y * 0.5).max(3.0);
 
@@ -3313,10 +3313,10 @@ fn try_expand_multi_row_cells(
 /// Returns `Some(issue)` if the cells look like they reflect a known
 /// SLANet detection pathology. Reasons (also used as metric labels):
 ///
-/// * `phantom_empty_row` — a row whose every cell is empty, surrounded
+/// * `phantom_empty_row`, a row whose every cell is empty, surrounded
 ///   above and below by rows with content. SLANet sometimes emits an
 ///   extra row that doesn't correspond to any visible PDF row.
-/// * `multi_row_in_cell` — at least one non-label `rowspan==1` cell
+/// * `multi_row_in_cell`, at least one non-label `rowspan==1` cell
 ///   encloses PDF text items that cluster into two distinct visual lines
 ///   separated by a whitespace gap larger than the line height. Cells
 ///   declared as `rowspan>1` are excluded since they are *expected*
@@ -3388,7 +3388,7 @@ fn detect_tsr_quality_issue(
     let first_col = cells.iter().map(|cell| cell.col).min().unwrap_or(0);
 
     for cell in cells {
-        // rowspan>1 cells are intentionally multi-line — skip them.
+        // rowspan>1 cells are intentionally multi-line, skip them.
         if cell.rowspan > 1 {
             continue;
         }
@@ -3447,7 +3447,7 @@ fn is_wrapped_tsr_label_cell(
 ///   result is labeled `multi_row_in_cell_expanded` and the heuristic is
 ///   not consulted.
 /// * **Per-input errors**: any failure in detection or heuristic
-///   extraction for a single input is contained — that input
+///   extraction for a single input is contained, that input
 ///   returns the raw TSR markdown with `fallback_reason` set to
 ///   an `_error` label so callers can metric on it. Other inputs
 ///   in the same batch are unaffected.
@@ -3474,7 +3474,7 @@ pub fn extract_tables_with_structure_auto_mem(
         let issue = match detect_tsr_quality_issue(buffer, input, cells) {
             Ok(opt) => opt,
             Err(_) => {
-                // Detection failed for this input — fall through with
+                // Detection failed for this input, fall through with
                 // the raw TSR markdown so the rest of the batch is
                 // unaffected. Tag the reason for caller metrics.
                 results.push(TableExtractionResult {
@@ -3517,7 +3517,7 @@ pub fn extract_tables_with_structure_auto_mem(
                         .and_then(|p| p.regions.into_iter().next().map(|r| r.text))
                         .unwrap_or_default(),
                     Err(_) => {
-                        // Heuristic threw — keep raw TSR markdown.
+                        // Heuristic threw, keep raw TSR markdown.
                         results.push(TableExtractionResult {
                             markdown: tsr_md,
                             fallback_reason: Some(format!("{reason}_heuristic_error")),
@@ -3526,7 +3526,7 @@ pub fn extract_tables_with_structure_auto_mem(
                     }
                 };
                 if heuristic_md.trim().is_empty() {
-                    // Heuristic produced nothing useful — keep TSR
+                    // Heuristic produced nothing useful, keep TSR
                     // markdown rather than ship empty. The reason
                     // suffix lets callers count this case.
                     TableExtractionResult {
@@ -3744,12 +3744,12 @@ fn region_bounds(
 }
 
 /// Inclusion margin shared by the region/item overlap predicates and the
-/// exclusive-assignment area score — these MUST stay in sync: an item that
+/// exclusive-assignment area score, these MUST stay in sync: an item that
 /// passes the boolean guard must always have positive overlap area.
 const REGION_MARGIN: f32 = 1.5;
 
 /// Overlap area between an item and region bounds (same margin as the
-/// boolean test) — the exclusive-assignment score.
+/// boolean test), the exclusive-assignment score.
 fn region_item_overlap_area(item: &TextItem, bounds: RegionBounds) -> f32 {
     let item_x_max = item.x + text_utils::effective_width(item);
     let item_y_max = item.y + item.height;
@@ -3955,23 +3955,23 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// Some PDF writers emit a `startxref` pointer that doesn't actually point
-/// at the cross-reference table — a single corrupted byte in the offset is
+/// at the cross-reference table, a single corrupted byte in the offset is
 /// enough. lopdf trusts that pointer outright and fails to load rather than
 /// searching for the real table, unlike pypdf/pdfium which both recover by
 /// locating it directly. This finds the real (classic, non-stream) `xref`
-/// table by scanning for the keyword — validating that a plausible
+/// table by scanning for the keyword, validating that a plausible
 /// subsection header follows, not just any standalone "xref" token, since
 /// this crate processes untrusted input and a coincidental match inside
 /// unrelated stream/string content must not get "repaired" against a bogus
 /// offset (lopdf would then load successfully against garbage instead of
-/// returning a clean error) — and appends a corrected trailing
+/// returning a clean error), and appends a corrected trailing
 /// `startxref`/`%%EOF` block. lopdf's own `get_xref_start` always uses the
 /// *last* `%%EOF` in the final 512 bytes of the buffer, so ours
 /// transparently supersedes the broken one without needing to touch
 /// anything already in the file.
 ///
 /// Doesn't cover cross-reference *streams* (`N 0 obj << /Type /XRef ...`,
-/// used by some PDF 1.5+ writers instead of a classic table) — recovering
+/// used by some PDF 1.5+ writers instead of a classic table), recovering
 /// those needs the containing object's number, not just a byte offset.
 fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
     let xref_pos = find_last_valid_xref_table_start(buf)?;
@@ -3987,7 +3987,7 @@ fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
 
 /// Finds the last standalone `xref` token in `buf` that is immediately
 /// followed by a plausible classic cross-reference subsection header
-/// (`<start-id> <count>`, e.g. "0 6") — the shape every real classic xref
+/// (`<start-id> <count>`, e.g. "0 6"), the shape every real classic xref
 /// table starts with. A single reverse byte scan: O(n) even on a
 /// pathological buffer with many non-matching or non-standalone "xref"
 /// occurrences, unlike repeatedly re-searching a shrinking prefix.
@@ -4016,7 +4016,7 @@ fn find_last_valid_xref_table_start(buf: &[u8]) -> Option<usize> {
 }
 
 /// Checks that `buf[pos..]` starts (after whitespace) with two
-/// whitespace-separated runs of ASCII digits — `<start-id> <count>`, the
+/// whitespace-separated runs of ASCII digits, `<start-id> <count>`, the
 /// first subsection header of a classic PDF cross-reference table.
 fn looks_like_xref_subsection_header(buf: &[u8], pos: usize) -> bool {
     fn skip_ws(buf: &[u8], mut pos: usize) -> usize {
@@ -4117,7 +4117,7 @@ fn process_document(
     options: PdfOptions,
     start: ProcessingTimer,
 ) -> Result<PdfProcessResult, PdfError> {
-    // Step 1 — Detection (cheap: scans content streams for text operators)
+    // Step 1, Detection (cheap: scans content streams for text operators)
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
     let pdf_type = detection.pdf_type;
     let pages_needing_ocr = detection.pages_needing_ocr;
@@ -4157,7 +4157,7 @@ fn process_document(
         });
     }
 
-    // Step 2 — Extraction (reuses the already-loaded document)
+    // Step 2, Extraction (reuses the already-loaded document)
     let extracted = {
         let font_cmaps = FontCMaps::from_doc(&doc);
         // Most page-filtered requests extract only the selected pages. Gather
@@ -4172,15 +4172,22 @@ fn process_document(
         // For Mixed/template PDFs: if normal extraction produces garbage text
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
+        //
+        // The sample judges what was *read*, so raster placeholders are
+        // excluded for the same reason `non_placeholder_alnum` excludes them:
+        // a scanned page whose only items are `[Image: ...]` would otherwise
+        // look like readable text and skip the retry that recovers its OCR
+        // layer.
         if pdf_type == PdfType::Mixed {
             if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
-                        options
-                            .page_filter
-                            .as_ref()
-                            .is_none_or(|filter| filter.contains(&item.page))
+                        !matches!(item.item_type, types::ItemType::Image)
+                            && options
+                                .page_filter
+                                .as_ref()
+                                .is_none_or(|filter| filter.contains(&item.page))
                     })
                     .take(200)
                     .map(|item| item.text.as_str())
@@ -4195,7 +4202,7 @@ fn process_document(
                     result
                 }
             } else {
-                // Normal extraction failed — try invisible as fallback
+                // Normal extraction failed, try invisible as fallback
                 extractor::extract_positioned_text_include_invisible_with_folio_context(
                     &doc,
                     &font_cmaps,
@@ -4248,7 +4255,7 @@ fn process_document(
             // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
             // passthrough actually produced readable text.  If a page's text
             // is garbage, strip its items so we don't emit mojibake.
-            // Only applies to TextBased — for Mixed PDFs, OCR flags come from
+            // Only applies to TextBased, for Mixed PDFs, OCR flags come from
             // template images rather than font encoding issues.
             let (items, rects, lines) =
                 if pages_needing_ocr.is_empty() || pdf_type != PdfType::TextBased {
@@ -4389,7 +4396,7 @@ fn process_document(
     };
 
     // If the extracted text is predominantly garbage (non-alphanumeric) and
-    // the PDF is image-backed (Mixed/template), upgrade to Scanned — the text
+    // the PDF is image-backed (Mixed/template), upgrade to Scanned, the text
     // layer comes from a bad OCR pass, and callers should use proper OCR.
     let (pdf_type, markdown, confidence) =
         if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
@@ -4404,7 +4411,7 @@ fn process_document(
     let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
         && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
     {
-        log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
+        log::debug!("TextBased PDF has garbage text, flagging all pages for OCR");
         (None, true, true)
     } else {
         (markdown, has_encoding_issues, false)
@@ -4453,7 +4460,7 @@ fn process_document(
         let chars_per_page = md_len as f32 / page_count as f32;
         if chars_per_page < 50.0 && md_len < 500 {
             log::debug!(
-                "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
+                "sparse extraction: {:.0} chars/page, recommending OCR for all {} pages",
                 chars_per_page,
                 page_count
             );
@@ -4463,7 +4470,7 @@ fn process_document(
 
     let markdown = if all_gid {
         log::debug!(
-            "all {} pages have gid-encoded fonts — suppressing markdown output",
+            "all {} pages have gid-encoded fonts, suppressing markdown output",
             page_count
         );
         None
@@ -4541,15 +4548,15 @@ fn page_ocr_reasons_vec(reasons_by_page: BTreeMap<u32, Vec<String>>) -> Vec<Page
 ///
 /// Catches three failure modes observed in production:
 ///
-/// 1. **Header row looks like a data row** — first row starts with a numeric
+/// 1. **Header row looks like a data row**, first row starts with a numeric
 ///    value (e.g. `|2|...`), suggesting we missed the actual header above it.
 ///    Real headers almost never start with a bare number.
 ///
-/// 2. **Header has empty cells in a multi-column table** — e.g.
+/// 2. **Header has empty cells in a multi-column table**, e.g.
 ///    `|Position||Administration|Administration|` (3+ cols, ≥1 empty cell).
 ///    Indicates poor column boundary detection.
 ///
-/// 3. **Header has duplicate non-empty cells** in a multi-column table —
+/// 3. **Header has duplicate non-empty cells** in a multi-column table,
 ///    e.g. `Administration|Administration` appearing as adjacent cells means
 ///    we collapsed multi-line headers wrong.
 ///
@@ -4558,13 +4565,13 @@ fn page_ocr_reasons_vec(reasons_by_page: BTreeMap<u32, Vec<String>>) -> Vec<Page
 /// When `layout_assisted` is true (the layout model identified this region
 /// as a table), we relax boundary-detection heuristics (numeric header,
 /// empty header cells, sparse first data row) because the layout model
-/// already gave us the table bbox — we're not guessing "is this a table?"
+/// already gave us the table bbox, we're not guessing "is this a table?"
 /// anymore, only "can we extract it correctly?". Paragraph and duplicate-
 /// header checks stay, since those indicate genuine extraction quality
 /// issues regardless of how the region was identified.
 /// Return true when the captured table markdown represents only a small
 /// fraction of the text the page extractor actually saw inside the
-/// region — typically a header-only band or a sparse fragment where
+/// region, typically a header-only band or a sparse fragment where
 /// the detector found valid grid structure but missed most of the
 /// data rows below.
 ///
@@ -4585,7 +4592,7 @@ fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
 }
 
 /// Return true when the text the page extractor saw inside this region
-/// is far too little for the bbox area — a strong signal that the page
+/// is far too little for the bbox area, a strong signal that the page
 /// has a font-CMap failure: Identity-H fonts with missing or broken
 /// ToUnicode entries, Type-3 fonts without unicode metadata, etc. The
 /// rendered image still carries the visible text (so GLM-OCR will
@@ -4594,7 +4601,7 @@ fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
 ///
 /// `captured_only_a_fragment` can't catch this case on its own because
 /// `region_text_chars` is itself symmetrically low under font-decode
-/// failure — the captured-vs-region ratio still looks fine when both
+/// failure, the captured-vs-region ratio still looks fine when both
 /// numerator and denominator collapse. The area-based floor breaks the
 /// symmetry: bbox area is independent of extraction success.
 ///
@@ -4613,7 +4620,7 @@ fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
 ///   - area > 400,000 sq pt: near-whole-A4 bboxes include large
 ///     white-space margins, so density is unreliable. Real font-
 ///     decode failures present at typical table sizes
-///     (50k–400k sq pt).
+///     (50k-400k sq pt).
 fn region_text_density_too_low(region_text_chars: usize, region_area: f32) -> bool {
     if region_text_chars < 20 {
         return false;
@@ -4896,7 +4903,7 @@ fn text_cluster_column_undercount(items: &[TextItem], shape: MarkdownTableShape)
         return false;
     }
 
-    // Count "significant" x-clusters — clusters whose item count is at
+    // Count "significant" x-clusters, clusters whose item count is at
     // least 1/4 of the dominant cluster. Filters out within-cell text
     // variation (wrapped continuations, bullet starts, indents) that
     // produces many small x-clusters not corresponding to real columns.
@@ -5118,7 +5125,7 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     let separator_line = lines.get(1).copied().unwrap_or("");
     let is_separator = |l: &str| l.chars().all(|c| matches!(c, '|' | '-' | ' '));
     if !is_separator(separator_line) {
-        // No separator after the first line — not a well-formed pipe-table.
+        // No separator after the first line, not a well-formed pipe-table.
         // table_to_markdown always emits one when it returns content, so this
         // shouldn't happen in practice. If it does, fall through to OCR.
         return true;
@@ -5144,7 +5151,7 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     }
 
     // Failure mode 1: header starts with a bare number (likely we missed
-    // the real header row above). Skip when layout-assisted — the layout
+    // the real header row above). Skip when layout-assisted, the layout
     // model's bbox includes the real header; a numeric first cell (e.g.,
     // a year "2024") is legitimate.
     if !layout_assisted {
@@ -5204,7 +5211,7 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
             let empty_data = data_inner.iter().filter(|c| c.is_empty()).count();
             // ≥3 cols, and significant portion of cells in the first data
             // row are empty → likely we mis-split a multi-row header.
-            // When layout-assisted, relax from 33% to 50% — the bbox is
+            // When layout-assisted, relax from 33% to 50%, the bbox is
             // more reliable, and real tables with one sparse first row
             // (totals, subtotals) are common.
             let threshold = if layout_assisted { 2 } else { 3 };
@@ -5425,21 +5432,21 @@ mod text_cluster_column_undercount_tests {
 
     #[test]
     fn matching_geometry_does_not_fire() {
-        // 4-col page with 4-col markdown — no undercount.
+        // 4-col page with 4-col markdown, no undercount.
         let items = make_four_column_grid();
         assert!(!text_cluster_column_undercount(&items, shape(4)));
     }
 
     #[test]
     fn single_column_skipped() {
-        // 1-col markdown is not a table — never flag.
+        // 1-col markdown is not a table, never flag.
         let items = make_four_column_grid();
         assert!(!text_cluster_column_undercount(&items, shape(1)));
     }
 
     #[test]
     fn insufficient_items_skipped() {
-        // < 2*table_cols items — not enough signal to claim undercount.
+        // < 2*table_cols items, not enough signal to claim undercount.
         let items = vec![
             item(60.0, 700.0, "x"),
             item(145.0, 700.0, "x"),
@@ -5469,7 +5476,7 @@ mod text_cluster_column_undercount_tests {
     fn wide_table_path_still_fires() {
         // The original wide-table case: 6+ markdown cols with ≥2 extra
         // significant clusters. Builds a 12-col geometry with 8-col
-        // markdown — the legacy wide-undercount path catches this.
+        // markdown, the legacy wide-undercount path catches this.
         let mut items = Vec::new();
         let xs: Vec<f32> = (0..12).map(|i| 50.0 + i as f32 * 40.0).collect();
         for row in 0..22 {
@@ -5488,7 +5495,7 @@ mod region_text_density_tests {
 
     #[test]
     fn small_region_skips_check() {
-        // Tiny stat blocks below the area floor are never flagged —
+        // Tiny stat blocks below the area floor are never flagged,
         // can't distinguish "font failure" from "small legitimate table".
         // 100×100 = 10,000 sq pt, below the 30,000 floor.
         assert!(!region_text_density_too_low(5, 10_000.0));
@@ -5496,7 +5503,7 @@ mod region_text_density_tests {
 
     #[test]
     fn dense_full_table_passes() {
-        // Observed clean extractions sit at 0.005–0.015 chars/sq pt.
+        // Observed clean extractions sit at 0.005-0.015 chars/sq pt.
         // Full A4 ledger: 438,000 sq pt with 6,500 chars → density 0.015.
         assert!(!region_text_density_too_low(6_500, 438_000.0));
     }
@@ -5510,7 +5517,7 @@ mod region_text_density_tests {
 
     #[test]
     fn font_decode_failure_caught() {
-        // Big region, almost no extractable text — page extractor hit a
+        // Big region, almost no extractable text, page extractor hit a
         // CMap failure. 102,000 sq pt with 46 chars → density 0.0005.
         assert!(region_text_density_too_low(46, 102_000.0));
     }
@@ -5519,7 +5526,7 @@ mod region_text_density_tests {
     fn sparse_glyph_repeat_caught() {
         // Full-page Cyrillic where every glyph decoded to "Т". The text
         // extractor returned a few hundred chars, but they're all the
-        // same letter. Density 0.00025 — well under the floor.
+        // same letter. Density 0.00025, well under the floor.
         assert!(region_text_density_too_low(89, 353_000.0));
     }
 
@@ -5537,7 +5544,7 @@ mod region_text_density_tests {
         // exactly. The check rejects when density is strictly less than
         // the floor, so the boundary is treated as acceptable.
         assert!(!region_text_density_too_low(90, 30_000.0));
-        // Just under: 89 chars / 30,000 = 0.00297 — flagged.
+        // Just under: 89 chars / 30,000 = 0.00297, flagged.
         assert!(region_text_density_too_low(89, 30_000.0));
     }
 
@@ -5555,7 +5562,7 @@ mod region_text_density_tests {
     #[test]
     fn tiny_text_chars_skips_check() {
         // Synthetic / fragmentary fixtures with <20 chars in a
-        // generously-sized bbox aren't font-decode failures — they're
+        // generously-sized bbox aren't font-decode failures, they're
         // unit-test artifacts. Real prod failures decode ≥30 chars.
         // 8 chars in a 127,800 sq pt bbox would otherwise flag at
         // density 0.00006.
@@ -5577,7 +5584,7 @@ mod captured_only_a_fragment_tests {
 
     #[test]
     fn full_table_passes() {
-        // Captured markdown matches the region text — full extraction.
+        // Captured markdown matches the region text, full extraction.
         let md =
             "|Name|Year|Country|\n|---|---|---|\n|Alice|2020|US|\n|Bob|2021|UK|\n|Carol|2019|FR|";
         // Region had ~50 chars of text (rough estimate of just the data words).
@@ -5605,10 +5612,10 @@ mod captured_only_a_fragment_tests {
     fn boundary_at_25_percent_floor() {
         // Right at the 25% line: 250 captured chars of 1000 region chars.
         // The check rejects when captured*4 < region, so 250*4=1000 is NOT
-        // less than 1000 — boundary is treated as acceptable.
+        // less than 1000, boundary is treated as acceptable.
         let md = "x".repeat(250);
         assert!(!captured_only_a_fragment(&md, 1000));
-        // Just under 25%: 249*4=996 < 1000 — flagged.
+        // Just under 25%: 249*4=996 < 1000, flagged.
         let md_under = "x".repeat(249);
         assert!(captured_only_a_fragment(&md_under, 1000));
     }
@@ -5869,7 +5876,7 @@ mod looks_like_partial_table_tests {
     fn two_column_with_one_empty_cell_passes() {
         // Many real two-column tables have key-only rows; don't penalise.
         let md = "|Key||\n|---|---|\n|Alice|123|\n|Bob|456|";
-        // Header "Key|" has one empty cell but only 2 cols total — keep it.
+        // Header "Key|" has one empty cell but only 2 cols total, keep it.
         assert!(!looks_like_partial_table(md));
     }
 
@@ -5883,7 +5890,7 @@ mod looks_like_partial_table_tests {
 
     #[test]
     fn no_table_at_all_returns_true() {
-        // table_to_markdown should never produce this, but defensive — if
+        // table_to_markdown should never produce this, but defensive, if
         // there's no separator, treat as not-a-table.
         let md = "Just some text\nWith multiple lines";
         // No lines start with '|' so we return false (no header to inspect).
@@ -5922,7 +5929,7 @@ mod looks_like_partial_table_tests {
 
     #[test]
     fn real_multi_word_table_is_kept() {
-        // Real table with multi-word entries — cells start with capital
+        // Real table with multi-word entries, cells start with capital
         // letters / proper nouns, NOT lowercase continuations.
         let md = "|Country|Capital|Notes|\n\
                   |---|---|---|\n\
@@ -6049,7 +6056,7 @@ mod looks_like_partial_table_tests {
 
     #[test]
     fn paragraph_still_rejected_when_layout_assisted() {
-        // Paragraph detection is not relaxed — it's a genuine extraction issue.
+        // Paragraph detection is not relaxed, it's a genuine extraction issue.
         let md = "|Approval is needed from the|Acquisitions of|\n\
                   |---|---|\n\
                   |Treasurer if the acquisition|residential and|\n\
@@ -6214,7 +6221,7 @@ fn compute_layout_complexity_with_chart_regions(
             .unwrap_or_default();
 
         let band_ranges: Vec<(f32, f32)> = if bands.is_empty() {
-            // Single region — use sentinel range that includes everything
+            // Single region, use sentinel range that includes everything
             vec![(f32::MIN, f32::MAX)]
         } else {
             bands
@@ -6687,7 +6694,7 @@ mod tests {
 
     #[test]
     fn test_detect_encoding_issues_few_dollars() {
-        // Under threshold of 10 total dollars — should not trigger
+        // Under threshold of 10 total dollars, should not trigger
         let text = "a$b c$d e$f";
         assert!(!detect_encoding_issues(text));
     }
@@ -7033,7 +7040,7 @@ mod tests {
     #[test]
     fn test_cid_garbage_detection() {
         // Simulates CID garbage from Identity-H fonts: Latin Extended chars
-        // mixed with C1 control characters (U+0080–U+009F).
+        // mixed with C1 control characters (U+0080-U+009F).
         let cid_garbage = "Ë>íÓ\tý\r\u{0088}æ&Ït\u{0094}äí;\ný;wAL¢©èåD\rü£\
                            qq\u{0096}¶Í Æ\réá; Ô 7G\u{008B}ý;èÕç¢ £ ý;C";
         assert!(
@@ -7298,16 +7305,16 @@ mod tests {
         // bounds [100, 112]; an item at native y=104 (center 108) lands in.
         use crate::tables::StructuredCell;
         let items = vec![
-            // Header text — centered in row 0 (native y=104, center 108) but
+            // Header text, centered in row 0 (native y=104, center 108) but
             // at the LEFT of the column (x=175, far left of the [410, 700]
             // data-derived band).
             test_item("Address", 175.0, 104.0, 50.0, 8.0),
-            // Data row 1 — fits its cell.
+            // Data row 1, fits its cell.
             test_item("205 W Oak St", 420.0, 84.0, 100.0, 8.0),
-            // Data row 2 — fits its cell.
+            // Data row 2, fits its cell.
             test_item("155 E Boardwalk Dr", 420.0, 64.0, 100.0, 8.0),
         ];
-        // Cells AFTER normalize_cell_bands would have run — col 0 band
+        // Cells AFTER normalize_cell_bands would have run, col 0 band
         // shifted right by data-cell centers, header cell now excludes
         // the "Address" text at center x=200.
         let mut cells = vec![
@@ -7341,7 +7348,7 @@ mod tests {
         ];
         let page_h = 200.0;
 
-        // Stage 1 mimic — fill cells via the strict rule, track claimed.
+        // Stage 1 mimic, fill cells via the strict rule, track claimed.
         let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for cell in &mut cells {
             let [x1, y1, x2, y2] = cell.page_pt_bbox;
@@ -7396,12 +7403,12 @@ mod tests {
         // both center-containment and 60% overlap fail in stage 1.
         use crate::tables::StructuredCell;
         let items = vec![
-            // Bellevue: native y=235, center 239 — just below row 0's
+            // Bellevue: native y=235, center 239, just below row 0's
             // cell native bottom (240). Closer to row 0 than row 1.
             test_item("Bellevue", 30.0, 235.0, 45.0, 8.0),
-            // Glenwood: native y=215, center 219 — just below row 1.
+            // Glenwood: native y=215, center 219, just below row 1.
             test_item("Glenwood", 30.0, 215.0, 45.0, 8.0),
-            // Metro Crossing: native y=195, center 199 — just below row 2.
+            // Metro Crossing: native y=195, center 199, just below row 2.
             test_item("Metro Crossing", 30.0, 195.0, 70.0, 8.0),
         ];
         let mut cells = vec![
@@ -7501,17 +7508,17 @@ mod tests {
             },
         ];
         // Two orphans, different rows of the PDF (y differs by 14pt = a
-        // full row), both 2pt outside their target cell — both within
+        // full row), both 2pt outside their target cell, both within
         // cap_y, both equidistant-ish to cell X. Without the same-line
         // guard they'd both land in X.
-        //   "Shawnee" should belong to cell X (row 0) — center y=98 is
+        //   "Shawnee" should belong to cell X (row 0), center y=98 is
         //   2pt below X's native min=100.
-        //   "BlueValley" should belong to cell Y (row 1) — center y=84
+        //   "BlueValley" should belong to cell Y (row 1), center y=84
         //   is 4pt above Y's native max=88.
         let items = vec![
-            // Shawnee orphan — closer to X (dy=2) than Y (dy=6 from native min=78).
+            // Shawnee orphan, closer to X (dy=2) than Y (dy=6 from native min=78).
             test_item("Shawnee", 30.0, 94.0, 50.0, 8.0),
-            // BlueValley orphan — closer to Y (dy=4) than X (dy=8 from native max=100).
+            // BlueValley orphan, closer to Y (dy=4) than X (dy=8 from native max=100).
             test_item("BlueValley", 30.0, 80.0, 60.0, 8.0),
         ];
         let claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -7572,7 +7579,7 @@ mod tests {
         use crate::tables::StructuredCell;
         let items = vec![
             test_item("Real", 50.0, 100.0, 30.0, 8.0),
-            // Far orphan — at native y=20 (page bottom edge) on a page where
+            // Far orphan, at native y=20 (page bottom edge) on a page where
             // the table sits around native y=92..104 (top-left y=96..108).
             // y-distance to nearest cell is ~70pt, far exceeding the ~12pt
             // cap from median row height.
@@ -7600,7 +7607,7 @@ mod tests {
         ];
         let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         // Pretend "Real" got claimed by a different cell (won't be re-assigned).
-        // Don't claim "FigureTitle" — it's the far orphan.
+        // Don't claim "FigureTitle", it's the far orphan.
         claimed.insert(0);
 
         tsr_assign_orphan_items(
@@ -7621,7 +7628,7 @@ mod tests {
     // Direct unit tests on the byte-level scan, addressing review feedback
     // on #230: a coincidental standalone "xref" token that isn't actually
     // followed by a subsection header (start-id + count) must not be
-    // treated as a real table — accepting it would let lopdf "succeed"
+    // treated as a real table, accepting it would let lopdf "succeed"
     // against a bogus offset and silently return garbled/empty content
     // instead of a clean error.
 
@@ -7644,7 +7651,7 @@ mod tests {
     #[test]
     fn find_xref_skips_coincidental_match_and_finds_real_table_before_it() {
         // A coincidental "xref" (no subsection header) appears *after* the
-        // real table in the buffer — the scan must not stop at the first
+        // real table in the buffer, the scan must not stop at the first
         // (rightmost) standalone token it finds; it must keep looking
         // backward until one actually validates.
         let buf = b"xref\n0 3\n0000000000 65535 f \ntrailer\nsee the xref\n";
@@ -7655,7 +7662,7 @@ mod tests {
     #[test]
     fn find_xref_rejects_substring_of_startxref() {
         // "xref" is a substring of "startxref" but isn't a standalone
-        // token there (not preceded by whitespace) — must not match, even
+        // token there (not preceded by whitespace), must not match, even
         // though a number immediately follows it.
         let buf = b"startxref\n1234\n%%EOF";
         assert_eq!(find_last_valid_xref_table_start(buf), None);
@@ -7664,7 +7671,7 @@ mod tests {
     #[test]
     fn find_xref_rejects_count_run_with_trailing_garbage() {
         // "xref\n0 6garbage" has the right shape (digits, whitespace,
-        // digits) but the count run doesn't end at whitespace/EOF — it
+        // digits) but the count run doesn't end at whitespace/EOF, it
         // runs straight into non-digit garbage, so this must not be
         // accepted as a real subsection header.
         let buf = b"xref\n0 6garbage\n%%EOF";
