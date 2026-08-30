@@ -283,6 +283,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         width: text.len() as f32 * font_size * 0.5,
         height: font_size,
         font: "Helvetica".to_string(),
+        font_tag: String::new(),
         font_size,
         page,
         is_bold: false,
@@ -310,6 +311,7 @@ fn make_text_item_with_font(
         width: text.len() as f32 * font_size * 0.5,
         height: font_size,
         font: font.to_string(),
+        font_tag: String::new(),
         font_size,
         page,
         is_bold: is_bold_font(font),
@@ -3530,20 +3532,15 @@ fn test_extract_pages_markdown_basic() {
 fn test_extract_pages_markdown_keeps_line_based_tables() {
     // The per-page path (used by every `--ocr auto` run) once passed an
     // empty line slice to markdown conversion, silently dropping every
-    // table that only the line-based detector finds. This fixture's table
-    // is rule-anchored: it must survive the pages API exactly as it does
-    // the whole-document API.
-    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+    // table that only the line-based detector finds. Keep this synthetic
+    // table to four text items so the heuristic detector cannot qualify it
+    // (it requires at least six); the vector rules are the only structural
+    // evidence available to the pages API.
+    let buf = synthetic_vector_grid_pdf(false);
     let result = extract_pages_markdown_mem(&buf, None).unwrap();
 
-    let all_markdown: String = result
-        .pages
-        .iter()
-        .map(|p| p.markdown.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
     assert!(
-        all_markdown.contains("|BIO|"),
+        result.pages[0].markdown.contains("|A1|B1|"),
         "line-based table rows missing from pages API output"
     );
 }

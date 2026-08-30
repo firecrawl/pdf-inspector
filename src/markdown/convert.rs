@@ -1569,6 +1569,7 @@ mod tests {
             width: 100.0,
             height: 12.0,
             font: "Helvetica".to_string(),
+            font_tag: String::new(),
             font_size: 12.0,
             page,
             is_bold: false,

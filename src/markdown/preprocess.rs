@@ -242,6 +242,7 @@ mod tests {
             width: 100.0,
             height: font_size,
             font: "TestFont".to_string(),
+            font_tag: String::new(),
             font_size,
             page: 1,
             is_bold: false,
