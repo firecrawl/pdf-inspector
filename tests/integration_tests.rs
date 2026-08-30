@@ -4400,6 +4400,22 @@ fn pdf_options_debug_redacts_password() {
 /// point raised "Invalid PDF structure" on a file whose object data was
 /// otherwise completely intact.
 #[test]
+fn test_process_pdf_recovers_bare_lf_xref_entries() {
+    // Bare-LF xref entries (19-byte stride, offsets correct); pypdf, pdfium
+    // and pdfjs all read such files.
+    let result =
+        process_pdf_with_options("tests/fixtures/bare_lf_xref_entries.pdf", PdfOptions::new())
+            .expect("bare-LF xref entries should be recoverable, like pypdf/pdfium");
+
+    assert_eq!(result.page_count, 1);
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Synthetic xref stride test"),
+        "recovered document should extract its real text, got: {md:?}"
+    );
+}
+
+#[test]
 fn test_process_pdf_recovers_corrupted_startxref_pointer() {
     let result = process_pdf_with_options(
         "tests/fixtures/broken_startxref_pointer.pdf",
