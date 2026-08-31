@@ -790,25 +790,18 @@ fn find_relative_valleys(
 }
 
 /// Detect whether a side of a gutter consists predominantly of list-marker
-/// glyphs (•, ●, ○, ◦, ▪, ▫, ◆, ◇). A column of bullets on the left margin
-/// creates a spurious histogram valley between the bullet and the content.
-/// Treating it as a real column splits each list item's text across two
-/// "columns," so we reject these candidates.
+/// glyphs from [`crate::markdown::classify::BULLET_GLYPHS`]. A column of bullets
+/// on the left margin creates a spurious histogram valley between the bullet
+/// and the content. Treating it as a real column splits each list item's text
+/// across two "columns," so we reject these candidates.
 fn is_list_marker_column(items: &[&&TextItem]) -> bool {
-    const LIST_MARKERS: &[char] = &['•', '●', '○', '◦', '▪', '▫', '◆', '◇', '■', '□'];
+    use crate::markdown::classify::is_standalone_bullet_glyph;
     if items.is_empty() {
         return false;
     }
     let marker_count = items
         .iter()
-        .filter(|i| {
-            let t = i.text.trim();
-            let mut chars = t.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) => LIST_MARKERS.contains(&c),
-                _ => false,
-            }
-        })
+        .filter(|i| is_standalone_bullet_glyph(&i.text))
         .count();
     // Require ≥80% of items on this side to be standalone markers. A handful
     // of non-marker items (stray page numbers, footnote refs) shouldn't

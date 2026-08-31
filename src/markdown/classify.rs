@@ -3,6 +3,16 @@
 pub(crate) const BULLET_GLYPHS: &[char] =
     &['•', '●', '○', '◦', '▪', '▫', '◆', '◇', '■', '□', '‣', '⁃'];
 
+/// True when `text` is exactly one `BULLET_GLYPHS` entry (standalone marker).
+pub(crate) fn is_standalone_bullet_glyph(text: &str) -> bool {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(c), None) if BULLET_GLYPHS.contains(&c)
+    )
+}
+
 fn starts_with_bullet_glyph_and_space(text: &str) -> bool {
     BULLET_GLYPHS.iter().any(|glyph| {
         text.strip_prefix(*glyph)
@@ -315,12 +325,11 @@ mod tests {
 
     #[test]
     fn is_list_item_extended_bullet_glyphs() {
-        for text in [
-            "▪ Item", "▫ Item", "◆ Item", "◇ Item", "■ Item", "□ Item", "‣ Item", "⁃ Item",
-        ] {
-            assert!(is_list_item(text), "{text}");
-            assert!(starts_with_bullet_marker(text), "{text}");
-            assert_eq!(format_list_item(text), "- Item", "{text}");
+        for &glyph in BULLET_GLYPHS {
+            let text = format!("{glyph} Item");
+            assert!(is_list_item(&text), "{text}");
+            assert!(starts_with_bullet_marker(&text), "{text}");
+            assert_eq!(format_list_item(&text), "- Item", "{text}");
         }
     }
 
