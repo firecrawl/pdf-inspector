@@ -3960,9 +3960,9 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
     candidates
 }
 
-/// Repairs classic xref entries that end with a single EOL byte (19-byte
-/// stride) instead of the spec's exactly 20: lopdf rejects the file, while
-/// pypdf/pdfium/pdfjs read it. Rebuilds the table in place with `SP LF`
+/// Repairs classic xref entries whose EOL is not the spec's exactly two
+/// bytes — a bare `LF` (19-byte stride) or a `SP CR LF` (21) — including a
+/// table that mixes both: lopdf rejects the file, pypdf/pdfium/pdfjs read it. Rebuilds the table in place with `SP LF`
 /// entries; offsets and `startxref` stay valid because nothing else moves.
 /// Same scope as `recover_startxref_pointer` (last classic table only);
 /// `None` when the stride is already correct or the table is ambiguous.
@@ -4025,13 +4025,20 @@ fn normalize_xref_entry_stride(buf: &[u8]) -> Option<Vec<u8>> {
                 return None;
             }
             entry_pos += 18;
-            let eol_len = match (buf.get(entry_pos), buf.get(entry_pos + 1)) {
-                (Some(b'\r'), Some(b'\n')) => 2,
-                (Some(b' '), Some(b'\r' | b'\n')) => 2,
-                (Some(b'\r' | b'\n'), _) => 1,
+            let eol_len = match (
+                buf.get(entry_pos),
+                buf.get(entry_pos + 1),
+                buf.get(entry_pos + 2),
+            ) {
+                // Longest first: `SP CR LF` must not be read as `SP CR`, which
+                // would leave the next entry starting on the stray `LF`.
+                (Some(b' '), Some(b'\r'), Some(b'\n')) => 3,
+                (Some(b'\r'), Some(b'\n'), _) => 2,
+                (Some(b' '), Some(b'\r' | b'\n'), _) => 2,
+                (Some(b'\r' | b'\n'), _, _) => 1,
                 _ => return None,
             };
-            if eol_len == 1 {
+            if eol_len != 2 {
                 saw_malformed = true;
             }
             entry_pos += eol_len;

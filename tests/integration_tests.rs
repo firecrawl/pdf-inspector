@@ -4400,6 +4400,22 @@ fn pdf_options_debug_redacts_password() {
 /// point raised "Invalid PDF structure" on a file whose object data was
 /// otherwise completely intact.
 #[test]
+fn test_process_pdf_recovers_corrupted_startxref_pointer() {
+    let result = process_pdf_with_options(
+        "tests/fixtures/broken_startxref_pointer.pdf",
+        PdfOptions::new(),
+    )
+    .expect("a corrupted startxref pointer should be recoverable, like pypdf/pdfium");
+
+    assert_eq!(result.page_count, 1);
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Order Detail Report by Account") && md.contains("WIDGET ASSEMBLY"),
+        "recovered document should extract its real text, got: {md:?}"
+    );
+}
+
+#[test]
 fn test_process_pdf_recovers_bare_lf_xref_entries() {
     // Bare-LF xref entries (19-byte stride, offsets correct); pypdf, pdfium
     // and pdfjs all read such files.
@@ -4416,17 +4432,19 @@ fn test_process_pdf_recovers_bare_lf_xref_entries() {
 }
 
 #[test]
-fn test_process_pdf_recovers_corrupted_startxref_pointer() {
+fn test_process_pdf_recovers_mixed_eol_xref_entries() {
+    // A table mixing bare-LF (19-byte) and `SP CR LF` (21-byte) entries: the
+    // longest EOL must be consumed first or the next entry starts on a stray LF.
     let result = process_pdf_with_options(
-        "tests/fixtures/broken_startxref_pointer.pdf",
+        "tests/fixtures/mixed_eol_xref_entries.pdf",
         PdfOptions::new(),
     )
-    .expect("a corrupted startxref pointer should be recoverable, like pypdf/pdfium");
+    .expect("mixed-EOL xref entries should be recoverable, like pypdf/pdfium");
 
     assert_eq!(result.page_count, 1);
     let md = result.markdown.unwrap_or_default();
     assert!(
-        md.contains("Order Detail Report by Account") && md.contains("WIDGET ASSEMBLY"),
+        md.contains("Mixed EOL stride test"),
         "recovered document should extract its real text, got: {md:?}"
     );
 }
