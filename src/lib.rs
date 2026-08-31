@@ -147,6 +147,9 @@ pub struct PdfProcessResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// Count of lines removed as page headers/footers on each page. The vector
+    /// is indexed by page number minus one, so entry `i` is page `i + 1`.
+    pub removed_header_footer_lines: Vec<u32>,
     /// Title from PDF metadata (if available).
     pub title: Option<String>,
     /// Detection confidence score (0.0–1.0).
@@ -4134,6 +4137,7 @@ fn process_document(
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
+            removed_header_footer_lines: vec![0; page_count as usize],
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -4150,6 +4154,7 @@ fn process_document(
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
+            removed_header_footer_lines: vec![0; page_count as usize],
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -4240,6 +4245,7 @@ fn process_document(
         gid_pages,
         text_quality_pages,
         text_quality_reasons_by_page,
+        removed_header_footer_lines,
     ) = match extracted {
         Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
@@ -4346,10 +4352,15 @@ fn process_document(
                 &chart_regions,
             );
 
-            let md = if options.mode == ProcessMode::Analyze {
-                None
+            let conversion = if options.mode == ProcessMode::Analyze {
+                markdown::MarkdownConversionOutput {
+                    markdown: String::new(),
+                    removed_header_footer_lines: vec![0; page_count as usize],
+                    #[cfg(feature = "ocr")]
+                    detected_tables: Vec::new(),
+                }
             } else {
-                Some(markdown::to_markdown_from_items_with_rects_and_lines(
+                markdown::markdown_conversion_output_from_items_with_rects_and_lines(
                     items,
                     options.markdown,
                     &rects,
@@ -4363,7 +4374,12 @@ fn process_document(
                         prefiltered_page_number_mask: Some(removal_mask.as_slice()),
                         precomputed_chart_regions: Some(&chart_regions),
                     },
-                ))
+                )
+            };
+            let md = if options.mode == ProcessMode::Analyze {
+                None
+            } else {
+                Some(conversion.markdown.clone())
             };
 
             let enc = !ocr_reasons_by_page.is_empty()
@@ -4376,6 +4392,7 @@ fn process_document(
                 gid_encoded_pages,
                 text_quality.pages_needing_ocr,
                 ocr_reasons_by_page,
+                conversion.removed_header_footer_lines,
             )
         }
         None => (
@@ -4385,6 +4402,7 @@ fn process_document(
             std::collections::HashSet::new(),
             Vec::new(),
             BTreeMap::new(),
+            vec![0; page_count as usize],
         ),
     };
 
@@ -4484,6 +4502,7 @@ fn process_document(
             merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
             page_ocr_reasons_vec(merged)
         },
+        removed_header_footer_lines,
         title,
         confidence,
         layout,
@@ -6655,6 +6674,25 @@ mod tests {
         let document_wide =
             compute_layout_complexity(&selected.items, &selected.layout_items, &[], &[]);
         assert!(!document_wide.pages_with_columns.contains(&1));
+    }
+
+    #[test]
+    fn removed_header_footer_line_count_is_exposed_in_result() {
+        let result = PdfProcessResult {
+            pdf_type: PdfType::TextBased,
+            markdown: Some("body".to_string()),
+            page_count: 3,
+            processing_time_ms: 1,
+            pages_needing_ocr: vec![],
+            ocr_reasons_by_page: vec![],
+            title: None,
+            confidence: 0.5,
+            layout: LayoutComplexity::default(),
+            has_encoding_issues: false,
+            removed_header_footer_lines: vec![0, 2, 1],
+        };
+
+        assert_eq!(result.removed_header_footer_lines, vec![0, 2, 1]);
     }
 
     #[test]

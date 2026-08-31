@@ -45,6 +45,8 @@ export interface PdfProcessResult {
   /** 1-indexed page numbers. */
   pagesNeedingOcr: number[];
   ocrReasonsByPage: PageOcrReasons[];
+  /** Number of lines removed as running headers/footers on each page. */
+  removedHeaderFooterLines: number[];
   title?: string;
   confidence: number;
   layout: LayoutComplexity;
@@ -126,6 +128,7 @@ struct WasmPdfProcessResult {
     processing_time_ms: f64,
     pages_needing_ocr: Vec<u32>,
     ocr_reasons_by_page: Vec<WasmPageOcrReasons>,
+    removed_header_footer_lines: Vec<u32>,
     title: Option<String>,
     confidence: f64,
     layout: WasmLayoutComplexity,
@@ -145,6 +148,7 @@ impl From<PdfProcessResult> for WasmPdfProcessResult {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            removed_header_footer_lines: value.removed_header_footer_lines,
             title: value.title,
             confidence: value.confidence as f64,
             layout: value.layout.into(),

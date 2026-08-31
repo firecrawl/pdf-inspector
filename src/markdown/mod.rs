@@ -909,10 +909,11 @@ impl TableDetectionOutput {
 }
 
 #[derive(Default)]
-struct MarkdownConversionOutput {
-    markdown: String,
+pub(crate) struct MarkdownConversionOutput {
+    pub(crate) markdown: String,
+    pub(crate) removed_header_footer_lines: Vec<u32>,
     #[cfg(feature = "ocr")]
-    detected_tables: Vec<(u32, crate::tables::Table)>,
+    pub(crate) detected_tables: Vec<(u32, crate::tables::Table)>,
 }
 
 /// Derive a side-by-side split from rect hint regions.
@@ -2385,30 +2386,89 @@ fn convert_items_with_rects_lines_and_table_output(
         all_lines
     };
 
-    // Strip repeated headers/footers before conversion
-    let lines = if options.strip_headers_footers {
-        furniture::strip_header_footer_lines(lines, document_page_count)
+    // Strip repeated headers/footers before conversion and retain a page-by-page
+    // audit trail so callers can tell exactly how much furniture was removed.
+    let conversion = if options.strip_headers_footers {
+        let original_counts = count_lines_by_page(&lines, document_page_count);
+        let stripped = furniture::strip_header_footer_lines(lines, document_page_count);
+        let stripped_counts = count_lines_by_page(&stripped, document_page_count);
+        let mut removed = Vec::with_capacity(document_page_count as usize);
+        for page in 0..document_page_count {
+            let page_index = page as usize;
+            removed.push(
+                original_counts
+                    .get(page_index)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(stripped_counts.get(page_index).copied().unwrap_or(0)),
+            );
+        }
+        let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
+        band_split_page_set.extend(page_chart_prose_splits.keys().copied());
+        let markdown = to_markdown_from_lines_with_tables_and_images(
+            stripped,
+            options,
+            page_tables,
+            page_images,
+            &page_chart_map,
+            &band_split_page_set,
+            effective_struct_roles,
+        );
+        MarkdownConversionOutput {
+            markdown,
+            removed_header_footer_lines: removed,
+            #[cfg(feature = "ocr")]
+            detected_tables,
+        }
     } else {
-        lines
+        let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
+        band_split_page_set.extend(page_chart_prose_splits.keys().copied());
+        let markdown = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            options,
+            page_tables,
+            page_images,
+            &page_chart_map,
+            &band_split_page_set,
+            effective_struct_roles,
+        );
+        MarkdownConversionOutput {
+            markdown,
+            removed_header_footer_lines: vec![0; document_page_count as usize],
+            #[cfg(feature = "ocr")]
+            detected_tables,
+        }
     };
 
-    // Convert to markdown, inserting tables and images at appropriate positions
-    let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
-    band_split_page_set.extend(page_chart_prose_splits.keys().copied());
-    let markdown = to_markdown_from_lines_with_tables_and_images(
-        lines,
-        options,
-        page_tables,
-        page_images,
-        &page_chart_map,
-        &band_split_page_set,
-        effective_struct_roles,
-    );
-    MarkdownConversionOutput {
-        markdown,
-        #[cfg(feature = "ocr")]
-        detected_tables,
+    conversion
+}
+
+fn count_lines_by_page(lines: &[crate::types::TextLine], page_count: u32) -> Vec<u32> {
+    let mut counts = vec![0u32; page_count as usize];
+    for line in lines {
+        let page_index = line.page.saturating_sub(1) as usize;
+        if page_index < counts.len() {
+            counts[page_index] += 1;
+        }
     }
+    counts
+}
+
+pub(crate) fn markdown_conversion_output_from_items_with_rects_and_lines(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+    context: MarkdownDocumentContext<'_>,
+) -> MarkdownConversionOutput {
+    convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        rects,
+        pdf_lines,
+        context,
+        TableOutputMode::Markdown,
+    )
 }
 
 #[cfg(test)]

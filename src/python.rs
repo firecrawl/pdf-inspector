@@ -33,6 +33,9 @@ pub struct PyPdfResult {
     /// Machine-readable OCR reasons by 1-indexed page.
     #[pyo3(get)]
     pub ocr_reasons_by_page: Vec<PyPageOcrReasons>,
+    /// Number of lines removed as running headers/footers on each page.
+    #[pyo3(get)]
+    pub removed_header_footer_lines: Vec<u32>,
     /// Title from PDF metadata.
     #[pyo3(get)]
     pub title: Option<String>,
@@ -442,6 +445,7 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         processing_time_ms: r.processing_time_ms,
         pages_needing_ocr: r.pages_needing_ocr,
         ocr_reasons_by_page: to_py_page_ocr_reasons(r.ocr_reasons_by_page),
+        removed_header_footer_lines: r.removed_header_footer_lines,
         title: r.title,
         confidence: r.confidence,
         is_complex_layout: r.layout.is_complex,

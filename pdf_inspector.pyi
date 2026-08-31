@@ -13,6 +13,8 @@ class PdfResult:
     """1-indexed page numbers that need OCR."""
     ocr_reasons_by_page: list["PageOcrReasons"]
     """Machine-readable OCR reasons by 1-indexed page."""
+    removed_header_footer_lines: list[int]
+    """Number of lines removed as running headers/footers on each page."""
     title: Optional[str]
     confidence: float
     is_complex_layout: bool

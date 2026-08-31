@@ -62,6 +62,8 @@ pub struct PdfResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// Number of lines removed as running headers/footers on each page.
+    pub removed_header_footer_lines: Vec<u32>,
     pub title: Option<String>,
     pub confidence: f64,
     pub is_complex_layout: bool,
@@ -248,6 +250,7 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         processing_time_ms: r.processing_time_ms as u32,
         pages_needing_ocr: r.pages_needing_ocr,
         ocr_reasons_by_page: to_napi_page_ocr_reasons(r.ocr_reasons_by_page),
+        removed_header_footer_lines: r.removed_header_footer_lines,
         title: r.title,
         confidence: r.confidence as f64,
         is_complex_layout: r.layout.is_complex,
