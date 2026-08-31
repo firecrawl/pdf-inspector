@@ -1,5 +1,19 @@
 //! Line classification: captions, lists, code detection.
 
+/// Unicode bullet glyphs used in PDF list markers.
+///
+/// Matches the set recognized by `extractor/layout.rs` and
+/// `extractor/underline.rs`, minus U+00B7 (·) middle dot which also
+/// appears in normal prose.
+const BULLET_MARKERS: &[char] = &['•', '●', '○', '◦', '▪', '▫', '◆', '◇', '■', '□', '‣', '⁃'];
+
+fn starts_with_unicode_bullet_and_space(text: &str) -> bool {
+    BULLET_MARKERS.iter().any(|marker| {
+        text.strip_prefix(*marker)
+            .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
 /// Check if text is a figure/table caption or source citation
 pub(crate) fn is_caption_line(text: &str) -> bool {
     let trimmed = text.trim();
@@ -64,7 +78,7 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
     false
 }
 
-/// Check if text starts with an unambiguous bullet marker (●, •, ○, ◦).
+/// Check if text starts with an unambiguous bullet marker (●, •, ○, ◦, ▪, …).
 ///
 /// Narrower than [`is_list_item`]: it excludes numbered/lettered patterns
 /// like `1.` or `a)`, which legitimately appear as section headings in many
@@ -72,10 +86,7 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
 /// also demoting numbered headings.
 pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with("• ")
-        || trimmed.starts_with("● ")
-        || trimmed.starts_with("○ ")
-        || trimmed.starts_with("◦ ")
+    starts_with_unicode_bullet_and_space(trimmed)
         || trimmed.starts_with("- ")
         || trimmed.starts_with("* ")
 }
@@ -85,12 +96,9 @@ pub(crate) fn is_list_item(text: &str) -> bool {
     let trimmed = text.trim_start();
 
     // Bullet patterns
-    if trimmed.starts_with("• ")
+    if starts_with_unicode_bullet_and_space(trimmed)
         || trimmed.starts_with("- ")
         || trimmed.starts_with("* ")
-        || trimmed.starts_with("○ ")
-        || trimmed.starts_with("● ")
-        || trimmed.starts_with("◦ ")
     {
         return true;
     }
@@ -127,7 +135,7 @@ pub(crate) fn format_list_item(text: &str) -> String {
 
     // Convert various bullet styles to markdown
     // Note: bullet characters like • are multi-byte in UTF-8, use char indices
-    for bullet in &['•', '○', '●', '◦'] {
+    for bullet in BULLET_MARKERS {
         if let Some(rest) = trimmed.strip_prefix(*bullet) {
             return format!("- {}", rest.trim_start());
         }
@@ -313,5 +321,28 @@ mod tests {
         assert!(is_list_item("● Item"));
         assert!(is_list_item("• Item"));
         assert!(is_list_item("- Item"));
+    }
+
+    #[test]
+    fn is_list_item_extended_bullet_glyphs() {
+        assert!(is_list_item("▪ Item"));
+        assert!(is_list_item("‣ Item"));
+        assert!(is_list_item("◆ Item"));
+        // Middle dot appears in prose; do not treat as a list marker.
+        assert!(!is_list_item("· Item"));
+    }
+
+    #[test]
+    fn starts_with_bullet_marker_extended_glyphs() {
+        assert!(starts_with_bullet_marker("▪ Item"));
+        assert!(starts_with_bullet_marker("‣ Item"));
+        assert!(starts_with_bullet_marker("◆ Item"));
+    }
+
+    #[test]
+    fn format_list_item_extended_glyphs() {
+        assert_eq!(format_list_item("▪ Item"), "- Item");
+        assert_eq!(format_list_item("‣ Item"), "- Item");
+        assert_eq!(format_list_item("◆ Item"), "- Item");
     }
 }
