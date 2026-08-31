@@ -602,6 +602,29 @@ mod tests {
     }
 
     #[test]
+    fn square_bullet_line_is_not_classified_as_heading() {
+        assert!(!title_like("▪ Short item", false, true));
+
+        let lines = vec![
+            line("▪ Short item", 700.0, 72.0, 14.0, "Bold", true),
+            line(
+                "Body paragraph continues here.",
+                680.0,
+                72.0,
+                12.0,
+                "Body",
+                false,
+            ),
+        ];
+        let decisions =
+            classify_heading_sequences(&lines, 12.0, &[], &HashSet::new(), &HashSet::new());
+        assert!(
+            !decisions.contains_key(&0),
+            "square bullet line must not be promoted to heading"
+        );
+    }
+
+    #[test]
     fn singleton_bold_label_does_not_form_sequence() {
         let lines = vec![
             line(

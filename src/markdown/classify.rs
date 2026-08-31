@@ -322,10 +322,20 @@ mod tests {
         assert!(is_list_item("- Item"));
         assert!(is_list_item("* Item"));
         assert!(is_list_item("1. First"));
+        assert!(is_list_item("1. Item"));
         assert!(is_list_item("a. Letter"));
         assert!(is_list_item("a) Letter"));
+        assert!(is_list_item("a) Item"));
     }
 
+    #[test]
+    fn is_list_item_primary_extended_glyphs() {
+        for text in ["▪ Item", "‣ Item", "◆ Item"] {
+            assert!(is_list_item(text), "{text}");
+            assert!(starts_with_bullet_marker(text), "{text}");
+            assert_eq!(format_list_item(text), "- Item", "{text}");
+        }
+    }
     #[test]
     fn is_list_item_extended_bullet_glyphs() {
         for glyph in ['▪', '▫', '◆', '◇', '■', '□', '‣', '⁃'] {
@@ -340,6 +350,12 @@ mod tests {
                 "glyph {glyph}"
             );
         }
+    }
+
+    #[test]
+    fn middle_dot_is_not_formatted_as_list_item() {
+        assert!(!is_list_item("· Item"));
+        assert_eq!(format_list_item("· Item"), "· Item");
     }
 
     #[test]
