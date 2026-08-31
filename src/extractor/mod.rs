@@ -634,7 +634,12 @@ fn effective_merge_width(item: &TextItem) -> f32 {
 }
 
 fn is_standalone_bullet_text(text: &str) -> bool {
-    matches!(text.trim(), "•" | "○" | "●" | "◦")
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(c), None) if crate::markdown::classify::BULLET_GLYPHS.contains(&c)
+    )
 }
 
 fn first_text_char(text: &str) -> Option<char> {

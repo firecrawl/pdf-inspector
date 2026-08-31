@@ -1,15 +1,11 @@
 //! Line classification: captions, lists, code detection.
 
-/// Unicode bullet glyphs used in PDF list markers.
-///
-/// Matches the set recognized by `extractor/layout.rs` and
-/// `extractor/underline.rs`, minus U+00B7 (·) middle dot which also
-/// appears in normal prose.
-const BULLET_MARKERS: &[char] = &['•', '●', '○', '◦', '▪', '▫', '◆', '◇', '■', '□', '‣', '⁃'];
+pub(crate) const BULLET_GLYPHS: &[char] =
+    &['•', '●', '○', '◦', '▪', '▫', '◆', '◇', '■', '□', '‣', '⁃'];
 
-fn starts_with_unicode_bullet_and_space(text: &str) -> bool {
-    BULLET_MARKERS.iter().any(|marker| {
-        text.strip_prefix(*marker)
+fn starts_with_bullet_glyph_and_space(text: &str) -> bool {
+    BULLET_GLYPHS.iter().any(|glyph| {
+        text.strip_prefix(*glyph)
             .is_some_and(|rest| rest.starts_with(' '))
     })
 }
@@ -86,7 +82,7 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
 /// also demoting numbered headings.
 pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
     let trimmed = text.trim_start();
-    starts_with_unicode_bullet_and_space(trimmed)
+    starts_with_bullet_glyph_and_space(trimmed)
         || trimmed.starts_with("- ")
         || trimmed.starts_with("* ")
 }
@@ -96,7 +92,7 @@ pub(crate) fn is_list_item(text: &str) -> bool {
     let trimmed = text.trim_start();
 
     // Bullet patterns
-    if starts_with_unicode_bullet_and_space(trimmed)
+    if starts_with_bullet_glyph_and_space(trimmed)
         || trimmed.starts_with("- ")
         || trimmed.starts_with("* ")
     {
@@ -135,7 +131,7 @@ pub(crate) fn format_list_item(text: &str) -> String {
 
     // Convert various bullet styles to markdown
     // Note: bullet characters like • are multi-byte in UTF-8, use char indices
-    for bullet in BULLET_MARKERS {
+    for bullet in BULLET_GLYPHS {
         if let Some(rest) = trimmed.strip_prefix(*bullet) {
             return format!("- {}", rest.trim_start());
         }
@@ -309,6 +305,7 @@ mod tests {
             "- **Label:** rest of line"
         );
         assert_eq!(format_list_item("*● Italic:* rest"), "- *Italic:* rest");
+        assert_eq!(format_list_item("**▪ Label:** rest"), "- **Label:** rest");
     }
 
     #[test]
@@ -317,32 +314,44 @@ mod tests {
     }
 
     #[test]
-    fn is_list_item_with_bullet_space() {
+    fn is_list_item_original_bullet_styles() {
         assert!(is_list_item("● Item"));
         assert!(is_list_item("• Item"));
+        assert!(is_list_item("○ Item"));
+        assert!(is_list_item("◦ Item"));
         assert!(is_list_item("- Item"));
+        assert!(is_list_item("* Item"));
+        assert!(is_list_item("1. First"));
+        assert!(is_list_item("a. Letter"));
+        assert!(is_list_item("a) Letter"));
     }
 
     #[test]
     fn is_list_item_extended_bullet_glyphs() {
-        assert!(is_list_item("▪ Item"));
-        assert!(is_list_item("‣ Item"));
-        assert!(is_list_item("◆ Item"));
-        // Middle dot appears in prose; do not treat as a list marker.
+        for glyph in ['▪', '▫', '◆', '◇', '■', '□', '‣', '⁃'] {
+            assert!(is_list_item(&format!("{glyph} Item")), "glyph {glyph}");
+            assert!(
+                starts_with_bullet_marker(&format!("{glyph} Item")),
+                "glyph {glyph}"
+            );
+            assert_eq!(
+                format_list_item(&format!("{glyph} Item")),
+                "- Item",
+                "glyph {glyph}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_list_item_rejects_non_bullets() {
+        assert!(!is_list_item("▪Item"));
+        assert!(!is_list_item("Item ▪"));
         assert!(!is_list_item("· Item"));
-    }
-
-    #[test]
-    fn starts_with_bullet_marker_extended_glyphs() {
-        assert!(starts_with_bullet_marker("▪ Item"));
-        assert!(starts_with_bullet_marker("‣ Item"));
-        assert!(starts_with_bullet_marker("◆ Item"));
-    }
-
-    #[test]
-    fn format_list_item_extended_glyphs() {
-        assert_eq!(format_list_item("▪ Item"), "- Item");
-        assert_eq!(format_list_item("‣ Item"), "- Item");
-        assert_eq!(format_list_item("◆ Item"), "- Item");
+        assert!(!is_list_item("– Item"));
+        assert!(!is_list_item("— Item"));
+        assert!(!is_list_item("Regular text"));
+        assert!(!starts_with_bullet_marker("· Item"));
+        assert!(!starts_with_bullet_marker("– Item"));
+        assert!(!starts_with_bullet_marker("— Item"));
     }
 }
