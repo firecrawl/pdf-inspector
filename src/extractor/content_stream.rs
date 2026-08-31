@@ -1938,11 +1938,11 @@ end"#
             "ToUnicode" => Object::Reference(f2_cmap),
         });
 
-        let content = b"BT /F1 12 Tf 10 700 Tm <41> Tj ET
+        let content = b"BT /F1 12 Tf 1 0 0 1 10 700 Tm <41> Tj ET
 q
-BT /F2 12 Tf 20 700 Tm <41> Tj ET
+BT /F2 12 Tf 1 0 0 1 20 700 Tm <41> Tj ET
 Q
-BT 30 700 Tm <41> Tj ET";
+BT 1 0 0 1 30 700 Tm <41> Tj ET";
         let content_id = doc.add_object(Object::Stream(Stream::new(
             dictionary! {},
             content.to_vec(),

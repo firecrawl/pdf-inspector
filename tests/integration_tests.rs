@@ -261,6 +261,58 @@ ET"#;
     make_text_pdf(content, "0 0 595 842")
 }
 
+fn make_double_draw_text_pdf() -> Vec<u8> {
+    // Mirror the issue attachment: PyMuPDF wraps each individual glyph paint
+    // in its own graphics-state and text block, then repeats that whole block.
+    let content = r#"q
+BT /F1 14 Tf 1 0 0 1 72 700 Tm (H) Tj ET
+Q
+q
+BT /F1 14 Tf 1 0 0 1 72 700 Tm (H) Tj ET
+Q
+q
+BT /F1 14 Tf 1 0 0 1 86 700 Tm (E) Tj ET
+Q
+q
+BT /F1 14 Tf 1 0 0 1 86 700 Tm (E) Tj ET
+Q
+q
+BT /F1 14 Tf 1 0 0 1 100 700 Tm (L) Tj ET
+Q
+q
+BT /F1 14 Tf 1 0 0 1 100 700 Tm (L) Tj ET
+Q
+q
+BT /F1 14 Tf 1 0 0 1 114 700 Tm (L) Tj ET
+Q
+q
+BT /F1 14 Tf 1 0 0 1 114 700 Tm (L) Tj ET
+Q
+q
+BT /F1 14 Tf 1 0 0 1 128 700 Tm (O) Tj ET
+Q
+q
+BT /F1 14 Tf 1 0 0 1 128 700 Tm (O) Tj ET
+Q"#;
+    make_text_pdf(content, "0 0 612 792")
+}
+
+fn make_replayed_text_run_pdf() -> Vec<u8> {
+    let content = r#"BT /F1 14 Tf
+1 0 0 1 72 700 Tm (H) Tj
+1 0 0 1 86 700 Tm (E) Tj
+1 0 0 1 100 700 Tm (L) Tj
+1 0 0 1 114 700 Tm (L) Tj
+1 0 0 1 128 700 Tm (O) Tj
+1 0 0 1 72 700 Tm (H) Tj
+1 0 0 1 86 700 Tm (E) Tj
+1 0 0 1 100 700 Tm (L) Tj
+1 0 0 1 114 700 Tm (L) Tj
+1 0 0 1 128 700 Tm (O) Tj
+ET"#;
+    make_text_pdf(content, "0 0 612 792")
+}
+
 fn truncate_eof_marker(mut pdf: Vec<u8>) -> Vec<u8> {
     assert!(pdf.ends_with(b"%%EOF"));
     pdf.pop();
@@ -527,6 +579,29 @@ fn test_digit_only_text_runs_are_preserved_in_markdown() {
         result.markdown.expect("markdown output").trim(),
         "A) The total of 730 seats was approved.\nB) let log 2 = a\nC) Control: The total of 730 seats was approved. let log 2 = a"
     );
+}
+
+#[test]
+fn test_double_draw_text_is_deduplicated() {
+    let pdf = make_double_draw_text_pdf();
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let extracted: String = items.iter().map(|item| item.text.as_str()).collect();
+    assert_eq!(extracted, "HELLO");
+
+    let result = process_pdf_mem(&pdf).expect("convert PDF to markdown");
+    let markdown = result.markdown.expect("markdown output");
+    assert_eq!(markdown.matches("HELLO").count(), 1, "{markdown}");
+}
+
+#[test]
+fn test_replayed_text_run_is_deduplicated() {
+    let pdf = make_replayed_text_run_pdf();
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let extracted: String = items.iter().map(|item| item.text.as_str()).collect();
+
+    assert_eq!(extracted, "HELLO");
 }
 
 // ============================================================================

@@ -976,7 +976,139 @@ fn trimmed_suffix(next: &TextItem) -> &str {
     next.text.trim()
 }
 
+/// Replayed paints routinely differ from the first paint by far less than a
+/// point: the producer recomputes a run through a slightly different text
+/// matrix, so width/height/font_size land on adjacent floats that describe
+/// the same glyphs. Position stays exact — a moved run is different content
+/// even when every other attribute matches.
+const REPLAY_DIMENSION_TOLERANCE: f32 = 0.1;
+
+/// Attributes that must match exactly before the tolerance comparison for
+/// replayed geometry is even worth running. Two paints with different text,
+/// font, page, styling, MCID, or position are never replays of each other.
+#[derive(Hash, PartialEq, Eq)]
+struct TextPaintIdentity<'a> {
+    text: &'a str,
+    x: u32,
+    y: u32,
+    font: &'a str,
+    page: u32,
+    is_bold: bool,
+    is_italic: bool,
+    is_underline: bool,
+    is_strikeout: bool,
+    mcid: Option<i64>,
+}
+
+/// The replayed geometry compared with `REPLAY_DIMENSION_TOLERANCE` instead
+/// of exact bits: sub-point drift here is producer arithmetic, not content.
+#[derive(Clone, Copy, PartialEq)]
+struct TextPaintGeometry {
+    width: f32,
+    height: f32,
+    font_size: f32,
+}
+
+impl TextPaintGeometry {
+    fn within_replay_tolerance(self, other: TextPaintGeometry) -> bool {
+        (self.width - other.width).abs() <= REPLAY_DIMENSION_TOLERANCE
+            && (self.height - other.height).abs() <= REPLAY_DIMENSION_TOLERANCE
+            && (self.font_size - other.font_size).abs() <= REPLAY_DIMENSION_TOLERANCE
+    }
+}
+
+fn finite_geometry_bits(value: f32) -> Option<u32> {
+    if !value.is_finite() {
+        None
+    } else if value == 0.0 {
+        // Treat -0.0 and +0.0 as the same coordinate.
+        Some(0)
+    } else {
+        Some(value.to_bits())
+    }
+}
+
+impl<'a> TextPaintIdentity<'a> {
+    fn from_item(item: &'a TextItem) -> Option<(Self, TextPaintGeometry)> {
+        if !matches!(item.item_type, ItemType::Text) {
+            return None;
+        }
+
+        // Non-finite dimensions stay out of deduplication entirely, exactly
+        // like non-finite positions: a NaN cannot be proven equal to anything.
+        if !item.width.is_finite() || !item.height.is_finite() || !item.font_size.is_finite() {
+            return None;
+        }
+
+        Some((
+            Self {
+                text: &item.text,
+                x: finite_geometry_bits(item.x)?,
+                y: finite_geometry_bits(item.y)?,
+                font: &item.font,
+                page: item.page,
+                is_bold: item.is_bold,
+                is_italic: item.is_italic,
+                is_underline: item.is_underline,
+                is_strikeout: item.is_strikeout,
+                mcid: item.mcid,
+            },
+            TextPaintGeometry {
+                width: item.width,
+                height: item.height,
+                font_size: item.font_size,
+            },
+        ))
+    }
+}
+
+/// Drop exact replays of visible text while keeping the first paint in stream order.
+///
+/// PDF producers may wrap each duplicate glyph in separate graphics-state and
+/// text blocks, or replay a complete run later in the content stream. Matching
+/// every extraction attribute keeps this conservative: positions must match
+/// exactly, while width/height/font_size tolerate sub-point drift because
+/// producers recompute replays through slightly different text matrices.
+/// Shifted outlines, alternate fonts/styles, marked-content spans, and
+/// non-text placeholders remain distinct.
+fn deduplicate_overlapping_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
+    // The geometry list per identity stays tiny in practice (replays of one
+    // run are rare); the cap bounds pathological inputs where a producer
+    // emits thousands of same-identity paints with drifting dimensions.
+    const MAX_GEOMETRY_ENTRIES_PER_IDENTITY: usize = 64;
+    let mut seen: HashMap<TextPaintIdentity<'_>, Vec<TextPaintGeometry>> = HashMap::new();
+    let keep: Vec<bool> = items
+        .iter()
+        .map(|item| {
+            TextPaintIdentity::from_item(item).is_none_or(|(identity, geometry)| {
+                let geometries = seen.entry(identity).or_default();
+                if geometries
+                    .iter()
+                    .any(|seen| seen.within_replay_tolerance(geometry))
+                {
+                    return false;
+                }
+                // Past the cap, keep probing (exact replays of anything stored
+                // still deduplicate) but stop growing, so a pathological page
+                // cannot turn this into quadratic work or unbounded memory.
+                if geometries.len() < MAX_GEOMETRY_ENTRIES_PER_IDENTITY {
+                    geometries.push(geometry);
+                }
+                true
+            })
+        })
+        .collect();
+    drop(seen);
+
+    items
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(item, keep)| keep.then_some(item))
+        .collect()
+}
+
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
+    let items = deduplicate_overlapping_text_items(items);
     if items.is_empty() {
         return items;
     }
@@ -1440,6 +1572,157 @@ mod tests {
     fn with_mcid(mut item: TextItem) -> TextItem {
         item.mcid = Some(1);
         item
+    }
+
+    #[test]
+    fn merge_items_deduplicates_overlapping_text_paints() {
+        let first = make_merge_item("HELLO", 100.0, 30.0);
+        let replay = first.clone();
+
+        let merged = merge_text_items(vec![first, replay]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "HELLO");
+    }
+
+    #[test]
+    fn merge_items_deduplicates_repeated_overlapping_text_paints() {
+        let first = make_merge_item("HELLO", 100.0, 30.0);
+
+        let deduplicated =
+            deduplicate_overlapping_text_items(vec![first.clone(), first.clone(), first]);
+
+        assert_eq!(deduplicated.len(), 1);
+    }
+
+    #[test]
+    fn merge_items_deduplicates_replays_with_subpoint_dimension_drift() {
+        let first = make_merge_item("HELLO", 100.0, 30.0);
+        let mut replay = first.clone();
+        replay.width += 0.05;
+        replay.height += 0.05;
+        replay.font_size += 0.05;
+
+        let deduplicated = deduplicate_overlapping_text_items(vec![first, replay]);
+
+        assert_eq!(deduplicated.len(), 1);
+    }
+
+    #[test]
+    fn merge_items_keeps_replays_apart_beyond_dimension_tolerance() {
+        let first = make_merge_item("HELLO", 100.0, 30.0);
+        for mutate in [(0.2_f32, 0.0, 0.0), (0.0, 0.2, 0.0), (0.0, 0.0, 0.2)] {
+            let mut distinct = first.clone();
+            distinct.width += mutate.0;
+            distinct.height += mutate.1;
+            distinct.font_size += mutate.2;
+
+            let deduplicated = deduplicate_overlapping_text_items(vec![first.clone(), distinct]);
+            assert_eq!(
+                deduplicated.len(),
+                2,
+                "drift {mutate:?} must keep items distinct"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_items_keeps_distinct_overlapping_text() {
+        type ItemMutation = (&'static str, Box<dyn Fn(&mut TextItem)>);
+
+        let first = make_merge_item("HELLO", 100.0, 30.0);
+        let cases: Vec<ItemMutation> = vec![
+            ("page", Box::new(|item| item.page += 1)),
+            ("x", Box::new(|item| item.x += 0.2)),
+            ("y", Box::new(|item| item.y += 0.2)),
+            ("width", Box::new(|item| item.width += 0.2)),
+            ("text", Box::new(|item| item.text = "WORLD".into())),
+            ("font", Box::new(|item| item.font = "F2".into())),
+            ("font size", Box::new(|item| item.font_size += 0.2)),
+            ("height", Box::new(|item| item.height += 0.2)),
+            ("bold", Box::new(|item| item.is_bold = true)),
+            ("italic", Box::new(|item| item.is_italic = true)),
+            ("underline", Box::new(|item| item.is_underline = true)),
+            ("strikeout", Box::new(|item| item.is_strikeout = true)),
+            ("MCID", Box::new(|item| item.mcid = Some(2))),
+            (
+                "item type",
+                Box::new(|item| item.item_type = ItemType::FormField),
+            ),
+        ];
+
+        for (field, mutate) in cases {
+            let mut distinct = first.clone();
+            mutate(&mut distinct);
+            let deduplicated = deduplicate_overlapping_text_items(vec![first.clone(), distinct]);
+            assert_eq!(deduplicated.len(), 2, "{field} must keep items distinct");
+        }
+    }
+
+    #[test]
+    fn merge_items_keeps_shifted_text_paints() {
+        let first = make_merge_item("HELLO", 100.0, 30.0);
+        let mut shifted = first.clone();
+        shifted.x += 0.001;
+
+        let deduplicated = deduplicate_overlapping_text_items(vec![first, shifted]);
+
+        assert_eq!(deduplicated.len(), 2);
+    }
+
+    #[test]
+    fn merge_items_deduplicates_matching_text_after_intervening_paint() {
+        let first = make_merge_item("X", 100.0, 10.0);
+        let mut intervening = first.clone();
+        intervening.text = "Y".into();
+        let replay = first.clone();
+
+        let deduplicated = deduplicate_overlapping_text_items(vec![first, intervening, replay]);
+
+        assert_eq!(deduplicated.len(), 2);
+        assert_eq!(
+            deduplicated
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            "XY"
+        );
+    }
+
+    #[test]
+    fn merge_items_keeps_nonfinite_geometry_out_of_deduplication() {
+        for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for field in ["x", "width", "height", "font_size"] {
+                let mut first = make_merge_item("X", 100.0, 10.0);
+                match field {
+                    "width" => first.width = nonfinite,
+                    "height" => first.height = nonfinite,
+                    "font_size" => first.font_size = nonfinite,
+                    _ => first.x = nonfinite,
+                }
+
+                let deduplicated = deduplicate_overlapping_text_items(vec![first.clone(), first]);
+
+                assert_eq!(
+                    deduplicated.len(),
+                    2,
+                    "{field} = {nonfinite} must not deduplicate"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_items_normalizes_signed_zero_geometry() {
+        let mut positive = make_merge_item("X", 0.0, 0.0);
+        positive.y = 0.0;
+        let mut negative = positive.clone();
+        negative.x = -0.0;
+        negative.y = -0.0;
+
+        let deduplicated = deduplicate_overlapping_text_items(vec![positive, negative]);
+
+        assert_eq!(deduplicated.len(), 1);
     }
 
     fn make_line(x1: f32, y1: f32, x2: f32, y2: f32) -> PdfLine {
