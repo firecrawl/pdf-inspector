@@ -1139,6 +1139,9 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     merged
 }
 
+/// How much smaller than its line's text a glyph must be to read as a script.
+const SCRIPT_SIZE_RATIO: f32 = 0.75;
+
 /// Merge subscript/superscript items into their adjacent parent items.
 ///
 /// Subscripts (e.g. "2" in H₂O) are rendered as separate text items with a
@@ -1154,17 +1157,70 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     // both the parent line and the subscript/superscript offset.
     let y_tolerance = 5.0;
     let mut line_groups: Vec<(u32, f32, Vec<TextItem>)> = Vec::new();
+    let mut anchors: Vec<(u32, f32)> = Vec::new();
 
+    // Collect line anchors first, then assign every item to its nearest. Doing
+    // both in one pass misplaces a raised glyph that reaches the loop before its
+    // own line does: it joins whichever neighbouring line already exists, and
+    // between two tightly-spaced table rows that is routinely the row above,
+    // where nothing is adjacent enough to absorb it.
+    for item in &items {
+        if !anchors
+            .iter()
+            .any(|(page, y)| *page == item.page && (item.y - *y).abs() < y_tolerance)
+        {
+            anchors.push((item.page, item.y));
+        }
+    }
+    line_groups.extend(anchors.iter().map(|&(page, y)| (page, y, Vec::new())));
+
+    let first_in_range = |groups: &[(u32, f32, Vec<TextItem>)], item: &TextItem| {
+        groups
+            .iter()
+            .position(|(page, y, _)| *page == item.page && (item.y - *y).abs() < y_tolerance)
+    };
+
+    // Ordinary items first, on first-match — exactly what the single-pass version
+    // did. Anything that could be a script glyph waits, because the test for one
+    // needs the line it would join to already carry its body text.
+    let mut deferred: Vec<TextItem> = Vec::new();
     for item in items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
-            group.push(item);
+        if item.text.len() <= 4 && is_script_token(&item.text) {
+            deferred.push(item);
+            continue;
+        }
+        match first_in_range(&line_groups, &item) {
+            Some(index) => line_groups[index].2.push(item),
+            None => line_groups.push((item.page, item.y, vec![item])),
+        }
+    }
+
+    for item in deferred {
+        let nearest = line_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, (page, y, _))| *page == item.page && (item.y - *y).abs() < y_tolerance)
+            .min_by(|(_, a), (_, b)| (item.y - a.1).abs().total_cmp(&(item.y - b.1).abs()))
+            .map(|(index, _)| index);
+        // Nearest line, but only for a glyph genuinely smaller than the text on
+        // that line. A body-sized numeric cell is a value, not a script: moving one
+        // to a different row group trades cells between rows in a dense table.
+        let raised = nearest.is_some_and(|index| {
+            let line_size = line_groups[index]
+                .2
+                .iter()
+                .map(|other| other.font_size)
+                .fold(0.0_f32, f32::max);
+            line_size > 0.0 && item.font_size < line_size * SCRIPT_SIZE_RATIO
+        });
+        let target = if raised {
+            nearest
         } else {
-            let page = item.page;
-            let y = item.y;
-            line_groups.push((page, y, vec![item]));
+            first_in_range(&line_groups, &item)
+        };
+        match target {
+            Some(index) => line_groups[index].2.push(item),
+            None => line_groups.push((item.page, item.y, vec![item])),
         }
     }
 
@@ -1182,7 +1238,7 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
             continue;
         }
 
-        let sub_threshold = max_fs * 0.75;
+        let sub_threshold = max_fs * SCRIPT_SIZE_RATIO;
 
         // Walk through items and merge subscripts into their preceding parent
         let mut merged: Vec<TextItem> = Vec::new();
@@ -1190,21 +1246,28 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
             if item.font_size < sub_threshold
                 && item.font_size > 0.0
                 && item.text.len() <= 4
-                && item.text.chars().all(|c| c.is_ascii_digit())
+                && is_script_token(&item.text)
             {
-                // This is a candidate numeric subscript/superscript (e.g. "2" in H₂O).
-                // Only merge purely numeric text to avoid false positives with small
-                // bullets, ordinal indicators, or letter-based labels.
+                // A candidate script glyph (e.g. "2" in H₂O, "1)" after a label).
+                // Restricting to numeric tokens keeps small bullets and letter-based
+                // labels out.
                 if let Some(parent) = merged.last_mut() {
-                    // Only merge into a parent that is normal-sized, not another subscript,
-                    // and whose text ends with a letter. This prevents merging into numbers
-                    // (e.g. "33" + "1" in "33 1/3%") or punctuation, while preserving
-                    // chemical formulas (NH + "3") and footnote refs (word + "2").
-                    let ends_with_letter = parent
-                        .text
-                        .chars()
-                        .last()
-                        .is_some_and(|c| c.is_alphabetic());
+                    // Only merge into a parent that is normal-sized and not another
+                    // subscript. A letter is the usual anchor — chemical formulas
+                    // (NH + "3") and footnote refs (word + "2") — but a marker just
+                    // as often follows a closing bracket or quote, as in
+                    // `POCP (“smog”)` + `3)`. Digits stay excluded either way:
+                    // appending to one corrupts the value ("33" + "1" in "33 1/3%").
+                    // `%` closes a value the way a bracket closes a phrase, but it
+                    // only anchors a *raised* glyph: nothing subscripts onto a rate,
+                    // so a level neighbour is a separate small numeric cell and
+                    // absorbing it would eat that value.
+                    let raised = item.y > parent.y + parent.font_size * 0.1;
+                    let ends_absorbable = parent.text.chars().last().is_some_and(|c| {
+                        c.is_alphabetic()
+                            || matches!(c, ')' | ']' | '}' | '”' | '"' | '\'' | '»')
+                            || (c == '%' && raised)
+                    });
                     // Strikeout boundaries block the merge (a struck word
                     // must not extend its strike over a live footnote digit,
                     // and a struck digit must not lose its own mark). An
@@ -1215,11 +1278,14 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     let marks_ok = parent.is_strikeout == item.is_strikeout
                         && (parent.is_underline == item.is_underline
                             || (parent.is_underline && !item.is_underline));
-                    if parent.font_size >= sub_threshold && ends_with_letter && marks_ok {
+                    if parent.font_size >= sub_threshold && marks_ok {
                         let parent_right = parent.x + parent.width;
                         let gap = item.x - parent_right;
                         // Subscripts must be tightly adjacent (within ~1pt)
-                        if gap < parent.font_size * 0.2 && gap > -parent.font_size * 0.3 {
+                        if ends_absorbable
+                            && gap < parent.font_size * 0.2
+                            && gap > -parent.font_size * 0.3
+                        {
                             // Preserve the script when absorbing it: map the
                             // digits to Unicode sub/superscript forms so the
                             // raised/lowered rendering survives in extracted
@@ -1229,10 +1295,24 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                             // unaffected. Direction from the baseline offset
                             // (y-up here): raised → superscript (footnote
                             // refs), lowered/level → subscript (chemistry).
-                            let raised = item.y > parent.y + parent.font_size * 0.1;
                             parent.text.push_str(&map_script_digits(&item.text, raised));
                             parent.width = (item.x + item.width) - parent.x;
                             continue;
+                        }
+                        // A superscript can also sit *inside* its parent rather
+                        // than after it: `(m³)` arrives here as `(m )` plus a
+                        // loose `3`, because item joining already stepped over
+                        // the glyph and appended the bracket. The blank it left
+                        // behind is exactly where the glyph belongs — and left
+                        // alone the digit drifts into the next table cell and
+                        // corrupts the value there.
+                        if item.x > parent.x && item.x < parent_right {
+                            if let Some(offset) = skipped_glyph_blank(parent, item.x) {
+                                parent
+                                    .text
+                                    .replace_range(offset..offset + 1, &map_script_digits(&item.text, raised));
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1245,9 +1325,49 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     result
 }
 
+/// Byte offset of the blank a stepped-over superscript left in `parent`, given
+/// the glyph's device x.
+///
+/// The character position is interpolated across the item's width, which is
+/// crude on a proportional font, so this takes the nearest blank within a couple
+/// of characters rather than demanding an exact hit. Returns `None` when no
+/// blank is close enough — better to leave the glyph loose than to punch a digit
+/// into the middle of a word.
+fn skipped_glyph_blank(parent: &TextItem, x: f32) -> Option<usize> {
+    if parent.width <= 0.0 {
+        return None;
+    }
+    let length = parent.text.chars().count();
+    if length == 0 {
+        return None;
+    }
+    let estimate = ((x - parent.x) / parent.width * length as f32).round() as isize;
+    parent
+        .text
+        .char_indices()
+        .enumerate()
+        .filter(|(_, (_, ch))| *ch == ' ')
+        .map(|(position, (offset, _))| ((position as isize - estimate).abs(), offset))
+        .filter(|(distance, _)| *distance <= 2)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, offset)| offset)
+}
+
+/// A digit run, optionally closed by `)` or `.` — the shape of both a chemical
+/// subscript and a numeric footnote marker. The bare-digit case alone leaves
+/// `total` + `1)` unmerged, and the loose marker then leads the cell instead of
+/// trailing its label.
+fn is_script_token(text: &str) -> bool {
+    let digits = text
+        .strip_suffix(')')
+        .or_else(|| text.strip_suffix('.'))
+        .unwrap_or(text);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Map ASCII digits to their Unicode superscript (`raised`) or subscript
-/// forms. Callers guarantee digit-only input (see `merge_subscript_items`);
-/// anything else passes through unchanged.
+/// forms. Any non-digit — the `)` of a footnote marker — passes through
+/// unchanged.
 fn map_script_digits(text: &str, raised: bool) -> String {
     const SUP: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
     const SUB: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
@@ -1415,6 +1535,91 @@ mod tests {
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "北京时事");
+    }
+
+    /// A script glyph: small font, raised, at `x`.
+    fn make_script_item(text: &str, x: f32, y: f32) -> TextItem {
+        let mut item = make_merge_item(text, x, 2.5);
+        item.y = y;
+        item.font_size = 5.0;
+        item.height = 5.0;
+        item
+    }
+
+    #[test]
+    fn test_is_script_token() {
+        assert!(is_script_token("2"));
+        assert!(is_script_token("1)"));
+        assert!(is_script_token("12."));
+        assert!(!is_script_token(""));
+        assert!(!is_script_token(")"));
+        assert!(!is_script_token("a)"));
+        assert!(!is_script_token("1a"));
+    }
+
+    #[test]
+    fn test_marker_after_closing_bracket_is_absorbed() {
+        // `POCP (“smog”)` + `3)`: the label ends in punctuation, and leaving the
+        // marker loose puts it at the head of the cell, where footnote detection
+        // then throws the whole data row out of the table.
+        let parent = make_merge_item("POCP (“smog”)", 100.0, 60.0);
+        let merged = merge_subscript_items(vec![parent, make_script_item("3)", 160.0, 702.0)]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "POCP (“smog”)³)");
+    }
+
+    #[test]
+    fn test_marker_after_percentage_is_absorbed() {
+        // A rate carries its marker the same way a phrase carries one. `%` closes
+        // the value, so absorbing cannot corrupt the number the way appending to a
+        // bare digit would — which the parent-ends-with-digit test still pins.
+        let parent = make_merge_item("24.99%", 100.0, 34.0);
+        let merged = merge_subscript_items(vec![parent, make_script_item("1)", 134.0, 702.0)]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "24.99%¹)");
+    }
+
+    #[test]
+    fn test_level_number_after_percentage_stays_separate() {
+        // Nothing subscripts onto a rate, so a small number sharing the baseline is
+        // a neighbouring cell rather than a marker. Absorbing it would eat a value.
+        let parent = make_merge_item("24.99%", 100.0, 34.0);
+        let mut level = make_script_item("2", 134.0, 700.0);
+        level.y = 700.0;
+        let merged = merge_subscript_items(vec![parent, level]);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "24.99%");
+        assert_eq!(merged[1].text, "2");
+    }
+
+    #[test]
+    fn test_superscript_inside_parent_fills_its_blank() {
+        // `(m³)` reaches this pass as `(m )` plus a loose `3` — the glyph belongs
+        // in the blank, not appended, and not left to drift into the next cell.
+        let parent = make_merge_item("Net freshwater use (m )", 100.0, 100.0);
+        let merged = merge_subscript_items(vec![parent, make_script_item("3", 195.0, 702.0)]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Net freshwater use (m³)");
+    }
+
+    #[test]
+    fn test_script_glyph_joins_the_nearer_of_two_tight_rows() {
+        // Rows 5.5pt apart: the glyph is inside both tolerances, and the row above
+        // is seen first. It still has to land on the row it is raised above.
+        let above = make_merge_item("Product name", 40.0, 46.0);
+        let mut parent = make_merge_item("Volume (m )", 300.0, 40.0);
+        parent.y = 694.5;
+        let glyph = make_script_item("3", 336.0, 697.0);
+        let merged = merge_subscript_items(vec![above, glyph, parent]);
+
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert!(texts.contains(&"Volume (m³)"), "got {texts:?}");
+        assert!(texts.contains(&"Product name"), "got {texts:?}");
+        assert_eq!(merged.len(), 2, "got {texts:?}");
     }
 
     fn make_merge_item(text: &str, x: f32, width: f32) -> TextItem {
