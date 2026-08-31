@@ -1613,6 +1613,20 @@ mod tests {
     }
 
     #[test]
+    fn merge_items_preserves_square_bullet_stream_order_with_backtracking() {
+        let items = vec![
+            with_mcid(make_merge_item("▪", 79.4, 5.0)),
+            with_mcid(make_merge_item("The MS", 91.0, 32.6)),
+            with_mcid(make_merge_item("A LoS project", 84.4, 70.0)),
+        ];
+
+        let merged = merge_text_items(items);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "▪ The MSA LoS project");
+    }
+
+    #[test]
     fn merge_items_keeps_normal_bullet_gap_limit_without_stream_order() {
         let items = vec![
             make_merge_item("•", 79.4, 5.0),

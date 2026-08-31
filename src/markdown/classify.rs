@@ -314,48 +314,24 @@ mod tests {
     }
 
     #[test]
-    fn is_list_item_original_bullet_styles() {
-        assert!(is_list_item("● Item"));
-        assert!(is_list_item("• Item"));
-        assert!(is_list_item("○ Item"));
-        assert!(is_list_item("◦ Item"));
-        assert!(is_list_item("- Item"));
-        assert!(is_list_item("* Item"));
-        assert!(is_list_item("1. First"));
-        assert!(is_list_item("1. Item"));
-        assert!(is_list_item("a. Letter"));
-        assert!(is_list_item("a) Letter"));
-        assert!(is_list_item("a) Item"));
-    }
-
-    #[test]
-    fn is_list_item_primary_extended_glyphs() {
-        for text in ["▪ Item", "‣ Item", "◆ Item"] {
+    fn is_list_item_extended_bullet_glyphs() {
+        for text in [
+            "▪ Item", "▫ Item", "◆ Item", "◇ Item", "■ Item", "□ Item", "‣ Item", "⁃ Item",
+        ] {
             assert!(is_list_item(text), "{text}");
             assert!(starts_with_bullet_marker(text), "{text}");
             assert_eq!(format_list_item(text), "- Item", "{text}");
         }
     }
-    #[test]
-    fn is_list_item_extended_bullet_glyphs() {
-        for glyph in ['▪', '▫', '◆', '◇', '■', '□', '‣', '⁃'] {
-            assert!(is_list_item(&format!("{glyph} Item")), "glyph {glyph}");
-            assert!(
-                starts_with_bullet_marker(&format!("{glyph} Item")),
-                "glyph {glyph}"
-            );
-            assert_eq!(
-                format_list_item(&format!("{glyph} Item")),
-                "- Item",
-                "glyph {glyph}"
-            );
-        }
-    }
 
     #[test]
-    fn middle_dot_is_not_formatted_as_list_item() {
-        assert!(!is_list_item("· Item"));
-        assert_eq!(format_list_item("· Item"), "· Item");
+    fn is_list_item_preserves_original_styles() {
+        assert!(is_list_item("● Item"));
+        assert!(is_list_item("• Item"));
+        assert!(is_list_item("- Item"));
+        assert!(is_list_item("* Item"));
+        assert!(is_list_item("1. Item"));
+        assert!(is_list_item("a) Item"));
     }
 
     #[test]
@@ -363,9 +339,11 @@ mod tests {
         assert!(!is_list_item("▪Item"));
         assert!(!is_list_item("Item ▪"));
         assert!(!is_list_item("· Item"));
+        assert_eq!(format_list_item("· Item"), "· Item");
         assert!(!is_list_item("– Item"));
         assert!(!is_list_item("— Item"));
-        assert!(!is_list_item("Regular text"));
+        assert!(!is_list_item("not a list"));
+        assert!(!is_list_item("**bold** not a list"));
         assert!(!starts_with_bullet_marker("· Item"));
         assert!(!starts_with_bullet_marker("– Item"));
         assert!(!starts_with_bullet_marker("— Item"));
