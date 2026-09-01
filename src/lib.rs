@@ -3914,19 +3914,21 @@ fn finish_loaded_document(doc: Document) -> Result<(Document, u32), PdfError> {
     }
     // lopdf drops the contents of object streams it could not expand (over
     // the decompression bound, or unparseable) without any signal on the
-    // returned document. The reliable trace either loader path leaves is a
+    // returned document. The only trace either loader path leaves is a
     // deficit between the xref size (`max_id`) and the objects actually
-    // loaded. Normal documents have small xref gaps (free entries), so only
-    // a large deficit is worth surfacing — the document is still usable, but
-    // the missing objects resolve as not-found.
+    // loaded — which free xref entries also contribute to, so this is a
+    // heuristic: surface large deficits for diagnosability, worded so a
+    // legitimately sparse xref isn't reported as data loss. The document is
+    // still usable either way; unloaded objects resolve as not-found.
     let expected = doc.max_id as usize;
     let loaded = doc.objects.len();
     let missing = expected.saturating_sub(loaded);
     if missing > 1000 && missing.saturating_mul(64) > expected {
         log::warn!(
-            "loaded {loaded} of {expected} xref objects; the rest were dropped \
-             (typically object streams over the {MAX_STREAM_DECOMPRESSED_BYTES}-byte \
-             decompression bound) and will resolve as not-found"
+            "loaded {loaded} of {expected} xref object slots; the rest are free \
+             xref entries or object streams skipped over the \
+             {MAX_STREAM_DECOMPRESSED_BYTES}-byte decompression bound, and will \
+             resolve as not-found"
         );
     }
     Ok((doc, page_count))
