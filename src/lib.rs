@@ -4404,25 +4404,43 @@ fn process_document(
                 &chart_regions,
             );
 
-            let conversion = markdown::markdown_conversion_output_from_items_with_rects_and_lines(
-                items,
-                options.markdown,
-                &rects,
-                &lines,
-                markdown::MarkdownDocumentContext {
-                    page_thresholds: &page_thresholds,
-                    struct_roles: struct_roles.as_ref(),
-                    struct_tables: &struct_tables,
-                    page_count,
-                    prefiltered_page_number_pages: Some(&removed_pages),
-                    prefiltered_page_number_mask: Some(removal_mask.as_slice()),
-                    precomputed_chart_regions: Some(&chart_regions),
-                },
-            );
+            let conversion = if options.mode == ProcessMode::Analyze {
+                markdown::markdown_counts_only_from_items_with_rects_and_lines(
+                    items,
+                    options.markdown,
+                    &rects,
+                    &lines,
+                    markdown::MarkdownDocumentContext {
+                        page_thresholds: &page_thresholds,
+                        struct_roles: struct_roles.as_ref(),
+                        struct_tables: &struct_tables,
+                        page_count,
+                        prefiltered_page_number_pages: Some(&removed_pages),
+                        prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                        precomputed_chart_regions: Some(&chart_regions),
+                    },
+                )
+            } else {
+                markdown::markdown_conversion_output_from_items_with_rects_and_lines(
+                    items,
+                    options.markdown,
+                    &rects,
+                    &lines,
+                    markdown::MarkdownDocumentContext {
+                        page_thresholds: &page_thresholds,
+                        struct_roles: struct_roles.as_ref(),
+                        struct_tables: &struct_tables,
+                        page_count,
+                        prefiltered_page_number_pages: Some(&removed_pages),
+                        prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                        precomputed_chart_regions: Some(&chart_regions),
+                    },
+                )
+            };
             let md = if options.mode == ProcessMode::Analyze {
                 None
             } else {
-Some(conversion.markdown)
+                Some(conversion.markdown)
             };
 
             let enc = !ocr_reasons_by_page.is_empty()

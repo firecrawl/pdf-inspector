@@ -848,6 +848,12 @@ enum TableOutputMode {
     CompleteTables,
 }
 
+#[derive(Clone, Copy)]
+enum MarkdownSerializationMode {
+    Full,
+    CountsOnly,
+}
+
 struct TableDetectionOutput {
     mode: TableOutputMode,
     pages_with_detected_tables: HashSet<u32>,
@@ -1469,6 +1475,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         pdf_lines,
         context,
         TableOutputMode::Markdown,
+        MarkdownSerializationMode::Full,
     )
     .markdown
 }
@@ -1497,6 +1504,7 @@ pub(crate) fn complete_table_markdown_from_items(
             precomputed_chart_regions: None,
         },
         TableOutputMode::CompleteTables,
+        MarkdownSerializationMode::Full,
     );
     let mut output = String::new();
     for (_, table) in conversion.detected_tables {
@@ -1519,6 +1527,7 @@ fn convert_items_with_rects_lines_and_table_output(
     pdf_lines: &[crate::types::PdfLine],
     context: MarkdownDocumentContext<'_>,
     table_output_mode: TableOutputMode,
+    serialization_mode: MarkdownSerializationMode,
 ) -> MarkdownConversionOutput {
     use crate::tables::{
         content_width, detect_tables_from_lines, detect_tables_from_rects,
@@ -2410,15 +2419,18 @@ fn convert_items_with_rects_lines_and_table_output(
         }
         let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
         band_split_page_set.extend(page_chart_prose_splits.keys().copied());
-        let markdown = to_markdown_from_lines_with_tables_and_images(
-            stripped,
-            options,
-            page_tables,
-            page_images,
-            &page_chart_map,
-            &band_split_page_set,
-            effective_struct_roles,
-        );
+        let markdown = match serialization_mode {
+            MarkdownSerializationMode::Full => to_markdown_from_lines_with_tables_and_images(
+                stripped,
+                options,
+                page_tables,
+                page_images,
+                &page_chart_map,
+                &band_split_page_set,
+                effective_struct_roles,
+            ),
+            MarkdownSerializationMode::CountsOnly => String::new(),
+        };
         MarkdownConversionOutput {
             markdown,
             removed_header_footer_lines: removed,
@@ -2428,15 +2440,18 @@ fn convert_items_with_rects_lines_and_table_output(
     } else {
         let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
         band_split_page_set.extend(page_chart_prose_splits.keys().copied());
-        let markdown = to_markdown_from_lines_with_tables_and_images(
-            lines,
-            options,
-            page_tables,
-            page_images,
-            &page_chart_map,
-            &band_split_page_set,
-            effective_struct_roles,
-        );
+        let markdown = match serialization_mode {
+            MarkdownSerializationMode::Full => to_markdown_from_lines_with_tables_and_images(
+                lines,
+                options,
+                page_tables,
+                page_images,
+                &page_chart_map,
+                &band_split_page_set,
+                effective_struct_roles,
+            ),
+            MarkdownSerializationMode::CountsOnly => String::new(),
+        };
         MarkdownConversionOutput {
             markdown,
             removed_header_footer_lines: vec![0; document_page_count as usize],
@@ -2473,6 +2488,25 @@ pub(crate) fn markdown_conversion_output_from_items_with_rects_and_lines(
         pdf_lines,
         context,
         TableOutputMode::Markdown,
+        MarkdownSerializationMode::Full,
+    )
+}
+
+pub(crate) fn markdown_counts_only_from_items_with_rects_and_lines(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+    context: MarkdownDocumentContext<'_>,
+) -> MarkdownConversionOutput {
+    convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        rects,
+        pdf_lines,
+        context,
+        TableOutputMode::Markdown,
+        MarkdownSerializationMode::CountsOnly,
     )
 }
 
@@ -2594,6 +2628,35 @@ mod tests {
 
         assert!(output.markdown.is_empty());
         assert_eq!(output.removed_header_footer_lines, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn counts_only_conversion_reuses_header_footer_stripping_without_markdown() {
+        let items = vec![
+            furniture_item("Running Header", 50.0, 780.0, 1),
+            furniture_item("Body text", 80.0, 700.0, 1),
+            furniture_item("Running Header", 50.0, 780.0, 2),
+            furniture_item("More body", 90.0, 650.0, 2),
+        ];
+
+        let output = markdown_counts_only_from_items_with_rects_and_lines(
+            items,
+            MarkdownOptions::default(),
+            &[],
+            &[],
+            MarkdownDocumentContext {
+                page_thresholds: &HashMap::new(),
+                struct_roles: None,
+                struct_tables: &[],
+                page_count: 2,
+                prefiltered_page_number_pages: None,
+                prefiltered_page_number_mask: None,
+                precomputed_chart_regions: None,
+            },
+        );
+
+        assert!(output.markdown.is_empty());
+        assert_eq!(output.removed_header_footer_lines, vec![1, 1]);
     }
 
     fn furniture_item(text: &str, x: f32, y: f32, page: u32) -> TextItem {
