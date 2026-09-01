@@ -250,10 +250,24 @@ pub(crate) fn extract_page_text_items(
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
-    // Get content
-    let content_data = doc
-        .get_page_content(page_id)
-        .map_err(|e| PdfError::Parse(e.to_string()))?;
+    // Get content, bounding decompression so a page-content bomb (a tiny
+    // Flate stream inflating to gigabytes) skips the page instead of
+    // exhausting memory — same degradation as the operator cap below. Real
+    // page content runs a few MB at most; the bound is deliberately far
+    // above that.
+    const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+    let content_data = match doc.get_page_content_with_limit(page_id, MAX_PAGE_CONTENT_BYTES) {
+        Ok(data) => data,
+        Err(e) => {
+            log::warn!(
+                "page {}: skipping extraction — content stream exceeds {} decompressed bytes: {}",
+                page_num,
+                MAX_PAGE_CONTENT_BYTES,
+                e
+            );
+            return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
+        }
+    };
 
     // Strip PDF comments (% to end of line) from the content stream.
     // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's
