@@ -4379,7 +4379,7 @@ fn process_document(
             let md = if options.mode == ProcessMode::Analyze {
                 None
             } else {
-                Some(conversion.markdown.clone())
+Some(conversion.markdown)
             };
 
             let enc = !ocr_reasons_by_page.is_empty()
