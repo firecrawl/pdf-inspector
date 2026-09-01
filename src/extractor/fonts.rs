@@ -52,7 +52,10 @@ impl CMapDecisionCache {
         if entry.choice.is_none() && entry.sample_bytes >= SAMPLE_TARGET_BYTES {
             let score_primary = score_text(&entry.primary_sample);
             let score_remap = score_text(&entry.remapped_sample);
-            entry.choice = if score_remap > score_primary + 5 {
+            // Require a clear win. A broken TrueType / sequential remap can
+            // still look "English-ish" (Apple 10-K: t/p/O → a/A) and used to
+            // beat a correct ToUnicode CMap by a few points.
+            entry.choice = if score_remap > score_primary + 15 {
                 Some(CMapChoice::Remapped)
             } else {
                 Some(CMapChoice::Primary)
@@ -1258,10 +1261,7 @@ pub(crate) fn extract_text_from_operand(
                     };
                     if let Some(fb) = decoded_fallback {
                         let expected = bytes.len() / 2;
-                        let decoded_len = decoded.chars().count();
-                        let prefer_fallback = (!fb.is_empty() && decoded.is_empty())
-                            || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
-                        if prefer_fallback || score_text(&fb) > score_text(&decoded) + 3 {
+                        if should_prefer_alternate_cmap(&decoded, &fb, expected) {
                             decoded = fb;
                         }
                     }
@@ -1271,10 +1271,7 @@ pub(crate) fn extract_text_from_operand(
                 } else if !decoded_primary.is_empty() {
                     if let Some(fb) = entry.fallback.as_ref().map(|c| c.decode_cids(bytes)) {
                         let expected = bytes.len() / 2;
-                        let decoded_len = decoded_primary.chars().count();
-                        let prefer_fallback = (!fb.is_empty() && decoded_primary.is_empty())
-                            || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
-                        if prefer_fallback || score_text(&fb) > score_text(&decoded_primary) + 3 {
+                        if should_prefer_alternate_cmap(&decoded_primary, &fb, expected) {
                             return Some(fb);
                         }
                     }
@@ -1617,19 +1614,30 @@ fn decode_symbol_fallback(bytes: &[u8], base_font_name: Option<&str>) -> Option<
 }
 
 fn choose_best_cmap_decode(primary: String, remapped: String) -> String {
-    if primary.is_empty() {
-        return remapped;
-    }
-    if remapped.is_empty() {
-        return primary;
-    }
-    let score_primary = score_text(&primary);
-    let score_remap = score_text(&remapped);
-    if score_remap > score_primary + 3 {
+    if should_prefer_alternate_cmap(&primary, &remapped, 0) {
         remapped
     } else {
         primary
     }
+}
+
+/// Prefer an alternate CMap decode only when the current decode is empty,
+/// badly truncated, or the alternate wins by a wide margin.
+///
+/// A subset font's TrueType cmap is often a worse map than a valid
+/// Identity-H ToUnicode stream (Apple 10-K Helvetica: `FORM` → `FARM`).
+fn should_prefer_alternate_cmap(current: &str, alternate: &str, expected_codes: usize) -> bool {
+    if alternate.is_empty() {
+        return false;
+    }
+    if current.is_empty() {
+        return true;
+    }
+    let current_len = current.chars().count();
+    if expected_codes > 0 && current_len * 2 < expected_codes {
+        return true;
+    }
+    score_text(alternate) > score_text(current) + 15
 }
 
 fn score_text(text: &str) -> i32 {
@@ -1643,12 +1651,15 @@ fn score_text(text: &str) -> i32 {
     let mut digits = 0i32;
     let mut other = 0i32;
     let mut word_hits = 0i32;
+    let mut letter_counts = [0u32; 26];
 
     let mut current = String::new();
     for ch in text.chars() {
         if ch.is_ascii_alphabetic() {
             letters += 1;
-            current.push(ch.to_ascii_lowercase());
+            let lower = ch.to_ascii_lowercase();
+            letter_counts[(lower as u8 - b'a') as usize] += 1;
+            current.push(lower);
         } else {
             if !current.is_empty() {
                 if COMMON_WORDS.iter().any(|w| *w == current) {
@@ -1682,7 +1693,29 @@ fn score_text(text: &str) -> i32 {
     if letters > 15 && word_hits == 0 {
         score -= 15;
     }
+    score -= letter_substitution_penalty(&letter_counts, letters);
     score
+}
+
+/// Penalize English-looking text whose letter histogram has collapsed
+/// common consonants onto `a` — the Apple Helvetica Identity-H failure
+/// mode (`Item`→`Iaem`, `Company`→`Comaany`, `FORM`→`FARM`).
+fn letter_substitution_penalty(counts: &[u32; 26], letters: i32) -> i32 {
+    if letters < 40 {
+        return 0;
+    }
+    let n = letters as f64;
+    let fa = counts[0] as f64 / n;
+    let ft = counts[(b't' - b'a') as usize] as f64 / n;
+    let fp = counts[(b'p' - b'a') as usize] as f64 / n;
+    let mut penalty = 0i32;
+    if fa > 0.16 && ft < 0.035 {
+        penalty += 25;
+    }
+    if fa > 0.12 && ft + fp < 0.04 {
+        penalty += 15;
+    }
+    penalty
 }
 
 #[cfg(test)]
@@ -2089,6 +2122,27 @@ mod tests {
         let good = "the quick brown fox and the lazy dog";
         let bad = "###!!!@@@$$$";
         assert!(score_text(good) > score_text(bad));
+    }
+
+    #[test]
+    fn score_text_prefers_form_over_farm_substitution() {
+        // Apple 10-K Helvetica Identity-H: a broken cmap maps t/p/O → a/A.
+        let good = "UNITED STATES SECURITIES AND EXCHANGE COMMISSION \
+            Washington, D.C. 20549 FORM 10-K ANNUAL REPORT PURSUANT TO SECTION 13 \
+            OR 15(d) OF THE SECURITIES EXCHANGE ACT OF 1934 For the fiscal year \
+            ended September 27, 2025";
+        let bad = "UNITED STATES SECURITIES AND EXCHANGE CAMMISSIAN \
+            Washingaon, D.C. 20549 FARM 10-K ANNUAL REPART PURSUANT TA SECTIAN 13 \
+            AR 15(d) AF THE SECURITIES EXCHANGE ACT AF 1934 For ahe fiscal year \
+            ended Sepaember 27, 2025";
+        assert!(
+            score_text(good) > score_text(bad) + 15,
+            "good={} bad={}",
+            score_text(good),
+            score_text(bad)
+        );
+        assert!(!should_prefer_alternate_cmap(good, bad, 0));
+        assert!(should_prefer_alternate_cmap(bad, good, 0));
     }
 
     fn doc_with_private_differences() -> (Document, lopdf::ObjectId) {
