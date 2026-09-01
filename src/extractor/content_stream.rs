@@ -250,9 +250,13 @@ pub(crate) fn extract_page_text_items(
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
-    // Get content
+    // Get content, bounding decompression so a page-content bomb (a tiny
+    // Flate stream inflating to gigabytes) fails the page instead of
+    // exhausting memory. Real page content runs a few MB at most; the bound
+    // is deliberately far above that.
+    const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
     let content_data = doc
-        .get_page_content(page_id)
+        .get_page_content_with_limit(page_id, MAX_PAGE_CONTENT_BYTES)
         .map_err(|e| PdfError::Parse(e.to_string()))?;
 
     // Strip PDF comments (% to end of line) from the content stream.
