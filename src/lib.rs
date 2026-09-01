@@ -4404,30 +4404,21 @@ fn process_document(
                 &chart_regions,
             );
 
-            let conversion = if options.mode == ProcessMode::Analyze {
-                markdown::MarkdownConversionOutput {
-                    markdown: String::new(),
-                    removed_header_footer_lines: vec![0; page_count as usize],
-                    #[cfg(feature = "ocr")]
-                    detected_tables: Vec::new(),
-                }
-            } else {
-                markdown::markdown_conversion_output_from_items_with_rects_and_lines(
-                    items,
-                    options.markdown,
-                    &rects,
-                    &lines,
-                    markdown::MarkdownDocumentContext {
-                        page_thresholds: &page_thresholds,
-                        struct_roles: struct_roles.as_ref(),
-                        struct_tables: &struct_tables,
-                        page_count,
-                        prefiltered_page_number_pages: Some(&removed_pages),
-                        prefiltered_page_number_mask: Some(removal_mask.as_slice()),
-                        precomputed_chart_regions: Some(&chart_regions),
-                    },
-                )
-            };
+            let conversion = markdown::markdown_conversion_output_from_items_with_rects_and_lines(
+                items,
+                options.markdown,
+                &rects,
+                &lines,
+                markdown::MarkdownDocumentContext {
+                    page_thresholds: &page_thresholds,
+                    struct_roles: struct_roles.as_ref(),
+                    struct_tables: &struct_tables,
+                    page_count,
+                    prefiltered_page_number_pages: Some(&removed_pages),
+                    prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                    precomputed_chart_regions: Some(&chart_regions),
+                },
+            );
             let md = if options.mode == ProcessMode::Analyze {
                 None
             } else {

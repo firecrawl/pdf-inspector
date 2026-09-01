@@ -1537,7 +1537,12 @@ fn convert_items_with_rects_lines_and_table_output(
     } = context;
 
     if items.is_empty() {
-        return MarkdownConversionOutput::default();
+        return MarkdownConversionOutput {
+            markdown: String::new(),
+            removed_header_footer_lines: vec![0; document_page_count as usize],
+            #[cfg(feature = "ocr")]
+            detected_tables: Vec::new(),
+        };
     }
 
     // Table detection must retain the original collection because short
@@ -2567,6 +2572,28 @@ mod tests {
         let md = to_markdown(text, MarkdownOptions::default());
         assert!(md.contains("- First item"));
         assert!(md.contains("- Second item"));
+    }
+
+    #[test]
+    fn empty_conversion_reports_zero_counts_for_each_document_page() {
+        let output = markdown_conversion_output_from_items_with_rects_and_lines(
+            Vec::new(),
+            MarkdownOptions::default(),
+            &[],
+            &[],
+            MarkdownDocumentContext {
+                page_thresholds: &HashMap::new(),
+                struct_roles: None,
+                struct_tables: &[],
+                page_count: 3,
+                prefiltered_page_number_pages: None,
+                prefiltered_page_number_mask: None,
+                precomputed_chart_regions: None,
+            },
+        );
+
+        assert!(output.markdown.is_empty());
+        assert_eq!(output.removed_header_footer_lines, vec![0, 0, 0]);
     }
 
     fn furniture_item(text: &str, x: f32, y: f32, page: u32) -> TextItem {
