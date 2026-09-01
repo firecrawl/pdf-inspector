@@ -27,23 +27,30 @@ pub fn table_to_markdown(table: &Table) -> String {
     let num_cols = cleaned_cells[0].len();
     let mut output = String::new();
 
-    // Compact format: no padding, minimal separators. Optimized for token
-    // efficiency — AI agents are the primary consumer, not human eyes.
-    for (row_idx, row) in cleaned_cells.iter().enumerate() {
-        output.push('|');
-        for cell in row.iter() {
-            output.push_str(cell);
+    // Sparse first rows (a short title split across empty spacer cells)
+    // are spanning titles. Markdown pipes cannot express colspan, so emit
+    // HTML instead of a row of empty spacer cells.
+    if first_row_is_spanning_title(&cleaned_cells[0]) {
+        output.push_str(&table_to_html(&cleaned_cells, num_cols));
+    } else {
+        // Compact format: no padding, minimal separators. Optimized for token
+        // efficiency — AI agents are the primary consumer, not human eyes.
+        for (row_idx, row) in cleaned_cells.iter().enumerate() {
             output.push('|');
-        }
-        output.push('\n');
-
-        // Add separator after header row
-        if row_idx == 0 {
-            output.push('|');
-            for _ in 0..num_cols {
-                output.push_str("---|");
+            for cell in row.iter() {
+                output.push_str(cell);
+                output.push('|');
             }
             output.push('\n');
+
+            // Add separator after header row
+            if row_idx == 0 {
+                output.push('|');
+                for _ in 0..num_cols {
+                    output.push_str("---|");
+                }
+                output.push('\n');
+            }
         }
     }
 
@@ -279,6 +286,75 @@ fn ends_like_incomplete_phrase(cell: &str) -> bool {
         || lower.ends_with(',')
         || lower.ends_with('-')
         || lower.ends_with('/')
+}
+
+/// True when the first row is a title smeared across a wide grid
+/// rather than real column headers.
+fn first_row_is_spanning_title(row: &[String]) -> bool {
+    if row.len() < 4 {
+        return false;
+    }
+    let filled: Vec<&str> = row
+        .iter()
+        .map(|cell| cell.trim())
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    if filled.is_empty() || filled.len() > 2 {
+        return false;
+    }
+    let filled_chars: usize = filled.iter().map(|cell| cell.chars().count()).sum();
+    let empty = row.len() - filled.len();
+    empty >= row.len().saturating_sub(2)
+        && filled_chars >= 4
+        && filled
+            .iter()
+            .all(|cell| cell.split_whitespace().count() <= 8)
+}
+
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn table_to_html(cells: &[Vec<String>], num_cols: usize) -> String {
+    let mut output = String::from("<table>\n");
+    for (row_idx, row) in cells.iter().enumerate() {
+        output.push_str("<tr>");
+        if row_idx == 0 && first_row_is_spanning_title(row) {
+            let title = row
+                .iter()
+                .map(|cell| cell.trim())
+                .filter(|cell| !cell.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            output.push_str(&format!(
+                "<th colspan=\"{num_cols}\">{}</th>",
+                html_escape(&title)
+            ));
+        } else {
+            let tag = if row_idx == 0 || (row_idx == 1 && first_row_is_spanning_title(&cells[0])) {
+                "th"
+            } else {
+                "td"
+            };
+            for col in 0..num_cols {
+                let cell = row.get(col).map(|s| s.trim()).unwrap_or("");
+                output.push_str(&format!("<{tag}>{}</{tag}>", html_escape(cell)));
+            }
+        }
+        output.push_str("</tr>\n");
+    }
+    output.push_str("</table>\n");
+    output
 }
 
 /// Clean up table cells: merge continuation rows, extract footnotes, remove empty rows
@@ -892,6 +968,65 @@ mod tests {
     }
 
     // --- table_to_markdown ---
+
+    #[test]
+    fn test_table_to_html_spanning_title_row() {
+        let table = Table {
+            columns: vec![10.0; 11],
+            rows: vec![500.0, 480.0, 460.0],
+            cells: vec![
+                vec![
+                    String::new(),
+                    "Q3".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    "Summary".into(),
+                    String::new(),
+                ],
+                vec![
+                    "Alpha".into(),
+                    "Bravo".into(),
+                    "Charlie".into(),
+                    "Delta".into(),
+                    "Echo".into(),
+                    "Foxtrot".into(),
+                    "Golf".into(),
+                    "Hotel".into(),
+                    "India".into(),
+                    "Juliet".into(),
+                    "Kilo".into(),
+                ],
+                vec![
+                    "10".into(),
+                    "11".into(),
+                    "12".into(),
+                    "13".into(),
+                    "14".into(),
+                    "15".into(),
+                    "16".into(),
+                    "17".into(),
+                    "18".into(),
+                    "19".into(),
+                    "20".into(),
+                ],
+            ],
+            item_indices: vec![],
+            kind: TableKind::Data,
+        };
+        let md = table_to_markdown(&table);
+        assert!(
+            md.contains("<th colspan=\"11\">Q3 Summary</th>"),
+            "expected spanning title, got: {md}"
+        );
+        assert!(md.contains("<th>Alpha</th>"));
+        assert!(md.contains("<td>10</td>"));
+        assert!(!md.contains("|Q3|"));
+    }
 
     #[test]
     fn test_table_to_markdown_basic() {
