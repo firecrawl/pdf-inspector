@@ -65,7 +65,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use text_quality::{
     analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
-    region_items_have_decoding_issue,
+    native_markdown_is_trustworthy, region_items_have_decoding_issue,
 };
 use tounicode::FontCMaps;
 
@@ -649,25 +649,26 @@ fn extract_pages_markdown_mem_impl(
             ..markdown_options.clone()
         };
 
-        let md = if has_text_quality_issue {
-            String::new()
-        } else {
-            markdown::to_markdown_from_items_with_rects_and_lines(
-                page_items,
-                options,
-                &page_rects,
-                &page_lines,
-                markdown::MarkdownDocumentContext {
-                    page_thresholds: &page_thresholds,
-                    struct_roles: None,
-                    struct_tables: &[],
-                    page_count,
-                    prefiltered_page_number_pages: Some(&removed_page_number_pages),
-                    prefiltered_page_number_mask: Some(&page_number_removal_mask),
-                    precomputed_chart_regions: Some(&chart_regions),
-                },
-            )
-        };
+        // Always build markdown. Item-level quality can flag a page because a
+        // minority of spans look broken (one decorative font, a few PUA
+        // bullets) while the assembled page is clean English. Skipping
+        // conversion here used to wipe recoverable native text for no-OCR
+        // callers. `needs_ocr` still records those signals for OCR routing.
+        let md = markdown::to_markdown_from_items_with_rects_and_lines(
+            page_items,
+            options,
+            &page_rects,
+            &page_lines,
+            markdown::MarkdownDocumentContext {
+                page_thresholds: &page_thresholds,
+                struct_roles: None,
+                struct_tables: &[],
+                page_count,
+                prefiltered_page_number_pages: Some(&removed_page_number_pages),
+                prefiltered_page_number_mask: Some(&page_number_removal_mask),
+                precomputed_chart_regions: Some(&chart_regions),
+            },
+        );
 
         let has_decoding_issue = has_text_quality_issue
             || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
@@ -699,14 +700,18 @@ fn extract_pages_markdown_mem_impl(
 
         results.push(PageMarkdown {
             page: page_0idx,
-            // The public native extractor continues to suppress unreliable
-            // text. The OCR orchestrator retains clean partial text
-            // internally so it can compare/fuse it with OCR before deciding
-            // what is safe to return.
-            markdown: if needs_ocr && !preserve_ocr_candidates {
-                String::new()
-            } else {
+            // Keep substantial, non-garbled native text even when the page
+            // also needs OCR (background image, outlined glyphs elsewhere,
+            // or a few bad spans). Stamps and short captions stay empty so
+            // scan-with-header / vector-outline fixtures still suppress.
+            // The OCR orchestrator always retains candidates.
+            markdown: if preserve_ocr_candidates
+                || !needs_ocr
+                || native_markdown_is_trustworthy(&md)
+            {
                 md
+            } else {
+                String::new()
             },
             needs_ocr,
             ocr_reason,
@@ -6683,6 +6688,29 @@ mod tests {
         assert!(!detect_encoding_issues(
             "Normal markdown text with no issues."
         ));
+    }
+
+    #[test]
+    fn test_native_markdown_keeps_article_and_drops_stamp() {
+        use crate::text_quality::native_markdown_is_trustworthy;
+
+        let article = "# Tech Talk\n\n## What is 4G?\n\nWe've been hearing from time to \
+            time about 4G and 3G broadband services and the difference in speed it makes \
+            to connecting to the internet through your mobile devices. Well, at the end \
+            of this article you should be able to differentiate between the both.";
+        assert!(native_markdown_is_trustworthy(article));
+        // Sparse replacement chars from a citation font should not condemn the page.
+        assert!(native_markdown_is_trustworthy(&format!(
+            "{article} \u{FFFD}\u{FFFD} Accessed 16th December."
+        )));
+
+        assert!(!native_markdown_is_trustworthy(
+            "Order Detail Report by Account"
+        ));
+        assert!(!native_markdown_is_trustworthy(
+            "Fig 1 Fig 1 Fig 1 Fig 1 Fig 1 Fig 1 Fig 1 Fig 1 Fig 1 Fig 1"
+        ));
+        assert!(!native_markdown_is_trustworthy(SHIFTED_CIPHER_TEXT));
     }
 
     #[test]

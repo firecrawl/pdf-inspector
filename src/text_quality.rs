@@ -518,3 +518,57 @@ pub(crate) fn is_cid_garbage(text: &str) -> bool {
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
     total >= 20 && high_latin * 5 >= total * 2 && ascii_letters * 3 < total
 }
+
+/// True when native markdown is substantial enough to return even if the
+/// page is also flagged `needs_ocr` (background image, vector art, or a
+/// minority of garbled spans).
+///
+/// Stamps, "Fig 1" captions, and ciphertext stay suppressed so OCR routing
+/// fixtures (`scan_with_native_header_text`, `vector_outlined_text_with_caption`)
+/// keep empty markdown. Real body text (articles, 10-K pages, titles plus
+/// a paragraph) is kept for no-OCR callers.
+pub(crate) fn native_markdown_is_trustworthy(markdown: &str) -> bool {
+    if markdown.trim().is_empty() {
+        return false;
+    }
+    if is_garbage_text(markdown) || is_cid_garbage(markdown) {
+        return false;
+    }
+    // A few U+FFFD from a logo/citation font must not wipe an otherwise
+    // clean article. Reject only when replacements dominate, or the
+    // letter histogram is a substitution cipher.
+    let replacement = markdown.chars().filter(|&ch| ch == '\u{FFFD}').count();
+    let letters = markdown.chars().filter(|ch| ch.is_alphanumeric()).count();
+    if replacement >= 8 && letters > 0 && replacement * 10 >= letters {
+        return false;
+    }
+    let mut cipher = CipherGarbleStats::default();
+    cipher.add_text(markdown);
+    if cipher.looks_garbled() {
+        return false;
+    }
+
+    let mut letters = 0usize;
+    let mut words = std::collections::HashSet::new();
+    let mut current = String::new();
+    for ch in markdown.chars() {
+        if ch.is_alphanumeric() {
+            letters += 1;
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            if current.chars().any(|c| c.is_alphabetic()) && current.chars().count() >= 2 {
+                words.insert(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+    }
+    if !current.is_empty()
+        && current.chars().any(|c| c.is_alphabetic())
+        && current.chars().count() >= 2
+    {
+        words.insert(current);
+    }
+
+    letters >= 80 && words.len() >= 8
+}
