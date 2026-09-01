@@ -161,6 +161,11 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Install Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: "1.22"
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -168,6 +173,7 @@ jobs:
           workspaces: |
             . -> target
             napi -> target
+            go -> target
 
       - name: Install PDFium
         shell: bash
@@ -285,6 +291,13 @@ jobs:
           if (!result.pages[0].markdown.trim()) throw new Error('empty OCR markdown')
           JS
 
+      - name: Build Go native library (OCR feature)
+        run: cargo build --manifest-path go/Cargo.toml --release
+
+      - name: Run Go OCR binding
+        working-directory: go/pdfinspector
+        run: go test -run TestProcessPdfWithOcr_AutoMode_ScannedFixture -v ./...
+
       - name: Run Python OCR binding
         shell: bash
         run: |
@@ -300,6 +313,151 @@ jobs:
           assert result.pages[0].provenance.source in {"ocr", "fused"}
           assert result.pages[0].markdown.strip()
           PY
+
+  go:
+    name: Go binding (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # go/Cargo.toml builds with the `ocr` feature (same as napi's
+          # crate), so this is sized like the `ocr` job above rather than
+          # the plain `build` job. Unlike that `ocr` job, this DOES
+          # provision real PDFium/ONNX Runtime below (on both platforms),
+          # so TestProcessPdfWithOcr_AutoMode_ScannedFixture actually
+          # exercises the real OCR runtime path here rather than only in
+          # the Ubuntu-only ocr-runtime job -- this is the one place in CI
+          # any binding's OCR path gets tested on macOS.
+          - os: ubuntu-latest
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - os: macos-latest
+            runner: blacksmith-6vcpu-macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
+        with:
+          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+
+      - name: Install Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: "1.22"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            go -> target
+          key: go-${{ matrix.os }}
+
+      # PDFium/ONNX Runtime asset names, hosts, and extraction differ per
+      # platform, so each is two OS-gated steps rather than one
+      # templated step; both write the same PDFIUM_LIB_PATH/ORT_DYLIB_PATH
+      # env vars so every step after this one is platform-agnostic. The
+      # Linux steps' URLs/checksums mirror the ocr-runtime job's below;
+      # the macOS ones are the same releases' mac-arm64 assets (checksums
+      # via `gh api repos/<owner>/<repo>/releases/tags/<tag>` --jq
+      # '.assets[].digest', which computes them server-side rather than
+      # requiring a full download to verify against).
+      - name: Install PDFium (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/firecrawl-pdfium-linux-x64.tgz"
+          directory="$RUNNER_TEMP/firecrawl-pdfium"
+          curl --fail --location --silent --show-error \
+            https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-linux-x64.tgz \
+            --output "$archive"
+          echo "6248189e07bbc33cdeb31976c539a88614307c8a19f3276dbd018efbe5b4a2a2  $archive" | sha256sum -c
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          pdfium_path="$(find "$directory" -type f -name 'libpdfium.so' -print -quit)"
+          test -n "$pdfium_path"
+          echo "PDFIUM_LIB_PATH=$pdfium_path" >> "$GITHUB_ENV"
+
+      - name: Install PDFium (macOS)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/firecrawl-pdfium-mac-arm64.tgz"
+          directory="$RUNNER_TEMP/firecrawl-pdfium"
+          curl --fail --location --silent --show-error \
+            https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-mac-arm64.tgz \
+            --output "$archive"
+          echo "4168356c2e62ad5e79553e2e9162f5c99949759d90cb83876a50311f0c32b9b3  $archive" | shasum -a 256 -c
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          pdfium_path="$(find "$directory" -type f -name 'libpdfium.dylib' -print -quit)"
+          test -n "$pdfium_path"
+          echo "PDFIUM_LIB_PATH=$pdfium_path" >> "$GITHUB_ENV"
+
+      - name: Install ONNX Runtime (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.27.0.tgz"
+          directory="$RUNNER_TEMP/onnxruntime"
+          curl --fail --location --silent --show-error \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz \
+            --output "$archive"
+          echo "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f  $archive" | sha256sum -c
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          ort_path="$(find "$directory" -type f -name 'libonnxruntime.so*' -print -quit)"
+          test -n "$ort_path"
+          echo "ORT_DYLIB_PATH=$ort_path" >> "$GITHUB_ENV"
+
+      - name: Install ONNX Runtime (macOS)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/onnxruntime-osx-arm64-1.27.0.tgz"
+          directory="$RUNNER_TEMP/onnxruntime"
+          curl --fail --location --silent --show-error \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz \
+            --output "$archive"
+          echo "545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a  $archive" | shasum -a 256 -c
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          # -not -path '*.dSYM*': the archive also ships a .dSYM debug-symbol
+          # bundle containing its own same-named copy of the library, which
+          # this glob would otherwise also match.
+          ort_path="$(find "$directory" -type f -name 'libonnxruntime*.dylib' -not -path '*.dSYM*' -print -quit)"
+          test -n "$ort_path"
+          echo "ORT_DYLIB_PATH=$ort_path" >> "$GITHUB_ENV"
+
+      - name: Configure isolated model cache
+        shell: bash
+        run: echo "PDF_INSPECTOR_MODEL_CACHE=$RUNNER_TEMP/pdf-inspector-models" >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path go/Cargo.toml -- --check
+
+      - name: Lint
+        run: cargo clippy --manifest-path go/Cargo.toml --release -- -D warnings
+
+      - name: Build native library
+        run: cargo build --manifest-path go/Cargo.toml --release --verbose
+
+      # Isolated from the full test run below for two reasons: it pre-warms
+      # PDF_INSPECTOR_MODEL_CACHE (nothing else does for this job, unlike
+      # ocr-runtime's CLI-based warm-up step) so the real OCR test doesn't
+      # hit a cold-cache network download while gating every other test's
+      # result; and a flaky/slow model download failing here reports
+      # clearly as "OCR model cache" rather than an opaque failure buried
+      # inside the full `go test` run.
+      - name: Warm OCR model cache
+        working-directory: go/pdfinspector
+        run: go test -run TestProcessPdfWithOcr_AutoMode_ScannedFixture -v ./...
+
+      - name: Run Go tests
+        working-directory: go/pdfinspector
+        run: go test -race ./... -v
 
   wasm:
     name: WebAssembly

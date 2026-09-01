@@ -1,0 +1,241 @@
+name: Publish Go native library
+
+# Unlike the npm/PyPI/crates.io workflows, there's no package registry for
+# Go modules — `go get` fetches source straight from GitHub. This workflow's
+# job is narrower: cross-build the prebuilt cgo native library per platform
+# and attach it to a GitHub Release, so pdfinspector/internal/fetchnative's
+# `go generate` step (see go/pdfinspector/pdfinspector.go) has something to
+# download. Building from source with `cargo build --release` in go/ always
+# remains a fallback that needs no release at all.
+#
+# Tagged `go/pdfinspector/vX.Y.Z` -- Go's own convention for a module that
+# lives in a repository subdirectory requires the tag to be prefixed with
+# that exact subdirectory path (see https://go.dev/ref/mod#vcs-version),
+# which for go/pdfinspector/go.mod's declared module path is `go/pdfinspector`,
+# not just `go`. Getting this prefix wrong wouldn't just be a style nit --
+# `go get`/`go install` resolve a versioned nested module by looking for
+# exactly this tag shape, so a mismatched prefix would leave the module
+# permanently unresolvable via the module system.
+
+on:
+  push:
+    branches: [main]
+    paths: ['go/Cargo.toml']
+  # Manual fallback: retry a release that failed partway (per-asset
+  # already-uploaded checks make re-runs idempotent).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: Check version change
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, not a shallow `fetch-depth: 2` -- comparing
+          # against `github.event.before` (the pre-push SHA, correct for a
+          # push containing more than one commit; HEAD~1 only ever looks
+          # one commit back regardless of how many landed) requires that
+          # commit's tree to actually be present locally, which a shallow
+          # clone doesn't guarantee.
+          fetch-depth: 0
+
+      - name: Check if version changed
+        id: check
+        run: |
+          NEW_VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("go/Cargo.toml").read_text())["package"]["version"])')
+          TAG="go/pdfinspector/v$NEW_VERSION"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Mirrors publish-wasm.yml's check-version step: `git cat-file -e`
+          # checks whether the pre-push commit has go/Cargo.toml at all
+          # before trying to read a version out of it, since that commit
+          # may predate the Go binding entirely (the first push that
+          # introduces it) -- an absent old version is definitionally a
+          # change. `workflow_dispatch` has no `github.event.before` (it's
+          # push-only), so it's handled by its own branch first.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch: releasing $TAG"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif git cat-file -e "${{ github.event.before }}:go/Cargo.toml" 2>/dev/null; then
+            OLD_VERSION=$(git show "${{ github.event.before }}:go/Cargo.toml" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
+            echo "old=$OLD_VERSION new=$NEW_VERSION"
+            if [ "$NEW_VERSION" != "$OLD_VERSION" ]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "go/Cargo.toml did not exist before this push — this is the first release"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Runner choices mirror publish.yml/publish-pypi.yml's per-target
+          # mapping: Blacksmith where they use it for the same target,
+          # otherwise the same plain GitHub-hosted label they fall back to
+          # (there's no Blacksmith arm64 Linux or Intel Mac runner
+          # precedent anywhere else in this repo's workflows).
+          #
+          # glibc-target: building linux-{x64,arm64} directly on the
+          # runner's own toolchain (plain `cargo build`) links against
+          # whatever glibc that runner's OS ships -- Ubuntu 24.04's, which
+          # is too new for fetchnative to safely hand to "every glibc
+          # linux/amd64 host" the way it currently claims to. napi/pypi
+          # solve the equivalent problem with napi-cross / manylinux
+          # containers; neither applies to a plain `cargo build`, so this
+          # uses cargo-zigbuild's explicit-glibc-version targeting instead
+          # (glibc 2.17 == the manylinux2014/CentOS 7 baseline pypi's own
+          # Linux wheels target, for consistency across this repo's
+          # published artifacts). Empty for the two macOS legs, which have
+          # no equivalent concern.
+          - runner: blacksmith-8vcpu-ubuntu-2404
+            target: linux-x64
+            rust-target: x86_64-unknown-linux-gnu
+            glibc-target: x86_64-unknown-linux-gnu.2.17
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+            rust-target: aarch64-unknown-linux-gnu
+            glibc-target: aarch64-unknown-linux-gnu.2.17
+          - runner: blacksmith-6vcpu-macos-15
+            target: darwin-arm64
+          - runner: macos-15-intel
+            target: darwin-x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action tag "stable"; the Rust version is pinned by the toolchain input
+        with:
+          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
+          targets: ${{ matrix.rust-target }}
+
+      - name: Install zig
+        if: matrix.glibc-target != ''
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: matrix.glibc-target != ''
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-zigbuild
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            go -> target
+          key: publish-go-${{ matrix.target }}
+
+      - name: Build native library
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.glibc-target }}" ]; then
+            cargo zigbuild --manifest-path go/Cargo.toml --release --verbose --target "${{ matrix.glibc-target }}"
+          else
+            cargo build --manifest-path go/Cargo.toml --release --verbose
+          fi
+
+      - name: Package archive
+        shell: bash
+        run: |
+          staging="$RUNNER_TEMP/pdf-inspector-go-${{ matrix.target }}"
+          mkdir -p "$staging"
+          # `--target` (used above only for the glibc-pinned Linux legs)
+          # always builds into target/<triple>/release, never plain
+          # target/release, regardless of whether it happens to match the
+          # host architecture.
+          if [ -n "${{ matrix.rust-target }}" ]; then
+            build_dir="go/target/${{ matrix.rust-target }}/release"
+          else
+            build_dir="go/target/release"
+          fi
+          # Only the dynamic library ships: cgo LDFLAGS link against it at
+          # runtime via -rpath (see go/pdfinspector/pdfinspector.go); the
+          # staticlib output is a much larger build-from-source-only artifact.
+          cp "$build_dir"/libpdf_inspector_go.{so,dylib} "$staging" 2>/dev/null || true
+          test -n "$(ls -A "$staging")" # fail loudly if neither .so nor .dylib was produced
+          tar -czf "pdf-inspector-go-${{ matrix.target }}.tar.gz" -C "$staging" .
+
+      - name: Upload archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: pdf-inspector-go-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    # Only this job needs to create/upload release assets — the
+    # workflow-wide default (contents: read) covers check-version and
+    # build, which just run Cargo/build scripts against untrusted-ish
+    # dependency graphs and shouldn't hold release-capable credentials
+    # while doing it.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download all archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Compute checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > checksums.txt
+
+      - name: List release assets
+        run: ls -la dist/
+
+      - name: Create or update release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check-version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" *.tar.gz checksums.txt --repo "${{ github.repository }}" --clobber
+          else
+            # --target pins the tag to the commit that triggered this run,
+            # not whatever main's HEAD happens to be by the time this job
+            # gets here -- without it, a commit landing on main in the gap
+            # between trigger and this job would make the tag point past
+            # the native assets actually being uploaded, silently
+            # decoupling the Go source tag from its own release artifacts.
+            gh release create "$TAG" *.tar.gz checksums.txt \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --title "Go native library $TAG" \
+              --notes "Prebuilt libpdf_inspector_go for the Go binding (go/pdfinspector). Fetched automatically by \`go generate ./...\`; see go/README.md."
+          fi
