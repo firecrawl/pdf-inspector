@@ -4,10 +4,16 @@
 //! both stamp identical boxes and baseline angles on their `TextItem`s.
 
 /// Which way a page's coordinate frame was turned so that predominantly
-/// rotated text reads along +x (see `content_stream::correct_rotated_page`).
-/// Region boxes given in page coordinates must be turned the same way.
+/// rotated text reads along +x.
+///
+/// A page whose text mostly runs vertically is re-based so its dominant runs
+/// read left-to-right: the items' `x`/`y`/`width`/`height` and `rotation`
+/// are then expressed in the turned frame, not in page coordinates. Region
+/// boxes given in page coordinates must be turned the same way —
+/// `collect_text_in_region_in_frame` does that, and
+/// `extract_text_with_positions_and_rotations_mem` reports each page's turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PageRotation {
+pub enum PageRotation {
     /// Text reads along +x; coordinates are plain page coordinates.
     Upright,
     /// Most runs read bottom-to-top (90°, `Tm = [0 b -b 0]`): the frame was
@@ -41,19 +47,20 @@ impl PageRotation {
     /// Turn an axis-aligned box with the page frame: the negated axis's far
     /// edge becomes the new near edge and the extents swap. Extents may be
     /// negative (rects drawn under a reflected CTM), so both edges are
-    /// normalised first and the result always has non-negative extents.
+    /// normalised first and the result always has non-negative extents —
+    /// for an upright page too, where the box otherwise stays put.
     pub(crate) fn rotate_box(self, x: &mut f32, y: &mut f32, width: &mut f32, height: &mut f32) {
         let (x0, x1) = (x.min(*x + *width), x.max(*x + *width));
         let (y0, y1) = (y.min(*y + *height), y.max(*y + *height));
-        let (new_x, new_y) = match self {
-            PageRotation::Upright => return,
-            PageRotation::Ccw => (y0, -x1),
-            PageRotation::Cw => (-y1, x0),
+        let (new_x, new_y, new_width, new_height) = match self {
+            PageRotation::Upright => (x0, y0, x1 - x0, y1 - y0),
+            PageRotation::Ccw => (y0, -x1, y1 - y0, x1 - x0),
+            PageRotation::Cw => (-y1, x0, y1 - y0, x1 - x0),
         };
         *x = new_x;
         *y = new_y;
-        *width = y1 - y0;
-        *height = x1 - x0;
+        *width = new_width;
+        *height = new_height;
     }
 }
 
@@ -236,6 +243,10 @@ mod tests {
         let (mut x, mut y, mut w, mut h) = (100.0, 200.0, -20.0, -10.0);
         PageRotation::Ccw.rotate_box(&mut x, &mut y, &mut w, &mut h);
         assert_eq!((x, y, w, h), (190.0, -100.0, 10.0, 20.0));
+        // An upright page keeps the box in place but still normalises it.
+        let (mut x, mut y, mut w, mut h) = (100.0, 200.0, -20.0, -10.0);
+        PageRotation::Upright.rotate_box(&mut x, &mut y, &mut w, &mut h);
+        assert_eq!((x, y, w, h), (80.0, 190.0, 20.0, 10.0));
     }
 
     #[test]

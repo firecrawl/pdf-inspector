@@ -5,6 +5,9 @@ use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::ItemType;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
+    collect_text_in_region_in_frame, extract_text_with_positions_and_rotations_mem, PageRotation,
+};
+use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
@@ -4595,6 +4598,17 @@ BT /F1 12 Tf 0 -1 1 0 270 644 Tm (LINE) Tj ET";
     assert!(text.contains("HELLO") && text.contains("WORLD"), "{text:?}");
     assert!(
         !text.contains("SECOND") && !text.contains("LINE"),
+        "{text:?}"
+    );
+
+    // Callers holding the items can ask for each page's frame and pass it
+    // explicitly to the region helper instead of relying on inference.
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem(&buf).unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Cw));
+    let text =
+        collect_text_in_region_in_frame(&items, 290.0, 87.0, 320.0, 192.0, 792.0, PageRotation::Cw);
+    assert!(
+        text.contains("HELLO") && !text.contains("SECOND"),
         "{text:?}"
     );
 

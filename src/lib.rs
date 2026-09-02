@@ -49,9 +49,11 @@ pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
+pub use extractor::geometry::PageRotation;
 pub use extractor::{
-    extract_text, extract_text_with_positions, extract_text_with_positions_mem,
-    extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
+    extract_text, extract_text_with_positions, extract_text_with_positions_and_rotations_mem,
+    extract_text_with_positions_mem, extract_text_with_positions_pages,
+    extract_text_with_positions_pages_with_password,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
@@ -516,7 +518,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -3616,12 +3618,13 @@ struct RegionBounds {
 /// and return them as a single string in reading order.
 ///
 /// Items from a page whose text was predominantly rotated live in a turned
-/// coordinate frame (see `TextItem::rotation`). This entry point recognises
-/// that frame heuristically: a counter-clockwise turn from most items at
-/// negative y, a clockwise turn only from an unambiguous set with every box
-/// entirely at negative x and non-negative y. Callers that hold the
-/// extractor's page metadata should prefer [`extract_text_in_regions_mem`],
-/// which carries the page rotation explicitly.
+/// coordinate frame (see [`PageRotation`]). This legacy entry point infers
+/// only the counter-clockwise turn, from most items sitting at negative y;
+/// a clockwise turn is never inferred, because content drawn at negative
+/// page x looks the same. Pass the page's frame explicitly with
+/// [`collect_text_in_region_in_frame`] (frames come from
+/// [`extract_text_with_positions_and_rotations_mem`]), or use
+/// [`extract_text_in_regions_mem`], which handles both turns itself.
 pub fn collect_text_in_region(
     items: &[TextItem],
     rx1: f32,
@@ -3638,6 +3641,32 @@ pub fn collect_text_in_region(
         ry2,
         page_height,
         infer_region_coord_space(items),
+        0.10,
+    )
+}
+
+/// [`collect_text_in_region`] with the page's coordinate frame given
+/// explicitly instead of inferred: `rotation` is the turn
+/// [`extract_text_with_positions_and_rotations_mem`] reported for the items'
+/// page (`PageRotation::Upright` for pages absent from that map). The region
+/// bbox stays in top-left page coordinates and is turned to match.
+pub fn collect_text_in_region_in_frame(
+    items: &[TextItem],
+    rx1: f32,
+    ry1: f32,
+    rx2: f32,
+    ry2: f32,
+    page_height: f32,
+    rotation: PageRotation,
+) -> String {
+    collect_text_in_region_with_options(
+        items,
+        rx1,
+        ry1,
+        rx2,
+        ry2,
+        page_height,
+        RegionCoordSpace::from(rotation),
         0.10,
     )
 }
@@ -3733,28 +3762,16 @@ fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
     // so most items land at negative y or negative x respectively. Use this
     // to keep `collect_text_in_region` behavior compatible for direct
     // callers that do not have extractor metadata.
-    // Legacy heuristic for callers without extractor metadata. A
+    // Legacy heuristic for callers without extractor metadata: a
     // counter-clockwise turn maps y = -(old right edge), so most items land
-    // at negative y (the pre-existing rule, kept as is). A clockwise turn
-    // maps x = -(old top edge); it is inferred only from an unambiguous
-    // set — every box lying entirely at negative x and every item at
-    // non-negative y — so content that merely touches negative x stays in
-    // page coordinates. Content drawn wholly at negative page x (an offset
-    // MediaBox) cannot be told apart from that frame; callers holding the
-    // extractor's metadata should use `extract_text_in_regions_mem`, which
-    // carries the page rotation explicitly.
-    if items.is_empty() {
-        return RegionCoordSpace::Standard;
-    }
+    // at negative y (the pre-existing rule, kept as is). A clockwise turn is
+    // never inferred — its signature (negative x) cannot be told apart from
+    // content drawn at negative page coordinates. Callers pass the frame
+    // explicitly through `collect_text_in_region_in_frame` or use
+    // `extract_text_in_regions_mem`, which carries the page rotation itself.
     let negative_y = items.iter().filter(|item| item.y < 0.0).count();
-    if negative_y * 2 >= items.len() {
-        return RegionCoordSpace::Rotated90Ccw;
-    }
-    let clockwise = items
-        .iter()
-        .all(|item| item.x + item.width <= 0.5 && item.y >= -0.5);
-    if clockwise {
-        RegionCoordSpace::Rotated90Cw
+    if !items.is_empty() && negative_y * 2 >= items.len() {
+        RegionCoordSpace::Rotated90Ccw
     } else {
         RegionCoordSpace::Standard
     }
@@ -4278,7 +4295,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4346,7 +4363,7 @@ fn process_document(
         text_quality_pages,
         text_quality_reasons_by_page,
     ) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
+        Some(((items, rects, lines), page_thresholds, gid_encoded_pages, _page_rotations)) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
             // For TextBased PDFs with pages flagged for OCR (Identity-H or
@@ -7882,12 +7899,12 @@ mod rotated_run_region_tests {
         assert!(region_overlaps_item(&header, strip));
         assert!(!region_overlaps_item(&header, body));
 
-        // The legacy heuristic recognises the counter-clockwise frame from
-        // most items at negative y, and the clockwise frame only when every
-        // box lies entirely at negative x with non-negative y.
+        // The legacy heuristic recognises only the counter-clockwise frame
+        // (most items at negative y); a clockwise frame is never inferred and
+        // must be passed explicitly.
         assert_eq!(
             infer_region_coord_space(&[header.clone()]),
-            RegionCoordSpace::Rotated90Cw
+            RegionCoordSpace::Standard
         );
         assert_eq!(
             infer_region_coord_space(&[item("x", 100.0, -200.0, 36.0, 12.0, 0.0)]),
@@ -7897,18 +7914,26 @@ mod rotated_run_region_tests {
             infer_region_coord_space(&[item("x", 100.0, 200.0, 36.0, 12.0, 0.0)]),
             RegionCoordSpace::Standard
         );
-        // One item merely touching negative x is ordinary page content.
-        assert_eq!(
-            infer_region_coord_space(&[
-                item("x", -3.0, 200.0, 36.0, 12.0, 0.0),
-                item("y", 100.0, 200.0, 36.0, 12.0, 0.0),
-            ]),
-            RegionCoordSpace::Standard
+        let strip = collect_text_in_region_in_frame(
+            &[header.clone()],
+            570.0,
+            80.0,
+            600.0,
+            140.0,
+            page_h,
+            PageRotation::Cw,
         );
-        assert_eq!(
-            infer_region_coord_space(&[item("x", -40.0, 200.0, 36.0, 12.0, 0.0)]),
-            RegionCoordSpace::Rotated90Cw
+        assert_eq!(strip, "HEADER");
+        let misread = collect_text_in_region_in_frame(
+            &[header.clone()],
+            570.0,
+            80.0,
+            600.0,
+            140.0,
+            page_h,
+            PageRotation::Upright,
         );
+        assert_eq!(misread, "");
 
         // Bounds round-trip back to the top-left page box they came from.
         for coords in [
