@@ -1,0 +1,9 @@
+tests/test_python.py
+  ai_agent 19-23,44-47,107-118,533-543
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5e80c69974aabcd6dbdf0ed5c41dcdcc940ffcd0",
+  "prompts": {}
+}
