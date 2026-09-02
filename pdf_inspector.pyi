@@ -87,11 +87,13 @@ class TextItem:
     """A positioned text item extracted from a PDF.
 
     ``x``/``y`` are PDF points relative to the page's visible page box
-    (``CropBox ∩ MediaBox``, else the MediaBox), origin at the box's lower-left
-    corner with ``y`` growing upward — a rendered page image's frame once its
-    top-left ``y`` is flipped by the box height, and the frame
-    :func:`extract_text_in_regions` reads its regions in. ``/Rotate`` is not
-    applied.
+    (``CropBox ∩ MediaBox``, else the MediaBox; a CropBox that does not overlap
+    the MediaBox is ignored, and a page without a MediaBox is measured against
+    US Letter), origin at the box's lower-left corner with ``y`` growing upward.
+    :func:`extract_text_in_regions` reads its regions relative to the same box
+    but from its top-left corner with ``y`` growing downward; flip with the box
+    height. Pages whose text is drawn rotated by 90° are normalized into a
+    synthetic landscape frame before the shift, and ``/Rotate`` is not applied.
     """
     text: str
     x: float
@@ -235,9 +237,14 @@ def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) ->
 
     ``x``/``y`` are PDF points relative to the page's visible page box
     (``CropBox ∩ MediaBox``, else the MediaBox), origin at its lower-left
-    corner — the same frame :func:`extract_text_in_regions` reads regions in,
-    so an item's region is ``[x, h - y - height, x + width, h - y]`` for a
-    visible box of height ``h``.
+    corner with ``y`` up. :func:`extract_text_in_regions` reads regions
+    relative to the same box from its top-left corner, so flip with the box
+    height ``h``: for text items ``y`` is the baseline and
+    ``[x, h - y - height, x + width, h - y]`` covers the glyph band above it
+    (descenders fall below); for image, link and form-field items ``y`` is the
+    rect bottom and that box is exact. Pages whose text is drawn rotated by
+    90° are normalized into a synthetic landscape frame, where this does not
+    apply.
 
     Args:
         path: Path to the PDF file.
@@ -285,7 +292,8 @@ def extract_text_in_regions(
         page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
             Coordinates are PDF points with top-left origin, relative to the
             visible page box (``CropBox ∩ MediaBox``, else the MediaBox) — the
-            same frame :func:`extract_text_with_positions` reports items in.
+            same box :func:`extract_text_with_positions` reports items in,
+            flipped to a top-left origin (``y_top = box_height - y``).
     """
     ...
 

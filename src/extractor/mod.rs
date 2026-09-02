@@ -83,12 +83,14 @@ fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
 /// Every positioned item (text, image placeholder, link, form field) is
 /// reported in PDF points relative to the page's **visible page box**:
 /// `CropBox ∩ MediaBox` when the page has a CropBox, else the MediaBox. The
-/// box's lower-left corner is the origin and `y` grows upward, so `x`/`y`
-/// line up with a renderer's page image once its top-left `y` is flipped by
-/// the box height — the same frame [`crate::extract_text_in_regions_mem`]
-/// and the other region APIs interpret their inputs in. Raw content-stream
-/// coordinates differ whenever the CropBox or MediaBox origin is not
-/// `(0, 0)`. `/Rotate` is not applied.
+/// box's lower-left corner is the origin and `y` grows upward. A renderer's
+/// page image and the region APIs ([`crate::extract_text_in_regions_mem`]
+/// and friends) use the same box from its top-left corner with `y` growing
+/// downward, so flipping `y` by the box height moves between the two. Raw
+/// content-stream coordinates differ whenever the CropBox or MediaBox origin
+/// is not `(0, 0)`. Pages whose text is drawn rotated by 90° are normalized
+/// into a synthetic landscape frame before the shift; `/Rotate` is not
+/// applied. See [`TextItem`] for the full note.
 pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextItem>, PdfError> {
     extract_text_with_positions_pages(path, None)
 }

@@ -149,7 +149,17 @@ fn find_inherited_box(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<P
                 _ => None,
             };
             if let Some(array) = array {
-                let values: Vec<f32> = array.iter().filter_map(super::get_number).collect();
+                // Operands may themselves be indirect. Like renderers, read
+                // the first four numbers and ignore anything trailing.
+                let values: Vec<f32> = array
+                    .iter()
+                    .filter_map(|value| match value {
+                        Object::Reference(reference) => {
+                            doc.get_object(*reference).ok().and_then(super::get_number)
+                        }
+                        _ => super::get_number(value),
+                    })
+                    .collect();
                 if values.len() >= 4 {
                     if let Some(page_box) =
                         PageBox::from_corners(values[0], values[1], values[2], values[3])
@@ -304,6 +314,45 @@ mod tests {
         assert_eq!(
             visible_page_box(&doc, page_id),
             Some(page_box(50.0, 60.0, 300.0, 300.0))
+        );
+    }
+
+    #[test]
+    fn indirect_box_operands_are_resolved() {
+        // `/CropBox [50 60 350 7 0 R]` with `7 0 obj 460 endobj`: dropping the
+        // reference would leave three numbers, skip the CropBox, and resolve
+        // the page against the MediaBox instead.
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let top = doc.add_object(Object::Real(460.0));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => boxed([0, 0, 400, 500]),
+            "CropBox" => Object::Array(vec![
+                50.into(),
+                60.into(),
+                350.into(),
+                Object::Reference(top),
+            ]),
+        });
+        doc.objects.insert(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Count" => 1,
+                "Kids" => vec![Object::Reference(page_id)],
+            }
+            .into(),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        assert_eq!(
+            visible_page_box(&doc, page_id),
+            Some(page_box(50.0, 60.0, 350.0, 460.0))
         );
     }
 

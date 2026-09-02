@@ -19,7 +19,7 @@ package, Node and WebAssembly packages) share one version; see
   not `(0, 0)` every item was displaced from anything rendered from the CropBox,
   and consumers intersecting items with rendered regions silently selected the
   wrong text.
-- The region APIs interpret their inputs in the same frame:
+- The region APIs interpret their inputs relative to the same box:
   `extract_text_in_regions*`, `extract_tables_in_regions*`,
   `detect_vector_grid_in_region*` and the TSR crop bboxes
   (`TsrTableInput.crop_pdf_pt_bbox`) are top-left-origin PDF points relative to

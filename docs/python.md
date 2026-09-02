@@ -78,8 +78,8 @@ else:
 text = pdf_inspector.extract_text("document.pdf")
 
 # Positioned text items with font info. x/y are PDF points relative to the
-# visible page box (CropBox ∩ MediaBox), origin at its lower-left corner — the
-# frame a rendered page image uses and extract_text_in_regions reads.
+# visible page box (CropBox ∩ MediaBox), origin at its lower-left corner, y up.
+# extract_text_in_regions uses the same box from its top-left corner (y down).
 items = pdf_inspector.extract_text_with_positions("document.pdf")
 for item in items[:5]:
     print(f"'{item.text}' at ({item.x:.0f}, {item.y:.0f}) size={item.font_size}")

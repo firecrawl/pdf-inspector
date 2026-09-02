@@ -489,16 +489,22 @@ for item in extract_text_with_positions("tagged.pdf")? {
 
 ## Coordinate frame
 
-Positioned items and region inputs share one frame: PDF points relative to the
-page's **visible page box** — `CropBox ∩ MediaBox` when the page has a CropBox,
-else the MediaBox. `TextItem.x`/`y` use the box's lower-left corner as origin
-with `y` growing upward; region and crop bboxes (`extract_text_in_regions_mem`,
+Positioned items and region inputs share one reference box: PDF points relative
+to the page's **visible page box** — `CropBox ∩ MediaBox` when the page has a
+CropBox, else the MediaBox (a CropBox that does not overlap the MediaBox is
+ignored, and a page without a MediaBox is measured against US Letter).
+`TextItem.x`/`y` use the box's lower-left corner as origin with `y` growing
+upward; region and crop bboxes (`extract_text_in_regions_mem`,
 `extract_tables_in_regions_mem`, `detect_vector_grid_in_region_mem`,
 `TsrTableInput`) use its top-left corner with `y` growing downward, exactly
 like a rendered page image. Converting between the two only needs the box
-height: an item's region is `[x, h - y - height, x + width, h - y]`. Pages
+height `h`: a positioned `y` becomes `h - y`. For text items `y` is the
+baseline and `height` the font size, so `[x, h - y - height, x + width, h - y]`
+covers the glyph band above the baseline (descenders fall below it); for image,
+link and form-field items `y` is the rect bottom and that box is exact. Pages
 whose CropBox equals the MediaBox with a `(0, 0)` origin are unaffected by this
-convention; `/Rotate` is not applied.
+convention. Pages whose text is drawn rotated by 90° are normalized into a
+synthetic landscape frame before the shift, and `/Rotate` is not applied.
 
 ## Processing modes
 

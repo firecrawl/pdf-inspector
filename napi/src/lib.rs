@@ -90,10 +90,13 @@ pub struct PdfClassification {
 /// A positioned text item extracted from a PDF.
 ///
 /// `x`/`y` are PDF points relative to the page's **visible page box**
-/// (`CropBox ∩ MediaBox`, else the MediaBox), origin at the box's lower-left
-/// corner with `y` growing upward — a rendered page image's frame once its
-/// top-left `y` is flipped by the box height, and the frame
-/// [`extractTextInRegions`] reads its regions in. `/Rotate` is not applied.
+/// (`CropBox ∩ MediaBox`, else the MediaBox; a CropBox that does not overlap
+/// the MediaBox is ignored, and a page without a MediaBox is measured against
+/// US Letter), origin at the box's lower-left corner with `y` growing upward.
+/// [`extractTextInRegions`] reads its regions relative to the same box but
+/// from its top-left corner with `y` growing downward; flip with the box
+/// height. Pages whose text is drawn rotated by 90° are normalized into a
+/// synthetic landscape frame before the shift, and `/Rotate` is not applied.
 #[napi(object)]
 pub struct TextItem {
     pub text: String,
@@ -596,9 +599,12 @@ pub fn extract_structure_elements(
 /// is unreliable (empty, GID-encoded fonts, garbage, encoding issues).
 ///
 /// Coordinates are PDF points with top-left origin, relative to the visible
-/// page box (`CropBox ∩ MediaBox`, else the MediaBox) — the same frame
-/// [`extractTextWithPositions`] reports items in, so an item's region is
-/// `[x, boxHeight - y - height, x + width, boxHeight - y]`.
+/// page box (`CropBox ∩ MediaBox`, else the MediaBox) — the same box
+/// [`extractTextWithPositions`] reports items in, flipped to a top-left
+/// origin: a positioned `y` becomes `boxHeight - y`. For text items `y` is
+/// the baseline, so `[x, boxHeight - y - height, x + width, boxHeight - y]`
+/// covers the glyph band above the baseline; for image, link and form-field
+/// items `y` is the rect bottom and that box is exact.
 #[napi]
 pub fn extract_text_in_regions(
     buffer: Buffer,

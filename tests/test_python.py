@@ -333,7 +333,13 @@ class TestVisiblePageBoxFrame:
 
     @staticmethod
     def _glyph(items):
-        return next(item for item in items if item.text.strip() == "Visible glyph")
+        glyph = next(
+            (item for item in items if item.text.strip() == "Visible glyph"), None
+        )
+        assert glyph is not None, (
+            f"fixture glyph missing from {[item.text for item in items]}"
+        )
+        return glyph
 
     def test_positions_are_relative_to_cropbox_origin(self):
         # MediaBox [0 0 400 500], CropBox [50 60 350 460]; the glyph is

@@ -95,9 +95,14 @@ console.log(result.confidence)     // 0.875
 Every text item (plus image placeholders, links and form fields) with its font
 and position. `x`/`y` are PDF points relative to the page's **visible page
 box** (`CropBox ∩ MediaBox`, else the MediaBox), origin at the box's lower-left
-corner with `y` growing upward — the same frame `extractTextInRegions` reads
-its regions in, so `[x, boxHeight - y - height, x + width, boxHeight - y]` is an
-item's region. Pages whose CropBox equals the MediaBox are unaffected.
+corner with `y` growing upward. `extractTextInRegions` reads its regions
+relative to the same box but from its top-left corner with `y` growing
+downward, so flip with the box height: `boxHeight - y`. For text items `y` is
+the baseline and `height` the font size, so
+`[x, boxHeight - y - height, x + width, boxHeight - y]` covers the glyph band
+above the baseline (descenders fall below it); for image, link and form-field
+items `y` is the rect bottom and that box is exact. Pages whose CropBox equals
+the MediaBox at `(0, 0)` are unaffected.
 
 ```typescript
 import { extractTextWithPositions } from '@firecrawl/pdf-inspector'

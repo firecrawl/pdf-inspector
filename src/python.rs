@@ -345,10 +345,13 @@ impl PyPagesExtractionResult {
 /// A positioned text item extracted from a PDF.
 ///
 /// x/y are PDF points relative to the page's visible page box (CropBox ∩
-/// MediaBox, else MediaBox), origin at the box's lower-left corner with y
-/// growing upward — a rendered page image's frame once its top-left y is
-/// flipped by the box height, and the frame extract_text_in_regions reads
-/// its regions in. /Rotate is not applied.
+/// MediaBox, else MediaBox; a CropBox that does not overlap the MediaBox is
+/// ignored, and a page without a MediaBox is measured against US Letter),
+/// origin at the box's lower-left corner with y growing upward.
+/// extract_text_in_regions reads its regions relative to the same box but
+/// from its top-left corner with y growing downward; flip with the box
+/// height. Pages whose text is drawn rotated by 90° are normalized into a
+/// synthetic landscape frame before the shift, and /Rotate is not applied.
 #[pyclass(name = "TextItem")]
 #[derive(Clone)]
 pub struct PyTextItem {
@@ -861,7 +864,8 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 /// Returns:
 ///     List of TextItem. x/y are PDF points relative to the page's visible
 ///     page box (CropBox ∩ MediaBox, else MediaBox), origin at its lower-left
-///     corner — the same frame extract_text_in_regions reads regions in.
+///     corner with y up; extract_text_in_regions reads regions relative to
+///     the same box from its top-left corner (flip y with the box height).
 #[pyfunction]
 #[pyo3(signature = (path, pages=None))]
 fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<Vec<PyTextItem>> {
@@ -902,7 +906,8 @@ fn extract_text_with_positions_bytes(
 ///     page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
 ///         Coordinates are PDF points with top-left origin, relative to the
 ///         visible page box (CropBox ∩ MediaBox, else MediaBox) — the same
-///         frame extract_text_with_positions reports items in.
+///         box extract_text_with_positions reports items in, flipped to a
+///         top-left origin (y_top = box_height - y).
 ///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
@@ -922,7 +927,8 @@ fn extract_text_in_regions(
 ///     page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
 ///         Coordinates are PDF points with top-left origin, relative to the
 ///         visible page box (CropBox ∩ MediaBox, else MediaBox) — the same
-///         frame extract_text_with_positions reports items in.
+///         box extract_text_with_positions reports items in, flipped to a
+///         top-left origin (y_top = box_height - y).
 ///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
