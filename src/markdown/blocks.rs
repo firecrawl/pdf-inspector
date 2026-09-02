@@ -149,6 +149,16 @@ impl BlockRecorder {
         let mut prev_content_end = 0usize;
         let mut have_prev = false;
 
+        // `remove_page_numbers` decides by line isolation, and a single-item
+        // fragment is always isolated — so a legitimate list item whose text
+        // is page-number-shaped ("- 5 -") would be dropped here even though
+        // the document-level pass keeps it (its list neighbors break the
+        // isolation). List items are already positively classified content;
+        // never run folio removal on them.
+        let list_item_options = MarkdownOptions {
+            remove_page_numbers: false,
+            ..options.clone()
+        };
         for block in raw_blocks {
             if block.start >= block.end || block.end > raw.len() {
                 continue;
@@ -158,7 +168,12 @@ impl BlockRecorder {
             };
             let content_start = block.start + (fragment.len() - fragment.trim_start().len());
             let content_end = block.start + fragment.trim_end().len();
-            let cleaned = clean_markdown(fragment.to_string(), options);
+            let fragment_options = if block.kind == RawBlockKind::ListItem {
+                &list_item_options
+            } else {
+                options
+            };
+            let cleaned = clean_markdown(fragment.to_string(), fragment_options);
             let cleaned = cleaned.trim();
             if cleaned.is_empty() {
                 // Removed entirely by postprocess (e.g. a folio line).
@@ -458,6 +473,25 @@ mod tests {
         assert_eq!(output.blocks[0].span, (0, 12));
         assert_eq!(output.blocks[1].span, (14, 22));
         assert_eq!(&output.markdown[14..22], "Goodbye.");
+    }
+
+    #[test]
+    fn finish_keeps_page_number_shaped_list_items() {
+        // "- 5 -" is a page-number expression, but as a classified list item
+        // it is content. The document-level pass keeps it because its list
+        // neighbors break line isolation; the per-fragment pass must not
+        // drop it just because a lone fragment is always "isolated".
+        let mut recorder = BlockRecorder::new();
+        let raw = "- one\n- 5 -\n- two\n";
+        recorder.push_fragment(RawBlockKind::ListItem, 1, 0, 6, None, false, true);
+        recorder.push_fragment(RawBlockKind::ListItem, 1, 6, 12, None, false, true);
+        recorder.push_fragment(RawBlockKind::ListItem, 1, 12, 18, None, false, true);
+        recorder.finish(raw, &MarkdownOptions::default());
+        let output = recorder.take_output();
+
+        assert_eq!(output.markdown, "- one\n- 5 -\n- two\n");
+        assert_eq!(output.blocks.len(), 3);
+        assert_eq!(&output.markdown[6..11], "- 5 -");
     }
 
     #[test]

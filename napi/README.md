@@ -120,7 +120,9 @@ for (const region of result[0].regions) {
 
 ### `extractLayoutBlocks(buffer: Buffer): LayoutBlocksResult`
 
-Extract Markdown plus typed layout blocks for citation grounding. Runs the same Full-mode pipeline as `processPdf` (no layout model) and records each emitted fragment — headings, paragraphs, list items, captions, code, tables, images — as a block with a normalized 0–1 page-space bbox (top-left origin) and an exact `[start, end)` byte span into the returned markdown.
+Extract Markdown plus typed layout blocks for citation grounding. Runs the same Full-mode pipeline as `processPdf` (no layout model) and records each emitted fragment — headings, paragraphs, list items, captions, code, tables, images — as a block with a normalized 0–1 page-space bbox (top-left origin) and an exact `[start, end)` byte span into the returned markdown. Unlike the default `processPdf` markdown, this payload includes image placeholders so figures surface as `picture` blocks.
+
+Synchronous: like `extractText`, `extractStructureElements`, and `extractTextInRegions`, it parses on the calling thread and has no async variant.
 
 ```typescript
 import { extractLayoutBlocks } from '@firecrawl/pdf-inspector'
@@ -136,7 +138,7 @@ for (const block of blocks) {
 
 ### Async variants
 
-`processPdf`, `classifyPdf`, and `extractPagesMarkdown` are synchronous and parse on the calling thread — in Node, that's the event loop. For a one-off call in a script that's fine, but in a server a large document can hold the loop for tens to hundreds of milliseconds.
+`processPdf`, `classifyPdf`, `extractPagesMarkdown`, and the other extraction functions (including `extractLayoutBlocks`) are synchronous and parse on the calling thread — in Node, that's the event loop. For a one-off call in a script that's fine, but in a server a large document can hold the loop for tens to hundreds of milliseconds.
 
 `processPdfAsync`, `classifyPdfAsync`, and `extractPagesMarkdownAsync` take the same arguments and produce the same results, but run the parse on the libuv thread pool and return a promise, keeping the event loop free. The input buffer is copied before the call returns, so it's safe to reuse or mutate immediately:
 

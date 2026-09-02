@@ -149,13 +149,15 @@ assert.ok(layoutBlocks.blocks.every(b => b.layoutConfidence === undefined));
 assert.ok(layoutBlocks.blocks.every(b => b.ocrConfidence === undefined));
 
 // Spans are byte offsets into the payload's own markdown: ascending,
-// non-overlapping, and each slice is non-empty content.
+// non-overlapping, on UTF-8 character boundaries (fatal decoder throws on
+// a mid-codepoint slice), and each slice is non-empty content.
 const markdownBytes = Buffer.from(layoutBlocks.markdown, 'utf8');
+const fatalUtf8 = new TextDecoder('utf-8', { fatal: true });
 let prevSpanEnd = 0;
 for (const block of layoutBlocks.blocks) {
   const [start, end] = block.markdownSpan;
   assert.ok(start >= prevSpanEnd && start < end && end <= markdownBytes.length);
-  assert.ok(markdownBytes.subarray(start, end).toString('utf8').trim().length > 0);
+  assert.ok(fatalUtf8.decode(markdownBytes.subarray(start, end)).trim().length > 0);
   prevSpanEnd = end;
 }
 

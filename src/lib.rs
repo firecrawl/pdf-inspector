@@ -992,7 +992,9 @@ pub enum LayoutBlockType {
     Code,
     /// Markdown pipe table.
     Table,
-    /// Image placeholder (only emitted when images are included).
+    /// Image placeholder. The layout-blocks pipeline enables image
+    /// placeholders (unlike the default `process_pdf` Markdown, which
+    /// omits them), so figures surface as picture blocks with bboxes.
     Picture,
 }
 
@@ -1112,6 +1114,10 @@ fn normalize_layout_bbox(
 /// - `source`: always `"native_text"`; confidence fields stay `None`
 ///   because no layout or OCR model produces a real score.
 ///
+/// Unlike the default `process_pdf` Markdown, this payload includes image
+/// placeholders (`![Image: …](image)`) so figures surface as `picture`
+/// blocks with page geometry.
+///
 /// The default [`process_pdf_mem`] Markdown output is unaffected: recording
 /// is a parallel observation of the same conversion pass. For Scanned or
 /// ImageBased PDFs (or when extraction yields no trustworthy text) the
@@ -1131,14 +1137,15 @@ pub fn extract_layout_blocks_mem(buffer: &[u8]) -> Result<LayoutBlocksResult, Pd
         })
         .collect();
 
+    // Picture blocks require image placeholders in the conversion stream.
+    // `include_images` stays off in `MarkdownOptions::default()` so the
+    // default `process_pdf` output is unaffected; this opt-in payload is the
+    // layout view, where figures are part of the contract.
+    let mut options = PdfOptions::default();
+    options.markdown.include_images = true;
+
     let mut sink: Option<markdown::blocks::LayoutBlocksOutput> = None;
-    let result = process_document(
-        doc,
-        page_count,
-        PdfOptions::default(),
-        start,
-        Some(&mut sink),
-    )?;
+    let result = process_document(doc, page_count, options, start, Some(&mut sink))?;
 
     // Scanned/ImageBased PDFs and garbage-text upgrades drop the Markdown;
     // the blocks payload must follow the same trust decision.

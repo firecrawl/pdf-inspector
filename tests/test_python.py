@@ -396,6 +396,18 @@ class TestExtractLayoutBlocks:
         start, end = tables[0].markdown_span
         assert "|" in result.markdown.encode("utf-8")[start:end].decode("utf-8")
 
+    def test_picture_blocks_included(self):
+        # The layout payload enables image placeholders, so figures surface
+        # as picture blocks (the default process_pdf markdown omits them).
+        result = pdf_inspector.extract_layout_blocks(
+            fixture_path("text_page_with_watermark_image.pdf")
+        )
+        pictures = [b for b in result.blocks if b.block_type == "picture"]
+        assert len(pictures) > 0
+        start, end = pictures[0].markdown_span
+        md = result.markdown.encode("utf-8")
+        assert md[start:end].decode("utf-8").startswith("![Image:")
+
     def test_bytes(self):
         data = fixture_bytes("thermo-freon12.pdf")
         result = pdf_inspector.extract_layout_blocks_bytes(data)

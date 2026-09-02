@@ -289,6 +289,9 @@ def extract_layout_blocks(path: str) -> LayoutBlocksResult:
     a normalized 0-1 page-space bbox (top-left origin) and an exact
     [start, end) byte span into the returned markdown.
 
+    Unlike the default process_pdf markdown, the payload includes image
+    placeholders so figures surface as "picture" blocks.
+
     For scanned/image-based PDFs the result carries the classification with
     empty markdown and no blocks.
     """

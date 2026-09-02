@@ -613,6 +613,9 @@ pub struct LayoutBlocksResultJs {
 /// with a normalized 0–1 page-space bbox (top-left origin) and an exact
 /// `[start, end)` byte span into the returned markdown.
 ///
+/// Unlike the default `processPdf` markdown, the payload includes image
+/// placeholders so figures surface as `picture` blocks.
+///
 /// For scanned/image-based PDFs the result carries the classification with
 /// empty `markdown` and no blocks.
 #[napi]

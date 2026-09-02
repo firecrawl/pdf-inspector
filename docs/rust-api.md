@@ -511,8 +511,10 @@ for block in &result.blocks {
 ```
 
 Spans are ascending and non-overlapping, so slicing `result.markdown` with
-them recovers the document in reading order. Scanned/image-based PDFs return
-the classification with empty `markdown` and no blocks. The default
+them recovers the document in reading order. Unlike the default
+`process_pdf` Markdown, the payload includes image placeholders so figures
+surface as `picture` blocks. Scanned/image-based PDFs return the
+classification with empty `markdown` and no blocks. The default
 `process_pdf` output is unaffected by recording.
 
 ## Processing modes

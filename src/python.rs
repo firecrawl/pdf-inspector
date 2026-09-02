@@ -1094,6 +1094,9 @@ fn extract_structure_elements_bytes(
 /// [start, end) byte span into the returned markdown — enough to ground
 /// citations both in the text and on the page.
 ///
+/// Unlike the default process_pdf markdown, the payload includes image
+/// placeholders so figures surface as "picture" blocks.
+///
 /// For scanned/image-based PDFs the result carries the classification with
 /// empty markdown and no blocks.
 ///

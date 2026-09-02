@@ -1697,6 +1697,7 @@ fn test_extract_layout_blocks_synthetic_pdf() {
         let [x0, y0, x1, y1] = block.bbox.expect("synthetic text has geometry");
         assert!(
             (0.0..=1.0).contains(&x0)
+                && (0.0..=1.0).contains(&y0)
                 && (0.0..=1.0).contains(&y1)
                 && x0 <= x1
                 && y0 <= y1
@@ -1775,13 +1776,40 @@ fn test_extract_layout_blocks_markdown_matches_default_output() {
     // document-level pass at fragment boundaries, but on this snapshot
     // fixture the two must agree byte-for-byte — a strong regression
     // signal that recording never changes what the convert loop emits.
+    // The layout payload enables image placeholders, so compare against a
+    // run with the same option (the `process_pdf_mem` default stays
+    // image-free and is covered by the snapshot tests).
     let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
-    let default = pdf_inspector::process_pdf_mem(&buf)
+    let mut options = pdf_inspector::PdfOptions::default();
+    options.markdown.include_images = true;
+    let default = pdf_inspector::process_pdf_mem_with_options(&buf, options)
         .unwrap()
         .markdown
         .unwrap();
     let blocks = pdf_inspector::extract_layout_blocks_mem(&buf).unwrap();
     assert_eq!(default, blocks.markdown);
+}
+
+#[test]
+fn test_extract_layout_blocks_surfaces_picture_blocks() {
+    use pdf_inspector::LayoutBlockType;
+
+    // The layout payload enables image placeholders (unlike the default
+    // process_pdf markdown), so figures must surface as picture blocks.
+    let result =
+        pdf_inspector::extract_layout_blocks("tests/fixtures/text_page_with_watermark_image.pdf")
+            .unwrap();
+    assert_layout_block_spans_valid(&result);
+    let picture = result
+        .blocks
+        .iter()
+        .find(|b| b.block_type == LayoutBlockType::Picture)
+        .expect("picture block");
+    let (start, end) = picture.markdown_span;
+    assert!(result.markdown[start..end].starts_with("![Image:"));
+    let [x0, y0, x1, y1] = picture.bbox.expect("image geometry");
+    assert!((0.0..=1.0).contains(&x0) && x0 <= x1 && x1 <= 1.0);
+    assert!((0.0..=1.0).contains(&y0) && y0 <= y1 && y1 <= 1.0);
 }
 
 #[test]
