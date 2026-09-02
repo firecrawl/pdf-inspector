@@ -71,6 +71,7 @@ assert.equal(typeof item.x, 'number');
 assert.equal(typeof item.y, 'number');
 assert.equal(typeof item.width, 'number');
 assert.equal(typeof item.height, 'number');
+assert.equal(typeof item.rotation, 'number');
 assert.equal(typeof item.font, 'string');
 assert.equal(typeof item.fontSize, 'number');
 assert.equal(typeof item.page, 'number');
@@ -93,6 +94,33 @@ assert.ok(
   'tagged PDF text items should carry Marked Content IDs',
 );
 console.log('  extractTextWithPositions mcid: OK');
+
+// rotation: a 90° margin stamp keeps a tall, thin axis-aligned box instead of
+// collapsing to width 0, and reports its baseline angle
+const rotatedFixture = readFileSync('../tests/fixtures/rotated_margin_stamp.pdf');
+const rotatedItems = extractTextWithPositions(rotatedFixture);
+const stamp = rotatedItems.find(i => i.text.startsWith('arXiv:'));
+assert.ok(stamp, 'rotated stamp item should be extracted');
+assert.ok(Math.abs(stamp.rotation - 90) < 1e-3, `stamp rotation ${stamp.rotation}`);
+assert.ok(
+  stamp.height > 10 * stamp.width,
+  `stamp box should be tall and thin, got ${stamp.width}x${stamp.height}`,
+);
+assert.ok(
+  rotatedItems.every(i => i.text.trim() === '' || i.width > 0),
+  'no run with glyphs may be zero-width',
+);
+assert.ok(rotatedItems.filter(i => !i.text.startsWith('arXiv:')).every(i => i.rotation === 0));
+console.log('  extractTextWithPositions rotation: OK');
+
+// the stamp belongs to the margin box only, never to the body paragraph
+const stampRegions = extractTextInRegions(rotatedFixture, [
+  { page: 0, regions: [[0, 0, 50, 792], [60, 0, 612, 792]] },
+]);
+assert.equal(stampRegions[0].regions[0].text.trim(), 'arXiv:2301.00001v1 [cs.CL] 1 Jan 2023');
+assert.ok(!stampRegions[0].regions[1].text.includes('arXiv'), 'stamp leaked into body region');
+assert.ok(stampRegions[0].regions[1].text.includes('The quick brown fox'));
+console.log('  extractTextInRegions rotated margin run: OK');
 
 // --- extractStructureElements ---
 console.log('Testing extractStructureElements...');

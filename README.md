@@ -12,7 +12,7 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 ## Features
 
 - **Smart classification** — Detect TextBased, Scanned, ImageBased, or Mixed PDFs in ~10-50ms by sampling content streams. Returns a confidence score (0.0-1.0) and per-page OCR routing.
-- **Text extraction** — Position-aware extraction with font info, X/Y coordinates, and automatic multi-column reading order.
+- **Text extraction** — Position-aware extraction with font info, X/Y coordinates, and automatic multi-column reading order. Rotated runs (margin stamps, chart axis titles) keep a true axis-aligned box and report their `rotation` angle instead of collapsing to zero width.
 - **Markdown conversion** — Headings (H1-H4 via font size ratios), bullet/numbered/letter lists, code blocks (monospace font detection), tables (rectangle-based and heuristic), bold/italic formatting, URL linking, and page breaks.
 - **Table detection** — Dual-mode: rectangle-based detection from PDF drawing ops, plus heuristic detection from text alignment. Handles financial tables, footnotes, and continuation tables across pages.
 - **CID font support** — ToUnicode CMap decoding for Type0/Identity-H fonts, UTF-16BE, UTF-8, and Latin-1 encodings.
@@ -145,7 +145,7 @@ pdf2md document.pdf
 # JSON output (for piping)
 pdf2md document.pdf --json
 
-# Positioned TextItem JSON, including is_underline metadata
+# Positioned TextItem JSON: axis-aligned box, rotation, font, underline metadata
 pdf2md document.pdf --items-json
 
 # Raw markdown only (no headers)

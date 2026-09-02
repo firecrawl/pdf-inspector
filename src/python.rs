@@ -356,6 +356,13 @@ pub struct PyTextItem {
     pub width: f32,
     #[pyo3(get)]
     pub height: f32,
+    /// Rotation of the run's baseline in degrees counter-clockwise from the
+    /// page's x axis, in [0, 360): 0 for ordinary horizontal text, 90 for
+    /// text reading bottom-to-top (a rotated margin stamp), 270 for
+    /// top-to-bottom, 180 for upside-down. x/y/width/height is the run's
+    /// axis-aligned box, so a vertical run is tall and thin.
+    #[pyo3(get)]
+    pub rotation: f32,
     #[pyo3(get)]
     pub font: String,
     #[pyo3(get)]
@@ -586,6 +593,7 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             is_italic: item.is_italic,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            rotation: item.rotation,
             item_type: item_type_str(&item.item_type),
             mcid: item.mcid,
         })

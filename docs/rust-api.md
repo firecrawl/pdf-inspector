@@ -506,7 +506,7 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | `detect_pdf_mem(bytes)` | Fast detection from a byte buffer |
 | `process_pdf_mem_with_options(bytes, options)` | Process from bytes with custom options |
 | `extract_text(path)` | Plain text extraction |
-| `extract_text_with_positions(path)` | Text with X/Y coordinates and font info |
+| `extract_text_with_positions(path)` | Text with its axis-aligned box, `rotation`, and font info |
 | `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |
 | `to_markdown_from_items_with_rects(items, options, rects)` | Markdown with rectangle-based table detection |
@@ -529,7 +529,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
-| `TextItem` | Text with position, font info, page number, and optional structure-tree `mcid` |
+| `TextItem` | Text with its axis-aligned box, baseline `rotation` in degrees (1.18.0+; a vertical run is tall and thin, never zero-width), font info, page number, and optional structure-tree `mcid` |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |

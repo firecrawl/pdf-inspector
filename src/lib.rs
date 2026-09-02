@@ -834,6 +834,7 @@ mod ocr_header_footer_tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: types::ItemType::Text,
             mcid: None,
         }
@@ -2771,6 +2772,12 @@ fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
     if total_chars == 0 {
         return Vec::new();
     }
+    // Token positions are interpolated along x, the reading direction of a
+    // horizontal run only. A rotated run (vertical table header) stays one
+    // item: its box already routes it to the right cell.
+    if !item.is_horizontal() {
+        return vec![item.clone()];
+    }
     let item_w = text_utils::effective_width(item);
     let char_w = item_w / total_chars as f32;
 
@@ -3702,9 +3709,10 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 }
 
 fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
-    // Rotated-page normalization currently maps y = -old_x, so most text items
-    // land at negative Y. Use this to keep `collect_text_in_region` behavior
-    // compatible for direct callers that do not have extractor metadata.
+    // Rotated-page normalization maps y = -(old right edge), so most text
+    // items land at negative Y. Use this to keep `collect_text_in_region`
+    // behavior compatible for direct callers that do not have extractor
+    // metadata.
     let negative_y = items.iter().filter(|item| item.y < 0.0).count();
     if !items.is_empty() && negative_y * 2 >= items.len() {
         RegionCoordSpace::Rotated90Ccw
@@ -5385,6 +5393,7 @@ mod text_cluster_column_undercount_tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -5662,6 +5671,7 @@ mod table_candidate_selection_tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -6493,6 +6503,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -7675,5 +7686,87 @@ mod tests {
     fn recover_startxref_pointer_returns_none_without_a_valid_table() {
         let buf = b"Please refer to the xref appendix for details.";
         assert!(recover_startxref_pointer(buf).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rotated_run_region_tests {
+    use super::*;
+    use crate::types::ItemType;
+
+    fn item(text: &str, x: f32, y: f32, width: f32, height: f32, rotation: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height,
+            rotation,
+            font: "Helvetica".to_string(),
+            font_tag: "F1".to_string(),
+            font_size: if rotation == 0.0 { height } else { width },
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    const STAMP: &str = "arXiv:2301.00001v1 [cs.CL] 1 Jan 2023";
+
+    #[test]
+    fn vertical_margin_run_overlaps_only_the_margin_region() {
+        // Letter page; region boxes are top-left page coordinates as the
+        // layout model reports them: a left-margin strip and the body area.
+        let page_h = 792.0;
+        let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
+        let body = region_bounds(60.0, 0.0, 612.0, 792.0, page_h, RegionCoordSpace::Standard);
+
+        let stamp = item(STAMP, 12.0, 200.0, 20.0, 400.0, 90.0);
+        assert!(region_overlaps_item(&stamp, margin));
+        assert!(!region_overlaps_item(&stamp, body));
+        assert!(region_item_overlap_area(&stamp, margin) > 0.0);
+        assert_eq!(region_item_overlap_area(&stamp, body), 0.0);
+
+        // The pre-fix degenerate box (zero width, em height, no rotation)
+        // was widened to chars × 0.5em by `effective_width` and crossed
+        // into the body region — the exclusive assignment then handed the
+        // stamp to the body paragraph and left the margin empty.
+        let phantom = item(STAMP, 32.0, 200.0, 0.0, 20.0, 0.0);
+        assert!(region_overlaps_item(&phantom, body));
+        assert!(
+            region_item_overlap_area(&phantom, body) > region_item_overlap_area(&phantom, margin)
+        );
+    }
+
+    #[test]
+    fn collect_text_in_region_finds_the_vertical_run_by_its_box() {
+        let items = vec![
+            item(STAMP, 12.0, 200.0, 20.0, 400.0, 90.0),
+            item("Body text", 72.0, 500.0, 50.0, 11.0, 0.0),
+        ];
+        assert_eq!(
+            collect_text_in_region(&items, 0.0, 0.0, 50.0, 792.0, 792.0),
+            STAMP
+        );
+        assert_eq!(
+            collect_text_in_region(&items, 60.0, 0.0, 612.0, 792.0, 792.0),
+            "Body text"
+        );
+    }
+
+    #[test]
+    fn token_splitting_leaves_rotated_runs_whole() {
+        let stamp = item("two words", 12.0, 200.0, 20.0, 100.0, 90.0);
+        let tokens = split_item_into_token_subitems(&stamp);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "two words");
+        assert_eq!((tokens[0].x, tokens[0].width), (12.0, 20.0));
+
+        let body = item("two words", 72.0, 500.0, 90.0, 10.0, 0.0);
+        assert_eq!(split_item_into_token_subitems(&body).len(), 2);
     }
 }

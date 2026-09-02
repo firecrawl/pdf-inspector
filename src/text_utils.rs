@@ -614,12 +614,23 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
     base_size * scale
 }
 
-/// Estimate the width of a text item, falling back to a character-count heuristic when width is 0.
+/// The item's horizontal extent, estimating it only when the geometry is
+/// genuinely unknown.
+///
+/// `width == 0` means the font carried no width information, so the run's
+/// advance — and with it a horizontal run's x-extent — is unknown and gets
+/// the character-count estimate. A rotated run's x-extent is its em box,
+/// stamped at extraction time whether or not the advance is known, so the
+/// estimate never applies to it: fabricating `chars × 0.5em` for a vertical
+/// stamp used to produce a page-wide phantom horizontal line that spanned
+/// columns and stole region assignments from the body text.
 pub(crate) fn effective_width(item: &TextItem) -> f32 {
     if item.width > 0.0 {
         item.width
-    } else {
+    } else if item.is_horizontal() {
         item.text.chars().count() as f32 * item.font_size * 0.5
+    } else {
+        item.font_size
     }
 }
 
@@ -1327,6 +1338,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1527,6 +1539,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1649,6 +1662,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             });
@@ -1728,6 +1742,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1806,5 +1821,40 @@ mod tests {
             "ized→fo: ratio={:.3}, should split (word boundary)",
             (fo.x - (ized.x + ized.width)) / fs
         );
+    }
+
+    fn geometry_item(width: f32, font_size: f32, rotation: f32) -> TextItem {
+        TextItem {
+            text: "abcd".to_string(),
+            x: 0.0,
+            y: 0.0,
+            width,
+            height: font_size,
+            rotation,
+            font: String::new(),
+            font_tag: String::new(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn effective_width_estimates_only_unknown_horizontal_advances() {
+        // Known widths pass through whatever the orientation.
+        assert_eq!(effective_width(&geometry_item(30.0, 10.0, 0.0)), 30.0);
+        assert_eq!(effective_width(&geometry_item(30.0, 10.0, 90.0)), 30.0);
+        // Horizontal run without font widths: chars × 0.5em.
+        assert_eq!(effective_width(&geometry_item(0.0, 10.0, 0.0)), 20.0);
+        assert_eq!(effective_width(&geometry_item(0.0, 10.0, 180.0)), 20.0);
+        // Vertical run without font widths: its x-extent is one em — never
+        // a character-count phantom line.
+        assert_eq!(effective_width(&geometry_item(0.0, 10.0, 90.0)), 10.0);
+        assert_eq!(effective_width(&geometry_item(0.0, 10.0, 270.0)), 10.0);
     }
 }

@@ -18,6 +18,7 @@ use super::fonts::{
     descriptor_style_flags, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
     CMapDecisionCache, FontStyleCache,
 };
+use super::geometry::{normalize_degrees, run_geometry};
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -537,19 +538,16 @@ pub(crate) fn extract_page_text_items(
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                        let (x, y) = (combined[4], combined[5]);
                         if combined[0].abs() >= combined[1].abs() {
                             rotation_votes.horizontal += 1;
                         } else {
                             rotation_votes.rotated += 1;
                         }
-                        let width = if let Some(w_ts) = w_ts_opt {
+                        let geometry = run_geometry(&combined, w_ts_opt, rendered_size);
+                        if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
-                            (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])).abs()
-                        } else {
-                            0.0
-                        };
+                        }
                         // Only create text item for non-whitespace; whitespace
                         // still advances the text matrix above so gap detection works
                         if !text.trim().is_empty() {
@@ -579,10 +577,10 @@ pub(crate) fn extract_page_text_items(
                             }
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
-                                x,
-                                y,
-                                width,
-                                height: rendered_size,
+                                x: geometry.x,
+                                y: geometry.y,
+                                width: geometry.width,
+                                height: geometry.height,
                                 font: crate::extractor::fonts::item_font_name(
                                     &current_font,
                                     base_font,
@@ -595,6 +593,7 @@ pub(crate) fn extract_page_text_items(
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
+                                rotation: geometry.rotation,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -790,12 +789,11 @@ pub(crate) fn extract_page_text_items(
                                 ];
                                 let combined =
                                     multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
-                                let (x, y) = (combined[4], combined[5]);
-                                let width = if font_info.is_some() {
-                                    ((end_w - start_w) * scale_x).abs()
-                                } else {
-                                    0.0
-                                };
+                                let geometry = run_geometry(
+                                    &combined,
+                                    font_info.map(|_| end_w - start_w),
+                                    rendered_size,
+                                );
                                 if horizontal_advance
                                     && crate::text_utils::is_visual_rtl_candidate(text)
                                 {
@@ -812,10 +810,10 @@ pub(crate) fn extract_page_text_items(
                                 }
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
-                                    x,
-                                    y,
-                                    width,
-                                    height: rendered_size,
+                                    x: geometry.x,
+                                    y: geometry.y,
+                                    width: geometry.width,
+                                    height: geometry.height,
                                     font: crate::extractor::fonts::item_font_name(
                                         &current_font,
                                         base_font,
@@ -828,6 +826,7 @@ pub(crate) fn extract_page_text_items(
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    rotation: geometry.rotation,
                                     item_type: ItemType::Text,
                                     mcid: current_mcid(&marked_content_stack),
                                 });
@@ -907,13 +906,7 @@ pub(crate) fn extract_page_text_items(
                             }
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                            let (x, y) = (combined[4], combined[5]);
-                            let width = w_ts_opt
-                                .map(|w_ts| {
-                                    (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2]))
-                                        .abs()
-                                })
-                                .unwrap_or(0.0);
+                            let geometry = run_geometry(&combined, w_ts_opt, rendered_size);
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -933,10 +926,10 @@ pub(crate) fn extract_page_text_items(
                             }
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
-                                x,
-                                y,
-                                width,
-                                height: rendered_size,
+                                x: geometry.x,
+                                y: geometry.y,
+                                width: geometry.width,
+                                height: geometry.height,
                                 font: crate::extractor::fonts::item_font_name(
                                     &current_font,
                                     base_font,
@@ -949,6 +942,7 @@ pub(crate) fn extract_page_text_items(
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
+                                rotation: geometry.rotation,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -994,6 +988,7 @@ pub(crate) fn extract_page_text_items(
                                         is_italic: false,
                                         is_underline: false,
                                         is_strikeout: false,
+                                        rotation: 0.0,
                                         item_type: ItemType::Image,
                                         mcid: current_mcid(&marked_content_stack),
                                     });
@@ -1080,11 +1075,25 @@ pub(crate) fn extract_page_text_items(
                             }
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                            let (x, y) = (combined[4], combined[5]);
-                            // Width in device space from text matrix delta
-                            let delta_ts = text_matrix[4] - start_tm[4];
-                            let scale_x = start_tm[0] * ctm[0] + start_tm[1] * ctm[2];
-                            let width = (delta_ts * scale_x).abs();
+                            // Advance in text-space units: the text matrix
+                            // travelled from `start_tm` along its own x axis.
+                            // Project the displacement onto that axis — a
+                            // rotated run advances through tm[5], and a
+                            // scaled matrix ([12 0 0 12] with `/F 1 Tf`)
+                            // carries the scale in tm[0], so the raw tm[4]
+                            // delta is neither the advance nor device width.
+                            let advance_ts = {
+                                let dx = text_matrix[4] - start_tm[4];
+                                let dy = text_matrix[5] - start_tm[5];
+                                let axis_len_sq =
+                                    start_tm[0] * start_tm[0] + start_tm[1] * start_tm[1];
+                                if axis_len_sq > f32::EPSILON {
+                                    Some((dx * start_tm[0] + dy * start_tm[1]) / axis_len_sq)
+                                } else {
+                                    None
+                                }
+                            };
+                            let geometry = run_geometry(&combined, advance_ts, rendered_size);
                             if !at.trim().is_empty() {
                                 let base_font = font_base_names
                                     .get(&current_font)
@@ -1096,10 +1105,10 @@ pub(crate) fn extract_page_text_items(
                                     .unwrap_or((false, false));
                                 items.push(TextItem {
                                     text: expand_ligatures(&at),
-                                    x,
-                                    y,
-                                    width,
-                                    height: rendered_size,
+                                    x: geometry.x,
+                                    y: geometry.y,
+                                    width: geometry.width,
+                                    height: geometry.height,
                                     font: crate::extractor::fonts::item_font_name(
                                         &current_font,
                                         base_font,
@@ -1112,6 +1121,7 @@ pub(crate) fn extract_page_text_items(
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    rotation: geometry.rotation,
                                     item_type: ItemType::Text,
                                     mcid: entry
                                         .mcid
@@ -1494,19 +1504,19 @@ fn correct_rotated_page(
     // The layout engine sorts by y descending (highest = top of page), so
     // we negate old_x so that visual-top (low device x) gets high new_y.
     for item in &mut items {
+        // Rotate the axis-aligned box exactly like the rects below. Items
+        // carry their true rotated-run box (see `run_geometry`), so for a
+        // 90° run this lands x on the run start, y on its baseline, and the
+        // real advance in `width` — the character-count estimate this loop
+        // used to apply is no longer needed. The same rotation puts an
+        // upright stray (page number, stamp) where it renders in the
+        // corrected frame: as a vertical run.
         let new_x = item.y;
-        let new_y = -item.x;
+        let new_y = -(item.x + item.width);
         item.x = new_x;
         item.y = new_y;
-        // For rotated text, the "width" along the reading direction was
-        // lost (computed as 0 due to scale_x ≈ 0).  Estimate from text
-        // length × approximate char width.  font_size is the rendered
-        // height in device space, which for 90° rotation corresponds to
-        // the horizontal extent of one em.
-        if item.width < 0.5 {
-            let char_count = item.text.chars().count() as f32;
-            item.width = char_count * item.font_size * 0.5;
-        }
+        std::mem::swap(&mut item.width, &mut item.height);
+        item.rotation = normalize_degrees(item.rotation - 90.0);
     }
 
     // Transform rectangles
@@ -2195,5 +2205,179 @@ end"#;
             items.is_empty(),
             "pages over the operator cap must not be decoded"
         );
+    }
+
+    // ── Rotated-run geometry ─────────────────────────────────────────────
+
+    const UPRIGHT_BODY: &str = "BT /F1 12 Tf 72 700 Td (Body line one) Tj ET
+BT /F1 12 Tf 72 686 Td (Body line two) Tj ET
+BT /F1 12 Tf 72 672 Td (Body line three) Tj ET
+";
+
+    /// Three upright lines keep the page from being classified as rotated,
+    /// so `extra_ops` is measured in plain page coordinates.
+    fn upright_page_with(extra_ops: &str) -> Vec<TextItem> {
+        extract_simple_items(format!("{UPRIGHT_BODY}{extra_ops}").as_bytes())
+    }
+
+    fn find_item<'a>(items: &'a [TextItem], text: &str) -> &'a TextItem {
+        items
+            .iter()
+            .find(|item| item.text == text)
+            .unwrap_or_else(|| {
+                let found: Vec<&String> = items.iter().map(|i| &i.text).collect();
+                panic!("no item {text:?} in {found:?}")
+            })
+    }
+
+    fn assert_close(actual: f32, expected: f32, what: &str) {
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "{what} = {actual}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn rotated_ccw_run_gets_tall_thin_box() {
+        // A 20pt arXiv-style stamp reading bottom-to-top along the left
+        // margin: 16 glyphs × 0.6em = 192pt of advance running up the page,
+        // glyph tops facing left. Projecting the advance onto x used to
+        // leave it `width == 0`.
+        let items = upright_page_with("BT /F1 20 Tf 0 1 -1 0 32 200 Tm (arXiv:2301.00001) Tj ET");
+        let stamp = find_item(&items, "arXiv:2301.00001");
+        assert_close(stamp.rotation, 90.0, "rotation");
+        assert!(!stamp.is_horizontal());
+        assert_close(stamp.x, 12.0, "x");
+        assert_close(stamp.y, 200.0, "y");
+        assert_close(stamp.width, 20.0, "width");
+        assert_close(stamp.height, 192.0, "height");
+        assert_close(stamp.font_size, 20.0, "font_size");
+
+        // Upright text keeps its historical box: baseline y, em height,
+        // advance width, no rotation.
+        let body = find_item(&items, "Body line one");
+        assert_eq!(body.rotation, 0.0);
+        assert!(body.is_horizontal());
+        assert_close(body.x, 72.0, "x");
+        assert_close(body.y, 700.0, "y");
+        assert_close(body.width, 13.0 * 7.2, "width");
+        assert_close(body.height, 12.0, "height");
+    }
+
+    #[test]
+    fn rotated_cw_run_box_hangs_below_its_start() {
+        // Top-to-bottom text (270°): the advance runs down the page and the
+        // glyph tops face right.
+        let items = upright_page_with("BT /F1 10 Tf 0 -1 1 0 580 700 Tm (HEADER) Tj ET");
+        let header = find_item(&items, "HEADER");
+        assert_close(header.rotation, 270.0, "rotation");
+        assert!(!header.is_horizontal());
+        assert_close(header.x, 580.0, "x");
+        assert_close(header.width, 10.0, "width");
+        assert_close(header.y, 700.0 - 36.0, "y");
+        assert_close(header.height, 36.0, "height");
+    }
+
+    #[test]
+    fn upside_down_run_box_covers_its_glyphs() {
+        let items = upright_page_with("BT /F1 10 Tf -1 0 0 -1 300 400 Tm (FLIP) Tj ET");
+        let flip = find_item(&items, "FLIP");
+        assert_close(flip.rotation, 180.0, "rotation");
+        assert!(flip.is_horizontal());
+        // 4 × 6pt of advance running left; the glyphs hang below the baseline.
+        assert_close(flip.x, 276.0, "x");
+        assert_close(flip.width, 24.0, "width");
+        assert_close(flip.y, 390.0, "y");
+        assert_close(flip.height, 10.0, "height");
+    }
+
+    #[test]
+    fn rotated_tj_run_boxes_cover_the_whole_advance() {
+        // A vertical TJ with a 6em positioning gap: whether or not the gap
+        // splits the array into sub-runs, every box sits on the em column
+        // left of the baseline and together they span the full advance
+        // (2 glyphs + 60pt gap + 2 glyphs = 84pt).
+        let items = upright_page_with("BT /F1 10 Tf 0 1 -1 0 40 100 Tm [(AB) -6000 (CD)] TJ ET");
+        let runs: Vec<&TextItem> = items.iter().filter(|i| i.font_size == 10.0).collect();
+        assert!(!runs.is_empty());
+        for run in &runs {
+            assert_close(run.rotation, 90.0, "rotation");
+            assert_close(run.x, 30.0, "x");
+            assert_close(run.width, 10.0, "width");
+        }
+        let bottom = runs.iter().map(|r| r.y).fold(f32::INFINITY, f32::min);
+        let top = runs
+            .iter()
+            .map(|r| r.y + r.height)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_close(bottom, 100.0, "bottom");
+        assert_close(top, 184.0, "top");
+    }
+
+    #[test]
+    fn actual_text_on_rotated_run_gets_tall_box() {
+        let items = upright_page_with(
+            "BT /F1 10 Tf 0 1 -1 0 40 100 Tm /Span <</ActualText (Stamp) >> BDC (STAMP) Tj EMC ET",
+        );
+        let stamp = find_item(&items, "Stamp");
+        assert_close(stamp.rotation, 90.0, "rotation");
+        assert_close(stamp.x, 30.0, "x");
+        assert_close(stamp.width, 10.0, "width");
+        assert_close(stamp.y, 100.0, "y");
+        assert_close(stamp.height, 30.0, "height");
+    }
+
+    #[test]
+    fn actual_text_width_follows_scaled_text_matrix() {
+        // `/F1 1 Tf` with the size carried by Tm ([12 0 0 12]): the advance
+        // is in tm[0]-scaled units. The old tm[4]-delta × device-scale
+        // formula applied the scale twice and reported a 432pt-wide "Hello".
+        let items = upright_page_with(
+            "BT /F1 1 Tf 12 0 0 12 72 500 Tm /Span <</ActualText (Hello) >> BDC (Hello) Tj EMC ET",
+        );
+        let hello = find_item(&items, "Hello");
+        assert_eq!(hello.rotation, 0.0);
+        assert_close(hello.x, 72.0, "x");
+        assert_close(hello.y, 500.0, "y");
+        assert_close(hello.width, 36.0, "width");
+        assert_close(hello.height, 12.0, "height");
+    }
+
+    #[test]
+    fn rotated_page_correction_keeps_real_advance_and_rebases_rotation() {
+        let content = b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (HELLO) Tj ET
+BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET";
+        let items = extract_simple_items(content);
+        let hello = find_item(&items, "HELLO");
+        // Corrected frame: x = run start (old y), y = -(baseline x), width =
+        // the real 5 × 7.2pt advance instead of a character-count estimate,
+        // em height, and the dominant runs now read as horizontal.
+        assert_eq!(hello.rotation, 0.0);
+        assert!(hello.is_horizontal());
+        assert_close(hello.x, 100.0, "x");
+        assert_close(hello.y, -200.0, "y");
+        assert_close(hello.width, 36.0, "width");
+        assert_close(hello.height, 12.0, "height");
+        let world = find_item(&items, "WORLD");
+        assert_close(world.y, -240.0, "y");
+    }
+
+    #[test]
+    fn upright_stray_on_rotated_page_becomes_vertical_in_corrected_frame() {
+        // A page number set upright on a page whose text is rotated 90°:
+        // after correction it reads top-to-bottom and its box turns with it
+        // (old box (300, 30, 6 × 10) → x = old y, y = -(old right edge)).
+        let content = b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (HELLO) Tj ET
+BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
+BT /F1 12 Tf 0 1 -1 0 280 100 Tm (AGAIN) Tj ET
+BT /F1 10 Tf 300 30 Td (7) Tj ET";
+        let items = extract_simple_items(content);
+        let seven = find_item(&items, "7");
+        assert_close(seven.rotation, 270.0, "rotation");
+        assert!(!seven.is_horizontal());
+        assert_close(seven.x, 30.0, "x");
+        assert_close(seven.y, -306.0, "y");
+        assert_close(seven.width, 10.0, "width");
+        assert_close(seven.height, 6.0, "height");
     }
 }

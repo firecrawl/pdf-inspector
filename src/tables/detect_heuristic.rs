@@ -131,6 +131,7 @@ fn merge_adjacent_items_preserving(
                 is_italic: first_item.is_italic,
                 is_underline: first_item.is_underline,
                 is_strikeout: first_item.is_strikeout,
+                rotation: first_item.rotation,
                 item_type: first_item.item_type.clone(),
                 mcid: first_item.mcid,
             });
@@ -2238,6 +2239,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -2381,6 +2383,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: strikeout,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }

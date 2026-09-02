@@ -356,7 +356,13 @@ fn tabular_row_separator_rule_indices(rules: &[Rule], items: &[TextItem]) -> Has
 }
 
 fn is_underline_candidate(item: &TextItem) -> bool {
-    matches!(item.item_type, ItemType::Text) && !item.text.trim().is_empty() && item.width > 0.0
+    // Rule geometry below assumes a horizontal baseline: a rotated run's
+    // box bottom is a run end, not a baseline, and a table border under a
+    // rotated header would otherwise read as an underline.
+    matches!(item.item_type, ItemType::Text)
+        && !item.text.trim().is_empty()
+        && item.width > 0.0
+        && item.is_horizontal()
 }
 
 fn rule_matches_item(rule: &Rule, item: &TextItem) -> bool {
@@ -711,6 +717,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1209,5 +1216,26 @@ mod tests {
         mark_underlined_items(&mut items, &[], &lines, 1);
 
         assert!(items.iter().all(|item| !item.is_underline));
+    }
+
+    #[test]
+    fn vertical_run_is_never_underlined_by_a_rule_under_its_box() {
+        // A rotated table header sitting on its cell's bottom border: the
+        // rule spans the run's em-wide box right under it. The identical
+        // geometry is an underline for a horizontal run, so orientation is
+        // the only thing keeping the border from marking the header.
+        let mut vertical = item("Header", 100.0, 500.0, 10.0, 10.0);
+        vertical.height = 60.0;
+        vertical.rotation = 90.0;
+        let horizontal = item("Header", 100.0, 500.0, 10.0, 10.0);
+        let lines = vec![hline(98.0, 112.0, 498.5)];
+
+        let mut items = vec![vertical];
+        mark_underlined_items(&mut items, &[], &lines, 1);
+        assert!(!items[0].is_underline);
+
+        let mut items = vec![horizontal];
+        mark_underlined_items(&mut items, &[], &lines, 1);
+        assert!(items[0].is_underline);
     }
 }

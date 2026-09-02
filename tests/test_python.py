@@ -214,6 +214,7 @@ class TestExtractTextWithPositions:
         assert isinstance(item.y, float)
         assert isinstance(item.width, float)
         assert isinstance(item.height, float)
+        assert isinstance(item.rotation, float)
         assert isinstance(item.font, str)
         assert isinstance(item.font_size, float)
         assert isinstance(item.page, int)
@@ -518,3 +519,35 @@ class TestMultipleFixtures:
         )
         assert result.page_count > 0
         assert result.confidence >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# rotated text-run geometry (fixture: rotated_margin_stamp.pdf)
+# ---------------------------------------------------------------------------
+
+
+ROTATED_STAMP_TEXT = "arXiv:2301.00001v1 [cs.CL] 1 Jan 2023"
+
+
+class TestRotatedRunGeometry:
+    def test_rotated_margin_run_has_tall_thin_box(self):
+        items = pdf_inspector.extract_text_with_positions(
+            fixture_path("rotated_margin_stamp.pdf")
+        )
+        stamp = next(i for i in items if i.text == ROTATED_STAMP_TEXT)
+        # 90° counter-clockwise: reads bottom-to-top, one em wide, advance tall.
+        assert abs(stamp.rotation - 90.0) < 1e-3
+        assert stamp.height > 10 * stamp.width
+        assert all(i.width > 0 for i in items if i.text.strip())
+        assert all(i.rotation == 0.0 for i in items if i.text != ROTATED_STAMP_TEXT)
+
+    def test_rotated_margin_run_assigned_to_margin_region_only(self):
+        results = pdf_inspector.extract_text_in_regions(
+            fixture_path("rotated_margin_stamp.pdf"),
+            [(0, [[0.0, 0.0, 50.0, 792.0], [60.0, 0.0, 612.0, 792.0]])],
+        )
+        margin, body = results[0].regions
+        assert margin.text.strip() == ROTATED_STAMP_TEXT
+        assert not margin.needs_ocr
+        assert "arXiv" not in body.text
+        assert "The quick brown fox" in body.text

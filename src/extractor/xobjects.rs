@@ -12,6 +12,7 @@ use super::fonts::{
     extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
     FontStyleCache,
 };
+use super::geometry::run_geometry;
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
@@ -470,6 +471,7 @@ fn extract_form_xobject_text_inner(
                                     is_italic: false,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    rotation: 0.0,
                                     item_type: ItemType::Image,
                                     mcid: None,
                                 });
@@ -628,25 +630,22 @@ fn extract_form_xobject_text_inner(
                         let combined = multiply_matrices(&text_matrix, &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                        let (x, y) = (combined[4], combined[5]);
-                        let width = if let Some(font_info) = font_widths.get(&current_font) {
-                            if let Some(raw_bytes) = get_operand_bytes(show_operand) {
-                                let w_ts = compute_string_width_ts(
+                        let advance_ts = font_widths.get(&current_font).and_then(|font_info| {
+                            get_operand_bytes(show_operand).map(|raw_bytes| {
+                                compute_string_width_ts(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
                                     char_spacing,
                                     word_spacing,
-                                );
-                                text_matrix[4] += w_ts * text_matrix[0];
-                                text_matrix[5] += w_ts * text_matrix[1];
-                                (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])).abs()
-                            } else {
-                                0.0
-                            }
-                        } else {
-                            0.0
-                        };
+                                )
+                            })
+                        });
+                        let geometry = run_geometry(&combined, advance_ts, rendered_size);
+                        if let Some(w_ts) = advance_ts {
+                            text_matrix[4] += w_ts * text_matrix[0];
+                            text_matrix[5] += w_ts * text_matrix[1];
+                        }
                         // Only create text item for non-whitespace; whitespace
                         // still advances the text matrix above so gap detection works
                         if !text.trim().is_empty() {
@@ -674,10 +673,10 @@ fn extract_form_xobject_text_inner(
                             }
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
-                                x,
-                                y,
-                                width,
-                                height: rendered_size,
+                                x: geometry.x,
+                                y: geometry.y,
+                                width: geometry.width,
+                                height: geometry.height,
                                 font: crate::extractor::fonts::item_font_name(
                                     &current_font,
                                     base_font,
@@ -690,6 +689,7 @@ fn extract_form_xobject_text_inner(
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
+                                rotation: geometry.rotation,
                                 item_type: ItemType::Text,
                                 mcid: None,
                             });
@@ -856,12 +856,11 @@ fn extract_form_xobject_text_inner(
                                     text_matrix[5] + start_w * text_matrix[1],
                                 ];
                                 let combined_mat = multiply_matrices(&offset_tm, &ctm);
-                                let (x, y) = (combined_mat[4], combined_mat[5]);
-                                let width = if font_info.is_some() {
-                                    ((end_w - start_w) * scale_x).abs()
-                                } else {
-                                    0.0
-                                };
+                                let geometry = run_geometry(
+                                    &combined_mat,
+                                    font_info.map(|_| end_w - start_w),
+                                    rendered_size,
+                                );
                                 if horizontal_advance
                                     && crate::text_utils::is_visual_rtl_candidate(text)
                                 {
@@ -878,10 +877,10 @@ fn extract_form_xobject_text_inner(
                                 }
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
-                                    x,
-                                    y,
-                                    width,
-                                    height: rendered_size,
+                                    x: geometry.x,
+                                    y: geometry.y,
+                                    width: geometry.width,
+                                    height: geometry.height,
                                     font: crate::extractor::fonts::item_font_name(
                                         &current_font,
                                         base_font,
@@ -894,6 +893,7 @@ fn extract_form_xobject_text_inner(
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    rotation: geometry.rotation,
                                     item_type: ItemType::Text,
                                     mcid: None,
                                 });
@@ -1384,5 +1384,53 @@ mod tests {
             "b y = {} (leading should restore to 12)",
             b.y
         );
+    }
+
+    #[test]
+    fn rotated_run_inside_form_gets_tall_thin_box() {
+        // Same contract as the page-level parser: a 20pt stamp reading
+        // bottom-to-top gets its em as width and its advance as height, for
+        // both Tj and TJ.
+        let items = form_items(
+            b"BT /F1 12 Tf 72 700 Td (Body line one) Tj ET
+BT /F1 12 Tf 72 686 Td (Body line two) Tj ET
+BT /F1 12 Tf 72 672 Td (Body line three) Tj ET
+BT /F1 20 Tf 0 1 -1 0 32 200 Tm (arXiv:2301.00001) Tj ET
+BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
+        );
+        let stamp = find(&items, "arXiv:2301.00001");
+        assert!(
+            (stamp.rotation - 90.0).abs() < 1e-3,
+            "rotation = {}",
+            stamp.rotation
+        );
+        assert!((stamp.x - 12.0).abs() < 0.01, "x = {}", stamp.x);
+        assert!((stamp.y - 200.0).abs() < 0.01, "y = {}", stamp.y);
+        assert!((stamp.width - 20.0).abs() < 0.01, "width = {}", stamp.width);
+        assert!(
+            (stamp.height - 192.0).abs() < 0.01,
+            "height = {}",
+            stamp.height
+        );
+
+        let tj = find(&items, "ABCD");
+        assert!(
+            (tj.rotation - 90.0).abs() < 1e-3,
+            "rotation = {}",
+            tj.rotation
+        );
+        assert!((tj.x - 50.0).abs() < 0.01, "x = {}", tj.x);
+        assert!((tj.width - 10.0).abs() < 0.01, "width = {}", tj.width);
+        assert!((tj.y - 200.0).abs() < 0.01, "y = {}", tj.y);
+        assert!((tj.height - 24.0).abs() < 0.01, "height = {}", tj.height);
+
+        let body = find(&items, "Body line one");
+        assert_eq!(body.rotation, 0.0);
+        assert!(
+            (body.width - 13.0 * 7.2).abs() < 0.01,
+            "width = {}",
+            body.width
+        );
+        assert_eq!(body.height, 12.0);
     }
 }

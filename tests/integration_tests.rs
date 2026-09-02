@@ -289,6 +289,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         is_italic: false,
         is_underline: false,
         is_strikeout: false,
+        rotation: 0.0,
         item_type: ItemType::Text,
         mcid: None,
     }
@@ -317,6 +318,7 @@ fn make_text_item_with_font(
         is_italic: is_italic_font(font),
         is_underline: false,
         is_strikeout: false,
+        rotation: 0.0,
         item_type: ItemType::Text,
         mcid: None,
     }
@@ -4447,4 +4449,99 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
          trustworthy, got: {:?}",
         page.markdown
     );
+}
+
+// =========================================================================
+// Rotated text-run geometry (fixture: rotated_margin_stamp.pdf)
+// =========================================================================
+
+/// An upright Letter page with a title, a two-column body, and a 20pt
+/// arXiv-style identifier shown with a 90° counter-clockwise text matrix
+/// (`0 1 -1 0 32 200 Tm`) along the left margin, reading bottom to top.
+const ROTATED_STAMP_FIXTURE: &str = "tests/fixtures/rotated_margin_stamp.pdf";
+const ROTATED_STAMP_TEXT: &str = "arXiv:2301.00001v1 [cs.CL] 1 Jan 2023";
+
+#[test]
+fn test_rotated_margin_run_has_tall_thin_box_and_rotation() {
+    let items = extract_text_with_positions(ROTATED_STAMP_FIXTURE).unwrap();
+    let stamp = items
+        .iter()
+        .find(|i| i.text == ROTATED_STAMP_TEXT)
+        .expect("stamp item");
+    assert!(
+        (stamp.rotation - 90.0).abs() < 1e-3,
+        "rotation = {}",
+        stamp.rotation
+    );
+    assert!(!stamp.is_horizontal());
+    // The glyphs extend one em to the left of the baseline drawn at x = 32,
+    // and the run starts at y = 200 then advances up the page.
+    assert!((stamp.x - 12.0).abs() < 0.05, "x = {}", stamp.x);
+    assert!((stamp.width - 20.0).abs() < 0.05, "width = {}", stamp.width);
+    assert!((stamp.y - 200.0).abs() < 0.05, "y = {}", stamp.y);
+    assert!(
+        stamp.height > 300.0 && stamp.height < 500.0,
+        "height = {}",
+        stamp.height
+    );
+    assert!(
+        stamp.height > 10.0 * stamp.width,
+        "box must be tall and thin, got {}x{}",
+        stamp.width,
+        stamp.height
+    );
+    assert_eq!(stamp.font_size, 20.0);
+
+    // Upright body text keeps the historical box: baseline y, em height,
+    // advance width, no rotation.
+    let body = items
+        .iter()
+        .find(|i| i.text.starts_with("The quick brown fox"))
+        .expect("body item");
+    assert_eq!(body.rotation, 0.0);
+    assert!(body.is_horizontal());
+    assert_eq!((body.x, body.y, body.height), (72.0, 690.0, 11.0));
+    assert!(
+        body.width > 150.0 && body.width < 250.0,
+        "width = {}",
+        body.width
+    );
+
+    assert!(
+        items
+            .iter()
+            .filter(|i| !i.text.trim().is_empty())
+            .all(|i| i.width > 0.0),
+        "no run with glyphs may be zero-width"
+    );
+}
+
+#[test]
+fn test_rotated_margin_run_is_assigned_to_margin_region_only() {
+    let buf = std::fs::read(ROTATED_STAMP_FIXTURE).unwrap();
+    // Top-left page coordinates, as layout models report them: a left-margin
+    // strip next to the body area. Before the geometry fix the stamp's
+    // zero width was replaced by a chars × 0.5em phantom that crossed into
+    // the body box, so the body region won the exclusive assignment and the
+    // margin region came back empty.
+    let margin = [0.0, 0.0, 50.0, 792.0];
+    let body = [60.0, 0.0, 612.0, 792.0];
+    let results = extract_text_in_regions_mem(&buf, &[(0, vec![margin, body])]).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].regions.len(), 2);
+    let (margin_text, body_text) = (&results[0].regions[0], &results[0].regions[1]);
+    assert_eq!(margin_text.text.trim(), ROTATED_STAMP_TEXT);
+    assert!(!margin_text.needs_ocr);
+    assert!(
+        !body_text.text.contains("arXiv"),
+        "stamp leaked into the body region: {:?}",
+        body_text.text
+    );
+    assert!(body_text.text.contains("The quick brown fox"));
+    assert!(body_text.text.contains("title line across both columns."));
+
+    // The margin box alone recovers the same stamp: pairing it with the body
+    // box must not change the answer.
+    let solo = extract_text_in_regions_mem(&buf, &[(0, vec![margin])]).unwrap();
+    assert_eq!(solo[0].regions[0].text.trim(), ROTATED_STAMP_TEXT);
 }

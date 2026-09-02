@@ -93,19 +93,43 @@ pub struct PdfRect {
     pub page: u32,
 }
 
-/// A text item with position information
+/// A text item with position information.
+///
+/// `x`, `y`, `width`, `height` describe the item's axis-aligned box in PDF
+/// user space (points, y-up). For ordinary horizontal text the box runs from
+/// the baseline one em upward and spans the run's advance, which is what
+/// every consumer historically assumed. A run shown with a rotated text
+/// matrix gets the bounding box of its rotated glyph run instead — tall and
+/// thin for a vertical margin stamp — and reports the angle in `rotation`.
 #[derive(Debug, Clone)]
 pub struct TextItem {
     /// The text content
     pub text: String,
-    /// X position on page
+    /// Left edge of the item's box.
     pub x: f32,
-    /// Y position on page (PDF coordinates, origin at bottom-left)
+    /// Bottom edge of the item's box (PDF coordinates, origin at
+    /// bottom-left). For horizontal text this is the baseline; descenders
+    /// are not included.
     pub y: f32,
-    /// Width of text
+    /// Horizontal extent of the box: the advance for horizontal text, the
+    /// em size for a vertical run. Zero only for a horizontal run whose font
+    /// carries no width information (advance unknown).
     pub width: f32,
-    /// Height (approximated from font size)
+    /// Vertical extent of the box: the rendered em size for horizontal
+    /// text, the advance for a vertical run.
     pub height: f32,
+    /// Rotation of the run's baseline in degrees, counter-clockwise from the
+    /// page's +x axis, normalised to `[0, 360)`: `0` for ordinary
+    /// left-to-right text, `90` for text reading bottom-to-top (a margin
+    /// stamp rotated counter-clockwise), `270` for text reading
+    /// top-to-bottom, `180` for upside-down text. Rotation-only matrices
+    /// report exact multiples of 90; skewed matrices (deskewed OCR layers,
+    /// diagonal watermarks) report fractional angles. `0` for items that
+    /// don't come from a text matrix (images, links, form fields, OCR).
+    /// On a page whose text is predominantly rotated the extractor
+    /// re-bases the coordinate frame so the dominant runs read as `0` and
+    /// upright strays as `270`.
+    pub rotation: f32,
     /// Font name: the `/BaseFont` family name ("ABCDEF+CMMI10"), which
     /// identifies the actual face (see `extractor::fonts::item_font_name`
     /// for the CID carve-out).
@@ -142,6 +166,35 @@ pub struct TextItem {
     /// Marked Content ID from the content stream's BDC/BMC operator.
     /// Used to link this item to the PDF structure tree for tagged PDFs.
     pub mcid: Option<i64>,
+}
+
+impl TextItem {
+    /// Whether the run reads along the page's x axis rather than its y
+    /// axis: `rotation` closer to `0`/`180` than to `90`/`270`, the same
+    /// 45° split the extractor uses to vote on page rotation. Layout
+    /// heuristics that reason about baselines, word gaps, and column spans
+    /// walk the x axis and assume this; rotated runs (margin stamps, chart
+    /// axis titles, rotated table headers) return `false` and are kept out
+    /// of them. Oblique runs (diagonal watermarks, deskewed OCR lines) are
+    /// deliberately still `true`: the x-axis heuristics are the closest fit
+    /// the pipeline has for them, exactly as before `rotation` existed, and
+    /// callers needing the precise angle read `rotation` directly.
+    pub fn is_horizontal(&self) -> bool {
+        let r = self.rotation.rem_euclid(360.0);
+        let vertical = (r > 45.0 && r < 135.0) || (r > 225.0 && r < 315.0);
+        !vertical
+    }
+
+    /// The item's extent perpendicular to its reading direction — the em
+    /// box whatever the orientation: `height` for horizontal text, `width`
+    /// for a vertical run.
+    pub(crate) fn cross_extent(&self) -> f32 {
+        if self.is_horizontal() {
+            self.height
+        } else {
+            self.width
+        }
+    }
 }
 
 /// A line of text (grouped text items)
@@ -360,6 +413,7 @@ mod formatting_tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: strikeout,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -424,5 +478,42 @@ mod formatting_tests {
             "<s>deleted</s>"
         );
         assert_eq!(line.text(), "deleted");
+    }
+
+    #[test]
+    fn is_horizontal_follows_the_baseline_quadrant() {
+        let cases = [
+            (0.0, true),
+            (180.0, true),
+            (90.0, false),
+            (270.0, false),
+            (44.0, true),
+            (46.0, false),
+            (134.0, false),
+            (136.0, true),
+            (359.5, true),
+            (-90.0, false),
+            (450.0, false),
+        ];
+        for (rotation, horizontal) in cases {
+            let mut probe = item("x", 0.0, 10.0, false);
+            probe.rotation = rotation;
+            assert_eq!(
+                probe.is_horizontal(),
+                horizontal,
+                "rotation {rotation} should be horizontal={horizontal}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_extent_is_the_em_box_whatever_the_orientation() {
+        let mut probe = item("x", 0.0, 10.0, false);
+        probe.height = 12.0;
+        assert_eq!(probe.cross_extent(), 12.0);
+        probe.rotation = 90.0;
+        probe.width = 12.0;
+        probe.height = 200.0;
+        assert_eq!(probe.cross_extent(), 12.0);
     }
 }

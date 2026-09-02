@@ -95,6 +95,13 @@ pub struct TextItem {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    /// Rotation of the run's baseline in degrees counter-clockwise from the
+    /// page's x axis, in `[0, 360)`: `0` for ordinary horizontal text, `90`
+    /// for text reading bottom-to-top (a rotated margin stamp), `270` for
+    /// top-to-bottom, `180` for upside-down. `x`/`y`/`width`/`height` is the
+    /// run's axis-aligned box, so a vertical run is tall and thin (height
+    /// ≫ width) instead of zero-width.
+    pub rotation: f64,
     pub font: String,
     pub font_tag: String,
     pub font_size: f64,
@@ -513,6 +520,7 @@ pub fn extract_text_with_positions(
                     is_italic: item.is_italic,
                     is_underline: item.is_underline,
                     is_strikeout: item.is_strikeout,
+                    rotation: item.rotation as f64,
                     item_type,
                     link_url,
                     mcid: item.mcid,

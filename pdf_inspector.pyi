@@ -90,6 +90,13 @@ class TextItem:
     y: float
     width: float
     height: float
+    """Axis-aligned box in PDF points (y-up): for horizontal text `y` is the
+    baseline and `height` the em size; a rotated run is tall and thin."""
+    rotation: float
+    """Rotation of the run's baseline in degrees counter-clockwise from the
+    page's x axis, in [0, 360): 0 for ordinary horizontal text, 90 for text
+    reading bottom-to-top (a rotated margin stamp), 270 for top-to-bottom,
+    180 for upside-down."""
     font: str
     font_tag: str
     font_size: float

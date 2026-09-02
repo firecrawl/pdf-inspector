@@ -6,6 +6,7 @@ mod base14;
 mod content_decode;
 pub(crate) mod content_stream;
 mod fonts;
+mod geometry;
 mod layout;
 mod links;
 mod reading_order;
@@ -1063,6 +1064,13 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 {
                     break;
                 }
+                // Merging walks along x, which is only the reading direction
+                // of horizontal runs. A vertical stamp whose box bottom shares
+                // a baseline with a body line must not be glued onto it, and
+                // two side-by-side vertical runs are separate lines.
+                if !first.is_horizontal() || !next.is_horizontal() {
+                    break;
+                }
                 let gap = next.x - end_x;
                 let x_gap_max = if *preserve_stream_order && is_standalone_bullet_text(&text) {
                     first.font_size * 1.2
@@ -1128,6 +1136,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 is_italic: first.is_italic,
                 is_underline: first.is_underline,
                 is_strikeout: first.is_strikeout,
+                rotation: first.rotation,
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
             });
@@ -1432,6 +1441,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1691,6 +1701,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1708,6 +1719,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1725,6 +1737,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2512,6 +2525,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2529,6 +2543,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2546,6 +2561,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2574,6 +2590,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2591,6 +2608,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2608,6 +2626,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2638,6 +2657,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -2675,6 +2695,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -2713,6 +2734,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2730,6 +2752,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2747,6 +2770,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2772,6 +2796,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -2912,6 +2937,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2929,6 +2955,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2956,6 +2983,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2973,6 +3001,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -3016,6 +3045,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -3063,6 +3093,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -3110,6 +3141,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -3150,6 +3182,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -3404,5 +3437,44 @@ mod tests {
         ];
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn vertical_run_never_merges_with_body_text_sharing_its_baseline() {
+        // A 12pt margin stamp whose box bottom lands on a body line's
+        // baseline, 2pt left of the body text: same y-group, tiny gap, same
+        // font — every merge criterion but orientation says "join". The same
+        // items set upright DO merge, so orientation is what blocks it.
+        let mut stamp = make_merge_item("arXiv:2301.00001", 12.0, 12.0);
+        stamp.height = 120.0;
+        stamp.rotation = 90.0;
+        let body = make_merge_item("Body text", 26.0, 54.0);
+
+        let merged = merge_text_items(vec![stamp.clone(), body.clone()]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged[0].text, "arXiv:2301.00001");
+        assert_eq!(merged[1].text, "Body text");
+
+        stamp.height = 12.0;
+        stamp.rotation = 0.0;
+        stamp.width = 96.0;
+        let body_after_upright_stamp = make_merge_item("Body text", 110.0, 54.0);
+        let merged = merge_text_items(vec![stamp, body_after_upright_stamp]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "arXiv:2301.00001 Body text");
+    }
+
+    #[test]
+    fn side_by_side_vertical_runs_stay_separate_lines() {
+        // Two lines of a vertical stamp are adjacent em columns with the
+        // same bottom: walking x would glue them into one "line".
+        let mut first = make_merge_item("line one", 12.0, 12.0);
+        first.height = 80.0;
+        first.rotation = 90.0;
+        let mut second = make_merge_item("line two", 24.0, 12.0);
+        second.height = 80.0;
+        second.rotation = 90.0;
+        let merged = merge_text_items(vec![first, second]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
     }
 }
