@@ -660,6 +660,9 @@ pub(crate) fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
 fn effective_merge_width(item: &TextItem) -> f32 {
     use crate::text_utils::is_cjk_char;
 
+    if !item.advance_known {
+        return item.measured_width();
+    }
     if item.width <= 0.0 || item.font_size <= 0.0 {
         return item.width;
     }
@@ -1125,6 +1128,11 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 if !first.is_upright() || !next.is_upright() {
                     break;
                 }
+                // A merged item carries one `advance_known`: never fold a
+                // measured run and an estimated one into the same item.
+                if next.advance_known != first.advance_known {
+                    break;
+                }
                 let gap = next.x - end_x;
                 let x_gap_max = if *preserve_stream_order && is_standalone_bullet_text(&text) {
                     first.font_size * 1.2
@@ -1180,7 +1188,13 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 text,
                 x: first.x,
                 y: first.y,
-                width: end_x - first.x,
+                // An estimated run contributes no width to the merge walk,
+                // so a lone one must keep its own estimated extent.
+                width: if first.advance_known {
+                    end_x - first.x
+                } else {
+                    (end_x - first.x).max(first.width)
+                },
                 height: first.height,
                 font: first.font.clone(),
                 font_tag: first.font_tag.clone(),
@@ -1279,7 +1293,12 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     let marks_ok = parent.is_strikeout == item.is_strikeout
                         && (parent.is_underline == item.is_underline
                             || (parent.is_underline && !item.is_underline));
-                    if parent.font_size >= sub_threshold && ends_with_letter && marks_ok {
+                    if parent.font_size >= sub_threshold
+                        && ends_with_letter
+                        && marks_ok
+                        && parent.advance_known
+                        && item.advance_known
+                    {
                         let parent_right = parent.x + parent.width;
                         let gap = item.x - parent_right;
                         // Subscripts must be tightly adjacent (within ~1pt)
@@ -3648,6 +3667,21 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         assert_eq!(merged.len(), 2, "{merged:?}");
         assert!(merged.iter().any(|i| i.text == "HELLO"));
         assert!(merged.iter().any(|i| i.text == "WORLD"));
+    }
+
+    #[test]
+    fn measured_and_estimated_runs_never_merge() {
+        // A width-less font's run (estimated box) next to a measured one on
+        // the same baseline: the pair must stay two items, whichever comes
+        // first, so `advance_known` keeps describing each item truthfully.
+        let measured = make_merge_item("known", 100.0, 30.0);
+        let mut estimated = make_merge_item("guess", 132.0, 30.0);
+        estimated.advance_known = false;
+        assert_eq!(
+            merge_text_items(vec![measured.clone(), estimated.clone()]).len(),
+            2
+        );
+        assert_eq!(merge_text_items(vec![estimated, measured]).len(), 2);
     }
 
     #[test]

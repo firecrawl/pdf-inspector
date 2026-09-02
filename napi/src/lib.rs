@@ -103,9 +103,9 @@ pub struct TextItem {
     /// ≫ width) instead of zero-width.
     pub rotation: f64,
     /// Whether the run's advance came from font metrics. `false` only when
-    /// the font carries no width information: the box then spans just the
-    /// em across the baseline (zero `width` for horizontal text, zero
-    /// `height` for vertical text) and says nothing about the run's length.
+    /// the font carries no width information: the box's extent along the
+    /// baseline is then an estimate of half an em per glyph, not a
+    /// measurement.
     pub advance_known: bool,
     pub font: String,
     pub font_tag: String,

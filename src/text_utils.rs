@@ -627,46 +627,18 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
     base_size * scale
 }
 
-/// Advance estimate for a run without font widths: half an em per glyph.
-fn estimated_advance(item: &TextItem) -> f32 {
-    item.text.chars().count() as f32 * item.font_size * 0.5
-}
-
-/// Box extents of a run whose advance is unknown (`TextItem::advance_known`
-/// is false). `run_geometry` spanned its box from the em across the baseline
-/// alone, so that box is one em turned by `rotation` and its diagonal is the
-/// em itself — which anisotropic or sheared matrices may have shrunk below
-/// `font_size`. The estimated advance is laid along the baseline and the em
-/// across it, giving `(width, height)`.
-fn estimated_extents(item: &TextItem) -> (f32, f32) {
-    let (sin, cos) = item.rotation.to_radians().sin_cos();
-    let (sin, cos) = (sin.abs(), cos.abs());
-    let em = item.width.hypot(item.height);
-    let advance = estimated_advance(item);
-    (advance * cos + em * sin, advance * sin + em * cos)
-}
-
-/// The item's horizontal extent: the real box when the advance came from
-/// font metrics, otherwise an estimate laid along the run — so a width-less
-/// vertical stamp never becomes a page-wide phantom line and a width-less
-/// oblique run is not shrunk to its em.
+/// The item's horizontal extent. Since 1.18 the box already holds an
+/// estimate for runs whose font carries no width metrics (laid along the
+/// run at extraction, flagged by `TextItem::advance_known == false`), so
+/// this is the box itself; it stays the single seam for layout code that
+/// wants a "usable width" should that policy ever change.
 pub(crate) fn effective_width(item: &TextItem) -> f32 {
-    if item.advance_known {
-        item.width
-    } else {
-        estimated_extents(item).0
-    }
+    item.width
 }
 
-/// The item's vertical extent — the counterpart of `effective_width`. Left
-/// at its em-only box, a width-less rotated run could never overlap a region
-/// and would silently vanish from region extraction.
+/// The item's vertical extent — the counterpart of `effective_width`.
 pub(crate) fn effective_height(item: &TextItem) -> f32 {
-    if item.advance_known {
-        item.height
-    } else {
-        estimated_extents(item).1
-    }
+    item.height
 }
 
 pub(crate) fn is_cid_font(font: &str) -> bool {
@@ -964,7 +936,10 @@ pub(crate) fn should_join_items(
     }
 
     // When we have accurate width from font metrics, use a tight threshold
-    if prev_item.width > 0.0 {
+    // Only measured widths earn the tight threshold: a width-less font's
+    // box is a half-em-per-glyph estimate (`advance_known == false`), which
+    // stays on the loose heuristic it always used.
+    if prev_item.width > 0.0 && prev_item.advance_known {
         let gap = if prev_item.x <= curr_item.x {
             // LTR: prev is left of curr
             curr_item.x - (prev_item.x + prev_item.width)
@@ -1920,53 +1895,24 @@ mod tests {
         assert_eq!(items[1].text, second.text);
     }
 
-    /// The em-only box `run_geometry` leaves for a run without font widths.
-    fn unknown_advance_item(rotation: f32, font_size: f32, em: f32) -> TextItem {
-        let (sin, cos) = rotation.to_radians().sin_cos();
-        let mut item = geometry_item(em * sin.abs(), font_size, rotation);
-        item.height = em * cos.abs();
-        item.advance_known = false;
-        item
-    }
-
     #[test]
-    fn unknown_advances_are_estimated_along_the_run() {
-        // "abcd" without font widths: half an em per glyph along the baseline,
-        // the em across it — whatever the angle.
-        let horizontal = unknown_advance_item(0.0, 10.0, 10.0);
-        assert!((effective_width(&horizontal) - 20.0).abs() < 1e-3);
-        assert!((effective_height(&horizontal) - 10.0).abs() < 1e-3);
-        let vertical = unknown_advance_item(90.0, 10.0, 10.0);
-        assert!((effective_width(&vertical) - 10.0).abs() < 1e-3);
-        assert!((effective_height(&vertical) - 20.0).abs() < 1e-3);
-        let (sin, cos) = 45.0_f32.to_radians().sin_cos();
-        let diagonal = unknown_advance_item(45.0, 10.0, 10.0);
-        let expected = 20.0 * cos + 10.0 * sin;
-        assert!((effective_width(&diagonal) - expected).abs() < 1e-3);
-        assert!((effective_height(&diagonal) - expected).abs() < 1e-3);
-        // Anisotropic text: `font_size` carries the larger scale (24) while
-        // the em across the baseline is 12 — the box's own diagonal.
-        let (sin, cos) = 30.0_f32.to_radians().sin_cos();
-        let stretched = unknown_advance_item(30.0, 24.0, 12.0);
-        let advance = 4.0 * 0.5 * 24.0;
-        assert!((effective_width(&stretched) - (advance * cos + 12.0 * sin)).abs() < 1e-3);
-        assert!((effective_height(&stretched) - (advance * sin + 12.0 * cos)).abs() < 1e-3);
-    }
-
-    #[test]
-    fn known_advances_are_never_estimated() {
-        // A font that reports a genuine zero advance keeps its zero width.
+    fn extent_helpers_pass_the_box_through() {
+        // Estimates for width-less fonts are laid into the box at extraction
+        // and flagged, so the helpers never second-guess it: a genuine zero
+        // advance stays zero and an estimate stays what extraction produced.
         let zero = geometry_item(0.0, 10.0, 0.0);
-        assert_eq!(effective_width(&zero), 0.0);
-        assert_eq!(effective_height(&zero), 10.0);
-        // A short run at 45° keeps its real (square-ish) box.
+        assert_eq!(
+            (effective_width(&zero), effective_height(&zero)),
+            (0.0, 10.0)
+        );
+        let mut estimated = geometry_item(20.0, 10.0, 0.0);
+        estimated.advance_known = false;
+        assert_eq!(effective_width(&estimated), 20.0);
         let mut short = geometry_item(6.0, 10.0, 45.0);
         short.height = 5.0;
         assert_eq!(
             (effective_width(&short), effective_height(&short)),
             (6.0, 5.0)
         );
-        let thin = geometry_item(0.4, 10.0, 0.0);
-        assert_eq!(effective_width(&thin), 0.4);
     }
 }

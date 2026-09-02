@@ -99,9 +99,8 @@ class TextItem:
     180 for upside-down."""
     advance_known: bool
     """Whether the run's advance came from font metrics. False only when the
-    font carries no width information: the box then spans just the em across
-    the baseline (zero width for horizontal text, zero height for vertical
-    text) and says nothing about the run's length."""
+    font carries no width information: the box's extent along the baseline is
+    then an estimate of half an em per glyph, not a measurement."""
     font: str
     font_tag: str
     font_size: float

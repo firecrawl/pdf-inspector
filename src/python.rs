@@ -364,9 +364,8 @@ pub struct PyTextItem {
     #[pyo3(get)]
     pub rotation: f32,
     /// Whether the run's advance came from font metrics. False only when the
-    /// font carries no width information: the box then spans just the em
-    /// across the baseline (zero width for horizontal text, zero height for
-    /// vertical text) and says nothing about the run's length.
+    /// font carries no width information: the box's extent along the baseline
+    /// is then an estimate of half an em per glyph, not a measurement.
     #[pyo3(get)]
     pub advance_known: bool,
     #[pyo3(get)]

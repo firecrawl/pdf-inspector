@@ -359,9 +359,12 @@ fn is_underline_candidate(item: &TextItem) -> bool {
     // Rule geometry below assumes a horizontal baseline: a rotated run's
     // box bottom is a run end, not a baseline, and a table border under a
     // rotated header would otherwise read as an underline.
+    // An estimated box (font without widths) says nothing about where the
+    // glyphs end, so it cannot own a rule either — as when it was zero-width.
     matches!(item.item_type, ItemType::Text)
         && !item.text.trim().is_empty()
         && item.width > 0.0
+        && item.advance_known
         && item.is_horizontal()
 }
 

@@ -120,18 +120,24 @@ pub(crate) struct RunGeometry {
 /// with a y-flipped text matrix so the glyphs come out upright, so their
 /// box belongs above the baseline although the matrix says otherwise.
 ///
-/// An unknown advance contributes no extent: the box is then exactly one em
-/// turned by the baseline angle, and `advance_known` records the fact so
-/// `text_utils::effective_width` and `effective_height` can lay an estimate
-/// along the run instead — whatever the angle.
+/// An unknown advance (a font without width metrics) is replaced by
+/// `fallback_advance_ts`, the caller's half-an-em-per-glyph estimate in
+/// text-space units, so the box still lies where the text plausibly is —
+/// laid along the baseline whichever way it runs, which a consumer adding an
+/// estimate on the +x side could not get right for runs reading towards -x —
+/// and `advance_known` records that the extent is an estimate.
 pub(crate) fn run_geometry(
     combined: &[f32; 6],
     advance_ts: Option<f32>,
+    fallback_advance_ts: f32,
     em: f32,
     glyph_up_flipped: bool,
 ) -> RunGeometry {
     let (x0, y0) = (combined[4], combined[5]);
-    let advance = advance_ts.unwrap_or(0.0);
+    let (advance, advance_known) = match advance_ts {
+        Some(advance) => (advance, true),
+        None => (fallback_advance_ts, false),
+    };
     let (ax, ay) = (advance * combined[0], advance * combined[1]);
     let axis_len = combined[0].hypot(combined[1]);
     let (ux, uy) = if axis_len > f32::EPSILON {
@@ -171,8 +177,15 @@ pub(crate) fn run_geometry(
         width: x_max - x_min,
         height: y_max - y_min,
         rotation: baseline_rotation(combined[0], combined[1]),
-        advance_known: advance_ts.is_some(),
+        advance_known,
     }
+}
+
+/// Advance estimate, in text-space units, for a run whose font carries no
+/// width metrics: half an em per glyph. `font_size_ts` is the em in text
+/// space (the `Tf` size, times the Type3 scale where one applies).
+pub(crate) fn estimated_advance_ts(text: &str, font_size_ts: f32) -> f32 {
+    text.chars().count() as f32 * 0.5 * font_size_ts
 }
 
 /// Angle of the text-space x axis `(a, b)` in device space, in degrees
@@ -256,38 +269,104 @@ mod tests {
     fn run_geometry_without_advance_keeps_em_width_for_vertical_runs() {
         // No font widths: an upright run keeps `width == 0` as the
         // "advance unknown" signal, a vertical run still owns its em column.
-        let vertical = run_geometry(&[0.0, 1.0, -1.0, 0.0, 100.0, 100.0], None, 10.0, false);
+        let vertical = run_geometry(&[0.0, 1.0, -1.0, 0.0, 100.0, 100.0], None, 0.0, 10.0, false);
         assert_eq!(
             (vertical.x, vertical.y, vertical.width, vertical.height),
             (90.0, 100.0, 10.0, 0.0)
         );
         assert!(!vertical.advance_known);
-        let upright = run_geometry(&[1.0, 0.0, 0.0, 1.0, 100.0, 100.0], None, 10.0, false);
+        let upright = run_geometry(&[1.0, 0.0, 0.0, 1.0, 100.0, 100.0], None, 0.0, 10.0, false);
         assert_eq!(
             (upright.x, upright.y, upright.width, upright.height),
             (100.0, 100.0, 0.0, 10.0)
         );
         assert!(!upright.advance_known);
         // A font that reports a zero advance is not "unknown".
-        let zero = run_geometry(&[1.0, 0.0, 0.0, 1.0, 100.0, 100.0], Some(0.0), 10.0, false);
+        let zero = run_geometry(
+            &[1.0, 0.0, 0.0, 1.0, 100.0, 100.0],
+            Some(0.0),
+            0.0,
+            10.0,
+            false,
+        );
         assert!(zero.advance_known);
         assert_eq!((zero.width, zero.height), (0.0, 10.0));
+    }
+
+    #[test]
+    fn run_geometry_lays_the_fallback_advance_along_the_run() {
+        // Four glyphs without metrics at a 10pt em: a 20pt estimate, laid in
+        // the direction the run reads so the box sits on the text — left of
+        // the origin for 180°, below it for 270°.
+        let upright = run_geometry(&[1.0, 0.0, 0.0, 1.0, 100.0, 100.0], None, 20.0, 10.0, false);
+        assert!(!upright.advance_known);
+        assert_eq!(
+            (upright.x, upright.y, upright.width, upright.height),
+            (100.0, 100.0, 20.0, 10.0)
+        );
+        let flipped = run_geometry(
+            &[-1.0, 0.0, 0.0, 1.0, 100.0, 100.0],
+            None,
+            20.0,
+            10.0,
+            false,
+        );
+        assert_eq!((flipped.x, flipped.width), (80.0, 20.0));
+        assert!(!flipped.advance_known);
+        let down = run_geometry(
+            &[0.0, -1.0, 1.0, 0.0, 100.0, 100.0],
+            None,
+            20.0,
+            10.0,
+            false,
+        );
+        assert_eq!(
+            (down.y, down.height, down.x, down.width),
+            (80.0, 20.0, 100.0, 10.0)
+        );
+        let up = run_geometry(
+            &[0.0, 1.0, -1.0, 0.0, 100.0, 100.0],
+            None,
+            20.0,
+            10.0,
+            false,
+        );
+        assert_eq!((up.y, up.height, up.x, up.width), (100.0, 20.0, 90.0, 10.0));
+        assert_eq!(estimated_advance_ts("abcd", 12.0), 24.0);
     }
 
     #[test]
     fn run_geometry_takes_the_em_height_from_the_y_axis() {
         // [2 0 0 1]: horizontally stretched 12pt text. `font_size` reports
         // the larger scale (24), but the glyphs are only 12pt tall.
-        let stretched = run_geometry(&[2.0, 0.0, 0.0, 1.0, 0.0, 0.0], Some(10.0), 24.0, false);
+        let stretched = run_geometry(
+            &[2.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            Some(10.0),
+            0.0,
+            24.0,
+            false,
+        );
         assert_eq!(
             (stretched.width, stretched.height, stretched.rotation),
             (20.0, 12.0, 0.0)
         );
         // [1 0 0 2]: vertically stretched — the y axis carries the scale.
-        let tall = run_geometry(&[1.0, 0.0, 0.0, 2.0, 0.0, 0.0], Some(10.0), 24.0, false);
+        let tall = run_geometry(
+            &[1.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+            Some(10.0),
+            0.0,
+            24.0,
+            false,
+        );
         assert_eq!((tall.width, tall.height), (10.0, 24.0));
         // Uniform scale and rotation are unaffected.
-        let turned = run_geometry(&[0.0, 2.0, -2.0, 0.0, 0.0, 0.0], Some(10.0), 24.0, false);
+        let turned = run_geometry(
+            &[0.0, 2.0, -2.0, 0.0, 0.0, 0.0],
+            Some(10.0),
+            0.0,
+            24.0,
+            false,
+        );
         assert_eq!((turned.width, turned.height), (24.0, 20.0));
     }
 
@@ -297,7 +376,13 @@ mod tests {
         // by the `[1 0 0 -1]` Type3 FontMatrix. The box must stay above the
         // baseline — putting it one em below would separate Type3 text from
         // the Type1 math on its line.
-        let dvips = run_geometry(&[1.0, 0.0, 0.0, -1.0, 100.0, 500.0], Some(30.0), 10.0, true);
+        let dvips = run_geometry(
+            &[1.0, 0.0, 0.0, -1.0, 100.0, 500.0],
+            Some(30.0),
+            0.0,
+            10.0,
+            true,
+        );
         assert_eq!(
             (dvips.x, dvips.y, dvips.width, dvips.height, dvips.rotation),
             (100.0, 500.0, 30.0, 10.0, 0.0)
@@ -307,6 +392,7 @@ mod tests {
         let hanging = run_geometry(
             &[1.0, 0.0, 0.0, -1.0, 100.0, 500.0],
             Some(30.0),
+            0.0,
             10.0,
             false,
         );
@@ -316,6 +402,7 @@ mod tests {
         let mirrored = run_geometry(
             &[-1.0, 0.0, 0.0, 1.0, 300.0, 500.0],
             Some(30.0),
+            0.0,
             10.0,
             false,
         );
@@ -333,7 +420,13 @@ mod tests {
         // advance-wide instead of growing by the slant. `em` is the rendered
         // size, which for this matrix carries the y axis's 1.056 length.
         let em = 10.0 * 0.34_f32.hypot(1.0);
-        let sheared = run_geometry(&[1.0, 0.0, 0.34, 1.0, 100.0, 500.0], Some(30.0), em, false);
+        let sheared = run_geometry(
+            &[1.0, 0.0, 0.34, 1.0, 100.0, 500.0],
+            Some(30.0),
+            0.0,
+            em,
+            false,
+        );
         assert_eq!((sheared.x, sheared.y, sheared.width), (100.0, 500.0, 30.0));
         assert!(
             (sheared.height - 10.0).abs() < 1e-3,
@@ -345,6 +438,7 @@ mod tests {
         let ccw = run_geometry(
             &[0.0, 1.0, -1.0, 0.0, 100.0, 100.0],
             Some(30.0),
+            0.0,
             10.0,
             false,
         );
@@ -352,6 +446,7 @@ mod tests {
         let cw = run_geometry(
             &[0.0, -1.0, 1.0, 0.0, 100.0, 100.0],
             Some(30.0),
+            0.0,
             10.0,
             false,
         );

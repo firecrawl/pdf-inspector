@@ -132,13 +132,12 @@ pub struct TextItem {
     /// clockwise one.
     pub rotation: f32,
     /// Whether the run's advance came from font metrics. `false` only when
-    /// the font carries no width information: the box then spans just the
-    /// em across the baseline (a zero `width` for horizontal text, a zero
-    /// `height` for vertical text) and says nothing about the run's length,
-    /// so consumers estimate it from the glyph count instead (see
-    /// `text_utils::effective_width`). A font that reports a genuine zero
-    /// advance keeps `true`. Items that don't come from a text matrix
-    /// (images, links, form fields, OCR) always report `true`.
+    /// the font carries no width information: the box's extent along the
+    /// baseline is then an estimate of half an em per glyph, laid in the
+    /// direction the run reads, rather than a measurement. A font that
+    /// reports a genuine zero advance keeps `true`. Items that don't come
+    /// from a text matrix (images, links, form fields, OCR) always report
+    /// `true`.
     pub advance_known: bool,
     /// Font name: the `/BaseFont` family name ("ABCDEF+CMMI10"), which
     /// identifies the actual face (see `extractor::fonts::item_font_name`
@@ -206,6 +205,18 @@ impl TextItem {
     /// Whether the run reads towards -x: `rotation` within 45° of `180`.
     pub fn is_upside_down(&self) -> bool {
         self.is_horizontal() && !self.is_upright()
+    }
+
+    /// The width merge logic may rely on: the measured width, or zero when
+    /// the box only holds an estimate (`advance_known == false`). Merging
+    /// keeps treating a width-less font's runs as zero-width, as it did when
+    /// their boxes were, so estimates never decide whether runs are glued.
+    pub(crate) fn measured_width(&self) -> f32 {
+        if self.advance_known {
+            self.width
+        } else {
+            0.0
+        }
     }
 
     /// The item's extent perpendicular to its reading direction: `height`

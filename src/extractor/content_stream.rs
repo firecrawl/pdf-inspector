@@ -18,7 +18,9 @@ use super::fonts::{
     compute_string_width_ts, descriptor_style_flags, extract_text_from_operand,
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
-use super::geometry::{normalize_degrees, rise_adjusted, run_geometry, PageRotation};
+use super::geometry::{
+    estimated_advance_ts, normalize_degrees, rise_adjusted, run_geometry, PageRotation,
+};
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -547,6 +549,11 @@ pub(crate) fn extract_page_text_items(
                         let geometry = run_geometry(
                             &combined,
                             w_ts_opt,
+                            estimated_advance_ts(
+                                &text,
+                                current_font_size
+                                    * type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                            ),
                             rendered_size,
                             type3_y_flips.contains(&current_font),
                         );
@@ -796,6 +803,14 @@ pub(crate) fn extract_page_text_items(
                                 let geometry = run_geometry(
                                     &combined,
                                     font_info.map(|_| end_w - start_w),
+                                    estimated_advance_ts(
+                                        text,
+                                        current_font_size
+                                            * type3_scales
+                                                .get(&current_font)
+                                                .copied()
+                                                .unwrap_or(1.0),
+                                    ),
                                     rendered_size,
                                     type3_y_flips.contains(&current_font),
                                 );
@@ -911,6 +926,11 @@ pub(crate) fn extract_page_text_items(
                             let geometry = run_geometry(
                                 &combined,
                                 w_ts_opt,
+                                estimated_advance_ts(
+                                    &text,
+                                    current_font_size
+                                        * type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                ),
                                 rendered_size,
                                 type3_y_flips.contains(&current_font),
                             );
@@ -1101,7 +1121,11 @@ pub(crate) fn extract_page_text_items(
                             // scaled matrix ([12 0 0 12] with `/F 1 Tf`)
                             // carries the scale in tm[0], so the raw tm[4]
                             // delta is neither the advance nor device width.
-                            let advance_ts = {
+                            // Without width metrics the matrix never moved,
+                            // so a zero displacement is not a zero advance.
+                            let advance_ts = if !font_widths.contains_key(&current_font) {
+                                None
+                            } else {
                                 let dx = text_matrix[4] - start_tm[4];
                                 let dy = text_matrix[5] - start_tm[5];
                                 let axis_len_sq =
@@ -1115,6 +1139,11 @@ pub(crate) fn extract_page_text_items(
                             let geometry = run_geometry(
                                 &combined,
                                 advance_ts,
+                                estimated_advance_ts(
+                                    &at,
+                                    current_font_size
+                                        * type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                ),
                                 rendered_size,
                                 type3_y_flips.contains(&current_font),
                             );
@@ -2167,7 +2196,22 @@ end"#;
         let items = extract_hebrew_items(b"BT /F1 12 Tf 100 700 Td <41424344> Tj ET");
         assert_eq!(items.len(), 1);
         assert!(!items[0].advance_known);
-        assert_eq!((items[0].width, items[0].height), (0.0, 12.0));
+        // Four glyphs at 12pt: a 24pt estimate laid along the baseline.
+        assert_eq!((items[0].width, items[0].height), (24.0, 12.0));
+    }
+
+    #[test]
+    fn actual_text_on_a_width_less_font_is_estimated_not_zero() {
+        // The text matrix never moves for a font without widths, so the
+        // ActualText span's zero displacement must not pass for a genuine
+        // zero advance.
+        let items = extract_hebrew_items(
+            b"BT /F1 12 Tf 100 700 Td /Span <</ActualText (Shalom) >> BDC <41424344> Tj EMC ET",
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "Shalom");
+        assert!(!items[0].advance_known);
+        assert_eq!(items[0].width, 36.0);
     }
 
     #[test]

@@ -65,7 +65,7 @@ fn merge_adjacent_items_preserving(
         while i < group.len() {
             let (first_idx, first_item) = group[i];
             let mut text = first_item.text.clone();
-            let mut end_x = first_item.x + first_item.width;
+            let mut end_x = first_item.x + first_item.measured_width();
             let mut indices = vec![first_idx];
             let x_gap_max = first_item.font_size * 0.5;
 
@@ -83,6 +83,9 @@ fn merge_adjacent_items_preserving(
                 // (or an upside-down run) never joins a neighbouring cell,
                 // matching `merge_text_items`.
                 if !first_item.is_upright() || !next_item.is_upright() {
+                    break;
+                }
+                if first_item.advance_known != next_item.advance_known {
                     break;
                 }
 
@@ -119,7 +122,7 @@ fn merge_adjacent_items_preserving(
                     text.push(' ');
                 }
                 text.push_str(&next_item.text);
-                end_x = next_item.x + next_item.width;
+                end_x = next_item.x + next_item.measured_width();
                 indices.push(next_idx);
                 j += 1;
             }
@@ -128,7 +131,11 @@ fn merge_adjacent_items_preserving(
                 text,
                 x: first_item.x,
                 y: first_item.y,
-                width: end_x - first_item.x,
+                width: if first_item.advance_known {
+                    end_x - first_item.x
+                } else {
+                    (end_x - first_item.x).max(first_item.width)
+                },
                 height: first_item.height,
                 font: first_item.font.clone(),
                 font_tag: first_item.font_tag.clone(),

@@ -12,7 +12,7 @@ use super::fonts::{
     compute_string_width_ts, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
     CMapDecisionCache, FontStyleCache,
 };
-use super::geometry::{baseline_rotation, rise_adjusted, run_geometry};
+use super::geometry::{baseline_rotation, estimated_advance_ts, rise_adjusted, run_geometry};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
@@ -707,6 +707,11 @@ fn extract_form_xobject_text_inner(
                         let geometry = run_geometry(
                             &combined,
                             advance_ts,
+                            estimated_advance_ts(
+                                &text,
+                                current_font_size
+                                    * type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                            ),
                             rendered_size,
                             type3_y_flips.contains(&current_font),
                         );
@@ -945,6 +950,14 @@ fn extract_form_xobject_text_inner(
                                 let geometry = run_geometry(
                                     &combined_mat,
                                     font_info.map(|_| end_w - start_w),
+                                    estimated_advance_ts(
+                                        text,
+                                        current_font_size
+                                            * type3_scales
+                                                .get(&current_font)
+                                                .copied()
+                                                .unwrap_or(1.0),
+                                    ),
                                     rendered_size,
                                     type3_y_flips.contains(&current_font),
                                 );

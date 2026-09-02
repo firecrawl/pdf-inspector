@@ -7849,17 +7849,6 @@ mod rotated_run_region_tests {
         assert!(!region_overlaps_item(&stamp, body));
         assert!(region_item_overlap_area(&stamp, margin) > 0.0);
         assert_eq!(region_item_overlap_area(&stamp, body), 0.0);
-
-        // The pre-fix degenerate box (zero width, em height, no rotation)
-        // was widened to chars × 0.5em by `effective_width` and crossed
-        // into the body region — the exclusive assignment then handed the
-        // stamp to the body paragraph and left the margin empty.
-        let mut phantom = item(STAMP, 32.0, 200.0, 0.0, 20.0, 0.0);
-        phantom.advance_known = false;
-        assert!(region_overlaps_item(&phantom, body));
-        assert!(
-            region_item_overlap_area(&phantom, body) > region_item_overlap_area(&phantom, margin)
-        );
     }
 
     #[test]
@@ -7959,7 +7948,7 @@ mod rotated_run_region_tests {
 
     #[test]
     fn tsr_line_clustering_uses_the_estimated_height_of_unknown_advances() {
-        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, 0.0, 90.0);
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, 370.0, 90.0);
         stamp.advance_known = false;
         let lines = cluster_tsr_cell_text_lines(vec![stamp]);
         assert_eq!(lines.len(), 1);
@@ -7974,7 +7963,9 @@ mod rotated_run_region_tests {
         // matchable instead of letting it vanish from region extraction.
         let page_h = 792.0;
         let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
-        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, 0.0, 90.0);
+        // Extraction lays a half-em-per-glyph estimate along the run for a
+        // width-less font and flags it; the box is what region matching sees.
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, 370.0, 90.0);
         stamp.advance_known = false;
         assert!(region_overlaps_item(&stamp, margin));
         assert!(region_item_overlap_area(&stamp, margin) > 0.0);
