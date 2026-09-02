@@ -6,7 +6,7 @@ mod base14;
 mod content_decode;
 pub(crate) mod content_stream;
 mod fonts;
-mod geometry;
+pub(crate) mod geometry;
 mod layout;
 mod links;
 mod reading_order;
@@ -307,7 +307,7 @@ fn extract_positioned_text_impl(
         // the page and poisons font statistics. Rotated pages are left alone
         // — their item coordinates are already transformed out of box space.
         let mut clipped_box: Option<(f32, f32, f32, f32)> = None;
-        if !coords_rotated {
+        if coords_rotated == geometry::PageRotation::Upright {
             if let Some((bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
                 const TOL: f32 = 6.0;
                 let outside = |it: &TextItem| {
@@ -1064,11 +1064,13 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 {
                     break;
                 }
-                // Merging walks along x, which is only the reading direction
-                // of horizontal runs. A vertical stamp whose box bottom shares
-                // a baseline with a body line must not be glued onto it, and
-                // two side-by-side vertical runs are separate lines.
-                if !first.is_horizontal() || !next.is_horizontal() {
+                // Merging walks along +x, which is only the reading direction
+                // of upright runs. A vertical stamp whose box bottom shares a
+                // baseline with a body line must not be glued onto it, two
+                // side-by-side vertical runs are separate lines, and the
+                // fragments of an upside-down run read towards -x, so an
+                // ascending walk would concatenate them reversed.
+                if !first.is_upright() || !next.is_upright() {
                     break;
                 }
                 let gap = next.x - end_x;
@@ -3462,6 +3464,21 @@ mod tests {
         let merged = merge_text_items(vec![stamp, body_after_upright_stamp]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "arXiv:2301.00001 Body text");
+    }
+
+    #[test]
+    fn upside_down_fragments_are_never_concatenated_reversed() {
+        // A 180° run shown as two operators: "HELLO" is painted first, at
+        // the right, and "WORLD" continues towards -x. Walking x ascending
+        // would merge them as "WORLD HELLO"; they must stay separate.
+        let mut hello = make_merge_item("HELLO", 310.0, 50.0);
+        hello.rotation = 180.0;
+        let mut world = make_merge_item("WORLD", 258.0, 50.0);
+        world.rotation = 180.0;
+        let merged = merge_text_items(vec![hello, world]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(merged.iter().any(|i| i.text == "HELLO"));
+        assert!(merged.iter().any(|i| i.text == "WORLD"));
     }
 
     #[test]

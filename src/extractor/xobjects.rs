@@ -1387,6 +1387,34 @@ mod tests {
     }
 
     #[test]
+    fn form_only_rotated_page_is_turned_like_page_stream_text() {
+        // The whole page is one Form XObject whose runs are all 90°: the
+        // form runs must vote, so the page is re-based exactly as if the
+        // runs had been shown by the page stream itself.
+        let (doc, page_id) = doc_with_form_content(
+            b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (HELLO) Tj ET
+BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET",
+        );
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, page_rotation, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        assert_eq!(page_rotation, crate::extractor::geometry::PageRotation::Ccw);
+        let hello = find(&items, "HELLO");
+        assert_eq!(hello.rotation, 0.0);
+        assert!((hello.x - 100.0).abs() < 0.01, "x = {}", hello.x);
+        assert!((hello.y + 200.0).abs() < 0.01, "y = {}", hello.y);
+        assert!((hello.width - 36.0).abs() < 0.01, "width = {}", hello.width);
+    }
+
+    #[test]
     fn rotated_run_inside_form_gets_tall_thin_box() {
         // Same contract as the page-level parser: a 20pt stamp reading
         // bottom-to-top gets its em as width and its advance as height, for

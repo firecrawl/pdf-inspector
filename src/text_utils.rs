@@ -186,9 +186,15 @@ pub(crate) fn sort_rtl_cell_items<T>(
 
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
+    // An upside-down line (180° runs) reads towards -x: its items sort by
+    // descending x like RTL text, but without the embedded-LTR reordering,
+    // which is about script direction rather than geometry.
+    let upside_down = !items.is_empty() && items.iter().all(|i| i.is_upside_down());
     if rtl {
         items.sort_by(|a, b| b.x.total_cmp(&a.x));
         restore_embedded_ltr_runs(items, |i| i.text.as_str());
+    } else if upside_down {
+        items.sort_by(|a, b| b.x.total_cmp(&a.x));
     } else {
         items.sort_by(|a, b| a.x.total_cmp(&b.x));
     }
@@ -1842,6 +1848,28 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    #[test]
+    fn upside_down_lines_sort_right_to_left() {
+        // A 180° run reads towards -x: the fragment painted first sits at
+        // the largest x and must come first.
+        let mut hello = geometry_item(30.0, 10.0, 180.0);
+        hello.text = "HELLO".to_string();
+        hello.x = 300.0;
+        let mut world = geometry_item(30.0, 10.0, 180.0);
+        world.text = "WORLD".to_string();
+        world.x = 260.0;
+        let mut items = vec![world, hello];
+        sort_line_items(&mut items);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["HELLO", "WORLD"]);
+
+        // Mixed or upright lines keep ascending x.
+        items[0].rotation = 0.0;
+        sort_line_items(&mut items);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["WORLD", "HELLO"]);
     }
 
     #[test]

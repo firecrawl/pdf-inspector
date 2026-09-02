@@ -1047,7 +1047,7 @@ pub fn extract_text_in_regions_mem(
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
     let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
@@ -1126,8 +1126,8 @@ pub fn extract_text_in_regions_mem(
         if has_gid {
             gid_pages.insert(*page_num);
         }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
+        if coords_rotated != extractor::geometry::PageRotation::Upright {
+            rotated_pages.insert(*page_num, coords_rotated.into());
         }
         items_by_page.insert(*page_num, items);
     }
@@ -1141,11 +1141,10 @@ pub fn extract_text_in_regions_mem(
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let _page_has_gid = gid_pages.contains(&page_1idx);
         let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let coords = rotated_pages
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(RegionCoordSpace::Standard);
 
         let mut page_results = Vec::with_capacity(regions.len());
 
@@ -1265,7 +1264,7 @@ pub fn extract_tables_in_regions_mem(
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
     let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
@@ -1292,8 +1291,8 @@ pub fn extract_tables_in_regions_mem(
         if has_gid {
             gid_pages.insert(*page_num);
         }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
+        if coords_rotated != extractor::geometry::PageRotation::Upright {
+            rotated_pages.insert(*page_num, coords_rotated.into());
         }
         items_by_page.insert(*page_num, items);
         rects_by_page.insert(*page_num, rects);
@@ -1307,11 +1306,10 @@ pub fn extract_tables_in_regions_mem(
         let items = items_by_page.get(&page_1idx);
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let _page_has_gid = gid_pages.contains(&page_1idx);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let coords = rotated_pages
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(RegionCoordSpace::Standard);
 
         let mut page_results = Vec::with_capacity(regions.len());
 
@@ -1599,12 +1597,8 @@ pub fn detect_vector_grid_in_region_mem(
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
-    let coords = if coords_rotated {
-        RegionCoordSpace::Rotated90Ccw
-    } else {
-        RegionCoordSpace::Standard
-    };
-    if matches!(coords, RegionCoordSpace::Rotated90Ccw) {
+    let coords = RegionCoordSpace::from(coords_rotated);
+    if coords != RegionCoordSpace::Standard {
         // TODO: add a rotated-page vector-grid fixture before enabling this.
         // The TSR crop contract is top-left page coordinates, while rotated
         // extraction normalizes vector geometry into a synthetic coordinate
@@ -2483,6 +2477,7 @@ fn extracted_bbox_to_page_top_left(
         RegionCoordSpace::Rotated90Ccw => {
             [-y_max, page_height - x_max, -y_min, page_height - x_min]
         }
+        RegionCoordSpace::Rotated90Cw => [y_min, page_height + x_min, y_max, page_height + x_max],
     }
 }
 
@@ -2554,7 +2549,7 @@ pub fn extract_tables_with_structure_cells_mem(
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
     let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
@@ -2578,8 +2573,8 @@ pub fn extract_tables_with_structure_cells_mem(
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
         }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
+        if coords_rotated != extractor::geometry::PageRotation::Upright {
+            rotated_pages.insert(*page_num, coords_rotated.into());
         }
         items_by_page.insert(*page_num, items);
     }
@@ -2595,11 +2590,10 @@ pub fn extract_tables_with_structure_cells_mem(
         };
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let coords = rotated_pages
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(RegionCoordSpace::Standard);
 
         let crop_origin = [input.crop_pdf_pt_bbox[0], input.crop_pdf_pt_bbox[1]];
 
@@ -3384,11 +3378,7 @@ fn detect_tsr_quality_issue(
             &mut extractor::FormWalkBudget::new(),
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
-    let coords = if coords_rotated {
-        RegionCoordSpace::Rotated90Ccw
-    } else {
-        RegionCoordSpace::Standard
-    };
+    let coords = RegionCoordSpace::from(coords_rotated);
     let expanded_cells =
         try_expand_multi_row_cells(cells, &items, page_h, coords, adaptive_threshold);
     let first_row = cells.iter().map(|cell| cell.row).min().unwrap_or(0);
@@ -3587,10 +3577,28 @@ fn obj_to_f32(obj: &lopdf::Object) -> Option<f32> {
     }
 }
 
-#[derive(Clone, Copy)]
+/// Coordinate frame the extracted items of a page live in: plain page
+/// coordinates, or the frame turned by the rotated-page correction (see
+/// `extractor::geometry::PageRotation`). Region boxes arrive in page
+/// coordinates and are turned the same way before matching items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegionCoordSpace {
     Standard,
+    /// Frame turned for a counter-clockwise page: `(x, y) → (y, -x)`.
     Rotated90Ccw,
+    /// Frame turned for a clockwise page: `(x, y) → (-y, x)`.
+    Rotated90Cw,
+}
+
+impl From<extractor::geometry::PageRotation> for RegionCoordSpace {
+    fn from(rotation: extractor::geometry::PageRotation) -> Self {
+        use extractor::geometry::PageRotation;
+        match rotation {
+            PageRotation::Upright => RegionCoordSpace::Standard,
+            PageRotation::Ccw => RegionCoordSpace::Rotated90Ccw,
+            PageRotation::Cw => RegionCoordSpace::Rotated90Cw,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3709,13 +3717,20 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 }
 
 fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
-    // Rotated-page normalization maps y = -(old right edge), so most text
-    // items land at negative Y. Use this to keep `collect_text_in_region`
-    // behavior compatible for direct callers that do not have extractor
-    // metadata.
+    // Rotated-page correction negates one axis: a counter-clockwise turn
+    // maps y = -(old right edge), a clockwise turn maps x = -(old top edge),
+    // so most items land at negative y or negative x respectively. Use this
+    // to keep `collect_text_in_region` behavior compatible for direct
+    // callers that do not have extractor metadata.
+    if items.is_empty() {
+        return RegionCoordSpace::Standard;
+    }
     let negative_y = items.iter().filter(|item| item.y < 0.0).count();
-    if !items.is_empty() && negative_y * 2 >= items.len() {
+    let negative_x = items.iter().filter(|item| item.x < 0.0).count();
+    if negative_y * 2 >= items.len() {
         RegionCoordSpace::Rotated90Ccw
+    } else if negative_x * 2 >= items.len() {
+        RegionCoordSpace::Rotated90Cw
     } else {
         RegionCoordSpace::Standard
     }
@@ -3747,6 +3762,12 @@ fn region_bounds(
             x_max: by_max,
             y_min: -tx_max,
             y_max: -tx_min,
+        },
+        RegionCoordSpace::Rotated90Cw => RegionBounds {
+            x_min: -by_max,
+            x_max: -by_min,
+            y_min: tx_min,
+            y_max: tx_max,
         },
     }
 }
@@ -7756,6 +7777,64 @@ mod rotated_run_region_tests {
             collect_text_in_region(&items, 60.0, 0.0, 612.0, 792.0, 792.0),
             "Body text"
         );
+    }
+
+    #[test]
+    fn clockwise_frame_region_bounds_follow_the_turned_page() {
+        // A 270° header along the right margin of a Letter page: page box
+        // x ∈ [580, 590], y ∈ [664, 700]. In the clockwise-turned frame it
+        // sits at x = -(top), y = baseline x.
+        let page_h = 792.0;
+        let header = item("HEADER", -700.0, 580.0, 36.0, 10.0, 0.0);
+        // Top-left region boxes: a strip around the header and the body.
+        let strip = region_bounds(
+            570.0,
+            80.0,
+            600.0,
+            140.0,
+            page_h,
+            RegionCoordSpace::Rotated90Cw,
+        );
+        let body = region_bounds(
+            60.0,
+            80.0,
+            500.0,
+            700.0,
+            page_h,
+            RegionCoordSpace::Rotated90Cw,
+        );
+        assert!(region_overlaps_item(&header, strip));
+        assert!(!region_overlaps_item(&header, body));
+
+        // The frame is inferred from the negated axis: x for clockwise
+        // pages, y for counter-clockwise ones.
+        assert_eq!(
+            infer_region_coord_space(&[header.clone()]),
+            RegionCoordSpace::Rotated90Cw
+        );
+        assert_eq!(
+            infer_region_coord_space(&[item("x", 100.0, -200.0, 36.0, 12.0, 0.0)]),
+            RegionCoordSpace::Rotated90Ccw
+        );
+        assert_eq!(
+            infer_region_coord_space(&[item("x", 100.0, 200.0, 36.0, 12.0, 0.0)]),
+            RegionCoordSpace::Standard
+        );
+
+        // Bounds round-trip back to the top-left page box they came from.
+        for coords in [
+            RegionCoordSpace::Standard,
+            RegionCoordSpace::Rotated90Ccw,
+            RegionCoordSpace::Rotated90Cw,
+        ] {
+            let b = region_bounds(570.0, 80.0, 600.0, 140.0, page_h, coords);
+            let back = extracted_bbox_to_page_top_left(
+                [b.x_min, b.y_min, b.x_max, b.y_max],
+                page_h,
+                coords,
+            );
+            assert_eq!(back, [570.0, 80.0, 600.0, 140.0], "{coords:?}");
+        }
     }
 
     #[test]

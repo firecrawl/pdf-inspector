@@ -4545,3 +4545,70 @@ fn test_rotated_margin_run_is_assigned_to_margin_region_only() {
     let solo = extract_text_in_regions_mem(&buf, &[(0, vec![margin])]).unwrap();
     assert_eq!(solo[0].regions[0].text.trim(), ROTATED_STAMP_TEXT);
 }
+
+#[test]
+fn test_clockwise_rotated_page_reads_in_order_and_regions_follow() {
+    // Top-to-bottom runs (`Tm = [0 -1 1 0]`): a page rotated clockwise. The
+    // first line runs down the page at x = 300, the next line sits to its
+    // LEFT at x = 270. The frame must be turned clockwise (not the fixed
+    // counter-clockwise turn, which mirrors both word and line order), and
+    // region boxes given in page coordinates must follow that frame.
+    let content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 300 655 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 644 Tm (LINE) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let find = |t: &str| {
+        items
+            .iter()
+            .find(|i| i.text.contains(t))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {t} in {:?}",
+                    items.iter().map(|i| &i.text).collect::<Vec<_>>()
+                )
+            })
+    };
+    let (hello, second) = (find("HELLO"), find("SECOND"));
+    assert!(
+        items.iter().all(|i| i.rotation == 0.0 && i.is_horizontal()),
+        "{items:?}"
+    );
+    assert!(hello.y > second.y, "first line must stack above the second");
+    assert!(
+        (hello.x - second.x).abs() < 0.5,
+        "both lines start at the same left edge"
+    );
+
+    let full = extract_text_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+    let text = &full[0].regions[0].text;
+    let at = |t: &str| text.find(t).unwrap_or_else(|| panic!("no {t} in {text:?}"));
+    assert!(at("HELLO") < at("WORLD") && at("WORLD") < at("SECOND") && at("SECOND") < at("LINE"));
+
+    // A top-left page box around the first line only (page x 290..320,
+    // y 87..192 from the top) must select exactly that line.
+    let first_line =
+        extract_text_in_regions_mem(&buf, &[(0, vec![[290.0, 87.0, 320.0, 192.0]])]).unwrap();
+    let text = &first_line[0].regions[0].text;
+    assert!(text.contains("HELLO") && text.contains("WORLD"), "{text:?}");
+    assert!(
+        !text.contains("SECOND") && !text.contains("LINE"),
+        "{text:?}"
+    );
+
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(
+        md.find("HELLO").unwrap() < md.find("WORLD").unwrap(),
+        "{md}"
+    );
+    assert!(
+        md.find("WORLD").unwrap() < md.find("SECOND").unwrap(),
+        "{md}"
+    );
+    assert!(
+        md.find("SECOND").unwrap() < md.find("LINE").unwrap(),
+        "{md}"
+    );
+}

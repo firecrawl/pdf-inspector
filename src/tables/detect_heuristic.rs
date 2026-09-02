@@ -79,6 +79,13 @@ fn merge_adjacent_items_preserving(
                     break;
                 }
 
+                // Merging walks +x in reading order: a rotated table header
+                // (or an upside-down run) never joins a neighbouring cell,
+                // matching `merge_text_items`.
+                if !first_item.is_upright() || !next_item.is_upright() {
+                    break;
+                }
+
                 // Proven replacement cells must retain their own decoration.
                 // Otherwise an adjacent old/new pair inherits only the first
                 // fragment's flags and can lose the live table evidence.

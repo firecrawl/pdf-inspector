@@ -126,9 +126,10 @@ pub struct TextItem {
     /// report exact multiples of 90; skewed matrices (deskewed OCR layers,
     /// diagonal watermarks) report fractional angles. `0` for items that
     /// don't come from a text matrix (images, links, form fields, OCR).
-    /// On a page whose text is predominantly rotated the extractor
-    /// re-bases the coordinate frame so the dominant runs read as `0` and
-    /// upright strays as `270`.
+    /// On a page whose text is predominantly rotated the extractor turns
+    /// the coordinate frame so the dominant runs read as `0`; upright
+    /// strays then report `270` on a counter-clockwise page and `90` on a
+    /// clockwise one.
     pub rotation: f32,
     /// Font name: the `/BaseFont` family name ("ABCDEF+CMMI10"), which
     /// identifies the actual face (see `extractor::fonts::item_font_name`
@@ -185,14 +186,32 @@ impl TextItem {
         !vertical
     }
 
-    /// The item's extent perpendicular to its reading direction — the em
-    /// box whatever the orientation: `height` for horizontal text, `width`
-    /// for a vertical run.
+    /// Whether the run reads along +x: `rotation` within 45° of `0`. The
+    /// x-ascending walks (item merging, line assembly) assume this; an
+    /// upside-down run is `is_horizontal()` but reads towards -x.
+    pub fn is_upright(&self) -> bool {
+        let r = self.rotation.rem_euclid(360.0);
+        r <= 45.0 || r >= 315.0
+    }
+
+    /// Whether the run reads towards -x: `rotation` within 45° of `180`.
+    pub fn is_upside_down(&self) -> bool {
+        self.is_horizontal() && !self.is_upright()
+    }
+
+    /// The item's extent perpendicular to its reading direction: `height`
+    /// for an unrotated item — identical to the historical value, and the
+    /// only meaningful extent for image, link, and OCR boxes — and the
+    /// rendered em (`font_size`) for any rotated run, whose axis-aligned
+    /// box mixes the advance into both dimensions (a long diagonal run is
+    /// not a tall line). Only content-stream runs carry a non-zero
+    /// `rotation`, and they set `font_size` to exactly the em height the
+    /// unrotated case reports.
     pub(crate) fn cross_extent(&self) -> f32 {
-        if self.is_horizontal() {
+        if self.rotation == 0.0 {
             self.height
         } else {
-            self.width
+            self.font_size
         }
     }
 }
@@ -515,5 +534,34 @@ mod formatting_tests {
         probe.width = 12.0;
         probe.height = 200.0;
         assert_eq!(probe.cross_extent(), 12.0);
+        // A long diagonal run: both box extents carry the advance, the em
+        // is the font size.
+        probe.rotation = 30.0;
+        probe.width = 180.0;
+        probe.height = 110.0;
+        assert_eq!(probe.cross_extent(), 12.0);
+    }
+
+    #[test]
+    fn upright_and_upside_down_split_the_horizontal_half_plane() {
+        let mut probe = item("x", 0.0, 10.0, false);
+        for (rotation, upright, upside_down) in [
+            (0.0, true, false),
+            (44.0, true, false),
+            (316.0, true, false),
+            (180.0, false, true),
+            (136.0, false, true),
+            (224.0, false, true),
+            (90.0, false, false),
+            (270.0, false, false),
+        ] {
+            probe.rotation = rotation;
+            assert_eq!(probe.is_upright(), upright, "upright at {rotation}");
+            assert_eq!(
+                probe.is_upside_down(),
+                upside_down,
+                "upside_down at {rotation}"
+            );
+        }
     }
 }

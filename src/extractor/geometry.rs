@@ -3,6 +3,61 @@
 //! Shared by the page content-stream parser and the Form XObject parser so
 //! both stamp identical boxes and baseline angles on their `TextItem`s.
 
+/// Which way a page's coordinate frame was turned so that predominantly
+/// rotated text reads along +x (see `content_stream::correct_rotated_page`).
+/// Region boxes given in page coordinates must be turned the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageRotation {
+    /// Text reads along +x; coordinates are plain page coordinates.
+    Upright,
+    /// Most runs read bottom-to-top (90°, `Tm = [0 b -b 0]`): the frame was
+    /// turned so they read along +x, mapping `(x, y) → (y, -x)`.
+    Ccw,
+    /// Most runs read top-to-bottom (270°, `Tm = [0 -b b 0]`): the frame was
+    /// turned the other way, mapping `(x, y) → (-y, x)`.
+    Cw,
+}
+
+impl PageRotation {
+    /// Degrees added to a run's baseline angle when its page frame is
+    /// turned: the dominant runs land on `0`.
+    pub(crate) fn baseline_rebase_degrees(self) -> f32 {
+        match self {
+            PageRotation::Upright => 0.0,
+            PageRotation::Ccw => -90.0,
+            PageRotation::Cw => 90.0,
+        }
+    }
+
+    /// Turn a point with the page frame.
+    pub(crate) fn rotate_point(self, x: f32, y: f32) -> (f32, f32) {
+        match self {
+            PageRotation::Upright => (x, y),
+            PageRotation::Ccw => (y, -x),
+            PageRotation::Cw => (-y, x),
+        }
+    }
+
+    /// Turn an axis-aligned box with the page frame: the negated edge
+    /// becomes the far edge and the extents swap.
+    pub(crate) fn rotate_box(self, x: &mut f32, y: &mut f32, width: &mut f32, height: &mut f32) {
+        match self {
+            PageRotation::Upright => return,
+            PageRotation::Ccw => {
+                let (new_x, new_y) = (*y, -(*x + width.abs()));
+                *x = new_x;
+                *y = new_y;
+            }
+            PageRotation::Cw => {
+                let (new_x, new_y) = (-(*y + height.abs()), *x);
+                *x = new_x;
+                *y = new_y;
+            }
+        }
+        std::mem::swap(width, height);
+    }
+}
+
 /// Axis-aligned device-space box of one shown run plus its baseline angle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RunGeometry {
@@ -94,6 +149,30 @@ pub(crate) fn normalize_degrees(degrees: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_rotation_turns_boxes_and_points_consistently() {
+        // A 90° run (box 12 wide, 36 tall, baseline at x = 200) turned CCW:
+        // x = run start, y = -baseline, extents swapped.
+        let (mut x, mut y, mut w, mut h) = (188.0, 100.0, 12.0, 36.0);
+        PageRotation::Ccw.rotate_box(&mut x, &mut y, &mut w, &mut h);
+        assert_eq!((x, y, w, h), (100.0, -200.0, 36.0, 12.0));
+        assert_eq!(
+            PageRotation::Ccw.rotate_point(200.0, 100.0),
+            (100.0, -200.0)
+        );
+        // A 270° run (baseline at x = 580, running down from y = 700) turned
+        // CW: x = -(run end), y = baseline x.
+        let (mut x, mut y, mut w, mut h) = (580.0, 664.0, 10.0, 36.0);
+        PageRotation::Cw.rotate_box(&mut x, &mut y, &mut w, &mut h);
+        assert_eq!((x, y, w, h), (-700.0, 580.0, 36.0, 10.0));
+        assert_eq!(PageRotation::Cw.rotate_point(580.0, 700.0), (-700.0, 580.0));
+        let (mut x, mut y, mut w, mut h) = (1.0, 2.0, 3.0, 4.0);
+        PageRotation::Upright.rotate_box(&mut x, &mut y, &mut w, &mut h);
+        assert_eq!((x, y, w, h), (1.0, 2.0, 3.0, 4.0));
+        assert_eq!(PageRotation::Ccw.baseline_rebase_degrees(), -90.0);
+        assert_eq!(PageRotation::Cw.baseline_rebase_degrees(), 90.0);
+    }
 
     #[test]
     fn run_geometry_without_advance_keeps_em_width_for_vertical_runs() {
