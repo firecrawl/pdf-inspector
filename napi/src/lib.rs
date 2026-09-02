@@ -570,6 +570,49 @@ pub fn extract_structure_elements(
     })
 }
 
+/// One flattened outline (bookmark) entry from the document catalog's
+/// `/Outlines` tree.
+#[napi(object)]
+pub struct OutlineEntryJs {
+    /// 1-based nesting depth (top-level bookmarks are level 1).
+    pub level: u32,
+    /// Bookmark title (decoded from UTF-16BE or PDFDocEncoding).
+    pub title: String,
+    /// 1-indexed target page (matches `TextItem.page`), `None` when the
+    /// destination is missing or cannot be resolved.
+    pub page: Option<u32>,
+    /// Destination kind when known: an explicit destination's fit type
+    /// ("XYZ", "Fit", "FitH", …) or "named" for named destinations.
+    pub dest_kind: Option<String>,
+}
+
+/// Extract the document outline (bookmarks) from a PDF.
+///
+/// Walks the catalog's `/Outlines` tree and returns one entry per bookmark
+/// in document order, matching the shape of PyMuPDF's simple TOC
+/// (`[level, title, page]` plus the destination kind). Returns an empty
+/// array when the PDF has no outline.
+///
+/// Pass 1-indexed page numbers (matching `TextItem.page`) to keep only
+/// entries that resolve to those pages; omit `pages` for the whole outline.
+#[napi]
+pub fn extract_outline(buffer: Buffer, pages: Option<Vec<u32>>) -> Result<Vec<OutlineEntryJs>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_outline", move || {
+        let entries = pdf_inspector::extract_outline_mem(&bytes, pages.as_deref())
+            .map_err(|e| to_napi_err(e, "extract_outline"))?;
+        Ok(entries
+            .into_iter()
+            .map(|e| OutlineEntryJs {
+                level: e.level,
+                title: e.title,
+                page: e.page,
+                dest_kind: e.dest_kind,
+            })
+            .collect())
+    })
+}
+
 /// Extract text within bounding-box regions from a PDF.
 ///
 /// For hybrid OCR: layout model detects regions in rendered images,

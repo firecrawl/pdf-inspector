@@ -8,6 +8,7 @@ pub(crate) mod content_stream;
 mod fonts;
 mod layout;
 mod links;
+pub(crate) mod outline;
 mod reading_order;
 pub(crate) mod underline;
 mod xobjects;
@@ -38,6 +39,7 @@ pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_re
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
+pub use outline::OutlineEntry;
 pub(crate) use xobjects::FormWalkBudget;
 
 // ---------------------------------------------------------------------------

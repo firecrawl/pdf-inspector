@@ -258,9 +258,51 @@ fn extract_items_json(
         .map(|items| format_items_json(&items))
 }
 
+fn format_outline_json(outline: &[pdf_inspector::OutlineEntry]) -> String {
+    let entries_json = outline
+        .iter()
+        .map(|entry| {
+            let page = entry
+                .page
+                .map(|page| page.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let dest_kind = entry
+                .dest_kind
+                .as_ref()
+                .map(|kind| format!(r#""{}""#, json_escape(kind)))
+                .unwrap_or_else(|| "null".to_string());
+            format!(
+                r#"{{"level":{},"title":"{}","page":{},"dest_kind":{}}}"#,
+                entry.level,
+                json_escape(&entry.title),
+                page,
+                dest_kind,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(r#"{{"schema_version":1,"outline":[{}]}}"#, entries_json)
+}
+
+fn extract_toc_json(
+    pdf_path: &str,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<String, pdf_inspector::PdfError> {
+    let pages: Option<Vec<u32>> = page_filter.map(|filter| {
+        let mut pages: Vec<u32> = filter.iter().copied().collect();
+        pages.sort_unstable();
+        pages
+    });
+    pdf_inspector::extract_outline(pdf_path, pages.as_deref())
+        .map(|outline| format_outline_json(&outline))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_items_json, format_items_json, format_ocr_error_json};
+    use super::{
+        extract_items_json, extract_toc_json, format_items_json, format_ocr_error_json,
+        format_outline_json,
+    };
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     use super::{format_ocr_json, process_pdf_with_ocr, OcrPdfOptions};
     use pdf_inspector::extractor::ItemType;
@@ -325,6 +367,44 @@ mod tests {
         assert!(json.starts_with(r#"{"schema_version":1,"page_count":3,"#));
         assert!(json.contains(r#""page":1,"source":"native""#));
         assert!(!json.contains("layout_ms"));
+    }
+
+    #[test]
+    fn toc_json_has_a_versioned_stable_envelope() {
+        let outline = vec![pdf_inspector::OutlineEntry {
+            level: 1,
+            title: "Say \"hi\"".to_string(),
+            page: Some(3),
+            dest_kind: Some("XYZ".to_string()),
+        }];
+        assert_eq!(
+            format_outline_json(&outline),
+            r#"{"schema_version":1,"outline":[{"level":1,"title":"Say \"hi\"","page":3,"dest_kind":"XYZ"}]}"#
+        );
+
+        let unresolved = vec![pdf_inspector::OutlineEntry {
+            level: 2,
+            title: "Dangling".to_string(),
+            page: None,
+            dest_kind: None,
+        }];
+        assert_eq!(
+            format_outline_json(&unresolved),
+            r#"{"schema_version":1,"outline":[{"level":2,"title":"Dangling","page":null,"dest_kind":null}]}"#
+        );
+    }
+
+    #[test]
+    fn toc_json_extracts_fixture_bookmarks() {
+        let json = extract_toc_json(
+            "tests/fixtures/accessory_building_permit_prose_frame.pdf",
+            None,
+        )
+        .expect("fixture outline should extract");
+        assert!(json.starts_with(r#"{"schema_version":1,"outline":["#));
+        assert!(json.contains(
+            r#"{"level":1,"title":"Accessory Building Ordinance","page":2,"dest_kind":"FitH"}"#
+        ));
     }
 
     #[test]
@@ -403,6 +483,7 @@ fn main() {
         eprintln!("Options:");
         eprintln!("  --json              Output result as JSON");
         eprintln!("  --items-json        Output positioned TextItem JSON");
+        eprintln!("  --toc-json          Output the outline (bookmark) TOC as JSON");
         eprintln!("  --raw               Output only markdown (no headers)");
         eprintln!(
             "  --compact           Collapse token-heavy source formatting such as dot leaders"
@@ -424,6 +505,7 @@ fn main() {
     let pdf_path = &args[1];
     let json_output = args.iter().any(|a| a == "--json");
     let items_json_output = args.iter().any(|a| a == "--items-json");
+    let toc_json_output = args.iter().any(|a| a == "--toc-json");
     let raw_output = args.iter().any(|a| a == "--raw");
     let compact_output = args.iter().any(|a| a == "--compact");
     let page_numbers = args.iter().any(|a| a == "--pages");
@@ -485,9 +567,9 @@ fn main() {
     }
 
     if let Some(mode) = ocr_mode_argument {
-        if items_json_output || detect_only || analyze {
+        if items_json_output || toc_json_output || detect_only || analyze {
             exit_ocr_error(
-                "--ocr cannot be combined with --items-json, --detect-only, or --analyze",
+                "--ocr cannot be combined with --items-json, --toc-json, --detect-only, or --analyze",
                 json_output,
             );
         }
@@ -597,6 +679,17 @@ fn main() {
 
     if items_json_output {
         match extract_items_json(pdf_path, page_filter.as_ref(), password.as_deref()) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if toc_json_output {
+        match extract_toc_json(pdf_path, page_filter.as_ref()) {
             Ok(json) => println!("{}", json),
             Err(e) => {
                 println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));

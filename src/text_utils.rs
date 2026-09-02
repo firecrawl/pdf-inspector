@@ -601,6 +601,83 @@ pub(crate) fn decode_text_string(bytes: &[u8]) -> String {
     }
 }
 
+/// PDFDocEncoding bytes that differ from Latin-1 (PDF 32000-1:2008 Annex D):
+/// accents at 0x18–0x1F, punctuation/ligatures at 0x80–0x9E, euro at 0xA0.
+/// Undefined bytes (0x7F, 0x9F, 0xAD) decode to the replacement character.
+fn pdfdoc_encoding_char(byte: u8) -> char {
+    match byte {
+        0x18 => '\u{02D8}', // breve
+        0x19 => '\u{02C7}', // caron
+        0x1A => '\u{02C6}', // circumflex
+        0x1B => '\u{02D9}', // dotaccent
+        0x1C => '\u{02DD}', // hungarumlaut
+        0x1D => '\u{02DB}', // ogonek
+        0x1E => '\u{02DA}', // ring
+        0x1F => '\u{02DC}', // tilde
+        0x7F | 0x9F | 0xAD => '\u{FFFD}',
+        0x80 => '\u{2022}', // bullet
+        0x81 => '\u{2020}', // dagger
+        0x82 => '\u{2021}', // daggerdbl
+        0x83 => '\u{2026}', // ellipsis
+        0x84 => '\u{2014}', // emdash
+        0x85 => '\u{2013}', // endash
+        0x86 => '\u{0192}', // florin
+        0x87 => '\u{2044}', // fraction
+        0x88 => '\u{2039}', // guilsinglleft
+        0x89 => '\u{203A}', // guilsinglright
+        0x8A => '\u{2212}', // minus
+        0x8B => '\u{2030}', // perthousand
+        0x8C => '\u{201E}', // quotedblbase
+        0x8D => '\u{201C}', // quotedblleft
+        0x8E => '\u{201D}', // quotedblright
+        0x8F => '\u{2018}', // quoteleft
+        0x90 => '\u{2019}', // quoteright
+        0x91 => '\u{201A}', // quotesinglbase
+        0x92 => '\u{2122}', // trademark
+        0x93 => '\u{FB01}', // fi ligature
+        0x94 => '\u{FB02}', // fl ligature
+        0x95 => '\u{0141}', // Lslash
+        0x96 => '\u{0152}', // OE
+        0x97 => '\u{0160}', // Scaron
+        0x98 => '\u{0178}', // Ydieresis
+        0x99 => '\u{017D}', // Zcaron
+        0x9A => '\u{0131}', // dotlessi
+        0x9B => '\u{0142}', // lslash
+        0x9C => '\u{0153}', // oe
+        0x9D => '\u{0161}', // scaron
+        0x9E => '\u{017E}', // zcaron
+        0xA0 => '\u{20AC}', // Euro
+        other => other as char,
+    }
+}
+
+/// Decode a PDF text string with the exact PDFDocEncoding table: UTF-16 when
+/// a byte-order mark is present, otherwise PDFDocEncoding including the bytes
+/// that differ from Latin-1 (curly quotes, dashes, fi/fl ligatures, accents,
+/// euro). Used for outline (bookmark) titles; [`decode_text_string`] keeps its
+/// Latin-1 approximation for existing ActualText callers.
+pub(crate) fn decode_pdfdoc_text_string(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        let utf16: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_be_bytes(*chunk))
+            .collect();
+        String::from_utf16_lossy(&utf16)
+    } else if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let utf16: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
+            .collect();
+        String::from_utf16_lossy(&utf16)
+    } else {
+        bytes.iter().map(|&b| pdfdoc_encoding_char(b)).collect()
+    }
+}
+
 /// Compute effective font size from base size and text matrix
 /// Text matrix is [a, b, c, d, tx, ty] where a,d are scale factors
 pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32 {
@@ -1125,6 +1202,42 @@ mod tests {
     #[test]
     fn strip_soft_hyphen() {
         assert_eq!(expand_ligatures("con\u{00AD}tent"), "content");
+    }
+
+    #[test]
+    fn pdfdoc_decoder_maps_differences_and_keeps_latin1_elsewhere() {
+        // Bytes that differ from Latin-1: accents, punctuation, ligatures, euro.
+        assert_eq!(decode_pdfdoc_text_string(&[0x18]), "\u{02D8}"); // breve
+        assert_eq!(decode_pdfdoc_text_string(&[0x84]), "\u{2014}"); // emdash
+        assert_eq!(decode_pdfdoc_text_string(&[0x93, 0x94]), "\u{FB01}\u{FB02}"); // fi fl
+        assert_eq!(decode_pdfdoc_text_string(&[0x8F, 0x90]), "\u{2018}\u{2019}"); // quotes
+        assert_eq!(decode_pdfdoc_text_string(&[0xA0]), "\u{20AC}"); // euro
+                                                                    // Latin-1-identical ranges pass through unchanged.
+        assert_eq!(decode_pdfdoc_text_string(b"Hello"), "Hello");
+        assert_eq!(decode_pdfdoc_text_string(&[0xE9]), "é");
+        // UTF-16BE with BOM still decodes.
+        let mut utf16 = vec![0xFE, 0xFF];
+        for unit in "Ü".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_be_bytes());
+        }
+        assert_eq!(decode_pdfdoc_text_string(&utf16), "Ü");
+    }
+
+    #[test]
+    fn pdfdoc_decoder_replaces_undefined_bytes() {
+        assert_eq!(
+            decode_pdfdoc_text_string(&[0x7F, 0x9F, 0xAD]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn pdfdoc_decoder_decodes_utf16le_with_bom() {
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "Résumé".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_pdfdoc_text_string(&utf16), "Résumé");
     }
 
     #[test]

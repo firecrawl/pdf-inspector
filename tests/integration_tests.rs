@@ -1532,6 +1532,96 @@ fn test_extract_structure_elements_untagged_pdf_empty() {
     );
 }
 
+/// Outline extraction must match PyMuPDF's `get_toc(simple=True)` for a
+/// fixture with bookmarks. Expected rows generated with PyMuPDF 1.28:
+/// `[[1, 'Accessory Building Ordinance', 2], [1, 'Accessory Building Permit
+/// Application', 1], [2, 'Accessory Building Permit Application', 1],
+/// [3, 'Accessory Building Permit', 1]]`.
+#[test]
+fn test_extract_outline_matches_pymupdf_simple_toc() {
+    let entries = pdf_inspector::extract_outline(
+        "tests/fixtures/accessory_building_permit_prose_frame.pdf",
+        None,
+    )
+    .unwrap();
+
+    let simple: Vec<(u32, &str, Option<u32>)> = entries
+        .iter()
+        .map(|e| (e.level, e.title.as_str(), e.page))
+        .collect();
+    assert_eq!(
+        simple,
+        vec![
+            (1, "Accessory Building Ordinance", Some(2)),
+            (1, "Accessory Building Permit Application", Some(1)),
+            (2, "Accessory Building Permit Application", Some(1)),
+            (3, "Accessory Building Permit", Some(1)),
+        ]
+    );
+
+    // This fixture's bookmarks use /A GoTo actions with /FitH destinations.
+    assert!(entries
+        .iter()
+        .all(|e| e.dest_kind.as_deref() == Some("FitH")));
+}
+
+/// Multi-level outline (53 entries, 3 levels deep, direct /Dest XYZ arrays).
+/// Expected values cross-checked against PyMuPDF's simple TOC.
+#[test]
+fn test_extract_outline_multilevel_fixture() {
+    let buf = std::fs::read("tests/fixtures/multiline_indent_cell_rect_grid.pdf").unwrap();
+    let entries = pdf_inspector::extract_outline_mem(&buf, None).unwrap();
+
+    assert_eq!(entries.len(), 53);
+    assert_eq!(
+        (entries[0].level, entries[0].title.as_str(), entries[0].page),
+        (1, "Terms of Use", Some(2))
+    );
+    let last = entries.last().unwrap();
+    assert_eq!(
+        (last.level, last.title.as_str(), last.page),
+        (1, "Appendix: Change History", Some(264))
+    );
+
+    // Level distribution matches PyMuPDF: 7 top-level, 21 second, 25 third.
+    let count = |level| entries.iter().filter(|e| e.level == level).count();
+    assert_eq!((count(1), count(2), count(3)), (7, 21, 25));
+
+    assert!(entries
+        .iter()
+        .all(|e| e.dest_kind.as_deref() == Some("XYZ")));
+}
+
+/// The optional page filter is 1-indexed and keeps only entries resolving
+/// to the requested pages.
+#[test]
+fn test_extract_outline_page_filter() {
+    let buf = std::fs::read("tests/fixtures/accessory_building_permit_prose_frame.pdf").unwrap();
+    let page1 = pdf_inspector::extract_outline_mem(&buf, Some(&[1])).unwrap();
+    assert_eq!(page1.len(), 3);
+    assert!(page1.iter().all(|e| e.page == Some(1)));
+
+    let page2 = pdf_inspector::extract_outline_mem(&buf, Some(&[2])).unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].title, "Accessory Building Ordinance");
+}
+
+/// A PDF without /Outlines yields an empty list, never an error.
+#[test]
+fn test_extract_outline_absent_is_empty_not_error() {
+    let pdf = make_text_pdf("(Hello world) Tj", "0 0 612 792");
+    let entries = pdf_inspector::extract_outline_mem(&pdf, None).unwrap();
+    assert!(entries.is_empty());
+
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let entries = pdf_inspector::extract_outline_mem(&buf, None).unwrap();
+    assert!(
+        entries.is_empty(),
+        "fixture without bookmarks should yield an empty outline, got {:?}",
+        entries
+    );
+}
+
 #[test]
 fn test_identity_h_no_tounicode_suppresses_garbage() {
     // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no

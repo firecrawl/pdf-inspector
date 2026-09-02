@@ -421,6 +421,42 @@ impl PyStructureElement {
     }
 }
 
+/// One flattened outline (bookmark) entry from the document catalog's
+/// /Outlines tree. Matches PyMuPDF's simple TOC rows ([level, title, page])
+/// plus the destination kind when known.
+#[pyclass(name = "OutlineEntry")]
+#[derive(Clone)]
+pub struct PyOutlineEntry {
+    /// 1-based nesting depth (top-level bookmarks are level 1).
+    #[pyo3(get)]
+    pub level: u32,
+    /// Bookmark title (decoded from BOM-marked UTF-16 or PDFDocEncoding).
+    #[pyo3(get)]
+    pub title: String,
+    /// 1-indexed target page (matches TextItem.page), None when the
+    /// destination is missing or cannot be resolved.
+    #[pyo3(get)]
+    pub page: Option<u32>,
+    /// Destination kind when known: an explicit destination's fit type
+    /// ("XYZ", "Fit", "FitH", ...) or "named" for named destinations.
+    #[pyo3(get)]
+    pub dest_kind: Option<String>,
+}
+
+#[pymethods]
+impl PyOutlineEntry {
+    fn __repr__(&self) -> String {
+        // `{:?}` escapes quotes and control characters so titles with
+        // apostrophes or embedded newlines cannot break the repr.
+        format!(
+            "OutlineEntry(level={}, title={:?}, page={:?})",
+            self.level,
+            self.title.chars().take(40).collect::<String>(),
+            self.page,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -991,6 +1027,49 @@ fn extract_structure_elements_bytes(
     Ok(convert_structure_elements(elements))
 }
 
+fn convert_outline_entries(entries: Vec<crate::OutlineEntry>) -> Vec<PyOutlineEntry> {
+    entries
+        .into_iter()
+        .map(|e| PyOutlineEntry {
+            level: e.level,
+            title: e.title,
+            page: e.page,
+            dest_kind: e.dest_kind,
+        })
+        .collect()
+}
+
+/// Extract the document outline (bookmarks) from a PDF file.
+///
+/// Walks the catalog's /Outlines tree and returns one OutlineEntry per
+/// bookmark in document order, matching PyMuPDF's simple TOC shape.
+/// Returns an empty list when the PDF has no outline.
+///
+/// Args:
+///     path: Path to the PDF file.
+///     pages: Optional list of 1-indexed pages (matching TextItem.page).
+///         When given, only entries resolving to those pages are returned;
+///         when None (default), the whole outline is returned.
+///
+/// Returns:
+///     List of OutlineEntry in document order.
+#[pyfunction]
+#[pyo3(signature = (path, pages=None))]
+fn extract_outline(path: &str, pages: Option<Vec<u32>>) -> PyResult<Vec<PyOutlineEntry>> {
+    let entries = crate::extract_outline(path, pages.as_deref()).map_err(to_py_err)?;
+    Ok(convert_outline_entries(entries))
+}
+
+/// Extract the document outline (bookmarks) from PDF bytes.
+///
+/// See [`extract_outline`] for details.
+#[pyfunction]
+#[pyo3(signature = (data, pages=None))]
+fn extract_outline_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<Vec<PyOutlineEntry>> {
+    let entries = crate::extract_outline_mem(data, pages.as_deref()).map_err(to_py_err)?;
+    Ok(convert_outline_entries(entries))
+}
+
 /// Python module definition.
 #[pymodule]
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1004,6 +1083,7 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfClassification>()?;
     m.add_class::<PyTextItem>()?;
     m.add_class::<PyStructureElement>()?;
+    m.add_class::<PyOutlineEntry>()?;
     m.add_class::<PyRegionText>()?;
     m.add_class::<PyPageRegionTexts>()?;
     m.add_class::<PyPageMarkdown>()?;
@@ -1022,6 +1102,8 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_with_positions_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_structure_elements, m)?)?;
     m.add_function(wrap_pyfunction!(extract_structure_elements_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_outline, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_outline_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_pages_markdown, m)?)?;

@@ -52,6 +52,7 @@ pub use detector::{
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_mem,
     extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
+    OutlineEntry,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
@@ -961,6 +962,49 @@ pub fn extract_structure_elements<P: AsRef<Path>>(
     validate_pdf_file(&path)?;
     let buffer = std::fs::read(path.as_ref())?;
     extract_structure_elements_mem(&buffer, pages)
+}
+
+/// Extract the document outline (bookmarks) from a PDF in memory.
+///
+/// Walks the catalog's `/Outlines` tree and returns one [`OutlineEntry`] per
+/// bookmark in document order, matching the shape of PyMuPDF's simple TOC
+/// (`[level, title, page]` plus the destination kind). Returns an empty list
+/// when the PDF has no outline — a missing outline is never an error.
+///
+/// Pass `Some(&[...])` with 1-indexed page numbers (matching
+/// [`TextItem::page`]) to keep only entries that resolve to those pages;
+/// pass `None` for the whole outline.
+pub fn extract_outline_mem(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+) -> Result<Vec<OutlineEntry>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let page_map: HashMap<lopdf::ObjectId, u32> = doc
+        .get_pages()
+        .iter()
+        .map(|(num, &id)| (id, *num))
+        .collect();
+    let mut entries = extractor::outline::extract_outline_from_doc(&doc, &page_map);
+    if let Some(pages) = pages {
+        let filter: HashSet<u32> = pages.iter().copied().collect();
+        entries.retain(|entry| entry.page.is_some_and(|page| filter.contains(&page)));
+    }
+    Ok(entries)
+}
+
+/// Path-based wrapper for [`extract_outline_mem`].
+///
+/// Reads the PDF from disk and extracts its outline (bookmarks). Pass `None`
+/// for `pages` to return the whole outline, or `Some(&[...])` to keep only
+/// entries resolving to specific 1-indexed pages.
+pub fn extract_outline<P: AsRef<Path>>(
+    path: P,
+    pages: Option<&[u32]>,
+) -> Result<Vec<OutlineEntry>, PdfError> {
+    validate_pdf_file(&path)?;
+    let buffer = std::fs::read(path.as_ref())?;
+    extract_outline_mem(&buffer, pages)
 }
 
 // =========================================================================
