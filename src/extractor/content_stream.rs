@@ -1540,7 +1540,14 @@ fn correct_rotated_page(
     mut lines: Vec<PdfLine>,
     votes: &RotationVotes,
 ) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>, PageRotation) {
-    if items.len() < 2 {
+    // A single rotated run never turns a page: it is a stamp or a caption,
+    // not a landscape layout. Only text runs count — an image placeholder
+    // next to one rotated run must not make the pair look like a page.
+    let text_runs = items
+        .iter()
+        .filter(|item| matches!(item.item_type, ItemType::Text))
+        .count();
+    if text_runs < 2 {
         return (items, rects, lines, PageRotation::Upright);
     }
 
@@ -2636,6 +2643,42 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             .iter()
             .filter(|i| i.text == "run")
             .all(|i| i.rotation == 0.0));
+    }
+
+    #[test]
+    fn single_rotated_run_next_to_an_image_does_not_turn_the_page() {
+        let run = TextItem {
+            text: "stamp".to_string(),
+            x: 188.0,
+            y: 100.0,
+            width: 12.0,
+            height: 36.0,
+            rotation: 90.0,
+            font: "Helvetica".to_string(),
+            font_tag: "F1".to_string(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        };
+        let mut image = run.clone();
+        image.text = "[Image: Im0]".to_string();
+        image.item_type = ItemType::Image;
+        image.rotation = 0.0;
+        let votes = RotationVotes {
+            horizontal: 0,
+            ccw: 1,
+            cw: 0,
+        };
+        let (items, _, _, rotation) =
+            correct_rotated_page(vec![run.clone(), image], Vec::new(), Vec::new(), &votes);
+        assert_eq!(rotation, PageRotation::Upright);
+        let kept = items.iter().find(|i| i.text == "stamp").unwrap();
+        assert_eq!((kept.x, kept.y, kept.rotation), (run.x, run.y, 90.0));
     }
 
     #[test]
