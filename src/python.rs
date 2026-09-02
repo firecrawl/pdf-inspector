@@ -343,13 +343,22 @@ impl PyPagesExtractionResult {
 }
 
 /// A positioned text item extracted from a PDF.
+///
+/// x/y are PDF points relative to the page's visible page box (CropBox ∩
+/// MediaBox, else MediaBox), origin at the box's lower-left corner with y
+/// growing upward — a rendered page image's frame once its top-left y is
+/// flipped by the box height, and the frame extract_text_in_regions reads
+/// its regions in. /Rotate is not applied.
 #[pyclass(name = "TextItem")]
 #[derive(Clone)]
 pub struct PyTextItem {
     #[pyo3(get)]
     pub text: String,
+    /// Left edge, in PDF points from the visible page box's left edge.
     #[pyo3(get)]
     pub x: f32,
+    /// Baseline for text (rect bottom edge for image, link and form-field
+    /// items), in PDF points from the visible page box's bottom edge.
     #[pyo3(get)]
     pub y: f32,
     #[pyo3(get)]
@@ -843,6 +852,16 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 }
 
 /// Extract text with position information from a file.
+///
+/// Args:
+///     path: Path to the PDF file.
+///     pages: Optional list of 1-indexed pages (matching TextItem.page).
+///         When None (default), the whole document is returned.
+///
+/// Returns:
+///     List of TextItem. x/y are PDF points relative to the page's visible
+///     page box (CropBox ∩ MediaBox, else MediaBox), origin at its lower-left
+///     corner — the same frame extract_text_in_regions reads regions in.
 #[pyfunction]
 #[pyo3(signature = (path, pages=None))]
 fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<Vec<PyTextItem>> {
@@ -857,6 +876,8 @@ fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<
 }
 
 /// Extract text with position information from bytes.
+///
+/// See extract_text_with_positions for the arguments and coordinate frame.
 #[pyfunction]
 #[pyo3(signature = (data, pages=None))]
 fn extract_text_with_positions_bytes(
@@ -879,7 +900,9 @@ fn extract_text_with_positions_bytes(
 /// Args:
 ///     path: Path to the PDF file.
 ///     page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
-///         Coordinates are PDF points with top-left origin.
+///         Coordinates are PDF points with top-left origin, relative to the
+///         visible page box (CropBox ∩ MediaBox, else MediaBox) — the same
+///         frame extract_text_with_positions reports items in.
 ///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
@@ -897,7 +920,9 @@ fn extract_text_in_regions(
 /// Args:
 ///     data: PDF file contents as bytes.
 ///     page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
-///         Coordinates are PDF points with top-left origin.
+///         Coordinates are PDF points with top-left origin, relative to the
+///         visible page box (CropBox ∩ MediaBox, else MediaBox) — the same
+///         frame extract_text_with_positions reports items in.
 ///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.

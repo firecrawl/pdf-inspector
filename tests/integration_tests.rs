@@ -15,8 +15,16 @@ use pdf_inspector::{
 use std::collections::HashSet;
 
 fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
+    make_text_pdf_with_boxes(content, media_box, None)
+}
+
+/// Like [`make_text_pdf`], optionally declaring a `/CropBox` on the page.
+fn make_text_pdf_with_boxes(content: &str, media_box: &str, crop_box: Option<&str>) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
+    let crop_entry = crop_box
+        .map(|b| format!(" /CropBox [{b}]"))
+        .unwrap_or_default();
 
     fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
         offsets.push(pdf.len());
@@ -42,7 +50,7 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
         &mut offsets,
         3,
         &format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}]{crop_entry} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
         ),
     );
 
@@ -2410,6 +2418,14 @@ fn synthetic_dense_table_pdf() -> Vec<u8> {
 }
 
 fn synthetic_vector_grid_pdf(two_tables: bool) -> Vec<u8> {
+    synthetic_vector_grid_pdf_with_crop_box(two_tables, None)
+}
+
+/// [`synthetic_vector_grid_pdf`] with an optional `/CropBox` on the page.
+fn synthetic_vector_grid_pdf_with_crop_box(
+    two_tables: bool,
+    crop_box: Option<[i64; 4]>,
+) -> Vec<u8> {
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Document, Object, Stream};
 
@@ -2481,21 +2497,24 @@ fn synthetic_vector_grid_pdf(two_tables: bool) -> Vec<u8> {
     doc.objects
         .insert(content_id, Stream::new(dictionary! {}, content).into());
 
-    doc.objects.insert(
-        page_id,
-        dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 800.into()],
-            "Resources" => dictionary! {
-                "Font" => dictionary! {
-                    "F1" => font_id,
-                },
+    let mut page = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 800.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! {
+                "F1" => font_id,
             },
-            "Contents" => content_id,
-        }
-        .into(),
-    );
+        },
+        "Contents" => content_id,
+    };
+    if let Some(crop_box) = crop_box {
+        page.set(
+            "CropBox",
+            Object::Array(crop_box.iter().map(|&v| v.into()).collect()),
+        );
+    }
+    doc.objects.insert(page_id, page.into());
     doc.objects.insert(
         pages_id,
         dictionary! {
@@ -4447,4 +4466,192 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
          trustworthy, got: {:?}",
         page.markdown
     );
+}
+
+// =========================================================================
+// Coordinate frame: positions and regions share the visible page box
+// =========================================================================
+
+fn find_item<'a>(items: &'a [TextItem], text: &str) -> &'a TextItem {
+    items
+        .iter()
+        .find(|item| item.text.trim() == text)
+        .unwrap_or_else(|| panic!("no item with text {text:?} in {items:#?}"))
+}
+
+/// Top-left region (visible-box frame) covering exactly `item`, given the
+/// visible box height — how a consumer turns a positioned item back into the
+/// box a renderer draws around it.
+fn item_region(item: &TextItem, visible_height: f32) -> [f32; 4] {
+    [
+        item.x,
+        visible_height - item.y - item.height,
+        item.x + item.width,
+        visible_height - item.y,
+    ]
+}
+
+fn region_text(buf: &[u8], region: [f32; 4]) -> String {
+    extract_text_in_regions_mem(buf, &[(0, vec![region])])
+        .unwrap()
+        .remove(0)
+        .regions
+        .remove(0)
+        .text
+}
+
+#[test]
+fn test_positions_are_relative_to_cropbox_origin() {
+    // MediaBox [0 0 400 500], CropBox [50 60 350 460]; the glyph is written
+    // at raw (120, 300), so a CropBox render puts it at (70, 240) from the
+    // visible box's lower-left corner.
+    let path = "tests/fixtures/cropbox_offset_origin.pdf";
+    let buf = std::fs::read(path).unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let glyph = find_item(&items, "Visible glyph");
+    assert_close(glyph.x, 70.0);
+    assert_close(glyph.y, 240.0);
+
+    // Every public variant shares the frame.
+    let from_path = extract_text_with_positions(path).unwrap();
+    let path_glyph = find_item(&from_path, "Visible glyph");
+    assert_eq!((path_glyph.x, path_glyph.y), (glyph.x, glyph.y));
+    let page_filter: HashSet<u32> = [1].into_iter().collect();
+    let paged =
+        pdf_inspector::extractor::extract_text_with_positions_mem_pages(&buf, Some(&page_filter))
+            .unwrap();
+    let paged_glyph = find_item(&paged, "Visible glyph");
+    assert_eq!((paged_glyph.x, paged_glyph.y), (glyph.x, glyph.y));
+
+    // The region API reads the same frame: the glyph's own box in the
+    // visible box's top-left space (300 x 400) yields exactly that line.
+    let text = region_text(&buf, item_region(glyph, 400.0));
+    assert!(text.contains("Visible glyph"), "got {text:?}");
+    assert!(!text.contains("Second line"), "got {text:?}");
+
+    // The same box in raw MediaBox coordinates (the pre-1.18 frame) lands on
+    // a different line — the silent mis-selection the shared frame fixes.
+    let raw_region = [
+        120.0,
+        500.0 - 300.0 - glyph.height,
+        120.0 + glyph.width,
+        500.0 - 300.0,
+    ];
+    let raw_text = region_text(&buf, raw_region);
+    assert!(!raw_text.contains("Visible glyph"), "got {raw_text:?}");
+    assert!(raw_text.contains("Third line"), "got {raw_text:?}");
+}
+
+#[test]
+fn test_positions_use_cropbox_intersected_with_offset_mediabox() {
+    // The MediaBox origin is itself non-zero and the CropBox pokes below it:
+    // renderers show the intersection (36, 36)-(648, 783), 612 x 747.
+    let content = "BT /F1 12 Tf 100 100 Td (Anchor) Tj ET";
+    let buf = make_text_pdf_with_boxes(content, "36 36 648 819", Some("36 0 648 783"));
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 64.0);
+    assert_close(anchor.y, 64.0);
+    let text = region_text(&buf, item_region(anchor, 747.0));
+    assert!(text.contains("Anchor"), "got {text:?}");
+
+    // Without a CropBox, the MediaBox origin alone shifts the frame.
+    let buf = make_text_pdf_with_boxes(content, "36 36 648 819", None);
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 64.0);
+    assert_close(anchor.y, 64.0);
+    let text = region_text(&buf, item_region(anchor, 783.0));
+    assert!(text.contains("Anchor"), "got {text:?}");
+}
+
+#[test]
+fn test_positions_unchanged_when_cropbox_matches_mediabox() {
+    // Origin MediaBox, no CropBox: raw coordinates pass through untouched.
+    let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET";
+    let items = extract_text_with_positions_mem(&make_text_pdf(content, "0 0 612 792")).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 72.0);
+    assert_close(anchor.y, 700.0);
+
+    // An explicit CropBox equal to the MediaBox changes nothing either.
+    let buf = make_text_pdf_with_boxes(content, "0 0 612 792", Some("0 0 612 792"));
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 72.0);
+    assert_close(anchor.y, 700.0);
+
+    // Real fixture without a CropBox: pinned to the pre-1.18 output.
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let title = items
+        .iter()
+        .find(|item| item.page == 1 && item.text == "Technical Information")
+        .expect("title item");
+    assert_close(title.x, 314.25);
+    assert_close(title.y, 645.0);
+}
+
+#[test]
+fn test_region_table_apis_use_visible_box_frame() {
+    use pdf_inspector::{
+        extract_tables_with_structure_cells_mem, extract_tables_with_structure_mem, TsrTableInput,
+    };
+
+    // The 2x2 ruled grid of `synthetic_vector_grid_pdf`, on a page whose
+    // CropBox [20 100 280 780] shifts the visible frame by (20, 20) from the
+    // MediaBox's top-left corner and makes it 260 x 680.
+    let buf = synthetic_vector_grid_pdf_with_crop_box(false, Some([20, 100, 280, 780]));
+    // The raw MediaBox-frame crop [50, 60, 210, 130] expressed in that frame.
+    let crop = [30.0_f32, 40.0, 190.0, 110.0];
+    let detected = detect_vector_grid_in_region_mem(&buf, 0, crop, 72.0)
+        .unwrap()
+        .expect("ruled vector table should be detected in the visible-box frame");
+    assert_eq!(detected.cell_bboxes.len(), 4);
+    // Cell bboxes are crop-relative pixels, so they match the CropBox-free page.
+    let first = &detected.cell_bboxes[0];
+    assert_close(first[0], 0.0);
+    assert_close(first[1], 0.0);
+    assert_close(first[2], 80.0);
+    assert_close(first[3], 30.0);
+
+    let input = TsrTableInput {
+        page: 0,
+        crop_pdf_pt_bbox: crop,
+        render_dpi: 72.0,
+        structure_tokens: detected.structure_tokens.clone(),
+        cell_bboxes: detected.cell_bboxes.clone(),
+    };
+    let markdown = extract_tables_with_structure_mem(&buf, std::slice::from_ref(&input))
+        .unwrap()
+        .remove(0);
+    for tok in ["A1", "B1", "A2", "B2"] {
+        assert!(markdown.contains(tok), "expected {tok} in {markdown}");
+    }
+    // The cell fill reads the same frame the crop was given in.
+    let cells = extract_tables_with_structure_cells_mem(&buf, std::slice::from_ref(&input))
+        .unwrap()
+        .remove(0);
+    let cell_text = |row: usize, col: usize| {
+        cells
+            .iter()
+            .find(|c| c.row == row && c.col == col)
+            .map(|c| c.text.trim().to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(cell_text(0, 0), "A1");
+    assert_eq!(cell_text(1, 1), "B2");
+
+    // The heuristic region path agrees.
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(0, vec![[20.0, 30.0, 200.0, 740.0]])]).unwrap();
+    let region = &results[0].regions[0];
+    assert!(!region.needs_ocr, "expected a table, got needs_ocr");
+    for tok in ["A1", "B1", "A2", "B2"] {
+        assert!(
+            region.text.contains(tok),
+            "expected {tok} in {}",
+            region.text
+        );
+    }
 }

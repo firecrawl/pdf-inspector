@@ -84,10 +84,21 @@ class PdfClassification:
     confidence: float
 
 class TextItem:
-    """A positioned text item extracted from a PDF."""
+    """A positioned text item extracted from a PDF.
+
+    ``x``/``y`` are PDF points relative to the page's visible page box
+    (``CropBox ∩ MediaBox``, else the MediaBox), origin at the box's lower-left
+    corner with ``y`` growing upward — a rendered page image's frame once its
+    top-left ``y`` is flipped by the box height, and the frame
+    :func:`extract_text_in_regions` reads its regions in. ``/Rotate`` is not
+    applied.
+    """
     text: str
     x: float
+    """Left edge, in PDF points from the visible page box's left edge."""
     y: float
+    """Baseline for text (rect bottom edge for image, link and form-field
+    items), in PDF points from the visible page box's bottom edge."""
     width: float
     height: float
     font: str
@@ -220,11 +231,26 @@ def extract_text_bytes(data: bytes) -> str:
     ...
 
 def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) -> list[TextItem]:
-    """Extract text with position information."""
+    """Extract text with position information.
+
+    ``x``/``y`` are PDF points relative to the page's visible page box
+    (``CropBox ∩ MediaBox``, else the MediaBox), origin at its lower-left
+    corner — the same frame :func:`extract_text_in_regions` reads regions in,
+    so an item's region is ``[x, h - y - height, x + width, h - y]`` for a
+    visible box of height ``h``.
+
+    Args:
+        path: Path to the PDF file.
+        pages: Optional list of 1-indexed pages (matching ``TextItem.page``).
+            When ``None`` (default), the whole document is returned.
+    """
     ...
 
 def extract_text_with_positions_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[TextItem]:
-    """Extract text with position information from bytes."""
+    """Extract text with position information from bytes.
+
+    See :func:`extract_text_with_positions` for the coordinate frame.
+    """
     ...
 
 def extract_structure_elements(path: str, pages: Optional[list[int]] = None) -> list[StructureElement]:
@@ -257,6 +283,9 @@ def extract_text_in_regions(
     Args:
         path: Path to the PDF file.
         page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
+            Coordinates are PDF points with top-left origin, relative to the
+            visible page box (``CropBox ∩ MediaBox``, else the MediaBox) — the
+            same frame :func:`extract_text_with_positions` reports items in.
     """
     ...
 
@@ -269,6 +298,7 @@ def extract_text_in_regions_bytes(
     Args:
         data: PDF file contents as bytes.
         page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
+            Coordinates: see :func:`extract_text_in_regions`.
     """
     ...
 

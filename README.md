@@ -145,7 +145,7 @@ pdf2md document.pdf
 # JSON output (for piping)
 pdf2md document.pdf --json
 
-# Positioned TextItem JSON, including is_underline metadata
+# Positioned TextItem JSON (coordinates relative to the visible page box), including is_underline metadata
 pdf2md document.pdf --items-json
 
 # Raw markdown only (no headers)

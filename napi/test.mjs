@@ -137,6 +137,36 @@ assert.equal(typeof regionResults[0].regions[0].text, 'string');
 assert.equal(typeof regionResults[0].regions[0].needsOcr, 'boolean');
 console.log('  extractTextInRegions: OK');
 
+// --- coordinate frame: positions and regions share the visible page box ---
+console.log('Testing visible page box coordinate frame...');
+// MediaBox [0 0 400 500], CropBox [50 60 350 460]; the glyph is written at
+// raw (120, 300), so a CropBox render puts it at (70, 240) from the box's
+// lower-left corner.
+const cropFixture = readFileSync('../tests/fixtures/cropbox_offset_origin.pdf');
+const cropItems = extractTextWithPositions(cropFixture);
+const glyph = cropItems.find(i => i.text.trim() === 'Visible glyph');
+assert.ok(glyph, 'fixture glyph should be extracted');
+assert.ok(Math.abs(glyph.x - 70) < 0.01, `glyph.x should be 70, got ${glyph.x}`);
+assert.ok(Math.abs(glyph.y - 240) < 0.01, `glyph.y should be 240, got ${glyph.y}`);
+// The region API reads the same frame: the glyph's own box in the visible
+// box's top-left space (300 x 400) yields exactly that line.
+const visibleHeight = 400;
+const glyphRegion = extractTextInRegions(cropFixture, [
+  {
+    page: 0,
+    regions: [[
+      glyph.x,
+      visibleHeight - glyph.y - glyph.height,
+      glyph.x + glyph.width,
+      visibleHeight - glyph.y,
+    ]],
+  },
+]);
+const glyphText = glyphRegion[0].regions[0].text;
+assert.ok(glyphText.includes('Visible glyph'), `region should hold the glyph, got ${glyphText}`);
+assert.ok(!glyphText.includes('Second line'), `region should not spill, got ${glyphText}`);
+console.log('  visible page box frame: OK');
+
 // --- detectVectorGridInRegion ---
 console.log('Testing detectVectorGridInRegion...');
 const vectorGrid = detectVectorGridInRegion(fixture, 0, [0, 0, 600, 800], 72);

@@ -93,14 +93,30 @@ pub struct PdfRect {
     pub page: u32,
 }
 
-/// A text item with position information
+/// A text item with position information.
+///
+/// # Coordinate frame
+///
+/// Items returned by the public position APIs (`extract_text_with_positions*`)
+/// are in PDF points relative to the page's **visible page box** —
+/// `CropBox ∩ MediaBox` when the page has a CropBox, else the MediaBox —
+/// with the box's lower-left corner as the origin and `y` growing upward.
+/// This is the frame a renderer's page image uses (after flipping `y` by the
+/// box height), and the frame the region APIs interpret their inputs in, so
+/// items and rendered regions can be intersected directly. Raw
+/// content-stream coordinates differ whenever the CropBox or MediaBox origin
+/// is not `(0, 0)`. `/Rotate` is not applied. Inside the markdown pipeline
+/// items stay in raw user space.
 #[derive(Debug, Clone)]
 pub struct TextItem {
     /// The text content
     pub text: String,
-    /// X position on page
+    /// X position of the item's left edge, in PDF points (see the
+    /// coordinate frame note on [`TextItem`])
     pub x: f32,
-    /// Y position on page (PDF coordinates, origin at bottom-left)
+    /// Baseline Y position for text — image, link and form-field items
+    /// carry their rect's bottom edge — in PDF points with `y` growing
+    /// upward (see the coordinate frame note on [`TextItem`])
     pub y: f32,
     /// Width of text
     pub width: f32,

@@ -77,7 +77,9 @@ else:
 # Plain text extraction
 text = pdf_inspector.extract_text("document.pdf")
 
-# Positioned text items with font info
+# Positioned text items with font info. x/y are PDF points relative to the
+# visible page box (CropBox ∩ MediaBox), origin at its lower-left corner — the
+# frame a rendered page image uses and extract_text_in_regions reads.
 items = pdf_inspector.extract_text_with_positions("document.pdf")
 for item in items[:5]:
     print(f"'{item.text}' at ({item.x:.0f}, {item.y:.0f}) size={item.font_size}")
@@ -129,9 +131,9 @@ headings = [
 | `classify_pdf_bytes(data)` | Lightweight classification from bytes |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_bytes(data)` | Plain text extraction from bytes |
-| `extract_text_with_positions(path, pages=None)` | Text with X/Y coords and font info |
+| `extract_text_with_positions(path, pages=None)` | Text with X/Y coords (visible-page-box frame) and font info |
 | `extract_text_with_positions_bytes(data, pages=None)` | Text with positions from bytes |
-| `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions |
+| `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions (top-left PDF points in the visible page box) |
 | `extract_text_in_regions_bytes(data, page_regions)` | Region extraction from bytes |
 | `extract_pages_markdown(path, pages=None)` | Per-page Markdown + layout metadata (all pages by default) |
 | `extract_pages_markdown_bytes(data, pages=None)` | Per-page Markdown from bytes |
@@ -208,8 +210,8 @@ class PdfClassification:             # classify_pdf
 
 class TextItem:                      # extract_text_with_positions
     text: str
-    x: float
-    y: float
+    x: float                         # PDF points from the visible page box's lower-left corner
+    y: float                         # (CropBox ∩ MediaBox, else MediaBox); y grows upward
     width: float
     height: float
     font: str

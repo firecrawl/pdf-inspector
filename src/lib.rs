@@ -1019,8 +1019,11 @@ fn non_placeholder_alnum(items: &[TextItem]) -> usize {
 ///
 /// * `buffer` — PDF file bytes
 /// * `page_regions` — list of `(page_number_0indexed, Vec<[x1, y1, x2, y2]>)`.
-///   Coordinates are in **PDF points** with **top-left origin** (matching typical
-///   layout model output after coordinate conversion).
+///   Coordinates are in **PDF points** with **top-left origin**, relative to
+///   the page's **visible page box** (`CropBox ∩ MediaBox`, else the
+///   MediaBox) — the frame of a rendered page image, and the frame
+///   [`extract_text_with_positions_mem`] reports items in (with `y` flipped
+///   by the box height). `/Rotate` is not applied.
 ///
 /// # Returns
 ///
@@ -1054,24 +1057,28 @@ pub fn extract_text_in_regions_mem(
             continue;
         }
 
-        // Get page height from MediaBox for coordinate flip
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        // Extract text items for this page. The Form XObject budget is shared
-        // with the invisible-layer retry below so one page cannot consume two
-        // full expansion budgets.
+        // Extract text items for this page in the visible-page-box frame;
+        // region bounds flip y with that box's height. The Form XObject
+        // budget is shared with the invisible-layer retry below so one page
+        // cannot consume two full expansion budgets.
         let mut form_budget = extractor::FormWalkBudget::new();
-        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
-                *page_num,
-                &font_cmaps,
-                false,
-                &mut style_cache,
-                &mut form_budget,
-            )?;
+        let extractor::PageBoxExtraction {
+            mut items,
+            has_gid_fonts: mut has_gid,
+            mut coords_rotated,
+            skipped_invisible,
+            page_box,
+            ..
+        } = extractor::extract_page_text_items_in_page_box(
+            &doc,
+            page_id,
+            *page_num,
+            &font_cmaps,
+            false,
+            &mut style_cache,
+            &mut form_budget,
+        )?;
+        page_heights.insert(*page_num, page_box.height());
         // OCR-layer fallback: scanned pages often carry their text as an
         // invisible (Tr 3) layer behind the page raster. The visible-only
         // pass sees nothing there but `[Image: ...]` placeholders, so every
@@ -1091,17 +1098,16 @@ pub fn extract_text_in_regions_mem(
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
         });
         if skipped_invisible && !has_visible_text {
-            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
-                extractor::content_stream::extract_page_text_items(
-                    &doc,
-                    page_id,
-                    *page_num,
-                    &font_cmaps,
-                    true,
-                    &mut style_cache,
-                    &mut form_budget,
-                )
-            {
+            if let Ok(invisible) = extractor::extract_page_text_items_in_page_box(
+                &doc,
+                page_id,
+                *page_num,
+                &font_cmaps,
+                true,
+                &mut style_cache,
+                &mut form_budget,
+            ) {
+                let inv_items = invisible.items;
                 let inv_alnum = non_placeholder_alnum(&inv_items);
                 // Judge the WHOLE recovered layer, not a prefix — a broken
                 // OCR layer can hide its garbage past any fixed sample size
@@ -1113,8 +1119,8 @@ pub fn extract_text_in_regions_mem(
                     .collect();
                 if inv_alnum >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample) {
                     items = inv_items;
-                    has_gid = inv_gid;
-                    coords_rotated = inv_rotated;
+                    has_gid = invisible.has_gid_fonts;
+                    coords_rotated = invisible.coords_rotated;
                 }
             }
         }
@@ -1242,6 +1248,7 @@ pub fn extract_text_in_regions_mem(
 ///
 /// Similar to [`extract_text_in_regions_mem`] but runs table detection on items
 /// within each region and returns markdown pipe-tables instead of flat text.
+/// Regions use the same visible-page-box coordinate frame.
 ///
 /// When table structure is detected, `text` contains a markdown pipe-table and
 /// `needs_ocr` is `false`. When no table is found (too few items, poor alignment,
@@ -1271,19 +1278,24 @@ pub fn extract_tables_in_regions_mem(
         if !needed_pages.contains(page_num) {
             continue;
         }
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
-                *page_num,
-                &font_cmaps,
-                false,
-                &mut style_cache,
-                &mut extractor::FormWalkBudget::new(),
-            )?;
+        let extractor::PageBoxExtraction {
+            mut items,
+            rects,
+            lines,
+            has_gid_fonts: has_gid,
+            coords_rotated,
+            page_box,
+            ..
+        } = extractor::extract_page_text_items_in_page_box(
+            &doc,
+            page_id,
+            *page_num,
+            &font_cmaps,
+            false,
+            &mut style_cache,
+            &mut extractor::FormWalkBudget::new(),
+        )?;
+        page_heights.insert(*page_num, page_box.height());
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -1568,6 +1580,10 @@ enum VectorGridSource {
 /// The returned shape intentionally matches [`TsrTableInput`]'s structure
 /// fields so callers can hand it to `extract_tables_with_structure_*` and let
 /// the existing PDF-text cell fill path populate contents.
+///
+/// `region_pdf_pt_bbox` is `[x1, y1, x2, y2]` in PDF points, top-left origin,
+/// relative to the visible page box (see [`extract_text_in_regions_mem`]).
+/// The returned cell bboxes are crop-image pixels.
 pub fn detect_vector_grid_in_region_mem(
     buffer: &[u8],
     page_idx: u32,
@@ -1585,17 +1601,23 @@ pub fn detect_vector_grid_in_region_mem(
 
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
-    let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible) =
-        extractor::content_stream::extract_page_text_items(
-            &doc,
-            page_id,
-            page_1idx,
-            &font_cmaps,
-            false,
-            &mut extractor::FontStyleCache::new(),
-            &mut extractor::FormWalkBudget::new(),
-        )?;
+    let extractor::PageBoxExtraction {
+        mut items,
+        rects,
+        lines,
+        coords_rotated,
+        page_box,
+        ..
+    } = extractor::extract_page_text_items_in_page_box(
+        &doc,
+        page_id,
+        page_1idx,
+        &font_cmaps,
+        false,
+        &mut extractor::FontStyleCache::new(),
+        &mut extractor::FormWalkBudget::new(),
+    )?;
+    let page_h = page_box.height();
     text_utils::fix_letterspaced_items(&mut items);
 
     let coords = if coords_rotated {
@@ -2501,7 +2523,8 @@ pub struct TsrTableInput {
     /// 0-indexed page number where the crop was taken from.
     pub page: u32,
     /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
-    /// **top-left origin** (matches the layout model's coordinate space).
+    /// **top-left origin**, relative to the visible page box — the frame of
+    /// a rendered page image (see [`extract_text_in_regions_mem`]).
     pub crop_pdf_pt_bbox: [f32; 4],
     /// DPI the crop image was rendered at (e.g. `200.0`). Used to convert
     /// cell bboxes from image-pixels back to PDF points.
@@ -2560,19 +2583,21 @@ pub fn extract_tables_with_structure_cells_mem(
         if !needed_pages.contains(page_num) {
             continue;
         }
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
-                *page_num,
-                &font_cmaps,
-                false,
-                &mut style_cache,
-                &mut extractor::FormWalkBudget::new(),
-            )?;
+        let extractor::PageBoxExtraction {
+            mut items,
+            coords_rotated,
+            page_box,
+            ..
+        } = extractor::extract_page_text_items_in_page_box(
+            &doc,
+            page_id,
+            *page_num,
+            &font_cmaps,
+            false,
+            &mut style_cache,
+            &mut extractor::FormWalkBudget::new(),
+        )?;
+        page_heights.insert(*page_num, page_box.height());
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -3362,20 +3387,24 @@ fn detect_tsr_quality_issue(
     let Some(&page_id) = pages.get(&page_1idx) else {
         return Ok(None);
     };
-    let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
-        extractor::content_stream::extract_page_text_items(
-            &doc,
-            page_id,
-            page_1idx,
-            &font_cmaps,
-            false,
-            &mut extractor::FontStyleCache::new(),
-            &mut extractor::FormWalkBudget::new(),
-        )?;
+    let extractor::PageBoxExtraction {
+        mut items,
+        coords_rotated,
+        page_box,
+        ..
+    } = extractor::extract_page_text_items_in_page_box(
+        &doc,
+        page_id,
+        page_1idx,
+        &font_cmaps,
+        false,
+        &mut extractor::FontStyleCache::new(),
+        &mut extractor::FormWalkBudget::new(),
+    )?;
+    let page_h = page_box.height();
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {
         RegionCoordSpace::Rotated90Ccw
@@ -3547,39 +3576,6 @@ pub fn extract_tables_with_structure_auto_mem(
     Ok(results)
 }
 
-/// Get page height in points from MediaBox.
-fn get_page_height(doc: &Document, page_id: lopdf::ObjectId) -> Option<f32> {
-    let page_dict = doc.get_dictionary(page_id).ok()?;
-    // Try MediaBox directly, then follow reference
-    let media_box = page_dict.get(b"MediaBox").ok()?;
-    let arr = match media_box {
-        lopdf::Object::Array(a) => a,
-        lopdf::Object::Reference(r) => {
-            if let Ok(lopdf::Object::Array(a)) = doc.get_object(*r) {
-                a
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    };
-    if arr.len() >= 4 {
-        let y1 = obj_to_f32(&arr[1])?;
-        let y2 = obj_to_f32(&arr[3])?;
-        Some((y2 - y1).abs())
-    } else {
-        None
-    }
-}
-
-fn obj_to_f32(obj: &lopdf::Object) -> Option<f32> {
-    match obj {
-        lopdf::Object::Integer(i) => Some(*i as f32),
-        lopdf::Object::Real(f) => Some(*f),
-        _ => None,
-    }
-}
-
 #[derive(Clone, Copy)]
 enum RegionCoordSpace {
     Standard,
@@ -3596,6 +3592,9 @@ struct RegionBounds {
 
 /// Collect text items that fall within a region bbox (top-left origin, PDF points)
 /// and return them as a single string in reading order.
+///
+/// `page_height` is the height of the frame the items live in — the visible
+/// page box height for items from [`extract_text_with_positions_mem`].
 pub fn collect_text_in_region(
     items: &[TextItem],
     rx1: f32,
@@ -3713,6 +3712,9 @@ fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
     }
 }
 
+/// Convert a top-left-origin region into bounds in the item frame.
+/// `page_height` is the visible page box height: items were shifted into
+/// that box, so flipping `y` by its height lands regions on them.
 fn region_bounds(
     rx1: f32,
     ry1: f32,
