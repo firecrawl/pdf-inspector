@@ -118,10 +118,11 @@ pub(crate) struct RunGeometry {
 /// with a y-flipped text matrix so the glyphs come out upright, so their
 /// box belongs above the baseline although the matrix says otherwise.
 ///
-/// An unknown advance contributes no extent, so a horizontal run keeps
-/// `width == 0` as the "unknown" signal `effective_width` relies on, while a
-/// vertical run still reports its em width (and `height == 0`, which
-/// `effective_height` estimates).
+/// An unknown advance contributes no extent: the box is then exactly one em
+/// turned by the baseline angle, which `text_utils::effective_width` and
+/// `effective_height` recognise as "advance unknown" and replace with an
+/// estimate along the run — whatever the angle, so a width-less oblique run
+/// is not shrunk to its em either.
 pub(crate) fn run_geometry(
     combined: &[f32; 6],
     advance_ts: Option<f32>,

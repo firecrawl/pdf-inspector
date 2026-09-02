@@ -627,38 +627,55 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
     base_size * scale
 }
 
-/// The item's horizontal extent, estimating it only when the geometry is
-/// genuinely unknown.
-///
-/// `width == 0` means the font carried no width information, so the run's
-/// advance — and with it a horizontal run's x-extent — is unknown and gets
-/// the character-count estimate. A rotated run's x-extent is its em box,
-/// stamped at extraction time whether or not the advance is known, so the
-/// estimate never applies to it: fabricating `chars × 0.5em` for a vertical
-/// stamp used to produce a page-wide phantom horizontal line that spanned
-/// columns and stole region assignments from the body text.
+/// A run whose font carried no width information has an unknown advance.
+/// `run_geometry` then spans its box from the em vector alone, so the box is
+/// exactly one em turned by `rotation` — `em·|sin θ|` wide, `em·|cos θ|`
+/// tall — and says nothing about the run's length: horizontal and vertical
+/// runs collapse to a zero width or height, oblique runs to an em-sized
+/// diamond. Recognised from the box itself, so the item model needs no
+/// extra flag; a known advance, however short, makes the box larger.
+/// Returns `(|sin θ|, |cos θ|)` for such a box.
+fn unknown_advance_box(item: &TextItem) -> Option<(f32, f32)> {
+    let (sin, cos) = item.rotation.to_radians().sin_cos();
+    let (sin, cos) = (sin.abs(), cos.abs());
+    let em = item.font_size;
+    let tolerance = 1e-3 * em.max(1.0);
+    let degenerate =
+        (item.width - em * sin).abs() <= tolerance && (item.height - em * cos).abs() <= tolerance;
+    degenerate.then_some((sin, cos))
+}
+
+/// Advance estimate for a run without font widths: half an em per glyph.
+fn estimated_advance(item: &TextItem) -> f32 {
+    item.text.chars().count() as f32 * item.font_size * 0.5
+}
+
+/// The item's horizontal extent, estimating it only when the advance is
+/// genuinely unknown (see `unknown_advance_box`): the estimated advance is
+/// projected onto x and the em box added, so a vertical stamp never turns
+/// into a page-wide phantom line and an oblique run is not shrunk to its em.
 pub(crate) fn effective_width(item: &TextItem) -> f32 {
-    if item.width > 0.0 {
-        item.width
-    } else if item.is_horizontal() {
-        item.text.chars().count() as f32 * item.font_size * 0.5
-    } else {
-        item.font_size
+    match unknown_advance_box(item) {
+        Some((sin, cos)) => estimated_advance(item) * cos + item.font_size * sin,
+        // Boxes not shaped by `run_geometry` (synthetic or legacy items)
+        // keep the plain zero-extent fallbacks.
+        None if item.width > 0.0 => item.width,
+        None if item.is_horizontal() => estimated_advance(item),
+        None => item.font_size,
     }
 }
 
-/// The item's vertical extent, estimating it only when the geometry is
-/// genuinely unknown — the counterpart of `effective_width` for rotated
-/// runs. A vertical run whose font carries no width information has an
-/// unknown advance and therefore `height == 0`; left at zero it could never
-/// overlap a region and would silently vanish from region extraction.
+/// The item's vertical extent, estimating it only when the advance is
+/// genuinely unknown (see `unknown_advance_box`) — the counterpart of
+/// `effective_width`. Left at its zero or em-sized box, a width-less rotated
+/// run could never overlap a region and would silently vanish from region
+/// extraction.
 pub(crate) fn effective_height(item: &TextItem) -> f32 {
-    if item.height > 0.0 {
-        item.height
-    } else if item.is_horizontal() {
-        item.font_size
-    } else {
-        item.text.chars().count() as f32 * item.font_size * 0.5
+    match unknown_advance_box(item) {
+        Some((sin, cos)) => estimated_advance(item) * sin + item.font_size * cos,
+        None if item.height > 0.0 => item.height,
+        None if item.is_horizontal() => item.font_size,
+        None => estimated_advance(item),
     }
 }
 
@@ -1918,6 +1935,27 @@ mod tests {
         let mut horizontal = geometry_item(0.0, 10.0, 0.0);
         horizontal.height = 0.0;
         assert_eq!(effective_height(&horizontal), 10.0);
+    }
+
+    #[test]
+    fn oblique_runs_without_font_widths_get_an_advance_estimate_too() {
+        // A 45° run whose font has no widths: `run_geometry` left exactly the
+        // turned em box (7.07 × 7.07 for a 10pt em). "abcd" estimates a 20pt
+        // advance, so both extents grow to 20·cos45 + 10·sin45.
+        let em_side = 10.0 * 45.0_f32.to_radians().sin();
+        let mut diagonal = geometry_item(em_side, 10.0, 45.0);
+        diagonal.height = em_side;
+        let expected = 20.0 * 45.0_f32.to_radians().cos() + em_side;
+        assert!((effective_width(&diagonal) - expected).abs() < 1e-3);
+        assert!((effective_height(&diagonal) - expected).abs() < 1e-3);
+        // The same run with a known advance keeps its box.
+        let mut known = geometry_item(30.0, 10.0, 45.0);
+        known.height = 25.0;
+        assert_eq!(effective_width(&known), 30.0);
+        assert_eq!(effective_height(&known), 25.0);
+        // A tiny but real horizontal advance is not "unknown".
+        let thin = geometry_item(0.4, 10.0, 0.0);
+        assert_eq!(effective_width(&thin), 0.4);
     }
 
     #[test]
