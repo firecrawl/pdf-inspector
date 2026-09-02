@@ -105,14 +105,16 @@ class TestProcessPdfWithOcr:
         assert "OcrPdfResult" in repr(result)
 
     def test_password_opens_encrypted_fixture(self):
+        filename = "encrypted-secret123.pdf"
+        password = ENCRYPTED_FIXTURE_PASSWORDS[filename]
         result = pdf_inspector.process_pdf_with_ocr(
-            fixture_path("encrypted-secret123.pdf"), mode="off", password="secret123"
+            fixture_path(filename), mode="off", password=password
         )
         assert result.page_count > 0
         assert "Procurement" in result.markdown
 
         result = pdf_inspector.process_pdf_with_ocr_bytes(
-            fixture_bytes("encrypted-secret123.pdf"), mode="off", password="secret123"
+            fixture_bytes(filename), mode="off", password=password
         )
         assert "Procurement" in result.markdown
 
