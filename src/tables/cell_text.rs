@@ -82,49 +82,106 @@ pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
     result
 }
 
+/// One piece of a cell string: plain text, or the content of a
+/// `<sup>…</sup>` / `<sub>…</sub>` span.
+enum Segment<'a> {
+    Text(&'a str),
+    Span(&'a str),
+}
+
+/// Split cell text at exact `<sup>`/`<sub>` openers (literal text such as
+/// "<sum>" is never a span). An unmatched opener is dropped and the text after
+/// it kept.
+fn script_segments(text: &str) -> Vec<Segment<'_>> {
+    let mut segments = Vec::new();
+    let mut rest = text;
+    loop {
+        let (open, tag, close) = match (rest.find("<sup>"), rest.find("<sub>")) {
+            (Some(a), Some(b)) if a <= b => (a, "<sup>", "</sup>"),
+            (Some(a), None) => (a, "<sup>", "</sup>"),
+            (_, Some(b)) => (b, "<sub>", "</sub>"),
+            (None, None) => break,
+        };
+        if open > 0 {
+            segments.push(Segment::Text(&rest[..open]));
+        }
+        let body = &rest[open + tag.len()..];
+        match body.find(close) {
+            Some(i) => {
+                segments.push(Segment::Span(&body[..i]));
+                rest = &body[i + close.len()..];
+            }
+            None => rest = body,
+        }
+    }
+    if !rest.is_empty() {
+        segments.push(Segment::Text(rest));
+    }
+    segments
+}
+
+/// Footnote/annotation marker content: digits, brackets and marker symbols
+/// ("1)", "(5)", "*", "†"). Letters ("f", "subc", "i") are label content.
+fn is_marker_content(content: &str) -> bool {
+    let t = content.trim();
+    !t.is_empty()
+        && t.chars().all(|c| {
+            c.is_numeric()
+                || matches!(
+                    c,
+                    '(' | ')' | '[' | ']' | '*' | '†' | '‡' | '§' | '¶' | ',' | ' '
+                )
+        })
+}
+
+fn has_script_markup(text: &str) -> bool {
+    text.contains("<sup>") || text.contains("<sub>")
+}
+
 /// Cell text with the `<sup>`/`<sub>` tags removed but their content kept,
 /// for length-based heuristics: `IV<sub>subc</sub>` measures as `IVsubc`.
 pub(crate) fn strip_script_markup(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains("<su") {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    std::borrow::Cow::Owned(
-        text.replace("<sup>", "")
-            .replace("</sup>", "")
-            .replace("<sub>", "")
-            .replace("</sub>", ""),
-    )
-}
-
-/// Cell text with `<sup>…</sup>` / `<sub>…</sub>` spans removed — tags AND
-/// their content — for heuristics that classify a cell by its characters
-/// (page-number cells, numeric data rows). A marker is an annotation on the
-/// cell, not part of its value: `12<sup>1)</sup>` is the page number 12,
-/// while `x<sub>i</sub>` must not become the roman numeral `xi`.
-pub(crate) fn strip_script_spans(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains("<su") {
+    if !has_script_markup(text) {
         return std::borrow::Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(open) = rest.find("<su") {
-        out.push_str(&rest[..open]);
-        let after = &rest[open..];
-        let tag_end = after.find('>').map(|i| i + 1).unwrap_or(after.len());
-        let tag = &after[..tag_end];
-        let close = match tag {
-            "<sup>" => Some("</sup>"),
-            "<sub>" => Some("</sub>"),
-            _ => None,
-        };
-        let body = &after[tag_end..];
-        rest = match close.and_then(|c| body.find(c).map(|i| i + c.len())) {
-            Some(skip) => &body[skip..],
-            None => body,
-        };
+    for segment in script_segments(text) {
+        match segment {
+            Segment::Text(t) | Segment::Span(t) => out.push_str(t),
+        }
     }
-    out.push_str(rest);
     std::borrow::Cow::Owned(out)
+}
+
+/// Cell text for value classification: footnote-marker spans
+/// (`<sup>1)</sup>`, `<sup>*</sup>`) removed entirely — a marker is an
+/// annotation on the cell, not part of its value, so `12<sup>1)</sup>` is
+/// the number 12 — while letter spans keep their content (`V<sub>f</sub>` →
+/// `Vf`), so a label never collapses onto a shorter token such as the roman
+/// numeral `V`.
+pub(crate) fn strip_marker_spans(text: &str) -> std::borrow::Cow<'_, str> {
+    if !has_script_markup(text) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for segment in script_segments(text) {
+        match segment {
+            Segment::Text(t) => out.push_str(t),
+            Segment::Span(t) if !is_marker_content(t) => out.push_str(t),
+            Segment::Span(_) => {}
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether the cell carries a script span with letter content — a label
+/// like `V<sub>f</sub>` or `x<sub>i</sub>`, which is never a page number
+/// however its letters read as roman numerals.
+pub(crate) fn has_letter_script_span(text: &str) -> bool {
+    has_script_markup(text)
+        && script_segments(text)
+            .iter()
+            .any(|segment| matches!(segment, Segment::Span(t) if !is_marker_content(t)))
 }
 
 /// Append one item to a cell that is being built incrementally (row/column
@@ -347,18 +404,31 @@ mod tests {
     fn strip_script_markup_removes_only_the_tags() {
         assert_eq!(strip_script_markup("IV<sub>subc</sub>"), "IVsubc");
         assert_eq!(strip_script_markup("12<sup>1)</sup>"), "121)");
+        assert_eq!(strip_script_markup("a <sum> b"), "a <sum> b");
     }
 
     #[test]
-    fn strip_script_spans_drops_markers_with_their_content() {
-        assert_eq!(strip_script_spans("12<sup>1)</sup>"), "12");
-        assert_eq!(strip_script_spans("x<sub>i</sub>"), "x");
-        assert_eq!(strip_script_spans("V<sub>f</sub> m/s"), "V m/s");
-        assert_eq!(strip_script_spans("a<sup>1</sup>b<sub>2</sub>c"), "abc");
+    fn strip_marker_spans_drops_markers_but_keeps_letter_content() {
+        assert_eq!(strip_marker_spans("12<sup>1)</sup>"), "12");
+        assert_eq!(strip_marker_spans("Total<sup>*</sup>"), "Total");
+        assert_eq!(strip_marker_spans("x<sub>i</sub>"), "xi");
+        assert_eq!(strip_marker_spans("V<sub>f</sub> m/s"), "Vf m/s");
+        assert_eq!(strip_marker_spans("a<sup>1</sup>b<sub>2</sub>c"), "abc");
+        // Literal text is never a span; an unmatched opener drops only itself.
+        assert_eq!(strip_marker_spans("a <sum> b<sup>1</sup>"), "a <sum> b");
+        assert_eq!(strip_marker_spans("odd <sup>1"), "odd 1");
         assert!(matches!(
-            strip_script_spans("plain"),
+            strip_marker_spans("plain"),
             std::borrow::Cow::Borrowed("plain")
         ));
+    }
+
+    #[test]
+    fn letter_script_spans_are_labels() {
+        assert!(has_letter_script_span("V<sub>f</sub>"));
+        assert!(has_letter_script_span("x<sub>i</sub>"));
+        assert!(!has_letter_script_span("12<sup>1)</sup>"));
+        assert!(!has_letter_script_span("plain 12"));
     }
 
     #[test]

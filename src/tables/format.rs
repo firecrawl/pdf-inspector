@@ -154,7 +154,13 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
 ///   - dashed section-page IDs: "5-21", "A-1", "B--3", "TC-2" (common in
 ///     technical manuals)
 fn is_page_number_cell(cell: &str) -> bool {
-    let cell = super::cell_text::strip_script_spans(cell);
+    // A label carrying a letter subscript/superscript (`V<sub>f</sub>`,
+    // `x<sub>i</sub>`) is never a page number, whatever its letters spell
+    // as roman numerals; footnote markers on a real page number are dropped.
+    if super::cell_text::has_letter_script_span(cell) {
+        return false;
+    }
+    let cell = super::cell_text::strip_marker_spans(cell);
     let tokens: Vec<&str> = cell.split_whitespace().collect();
     if tokens.is_empty() {
         return false;
@@ -343,7 +349,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let numeric_cells = non_first_cells
             .iter()
             .filter(|c| {
-                let value = super::cell_text::strip_script_spans(c);
+                let value = super::cell_text::strip_marker_spans(c);
                 value.trim().is_empty()
                     || value.chars().all(|ch| {
                         ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
@@ -1056,5 +1062,13 @@ mod tests {
         );
         assert!(md.contains("4.3 Case studies and targeted evaluations\t86"));
         assert!(md.contains("4.5 White-box analyses\t113"));
+    }
+
+    #[test]
+    fn scripted_labels_are_not_page_numbers() {
+        assert!(!is_page_number_cell("V<sub>f</sub>"));
+        assert!(!is_page_number_cell("x<sub>i</sub>"));
+        assert!(is_page_number_cell("12<sup>1)</sup>"));
+        assert!(is_page_number_cell("xi"));
     }
 }

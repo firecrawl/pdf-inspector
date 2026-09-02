@@ -363,11 +363,11 @@ impl TextLine {
             };
             // A run's own decoration is emitted around the run itself and
             // closed right after it, so it never leaks onto the next run.
-            let own_script_tag = if !is_script || current_strikeout || current_underline {
+            let own_script_tag = if !is_script {
                 None
-            } else if own_strikeout {
+            } else if own_strikeout && !current_strikeout {
                 Some("s")
-            } else if own_underline {
+            } else if own_underline && !current_underline && !current_strikeout {
                 Some("u")
             } else {
                 None
@@ -713,6 +713,21 @@ mod formatting_tests {
         assert_eq!(
             line.text_with_formatting(false, false, true),
             "word<u><sup>1</sup></u> <sup>2</sup>"
+        );
+    }
+
+    #[test]
+    fn own_decoration_nests_inside_an_open_body_decoration() {
+        // Underlined body text with a struck footnote marker: the strike
+        // nests inside the underline instead of being dropped.
+        let mut word = body("word", 10.0, 48.0);
+        word.is_underline = true;
+        let mut marker = script("1", 58.0, 4.0, 4.3);
+        marker.is_strikeout = true;
+        let line = line(vec![word, marker]);
+        assert_eq!(
+            line.text_with_formatting(false, false, true),
+            "<u>word<s><sup>1</sup></s></u>"
         );
     }
 
