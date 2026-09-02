@@ -629,20 +629,26 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
 
 /// A run whose font carried no width information has an unknown advance.
 /// `run_geometry` then spans its box from the em vector alone, so the box is
-/// exactly one em turned by `rotation` — `em·|sin θ|` wide, `em·|cos θ|`
-/// tall — and says nothing about the run's length: horizontal and vertical
-/// runs collapse to a zero width or height, oblique runs to an em-sized
-/// diamond. Recognised from the box itself, so the item model needs no
-/// extra flag; a known advance, however short, makes the box larger.
-/// Returns `(|sin θ|, |cos θ|)` for such a box.
-fn unknown_advance_box(item: &TextItem) -> Option<(f32, f32)> {
+/// exactly one perpendicular em turned by `rotation`: `em·|sin θ|` wide,
+/// `em·|cos θ|` tall, and silent about the run's length — horizontal and
+/// vertical runs collapse to a zero width or height, oblique runs to an
+/// em-sized diamond. Recognised from the box itself, so the item model
+/// needs no extra flag: the box is proportional to `(|sin θ|, |cos θ|)`,
+/// and its diagonal *is* the perpendicular em, which the matrix may have
+/// shrunk below `font_size` (anisotropic or sheared text) but can never
+/// stretch above it. A known advance, however short, breaks the proportion
+/// except at exactly 45°, where it pushes the diagonal past `font_size`
+/// instead. Returns `(|sin θ|, |cos θ|, perpendicular em)` for such a box.
+fn unknown_advance_box(item: &TextItem) -> Option<(f32, f32, f32)> {
     let (sin, cos) = item.rotation.to_radians().sin_cos();
     let (sin, cos) = (sin.abs(), cos.abs());
-    let em = item.font_size;
+    let em = item.width.hypot(item.height);
     let tolerance = 1e-3 * em.max(1.0);
-    let degenerate =
-        (item.width - em * sin).abs() <= tolerance && (item.height - em * cos).abs() <= tolerance;
-    degenerate.then_some((sin, cos))
+    let proportional = (item.width * cos - item.height * sin).abs() <= tolerance;
+    // A collapsed box (no em at all) never comes from `run_geometry`; leave
+    // it to the plain zero-extent fallbacks.
+    let em_fits = em > 0.0 && em <= item.font_size * 1.001 + 1e-3;
+    (proportional && em_fits).then_some((sin, cos, em))
 }
 
 /// Advance estimate for a run without font widths: half an em per glyph.
@@ -656,7 +662,7 @@ fn estimated_advance(item: &TextItem) -> f32 {
 /// into a page-wide phantom line and an oblique run is not shrunk to its em.
 pub(crate) fn effective_width(item: &TextItem) -> f32 {
     match unknown_advance_box(item) {
-        Some((sin, cos)) => estimated_advance(item) * cos + item.font_size * sin,
+        Some((sin, cos, em)) => estimated_advance(item) * cos + em * sin,
         // Boxes not shaped by `run_geometry` (synthetic or legacy items)
         // keep the plain zero-extent fallbacks.
         None if item.width > 0.0 => item.width,
@@ -672,7 +678,7 @@ pub(crate) fn effective_width(item: &TextItem) -> f32 {
 /// extraction.
 pub(crate) fn effective_height(item: &TextItem) -> f32 {
     match unknown_advance_box(item) {
-        Some((sin, cos)) => estimated_advance(item) * sin + item.font_size * cos,
+        Some((sin, cos, em)) => estimated_advance(item) * sin + em * cos,
         None if item.height > 0.0 => item.height,
         None if item.is_horizontal() => item.font_size,
         None => estimated_advance(item),
@@ -1956,6 +1962,30 @@ mod tests {
         // A tiny but real horizontal advance is not "unknown".
         let thin = geometry_item(0.4, 10.0, 0.0);
         assert_eq!(effective_width(&thin), 0.4);
+        // A real 45° run whose box happens to be square is not "unknown"
+        // either: its diagonal exceeds the em.
+        let mut square = geometry_item(30.0, 10.0, 45.0);
+        square.height = 30.0;
+        assert_eq!(
+            (effective_width(&square), effective_height(&square)),
+            (30.0, 30.0)
+        );
+    }
+
+    #[test]
+    fn anisotropic_width_less_oblique_runs_are_recognised_from_their_box() {
+        // `[2 0 0 1]`-style text turned 30°: `font_size` reports the larger
+        // scale (24) while the perpendicular em is 12, so the no-advance box
+        // is 12·(sin30, cos30) = (6, 10.39). A `font_size` comparison misses
+        // it; the box's own diagonal is the em.
+        let (sin, cos) = 30.0_f32.to_radians().sin_cos();
+        let mut stretched = geometry_item(12.0 * sin, 24.0, 30.0);
+        stretched.height = 12.0 * cos;
+        let advance = 4.0 * 0.5 * 24.0;
+        let expected_w = advance * cos + 12.0 * sin;
+        let expected_h = advance * sin + 12.0 * cos;
+        assert!((effective_width(&stretched) - expected_w).abs() < 1e-3);
+        assert!((effective_height(&stretched) - expected_h).abs() < 1e-3);
     }
 
     #[test]
