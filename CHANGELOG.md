@@ -82,9 +82,9 @@ version and date. Earlier releases are described in their
   and the text cursor moves by the same estimate, so the runs that follow it
   no longer pile up on one origin.
 - A reflected text matrix has no rotation — its reading direction and its
-  glyphs' orientation differ by a half turn — so such a run reports the more
-  upright of the two: `0` for the mirrored-x matrix some producers paint
-  right-to-left text with, which then merges, groups into lines, and carries
+  glyphs' orientation differ by a half turn — so such a run reports how its glyphs
+  stand: `0` for the mirrored-x matrix some producers paint right-to-left
+  text with, which then merges, groups into lines, and carries
   decorations like the upright run it looks like. A negative `Tf` size turns
   a run around and reads as `180`; upside-down runs group into lines by the
   baseline they hang from (`TextItem::baseline_y()`).

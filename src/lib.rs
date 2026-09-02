@@ -2758,10 +2758,11 @@ pub fn extract_tables_with_structure_cells_mem(
 /// distribute the words to whichever cells their estimated centers fall
 /// into.
 ///
-/// The character-width estimate is `item.width / char_count`; a run whose
-/// box has no width (a genuine zero advance) is spread over half an em per
-/// character for the interpolation only, so its tokens still land in
-/// different cells. Either way the estimate is uniform across the item —
+/// The character-width estimate is `item.width / char_count`. A run with a
+/// known zero advance keeps all its tokens at its origin — that is where
+/// they were drawn; only a run whose advance is unknown (and somehow has no
+/// box) is spread over half an em per character for the interpolation. The
+/// estimate is uniform across the item —
 /// fine for routing, since we only need to know which cell each token's
 /// center lands in, not its exact position. Single-token items collapse to
 /// a one-element vector equivalent to the input item, making this a no-op
@@ -2778,7 +2779,7 @@ fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
     if !item.is_upright() {
         return vec![item.clone()];
     }
-    let item_w = if item.width > 0.0 {
+    let item_w = if item.width > 0.0 || item.advance_known {
         item.width
     } else {
         total_chars as f32 * item.font_size * 0.5
@@ -8018,14 +8019,19 @@ mod rotated_run_region_tests {
     }
 
     #[test]
-    fn token_splitting_spreads_a_zero_width_run() {
-        // A genuine zero advance leaves no box to interpolate along; the
-        // tokens are spread over half an em per character instead of all
-        // landing on the run's origin.
+    fn token_splitting_spreads_only_an_unknown_zero_width_run() {
+        // A known zero advance (an ActualText replacement that painted
+        // nothing) keeps its tokens where the run was drawn; a run whose
+        // advance is unknown is spread over half an em per character.
         let zero = item("two words", 72.0, 500.0, 0.0, 10.0, 0.0);
         let tokens = split_item_into_token_subitems(&zero);
         assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].x, 72.0);
+        assert_eq!((tokens[0].x, tokens[1].x), (72.0, 72.0));
+
+        let mut unknown = zero;
+        unknown.advance_known = false;
+        let tokens = split_item_into_token_subitems(&unknown);
+        assert_eq!(tokens.len(), 2);
         assert!(tokens[1].x > tokens[0].x + 15.0, "{tokens:?}");
     }
 }

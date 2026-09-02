@@ -126,11 +126,12 @@ pub struct TextItem {
     /// report exact multiples of 90; skewed matrices (deskewed OCR layers,
     /// diagonal watermarks) report fractional angles. A reflected text
     /// matrix has no rotation — its reading direction and its glyphs'
-    /// orientation differ by a half turn — and reports the more upright of
-    /// the two: `0` for the mirrored-x matrix some producers paint
-    /// right-to-left text with (upright glyphs). A negative `Tf` size turns
-    /// a run around and reads as `180`. `0` for items that don't come from a
-    /// text matrix (images, links, form fields, OCR).
+    /// orientation differ by a half turn — and reports how its glyphs
+    /// stand: `0` for the mirrored-x matrix some producers paint
+    /// right-to-left text with (upright glyphs reading left), `180` for a
+    /// y-flipped one. A negative `Tf` size turns a run around and reads as
+    /// `180`. `0` for items that don't come from a text matrix (images,
+    /// links, form fields, OCR).
     /// On a page whose text is predominantly rotated the extractor turns
     /// the coordinate frame so the dominant runs read as `0`; upright
     /// strays then report `270` on a counter-clockwise page and `90` on a
@@ -206,9 +207,13 @@ impl TextItem {
         self.baseline_y() - self.baseline_shift
     }
 
-    /// The baseline the glyphs sit on: `y` for upright text (the box's
-    /// bottom edge); an upside-down run hangs from its box's top edge,
-    /// `y + height`.
+    /// The y of the glyphs' baseline for a horizontal run: `y` (the box's
+    /// bottom edge) when they stand upright, `y + height` (the top edge)
+    /// when the run is upside-down — `rotation` says which, glyph
+    /// orientation included for reflected matrices. A vertical or oblique
+    /// run has no horizontal baseline; this returns its box bottom `y`,
+    /// which line grouping never compares for such runs (they keep to
+    /// themselves).
     pub fn baseline_y(&self) -> f32 {
         if self.is_upside_down() {
             self.y + self.height

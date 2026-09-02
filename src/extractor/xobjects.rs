@@ -743,7 +743,7 @@ fn extract_form_xobject_text_inner(
                             &combined,
                             advance_ts,
                             fallback_ts,
-                            rendered_size,
+                            rendered_size.copysign(current_font_size),
                             type3_y_flips.contains(&current_font),
                         );
                         // Without width metrics the cursor moves by the same
@@ -834,8 +834,9 @@ fn extract_form_xobject_text_inner(
                         };
                         let column_gap_threshold = space_threshold * 4.0;
 
-                        let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
+                        let mut sub_items: Vec<(String, f32, f32, f32)> = Vec::new();
                         let mut current_text = String::new();
+                        let mut current_estimate_ts: f32 = 0.0; // metric-less estimate of `current_text`
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         // Positive TJ offsets beyond a space width move the pen
@@ -864,6 +865,7 @@ fn extract_form_xobject_text_inner(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            std::mem::take(&mut current_estimate_ts),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -899,6 +901,7 @@ fn extract_form_xobject_text_inner(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            std::mem::take(&mut current_estimate_ts),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -929,7 +932,7 @@ fn extract_form_xobject_text_inner(
                             } else {
                                 // No width metrics: the cursor moves by the
                                 // estimate the sub-run's box will carry.
-                                total_width_ts += estimated_string_advance_ts(
+                                let element_estimate_ts = estimated_string_advance_ts(
                                     get_operand_bytes(element),
                                     None,
                                     current_font_size
@@ -937,6 +940,8 @@ fn extract_form_xobject_text_inner(
                                     char_spacing,
                                     word_spacing,
                                 );
+                                total_width_ts += element_estimate_ts;
+                                current_estimate_ts += element_estimate_ts;
                             }
                             if !hidden {
                                 if let Some(text) = extract_text_from_operand(
@@ -956,7 +961,12 @@ fn extract_form_xobject_text_inner(
                             }
                         }
                         if !hidden && !current_text.trim().is_empty() {
-                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                            sub_items.push((
+                                current_text,
+                                sub_start_width_ts,
+                                total_width_ts,
+                                current_estimate_ts,
+                            ));
                         }
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
@@ -980,7 +990,7 @@ fn extract_form_xobject_text_inner(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w) in &sub_items {
+                            for (text, start_w, end_w, estimate_ts) in &sub_items {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -995,9 +1005,13 @@ fn extract_form_xobject_text_inner(
                                     &combined_mat,
                                     font_info.map(|_| end_w - start_w),
                                     // Without metrics the accumulated width IS
-                                    // the sub-run's estimate, kerning included.
+                                    // the sub-run's estimate, kerning included;
+                                    // if kerning walked it back past zero, the
+                                    // painted codes' own estimate stands.
                                     if end_w - start_w > 0.0 {
                                         end_w - start_w
+                                    } else if *estimate_ts > 0.0 {
+                                        *estimate_ts
                                     } else {
                                         estimated_advance_ts(
                                             text,
@@ -1008,7 +1022,7 @@ fn extract_form_xobject_text_inner(
                                                     .unwrap_or(1.0),
                                         )
                                     },
-                                    rendered_size,
+                                    rendered_size.copysign(current_font_size),
                                     type3_y_flips.contains(&current_font),
                                 );
                                 if horizontal_advance

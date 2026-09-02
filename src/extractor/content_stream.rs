@@ -375,8 +375,9 @@ pub(crate) fn extract_page_text_items(
     let mut actual_text_glyph_rise: Option<f32> = None;
     let mut actual_text_glyph_font: Option<String> = None; // font that painted the span's first glyph
     let mut actual_text_glyphs_measured: bool = true; // every painted font had width metrics
-                                                      // Glyphs painted inside the current ActualText span: sizes the span's box
-                                                      // when its font has no width metrics.
+    let mut actual_text_estimate_ts: f32 = 0.0; // estimate accumulated per painted run, its own size and spacing
+                                                // Glyphs painted inside the current ActualText span: sizes the span's box
+                                                // when its font has no width metrics.
     let mut actual_text_glyph_count: usize = 0;
     /// Get the innermost MCID from the marked content stack.
     fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
@@ -566,6 +567,7 @@ pub(crate) fn extract_page_text_items(
                         }
                         actual_text_glyph_count += glyph_count;
                         actual_text_glyphs_measured &= w_ts_opt.is_some();
+                        actual_text_estimate_ts += estimate_ts;
                         let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
                         text_matrix[4] += cursor_ts * text_matrix[0];
                         text_matrix[5] += cursor_ts * text_matrix[1];
@@ -612,7 +614,7 @@ pub(crate) fn extract_page_text_items(
                             } else {
                                 estimated_advance_ts(&text, em_ts)
                             },
-                            rendered_size,
+                            rendered_size.copysign(current_font_size),
                             type3_y_flips.contains(&current_font),
                         );
                         let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
@@ -710,8 +712,9 @@ pub(crate) fn extract_page_text_items(
 
                         // Track sub-items for column-gap splitting:
                         // (text, start_width_ts, end_width_ts)
-                        let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
+                        let mut sub_items: Vec<(String, f32, f32, f32)> = Vec::new();
                         let mut current_text = String::new();
+                        let mut current_estimate_ts: f32 = 0.0; // metric-less estimate of `current_text`
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         // Positive TJ offsets beyond a space width move the pen
@@ -741,6 +744,7 @@ pub(crate) fn extract_page_text_items(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            std::mem::take(&mut current_estimate_ts),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -776,6 +780,7 @@ pub(crate) fn extract_page_text_items(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            std::mem::take(&mut current_estimate_ts),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -795,6 +800,16 @@ pub(crate) fn extract_page_text_items(
                             }
                             let element_glyphs =
                                 shown_glyph_count(get_operand_bytes(element), font_info);
+                            // The estimate this element would carry without
+                            // metrics: its own size, scale, and spacing.
+                            let element_estimate_ts = estimated_string_advance_ts(
+                                get_operand_bytes(element),
+                                font_info,
+                                current_font_size
+                                    * type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                char_spacing,
+                                word_spacing,
+                            );
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
                                     total_width_ts += compute_string_width_ts(
@@ -808,18 +823,13 @@ pub(crate) fn extract_page_text_items(
                             } else {
                                 // No width metrics: the cursor moves by the
                                 // estimate the sub-run's box will carry.
-                                total_width_ts += estimated_string_advance_ts(
-                                    get_operand_bytes(element),
-                                    None,
-                                    current_font_size
-                                        * type3_scales.get(&current_font).copied().unwrap_or(1.0),
-                                    char_spacing,
-                                    word_spacing,
-                                );
+                                total_width_ts += element_estimate_ts;
+                                current_estimate_ts += element_estimate_ts;
                             }
                             if suppress_glyph_extraction {
                                 actual_text_glyph_count += element_glyphs;
                                 actual_text_glyphs_measured &= font_info.is_some();
+                                actual_text_estimate_ts += element_estimate_ts;
                             }
                             if !is_invisible {
                                 if let Some(text) = extract_text_from_operand(
@@ -840,7 +850,12 @@ pub(crate) fn extract_page_text_items(
                         }
                         // Flush remaining text
                         if !is_invisible && !current_text.trim().is_empty() {
-                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                            sub_items.push((
+                                current_text,
+                                sub_start_width_ts,
+                                total_width_ts,
+                                current_estimate_ts,
+                            ));
                         }
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
@@ -865,7 +880,7 @@ pub(crate) fn extract_page_text_items(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w) in &sub_items {
+                            for (text, start_w, end_w, estimate_ts) in &sub_items {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -880,9 +895,13 @@ pub(crate) fn extract_page_text_items(
                                     &combined,
                                     font_info.map(|_| end_w - start_w),
                                     // Without metrics the accumulated width IS
-                                    // the sub-run's estimate, kerning included.
+                                    // the sub-run's estimate, kerning included;
+                                    // if kerning walked it back past zero, the
+                                    // painted codes' own estimate stands.
                                     if end_w - start_w > 0.0 {
                                         end_w - start_w
+                                    } else if *estimate_ts > 0.0 {
+                                        *estimate_ts
                                     } else {
                                         estimated_advance_ts(
                                             text,
@@ -893,7 +912,7 @@ pub(crate) fn extract_page_text_items(
                                                     .unwrap_or(1.0),
                                         )
                                     },
-                                    rendered_size,
+                                    rendered_size.copysign(current_font_size),
                                     type3_y_flips.contains(&current_font),
                                 );
                                 if horizontal_advance
@@ -966,6 +985,13 @@ pub(crate) fn extract_page_text_items(
                         font_widths.get(&current_font),
                     );
                     actual_text_glyphs_measured &= font_widths.contains_key(&current_font);
+                    actual_text_estimate_ts += estimated_string_advance_ts(
+                        op.operands.first().and_then(get_operand_bytes),
+                        font_widths.get(&current_font),
+                        current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                        char_spacing,
+                        word_spacing,
+                    );
                 }
                 // Advance width, as for Tj — without it the item stays
                 // zero-width and geometric underline/strikeout detection
@@ -1034,7 +1060,7 @@ pub(crate) fn extract_page_text_items(
                                 } else {
                                     estimated_advance_ts(&text, em_ts)
                                 },
-                                rendered_size,
+                                rendered_size.copysign(current_font_size),
                                 type3_y_flips.contains(&current_font),
                             );
                             let base_font = font_base_names
@@ -1202,6 +1228,7 @@ pub(crate) fn extract_page_text_items(
                     actual_text_glyph_rise = None;
                     actual_text_glyph_font = None;
                     actual_text_glyphs_measured = true;
+                    actual_text_estimate_ts = 0.0;
                     actual_text_glyph_count = 0;
                 }
                 marked_content_stack.push(MarkedContentEntry { actual_text, mcid });
@@ -1255,15 +1282,11 @@ pub(crate) fn extract_page_text_items(
                             let geometry = run_geometry(
                                 &combined,
                                 advance_ts,
-                                // Size the estimate from what was painted (with
-                                // the character spacing each code carried); the
+                                // Size the estimate from what was painted, each
+                                // run at its own size and spacing; the
                                 // replacement text is only what gets emitted.
-                                estimated_advance_for_glyphs(
-                                    actual_text_glyph_count,
-                                    current_font_size
-                                        * type3_scales.get(&paint_font).copied().unwrap_or(1.0),
-                                ) + actual_text_glyph_count as f32 * char_spacing,
-                                rendered_size,
+                                actual_text_estimate_ts,
+                                rendered_size.copysign(current_font_size),
                                 type3_y_flips.contains(&paint_font),
                             );
                             if !at.trim().is_empty() {
@@ -2474,6 +2497,25 @@ end"#;
     }
 
     #[test]
+    fn actual_text_span_estimate_follows_each_runs_size_and_spacing() {
+        // Two width-less runs inside one span at different sizes with `Tc`
+        // and `Tw` set: one code at 12pt (6 + 2), then a space and a code at
+        // 24pt (2 × (12 + 2) + one space × 5) — 8 + 33 = 41pt, not one size
+        // for all three codes.
+        let items = extract_hebrew_items(
+            b"BT /F1 12 Tf 2 Tc 5 Tw 100 700 Td /Span <</ActualText (AB C) >> BDC <41> Tj /F1 24 Tf <2042> Tj EMC ET",
+        );
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].text, "AB C");
+        assert!(!items[0].advance_known);
+        assert!(
+            (items[0].width - 41.0).abs() < 1e-3,
+            "width = {}",
+            items[0].width
+        );
+    }
+
+    #[test]
     fn actual_text_on_a_width_less_font_is_estimated_from_painted_glyphs() {
         // The text matrix never moves for a font without widths, so the
         // ActualText span's zero displacement must not pass for a genuine
@@ -2761,10 +2803,9 @@ BT /F1 12 Tf 72 672 Td (Body line three) Tj ET
     fn mirrored_text_matrix_keeps_glyphs_above_the_baseline() {
         // `[-1 0 0 1]`: the advance runs towards -x but the glyphs still
         // stand on the baseline. 3 glyphs × 7.2pt = 21.6pt, running left. A
-        // reflection has no rotation, so the run reports the more upright of
-        // its reading direction and its glyphs' orientation — here the
-        // glyphs — and merging, decoration, and line grouping treat it as
-        // the upright run it looks like.
+        // reflection has no rotation, so the run reports how its glyphs
+        // stand — upright — and merging, decoration, and line grouping treat
+        // it as the upright run it looks like.
         let items = upright_page_with("BT /F1 12 Tf -1 0 0 1 300 500 Tm (ABC) Tj ET");
         let abc = find_item(&items, "ABC");
         assert_close(abc.rotation, 0.0, "rotation");

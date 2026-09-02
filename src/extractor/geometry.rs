@@ -126,6 +126,7 @@ pub(crate) struct RunGeometry {
 /// laid along the baseline whichever way it runs, which a consumer adding an
 /// estimate on the +x side could not get right for runs reading towards -x —
 /// and `advance_known` records that the extent is an estimate.
+/// `em` is the rendered font size, negative when the `Tf` size was.
 pub(crate) fn run_geometry(
     combined: &[f32; 6],
     advance_ts: Option<f32>,
@@ -138,10 +139,13 @@ pub(crate) fn run_geometry(
         Some(advance) => (advance, true),
         None => (fallback_advance_ts, false),
     };
-    // A negative advance — a negative `Tf` size turns the glyph matrix
-    // around — reads the run backwards: its direction and the side its
-    // glyphs stand on both flip.
-    let reversed = advance < 0.0;
+    // A negative `em` is the caller saying the `Tf` size was negative: that
+    // turns the glyph matrix around, so the run reads backwards and its
+    // glyphs stand on the other side. A negative *advance* alone (tight
+    // character spacing, TJ positioning) only moves the cursor backwards
+    // over upright glyphs and changes neither.
+    let reversed = em < 0.0;
+    let em = em.abs();
     let (ax, ay) = (advance * combined[0], advance * combined[1]);
     let axis_len = combined[0].hypot(combined[1]);
     let (ux, uy) = if axis_len > f32::EPSILON {
@@ -176,14 +180,13 @@ pub(crate) fn run_geometry(
             },
         )
     };
-    // The reading direction. A reflected matrix (negative determinant) has
-    // no rotation: its reading direction and its glyphs' orientation differ
-    // by a half turn. Such a run reports whichever of the two is the more
-    // upright — the pipeline's horizontal heuristics fit that one — so the
-    // mirrored-x matrix some producers paint right-to-left text with
-    // (upright glyphs, reading left) and a y-flipped matrix (upright
-    // reading, hanging glyphs) both stay upright runs; the box covers the
-    // run either way. The glyphs' "right" is their up vector turned 90°
+    // The reading direction, or for a reflected matrix (negative
+    // determinant) the orientation of the glyphs: a reflection has no
+    // rotation — its reading direction and its glyphs differ by a half turn
+    // — so the run reports how its glyphs stand. The mirrored-x matrix some
+    // producers paint right-to-left text with therefore reads as an upright
+    // run (0), a y-flipped matrix as an upside-down one (180); the box covers
+    // the run either way. The glyphs' "right" is their up vector turned 90°
     // clockwise.
     let (dir_x, dir_y) = if reversed {
         (-combined[0], -combined[1])
@@ -191,7 +194,6 @@ pub(crate) fn run_geometry(
         (combined[0], combined[1])
     };
     let det = combined[0] * combined[3] - combined[1] * combined[2];
-    let reading = baseline_rotation(dir_x, dir_y);
     let rotation = if det < 0.0 {
         let up_sign = if glyph_up_flipped != reversed {
             -1.0
@@ -199,14 +201,9 @@ pub(crate) fn run_geometry(
             1.0
         };
         let (up_x, up_y) = (combined[2] * up_sign, combined[3] * up_sign);
-        let glyphs = baseline_rotation(up_y, -up_x);
-        if glyphs.to_radians().cos() > reading.to_radians().cos() + 1e-6 {
-            glyphs
-        } else {
-            reading
-        }
+        baseline_rotation(up_y, -up_x)
     } else {
-        reading
+        baseline_rotation(dir_x, dir_y)
     };
     let xs = [x0, x0 + ax, x0 + ux, x0 + ax + ux];
     let ys = [y0, y0 + ay, y0 + uy, y0 + ay + uy];
@@ -507,11 +504,10 @@ mod tests {
     }
 
     #[test]
-    fn run_geometry_keeps_reflected_runs_upright() {
+    fn run_geometry_reports_glyph_orientation_for_reflected_matrices() {
         // `[-1 0 0 1]` mirrors x: the advance runs left, the glyphs stand
         // upright — no rotation maps one onto the other, so the run reports
-        // the more upright of the two (its glyphs) and its box still covers
-        // the advance.
+        // how its glyphs stand and its box still covers the advance.
         let mirrored = run_geometry(
             &[-1.0, 0.0, 0.0, 1.0, 300.0, 500.0],
             Some(21.6),
@@ -535,8 +531,8 @@ mod tests {
         assert_eq!(dvips.rotation, 0.0);
         assert_eq!(dvips.y, 700.0);
 
-        // A y-flip without that correction hangs the glyphs upside down but
-        // still reads left-to-right: the reading direction is the upright one.
+        // A y-flip without that correction hangs the glyphs upside down: the
+        // run is upside-down, its baseline at the top of its box.
         let flipped = run_geometry(
             &[1.0, 0.0, 0.0, -1.0, 100.0, 700.0],
             Some(36.0),
@@ -544,12 +540,11 @@ mod tests {
             12.0,
             false,
         );
-        assert_eq!(flipped.rotation, 0.0);
+        assert_eq!(flipped.rotation, 180.0);
         assert_eq!((flipped.y, flipped.height), (688.0, 12.0));
 
-        // A mirrored run turned on its side: reading direction and glyph
-        // orientation are equally far from upright; the reading direction
-        // stands, as for every vertical run.
+        // A mirrored run turned on its side reads up while its glyphs point
+        // the other way: their orientation is what it reports.
         let sideways = run_geometry(
             &[0.0, 1.0, 1.0, 0.0, 100.0, 100.0],
             Some(36.0),
@@ -557,24 +552,39 @@ mod tests {
             12.0,
             false,
         );
-        assert_eq!(sideways.rotation, 90.0);
+        assert_eq!(sideways.rotation, 270.0);
     }
 
     #[test]
-    fn run_geometry_turns_a_negative_advance_around() {
-        // A negative `Tf` size negates the advance: the run reads towards -x
-        // with its glyphs below the baseline, i.e. a 180° turn.
-        let g = run_geometry(
+    fn run_geometry_reads_the_turn_from_the_font_size_sign_not_the_advance() {
+        // A negative `Tf` size (negative `em`) negates the glyph matrix: the
+        // run reads towards -x with its glyphs below the baseline, a 180°
+        // turn; the advance it produced is negative too.
+        let turned = run_geometry(
+            &[1.0, 0.0, 0.0, 1.0, 100.0, 700.0],
+            Some(-36.0),
+            0.0,
+            -12.0,
+            false,
+        );
+        assert_eq!(turned.rotation, 180.0);
+        assert_eq!((turned.x, turned.width), (64.0, 36.0));
+        assert_eq!((turned.y, turned.height), (688.0, 12.0));
+        assert!(turned.advance_known);
+
+        // A negative advance alone — character spacing tighter than the
+        // glyphs, or TJ positioning walking back — leaves the glyphs upright
+        // on their baseline; only the box extends the other way.
+        let tight = run_geometry(
             &[1.0, 0.0, 0.0, 1.0, 100.0, 700.0],
             Some(-36.0),
             0.0,
             12.0,
             false,
         );
-        assert_eq!(g.rotation, 180.0);
-        assert_eq!((g.x, g.width), (64.0, 36.0));
-        assert_eq!((g.y, g.height), (688.0, 12.0));
-        assert!(g.advance_known);
+        assert_eq!(tight.rotation, 0.0);
+        assert_eq!((tight.x, tight.width), (64.0, 36.0));
+        assert_eq!((tight.y, tight.height), (700.0, 12.0));
     }
 
     #[test]
