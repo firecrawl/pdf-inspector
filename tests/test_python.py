@@ -16,6 +16,11 @@ def fixture_bytes(name: str) -> bytes:
         return f.read()
 
 
+# Fixtures that need a user password to open. `process_pdf` has no password
+# parameter, so these are exercised through `process_pdf_with_ocr`, which does.
+ENCRYPTED_FIXTURE_PASSWORDS = {"encrypted-secret123.pdf": "secret123"}
+
+
 # ---------------------------------------------------------------------------
 # process_pdf
 # ---------------------------------------------------------------------------
@@ -35,6 +40,10 @@ class TestProcessPdf:
         r = repr(result)
         assert "PdfResult" in r
         assert "text_based" in r
+
+    def test_encrypted_pdf_without_password_raises(self):
+        with pytest.raises(ValueError, match="encrypted"):
+            pdf_inspector.process_pdf(fixture_path("encrypted-secret123.pdf"))
 
     def test_with_pages(self):
         result = pdf_inspector.process_pdf(
@@ -94,6 +103,18 @@ class TestProcessPdfWithOcr:
         assert all(page.provenance.ocr_model is None for page in result.pages)
         assert result.markdown
         assert "OcrPdfResult" in repr(result)
+
+    def test_password_opens_encrypted_fixture(self):
+        result = pdf_inspector.process_pdf_with_ocr(
+            fixture_path("encrypted-secret123.pdf"), mode="off", password="secret123"
+        )
+        assert result.page_count > 0
+        assert "Procurement" in result.markdown
+
+        result = pdf_inspector.process_pdf_with_ocr_bytes(
+            fixture_bytes("encrypted-secret123.pdf"), mode="off", password="secret123"
+        )
+        assert "Procurement" in result.markdown
 
     def test_auto_mode_skips_external_runtimes_for_clean_text(self):
         result = pdf_inspector.process_pdf_with_ocr_bytes(
@@ -509,6 +530,17 @@ class TestMultipleFixtures:
         [f for f in os.listdir(FIXTURES_DIR) if f.endswith(".pdf")],
     )
     def test_process_all_fixtures(self, filename):
+        password = ENCRYPTED_FIXTURE_PASSWORDS.get(filename)
+        if password is not None:
+            # `process_pdf` cannot open encrypted files; use the password-aware
+            # entry point with OCR disabled so no external runtime is needed.
+            result = pdf_inspector.process_pdf_with_ocr(
+                fixture_path(filename), mode="off", password=password
+            )
+            assert result.page_count > 0
+            assert result.markdown
+            return
+
         result = pdf_inspector.process_pdf(fixture_path(filename))
         assert result.pdf_type in (
             "text_based",
