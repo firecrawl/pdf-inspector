@@ -104,6 +104,7 @@ pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>>
             width: sub_width,
             height: item.height,
             font: item.font.clone(),
+            font_tag: item.font_tag.clone(),
             font_size: item.font_size,
             page: item.page,
             is_bold: item.is_bold,

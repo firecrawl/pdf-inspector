@@ -1005,6 +1005,10 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
             group.sort_by(|a, b| b.x.total_cmp(&a.x));
+            // Embedded LTR phrases must recover screen order before merging
+            // bakes the concatenation in — later sort_line_items passes can
+            // no longer separate a merged item.
+            crate::text_utils::restore_embedded_ltr_runs(&mut group, |i| i.text.as_str());
         } else if !preserve_stream_order {
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
         }
@@ -1117,6 +1121,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 width: end_x - first.x,
                 height: first.height,
                 font: first.font.clone(),
+                font_tag: first.font_tag.clone(),
                 font_size: first.font_size,
                 page: first.page,
                 is_bold: first.is_bold,
@@ -1420,6 +1425,7 @@ mod tests {
             width,
             height: 12.0,
             font: "F1".into(),
+            font_tag: String::new(),
             font_size: 12.0,
             page: 1,
             is_bold: false,
@@ -1678,6 +1684,7 @@ mod tests {
                 width: 50.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -1694,6 +1701,7 @@ mod tests {
                 width: 50.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -1710,6 +1718,7 @@ mod tests {
                 width: 80.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2496,6 +2505,7 @@ mod tests {
                 width: 19.5,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2512,6 +2522,7 @@ mod tests {
                 width: 42.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2528,6 +2539,7 @@ mod tests {
                 width: 35.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2555,6 +2567,7 @@ mod tests {
                 width: 8.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2571,6 +2584,7 @@ mod tests {
                 width: 8.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2587,6 +2601,7 @@ mod tests {
                 width: 8.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2616,6 +2631,7 @@ mod tests {
                 width,
                 height: 13.3,
                 font: "F4".into(),
+                font_tag: String::new(),
                 font_size: 13.3,
                 page: 1,
                 is_bold: true,
@@ -2652,6 +2668,7 @@ mod tests {
                 width,
                 height: 13.3,
                 font: "F5".into(),
+                font_tag: String::new(),
                 font_size: 13.3,
                 page: 1,
                 is_bold: false,
@@ -2689,6 +2706,7 @@ mod tests {
                 width: 24.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2705,6 +2723,7 @@ mod tests {
                 width: 32.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2721,6 +2740,7 @@ mod tests {
                 width: 32.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2745,6 +2765,7 @@ mod tests {
             width,
             height: 12.0,
             font: "F1".into(),
+            font_tag: String::new(),
             font_size: 12.0,
             page: 1,
             is_bold: false,
@@ -2850,6 +2871,31 @@ mod tests {
     }
 
     #[test]
+    fn test_is_rtl_text_weak_chars_do_not_vote() {
+        // Arabic-Indic digits (U+0660-0669) are bidi class AN, not strong RTL:
+        // a digits-only line must stay neutral, like ASCII-digit lines.
+        assert!(!is_rtl_text(["\u{0661}\u{0662}\u{0663}"].iter()));
+        // Extended Arabic-Indic digits (U+06F0-06F9) likewise
+        assert!(!is_rtl_text(["\u{06F1}\u{06F2}\u{06F3}"].iter()));
+        // Arabic decimal/thousands separators (U+066B/U+066C) with digits
+        assert!(!is_rtl_text(
+            ["\u{0661}\u{066B}\u{0662}\u{0663}\u{066C}\u{0664}"].iter()
+        ));
+        // Arabic letters alongside Arabic-Indic digits → still RTL
+        assert!(is_rtl_text(
+            ["\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \u{0661}\u{0662}"].iter()
+        ));
+        // Arabic letters with combining marks (NSM) → still RTL
+        assert!(is_rtl_text(["\u{0645}\u{064E}\u{0631}\u{064D}"].iter()));
+        // Combining marks alone are NSM, not strong RTL, even though they are
+        // Other_Alphabetic: harakat-only and niqqud-only lines stay neutral
+        assert!(!is_rtl_text(["\u{064E}\u{064F}\u{0650}\u{0651}"].iter()));
+        assert!(!is_rtl_text(["\u{05B8}\u{05B4}\u{05BC}"].iter()));
+        // Marks + Arabic-Indic digits (the full weak-only mix) → still neutral
+        assert!(!is_rtl_text(["\u{0661}\u{064E}\u{0662}"].iter()));
+    }
+
+    #[test]
     fn test_rtl_line_sorting() {
         let mut items = vec![
             TextItem {
@@ -2859,6 +2905,7 @@ mod tests {
                 width: 10.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2875,6 +2922,7 @@ mod tests {
                 width: 10.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2901,6 +2949,7 @@ mod tests {
                 width: 50.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2917,6 +2966,7 @@ mod tests {
                 width: 50.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2959,6 +3009,7 @@ mod tests {
                 width: 100.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page,
                 is_bold: false,
@@ -3005,6 +3056,7 @@ mod tests {
                 width: 100.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page,
                 is_bold: false,
@@ -3051,6 +3103,7 @@ mod tests {
                 width: 100.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page,
                 is_bold: false,
@@ -3090,6 +3143,7 @@ mod tests {
             width,
             height: font_size,
             font: "F1".into(),
+            font_tag: String::new(),
             font_size,
             page: 1,
             is_bold: false,

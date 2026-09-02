@@ -437,6 +437,14 @@ pub struct PagesExtractionResult {
     pub is_complex: bool,
 }
 
+pub(crate) struct InternalPagesExtraction {
+    pub(crate) result: PagesExtractionResult,
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) page_count: u32,
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) supplemental_ocr_regions: BTreeMap<u32, Vec<PdfRect>>,
+}
+
 /// Extract formatted markdown for pages of a PDF, with layout
 /// classification metadata.
 ///
@@ -467,7 +475,7 @@ pub fn extract_pages_markdown_mem(
         false,
         false,
     )
-    .map(|(result, _)| result)
+    .map(|extraction| extraction.result)
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -476,7 +484,7 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
-) -> Result<(PagesExtractionResult, u32), PdfError> {
+) -> Result<InternalPagesExtraction, PdfError> {
     extract_pages_markdown_mem_impl(
         buffer,
         pages,
@@ -494,7 +502,7 @@ fn extract_pages_markdown_mem_impl(
     markdown_options: &MarkdownOptions,
     strip_repeated_headers_footers: bool,
     preserve_ocr_candidates: bool,
-) -> Result<(PagesExtractionResult, u32), PdfError> {
+) -> Result<InternalPagesExtraction, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
@@ -558,6 +566,8 @@ fn extract_pages_markdown_mem_impl(
     let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
 
     for &page_0idx in pages_slice {
@@ -597,6 +607,17 @@ fn extract_pages_markdown_mem_impl(
             .filter(|l| l.page == page_1idx)
             .cloned()
             .collect();
+
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        {
+            let image_regions: Vec<PdfRect> = page_items
+                .iter()
+                .filter_map(supplemental_ocr_image_region)
+                .collect();
+            if !image_regions.is_empty() {
+                supplemental_ocr_regions.insert(page_1idx, image_regions);
+            }
+        }
 
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
@@ -692,8 +713,8 @@ fn extract_pages_markdown_mem_impl(
         });
     }
 
-    Ok((
-        PagesExtractionResult {
+    Ok(InternalPagesExtraction {
+        result: PagesExtractionResult {
             pages: results,
             pages_with_tables: complexity.pages_with_tables,
             pages_with_columns: complexity.pages_with_columns,
@@ -701,8 +722,44 @@ fn extract_pages_markdown_mem_impl(
             ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
             is_complex: complexity.is_complex,
         },
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         page_count,
-    ))
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        supplemental_ocr_regions,
+    })
+}
+
+/// Image regions large enough to plausibly contain rasterized document
+/// structure such as a table. Logos, icons, and decorative rules remain below
+/// these physical-size gates. OCR still has to produce a valid table inside
+/// the region before any text is fused into a clean native page.
+#[cfg(any(test, all(feature = "ocr", not(target_arch = "wasm32"))))]
+fn supplemental_ocr_image_region(item: &TextItem) -> Option<PdfRect> {
+    const MIN_WIDTH_PT: f32 = 108.0;
+    const MIN_HEIGHT_PT: f32 = 72.0;
+    const MIN_AREA_PT2: f32 = 20_000.0;
+
+    if !matches!(item.item_type, types::ItemType::Image)
+        || !item.x.is_finite()
+        || !item.y.is_finite()
+        || !item.width.is_finite()
+        || !item.height.is_finite()
+    {
+        return None;
+    }
+    let x = item.x.min(item.x + item.width);
+    let y = item.y.min(item.y + item.height);
+    let width = item.width.abs();
+    let height = item.height.abs();
+    (width >= MIN_WIDTH_PT && height >= MIN_HEIGHT_PT && width * height >= MIN_AREA_PT2).then_some(
+        PdfRect {
+            x,
+            y,
+            width,
+            height,
+            page: item.page,
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -770,6 +827,7 @@ mod ocr_header_footer_tests {
             width: 120.0,
             height: 10.0,
             font: "Test".to_string(),
+            font_tag: String::new(),
             font_size: 10.0,
             page,
             is_bold: false,
@@ -3827,8 +3885,7 @@ pub(crate) fn load_document_from_mem_with_password(
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
-                        let page_count = doc.get_pages().len() as u32;
-                        return Ok((doc, page_count));
+                        return finish_loaded_document(doc);
                     }
                     Err(e) => {
                         if is_encrypted_lopdf_error(&e) {
@@ -3840,12 +3897,62 @@ pub(crate) fn load_document_from_mem_with_password(
             return Err(first_err.into());
         }
     };
+    finish_loaded_document(doc)
+}
+
+/// A loaded document with zero pages is unusable by every caller, and with
+/// the decompression bound in place it can also mean the page tree lived in
+/// an object stream lopdf skipped for exceeding the bound. Fail the load
+/// either way rather than letting a pageless document masquerade as a
+/// successful parse.
+fn finish_loaded_document(doc: Document) -> Result<(Document, u32), PdfError> {
     let page_count = doc.get_pages().len() as u32;
+    if page_count == 0 {
+        return Err(PdfError::Parse(
+            "document has no readable pages".to_string(),
+        ));
+    }
+    // lopdf drops the contents of object streams it could not expand (over
+    // the decompression bound, or unparseable) without any signal on the
+    // returned document. The only trace either loader path leaves is a
+    // deficit between the xref size (`max_id`) and the objects actually
+    // loaded — which free xref entries also contribute to, so this is a
+    // heuristic: surface large deficits for diagnosability, worded so a
+    // legitimately sparse xref isn't reported as data loss. The document is
+    // still usable either way; unloaded objects resolve as not-found.
+    let expected = doc.max_id as usize;
+    let loaded = doc.objects.len();
+    let missing = expected.saturating_sub(loaded);
+    if missing > 1000 && missing.saturating_mul(64) > expected {
+        log::warn!(
+            "loaded {loaded} of {expected} xref object slots; the rest are free \
+             xref entries or object streams skipped over the \
+             {MAX_STREAM_DECOMPRESSED_BYTES}-byte decompression bound, and will \
+             resolve as not-found"
+        );
+    }
     Ok((doc, page_count))
 }
 
+/// Per-stream decompression budget applied while loading (object streams and
+/// xref streams). Some tagged PDFs pack their structure tree into object
+/// streams that inflate to hundreds of MB each from a ~20MB file; lopdf
+/// materializes every object stream eagerly at load, so without a bound one
+/// such document exhausts memory before any of our code runs. lopdf skips an
+/// object stream that would exceed the bound (its objects resolve as
+/// not-found), which the zero-page check in `load_document_from_mem_with_password`
+/// turns into a load error instead of a silently wrong answer.
+const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+
+fn bounded_load_options() -> lopdf::LoadOptions {
+    lopdf::LoadOptions {
+        max_decompressed_size: Some(MAX_STREAM_DECOMPRESSED_BYTES),
+        ..Default::default()
+    }
+}
+
 fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
-    match Document::load_mem(buf) {
+    match Document::load_mem_with_options(buf, bounded_load_options()) {
         // Some encrypted PDFs load structurally but leave their streams
         // encrypted (`is_encrypted()` stays true); reading them yields garbage
         // until we re-load with a password. Others fail load_mem outright with
@@ -3862,11 +3969,14 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
 /// non-empty password was supplied but rejected.
 fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
     let pw = password.unwrap_or("");
-    match Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(pw)) {
+    let with_password = |pw: &str| lopdf::LoadOptions {
+        password: Some(pw.to_string()),
+        ..bounded_load_options()
+    };
+    match Document::load_mem_with_options(buf, with_password(pw)) {
         Ok(doc) => Ok(doc),
         Err(inner) if !pw.is_empty() => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
-                .map_err(|_| inner)
+            Document::load_mem_with_options(buf, with_password("")).map_err(|_| inner)
         }
         Err(inner) => Err(inner),
     }
@@ -5320,6 +5430,7 @@ mod text_cluster_column_undercount_tests {
             width: text.len() as f32 * 5.0,
             height: 10.0,
             font: "F".into(),
+            font_tag: String::new(),
             font_size: 10.0,
             page: 1,
             is_bold: false,
@@ -5596,6 +5707,7 @@ mod table_candidate_selection_tests {
             width: 50.0,
             height: 10.0,
             font: "F1".to_string(),
+            font_tag: String::new(),
             font_size: 10.0,
             page: 1,
             is_bold: false,
@@ -6426,6 +6538,7 @@ mod tests {
             width,
             height,
             font: "Helvetica".to_string(),
+            font_tag: String::new(),
             font_size: height,
             page: 1,
             is_bold: false,
@@ -6442,6 +6555,36 @@ mod tests {
             page,
             ..test_item(text, 10.0, 10.0, text.len() as f32 * 5.0, 12.0)
         }
+    }
+
+    fn test_image_item(width: f32, height: f32) -> TextItem {
+        TextItem {
+            item_type: ItemType::Image,
+            ..test_item("[Image]", 20.0, 30.0, width, height)
+        }
+    }
+
+    #[test]
+    fn supplemental_ocr_regions_require_substantial_physical_images() {
+        let substantial = supplemental_ocr_image_region(&test_image_item(200.0, 120.0)).unwrap();
+        assert_eq!(substantial.width, 200.0);
+        assert_eq!(substantial.height, 120.0);
+
+        assert!(supplemental_ocr_image_region(&test_image_item(100.0, 200.0)).is_none());
+        assert!(supplemental_ocr_image_region(&test_image_item(200.0, 60.0)).is_none());
+        assert!(supplemental_ocr_image_region(&test_image_item(120.0, 100.0)).is_none());
+        assert!(
+            supplemental_ocr_image_region(&test_item("text", 0.0, 0.0, 300.0, 300.0)).is_none()
+        );
+    }
+
+    #[test]
+    fn supplemental_ocr_regions_normalize_negative_image_dimensions() {
+        let region = supplemental_ocr_image_region(&test_image_item(-200.0, -120.0)).unwrap();
+        assert_eq!(region.x, -180.0);
+        assert_eq!(region.y, -90.0);
+        assert_eq!(region.width, 200.0);
+        assert_eq!(region.height, 120.0);
     }
 
     #[test]
