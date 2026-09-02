@@ -3617,10 +3617,11 @@ struct RegionBounds {
 ///
 /// Items from a page whose text was predominantly rotated live in a turned
 /// coordinate frame (see `TextItem::rotation`). This entry point recognises
-/// only the counter-clockwise turn, heuristically (most items at negative
-/// y); a clockwise turn is not inferred. Callers that hold the extractor's
-/// page metadata should prefer [`extract_text_in_regions_mem`], which
-/// carries the page rotation explicitly and handles both turns.
+/// that frame heuristically: a counter-clockwise turn from most items at
+/// negative y, a clockwise turn only from an unambiguous set with every box
+/// entirely at negative x and non-negative y. Callers that hold the
+/// extractor's page metadata should prefer [`extract_text_in_regions_mem`],
+/// which carries the page rotation explicitly.
 pub fn collect_text_in_region(
     items: &[TextItem],
     rx1: f32,
@@ -3732,15 +3733,28 @@ fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
     // so most items land at negative y or negative x respectively. Use this
     // to keep `collect_text_in_region` behavior compatible for direct
     // callers that do not have extractor metadata.
-    // Legacy heuristic for callers without extractor metadata: a
+    // Legacy heuristic for callers without extractor metadata. A
     // counter-clockwise turn maps y = -(old right edge), so most items land
-    // at negative y. A clockwise turn is deliberately NOT inferred — its
-    // signature (negative x) cannot be told apart from content drawn at
-    // negative page coordinates. `extract_text_in_regions_mem` carries the
-    // page rotation explicitly and handles both turns.
+    // at negative y (the pre-existing rule, kept as is). A clockwise turn
+    // maps x = -(old top edge); it is inferred only from an unambiguous
+    // set — every box lying entirely at negative x and every item at
+    // non-negative y — so content that merely touches negative x stays in
+    // page coordinates. Content drawn wholly at negative page x (an offset
+    // MediaBox) cannot be told apart from that frame; callers holding the
+    // extractor's metadata should use `extract_text_in_regions_mem`, which
+    // carries the page rotation explicitly.
+    if items.is_empty() {
+        return RegionCoordSpace::Standard;
+    }
     let negative_y = items.iter().filter(|item| item.y < 0.0).count();
-    if !items.is_empty() && negative_y * 2 >= items.len() {
-        RegionCoordSpace::Rotated90Ccw
+    if negative_y * 2 >= items.len() {
+        return RegionCoordSpace::Rotated90Ccw;
+    }
+    let clockwise = items
+        .iter()
+        .all(|item| item.x + item.width <= 0.5 && item.y >= -0.5);
+    if clockwise {
+        RegionCoordSpace::Rotated90Cw
     } else {
         RegionCoordSpace::Standard
     }
@@ -7869,10 +7883,11 @@ mod rotated_run_region_tests {
         assert!(!region_overlaps_item(&header, body));
 
         // The legacy heuristic recognises the counter-clockwise frame from
-        // its negative y; a clockwise frame (negative x) is never inferred.
+        // most items at negative y, and the clockwise frame only when every
+        // box lies entirely at negative x with non-negative y.
         assert_eq!(
             infer_region_coord_space(&[header.clone()]),
-            RegionCoordSpace::Standard
+            RegionCoordSpace::Rotated90Cw
         );
         assert_eq!(
             infer_region_coord_space(&[item("x", 100.0, -200.0, 36.0, 12.0, 0.0)]),
@@ -7881,6 +7896,18 @@ mod rotated_run_region_tests {
         assert_eq!(
             infer_region_coord_space(&[item("x", 100.0, 200.0, 36.0, 12.0, 0.0)]),
             RegionCoordSpace::Standard
+        );
+        // One item merely touching negative x is ordinary page content.
+        assert_eq!(
+            infer_region_coord_space(&[
+                item("x", -3.0, 200.0, 36.0, 12.0, 0.0),
+                item("y", 100.0, 200.0, 36.0, 12.0, 0.0),
+            ]),
+            RegionCoordSpace::Standard
+        );
+        assert_eq!(
+            infer_region_coord_space(&[item("x", -40.0, 200.0, 36.0, 12.0, 0.0)]),
+            RegionCoordSpace::Rotated90Cw
         );
 
         // Bounds round-trip back to the top-left page box they came from.

@@ -238,6 +238,7 @@ pub(crate) fn extract_form_xobject_text(
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
     include_invisible: bool,
+    inherited_render_mode: i32,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
@@ -249,6 +250,7 @@ pub(crate) fn extract_form_xobject_text(
         font_cmaps,
         parent_ctm,
         include_invisible,
+        inherited_render_mode,
         cmap_decisions,
         style_cache,
         0,
@@ -264,6 +266,7 @@ fn extract_form_xobject_text_inner(
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
     include_invisible: bool,
+    inherited_render_mode: i32,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
@@ -393,7 +396,10 @@ fn extract_form_xobject_text_inner(
     let mut char_spacing: f32 = 0.0; // Tc parameter
     let mut word_spacing: f32 = 0.0; // Tw parameter
     let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift, unscaled)
-    let mut text_rendering_mode: i32 = 0; // Tr parameter (3 = invisible)
+                                  // Tr is graphics state, so a form starts in the mode the invoking stream
+                                  // left it in: `3 Tr` set on the page or in an outer form hides the text
+                                  // drawn here too.
+    let mut text_rendering_mode: i32 = inherited_render_mode;
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
@@ -468,6 +474,7 @@ fn extract_form_xobject_text_inner(
                                         font_cmaps,
                                         &ctm,
                                         include_invisible,
+                                        text_rendering_mode,
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
@@ -1134,6 +1141,7 @@ mod tests {
             &FontCMaps::from_doc(doc),
             &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             false,
+            0,
             &mut CMapDecisionCache::new(),
             &mut FontStyleCache::new(),
             budget,
@@ -1291,6 +1299,12 @@ mod tests {
     /// Form XObject — the shape emitted by print-to-PDF producers like PDFlib,
     /// where the page stream itself is only `q /X1 Do Q`.
     fn doc_with_form_content(form_content: &[u8]) -> (Document, ObjectId) {
+        doc_with_page_and_forms(b"q /X1 Do Q", &[form_content])
+    }
+
+    /// A page drawing `page_content` with forms `X1`, `X2`, … available to
+    /// the page and to each other (so a form can invoke a nested form).
+    fn doc_with_page_and_forms(page_content: &[u8], forms: &[&[u8]]) -> (Document, ObjectId) {
         let mut doc = Document::new();
         let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
         let font_id = doc.add_object(dictionary! {
@@ -1301,26 +1315,41 @@ mod tests {
             "LastChar" => 255,
             "Widths" => Object::Array(widths),
         });
-        let form_id = doc.add_object(Object::Stream(Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Form",
-                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-                "Resources" => dictionary! {
-                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
-                },
-            },
-            form_content.to_vec(),
-        )));
+        let form_ids: Vec<ObjectId> = forms.iter().map(|_| doc.new_object_id()).collect();
+        let xobjects = || {
+            let mut dict = lopdf::Dictionary::new();
+            for (index, id) in form_ids.iter().enumerate() {
+                dict.set(format!("X{}", index + 1), Object::Reference(*id));
+            }
+            dict
+        };
+        for (id, content) in form_ids.iter().zip(forms) {
+            doc.set_object(
+                *id,
+                Object::Stream(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject",
+                        "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                        "Resources" => dictionary! {
+                            "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                            "XObject" => xobjects(),
+                        },
+                    },
+                    content.to_vec(),
+                )),
+            );
+        }
         let content_id = doc.add_object(Object::Stream(Stream::new(
             dictionary! {},
-            b"q /X1 Do Q".to_vec(),
+            page_content.to_vec(),
         )));
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
             "Contents" => Object::Reference(content_id),
             "Resources" => dictionary! {
-                "XObject" => dictionary! { "X1" => Object::Reference(form_id) },
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                "XObject" => xobjects(),
             },
             "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
         });
@@ -1561,6 +1590,60 @@ BT 3 Tr /F1 12 Tf 0 1 -1 0 240 100 Tm [(ALSO) -3000 (HIDDEN)] TJ ET";
         // Two rotated operators against one upright: the recovered layer
         // now turns the page like any other rotated text.
         assert_eq!(page_rotation, crate::extractor::geometry::PageRotation::Ccw);
+    }
+
+    fn extract_page(
+        doc: &Document,
+        page_id: ObjectId,
+        include_invisible: bool,
+    ) -> (Vec<TextItem>, bool) {
+        let font_cmaps = FontCMaps::from_doc(doc);
+        let ((items, _, _), _, _, skipped_invisible) = extract_page_text_items(
+            doc,
+            page_id,
+            1,
+            &font_cmaps,
+            include_invisible,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        (items, skipped_invisible)
+    }
+
+    #[test]
+    fn form_inherits_the_pages_text_rendering_mode() {
+        // `3 Tr` set by the page stream before `Do`: the form's text is an
+        // OCR-style hidden layer and must stay hidden on the visible pass.
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"BT 3 Tr ET q /X1 Do Q",
+            &[b"BT /F1 12 Tf 72 700 Td (Hidden) Tj ET"],
+        );
+        let (items, skipped_invisible) = extract_page(&doc, page_id, false);
+        assert!(items.is_empty(), "{items:?}");
+        assert!(skipped_invisible);
+        let (items, _) = extract_page(&doc, page_id, true);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "Hidden");
+    }
+
+    #[test]
+    fn nested_form_inherits_the_outer_forms_text_rendering_mode() {
+        // The outer form sets `3 Tr` and invokes the inner form, whose text
+        // must stay hidden; an outer run at the default mode stays visible.
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"q /X1 Do Q",
+            &[
+                b"BT /F1 12 Tf 72 700 Td (Visible) Tj ET BT 3 Tr ET q /X2 Do Q",
+                b"BT /F1 12 Tf 72 650 Td (Hidden) Tj ET",
+            ],
+        );
+        let (items, skipped_invisible) = extract_page(&doc, page_id, false);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["Visible"]);
+        assert!(skipped_invisible);
+        let (items, _) = extract_page(&doc, page_id, true);
+        assert!(items.iter().any(|i| i.text == "Hidden"), "{items:?}");
     }
 
     #[test]

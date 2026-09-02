@@ -267,6 +267,9 @@ fn extract_positioned_text_impl(
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
+    // Pages whose coordinate frame was turned (see `PageRotation`): the
+    // document-level annotation items appended below must follow.
+    let mut page_rotations: HashMap<u32, geometry::PageRotation> = HashMap::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -301,6 +304,9 @@ fn extract_positioned_text_impl(
                 }
                 Err(error) => return Err(error),
             };
+        if coords_rotated != geometry::PageRotation::Upright {
+            page_rotations.insert(*page_num, coords_rotated);
+        }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
@@ -434,10 +440,17 @@ fn extract_positioned_text_impl(
         all_items.extend(links);
     }
 
-    // Extract AcroForm field values
+    // Extract AcroForm field values. Widgets on a turned page turn with it,
+    // like links, so positional consumers keep them on the text they cover.
     let form_items = extract_form_fields(doc, &page_id_to_num)
         .into_iter()
-        .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)));
+        .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)))
+        .map(|mut item| {
+            if let Some(rotation) = page_rotations.get(&item.page) {
+                rotation.rotate_box(&mut item.x, &mut item.y, &mut item.width, &mut item.height);
+            }
+            item
+        });
     all_items.extend(form_items);
 
     Ok((
@@ -3504,10 +3517,20 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
                 "URI" => Object::string_literal("https://example.com/"),
             },
         });
+        // An AcroForm text field drawn over the second run (page box
+        // x 228..240, y 100..150) must turn the same way.
+        let widget_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => "Tx",
+            "T" => Object::string_literal("field"),
+            "V" => Object::string_literal("value"),
+            "Rect" => vec![228.into(), 100.into(), 240.into(), 150.into()],
+        });
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
             "Contents" => Object::Reference(content_id),
-            "Annots" => vec![Object::Reference(link_id)],
+            "Annots" => vec![Object::Reference(link_id), Object::Reference(widget_id)],
             "Resources" => dictionary! {
                 "Font" => dictionary! { "F1" => Object::Reference(font_id) },
             },
@@ -3521,12 +3544,23 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         let catalog_id = doc.add_object(dictionary! {
             "Type" => "Catalog",
             "Pages" => Object::Reference(pages_id),
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(widget_id)],
+            },
         });
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
         let ((items, _, _), _, _) =
             extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+        let field = items
+            .iter()
+            .find(|i| matches!(i.item_type, ItemType::FormField))
+            .expect("form field item");
+        assert_eq!(
+            (field.x, field.y, field.width, field.height),
+            (100.0, -240.0, 50.0, 12.0)
+        );
         let hello = items.iter().find(|i| i.text == "HELLO").unwrap();
         assert_eq!(hello.rotation, 0.0);
         assert!((hello.x - 100.0).abs() < 0.01 && (hello.y + 200.0).abs() < 0.01);

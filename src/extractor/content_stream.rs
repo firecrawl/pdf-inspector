@@ -1008,6 +1008,7 @@ pub(crate) fn extract_page_text_items(
                                         font_cmaps,
                                         &ctm,
                                         include_invisible,
+                                        text_rendering_mode,
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
