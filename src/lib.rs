@@ -3914,8 +3914,7 @@ pub(crate) fn load_document_from_mem_with_password(
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
-                        let page_count = doc.get_pages().len() as u32;
-                        return Ok((doc, page_count));
+                        return finish_loaded_document(doc);
                     }
                     Err(e) => {
                         if is_encrypted_lopdf_error(&e) {
@@ -3927,12 +3926,62 @@ pub(crate) fn load_document_from_mem_with_password(
             return Err(first_err.into());
         }
     };
+    finish_loaded_document(doc)
+}
+
+/// A loaded document with zero pages is unusable by every caller, and with
+/// the decompression bound in place it can also mean the page tree lived in
+/// an object stream lopdf skipped for exceeding the bound. Fail the load
+/// either way rather than letting a pageless document masquerade as a
+/// successful parse.
+fn finish_loaded_document(doc: Document) -> Result<(Document, u32), PdfError> {
     let page_count = doc.get_pages().len() as u32;
+    if page_count == 0 {
+        return Err(PdfError::Parse(
+            "document has no readable pages".to_string(),
+        ));
+    }
+    // lopdf drops the contents of object streams it could not expand (over
+    // the decompression bound, or unparseable) without any signal on the
+    // returned document. The only trace either loader path leaves is a
+    // deficit between the xref size (`max_id`) and the objects actually
+    // loaded — which free xref entries also contribute to, so this is a
+    // heuristic: surface large deficits for diagnosability, worded so a
+    // legitimately sparse xref isn't reported as data loss. The document is
+    // still usable either way; unloaded objects resolve as not-found.
+    let expected = doc.max_id as usize;
+    let loaded = doc.objects.len();
+    let missing = expected.saturating_sub(loaded);
+    if missing > 1000 && missing.saturating_mul(64) > expected {
+        log::warn!(
+            "loaded {loaded} of {expected} xref object slots; the rest are free \
+             xref entries or object streams skipped over the \
+             {MAX_STREAM_DECOMPRESSED_BYTES}-byte decompression bound, and will \
+             resolve as not-found"
+        );
+    }
     Ok((doc, page_count))
 }
 
+/// Per-stream decompression budget applied while loading (object streams and
+/// xref streams). Some tagged PDFs pack their structure tree into object
+/// streams that inflate to hundreds of MB each from a ~20MB file; lopdf
+/// materializes every object stream eagerly at load, so without a bound one
+/// such document exhausts memory before any of our code runs. lopdf skips an
+/// object stream that would exceed the bound (its objects resolve as
+/// not-found), which the zero-page check in `load_document_from_mem_with_password`
+/// turns into a load error instead of a silently wrong answer.
+const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+
+fn bounded_load_options() -> lopdf::LoadOptions {
+    lopdf::LoadOptions {
+        max_decompressed_size: Some(MAX_STREAM_DECOMPRESSED_BYTES),
+        ..Default::default()
+    }
+}
+
 fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
-    match Document::load_mem(buf) {
+    match Document::load_mem_with_options(buf, bounded_load_options()) {
         // Some encrypted PDFs load structurally but leave their streams
         // encrypted (`is_encrypted()` stays true); reading them yields garbage
         // until we re-load with a password. Others fail load_mem outright with
@@ -3949,11 +3998,14 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
 /// non-empty password was supplied but rejected.
 fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
     let pw = password.unwrap_or("");
-    match Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(pw)) {
+    let with_password = |pw: &str| lopdf::LoadOptions {
+        password: Some(pw.to_string()),
+        ..bounded_load_options()
+    };
+    match Document::load_mem_with_options(buf, with_password(pw)) {
         Ok(doc) => Ok(doc),
         Err(inner) if !pw.is_empty() => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
-                .map_err(|_| inner)
+            Document::load_mem_with_options(buf, with_password("")).map_err(|_| inner)
         }
         Err(inner) => Err(inner),
     }
