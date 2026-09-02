@@ -1007,13 +1007,16 @@ fn extract_form_xobject_text_inner(
                                 let geometry = run_geometry(
                                     &combined_mat,
                                     font_info.map(|_| end_w - start_w),
-                                    // Without metrics the accumulated width IS
-                                    // the sub-run's estimate, kerning included —
-                                    // signed, since a negative `Tf` size reads
-                                    // backwards; if kerning walked it past zero
-                                    // the painted codes' own estimate stands.
-                                    if end_w - start_w != 0.0
-                                        && ((end_w - start_w > 0.0) == (*estimate_ts > 0.0))
+                                    // A measured sub-run's advance is the `Some`
+                                    // above and this fallback goes unused. Without
+                                    // metrics the accumulated width IS the sub-run's
+                                    // estimate, kerning included — signed, since a
+                                    // negative `Tf` size reads backwards; if kerning
+                                    // walked it past zero the painted codes' own
+                                    // estimate stands.
+                                    if font_info.is_some()
+                                        || (end_w - start_w != 0.0
+                                            && ((end_w - start_w > 0.0) == (*estimate_ts > 0.0)))
                                     {
                                         end_w - start_w
                                     } else if *estimate_ts != 0.0 {

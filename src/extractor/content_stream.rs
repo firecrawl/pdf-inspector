@@ -374,6 +374,7 @@ pub(crate) fn extract_page_text_items(
     let mut actual_text_start_rise: f32 = 0.0;
     let mut actual_text_glyph_rise: Option<f32> = None;
     let mut actual_text_glyph_font: Option<String> = None; // font that painted the span's first glyph
+    let mut actual_text_glyph_font_size: Option<f32> = None; // `Tf` size in force for that glyph, sign included
     let mut actual_text_glyphs_measured: bool = true; // every painted font had width metrics
     let mut actual_text_estimate_ts: f32 = 0.0; // estimate accumulated per painted run, its own size and spacing
                                                 // Glyphs painted inside the current ActualText span: sizes the span's box
@@ -564,6 +565,7 @@ pub(crate) fn extract_page_text_items(
                             actual_text_glyph_tm = Some(text_matrix);
                             actual_text_glyph_rise = Some(text_rise);
                             actual_text_glyph_font = Some(current_font.clone());
+                            actual_text_glyph_font_size = Some(current_font_size);
                         }
                         actual_text_glyph_count += glyph_count;
                         actual_text_glyphs_measured &= w_ts_opt.is_some();
@@ -699,6 +701,7 @@ pub(crate) fn extract_page_text_items(
                             actual_text_glyph_tm = Some(text_matrix);
                             actual_text_glyph_rise = Some(text_rise);
                             actual_text_glyph_font = Some(current_font.clone());
+                            actual_text_glyph_font_size = Some(current_font_size);
                         }
 
                         // Compute space threshold based on font metrics when available
@@ -896,13 +899,16 @@ pub(crate) fn extract_page_text_items(
                                 let geometry = run_geometry(
                                     &combined,
                                     font_info.map(|_| end_w - start_w),
-                                    // Without metrics the accumulated width IS
-                                    // the sub-run's estimate, kerning included —
-                                    // signed, since a negative `Tf` size reads
-                                    // backwards; if kerning walked it past zero
-                                    // the painted codes' own estimate stands.
-                                    if end_w - start_w != 0.0
-                                        && ((end_w - start_w > 0.0) == (*estimate_ts > 0.0))
+                                    // A measured sub-run's advance is the `Some`
+                                    // above and this fallback goes unused. Without
+                                    // metrics the accumulated width IS the sub-run's
+                                    // estimate, kerning included — signed, since a
+                                    // negative `Tf` size reads backwards; if kerning
+                                    // walked it past zero the painted codes' own
+                                    // estimate stands.
+                                    if font_info.is_some()
+                                        || (end_w - start_w != 0.0
+                                            && ((end_w - start_w > 0.0) == (*estimate_ts > 0.0)))
                                     {
                                         end_w - start_w
                                     } else if *estimate_ts != 0.0 {
@@ -983,6 +989,7 @@ pub(crate) fn extract_page_text_items(
                     actual_text_glyph_tm = Some(text_matrix);
                     actual_text_glyph_rise = Some(text_rise);
                     actual_text_glyph_font = Some(current_font.clone());
+                    actual_text_glyph_font_size = Some(current_font_size);
                 }
                 if suppress_glyph_extraction {
                     actual_text_glyph_count += shown_glyph_count(
@@ -1233,6 +1240,7 @@ pub(crate) fn extract_page_text_items(
                     actual_text_glyph_tm = None; // reset — will be captured at first Tj/TJ
                     actual_text_glyph_rise = None;
                     actual_text_glyph_font = None;
+                    actual_text_glyph_font_size = None;
                     actual_text_glyphs_measured = true;
                     actual_text_estimate_ts = 0.0;
                     actual_text_glyph_count = 0;
@@ -1253,8 +1261,17 @@ pub(crate) fn extract_page_text_items(
                         if let Some(start_tm) = glyph_tm.or(entry_tm) {
                             let rise = glyph_rise.unwrap_or(actual_text_start_rise);
                             let combined = multiply_matrices(&rise_adjusted(&start_tm, rise), &ctm);
-                            let rendered_size = effective_font_size(current_font_size, &combined)
-                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
+                            // The font and `Tf` size in force when the span's
+                            // first glyph was painted decide its size, its turn,
+                            // and its vote — not whatever `Tf` selected before EMC.
+                            let paint_font = actual_text_glyph_font
+                                .take()
+                                .unwrap_or_else(|| current_font.clone());
+                            let paint_size = actual_text_glyph_font_size
+                                .take()
+                                .unwrap_or(current_font_size);
+                            let rendered_size = effective_font_size(paint_size, &combined)
+                                * type3_scales.get(&paint_font).copied().unwrap_or(1.0);
                             // Advance in text-space units: the text matrix
                             // travelled from `start_tm` along its own x axis.
                             // Project the displacement onto that axis — a
@@ -1268,9 +1285,6 @@ pub(crate) fn extract_page_text_items(
                             // glyphs decide — all of them — not one selected
                             // after them; a span that painted nothing has only
                             // its displacement.
-                            let paint_font = actual_text_glyph_font
-                                .take()
-                                .unwrap_or_else(|| current_font.clone());
                             let advance_ts =
                                 if actual_text_glyph_count > 0 && !actual_text_glyphs_measured {
                                     None
@@ -1292,14 +1306,12 @@ pub(crate) fn extract_page_text_items(
                                 // run at its own size and spacing; the
                                 // replacement text is only what gets emitted.
                                 actual_text_estimate_ts,
-                                rendered_size.copysign(current_font_size),
+                                rendered_size.copysign(paint_size),
                                 type3_y_flips.contains(&paint_font),
                             );
                             if !at.trim().is_empty() {
-                                rotation_votes.cast_direction(reading_direction(
-                                    &combined,
-                                    current_font_size,
-                                ));
+                                rotation_votes
+                                    .cast_direction(reading_direction(&combined, paint_size));
                                 let base_font = font_base_names
                                     .get(&current_font)
                                     .map(|s| s.as_str())
@@ -2873,6 +2885,25 @@ BT /F1 -12 Tf 0 1 -1 0 160 100 Tm (UP) ' ET";
         for item in &items {
             assert_close(item.rotation, 0.0, "rotation");
             assert_close(item.font_size, 12.0, "font_size");
+        }
+    }
+
+    #[test]
+    fn actual_text_span_votes_and_sizes_with_the_size_that_painted_it() {
+        // Each span paints its glyphs at `-12 Tf` (reading top-to-bottom on
+        // this bottom-to-top matrix) and then selects `12 Tf` before EMC. The
+        // vote, the turn, and the size follow the painting size: the page
+        // turns clockwise and the replacements come out upright at 12pt.
+        let content = b"BT /F1 -12 Tf 0 1 -1 0 100 100 Tm /Span <</ActualText (Up) >> BDC (UP) Tj /F1 12 Tf EMC ET
+BT /F1 -12 Tf 0 1 -1 0 130 100 Tm /Span <</ActualText (Up) >> BDC (UP) Tj /F1 12 Tf EMC ET";
+        let (items, page_rotation) = extract_simple_page(content);
+        assert_eq!(page_rotation, PageRotation::Cw);
+        assert_eq!(items.len(), 2, "{items:?}");
+        for item in &items {
+            assert_eq!(item.text, "Up");
+            assert_close(item.rotation, 0.0, "rotation");
+            assert_close(item.font_size, 12.0, "font_size");
+            assert!(item.advance_known);
         }
     }
 
