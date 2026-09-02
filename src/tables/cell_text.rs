@@ -174,6 +174,21 @@ pub(crate) fn strip_marker_spans(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Cell text with every `<sup>…</sup>` / `<sub>…</sub>` span removed, tags
+/// and content alike: what the cell says outside its annotations.
+pub(crate) fn strip_script_spans(text: &str) -> std::borrow::Cow<'_, str> {
+    if !has_script_markup(text) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for segment in script_segments(text) {
+        if let Segment::Text(t) = segment {
+            out.push_str(t);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Whether the cell carries a script span with letter content — a label
 /// like `V<sub>f</sub>` or `x<sub>i</sub>`, which is never a page number
 /// however its letters read as roman numerals.
@@ -421,6 +436,13 @@ mod tests {
             strip_marker_spans("plain"),
             std::borrow::Cow::Borrowed("plain")
         ));
+    }
+
+    #[test]
+    fn strip_script_spans_keeps_only_the_base_text() {
+        assert_eq!(strip_script_spans("12<sup>a</sup>"), "12");
+        assert_eq!(strip_script_spans("V<sub>f</sub> m/s"), "V m/s");
+        assert_eq!(strip_script_spans("plain"), "plain");
     }
 
     #[test]

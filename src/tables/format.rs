@@ -154,13 +154,16 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
 ///   - dashed section-page IDs: "5-21", "A-1", "B--3", "TC-2" (common in
 ///     technical manuals)
 fn is_page_number_cell(cell: &str) -> bool {
-    // A label carrying a letter subscript/superscript (`V<sub>f</sub>`,
-    // `x<sub>i</sub>`) is never a page number, whatever its letters spell
-    // as roman numerals; footnote markers on a real page number are dropped.
-    if super::cell_text::has_letter_script_span(cell) {
+    // A label whose base has letters and carries a letter subscript or
+    // superscript (`V<sub>f</sub>`, `x<sub>i</sub>`) is never a page number,
+    // whatever its letters spell as roman numerals. On a digit-only base
+    // every span is a footnote marker (`12<sup>a</sup>`, `12<sup>1)</sup>`)
+    // and is dropped before the page-number test.
+    let base = super::cell_text::strip_script_spans(cell);
+    if base.chars().any(char::is_alphabetic) && super::cell_text::has_letter_script_span(cell) {
         return false;
     }
-    let cell = super::cell_text::strip_marker_spans(cell);
+    let cell = base;
     let tokens: Vec<&str> = cell.split_whitespace().collect();
     if tokens.is_empty() {
         return false;
@@ -1069,6 +1072,8 @@ mod tests {
         assert!(!is_page_number_cell("V<sub>f</sub>"));
         assert!(!is_page_number_cell("x<sub>i</sub>"));
         assert!(is_page_number_cell("12<sup>1)</sup>"));
+        assert!(is_page_number_cell("12<sup>a</sup>"));
+        assert!(is_page_number_cell("xi<sup>1)</sup>"));
         assert!(is_page_number_cell("xi"));
     }
 }
