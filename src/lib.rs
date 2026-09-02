@@ -2758,13 +2758,14 @@ pub fn extract_tables_with_structure_cells_mem(
 /// distribute the words to whichever cells their estimated centers fall
 /// into.
 ///
-/// The character-width estimate is `effective_width / char_count`.
-/// `effective_width` returns the explicit `item.width` when known and
-/// otherwise falls back to `char_count * font_size * 0.5`. Either way the
-/// estimate is uniform across the item — fine for routing, since we only
-/// need to know which cell each token's center lands in, not its exact
-/// position. Single-token items collapse to a one-element vector
-/// equivalent to the input item, making this a no-op for the common case.
+/// The character-width estimate is `item.width / char_count`; a run whose
+/// box has no width (a genuine zero advance) is spread over half an em per
+/// character for the interpolation only, so its tokens still land in
+/// different cells. Either way the estimate is uniform across the item —
+/// fine for routing, since we only need to know which cell each token's
+/// center lands in, not its exact position. Single-token items collapse to
+/// a one-element vector equivalent to the input item, making this a no-op
+/// for the common case.
 fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
     let total_chars = item.text.chars().count();
     if total_chars == 0 {
@@ -2777,7 +2778,11 @@ fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
     if !item.is_upright() {
         return vec![item.clone()];
     }
-    let item_w = text_utils::effective_width(item);
+    let item_w = if item.width > 0.0 {
+        item.width
+    } else {
+        total_chars as f32 * item.font_size * 0.5
+    };
     let char_w = item_w / total_chars as f32;
 
     let mut tokens: Vec<TextItem> = Vec::new();
@@ -8010,5 +8015,17 @@ mod rotated_run_region_tests {
 
         let body = item("two words", 72.0, 500.0, 90.0, 10.0, 0.0);
         assert_eq!(split_item_into_token_subitems(&body).len(), 2);
+    }
+
+    #[test]
+    fn token_splitting_spreads_a_zero_width_run() {
+        // A genuine zero advance leaves no box to interpolate along; the
+        // tokens are spread over half an em per character instead of all
+        // landing on the run's origin.
+        let zero = item("two words", 72.0, 500.0, 0.0, 10.0, 0.0);
+        let tokens = split_item_into_token_subitems(&zero);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].x, 72.0);
+        assert!(tokens[1].x > tokens[0].x + 15.0, "{tokens:?}");
     }
 }

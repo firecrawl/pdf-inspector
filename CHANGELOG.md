@@ -78,8 +78,16 @@ version and date. Earlier releases are described in their
   axis vote on the turn, so a page of diagonal text keeps its frame, and so
   does a page whose vertical runs split evenly between the two directions.
 - A run whose font carries no width metrics gets a half-em-per-painted-glyph
-  estimate laid along its baseline, and the text cursor moves by the same
-  estimate, so the runs that follow it no longer pile up on one origin.
+  estimate laid along its baseline (character and word spacing included),
+  and the text cursor moves by the same estimate, so the runs that follow it
+  no longer pile up on one origin.
+- A reflected text matrix has no rotation — its reading direction and its
+  glyphs' orientation differ by a half turn — so such a run reports the more
+  upright of the two: `0` for the mirrored-x matrix some producers paint
+  right-to-left text with, which then merges, groups into lines, and carries
+  decorations like the upright run it looks like. A negative `Tf` size turns
+  a run around and reads as `180`; upside-down runs group into lines by the
+  baseline they hang from (`TextItem::baseline_y()`).
 - ActualText runs shown under a scaled text matrix reported widths multiplied
   by the scale twice.
 - Form XObjects inherit the invoking stream's text rise and rendering mode

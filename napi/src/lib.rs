@@ -92,8 +92,8 @@ pub struct PdfClassification {
 /// On a page whose text is predominantly rotated the extractor turns the
 /// coordinate frame so that text reads left-to-right; items on such a page
 /// are expressed in that turned frame, not in page coordinates. Use
-/// [`extractTextWithPositionsAndRotations`] to learn which pages were turned
-/// and which way.
+/// [`extract_text_with_positions_and_rotations`] (`extractTextWithPositionsAndRotations`
+/// in JavaScript) to learn which pages were turned and which way.
 #[napi(object)]
 pub struct TextItem {
     pub text: String,

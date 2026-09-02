@@ -7,16 +7,13 @@ use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
-use super::content_stream::shown_glyph_count;
+use super::content_stream::estimated_string_advance_ts;
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, build_type3_y_flips,
     compute_string_width_ts, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
     CMapDecisionCache, FontStyleCache,
 };
-use super::geometry::{
-    baseline_rotation, estimated_advance_for_glyphs, estimated_advance_for_run, rise_adjusted,
-    run_geometry,
-};
+use super::geometry::{baseline_rotation, estimated_advance_ts, rise_adjusted, run_geometry};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
@@ -688,10 +685,13 @@ fn extract_form_xobject_text_inner(
                         } else {
                             // No width metrics: move by the estimate the run
                             // would have carried, as the page parser does.
-                            let estimate_ts = estimated_advance_for_glyphs(
-                                shown_glyph_count(get_operand_bytes(show_operand), None),
+                            let estimate_ts = estimated_string_advance_ts(
+                                get_operand_bytes(show_operand),
+                                None,
                                 current_font_size
                                     * type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                char_spacing,
+                                word_spacing,
                             );
                             text_matrix[4] += estimate_ts * text_matrix[0];
                             text_matrix[5] += estimate_ts * text_matrix[1];
@@ -727,14 +727,18 @@ fn extract_form_xobject_text_inner(
                         });
                         let em_ts = current_font_size
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                        let fallback_ts = estimated_advance_for_run(
-                            shown_glyph_count(
-                                get_operand_bytes(show_operand),
+                        let raw = get_operand_bytes(show_operand);
+                        let fallback_ts = if raw.is_some_and(|bytes| !bytes.is_empty()) {
+                            estimated_string_advance_ts(
+                                raw,
                                 font_widths.get(&current_font),
-                            ),
-                            &text,
-                            em_ts,
-                        );
+                                em_ts,
+                                char_spacing,
+                                word_spacing,
+                            )
+                        } else {
+                            estimated_advance_ts(&text, em_ts)
+                        };
                         let geometry = run_geometry(
                             &combined,
                             advance_ts,
@@ -830,9 +834,8 @@ fn extract_form_xobject_text_inner(
                         };
                         let column_gap_threshold = space_threshold * 4.0;
 
-                        let mut sub_items: Vec<(String, f32, f32, usize)> = Vec::new();
+                        let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
                         let mut current_text = String::new();
-                        let mut current_glyphs: usize = 0; // codes painted into `current_text`
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         // Positive TJ offsets beyond a space width move the pen
@@ -861,7 +864,6 @@ fn extract_form_xobject_text_inner(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
-                                            std::mem::take(&mut current_glyphs),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -897,7 +899,6 @@ fn extract_form_xobject_text_inner(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
-                                            std::mem::take(&mut current_glyphs),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -915,8 +916,6 @@ fn extract_form_xobject_text_inner(
                                 }
                                 _ => {}
                             }
-                            let element_glyphs =
-                                shown_glyph_count(get_operand_bytes(element), font_info);
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
                                     total_width_ts += compute_string_width_ts(
@@ -930,13 +929,15 @@ fn extract_form_xobject_text_inner(
                             } else {
                                 // No width metrics: the cursor moves by the
                                 // estimate the sub-run's box will carry.
-                                total_width_ts += estimated_advance_for_glyphs(
-                                    element_glyphs,
+                                total_width_ts += estimated_string_advance_ts(
+                                    get_operand_bytes(element),
+                                    None,
                                     current_font_size
                                         * type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                    char_spacing,
+                                    word_spacing,
                                 );
                             }
-                            current_glyphs += element_glyphs;
                             if !hidden {
                                 if let Some(text) = extract_text_from_operand(
                                     element,
@@ -955,12 +956,7 @@ fn extract_form_xobject_text_inner(
                             }
                         }
                         if !hidden && !current_text.trim().is_empty() {
-                            sub_items.push((
-                                current_text,
-                                sub_start_width_ts,
-                                total_width_ts,
-                                current_glyphs,
-                            ));
+                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
                         }
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
@@ -984,7 +980,7 @@ fn extract_form_xobject_text_inner(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w, glyphs) in &sub_items {
+                            for (text, start_w, end_w) in &sub_items {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -998,15 +994,20 @@ fn extract_form_xobject_text_inner(
                                 let geometry = run_geometry(
                                     &combined_mat,
                                     font_info.map(|_| end_w - start_w),
-                                    estimated_advance_for_run(
-                                        *glyphs,
-                                        text,
-                                        current_font_size
-                                            * type3_scales
-                                                .get(&current_font)
-                                                .copied()
-                                                .unwrap_or(1.0),
-                                    ),
+                                    // Without metrics the accumulated width IS
+                                    // the sub-run's estimate, kerning included.
+                                    if end_w - start_w > 0.0 {
+                                        end_w - start_w
+                                    } else {
+                                        estimated_advance_ts(
+                                            text,
+                                            current_font_size
+                                                * type3_scales
+                                                    .get(&current_font)
+                                                    .copied()
+                                                    .unwrap_or(1.0),
+                                        )
+                                    },
                                     rendered_size,
                                     type3_y_flips.contains(&current_font),
                                 );

@@ -188,9 +188,8 @@ pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
     // An upside-down line of LTR runs (180°) reads towards -x: sort it by its
     // mirrored position so the fragments come out in reading order. RTL lines
-    // are exempt: the common way to paint right-to-left text is a mirrored-x
-    // text matrix, which also reports 180° while the glyphs stand upright and
-    // the line already reads in the classic RTL order (descending x).
+    // are exempt: they already read in the classic RTL order (descending x),
+    // whichever way their glyphs stand, so mirroring them would reverse it.
     // Non-text items on the line (links, form fields, images) are axis-aligned
     // boxes reporting 0° and say nothing about the reading direction.
     let mut text_runs = items
@@ -630,7 +629,9 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
     let scale_y = (text_matrix[2].powi(2) + text_matrix[3].powi(2)).sqrt();
     // Use the larger of the two scales (usually they're equal for non-rotated text)
     let scale = scale_x.max(scale_y);
-    base_size * scale
+    // A negative `Tf` size turns the glyphs around; their size is still
+    // their size (the geometry reads the direction from the advance).
+    base_size.abs() * scale
 }
 
 /// The item's horizontal extent. The box already holds an
@@ -944,8 +945,14 @@ pub(crate) fn should_join_items(
     // When we have accurate width from font metrics, use a tight threshold
     // Only measured widths earn the tight threshold: a width-less font's
     // box is a half-em-per-glyph estimate (`advance_known == false`), which
-    // stays on the loose heuristic it always used.
-    if prev_item.width > 0.0 && prev_item.advance_known {
+    // stays on the loose heuristic it always used. So does a rotated pair:
+    // a vertical run's `width` is its em, not its advance, and the x gap
+    // below says nothing about how far apart the runs read.
+    if prev_item.width > 0.0
+        && prev_item.advance_known
+        && prev_item.is_upright()
+        && curr_item.is_upright()
+    {
         let gap = if prev_item.x <= curr_item.x {
             // LTR: prev is left of curr
             curr_item.x - (prev_item.x + prev_item.width)
@@ -1871,6 +1878,29 @@ mod tests {
     }
 
     #[test]
+    fn join_threshold_ignores_a_vertical_runs_em_width() {
+        // For a vertical run `width` is its em, so the tight measured-width
+        // path would read the x gap to the next run as a word boundary. The
+        // pair falls back to the loose heuristic instead — which the same
+        // geometry laid out upright does not.
+        let mut prev = geometry_item(10.0, 30.0, 90.0);
+        prev.text = "ab".to_string();
+        prev.x = 100.0;
+        prev.font_size = 10.0;
+        let mut curr = geometry_item(10.0, 30.0, 90.0);
+        curr.text = "cd".to_string();
+        curr.x = 112.5;
+        curr.font_size = 10.0;
+        assert!(should_join_items(&prev, &curr, 0.1));
+
+        prev.rotation = 0.0;
+        prev.height = 10.0;
+        curr.rotation = 0.0;
+        curr.height = 10.0;
+        assert!(!should_join_items(&prev, &curr, 0.1));
+    }
+
+    #[test]
     fn upside_down_lines_sort_right_to_left() {
         // A 180° run reads towards -x: the fragment painted first sits at
         // the largest x and must come first.
@@ -1902,9 +1932,8 @@ mod tests {
         let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(texts, ["HELLO", "link", "WORLD"]);
 
-        // An RTL line at 180° is the mirrored-x matrix producers use for
-        // right-to-left text, not upside-down glyphs: it keeps the classic
-        // RTL order, first word at the largest x.
+        // An RTL line whose runs report 180° keeps the classic RTL order,
+        // first word at the largest x: mirroring it would reverse the text.
         let mut first = geometry_item(30.0, 10.0, 180.0);
         first.text = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}".to_string();
         first.x = 140.0;

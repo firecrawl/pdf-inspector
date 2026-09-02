@@ -124,8 +124,13 @@ pub struct TextItem {
     /// stamp rotated counter-clockwise), `270` for text reading
     /// top-to-bottom, `180` for upside-down text. Rotation-only matrices
     /// report exact multiples of 90; skewed matrices (deskewed OCR layers,
-    /// diagonal watermarks) report fractional angles. `0` for items that
-    /// don't come from a text matrix (images, links, form fields, OCR).
+    /// diagonal watermarks) report fractional angles. A reflected text
+    /// matrix has no rotation — its reading direction and its glyphs'
+    /// orientation differ by a half turn — and reports the more upright of
+    /// the two: `0` for the mirrored-x matrix some producers paint
+    /// right-to-left text with (upright glyphs). A negative `Tf` size turns
+    /// a run around and reads as `180`. `0` for items that don't come from a
+    /// text matrix (images, links, form fields, OCR).
     /// On a page whose text is predominantly rotated the extractor turns
     /// the coordinate frame so the dominant runs read as `0`; upright
     /// strays then report `270` on a counter-clockwise page and `90` on a
@@ -192,12 +197,24 @@ pub struct TextItem {
 }
 
 impl TextItem {
-    /// Baseline of the visual line this item belongs to: `y` for normal
-    /// text, the anchor's baseline for a super/subscript glyph run (`y`
-    /// minus `baseline_shift`). Line grouping compares this instead of `y`
-    /// so raised and lowered markers stay on their body line.
+    /// Baseline of the visual line this item belongs to: the glyphs'
+    /// baseline for normal text, the anchor's baseline for a super/subscript
+    /// glyph run (`baseline_shift` below it). Line grouping compares this
+    /// instead of `y` so raised and lowered markers stay on their body line
+    /// and upside-down runs of different sizes share theirs.
     pub fn line_y(&self) -> f32 {
-        self.y - self.baseline_shift
+        self.baseline_y() - self.baseline_shift
+    }
+
+    /// The baseline the glyphs sit on: `y` for upright text (the box's
+    /// bottom edge); an upside-down run hangs from its box's top edge,
+    /// `y + height`.
+    pub fn baseline_y(&self) -> f32 {
+        if self.is_upside_down() {
+            self.y + self.height
+        } else {
+            self.y
+        }
     }
 
     /// `true` for a glyph run flagged as a super- or subscript of a larger
@@ -734,6 +751,24 @@ mod formatting_tests {
             "**Yibo Yan<sup>1</sup>, Jiahao Huo**"
         );
         assert_eq!(line.text(), "Yibo Yan<sup>1</sup>, Jiahao Huo");
+    }
+
+    #[test]
+    fn line_y_of_an_upside_down_run_is_its_baseline() {
+        // A 180° run hangs from its box top: that is the baseline its line
+        // groups by, a script offset still applies below it, and an upright
+        // run keeps `y`.
+        let mut run = item("x", 100.0, 20.0, false);
+        run.y = 500.0;
+        run.height = 10.0;
+        run.rotation = 180.0;
+        assert_eq!(run.baseline_y(), 510.0);
+        assert_eq!(run.line_y(), 510.0);
+        run.baseline_shift = 2.0;
+        assert_eq!(run.line_y(), 508.0);
+        run.rotation = 0.0;
+        assert_eq!(run.baseline_y(), 500.0);
+        assert_eq!(run.line_y(), 498.0);
     }
 
     #[test]

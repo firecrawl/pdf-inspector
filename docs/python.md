@@ -137,6 +137,8 @@ headings = [
 | `extract_text_bytes(data)` | Plain text extraction from bytes |
 | `extract_text_with_positions(path, pages=None)` | Text with X/Y coords and font info |
 | `extract_text_with_positions_bytes(data, pages=None)` | Text with positions from bytes |
+| `extract_text_with_positions_and_rotations(path)` | Positioned text plus the frame of every page whose text was turned (`PositionedText`) |
+| `extract_text_with_positions_and_rotations_bytes(data)` | The same from bytes |
 | `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions |
 | `extract_text_in_regions_bytes(data, page_regions)` | Region extraction from bytes |
 | `extract_pages_markdown(path, pages=None)` | Per-page Markdown + layout metadata (all pages by default) |
@@ -230,6 +232,14 @@ class TextItem:                      # extract_text_with_positions
     baseline_shift: float            # super/subscript offset from the body baseline (0.0 = normal text; >0 raised, <0 lowered)
     item_type: str
     mcid: int | None                 # marked-content ID for tagged PDFs (None otherwise)
+
+class PageRotation:                  # extract_text_with_positions_and_rotations
+    page: int                        # 1-indexed (matches TextItem.page)
+    rotation: Literal["ccw", "cw"]   # how the page's frame was turned so its text reads left-to-right
+
+class PositionedText:                # extract_text_with_positions_and_rotations
+    items: list[TextItem]            # on a page listed below, in that page's turned frame
+    page_rotations: list[PageRotation]
 
 class StructureElement:              # extract_structure_elements
     page: int                        # 1-indexed (matches TextItem.page)
