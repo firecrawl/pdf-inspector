@@ -446,8 +446,10 @@ pub struct PyOutlineEntry {
 #[pymethods]
 impl PyOutlineEntry {
     fn __repr__(&self) -> String {
+        // `{:?}` escapes quotes and control characters so titles with
+        // apostrophes or embedded newlines cannot break the repr.
         format!(
-            "OutlineEntry(level={}, title='{}', page={:?})",
+            "OutlineEntry(level={}, title={:?}, page={:?})",
             self.level,
             self.title.chars().take(40).collect::<String>(),
             self.page,

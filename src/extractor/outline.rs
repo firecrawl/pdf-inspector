@@ -10,7 +10,7 @@
 //! work so a crafted PDF cannot burn unbounded CPU on invalid or duplicate
 //! entries.
 
-use crate::text_utils::decode_text_string;
+use crate::text_utils::decode_pdfdoc_text_string;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 
@@ -163,7 +163,7 @@ fn walk_outline_level(
             .get(b"Title")
             .ok()
             .and_then(|obj| resolve_string_bytes(doc, obj))
-            .map(decode_text_string)
+            .map(decode_pdfdoc_text_string)
             .unwrap_or_default();
 
         let (page, dest_kind) = resolve_outline_destination(doc, node, page_map, named_dests);
@@ -211,6 +211,18 @@ fn resolve_string_bytes<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a [u
     }
 }
 
+/// Resolve a possibly-referenced PDF name object to its raw bytes.
+fn resolve_name_bytes<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a [u8]> {
+    match obj {
+        Object::Name(name) => Some(name),
+        Object::Reference(r) => match doc.get_object(*r) {
+            Ok(Object::Name(name)) => Some(name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Resolve an outline node's destination to a 1-indexed page and dest kind.
 ///
 /// Tries `/Dest` first (explicit array or named destination), then a `/A`
@@ -227,10 +239,11 @@ fn resolve_outline_destination(
     }
 
     if let Some(action) = node.get(b"A").ok().and_then(|obj| resolve_dict(doc, obj)) {
+        // `/S` may itself be an indirect reference to the action-type name.
         let is_goto = action
             .get(b"S")
             .ok()
-            .and_then(|s| s.as_name().ok())
+            .and_then(|s| resolve_name_bytes(doc, s))
             .is_some_and(|name| name == b"GoTo");
         if is_goto {
             if let Ok(dest) = action.get(b"D") {
@@ -261,7 +274,7 @@ fn resolve_dest_object(
     match dest {
         Object::Array(arr) => (
             dest_array_page(arr, page_map),
-            dest_array_kind(arr).map(str::to_string),
+            dest_array_kind(doc, arr).map(str::to_string),
         ),
         Object::Name(name) => {
             let page = named_dests
@@ -287,7 +300,9 @@ fn dest_array_page(arr: &[Object], page_map: &HashMap<ObjectId, u32>) -> Option<
         Object::Reference(r) => page_map.get(r).copied(),
         Object::Integer(i) => {
             let index = u32::try_from(*i).ok()?;
-            let page = index + 1;
+            // Checked: a malformed u32::MAX index must yield None, not
+            // overflow.
+            let page = index.checked_add(1)?;
             (page as usize <= page_map.len()).then_some(page)
         }
         _ => None,
@@ -295,12 +310,10 @@ fn dest_array_page(arr: &[Object], page_map: &HashMap<ObjectId, u32>) -> Option<
 }
 
 /// Fit-type name from an explicit destination array's second element
-/// ("XYZ", "Fit", "FitH", …).
-fn dest_array_kind(arr: &[Object]) -> Option<&str> {
-    match arr.get(1)? {
-        Object::Name(name) => std::str::from_utf8(name).ok(),
-        _ => None,
-    }
+/// ("XYZ", "Fit", "FitH", …), which may be an indirect reference.
+fn dest_array_kind<'a>(doc: &'a Document, arr: &'a [Object]) -> Option<&'a str> {
+    let name = resolve_name_bytes(doc, arr.get(1)?)?;
+    std::str::from_utf8(name).ok()
 }
 
 /// Lazily-built map of named destinations.
@@ -599,6 +612,84 @@ mod tests {
     }
 
     #[test]
+    fn goto_action_with_indirect_s_name_resolves() {
+        // `/S` stored as an indirect reference to the /GoTo name must still
+        // be recognized as a GoTo action.
+        let (mut doc, page_ids) = doc_with_pages(2);
+        let s_name = doc.add_object(Object::Name(b"GoTo".to_vec()));
+        let action = doc.add_object(dictionary! {
+            "S" => Object::Reference(s_name),
+            "D" => vec![
+                Object::Reference(page_ids[1]),
+                Object::Name(b"Fit".to_vec()),
+            ],
+        });
+        let node = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Indirect S"),
+            "A" => Object::Reference(action),
+        });
+        let outlines_id = doc.add_object(dictionary! {
+            "Type" => "Outlines",
+            "First" => Object::Reference(node),
+        });
+        set_catalog(&mut doc, outlines_id);
+
+        let entries = extract_outline_from_doc(&doc, &page_map(&page_ids));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].page, Some(2));
+        assert_eq!(entries[0].dest_kind.as_deref(), Some("Fit"));
+    }
+
+    #[test]
+    fn indirect_dest_fit_type_name_resolves() {
+        // The fit-type name in an explicit destination array may itself be
+        // an indirect reference.
+        let (mut doc, page_ids) = doc_with_pages(1);
+        let kind_name = doc.add_object(Object::Name(b"FitH".to_vec()));
+        let node = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Indirect kind"),
+            "Dest" => vec![
+                Object::Reference(page_ids[0]),
+                Object::Reference(kind_name),
+                796.into(),
+            ],
+        });
+        let outlines_id = doc.add_object(dictionary! {
+            "Type" => "Outlines",
+            "First" => Object::Reference(node),
+        });
+        set_catalog(&mut doc, outlines_id);
+
+        let entries = extract_outline_from_doc(&doc, &page_map(&page_ids));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].page, Some(1));
+        assert_eq!(entries[0].dest_kind.as_deref(), Some("FitH"));
+    }
+
+    #[test]
+    fn max_u32_integer_page_index_yields_none_without_overflow() {
+        // A malformed 0-based page index of u32::MAX must return None, not
+        // overflow in `index + 1`.
+        let (mut doc, page_ids) = doc_with_pages(1);
+        let node = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Overflow"),
+            "Dest" => vec![
+                Object::Integer(u32::MAX as i64),
+                Object::Name(b"Fit".to_vec()),
+            ],
+        });
+        let outlines_id = doc.add_object(dictionary! {
+            "Type" => "Outlines",
+            "First" => Object::Reference(node),
+        });
+        set_catalog(&mut doc, outlines_id);
+
+        let entries = extract_outline_from_doc(&doc, &page_map(&page_ids));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].page, None);
+    }
+
+    #[test]
     fn non_goto_action_yields_no_page() {
         let (mut doc, page_ids) = doc_with_pages(1);
         let node = doc.add_object(dictionary! {
@@ -738,6 +829,36 @@ mod tests {
         let entries = extract_outline_from_doc(&doc, &page_map(&page_ids));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "Résumé");
+    }
+
+    #[test]
+    fn pdfdoc_encoding_title_maps_punctuation_and_ligatures() {
+        // Titles without a UTF-16BE BOM are PDFDocEncoded: bytes 0x80–0x9E
+        // are punctuation/ligatures, not the Latin-1 control characters.
+        let (mut doc, page_ids) = doc_with_pages(1);
+        // "ﬁle — 'quoted'" in PDFDocEncoding.
+        let bytes = vec![
+            0x93, b'l', b'e', b' ', 0x84, b' ', 0x8F, b'q', b'u', b'o', b't', b'e', b'd', 0x90,
+        ];
+        let node = doc.add_object(dictionary! {
+            "Title" => Object::String(bytes, lopdf::StringFormat::Literal),
+            "Dest" => vec![
+                Object::Reference(page_ids[0]),
+                Object::Name(b"Fit".to_vec()),
+            ],
+        });
+        let outlines_id = doc.add_object(dictionary! {
+            "Type" => "Outlines",
+            "First" => Object::Reference(node),
+        });
+        set_catalog(&mut doc, outlines_id);
+
+        let entries = extract_outline_from_doc(&doc, &page_map(&page_ids));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].title,
+            "\u{FB01}le \u{2014} \u{2018}quoted\u{2019}"
+        );
     }
 
     #[test]
