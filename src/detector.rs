@@ -1597,7 +1597,7 @@ fn scan_content_for_text_operators(
                     }
                 }
             }
-        } else if b == b'\'' && is_word_start(i) && is_word_end(i) {
+        } else if b == b'\'' && (is_word_start(i) || (i > 0 && is_pdf_delimiter(content[i - 1]))) && is_word_end(i) {
             // ' = move to next line and show text: `(text) '`. Single
             // string operand, same show-text semantics as Tj for our
             // purposes (detecting presence, not reproducing layout) - and
