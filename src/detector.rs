@@ -423,11 +423,21 @@ pub(crate) fn detect_from_document(
                 // this in sync with `page_ocr_signals`.
                 let sparse_text_over_scan = analysis.has_template_image
                     && analysis.text_operator_count < config.min_text_ops_per_page.max(10);
+                // A confirmed invisible (Tr 3) layer under a template image
+                // is a scan needing recovery regardless of how much diverse
+                // *visible* chrome sits on top of it — mirrors the
+                // `pages_with_template_images` gate above and must stay in
+                // sync with `page_ocr_signals`. Without this, a page with
+                // e.g. 10-49 visible ops (clearing looks_like_scan's and
+                // sparse_text_over_scan's floors) plus an invisible body
+                // made the whole document classify Mixed but never queued
+                // that specific page for OCR/recovery.
                 if (analysis.has_template_image && looks_like_scan)
                     || analysis.has_vector_text
                     || sparse_text_over_scan
                     || (analysis.text_operator_count < config.min_text_ops_per_page
                         && analysis.has_images)
+                    || analysis.has_invisible_text
                 {
                     ocr_pages.push(page_num);
                 }
@@ -787,6 +797,15 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // inline and indirect resource dicts respectively.
     let page_resources = doc.get_page_resources(page_id).ok();
 
+    // A page's /Contents can be an array of several stream objects that are
+    // logically one continuous stream (PDF 32000-1, 7.8.2): the split may
+    // only fall between complete tokens, so text/graphics state set in one
+    // stream still applies in the next. Carried across the loop below
+    // instead of reset per stream, or e.g. `3 Tr` in one stream followed by
+    // the real `Tj` in the next would be miscounted as visible.
+    let mut render_mode: i32 = 0;
+    let mut render_mode_stack: Vec<i32> = Vec::new();
+
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
             let content = match stream.decompressed_content() {
@@ -800,6 +819,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 &content,
                 &mut all_unique_chars,
                 &mut page_font_names,
+                &mut render_mode,
+                &mut render_mode_stack,
             );
             text_ops += ops;
             has_invisible_text = has_invisible_text || invisible;
@@ -1337,10 +1358,20 @@ fn scan_xobjects_in_resources(
                         .unwrap_or_else(|_| stream.content.clone());
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
+                    // Fresh, form-local render-mode state: a Form XObject's
+                    // content stream is executed with an implicit q/Q around
+                    // it (PDF 32000-1, 8.10), so its Tr changes never leak
+                    // to the caller's tracking - unlike the page-level
+                    // /Contents array (see analyze_page_content), which is
+                    // one logical stream and must carry state across parts.
+                    let mut form_render_mode = 0i32;
+                    let mut form_render_mode_stack: Vec<i32> = Vec::new();
                     let (ops, imgs, paths, fonts, invisible) = scan_content_for_text_operators(
                         &content,
                         unique_chars,
                         &mut xobj_font_names,
+                        &mut form_render_mode,
+                        &mut form_render_mode_stack,
                     );
                     text_ops += ops;
                     image_count += imgs;
@@ -1420,6 +1451,8 @@ fn scan_content_for_text_operators(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
     used_font_names: &mut HashSet<Vec<u8>>,
+    render_mode: &mut i32,
+    render_mode_stack: &mut Vec<i32>,
 ) -> (u32, u32, u32, u32, bool) {
     let mut text_ops = 0u32;
     let image_count = 0u32;
@@ -1430,9 +1463,12 @@ fn scan_content_for_text_operators(
     // Text rendering mode (Tr operand): 0=fill, 1=stroke, 2=fill+stroke,
     // 3=invisible, 4-7=add-to-clip variants. Part of the graphics state, so
     // it is saved/restored by q/Q like any other graphics state parameter —
-    // tracked with a small stack alongside the single running value.
-    let mut render_mode: i32 = 0;
-    let mut render_mode_stack: Vec<i32> = Vec::new();
+    // tracked with a small stack alongside the single running value. Caller-
+    // owned (not local) because a page's `/Contents` can be an array of
+    // several stream objects that are logically one continuous stream (PDF
+    // 32000-1, 7.8.2): state set in one must still apply to operators in
+    // the next, so `analyze_page_content` carries one instance across its
+    // loop over that array instead of resetting it per stream.
 
     // Helper: check if position is a word boundary (start of content or preceded by whitespace)
     let is_word_start = |pos: usize| -> bool { pos == 0 || content[pos - 1].is_ascii_whitespace() };
@@ -1459,9 +1495,42 @@ fn scan_content_for_text_operators(
     // `Tj`/`TJ` are only counted when the preceding token closes a string or
     // array (')', '>', ']'), so `Tj` inside `(Hello Tj World)` cannot pin the floor.
     let mut operand_floor = 0usize;
+    // Nesting depth of the literal string we're currently inside, if any.
+    // `Tj`/`TJ` lean on `preceding_operand_closer` to reject a false match
+    // like the word "Tj" inside `(see figure Tj)`, but that guard only
+    // covers operators whose real operand is a string/array (so it's
+    // preceded by a closing delimiter). `Tr`'s operand is a bare number, so
+    // "3 Tr" inside a comment or string (`% figure 3 Tr`, `(page 3 Tr note)`)
+    // has no such guard and would otherwise corrupt render_mode. Skipping
+    // string/comment bytes here up front closes that gap for every operator
+    // this scanner looks for, not just Tr.
+    let mut string_depth: i32 = 0;
     let mut i = 0;
     while i < content.len() {
         let b = content[i];
+
+        if string_depth > 0 {
+            match b {
+                b'\\' => i = i.saturating_add(1), // skip the escaped byte too
+                b'(' => string_depth += 1,
+                b')' => string_depth -= 1,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'%' {
+            // Comment: runs to end of line (or end of content).
+            while i < content.len() && content[i] != b'\n' && content[i] != b'\r' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'(' {
+            string_depth = 1;
+            i += 1;
+            continue;
+        }
 
         // Look for 'T' followed by 'j', 'J', 'f', or 'r'
         if b == b'T' && i + 1 < content.len() {
@@ -1474,8 +1543,18 @@ fn scan_content_for_text_operators(
                     || content[i + 2] == b'\r')
                     && preceding_operand_closer(content, i, operand_floor)
                 {
-                    if render_mode == 3 {
-                        has_invisible_text = true;
+                    if *render_mode == 3 {
+                        // An empty `() Tj` or a numeric-only `[...] TJ`
+                        // (pure kerning, no string operands) has nothing to
+                        // recover - don't claim an invisible layer exists
+                        // when it doesn't. Reuses the same string-operand
+                        // parsing as the visible path via a scratch set
+                        // instead of duplicating it.
+                        let mut invisible_chars = HashSet::new();
+                        collect_text_chars_before(content, i, &mut invisible_chars, operand_floor);
+                        if !invisible_chars.is_empty() {
+                            has_invisible_text = true;
+                        }
                     } else {
                         text_ops += 1;
                         collect_text_chars_before(content, i, unique_chars, operand_floor);
@@ -1513,10 +1592,28 @@ fn scan_content_for_text_operators(
                     && is_word_start(i)
                 {
                     if let Some(mode) = extract_number_before_op(content, i, operand_floor) {
-                        render_mode = mode;
+                        *render_mode = mode;
                         operand_floor = i;
                     }
                 }
+            }
+        } else if b == b'\'' && is_word_start(i) && is_word_end(i) {
+            // ' = move to next line and show text: `(text) '`. Single
+            // string operand, same show-text semantics as Tj for our
+            // purposes (detecting presence, not reproducing layout) - and
+            // the same render-mode/emptiness handling.
+            if preceding_operand_closer(content, i, operand_floor) {
+                if *render_mode == 3 {
+                    let mut invisible_chars = HashSet::new();
+                    collect_text_chars_before(content, i, &mut invisible_chars, operand_floor);
+                    if !invisible_chars.is_empty() {
+                        has_invisible_text = true;
+                    }
+                } else {
+                    text_ops += 1;
+                    collect_text_chars_before(content, i, unique_chars, operand_floor);
+                }
+                operand_floor = i;
             }
         }
 
@@ -1532,11 +1629,11 @@ fn scan_content_for_text_operators(
         // These are the high-volume operators in vector-outlined text.
         match b {
             b'q' if is_word_start(i) && is_word_end(i) => {
-                render_mode_stack.push(render_mode);
+                render_mode_stack.push(*render_mode);
             }
             b'Q' if is_word_start(i) && is_word_end(i) => {
                 if let Some(prev) = render_mode_stack.pop() {
-                    render_mode = prev;
+                    *render_mode = prev;
                 }
             }
             b'm' | b'l' | b'c' | b'h' | b'f' | b'S' | b's' | b'B' | b'F'
@@ -1959,7 +2056,7 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool
             analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
         let insufficient_text =
             analysis.text_operator_count < DetectionConfig::default().min_text_ops_per_page.max(10);
-        looks_like_scan || insufficient_text
+        looks_like_scan || insufficient_text || analysis.has_invisible_text
     };
 
     (needs_ocr_for_template_image, analysis.has_vector_text)
@@ -2150,8 +2247,13 @@ mod tests {
 
         // Sample PDF content stream with text operators
         let content = b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET";
-        let (ops, imgs, _, _, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, imgs, _, _, _) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0);
         // "Hello World" without space: H, e, l, o, W, r, d = 7 unique
@@ -2160,8 +2262,13 @@ mod tests {
         // Content with TJ array
         uchars.clear();
         let content2 = b"BT /F1 12 Tf 100 700 Td [(H) 10 (ello)] TJ ET";
-        let (ops2, _, _, _, _) =
-            scan_content_for_text_operators(content2, &mut uchars, &mut HashSet::new());
+        let (ops2, _, _, _, _) = scan_content_for_text_operators(
+            content2,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops2, 1);
         // H, e, l, o = 4 unique
         assert!(uchars.len() >= 4);
@@ -2170,8 +2277,13 @@ mod tests {
         // actual image detection is handled by scan_xobjects_in_resources)
         uchars.clear();
         let content3 = b"q 100 0 0 100 50 700 cm /Img1 Do Q";
-        let (ops3, imgs3, _, _, _) =
-            scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
+        let (ops3, imgs3, _, _, _) = scan_content_for_text_operators(
+            content3,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops3, 0);
         assert_eq!(imgs3, 0);
     }
@@ -2182,8 +2294,13 @@ mod tests {
         // still see their own operands.
         let content = b"[(Hello)] TJ [(World)] TJ (More) Tj";
         let mut uchars = HashSet::new();
-        let (ops, _, _, _, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, _) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 3);
         for &ch in b"HeloWrdM" {
             assert!(uchars.contains(&ch), "missing char {}", ch as char);
@@ -2196,8 +2313,13 @@ mod tests {
         // or pin the lookback floor; the real `Tj` still collects the string.
         let content = b"BT (Hello Tj World) Tj ET";
         let mut uchars = HashSet::new();
-        let (ops, _, _, _, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, _) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 1);
         for &ch in b"HeloTjWrd" {
             assert!(uchars.contains(&ch), "missing char {}", ch as char);
@@ -2215,8 +2337,13 @@ mod tests {
             content.extend_from_slice(b"] TJ\n");
         }
         let mut uchars = HashSet::new();
-        let (ops, _, _, _, _) =
-            scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, _) = scan_content_for_text_operators(
+            &content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, n as u32);
         assert!(uchars.is_empty());
     }
@@ -2235,8 +2362,13 @@ mod tests {
         content.extend_from_slice(b"BT (x) Tj ET\n");
 
         let mut uchars = HashSet::new();
-        let (ops, imgs, _, _, _) =
-            scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
+        let (ops, imgs, _, _, _) = scan_content_for_text_operators(
+            &content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 3);
         assert_eq!(imgs, 0); // Do operators are not counted here
         assert_eq!(uchars.len(), 1);
@@ -2247,8 +2379,13 @@ mod tests {
         let content = b"BT /F1 12 Tf (The quick brown fox jumps over the lazy dog) Tj ET\n\
                          /Img1 Do\n/Img2 Do\n";
         let mut uchars = HashSet::new();
-        let (ops, imgs, _, _, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, imgs, _, _, _) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0); // Do operators not counted here
                              // Many unique chars from the sentence
@@ -2268,8 +2405,13 @@ mod tests {
         content.extend_from_slice(b"f\n");
 
         let mut uchars = HashSet::new();
-        let (text, imgs, paths, _, _) =
-            scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
+        let (text, imgs, paths, _, _) = scan_content_for_text_operators(
+            &content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(text, 1);
         assert_eq!(imgs, 0);
         // 500 * (m + l + c + h) + 1 f = 2001
@@ -2294,8 +2436,13 @@ mod tests {
         }
 
         let mut uchars = HashSet::new();
-        let (text, _, paths, _, _) =
-            scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
+        let (text, _, paths, _, _) = scan_content_for_text_operators(
+            &content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(text, 20);
         assert!(paths >= 40, "expected >= 40 path ops, got {paths}");
 
@@ -2539,8 +2686,13 @@ mod tests {
     fn test_scan_content_counts_tf_operators() {
         let mut uchars = HashSet::new();
         let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
-        let (ops, _, _, fonts, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, fonts, _) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 2);
         assert_eq!(fonts, 2);
     }
@@ -2553,32 +2705,52 @@ mod tests {
 
         // Tf followed by '[' (TJ array start)
         let content = b"BT /F1 25 Tf[<01>1<02>-1] TJ ET";
-        let (ops, _, _, fonts, _) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, fonts, _) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(fonts, 1, "Tf followed by '[' should be counted");
         assert_eq!(ops, 1);
 
         // Tf followed by '(' (literal string)
         uchars.clear();
         let content2 = b"BT /F1 12 Tf(Hello) Tj ET";
-        let (ops2, _, _, fonts2, _) =
-            scan_content_for_text_operators(content2, &mut uchars, &mut HashSet::new());
+        let (ops2, _, _, fonts2, _) = scan_content_for_text_operators(
+            content2,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(fonts2, 1, "Tf followed by '(' should be counted");
         assert_eq!(ops2, 1);
 
         // Tf followed by '<' (hex string)
         uchars.clear();
         let content3 = b"BT /F1 12 Tf<0102> Tj ET";
-        let (ops3, _, _, fonts3, _) =
-            scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
+        let (ops3, _, _, fonts3, _) = scan_content_for_text_operators(
+            content3,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(fonts3, 1, "Tf followed by '<' should be counted");
         assert_eq!(ops3, 1);
 
         // Tf followed by '/' (next font name)
         uchars.clear();
         let content4 = b"BT /F1 12 Tf/F2 10 Tf (x) Tj ET";
-        let (_, _, _, fonts4, _) =
-            scan_content_for_text_operators(content4, &mut uchars, &mut HashSet::new());
+        let (_, _, _, fonts4, _) = scan_content_for_text_operators(
+            content4,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(fonts4, 2, "Tf followed by '/' should be counted");
     }
 
@@ -2591,8 +2763,13 @@ mod tests {
         // has_invisible_text so callers can still recover it deliberately.
         let mut uchars = HashSet::new();
         let content = b"BT /F1 12 Tf 3 Tr (Hidden OCR text) Tj ET";
-        let (ops, _, _, _, invisible) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 0, "invisible Tj must not count as a text op");
         assert!(uchars.is_empty(), "invisible Tj must not contribute chars");
         assert!(
@@ -2608,8 +2785,13 @@ mod tests {
         // toward text_ops, but has_invisible_text still fires.
         let mut uchars = HashSet::new();
         let content = b"BT /F1 12 Tf (STAMP-001) Tj 3 Tr (Full OCR body text here) Tj ET";
-        let (ops, _, _, _, invisible) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 1, "only the visible Tj should count");
         assert!(invisible);
     }
@@ -2620,8 +2802,13 @@ mod tests {
         // count as visible again.
         let mut uchars = HashSet::new();
         let content = b"BT /F1 12 Tf 3 Tr (hidden) Tj 0 Tr (visible) Tj ET";
-        let (ops, _, _, _, invisible) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 1, "only the post-reset Tj should count");
         assert!(invisible, "the earlier invisible Tj is still reported");
     }
@@ -2632,8 +2819,13 @@ mod tests {
         // after the matching Q, even with no reset operator of its own.
         let mut uchars = HashSet::new();
         let content = b"BT /F1 12 Tf q 3 Tr (hidden) Tj Q (visible) Tj ET";
-        let (ops, _, _, _, invisible) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(ops, 1, "text after Q must use the pre-q render mode");
         assert!(invisible);
     }
@@ -2646,8 +2838,13 @@ mod tests {
         // keep this readable while still exercising a 2-deep stack.
         let content =
             b"BT /F1 12 Tf (a) Tj q 1 Tr q 3 Tr (hidden) Tj Q (stroke-again) Tj Q (fill-again) Tj ET";
-        let (ops, _, _, _, invisible) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         // "a", "stroke-again", "fill-again" are visible (modes 0 and 1);
         // only "hidden" (mode 3) is excluded.
         assert_eq!(ops, 3);
@@ -2663,8 +2860,13 @@ mod tests {
         // releases, where the whole body is one continuous invisible run.
         let mut uchars = HashSet::new();
         let content = b"BT 3 Tr/F1 12 Tf(hidden body text)Tj ET";
-        let (ops, _, _, _, invisible) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(
             ops, 0,
             "Tr immediately followed by a delimiter must still be recognized"
@@ -2680,8 +2882,13 @@ mod tests {
         // stack desyncs and render mode leaks across scopes.
         let mut uchars = HashSet::new();
         let content = b"q%masthead layer\n3 Tr (hidden) Tj Q (visible) Tj";
-        let (ops, _, _, _, invisible) =
-            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
         assert_eq!(
             ops, 1,
             "q immediately followed by a comment must still push state"
@@ -2696,6 +2903,139 @@ mod tests {
         assert_eq!(extract_number_before_op(b"12 3 Tr", 5, 0), Some(3));
         // No preceding number - not a valid Tr invocation.
         assert_eq!(extract_number_before_op(b"Tr", 0, 0), None);
+    }
+
+    #[test]
+    fn test_tr_empty_string_operand_does_not_set_invisible() {
+        // `() Tj` under Tr 3 has no text to recover - nothing should be
+        // reported as an invisible layer.
+        let mut uchars = HashSet::new();
+        let content = b"3 Tr () Tj";
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
+        assert_eq!(ops, 0);
+        assert!(!invisible, "an empty string operand has nothing to recover");
+    }
+
+    #[test]
+    fn test_tr_numeric_only_tj_array_does_not_set_invisible() {
+        // A `TJ` array of pure kerning adjustments (no string elements) is
+        // the same "nothing to recover" case as an empty Tj.
+        let mut uchars = HashSet::new();
+        let content = b"3 Tr [-500 300 -120] TJ";
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
+        assert_eq!(ops, 0);
+        assert!(!invisible, "a numeric-only TJ array has no string content");
+    }
+
+    #[test]
+    fn test_apostrophe_visible_text_counted() {
+        // ' = move to next line and show text: a single string operand,
+        // same show-text semantics as Tj for counting purposes.
+        let mut uchars = HashSet::new();
+        let content = b"(Hello) '";
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
+        assert_eq!(ops, 1);
+        assert!(!invisible);
+    }
+
+    #[test]
+    fn test_apostrophe_invisible_text_detected() {
+        // Before this fix, invisible text shown via ' (rather than Tj/TJ)
+        // was never reported at all - the scanner only recognized Tj/TJ.
+        let mut uchars = HashSet::new();
+        let content = b"3 Tr (Hidden OCR line) '";
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            ops, 0,
+            "invisible text shown via ' must not count as visible"
+        );
+        assert!(
+            invisible,
+            "invisible text shown via ' must still be detected"
+        );
+    }
+
+    #[test]
+    fn test_tr_inside_string_literal_is_not_an_operator() {
+        // "3 Tr" appearing as literal string content (not a real operator)
+        // must not corrupt render_mode - the real Tj that shows this string
+        // (and the one after it) must both count as ordinary visible text.
+        let mut uchars = HashSet::new();
+        let content = b"(page 3 Tr note) Tj (after) Tj";
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            ops, 2,
+            "the text 'Tr' inside a string literal must not be treated as a real Tr operator"
+        );
+        assert!(!invisible);
+    }
+
+    #[test]
+    fn test_tr_inside_comment_is_not_an_operator() {
+        // Same hazard as the string case, but for a `%` comment - which,
+        // unlike Tj/TJ's string-closer guard, Tr's bare-number operand has
+        // no natural protection against at all.
+        let mut uchars = HashSet::new();
+        let content = b"% see page 3 Tr for details\n(visible) Tj";
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            ops, 1,
+            "the text 'Tr' inside a comment must not be treated as a real Tr operator"
+        );
+        assert!(!invisible);
+    }
+
+    #[test]
+    fn test_percent_inside_string_is_not_a_comment() {
+        // A literal `%` can legitimately appear as string content (e.g. "50%
+        // off"); it must not be misread as a comment-start that swallows the
+        // rest of the string, including the real Tj that follows.
+        let mut uchars = HashSet::new();
+        let content = b"(50% off) Tj";
+        let (ops, _, _, _, _) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
+        assert_eq!(ops, 1, "a % inside a string is not a comment");
     }
 
     #[test]
@@ -3111,7 +3451,7 @@ mod tests {
         let mut uchars = HashSet::new();
         let mut fonts = HashSet::new();
         let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
-        scan_content_for_text_operators(content, &mut uchars, &mut fonts);
+        scan_content_for_text_operators(content, &mut uchars, &mut fonts, &mut 0, &mut Vec::new());
         assert!(fonts.contains(&b"F1".to_vec()), "should collect F1");
         assert!(fonts.contains(&b"F2".to_vec()), "should collect F2");
         assert_eq!(fonts.len(), 2);
@@ -3508,6 +3848,108 @@ mod tests {
         let config = DetectionConfig::default();
         let result = detect_from_document(&doc, 1, &config).unwrap();
         assert_eq!(result.pdf_type, PdfType::Mixed);
+    }
+
+    #[test]
+    fn test_invisible_body_with_diverse_visible_text_still_queues_page_for_ocr() {
+        // A page with substantial, diverse visible chrome (12 lines - well
+        // past the `alphanum_ok`/`sparse_text_over_scan` floors both being
+        // < 10 text ops) plus an invisible OCR body. Whole-document
+        // classification correctly said Mixed for this case already, but
+        // the per-page `pages_needing_ocr` list (built separately in
+        // `detect_from_document`'s Mixed-type loop, and duplicated in
+        // `page_ocr_signals` for `extract_pages_markdown`) didn't check
+        // `has_invisible_text` at all, so this specific page was silently
+        // skipped for recovery even though the document overall knew it
+        // needed it.
+        let lines: Vec<String> = (0..12)
+            .map(|i| format!("Masthead diverse chrome line {i}"))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (doc, page_id) =
+            masthead_scan_page_with_invisible_body(&refs, "The real hidden body text.");
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.text_operator_count >= 10,
+            "sanity: visible chrome clears both alphanum_ok and sparse_text_over_scan floors"
+        );
+        assert!(analysis.has_invisible_text);
+
+        let config = DetectionConfig::default();
+        let result = detect_from_document(&doc, 1, &config).unwrap();
+        assert_eq!(result.pdf_type, PdfType::Mixed);
+        assert!(
+            result.pages_needing_ocr.contains(&1),
+            "the document is Mixed but page 1 must still be queued for \
+             invisible-layer recovery, got: {:?}",
+            result.pages_needing_ocr
+        );
+
+        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        assert!(
+            needs_ocr,
+            "page_ocr_signals must agree with detect_from_document that this page needs recovery"
+        );
+    }
+
+    /// A page whose `/Contents` is an array of two separate stream objects,
+    /// split mid-sequence between complete tokens: `3 Tr` in the first
+    /// stream, the invisible `Tj` in the second. Per PDF 32000-1, 7.8.2 this
+    /// must behave exactly as if both streams were one concatenated stream.
+    fn multi_stream_invisible_text_page() -> (Document, ObjectId) {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let stream_a_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            b"3 Tr".to_vec(),
+        )));
+        let stream_b_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            b"(hidden across stream boundary) Tj".to_vec(),
+        )));
+
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {},
+                "Contents" => vec![Object::Reference(stream_a_id), Object::Reference(stream_b_id)],
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, page_id)
+    }
+
+    #[test]
+    fn test_render_mode_persists_across_page_content_streams() {
+        let (doc, page_id) = multi_stream_invisible_text_page();
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(
+            analysis.text_operator_count, 0,
+            "Tr set in one content stream must still apply to a Tj in the next"
+        );
+        assert!(
+            analysis.has_invisible_text,
+            "the Tj split into the second stream must still be recognized as invisible"
+        );
     }
 
     // ---------- P2 tests: Form XObject font traversal ----------

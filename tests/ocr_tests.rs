@@ -177,12 +177,13 @@ fn auto_prefers_recovered_invisible_ocr_layer_over_a_fresh_ocr_pass() {
     // reaching the Mixed-only invisible-text retry at all). Its OCR reason
     // is `scanned`, not `suspected_garbled_text`/`vector_text`, so - unlike
     // `auto_recovers_credible_native_text_before_loading_ocr_models` above -
-    // it doesn't qualify for the short-circuit that skips OCR entirely;
-    // `auto` mode still renders and OCRs the (blank placeholder) page image.
-    // What must hold is that fusion still prefers the recovered, higher-
-    // fidelity native text - originally embedded by whatever tool produced
-    // the scan - over the OCR engine's much weaker re-derivation of a plain
-    // gray rectangle.
+    // it doesn't qualify for the short-circuit that skips OCR entirely:
+    // `auto` mode still renders and OCRs the page image (asserted below via
+    // `pages_routed_to_ocr`, so this test can't silently stop exercising
+    // that path). What must hold is that fusion still prefers the
+    // recovered, higher-fidelity native text - originally embedded by
+    // whatever tool produced the scan - over the OCR engine's own weaker
+    // re-derivation of the same rasterized text.
     let Some(model_directory) = std::env::var_os(MODEL_DIRECTORY_ENV) else {
         eprintln!("skipping OCR runtime test because {MODEL_DIRECTORY_ENV} is not set");
         return;
@@ -198,6 +199,13 @@ fn auto_prefers_recovered_invisible_ocr_layer_over_a_fresh_ocr_pass() {
         .model_downloads(ModelDownloadPolicy::Offline);
     let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().ocr(ocr)).unwrap();
 
+    assert_eq!(
+        result.pages_routed_to_ocr,
+        vec![1],
+        "page 1's OCR reason is `scanned`, not `garbled`/`vector_text`, so it \
+         must actually go through OCR - otherwise this test never exercises \
+         the fusion-prefers-native behavior its name claims to check"
+    );
     assert!(result.markdown.contains("Jane Roe"));
     assert!(result.markdown.contains("John Smith"));
     assert!(result
