@@ -114,6 +114,17 @@ class StructureElement:
     role: str
     """Standard structure type name ("H1".."H6", "P", "Table", "TD", ...)."""
 
+class OutlineEntry:
+    """One flattened outline (bookmark) entry from the /Outlines tree."""
+    level: int
+    """1-based nesting depth (top-level bookmarks are level 1)."""
+    title: str
+    """Bookmark title (decoded from UTF-16BE or PDFDocEncoding)."""
+    page: Optional[int]
+    """1-indexed target page (matches TextItem.page), None when unresolved."""
+    dest_kind: Optional[str]
+    """Destination kind: fit type ("XYZ", "Fit", "FitH", ...) or "named"."""
+
 class RegionText:
     """Extracted text for a single region."""
     text: str
@@ -245,6 +256,29 @@ def extract_structure_elements_bytes(data: bytes, pages: Optional[list[int]] = N
     """Extract structure-tree element references from tagged PDF bytes.
 
     See :func:`extract_structure_elements` for details.
+    """
+    ...
+
+def extract_outline(path: str, pages: Optional[list[int]] = None) -> list[OutlineEntry]:
+    """Extract the document outline (bookmarks) from a PDF file.
+
+    Walks the catalog's /Outlines tree and returns one OutlineEntry per
+    bookmark in document order, matching PyMuPDF's simple TOC shape
+    ([level, title, page] plus the destination kind). Returns an empty list
+    when the PDF has no outline.
+
+    Args:
+        path: Path to the PDF file.
+        pages: Optional list of 1-indexed pages (matching ``TextItem.page``).
+            When given, only entries resolving to those pages are returned;
+            when ``None`` (default), the whole outline is returned.
+    """
+    ...
+
+def extract_outline_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[OutlineEntry]:
+    """Extract the document outline (bookmarks) from PDF bytes.
+
+    See :func:`extract_outline` for details.
     """
     ...
 
