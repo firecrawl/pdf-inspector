@@ -1,0 +1,29 @@
+src/extractor/geometry.rs
+  s_9d37727abe0b7e::t_286a03276d563a 7-14,16,50-51,55-58,62-63,246-249
+tests/integration_tests.rs
+  s_9d37727abe0b7e::t_1c6d90f7693836 8-9,4604-4611
+src/extractor/mod.rs
+  s_9d37727abe0b7e::t_1c6d90f7693836 257-262
+  s_9d37727abe0b7e::t_286a03276d563a 119,138-157,166,178-182,190,201,210,219,228,241,251-256,268,273,283,293,305,493,3588,3590
+src/lib.rs
+  s_9d37727abe0b7e::t_508adeef45f7b1 4366
+  s_9d37727abe0b7e::t_286a03276d563a 52,54-56,521,3621-3627,3648-3673,3765,3767-3771,3773-3774,4298,7902-7904,7907,7917-7924,7926-7934,7936
+docs/rust-api.md
+  s_9d37727abe0b7e::t_1c6d90f7693836 510-511,535
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "7295b2b015b38bcf59ae5f4a7b65abce1b33d44e",
+  "prompts": {},
+  "sessions": {
+    "s_9d37727abe0b7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc8426ba-5c23-49c3-a8f8-b78998896dc0",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
