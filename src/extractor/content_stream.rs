@@ -18,7 +18,7 @@ use super::fonts::{
     compute_string_width_ts, descriptor_style_flags, extract_text_from_operand,
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
-use super::geometry::{normalize_degrees, run_geometry, PageRotation};
+use super::geometry::{normalize_degrees, rise_adjusted, run_geometry, PageRotation};
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -117,25 +117,6 @@ fn transformed_stroke_width(
     let ndx = nx * ctm[0] + ny * ctm[2];
     let ndy = nx * ctm[1] + ny * ctm[3];
     user_width * (ndx * ndx + ndy * ndy).sqrt()
-}
-
-/// Text rise (Ts) displaces the glyph origin by (0, rise) in unscaled text
-/// space — per the rendering-matrix definition it sits left of Tm, so the
-/// offset maps through the text matrix's y column. Rise never contributes
-/// to the advance, so callers apply it only to the rendering position and
-/// keep advancing the unshifted text matrix.
-fn rise_adjusted(tm: &[f32; 6], rise: f32) -> [f32; 6] {
-    if rise == 0.0 {
-        return *tm;
-    }
-    [
-        tm[0],
-        tm[1],
-        tm[2],
-        tm[3],
-        tm[4] + rise * tm[2],
-        tm[5] + rise * tm[3],
-    ]
 }
 
 /// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible)`
@@ -1026,6 +1007,7 @@ pub(crate) fn extract_page_text_items(
                                         page_num,
                                         font_cmaps,
                                         &ctm,
+                                        include_invisible,
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
@@ -1035,6 +1017,7 @@ pub(crate) fn extract_page_text_items(
                                         &mut rtl_visual_candidates,
                                         &mut rtl_logical_ops,
                                         &mut form_runs,
+                                        &mut skipped_invisible,
                                     );
                                     // Form runs vote on page rotation like
                                     // page-stream runs — once per show

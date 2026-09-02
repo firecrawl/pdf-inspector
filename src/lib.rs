@@ -3016,8 +3016,8 @@ struct TsrCellTextLine {
 
 impl TsrCellTextLine {
     fn new(item: TextItem) -> Self {
-        let center_y = item.y + item.height * 0.5;
-        let half_height = (item.height * 0.5).max(2.5);
+        let center_y = item.y + text_utils::effective_height(&item) * 0.5;
+        let half_height = (text_utils::effective_height(&item) * 0.5).max(2.5);
         Self {
             center_y,
             half_height,
@@ -3026,10 +3026,12 @@ impl TsrCellTextLine {
     }
 
     fn add(&mut self, item: TextItem) {
-        let center_y = item.y + item.height * 0.5;
+        let center_y = item.y + text_utils::effective_height(&item) * 0.5;
         let existing = self.items.len() as f32;
         self.center_y = (self.center_y * existing + center_y) / (existing + 1.0);
-        self.half_height = self.half_height.max((item.height * 0.5).max(2.5));
+        self.half_height = self
+            .half_height
+            .max((text_utils::effective_height(&item) * 0.5).max(2.5));
         self.items.push(item);
     }
 
@@ -3078,8 +3080,8 @@ fn cluster_tsr_cell_text_lines(mut items: Vec<TextItem>) -> Vec<TsrCellTextLine>
 
     let mut lines: Vec<TsrCellTextLine> = Vec::new();
     for item in items {
-        let item_top = item.y + item.height;
-        let item_half_height = (item.height * 0.5).max(2.5);
+        let item_top = item.y + text_utils::effective_height(&item);
+        let item_half_height = (text_utils::effective_height(&item) * 0.5).max(2.5);
         if let Some(last) = lines.last_mut() {
             let gap = last.bottom_y() - item_top;
             if gap <= last.half_height.max(item_half_height) {
@@ -3614,11 +3616,11 @@ struct RegionBounds {
 /// and return them as a single string in reading order.
 ///
 /// Items from a page whose text was predominantly rotated live in a turned
-/// coordinate frame (see `TextItem::rotation`); this entry point recognises
-/// that frame heuristically from the axis the turn negated. Callers that
-/// hold the extractor's page metadata should prefer
-/// [`extract_text_in_regions_mem`], which carries the page rotation
-/// explicitly.
+/// coordinate frame (see `TextItem::rotation`). This entry point recognises
+/// only the counter-clockwise turn, heuristically (most items at negative
+/// y); a clockwise turn is not inferred. Callers that hold the extractor's
+/// page metadata should prefer [`extract_text_in_regions_mem`], which
+/// carries the page rotation explicitly and handles both turns.
 pub fn collect_text_in_region(
     items: &[TextItem],
     rx1: f32,
@@ -3730,19 +3732,15 @@ fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
     // so most items land at negative y or negative x respectively. Use this
     // to keep `collect_text_in_region` behavior compatible for direct
     // callers that do not have extractor metadata.
-    // A turned frame negates exactly one axis; content that is negative on
-    // both, or on neither, is ordinary page content however odd its
-    // coordinates.
-    if items.is_empty() {
-        return RegionCoordSpace::Standard;
-    }
-    let n = items.len();
+    // Legacy heuristic for callers without extractor metadata: a
+    // counter-clockwise turn maps y = -(old right edge), so most items land
+    // at negative y. A clockwise turn is deliberately NOT inferred — its
+    // signature (negative x) cannot be told apart from content drawn at
+    // negative page coordinates. `extract_text_in_regions_mem` carries the
+    // page rotation explicitly and handles both turns.
     let negative_y = items.iter().filter(|item| item.y < 0.0).count();
-    let negative_x = items.iter().filter(|item| item.x < 0.0).count();
-    if negative_y * 2 >= n && negative_x * 2 < n {
+    if !items.is_empty() && negative_y * 2 >= items.len() {
         RegionCoordSpace::Rotated90Ccw
-    } else if negative_x * 2 >= n && negative_y * 2 < n {
-        RegionCoordSpace::Rotated90Cw
     } else {
         RegionCoordSpace::Standard
     }
@@ -7870,11 +7868,11 @@ mod rotated_run_region_tests {
         assert!(region_overlaps_item(&header, strip));
         assert!(!region_overlaps_item(&header, body));
 
-        // The frame is inferred from the negated axis: x for clockwise
-        // pages, y for counter-clockwise ones.
+        // The legacy heuristic recognises the counter-clockwise frame from
+        // its negative y; a clockwise frame (negative x) is never inferred.
         assert_eq!(
             infer_region_coord_space(&[header.clone()]),
-            RegionCoordSpace::Rotated90Cw
+            RegionCoordSpace::Standard
         );
         assert_eq!(
             infer_region_coord_space(&[item("x", 100.0, -200.0, 36.0, 12.0, 0.0)]),
@@ -7882,11 +7880,6 @@ mod rotated_run_region_tests {
         );
         assert_eq!(
             infer_region_coord_space(&[item("x", 100.0, 200.0, 36.0, 12.0, 0.0)]),
-            RegionCoordSpace::Standard
-        );
-        // Negative on both axes is not a turned frame.
-        assert_eq!(
-            infer_region_coord_space(&[item("x", -100.0, -200.0, 36.0, 12.0, 0.0)]),
             RegionCoordSpace::Standard
         );
 
@@ -7904,6 +7897,15 @@ mod rotated_run_region_tests {
             );
             assert_eq!(back, [570.0, 80.0, 600.0, 140.0], "{coords:?}");
         }
+    }
+
+    #[test]
+    fn tsr_line_clustering_uses_the_estimated_height_of_unknown_advances() {
+        let stamp = item(STAMP, 12.0, 200.0, 20.0, 0.0, 90.0);
+        let lines = cluster_tsr_cell_text_lines(vec![stamp]);
+        assert_eq!(lines.len(), 1);
+        // 37 glyphs × 0.5em at 20pt: a real extent, not the 2.5pt floor.
+        assert!(lines[0].half_height > 100.0, "{}", lines[0].half_height);
     }
 
     #[test]

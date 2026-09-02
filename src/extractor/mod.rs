@@ -413,8 +413,13 @@ fn extract_positioned_text_impl(
         all_rects.extend(rects);
         all_lines.extend(lines);
 
-        // Extract hyperlinks from page annotations
+        // Extract hyperlinks from page annotations. A turned page turns its
+        // annotation boxes too, so links stay on the text they cover and in
+        // the regions that text is assigned to.
         let mut links = extract_page_links(doc, page_id, *page_num);
+        for link in &mut links {
+            coords_rotated.rotate_box(&mut link.x, &mut link.y, &mut link.width, &mut link.height);
+        }
         // Annotations from the neighboring page are off-box too.
         if let Some((bx0, by0, bx1, by1)) = clipped_box {
             links.retain(|it| {
@@ -3464,6 +3469,76 @@ mod tests {
         let merged = merge_text_items(vec![stamp, body_after_upright_stamp]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "arXiv:2301.00001 Body text");
+    }
+
+    #[test]
+    fn link_annotations_turn_with_a_rotated_page() {
+        use crate::tounicode::FontCMaps;
+        use lopdf::{dictionary, Object, Stream};
+
+        // Two 90° runs make the page rotated; the link annotation covering
+        // the first one (page box x 188..200, y 100..140) must land in the
+        // same turned frame as the text: x = old y, y = -(old right edge).
+        let mut doc = lopdf::Document::new();
+        let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths),
+        });
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (HELLO) Tj ET
+BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
+                .to_vec(),
+        )));
+        let link_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Link",
+            "Rect" => vec![188.into(), 100.into(), 200.into(), 140.into()],
+            "A" => dictionary! {
+                "S" => "URI",
+                "URI" => Object::string_literal("https://example.com/"),
+            },
+        });
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Annots" => vec![Object::Reference(link_id)],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _) =
+            extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+        let hello = items.iter().find(|i| i.text == "HELLO").unwrap();
+        assert_eq!(hello.rotation, 0.0);
+        assert!((hello.x - 100.0).abs() < 0.01 && (hello.y + 200.0).abs() < 0.01);
+        let link = items
+            .iter()
+            .find(|i| matches!(i.item_type, ItemType::Link(_)))
+            .expect("link item");
+        assert_eq!(
+            (link.x, link.y, link.width, link.height),
+            (100.0, -200.0, 40.0, 12.0)
+        );
+        assert_eq!(link.rotation, 0.0);
     }
 
     #[test]

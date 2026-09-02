@@ -57,6 +57,25 @@ impl PageRotation {
     }
 }
 
+/// Text rise (Ts) displaces the glyph origin by (0, rise) in unscaled text
+/// space — per the rendering-matrix definition it sits left of Tm, so the
+/// offset maps through the text matrix's y column. Rise never contributes
+/// to the advance, so callers apply it only to the rendering position and
+/// keep advancing the unshifted text matrix.
+pub(crate) fn rise_adjusted(tm: &[f32; 6], rise: f32) -> [f32; 6] {
+    if rise == 0.0 {
+        return *tm;
+    }
+    [
+        tm[0],
+        tm[1],
+        tm[2],
+        tm[3],
+        tm[4] + rise * tm[2],
+        tm[5] + rise * tm[3],
+    ]
+}
+
 /// Axis-aligned device-space box of one shown run plus its baseline angle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RunGeometry {
@@ -108,19 +127,26 @@ pub(crate) fn run_geometry(
     let axis_len = combined[0].hypot(combined[1]);
     let (ux, uy) = if axis_len > f32::EPSILON {
         // Unit perpendicular to the baseline (the advance turned 90° CCW),
-        // then the side the matrix's y axis (c, d) points to.
+        // then the y axis's (c, d) component along it: its sign is the side
+        // the glyphs stand on, its size the em's true perpendicular extent.
+        // `em` carries the matrix's larger scale (that is what `font_size`
+        // reports), so a stretched `[2 0 0 1]` matrix must be scaled back
+        // down or the box would be twice as tall as the glyphs.
         let (px, py) = (-combined[1] / axis_len, combined[0] / axis_len);
-        let y_axis_side = if combined[2] * px + combined[3] * py < 0.0 {
-            -1.0
+        let y_axis_perp = combined[2] * px + combined[3] * py;
+        let max_scale = axis_len.max(combined[2].hypot(combined[3]));
+        let em_perp = if y_axis_perp.abs() > f32::EPSILON && max_scale > f32::EPSILON {
+            em * y_axis_perp.abs() / max_scale
         } else {
-            1.0
+            em
         };
+        let y_axis_side = if y_axis_perp < 0.0 { -1.0 } else { 1.0 };
         let side = if glyph_up_flipped {
             -y_axis_side
         } else {
             y_axis_side
         };
-        (px * em * side, py * em * side)
+        (px * em_perp * side, py * em_perp * side)
     } else {
         (0.0, if glyph_up_flipped { -em } else { em })
     };
@@ -229,14 +255,20 @@ mod tests {
     }
 
     #[test]
-    fn run_geometry_anisotropic_scale_keeps_rendered_em_height() {
-        // [2 0 0 1]: horizontally stretched text. The em passed in is the
-        // rendered size, and the box height must stay exactly that.
+    fn run_geometry_takes_the_em_height_from_the_y_axis() {
+        // [2 0 0 1]: horizontally stretched 12pt text. `font_size` reports
+        // the larger scale (24), but the glyphs are only 12pt tall.
         let stretched = run_geometry(&[2.0, 0.0, 0.0, 1.0, 0.0, 0.0], Some(10.0), 24.0, false);
         assert_eq!(
             (stretched.width, stretched.height, stretched.rotation),
-            (20.0, 24.0, 0.0)
+            (20.0, 12.0, 0.0)
         );
+        // [1 0 0 2]: vertically stretched — the y axis carries the scale.
+        let tall = run_geometry(&[1.0, 0.0, 0.0, 2.0, 0.0, 0.0], Some(10.0), 24.0, false);
+        assert_eq!((tall.width, tall.height), (10.0, 24.0));
+        // Uniform scale and rotation are unaffected.
+        let turned = run_geometry(&[0.0, 2.0, -2.0, 0.0, 0.0, 0.0], Some(10.0), 24.0, false);
+        assert_eq!((turned.width, turned.height), (24.0, 20.0));
     }
 
     #[test]
@@ -278,16 +310,15 @@ mod tests {
             (270.0, 500.0, 30.0, 10.0, 180.0)
         );
         // Synthetic italics shear the y axis; the box stays em-high and
-        // advance-wide instead of growing by the slant.
-        let sheared = run_geometry(
-            &[1.0, 0.0, 0.34, 1.0, 100.0, 500.0],
-            Some(30.0),
-            10.0,
-            false,
-        );
-        assert_eq!(
-            (sheared.x, sheared.y, sheared.width, sheared.height),
-            (100.0, 500.0, 30.0, 10.0)
+        // advance-wide instead of growing by the slant. `em` is the rendered
+        // size, which for this matrix carries the y axis's 1.056 length.
+        let em = 10.0 * 0.34_f32.hypot(1.0);
+        let sheared = run_geometry(&[1.0, 0.0, 0.34, 1.0, 100.0, 500.0], Some(30.0), em, false);
+        assert_eq!((sheared.x, sheared.y, sheared.width), (100.0, 500.0, 30.0));
+        assert!(
+            (sheared.height - 10.0).abs() < 1e-3,
+            "height = {}",
+            sheared.height
         );
         // Rotations keep the glyph side with the matrix: 90° runs stand to
         // the left of their baseline, 270° runs to the right.

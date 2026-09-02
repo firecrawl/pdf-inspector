@@ -12,7 +12,7 @@ use super::fonts::{
     compute_string_width_ts, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
     CMapDecisionCache, FontStyleCache,
 };
-use super::geometry::{baseline_rotation, run_geometry};
+use super::geometry::{baseline_rotation, rise_adjusted, run_geometry};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
@@ -191,6 +191,10 @@ pub(crate) struct ExtractedText {
     /// order: this form's share of the page-rotation vote. Per operator,
     /// not per item — one TJ array can split into several items.
     pub(crate) run_rotations: Vec<f32>,
+    /// Invisible (Tr 3) text was present but suppressed — the same signal
+    /// the page parser reports, so a hidden OCR layer drawn through a form
+    /// still earns the `include_invisible` retry.
+    pub(crate) skipped_invisible: bool,
 }
 
 impl ExtractedText {
@@ -200,6 +204,7 @@ impl ExtractedText {
             rtl_visual_candidates: Vec::new(),
             rtl_logical_ops: 0,
             run_rotations: Vec::new(),
+            skipped_invisible: false,
         }
     }
 
@@ -213,11 +218,13 @@ impl ExtractedText {
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_ops: &mut u32,
         run_rotations: &mut Vec<f32>,
+        skipped_invisible: &mut bool,
     ) {
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         *rtl_logical_ops += self.rtl_logical_ops;
         run_rotations.extend(self.run_rotations);
+        *skipped_invisible |= self.skipped_invisible;
         items.extend(self.items);
     }
 }
@@ -230,6 +237,7 @@ pub(crate) fn extract_form_xobject_text(
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    include_invisible: bool,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
@@ -240,6 +248,7 @@ pub(crate) fn extract_form_xobject_text(
         page_num,
         font_cmaps,
         parent_ctm,
+        include_invisible,
         cmap_decisions,
         style_cache,
         0,
@@ -254,6 +263,7 @@ fn extract_form_xobject_text_inner(
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    include_invisible: bool,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
@@ -288,6 +298,7 @@ fn extract_form_xobject_text_inner(
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_ops = &mut extracted.rtl_logical_ops;
     let run_rotations = &mut extracted.run_rotations;
+    let skipped_invisible = &mut extracted.skipped_invisible;
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict);
@@ -381,6 +392,8 @@ fn extract_form_xobject_text_inner(
     let mut text_leading: f32 = 0.0; // TL parameter (text-space units)
     let mut char_spacing: f32 = 0.0; // Tc parameter
     let mut word_spacing: f32 = 0.0; // Tw parameter
+    let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift, unscaled)
+    let mut text_rendering_mode: i32 = 0; // Tr parameter (3 = invisible)
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
@@ -392,6 +405,8 @@ fn extract_form_xobject_text_inner(
         ctm: [f32; 6],
         char_spacing: f32,
         word_spacing: f32,
+        text_rise: f32,
+        text_rendering_mode: i32,
         text_leading: f32,
         current_font: String,
         current_font_size: f32,
@@ -409,6 +424,8 @@ fn extract_form_xobject_text_inner(
                     ctm,
                     char_spacing,
                     word_spacing,
+                    text_rise,
+                    text_rendering_mode,
                     text_leading,
                     current_font: current_font.clone(),
                     current_font_size,
@@ -420,6 +437,8 @@ fn extract_form_xobject_text_inner(
                     ctm = saved.ctm;
                     char_spacing = saved.char_spacing;
                     word_spacing = saved.word_spacing;
+                    text_rise = saved.text_rise;
+                    text_rendering_mode = saved.text_rendering_mode;
                     text_leading = saved.text_leading;
                     current_font = saved.current_font;
                     current_font_size = saved.current_font_size;
@@ -448,6 +467,7 @@ fn extract_form_xobject_text_inner(
                                         page_num,
                                         font_cmaps,
                                         &ctm,
+                                        include_invisible,
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
@@ -458,6 +478,7 @@ fn extract_form_xobject_text_inner(
                                         rtl_visual_candidates,
                                         rtl_logical_ops,
                                         run_rotations,
+                                        skipped_invisible,
                                     );
                                 }
                             }
@@ -521,6 +542,23 @@ fn extract_form_xobject_text_inner(
             "Tw" => {
                 if let Some(tw) = op.operands.first().and_then(get_number) {
                     word_spacing = tw;
+                }
+            }
+            "Tr" => {
+                // Text rendering mode (3 = invisible / OCR overlay). Hidden
+                // text is skipped exactly like the page parser skips it —
+                // it neither emits items nor votes on page rotation — unless
+                // the caller asked for the hidden layer.
+                if let Some(mode) = op.operands.first().and_then(get_number) {
+                    text_rendering_mode = mode as i32;
+                }
+            }
+            "Ts" => {
+                // Text rise: baseline shift for superscripts/subscripts. It
+                // moves the glyph origin, never the advance (see
+                // `rise_adjusted`).
+                if let Some(ts) = op.operands.first().and_then(get_number) {
+                    text_rise = ts;
                 }
             }
             "Td" | "TD" => {
@@ -609,7 +647,13 @@ fn extract_form_xobject_text_inner(
                     text_matrix = line_matrix;
                 }
                 if let (true, Some(show_operand)) = (in_text_block, op.operands.last()) {
-                    if fill_is_white {
+                    let invisible = text_rendering_mode == 3 && !include_invisible;
+                    if invisible
+                        && get_operand_bytes(show_operand).is_some_and(|raw| !raw.is_empty())
+                    {
+                        *skipped_invisible = true;
+                    }
+                    if fill_is_white || invisible {
                         if let Some(font_info) = font_widths.get(&current_font) {
                             if let Some(raw_bytes) = get_operand_bytes(show_operand) {
                                 let w_ts = compute_string_width_ts(
@@ -637,7 +681,8 @@ fn extract_form_xobject_text_inner(
                         cmap_decisions,
                         &font_widths,
                     ) {
-                        let combined = multiply_matrices(&text_matrix, &ctm);
+                        let combined =
+                            multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                         let advance_ts = font_widths.get(&current_font).and_then(|font_info| {
@@ -717,6 +762,20 @@ fn extract_form_xobject_text_inner(
                 // Show text with positioning — split at column-sized gaps
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
+                        // Invisible (Tr 3) text is hidden like white-on-white
+                        // text: it advances the pen but shows nothing and
+                        // must not vote on page rotation. Numeric-only arrays
+                        // (pure kerning) show no text and must not trigger
+                        // the invisible retry.
+                        let invisible = text_rendering_mode == 3 && !include_invisible;
+                        if invisible
+                            && array
+                                .iter()
+                                .any(|el| get_operand_bytes(el).is_some_and(|raw| !raw.is_empty()))
+                        {
+                            *skipped_invisible = true;
+                        }
+                        let hidden = fill_is_white || invisible;
                         let font_info = font_widths.get(&current_font);
 
                         let space_threshold = if let Some(fi) = font_info {
@@ -750,7 +809,7 @@ fn extract_form_xobject_text_inner(
                                     {
                                         backward_jump = true;
                                     }
-                                    if !fill_is_white
+                                    if !hidden
                                         && n_val < -column_gap_threshold
                                         && !current_text.is_empty()
                                     {
@@ -763,7 +822,7 @@ fn extract_form_xobject_text_inner(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
-                                        if !fill_is_white
+                                        if !hidden
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
@@ -785,7 +844,7 @@ fn extract_form_xobject_text_inner(
                                     {
                                         backward_jump = true;
                                     }
-                                    if !fill_is_white
+                                    if !hidden
                                         && n_val < -column_gap_threshold
                                         && !current_text.is_empty()
                                     {
@@ -798,7 +857,7 @@ fn extract_form_xobject_text_inner(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
-                                        if !fill_is_white
+                                        if !hidden
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
@@ -821,7 +880,7 @@ fn extract_form_xobject_text_inner(
                                     );
                                 }
                             }
-                            if !fill_is_white {
+                            if !hidden {
                                 if let Some(text) = extract_text_from_operand(
                                     element,
                                     &current_font,
@@ -838,7 +897,7 @@ fn extract_form_xobject_text_inner(
                                 }
                             }
                         }
-                        if !fill_is_white && !current_text.trim().is_empty() {
+                        if !hidden && !current_text.trim().is_empty() {
                             sub_items.push((current_text, sub_start_width_ts, total_width_ts));
                         }
                         if !sub_items.is_empty() {
@@ -872,7 +931,8 @@ fn extract_form_xobject_text_inner(
                                     text_matrix[4] + start_w * text_matrix[0],
                                     text_matrix[5] + start_w * text_matrix[1],
                                 ];
-                                let combined_mat = multiply_matrices(&offset_tm, &ctm);
+                                let combined_mat =
+                                    multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
                                 let geometry = run_geometry(
                                     &combined_mat,
                                     font_info.map(|_| end_w - start_w),
@@ -1073,6 +1133,7 @@ mod tests {
             1,
             &FontCMaps::from_doc(doc),
             &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            false,
             &mut CMapDecisionCache::new(),
             &mut FontStyleCache::new(),
             budget,
@@ -1455,6 +1516,68 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET",
             crate::extractor::geometry::PageRotation::Upright
         );
         assert!(items.iter().all(|i| (i.rotation - 90.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn invisible_form_text_is_skipped_and_does_not_vote() {
+        // An OCR layer drawn inside a form with `3 Tr`: two rotated hidden
+        // runs next to one visible upright caption. The hidden runs must
+        // neither appear nor turn the page, and the page must report that
+        // it skipped them so the `include_invisible` retry recovers them,
+        // exactly as for page-stream text.
+        let content = b"BT /F1 12 Tf 72 700 Td (Caption) Tj ET
+BT 3 Tr /F1 12 Tf 0 1 -1 0 200 100 Tm (HIDDEN) Tj ET
+BT 3 Tr /F1 12 Tf 0 1 -1 0 240 100 Tm [(ALSO) -3000 (HIDDEN)] TJ ET";
+        let (doc, page_id) = doc_with_form_content(content);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let extract = |include_invisible: bool| {
+            extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &font_cmaps,
+                include_invisible,
+                &mut FontStyleCache::new(),
+                &mut FormWalkBudget::new(),
+            )
+            .unwrap()
+        };
+
+        let ((items, _, _), _, page_rotation, skipped_invisible) = extract(false);
+        assert_eq!(
+            page_rotation,
+            crate::extractor::geometry::PageRotation::Upright
+        );
+        assert!(skipped_invisible);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["Caption"]);
+
+        let ((items, _, _), _, page_rotation, _) = extract(true);
+        assert!(items.iter().any(|i| i.text == "HIDDEN"), "{items:?}");
+        assert!(
+            items.iter().any(|i| i.text.starts_with("ALSO")),
+            "{items:?}"
+        );
+        // Two rotated operators against one upright: the recovered layer
+        // now turns the page like any other rotated text.
+        assert_eq!(page_rotation, crate::extractor::geometry::PageRotation::Ccw);
+    }
+
+    #[test]
+    fn text_rise_inside_form_shifts_the_baseline() {
+        // Ts displaces the glyph origin without touching the advance, in a
+        // form exactly as in the page stream; the next run at rise 0 returns
+        // to the original baseline and follows the raised run horizontally.
+        let items = form_items(
+            b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (base) Tj 5 Ts (super) Tj 0 Ts (after) Tj ET",
+        );
+        let base = find(&items, "base");
+        let raised = find(&items, "super");
+        let after = find(&items, "after");
+        assert!((base.y - 500.0).abs() < 0.1, "base y = {}", base.y);
+        assert!((raised.y - 505.0).abs() < 0.1, "raised y = {}", raised.y);
+        assert!((after.y - 500.0).abs() < 0.1, "after y = {}", after.y);
+        assert!(after.x > raised.x);
     }
 
     #[test]
