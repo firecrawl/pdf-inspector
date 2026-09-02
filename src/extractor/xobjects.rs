@@ -12,7 +12,7 @@ use super::fonts::{
     compute_string_width_ts, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
     CMapDecisionCache, FontStyleCache,
 };
-use super::geometry::run_geometry;
+use super::geometry::{baseline_rotation, run_geometry};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
@@ -187,6 +187,10 @@ pub(crate) struct ExtractedText {
     pub(crate) items: Vec<TextItem>,
     pub(crate) rtl_visual_candidates: Vec<usize>,
     pub(crate) rtl_logical_ops: u32,
+    /// Baseline angle of every text-producing show operator, in stream
+    /// order: this form's share of the page-rotation vote. Per operator,
+    /// not per item — one TJ array can split into several items.
+    pub(crate) run_rotations: Vec<f32>,
 }
 
 impl ExtractedText {
@@ -195,6 +199,7 @@ impl ExtractedText {
             items: Vec::new(),
             rtl_visual_candidates: Vec::new(),
             rtl_logical_ops: 0,
+            run_rotations: Vec::new(),
         }
     }
 
@@ -207,10 +212,12 @@ impl ExtractedText {
         items: &mut Vec<TextItem>,
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_ops: &mut u32,
+        run_rotations: &mut Vec<f32>,
     ) {
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         *rtl_logical_ops += self.rtl_logical_ops;
+        run_rotations.extend(self.run_rotations);
         items.extend(self.items);
     }
 }
@@ -280,6 +287,7 @@ fn extract_form_xobject_text_inner(
     let items = &mut extracted.items;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_ops = &mut extracted.rtl_logical_ops;
+    let run_rotations = &mut extracted.run_rotations;
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict);
@@ -449,6 +457,7 @@ fn extract_form_xobject_text_inner(
                                         items,
                                         rtl_visual_candidates,
                                         rtl_logical_ops,
+                                        run_rotations,
                                     );
                                 }
                             }
@@ -655,6 +664,7 @@ fn extract_form_xobject_text_inner(
                         // Only create text item for non-whitespace; whitespace
                         // still advances the text matrix above so gap detection works
                         if !text.trim().is_empty() {
+                            run_rotations.push(geometry.rotation);
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -833,6 +843,7 @@ fn extract_form_xobject_text_inner(
                         }
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
+                            run_rotations.push(baseline_rotation(combined[0], combined[1]));
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
@@ -1419,6 +1430,31 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET",
         assert!((hello.x - 100.0).abs() < 0.01, "x = {}", hello.x);
         assert!((hello.y + 200.0).abs() < 0.01, "y = {}", hello.y);
         assert!((hello.width - 36.0).abs() < 0.01, "width = {}", hello.width);
+    }
+
+    #[test]
+    fn form_only_page_with_a_lone_split_tj_stays_upright() {
+        // One rotated TJ that splits at a 6em gap yields two items but is a
+        // single show operator: a lone stamp, not a rotated page.
+        let (doc, page_id) =
+            doc_with_form_content(b"BT /F1 10 Tf 0 1 -1 0 40 100 Tm [(AB) -6000 (CD)] TJ ET");
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, page_rotation, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(
+            page_rotation,
+            crate::extractor::geometry::PageRotation::Upright
+        );
+        assert!(items.iter().all(|i| (i.rotation - 90.0).abs() < 1e-3));
     }
 
     #[test]

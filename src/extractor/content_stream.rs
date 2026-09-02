@@ -563,7 +563,6 @@ pub(crate) fn extract_page_text_items(
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                        rotation_votes.cast(combined[0], combined[1]);
                         let geometry = run_geometry(
                             &combined,
                             w_ts_opt,
@@ -577,6 +576,7 @@ pub(crate) fn extract_page_text_items(
                         // Only create text item for non-whitespace; whitespace
                         // still advances the text matrix above so gap detection works
                         if !text.trim().is_empty() {
+                            rotation_votes.cast(combined[0], combined[1]);
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -1019,7 +1019,7 @@ pub(crate) fn extract_page_text_items(
                                 }
                                 XObjectType::Form(form_id) => {
                                     // Extract text from Form XObject
-                                    let form_start = items.len();
+                                    let mut form_runs = Vec::new();
                                     extract_form_xobject_text(
                                         doc,
                                         *form_id,
@@ -1034,16 +1034,17 @@ pub(crate) fn extract_page_text_items(
                                         &mut items,
                                         &mut rtl_visual_candidates,
                                         &mut rtl_logical_ops,
+                                        &mut form_runs,
                                     );
                                     // Form runs vote on page rotation like
-                                    // page-stream runs: print-to-PDF producers
+                                    // page-stream runs — once per show
+                                    // operator, as one TJ can split into
+                                    // several items. Print-to-PDF producers
                                     // route the whole page through one form,
                                     // and a rotated page drawn that way must
                                     // be turned like any other.
-                                    for item in &items[form_start..] {
-                                        if matches!(item.item_type, ItemType::Text) {
-                                            rotation_votes.cast_rotation(item.rotation);
-                                        }
+                                    for rotation in form_runs {
+                                        rotation_votes.cast_rotation(rotation);
                                     }
                                 }
                             }
@@ -1103,7 +1104,6 @@ pub(crate) fn extract_page_text_items(
                         if let Some(start_tm) = glyph_tm.or(entry_tm) {
                             let rise = glyph_rise.unwrap_or(actual_text_start_rise);
                             let combined = multiply_matrices(&rise_adjusted(&start_tm, rise), &ctm);
-                            rotation_votes.cast(combined[0], combined[1]);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             // Advance in text-space units: the text matrix
@@ -1131,6 +1131,7 @@ pub(crate) fn extract_page_text_items(
                                 type3_y_flips.contains(&current_font),
                             );
                             if !at.trim().is_empty() {
+                                rotation_votes.cast(combined[0], combined[1]);
                                 let base_font = font_base_names
                                     .get(&current_font)
                                     .map(|s| s.as_str())
@@ -1500,7 +1501,9 @@ pub(crate) fn extract_page_text_items(
     ))
 }
 
-/// Counts of shown runs by baseline direction: the page-rotation vote.
+/// Counts of text-producing show operators by baseline direction: the
+/// page-rotation vote. Operators, not items — one TJ array can split into
+/// several items — and never whitespace-only runs or image placeholders.
 #[derive(Default)]
 struct RotationVotes {
     horizontal: u32,
@@ -1540,23 +1543,15 @@ fn correct_rotated_page(
     mut lines: Vec<PdfLine>,
     votes: &RotationVotes,
 ) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>, PageRotation) {
-    // A single rotated run never turns a page: it is a stamp or a caption,
-    // not a landscape layout. Only text runs count — an image placeholder
-    // next to one rotated run must not make the pair look like a page.
-    let text_runs = items
-        .iter()
-        .filter(|item| matches!(item.item_type, ItemType::Text))
-        .count();
-    if text_runs < 2 {
-        return (items, rects, lines, PageRotation::Upright);
-    }
-
     // Use the direction votes collected during extraction: for normal text
     // combined[0] (the x-component of the text x-axis) dominates, for 90°
-    // rotated text combined[1] does.
+    // rotated text combined[1] does. Votes count text-producing show
+    // operators, never items or placeholders: a single rotated run is a
+    // stamp or a caption, not a landscape layout, even when a TJ array
+    // splits it into several items or an image sits next to it.
     let rotated = votes.ccw + votes.cw;
     let total_votes = votes.horizontal + rotated;
-    if total_votes == 0 || rotated * 3 < total_votes * 2 {
+    if total_votes < 2 || rotated * 3 < total_votes * 2 {
         // Less than ~67% of text operators are rotated → not a rotated page
         return (items, rects, lines, PageRotation::Upright);
     }
@@ -2643,6 +2638,31 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             .iter()
             .filter(|i| i.text == "run")
             .all(|i| i.rotation == 0.0));
+    }
+
+    #[test]
+    fn lone_rotated_tj_split_at_a_gap_does_not_turn_the_page() {
+        // One rotated TJ with a 6em positioning gap yields two items but is
+        // a single show operator: a lone stamp, not a rotated page.
+        let (items, page_rotation) =
+            extract_simple_page(b"BT /F1 10 Tf 0 1 -1 0 40 100 Tm [(AB) -6000 (CD)] TJ ET");
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(page_rotation, PageRotation::Upright);
+        assert!(items.iter().all(|i| (i.rotation - 90.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn whitespace_only_runs_do_not_vote_on_page_rotation() {
+        // A rotated word plus a rotated whitespace-only run: the latter
+        // produces no item, so it must not be the second vote that turns
+        // the page.
+        let (items, page_rotation) = extract_simple_page(
+            b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (HELLO) Tj ET
+BT /F1 12 Tf 0 1 -1 0 240 100 Tm (   ) Tj ET",
+        );
+        assert_eq!(page_rotation, PageRotation::Upright);
+        let hello = find_item(&items, "HELLO");
+        assert_close(hello.rotation, 90.0, "rotation");
     }
 
     #[test]
