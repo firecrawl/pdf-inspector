@@ -49,7 +49,7 @@
     "build:debug": "napi build --platform"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.4.1"
+    "@napi-rs/cli": "^3.8.6"
   },
   "optionalDependencies": {
     "@firecrawl/pdf-inspector-linux-x64-gnu": "1.17.0",
