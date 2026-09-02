@@ -19,8 +19,8 @@ use super::fonts::{
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
 use super::geometry::{
-    estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees, rise_adjusted,
-    run_geometry, PageRotation,
+    estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees, reading_direction,
+    rise_adjusted, run_geometry, PageRotation,
 };
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
@@ -623,7 +623,8 @@ pub(crate) fn extract_page_text_items(
                         // Only create text item for non-whitespace; whitespace
                         // still advances the text matrix above so gap detection works
                         if !text.trim().is_empty() {
-                            rotation_votes.cast(combined[0], combined[1]);
+                            rotation_votes
+                                .cast_direction(reading_direction(&combined, current_font_size));
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -860,7 +861,8 @@ pub(crate) fn extract_page_text_items(
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
-                            rotation_votes.cast(combined[0], combined[1]);
+                            rotation_votes
+                                .cast_direction(reading_direction(&combined, current_font_size));
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
@@ -895,12 +897,15 @@ pub(crate) fn extract_page_text_items(
                                     &combined,
                                     font_info.map(|_| end_w - start_w),
                                     // Without metrics the accumulated width IS
-                                    // the sub-run's estimate, kerning included;
-                                    // if kerning walked it back past zero, the
-                                    // painted codes' own estimate stands.
-                                    if end_w - start_w > 0.0 {
+                                    // the sub-run's estimate, kerning included —
+                                    // signed, since a negative `Tf` size reads
+                                    // backwards; if kerning walked it past zero
+                                    // the painted codes' own estimate stands.
+                                    if end_w - start_w != 0.0
+                                        && ((end_w - start_w > 0.0) == (*estimate_ts > 0.0))
+                                    {
                                         end_w - start_w
-                                    } else if *estimate_ts > 0.0 {
+                                    } else if *estimate_ts != 0.0 {
                                         *estimate_ts
                                     } else {
                                         estimated_advance_ts(
@@ -1049,7 +1054,8 @@ pub(crate) fn extract_page_text_items(
                         if !text.trim().is_empty() {
                             let combined =
                                 multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
-                            rotation_votes.cast(combined[0], combined[1]);
+                            rotation_votes
+                                .cast_direction(reading_direction(&combined, current_font_size));
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let geometry = run_geometry(
@@ -1290,7 +1296,10 @@ pub(crate) fn extract_page_text_items(
                                 type3_y_flips.contains(&paint_font),
                             );
                             if !at.trim().is_empty() {
-                                rotation_votes.cast(combined[0], combined[1]);
+                                rotation_votes.cast_direction(reading_direction(
+                                    &combined,
+                                    current_font_size,
+                                ));
                                 let base_font = font_base_names
                                     .get(&current_font)
                                     .map(|s| s.as_str())
@@ -1692,6 +1701,11 @@ impl RotationVotes {
                 self.cw += 1;
             }
         }
+    }
+
+    /// Vote with a run's reading direction (see `geometry::reading_direction`).
+    fn cast_direction(&mut self, (a, b): (f32, f32)) {
+        self.cast(a, b);
     }
 
     /// Vote with a finished item's baseline angle (Form XObject runs arrive
@@ -2516,6 +2530,19 @@ end"#;
     }
 
     #[test]
+    fn metric_less_tj_with_negative_font_size_keeps_its_signed_estimate() {
+        // Two codes at `-12 Tf` without metrics: the estimate is -12pt, the
+        // run reads backwards from its origin with its glyphs below the
+        // baseline, and the box says so.
+        let items = extract_hebrew_items(b"BT /F1 -12 Tf 100 700 Td [<4142>] TJ ET");
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(!items[0].advance_known);
+        assert_eq!((items[0].x, items[0].width), (88.0, 12.0));
+        assert_eq!((items[0].y, items[0].height), (688.0, 12.0));
+        assert_eq!(items[0].rotation, 180.0);
+    }
+
+    #[test]
     fn actual_text_on_a_width_less_font_is_estimated_from_painted_glyphs() {
         // The text matrix never moves for a font without widths, so the
         // ActualText span's zero displacement must not pass for a genuine
@@ -2830,6 +2857,23 @@ BT /F1 12 Tf 72 672 Td (Body line three) Tj ET
         assert_close(hello.y, 688.0, "y");
         assert_close(hello.height, 12.0, "height");
         assert!(hello.advance_known);
+    }
+
+    #[test]
+    fn negative_font_size_vertical_runs_vote_with_their_turned_direction() {
+        // `-12 Tf` on a bottom-to-top matrix reads top-to-bottom: the page
+        // vote must follow the items (270° before the turn), so the frame
+        // turns clockwise and the runs come out upright — not the other way.
+        let content = b"BT /F1 -12 Tf 0 1 -1 0 100 100 Tm (UP) Tj ET
+BT /F1 -12 Tf 0 1 -1 0 130 100 Tm [(UP)] TJ ET
+BT /F1 -12 Tf 0 1 -1 0 160 100 Tm (UP) ' ET";
+        let (items, page_rotation) = extract_simple_page(content);
+        assert_eq!(page_rotation, PageRotation::Cw);
+        assert_eq!(items.len(), 3, "{items:?}");
+        for item in &items {
+            assert_close(item.rotation, 0.0, "rotation");
+            assert_close(item.font_size, 12.0, "font_size");
+        }
     }
 
     #[test]

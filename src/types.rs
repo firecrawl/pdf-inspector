@@ -207,13 +207,13 @@ impl TextItem {
         self.baseline_y() - self.baseline_shift
     }
 
-    /// The y of the glyphs' baseline for a horizontal run: `y` (the box's
-    /// bottom edge) when they stand upright, `y + height` (the top edge)
-    /// when the run is upside-down — `rotation` says which, glyph
-    /// orientation included for reflected matrices. A vertical or oblique
-    /// run has no horizontal baseline; this returns its box bottom `y`,
-    /// which line grouping never compares for such runs (they keep to
-    /// themselves).
+    /// The y of the edge the glyphs stand on or hang from: `y` (the box's
+    /// bottom edge) for a run within 45° of upright, `y + height` (the top
+    /// edge) for one within 45° of upside-down (`is_upside_down()`, glyph
+    /// orientation included for reflected matrices). Exact for level runs;
+    /// for oblique ones the baseline is not horizontal and the edge is only
+    /// an approximation of it, which is what line grouping then compares.
+    /// Vertical runs return the box bottom `y`.
     pub fn baseline_y(&self) -> f32 {
         if self.is_upside_down() {
             self.y + self.height

@@ -13,7 +13,9 @@ use super::fonts::{
     compute_string_width_ts, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
     CMapDecisionCache, FontStyleCache,
 };
-use super::geometry::{baseline_rotation, estimated_advance_ts, rise_adjusted, run_geometry};
+use super::geometry::{
+    baseline_rotation, estimated_advance_ts, reading_direction, rise_adjusted, run_geometry,
+};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
@@ -970,7 +972,8 @@ fn extract_form_xobject_text_inner(
                         }
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
-                            run_rotations.push(baseline_rotation(combined[0], combined[1]));
+                            let (dir_x, dir_y) = reading_direction(&combined, current_font_size);
+                            run_rotations.push(baseline_rotation(dir_x, dir_y));
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
@@ -1005,12 +1008,15 @@ fn extract_form_xobject_text_inner(
                                     &combined_mat,
                                     font_info.map(|_| end_w - start_w),
                                     // Without metrics the accumulated width IS
-                                    // the sub-run's estimate, kerning included;
-                                    // if kerning walked it back past zero, the
-                                    // painted codes' own estimate stands.
-                                    if end_w - start_w > 0.0 {
+                                    // the sub-run's estimate, kerning included —
+                                    // signed, since a negative `Tf` size reads
+                                    // backwards; if kerning walked it past zero
+                                    // the painted codes' own estimate stands.
+                                    if end_w - start_w != 0.0
+                                        && ((end_w - start_w > 0.0) == (*estimate_ts > 0.0))
+                                    {
                                         end_w - start_w
-                                    } else if *estimate_ts > 0.0 {
+                                    } else if *estimate_ts != 0.0 {
                                         *estimate_ts
                                     } else {
                                         estimated_advance_ts(
@@ -1759,6 +1765,31 @@ BT 3 Tr /F1 12 Tf 0 1 -1 0 240 100 Tm [(ALSO) -3000 (HIDDEN)] TJ ET";
         let inner = find(&items, "inner");
         assert!((outer.y - 500.0).abs() < 0.1, "outer y = {}", outer.y);
         assert!((inner.y - 405.0).abs() < 0.1, "inner y = {}", inner.y);
+    }
+
+    #[test]
+    fn form_tj_at_a_negative_size_votes_with_its_own_items() {
+        // A form's vertical TJ runs at `-12 Tf` read top-to-bottom: their
+        // page-rotation votes must say so, like the items they produce, or
+        // the page would be turned against them.
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"q /X1 Do Q",
+            &[b"BT /F1 -12 Tf 0 1 -1 0 100 100 Tm [(UP)] TJ ET BT /F1 -12 Tf 0 1 -1 0 130 100 Tm [(UP)] TJ ET"],
+        );
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, page_rotation, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        assert_eq!(page_rotation, crate::extractor::geometry::PageRotation::Cw);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items.iter().all(|i| i.rotation == 0.0), "{items:?}");
     }
 
     #[test]

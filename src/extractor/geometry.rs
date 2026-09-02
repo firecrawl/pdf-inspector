@@ -126,6 +126,18 @@ pub(crate) struct RunGeometry {
 /// laid along the baseline whichever way it runs, which a consumer adding an
 /// estimate on the +x side could not get right for runs reading towards -x —
 /// and `advance_known` records that the extent is an estimate.
+/// The device-space direction a run reads in: the text matrix's x axis,
+/// turned around when the `Tf` size is negative (a negative size negates the
+/// glyph matrix). Page-rotation votes take this, as `run_geometry` does, so a
+/// vertical run drawn at a negative size never votes against its own items.
+pub(crate) fn reading_direction(combined: &[f32; 6], font_size: f32) -> (f32, f32) {
+    if font_size < 0.0 {
+        (-combined[0], -combined[1])
+    } else {
+        (combined[0], combined[1])
+    }
+}
+
 /// `em` is the rendered font size, negative when the `Tf` size was.
 pub(crate) fn run_geometry(
     combined: &[f32; 6],
