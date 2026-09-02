@@ -64,18 +64,26 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
     false
 }
 
-/// Check if text starts with an unambiguous bullet marker (●, •, ○, ◦).
+/// Check if text starts with an unambiguous bullet marker.
+///
+/// Recognizes the same set of bullet glyphs as the extractor layer
+/// (`src/extractor/layout.rs`, `src/extractor/underline.rs`), so that
+/// lines like `▪ Item` or `‣ Item` are classified as list items rather
+/// than plain paragraphs.
 ///
 /// Narrower than [`is_list_item`]: it excludes numbered/lettered patterns
 /// like `1.` or `a)`, which legitimately appear as section headings in many
 /// documents. Used by the heading classifier to reject bullet lines without
 /// also demoting numbered headings.
+const BULLET_MARKERS: [&str; 11] = [
+    "•", "●", "○", "◦", "▪", "▫", "◆", "◇", "■", "□", "‣",
+];
+
 pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with("• ")
-        || trimmed.starts_with("● ")
-        || trimmed.starts_with("○ ")
-        || trimmed.starts_with("◦ ")
+    BULLET_MARKERS
+        .iter()
+        .any(|m| trimmed.starts_with(m) && trimmed[m.len()..].starts_with(char::is_whitespace))
         || trimmed.starts_with("- ")
         || trimmed.starts_with("* ")
 }
@@ -84,14 +92,15 @@ pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
 pub(crate) fn is_list_item(text: &str) -> bool {
     let trimmed = text.trim_start();
 
-    // Bullet patterns
-    if trimmed.starts_with("• ")
-        || trimmed.starts_with("- ")
-        || trimmed.starts_with("* ")
-        || trimmed.starts_with("○ ")
-        || trimmed.starts_with("● ")
-        || trimmed.starts_with("◦ ")
+    // Bullet patterns — reuse the canonical BULLET_MARKERS set
+    if BULLET_MARKERS
+        .iter()
+        .any(|m| trimmed.starts_with(m) && trimmed[m.len()..].starts_with(char::is_whitespace))
     {
+        return true;
+    }
+
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
         return true;
     }
 
@@ -125,10 +134,9 @@ pub(crate) fn is_list_item(text: &str) -> bool {
 pub(crate) fn format_list_item(text: &str) -> String {
     let trimmed = text.trim_start();
 
-    // Convert various bullet styles to markdown
-    // Note: bullet characters like • are multi-byte in UTF-8, use char indices
-    for bullet in &['•', '○', '●', '◦'] {
-        if let Some(rest) = trimmed.strip_prefix(*bullet) {
+    // Convert bullet styles to markdown `-`
+    for bullet in BULLET_MARKERS {
+        if let Some(rest) = trimmed.strip_prefix(bullet) {
             return format!("- {}", rest.trim_start());
         }
         // Bullet inside a leading style run (e.g. "**● Label:** rest" or
@@ -137,7 +145,7 @@ pub(crate) fn format_list_item(text: &str) -> String {
         // outside the wrapper so markdown still sees a list item.
         for wrapper in ["**", "*", "<u>"] {
             if let Some(after_open) = trimmed.strip_prefix(wrapper) {
-                if let Some(rest) = after_open.strip_prefix(*bullet) {
+                if let Some(rest) = after_open.strip_prefix(bullet) {
                     return format!("- {}{}", wrapper, rest.trim_start());
                 }
             }
@@ -313,5 +321,47 @@ mod tests {
         assert!(is_list_item("● Item"));
         assert!(is_list_item("• Item"));
         assert!(is_list_item("- Item"));
+    }
+
+    #[test]
+    fn is_list_item_with_enumerated_glyphs() {
+        // Issue #475: bullet glyphs recognized by the extractor but not the
+        // markdown layer. These must now be detected as list items.
+        assert!(is_list_item("▪ Item"));
+        assert!(is_list_item("▫ Item"));
+        assert!(is_list_item("◆ Item"));
+        assert!(is_list_item("◇ Item"));
+        assert!(is_list_item("■ Item"));
+        assert!(is_list_item("□ Item"));
+        assert!(is_list_item("‣ Item"));
+    }
+
+    #[test]
+    fn starts_with_bullet_marker_enumerated_glyphs() {
+        assert!(starts_with_bullet_marker("▪ Item"));
+        assert!(starts_with_bullet_marker("▫ Item"));
+        assert!(starts_with_bullet_marker("◆ Item"));
+        assert!(starts_with_bullet_marker("◇ Item"));
+        assert!(starts_with_bullet_marker("■ Item"));
+        assert!(starts_with_bullet_marker("□ Item"));
+        assert!(starts_with_bullet_marker("‣ Item"));
+    }
+
+    #[test]
+    fn format_list_item_enumerated_glyphs() {
+        assert_eq!(format_list_item("▪ Item"), "- Item");
+        assert_eq!(format_list_item("▫ Item"), "- Item");
+        assert_eq!(format_list_item("◆ Item"), "- Item");
+        assert_eq!(format_list_item("◇ Item"), "- Item");
+        assert_eq!(format_list_item("■ Item"), "- Item");
+        assert_eq!(format_list_item("□ Item"), "- Item");
+        assert_eq!(format_list_item("‣ Item"), "- Item");
+    }
+
+    #[test]
+    fn bullet_marker_requires_space() {
+        // Glyph without trailing space is not a list item
+        assert!(!starts_with_bullet_marker("▪Item"));
+        assert!(!starts_with_bullet_marker("‣Item"));
     }
 }
