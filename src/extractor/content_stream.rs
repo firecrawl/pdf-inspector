@@ -14,9 +14,9 @@ use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
 use super::fonts::{
-    build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
-    descriptor_style_flags, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
-    CMapDecisionCache, FontStyleCache,
+    build_font_encodings, build_font_widths, build_type3_scales, build_type3_y_flips,
+    compute_string_width_ts, descriptor_style_flags, extract_text_from_operand,
+    get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
 use super::geometry::{normalize_degrees, run_geometry, PageRotation};
 use super::underline::UnderlineLine;
@@ -190,6 +190,7 @@ pub(crate) fn extract_page_text_items(
     // Build font width info for accurate text positioning
     let font_widths = build_font_widths(doc, &fonts);
     let type3_scales = build_type3_scales(doc, &fonts);
+    let type3_y_flips = build_type3_y_flips(doc, &fonts);
 
     // Build maps of font resource names to their base font names and ToUnicode object refs
     let mut font_base_names: std::collections::HashMap<String, String> =
@@ -269,7 +270,12 @@ pub(crate) fn extract_page_text_items(
                 MAX_PAGE_CONTENT_BYTES,
                 e
             );
-            return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
+            return Ok((
+                (Vec::new(), Vec::new(), Vec::new()),
+                false,
+                PageRotation::Upright,
+                false,
+            ));
         }
     };
 
@@ -558,7 +564,12 @@ pub(crate) fn extract_page_text_items(
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                         rotation_votes.cast(combined[0], combined[1]);
-                        let geometry = run_geometry(&combined, w_ts_opt, rendered_size);
+                        let geometry = run_geometry(
+                            &combined,
+                            w_ts_opt,
+                            rendered_size,
+                            type3_y_flips.contains(&current_font),
+                        );
                         if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -804,6 +815,7 @@ pub(crate) fn extract_page_text_items(
                                     &combined,
                                     font_info.map(|_| end_w - start_w),
                                     rendered_size,
+                                    type3_y_flips.contains(&current_font),
                                 );
                                 if horizontal_advance
                                     && crate::text_utils::is_visual_rtl_candidate(text)
@@ -913,7 +925,12 @@ pub(crate) fn extract_page_text_items(
                             rotation_votes.cast(combined[0], combined[1]);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                            let geometry = run_geometry(&combined, w_ts_opt, rendered_size);
+                            let geometry = run_geometry(
+                                &combined,
+                                w_ts_opt,
+                                rendered_size,
+                                type3_y_flips.contains(&current_font),
+                            );
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -1107,7 +1124,12 @@ pub(crate) fn extract_page_text_items(
                                     None
                                 }
                             };
-                            let geometry = run_geometry(&combined, advance_ts, rendered_size);
+                            let geometry = run_geometry(
+                                &combined,
+                                advance_ts,
+                                rendered_size,
+                                type3_y_flips.contains(&current_font),
+                            );
                             if !at.trim().is_empty() {
                                 let base_font = font_base_names
                                     .get(&current_font)
@@ -2325,6 +2347,100 @@ BT /F1 12 Tf 72 672 Td (Body line three) Tj ET
         assert_close(flip.width, 24.0, "width");
         assert_close(flip.y, 390.0, "y");
         assert_close(flip.height, 10.0, "height");
+    }
+
+    /// A page whose only font is a dvips/PK-style Type3 font: `FontMatrix
+    /// [1 0 0 -1 0 0]`, glyphs measured in device pixels (a 100-unit em,
+    /// 50-unit advances), shown at 0.12pt per pixel through the text matrix.
+    fn type3_doc_with_content(content: &[u8]) -> (lopdf::Document, lopdf::ObjectId) {
+        use lopdf::{dictionary, Object, Stream};
+
+        let mut doc = lopdf::Document::new();
+        let widths: Vec<Object> = (0..=255).map(|_| 50.into()).collect();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontMatrix" => vec![1.into(), 0.into(), 0.into(), Object::Real(-1.0), 0.into(), 0.into()],
+            "FontBBox" => vec![0.into(), Object::Integer(-25), 60.into(), 75.into()],
+            "CharProcs" => dictionary! {},
+            "Encoding" => dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![
+                    72.into(), Object::Name(b"H".to_vec()),
+                    69.into(), Object::Name(b"E".to_vec()),
+                    76.into(), Object::Name(b"L".to_vec()),
+                    79.into(), Object::Name(b"O".to_vec()),
+                ],
+            },
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths),
+            "Resources" => dictionary! {},
+        });
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            content.to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "T1" => Object::Reference(font_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, page_id)
+    }
+
+    #[test]
+    fn dvips_type3_text_keeps_its_box_above_the_baseline() {
+        // dvips: `/T1 1 Tf` with the pixel size in a y-flipped text matrix,
+        // undone by the font's mirrored FontMatrix. The 100-pixel em renders
+        // at 12pt; 5 glyphs × 50 pixels × 0.12pt = 30pt of advance.
+        use crate::tounicode::FontCMaps;
+
+        let (doc, page_id) =
+            type3_doc_with_content(b"BT /T1 1 Tf 0.12 0 0 -0.12 100 500 Tm (HELLO) Tj ET");
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        let hello = find_item(&items, "HELLO");
+        assert_eq!(hello.rotation, 0.0);
+        assert_close(hello.x, 100.0, "x");
+        assert_close(hello.y, 500.0, "y");
+        assert_close(hello.width, 30.0, "width");
+        assert_close(hello.height, 12.0, "height");
+    }
+
+    #[test]
+    fn mirrored_text_matrix_keeps_glyphs_above_the_baseline() {
+        // `[-1 0 0 1]`: the advance runs towards -x but the glyphs still
+        // stand on the baseline. 3 glyphs × 7.2pt = 21.6pt, running left.
+        let items = upright_page_with("BT /F1 12 Tf -1 0 0 1 300 500 Tm (ABC) Tj ET");
+        let abc = find_item(&items, "ABC");
+        assert_close(abc.rotation, 180.0, "rotation");
+        assert_close(abc.x, 300.0 - 21.6, "x");
+        assert_close(abc.y, 500.0, "y");
+        assert_close(abc.width, 21.6, "width");
+        assert_close(abc.height, 12.0, "height");
     }
 
     #[test]

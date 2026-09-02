@@ -8,9 +8,9 @@ use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
 use super::fonts::{
-    build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
-    extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
-    FontStyleCache,
+    build_font_encodings, build_font_widths, build_type3_scales, build_type3_y_flips,
+    compute_string_width_ts, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
+    CMapDecisionCache, FontStyleCache,
 };
 use super::geometry::run_geometry;
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -288,6 +288,7 @@ fn extract_form_xobject_text_inner(
     // Build font width info for the form
     let font_widths = build_font_widths(doc, &form_fonts);
     let type3_scales = build_type3_scales(doc, &form_fonts);
+    let type3_y_flips = build_type3_y_flips(doc, &form_fonts);
 
     // Build font base names and ToUnicode refs for the form
     let mut font_base_names: HashMap<String, String> = HashMap::new();
@@ -641,7 +642,12 @@ fn extract_form_xobject_text_inner(
                                 )
                             })
                         });
-                        let geometry = run_geometry(&combined, advance_ts, rendered_size);
+                        let geometry = run_geometry(
+                            &combined,
+                            advance_ts,
+                            rendered_size,
+                            type3_y_flips.contains(&current_font),
+                        );
                         if let Some(w_ts) = advance_ts {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -860,6 +866,7 @@ fn extract_form_xobject_text_inner(
                                     &combined_mat,
                                     font_info.map(|_| end_w - start_w),
                                     rendered_size,
+                                    type3_y_flips.contains(&current_font),
                                 );
                                 if horizontal_advance
                                     && crate::text_utils::is_visual_rtl_candidate(text)

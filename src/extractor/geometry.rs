@@ -38,23 +38,22 @@ impl PageRotation {
         }
     }
 
-    /// Turn an axis-aligned box with the page frame: the negated edge
-    /// becomes the far edge and the extents swap.
+    /// Turn an axis-aligned box with the page frame: the negated axis's far
+    /// edge becomes the new near edge and the extents swap. Extents may be
+    /// negative (rects drawn under a reflected CTM), so both edges are
+    /// normalised first and the result always has non-negative extents.
     pub(crate) fn rotate_box(self, x: &mut f32, y: &mut f32, width: &mut f32, height: &mut f32) {
-        match self {
+        let (x0, x1) = (x.min(*x + *width), x.max(*x + *width));
+        let (y0, y1) = (y.min(*y + *height), y.max(*y + *height));
+        let (new_x, new_y) = match self {
             PageRotation::Upright => return,
-            PageRotation::Ccw => {
-                let (new_x, new_y) = (*y, -(*x + width.abs()));
-                *x = new_x;
-                *y = new_y;
-            }
-            PageRotation::Cw => {
-                let (new_x, new_y) = (-(*y + height.abs()), *x);
-                *x = new_x;
-                *y = new_y;
-            }
-        }
-        std::mem::swap(width, height);
+            PageRotation::Ccw => (y0, -x1),
+            PageRotation::Cw => (-y1, x0),
+        };
+        *x = new_x;
+        *y = new_y;
+        *width = y1 - y0;
+        *height = x1 - x0;
     }
 }
 
@@ -81,28 +80,49 @@ pub(crate) struct RunGeometry {
 /// replaces with a character-count estimate: a vertical margin stamp became
 /// a page-wide phantom horizontal line.
 ///
-/// The up vector is the advance direction turned 90° counter-clockwise, not
-/// the matrix's own y axis: glyphs stand on the left of their baseline in
-/// every real layout, whereas the y axis flips sign in legacy dvips output
-/// (a `[s 0 0 -s]` text matrix undone by a mirrored Type3 FontMatrix) and
-/// leans in synthetic-italic shears — following it would drop those boxes
-/// one em below the baseline or widen them by the slant, neither of which
-/// the baseline-anchored box ever did. An unknown advance contributes no
-/// extent, so a horizontal run keeps `width == 0` as the "unknown" signal
-/// `effective_width` relies on, while a vertical run still reports its em
-/// width.
-pub(crate) fn run_geometry(combined: &[f32; 6], advance_ts: Option<f32>, em: f32) -> RunGeometry {
+/// The up vector is one em perpendicular to the baseline, on the side the
+/// matrix's own y axis points to. Perpendicular rather than the y axis
+/// itself, because synthetic-italic shears lean that axis and would widen
+/// the box by the slant and shrink its height, which the baseline-anchored
+/// box never did. The y axis still decides the side: a producer that
+/// mirrors x for right-to-left text (`[-s 0 0 s]`) keeps its glyphs above
+/// the baseline, and a genuinely y-flipped matrix renders them below.
+/// `glyph_up_flipped` undoes that choice for Type3 fonts whose FontMatrix
+/// mirrors y: dvips/PK bitmap fonts declare `[1 0 0 -1 0 0]` and pair it
+/// with a y-flipped text matrix so the glyphs come out upright, so their
+/// box belongs above the baseline although the matrix says otherwise.
+///
+/// An unknown advance contributes no extent, so a horizontal run keeps
+/// `width == 0` as the "unknown" signal `effective_width` relies on, while a
+/// vertical run still reports its em width (and `height == 0`, which
+/// `effective_height` estimates).
+pub(crate) fn run_geometry(
+    combined: &[f32; 6],
+    advance_ts: Option<f32>,
+    em: f32,
+    glyph_up_flipped: bool,
+) -> RunGeometry {
     let (x0, y0) = (combined[4], combined[5]);
     let advance = advance_ts.unwrap_or(0.0);
     let (ax, ay) = (advance * combined[0], advance * combined[1]);
-    // One em perpendicular to the baseline, on its left: (a, b) turned 90°
-    // counter-clockwise and scaled to `em` (which already carries the
-    // matrix's scale, so anisotropic scaling keeps `height == em`).
     let axis_len = combined[0].hypot(combined[1]);
     let (ux, uy) = if axis_len > f32::EPSILON {
-        (-combined[1] / axis_len * em, combined[0] / axis_len * em)
+        // Unit perpendicular to the baseline (the advance turned 90° CCW),
+        // then the side the matrix's y axis (c, d) points to.
+        let (px, py) = (-combined[1] / axis_len, combined[0] / axis_len);
+        let y_axis_side = if combined[2] * px + combined[3] * py < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        let side = if glyph_up_flipped {
+            -y_axis_side
+        } else {
+            y_axis_side
+        };
+        (px * em * side, py * em * side)
     } else {
-        (0.0, em)
+        (0.0, if glyph_up_flipped { -em } else { em })
     };
     let xs = [x0, x0 + ax, x0 + ux, x0 + ax + ux];
     let ys = [y0, y0 + ay, y0 + uy, y0 + ay + uy];
@@ -175,15 +195,33 @@ mod tests {
     }
 
     #[test]
+    fn page_rotation_normalises_negative_extents() {
+        // A rect drawn under a reflected CTM: anchor (100, 200), extents
+        // (-20, -10) span x ∈ [80, 100], y ∈ [190, 200]. Both turns must
+        // produce the same box as for the normalised rect.
+        for rotation in [PageRotation::Ccw, PageRotation::Cw] {
+            let (mut x, mut y, mut w, mut h) = (100.0, 200.0, -20.0, -10.0);
+            rotation.rotate_box(&mut x, &mut y, &mut w, &mut h);
+            let (mut nx, mut ny, mut nw, mut nh) = (80.0, 190.0, 20.0, 10.0);
+            rotation.rotate_box(&mut nx, &mut ny, &mut nw, &mut nh);
+            assert_eq!((x, y, w, h), (nx, ny, nw, nh), "{rotation:?}");
+            assert!(w > 0.0 && h > 0.0);
+        }
+        let (mut x, mut y, mut w, mut h) = (100.0, 200.0, -20.0, -10.0);
+        PageRotation::Ccw.rotate_box(&mut x, &mut y, &mut w, &mut h);
+        assert_eq!((x, y, w, h), (190.0, -100.0, 10.0, 20.0));
+    }
+
+    #[test]
     fn run_geometry_without_advance_keeps_em_width_for_vertical_runs() {
         // No font widths: an upright run keeps `width == 0` as the
         // "advance unknown" signal, a vertical run still owns its em column.
-        let vertical = run_geometry(&[0.0, 1.0, -1.0, 0.0, 100.0, 100.0], None, 10.0);
+        let vertical = run_geometry(&[0.0, 1.0, -1.0, 0.0, 100.0, 100.0], None, 10.0, false);
         assert_eq!(
             (vertical.x, vertical.y, vertical.width, vertical.height),
             (90.0, 100.0, 10.0, 0.0)
         );
-        let upright = run_geometry(&[1.0, 0.0, 0.0, 1.0, 100.0, 100.0], None, 10.0);
+        let upright = run_geometry(&[1.0, 0.0, 0.0, 1.0, 100.0, 100.0], None, 10.0, false);
         assert_eq!(
             (upright.x, upright.y, upright.width, upright.height),
             (100.0, 100.0, 0.0, 10.0)
@@ -194,7 +232,7 @@ mod tests {
     fn run_geometry_anisotropic_scale_keeps_rendered_em_height() {
         // [2 0 0 1]: horizontally stretched text. The em passed in is the
         // rendered size, and the box height must stay exactly that.
-        let stretched = run_geometry(&[2.0, 0.0, 0.0, 1.0, 0.0, 0.0], Some(10.0), 24.0);
+        let stretched = run_geometry(&[2.0, 0.0, 0.0, 1.0, 0.0, 0.0], Some(10.0), 24.0, false);
         assert_eq!(
             (stretched.width, stretched.height, stretched.rotation),
             (20.0, 24.0, 0.0)
@@ -202,29 +240,71 @@ mod tests {
     }
 
     #[test]
-    fn run_geometry_keeps_the_box_above_a_y_flipped_baseline() {
+    fn run_geometry_picks_the_baseline_side_from_the_matrix_and_font() {
         // dvips output: `[s 0 0 -s]` text matrix, glyphs flipped back upright
-        // by the Type3 FontMatrix. The baseline-anchored box must not drop
-        // below the baseline just because the matrix's y axis points down —
-        // that would put Type3 text one em off the Type1 math on its line.
-        let flipped = run_geometry(&[1.0, 0.0, 0.0, -1.0, 100.0, 500.0], Some(30.0), 10.0);
+        // by the `[1 0 0 -1]` Type3 FontMatrix. The box must stay above the
+        // baseline — putting it one em below would separate Type3 text from
+        // the Type1 math on its line.
+        let dvips = run_geometry(&[1.0, 0.0, 0.0, -1.0, 100.0, 500.0], Some(30.0), 10.0, true);
+        assert_eq!(
+            (dvips.x, dvips.y, dvips.width, dvips.height, dvips.rotation),
+            (100.0, 500.0, 30.0, 10.0, 0.0)
+        );
+        // The same matrix with an ordinary font really does render the
+        // glyphs upside down, hanging below the baseline.
+        let hanging = run_geometry(
+            &[1.0, 0.0, 0.0, -1.0, 100.0, 500.0],
+            Some(30.0),
+            10.0,
+            false,
+        );
+        assert_eq!((hanging.y, hanging.height), (490.0, 10.0));
+        // A producer mirroring x for right-to-left text keeps its glyphs
+        // above the baseline: the box runs left from the start point and up.
+        let mirrored = run_geometry(
+            &[-1.0, 0.0, 0.0, 1.0, 300.0, 500.0],
+            Some(30.0),
+            10.0,
+            false,
+        );
         assert_eq!(
             (
-                flipped.x,
-                flipped.y,
-                flipped.width,
-                flipped.height,
-                flipped.rotation
+                mirrored.x,
+                mirrored.y,
+                mirrored.width,
+                mirrored.height,
+                mirrored.rotation
             ),
-            (100.0, 500.0, 30.0, 10.0, 0.0)
+            (270.0, 500.0, 30.0, 10.0, 180.0)
         );
         // Synthetic italics shear the y axis; the box stays em-high and
         // advance-wide instead of growing by the slant.
-        let sheared = run_geometry(&[1.0, 0.0, 0.34, 1.0, 100.0, 500.0], Some(30.0), 10.0);
+        let sheared = run_geometry(
+            &[1.0, 0.0, 0.34, 1.0, 100.0, 500.0],
+            Some(30.0),
+            10.0,
+            false,
+        );
         assert_eq!(
             (sheared.x, sheared.y, sheared.width, sheared.height),
             (100.0, 500.0, 30.0, 10.0)
         );
+        // Rotations keep the glyph side with the matrix: 90° runs stand to
+        // the left of their baseline, 270° runs to the right.
+        let ccw = run_geometry(
+            &[0.0, 1.0, -1.0, 0.0, 100.0, 100.0],
+            Some(30.0),
+            10.0,
+            false,
+        );
+        assert_eq!((ccw.x, ccw.width), (90.0, 10.0));
+        let cw = run_geometry(
+            &[0.0, -1.0, 1.0, 0.0, 100.0, 100.0],
+            Some(30.0),
+            10.0,
+            false,
+        );
+        assert_eq!((cw.x, cw.width), (100.0, 10.0));
     }
 
     #[test]

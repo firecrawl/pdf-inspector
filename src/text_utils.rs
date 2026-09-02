@@ -186,17 +186,24 @@ pub(crate) fn sort_rtl_cell_items<T>(
 
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
-    // An upside-down line (180° runs) reads towards -x: its items sort by
-    // descending x like RTL text, but without the embedded-LTR reordering,
-    // which is about script direction rather than geometry.
+    // An upside-down line (180° runs) reads towards -x. Sort it by its
+    // mirrored position so the script-direction logic — RTL ordering and
+    // embedded-LTR restoration alike — sees the line in its own reading
+    // frame: upside-down LTR reads in descending x, upside-down RTL in
+    // ascending x.
     let upside_down = !items.is_empty() && items.iter().all(|i| i.is_upside_down());
+    let key = |item: &TextItem| {
+        if upside_down {
+            -(item.x + item.width)
+        } else {
+            item.x
+        }
+    };
     if rtl {
-        items.sort_by(|a, b| b.x.total_cmp(&a.x));
+        items.sort_by(|a, b| key(b).total_cmp(&key(a)));
         restore_embedded_ltr_runs(items, |i| i.text.as_str());
-    } else if upside_down {
-        items.sort_by(|a, b| b.x.total_cmp(&a.x));
     } else {
-        items.sort_by(|a, b| a.x.total_cmp(&b.x));
+        items.sort_by(|a, b| key(a).total_cmp(&key(b)));
     }
 }
 
@@ -637,6 +644,21 @@ pub(crate) fn effective_width(item: &TextItem) -> f32 {
         item.text.chars().count() as f32 * item.font_size * 0.5
     } else {
         item.font_size
+    }
+}
+
+/// The item's vertical extent, estimating it only when the geometry is
+/// genuinely unknown — the counterpart of `effective_width` for rotated
+/// runs. A vertical run whose font carries no width information has an
+/// unknown advance and therefore `height == 0`; left at zero it could never
+/// overlap a region and would silently vanish from region extraction.
+pub(crate) fn effective_height(item: &TextItem) -> f32 {
+    if item.height > 0.0 {
+        item.height
+    } else if item.is_horizontal() {
+        item.font_size
+    } else {
+        item.text.chars().count() as f32 * item.font_size * 0.5
     }
 }
 
@@ -1870,6 +1892,32 @@ mod tests {
         sort_line_items(&mut items);
         let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(texts, ["WORLD", "HELLO"]);
+
+        // Upside-down RTL text reads in ascending page x: the first word
+        // sits at the smallest x.
+        let mut first = geometry_item(30.0, 10.0, 180.0);
+        first.text = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}".to_string();
+        first.x = 100.0;
+        let mut second = geometry_item(30.0, 10.0, 180.0);
+        second.text = "\u{05E2}\u{05D5}\u{05DC}\u{05DD}".to_string();
+        second.x = 140.0;
+        let mut items = vec![second.clone(), first.clone()];
+        sort_line_items(&mut items);
+        assert_eq!(items[0].text, first.text);
+        assert_eq!(items[1].text, second.text);
+    }
+
+    #[test]
+    fn effective_height_estimates_only_unknown_vertical_advances() {
+        let mut vertical = geometry_item(10.0, 10.0, 90.0);
+        vertical.height = 0.0;
+        // "abcd" without font widths: chars × 0.5em along the advance.
+        assert_eq!(effective_height(&vertical), 20.0);
+        vertical.height = 55.0;
+        assert_eq!(effective_height(&vertical), 55.0);
+        let mut horizontal = geometry_item(0.0, 10.0, 0.0);
+        horizontal.height = 0.0;
+        assert_eq!(effective_height(&horizontal), 10.0);
     }
 
     #[test]

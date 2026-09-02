@@ -2684,7 +2684,7 @@ pub fn extract_tables_with_structure_cells_mem(
             for token_item in token_subitems {
                 let token_w = text_utils::effective_width(&token_item);
                 let token_cx = token_item.x + token_w * 0.5;
-                let token_cy = token_item.y + token_item.height * 0.5;
+                let token_cy = token_item.y + text_utils::effective_height(&token_item) * 0.5;
                 let mut best: Option<(usize, f32)> = None;
                 for (cell_idx, meta) in cell_meta.iter().enumerate() {
                     let Some((bounds, ccx, ccy)) = meta else {
@@ -2766,10 +2766,11 @@ fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
     if total_chars == 0 {
         return Vec::new();
     }
-    // Token positions are interpolated along x, the reading direction of a
-    // horizontal run only. A rotated run (vertical table header) stays one
-    // item: its box already routes it to the right cell.
-    if !item.is_horizontal() {
+    // Token positions are interpolated along +x, the reading direction of
+    // an upright run only. A rotated run (vertical table header) or an
+    // upside-down one, whose tokens advance towards -x, stays one item: its
+    // box already routes it to the right cell.
+    if !item.is_upright() {
         return vec![item.clone()];
     }
     let item_w = text_utils::effective_width(item);
@@ -2909,7 +2910,7 @@ fn tsr_assign_orphan_items(
             continue;
         }
         let cx = item.x + item_w * 0.5;
-        let cy = item.y + item.height * 0.5;
+        let cy = item.y + text_utils::effective_height(item) * 0.5;
 
         let mut best: Option<(usize, f32)> = None;
         for (ci, bounds_opt) in cell_bounds.iter().enumerate() {
@@ -3611,6 +3612,13 @@ struct RegionBounds {
 
 /// Collect text items that fall within a region bbox (top-left origin, PDF points)
 /// and return them as a single string in reading order.
+///
+/// Items from a page whose text was predominantly rotated live in a turned
+/// coordinate frame (see `TextItem::rotation`); this entry point recognises
+/// that frame heuristically from the axis the turn negated. Callers that
+/// hold the extractor's page metadata should prefer
+/// [`extract_text_in_regions_mem`], which carries the page rotation
+/// explicitly.
 pub fn collect_text_in_region(
     items: &[TextItem],
     rx1: f32,
@@ -3722,14 +3730,18 @@ fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
     // so most items land at negative y or negative x respectively. Use this
     // to keep `collect_text_in_region` behavior compatible for direct
     // callers that do not have extractor metadata.
+    // A turned frame negates exactly one axis; content that is negative on
+    // both, or on neither, is ordinary page content however odd its
+    // coordinates.
     if items.is_empty() {
         return RegionCoordSpace::Standard;
     }
+    let n = items.len();
     let negative_y = items.iter().filter(|item| item.y < 0.0).count();
     let negative_x = items.iter().filter(|item| item.x < 0.0).count();
-    if negative_y * 2 >= items.len() {
+    if negative_y * 2 >= n && negative_x * 2 < n {
         RegionCoordSpace::Rotated90Ccw
-    } else if negative_x * 2 >= items.len() {
+    } else if negative_x * 2 >= n && negative_y * 2 < n {
         RegionCoordSpace::Rotated90Cw
     } else {
         RegionCoordSpace::Standard
@@ -3781,7 +3793,7 @@ const REGION_MARGIN: f32 = 1.5;
 /// boolean test) — the exclusive-assignment score.
 fn region_item_overlap_area(item: &TextItem, bounds: RegionBounds) -> f32 {
     let item_x_max = item.x + text_utils::effective_width(item);
-    let item_y_max = item.y + item.height;
+    let item_y_max = item.y + text_utils::effective_height(item);
     let x_overlap = (item_x_max.min(bounds.x_max + REGION_MARGIN)
         - item.x.max(bounds.x_min - REGION_MARGIN))
     .max(0.0);
@@ -3795,7 +3807,7 @@ fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
     let item_x_min = item.x;
     let item_x_max = item.x + text_utils::effective_width(item);
     let item_y_min = item.y;
-    let item_y_max = item.y + item.height;
+    let item_y_max = item.y + text_utils::effective_height(item);
 
     let x_overlap = (item_x_max.min(bounds.x_max + REGION_MARGIN)
         - item_x_min.max(bounds.x_min - REGION_MARGIN))
@@ -3847,7 +3859,7 @@ fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {
     let item_x_min = item.x;
     let item_x_max = item.x + text_utils::effective_width(item);
     let item_y_min = item.y;
-    let item_y_max = item.y + item.height;
+    let item_y_max = item.y + text_utils::effective_height(item);
 
     let center_x = (item_x_min + item_x_max) * 0.5;
     let center_y = (item_y_min + item_y_max) * 0.5;
@@ -7872,6 +7884,11 @@ mod rotated_run_region_tests {
             infer_region_coord_space(&[item("x", 100.0, 200.0, 36.0, 12.0, 0.0)]),
             RegionCoordSpace::Standard
         );
+        // Negative on both axes is not a turned frame.
+        assert_eq!(
+            infer_region_coord_space(&[item("x", -100.0, -200.0, 36.0, 12.0, 0.0)]),
+            RegionCoordSpace::Standard
+        );
 
         // Bounds round-trip back to the top-left page box they came from.
         for coords in [
@@ -7890,12 +7907,30 @@ mod rotated_run_region_tests {
     }
 
     #[test]
+    fn vertical_run_without_font_widths_still_overlaps_its_region() {
+        // No width information: the advance is unknown, so the run's box is
+        // one em wide and zero tall. The estimated height must keep it
+        // matchable instead of letting it vanish from region extraction.
+        let page_h = 792.0;
+        let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
+        let stamp = item(STAMP, 12.0, 200.0, 20.0, 0.0, 90.0);
+        assert!(region_overlaps_item(&stamp, margin));
+        assert!(region_item_overlap_area(&stamp, margin) > 0.0);
+        assert!(tsr_region_contains_item(&stamp, margin));
+    }
+
+    #[test]
     fn token_splitting_leaves_rotated_runs_whole() {
         let stamp = item("two words", 12.0, 200.0, 20.0, 100.0, 90.0);
         let tokens = split_item_into_token_subitems(&stamp);
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].text, "two words");
         assert_eq!((tokens[0].x, tokens[0].width), (12.0, 20.0));
+
+        // Upside-down runs advance towards -x: interpolating from the left
+        // edge would swap the tokens' cells.
+        let flipped = item("two words", 72.0, 500.0, 90.0, 10.0, 180.0);
+        assert_eq!(split_item_into_token_subitems(&flipped).len(), 1);
 
         let body = item("two words", 72.0, 500.0, 90.0, 10.0, 0.0);
         assert_eq!(split_item_into_token_subitems(&body).len(), 2);

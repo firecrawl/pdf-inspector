@@ -225,6 +225,46 @@ pub(crate) fn build_type3_scales(
     scales
 }
 
+/// Resource names of Type3 fonts whose `FontMatrix` mirrors the y axis
+/// (`d < 0`). dvips/PK bitmap fonts declare `[1 0 0 -1 0 0]` and pair it with
+/// a y-flipped text matrix so the glyphs render upright; the run geometry
+/// must undo the flip when deciding which side of the baseline the glyph box
+/// lies on (see `geometry::run_geometry`).
+pub(crate) fn build_type3_y_flips(
+    doc: &Document,
+    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+) -> std::collections::HashSet<String> {
+    let mut flipped = std::collections::HashSet::new();
+    for (font_name, font_dict) in fonts {
+        let is_type3 = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .is_some_and(|n| n == b"Type3");
+        if !is_type3 {
+            continue;
+        }
+        let Some(matrix) = font_dict
+            .get(b"FontMatrix")
+            .ok()
+            .and_then(|o| resolve_array(doc, o))
+        else {
+            continue;
+        };
+        let Some(d) = matrix.get(3) else {
+            continue;
+        };
+        let d = match d {
+            Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_float().ok()),
+            other => other.as_float().ok(),
+        };
+        if d.is_some_and(|d| d < 0.0) {
+            flipped.insert(String::from_utf8_lossy(font_name).to_string());
+        }
+    }
+    flipped
+}
+
 /// The name a `TextItem` carries for its font: the `/BaseFont` family name
 /// ("ABCDEF+CMMI10"), which identifies the actual face, rather than the
 /// arbitrary per-page resource tag ("F2").
