@@ -1597,7 +1597,10 @@ fn scan_content_for_text_operators(
                     }
                 }
             }
-        } else if b == b'\'' && (is_word_start(i) || (i > 0 && is_pdf_delimiter(content[i - 1]))) && is_word_end(i) {
+        } else if b == b'\''
+            && (is_word_start(i) || (i > 0 && is_pdf_delimiter(content[i - 1])))
+            && is_word_end(i)
+        {
             // ' = move to next line and show text: `(text) '`. Single
             // string operand, same show-text semantics as Tj for our
             // purposes (detecting presence, not reproducing layout) - and
@@ -2976,6 +2979,30 @@ mod tests {
         assert!(
             invisible,
             "invisible text shown via ' must still be detected"
+        );
+    }
+
+    #[test]
+    fn test_apostrophe_immediately_after_string_closer_no_whitespace() {
+        // `'` immediately adjacent to its string operand's closing `)` (no
+        // whitespace) is valid PDF syntax, same as the delimiter-adjacency
+        // already tolerated for Tf/Tr. The other apostrophe tests above put
+        // whitespace before `'`, so they only exercise the pre-existing
+        // is_word_start (whitespace) path - this pins the is_pdf_delimiter
+        // branch specifically.
+        let mut uchars = HashSet::new();
+        let content = b"3 Tr (Hidden OCR line)'";
+        let (ops, _, _, _, invisible) = scan_content_for_text_operators(
+            content,
+            &mut uchars,
+            &mut HashSet::new(),
+            &mut 0,
+            &mut Vec::new(),
+        );
+        assert_eq!(ops, 0);
+        assert!(
+            invisible,
+            "' with no whitespace before it must still be recognized as an operator"
         );
     }
 
