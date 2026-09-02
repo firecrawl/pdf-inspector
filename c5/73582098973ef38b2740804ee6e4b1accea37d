@@ -1,0 +1,94 @@
+src/extractor/geometry.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 174
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 94-95,124-126,264,270-274
+src/extractor/underline.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 721
+pdf_inspector.pyi
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 100-104
+src/tables/mod.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 304,329,1508,1530
+src/tables/grid.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 528,922,963
+src/tables/detect_lines.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 2127
+src/markdown/furniture.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 636
+src/vision/pipeline.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 1151
+src/tables/detect_heuristic.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 142,2251,2396
+src/extractor/layout.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 3076,3826
+src/extractor/xobjects.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 513,762,984
+docs/rust-api.md
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 534
+src/text_utils.rs
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 189-194,635-652,654-657,661-663,665-668,1908-1910,1913,1916,1923-1929,1933-1944,1947-1948,1950,1952-1953,1957-1970
+  s_9d37727abe0b7e::t_47f01f852fb79a 1377,1579,1703,1784,1873
+docs/python.md
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 216
+src/extractor/links.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 125,461
+src/vision/fusion.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 621,1254,1273,1302,1321
+src/tables/financial.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 115
+tests/integration_tests.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 296,326
+napi/src/lib.rs
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 105-109
+  s_9d37727abe0b7e::t_47f01f852fb79a 529
+src/markdown/preprocess.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 253
+src/extractor/reading_order.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 451
+src/vision/pdfium.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 265
+src/tables/detect_rects.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 3571,5274,5588
+src/markdown/analysis.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 856
+src/types.rs
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 134-142
+  s_9d37727abe0b7e::t_47f01f852fb79a 445
+src/markdown/convert.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 1580
+src/lib.rs
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 7962-7963,7977-7978
+  s_9d37727abe0b7e::t_b2ba24e15cbfc7 7857-7858
+  s_9d37727abe0b7e::t_47f01f852fb79a 840,5512,5791,6624,7823
+src/extractor/mod.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 1194,1500,1761,1780,1799,2588,2607,2626,2656,2675,2694,2726,2765,2805,2824,2843,2870,3012,3031,3060,3079,3124,3173,3222,3264
+src/markdown/mod.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 2696
+src/markdown/heading.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 528,689
+src/bin/pdf2md.rs
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 82,90,299
+  s_9d37727abe0b7e::t_47f01f852fb79a 288
+src/extractor/content_stream.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 604,835,953,1000,1150,2597,2679
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 2163-2172,2315
+src/python.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 603
+  s_9d37727abe0b7e::t_9b74b81bfaa4d5 366-371
+src/tables/detect_struct.rs
+  s_9d37727abe0b7e::t_47f01f852fb79a 605
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c573582098973ef38b2740804ee6e4b1accea37d",
+  "prompts": {},
+  "sessions": {
+    "s_9d37727abe0b7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc8426ba-5c23-49c3-a8f8-b78998896dc0",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
