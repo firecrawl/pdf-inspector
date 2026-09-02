@@ -430,7 +430,7 @@ pub struct PyOutlineEntry {
     /// 1-based nesting depth (top-level bookmarks are level 1).
     #[pyo3(get)]
     pub level: u32,
-    /// Bookmark title (decoded from UTF-16BE or PDFDocEncoding).
+    /// Bookmark title (decoded from BOM-marked UTF-16 or PDFDocEncoding).
     #[pyo3(get)]
     pub title: String,
     /// 1-indexed target page (matches TextItem.page), None when the

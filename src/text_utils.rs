@@ -603,7 +603,7 @@ pub(crate) fn decode_text_string(bytes: &[u8]) -> String {
 
 /// PDFDocEncoding bytes that differ from Latin-1 (PDF 32000-1:2008 Annex D):
 /// accents at 0x18–0x1F, punctuation/ligatures at 0x80–0x9E, euro at 0xA0.
-/// Undefined bytes (0x7F, 0x9F, 0xAD) fall back to their Latin-1 value.
+/// Undefined bytes (0x7F, 0x9F, 0xAD) decode to the replacement character.
 fn pdfdoc_encoding_char(byte: u8) -> char {
     match byte {
         0x18 => '\u{02D8}', // breve
@@ -614,6 +614,7 @@ fn pdfdoc_encoding_char(byte: u8) -> char {
         0x1D => '\u{02DB}', // ogonek
         0x1E => '\u{02DA}', // ring
         0x1F => '\u{02DC}', // tilde
+        0x7F | 0x9F | 0xAD => '\u{FFFD}',
         0x80 => '\u{2022}', // bullet
         0x81 => '\u{2020}', // dagger
         0x82 => '\u{2021}', // daggerdbl
@@ -650,12 +651,11 @@ fn pdfdoc_encoding_char(byte: u8) -> char {
     }
 }
 
-/// Decode a PDF text string with the exact PDFDocEncoding table: UTF-16BE
-/// when the BOM (\xFE\xFF) is present, otherwise PDFDocEncoding including
-/// the bytes that differ from Latin-1 (curly quotes, dashes, fi/fl
-/// ligatures, accents, euro). Used for outline (bookmark) titles;
-/// [`decode_text_string`] keeps its Latin-1 approximation for existing
-/// ActualText callers.
+/// Decode a PDF text string with the exact PDFDocEncoding table: UTF-16 when
+/// a byte-order mark is present, otherwise PDFDocEncoding including the bytes
+/// that differ from Latin-1 (curly quotes, dashes, fi/fl ligatures, accents,
+/// euro). Used for outline (bookmark) titles; [`decode_text_string`] keeps its
+/// Latin-1 approximation for existing ActualText callers.
 pub(crate) fn decode_pdfdoc_text_string(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
         let utf16: Vec<u16> = bytes[2..]
@@ -663,6 +663,14 @@ pub(crate) fn decode_pdfdoc_text_string(bytes: &[u8]) -> String {
             .0
             .iter()
             .map(|chunk| u16::from_be_bytes(*chunk))
+            .collect();
+        String::from_utf16_lossy(&utf16)
+    } else if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let utf16: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect();
         String::from_utf16_lossy(&utf16)
     } else {
@@ -1213,6 +1221,23 @@ mod tests {
             utf16.extend_from_slice(&unit.to_be_bytes());
         }
         assert_eq!(decode_pdfdoc_text_string(&utf16), "Ü");
+    }
+
+    #[test]
+    fn pdfdoc_decoder_replaces_undefined_bytes() {
+        assert_eq!(
+            decode_pdfdoc_text_string(&[0x7F, 0x9F, 0xAD]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn pdfdoc_decoder_decodes_utf16le_with_bom() {
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "Résumé".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_pdfdoc_text_string(&utf16), "Résumé");
     }
 
     #[test]

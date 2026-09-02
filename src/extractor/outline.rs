@@ -59,7 +59,7 @@ impl OutlineWalkBudget {
 pub struct OutlineEntry {
     /// 1-based nesting depth (top-level bookmarks are level 1).
     pub level: u32,
-    /// Bookmark title, decoded from UTF-16BE (BOM `FE FF`) or PDFDocEncoding.
+    /// Bookmark title, decoded from BOM-marked UTF-16 or PDFDocEncoding.
     pub title: String,
     /// 1-indexed target page (matches [`crate::TextItem::page`]), or `None`
     /// when the destination is missing or cannot be resolved.
@@ -832,8 +832,33 @@ mod tests {
     }
 
     #[test]
+    fn utf16le_title_decodes() {
+        let (mut doc, page_ids) = doc_with_pages(1);
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "Résumé".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let node = doc.add_object(dictionary! {
+            "Title" => Object::String(bytes, lopdf::StringFormat::Literal),
+            "Dest" => vec![
+                Object::Reference(page_ids[0]),
+                Object::Name(b"Fit".to_vec()),
+            ],
+        });
+        let outlines_id = doc.add_object(dictionary! {
+            "Type" => "Outlines",
+            "First" => Object::Reference(node),
+        });
+        set_catalog(&mut doc, outlines_id);
+
+        let entries = extract_outline_from_doc(&doc, &page_map(&page_ids));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Résumé");
+    }
+
+    #[test]
     fn pdfdoc_encoding_title_maps_punctuation_and_ligatures() {
-        // Titles without a UTF-16BE BOM are PDFDocEncoded: bytes 0x80–0x9E
+        // Titles without a UTF-16 BOM are PDFDocEncoded: bytes 0x80–0x9E
         // are punctuation/ligatures, not the Latin-1 control characters.
         let (mut doc, page_ids) = doc_with_pages(1);
         // "ﬁle — 'quoted'" in PDFDocEncoding.
