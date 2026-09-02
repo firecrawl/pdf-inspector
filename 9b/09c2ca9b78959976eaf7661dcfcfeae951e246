@@ -1,0 +1,47 @@
+src/extractor/content_stream.rs
+  s_9d37727abe0b7e::t_522f85909bafa3 21-23,552-556,806-813,929-933,1124-1128,1142-1146,2199-2214
+pdf_inspector.pyi
+  s_9d37727abe0b7e::t_522f85909bafa3 102-103
+src/tables/detect_heuristic.rs
+  s_9d37727abe0b7e::t_c36813419fddc4 68,125,134-138
+  s_9d37727abe0b7e::t_522f85909bafa3 88-90
+src/extractor/xobjects.rs
+  s_9d37727abe0b7e::t_522f85909bafa3 15,710-714,953-960
+src/python.rs
+  s_9d37727abe0b7e::t_522f85909bafa3 367-368
+src/extractor/underline.rs
+  s_9d37727abe0b7e::t_522f85909bafa3 362-363,367
+src/types.rs
+  s_9d37727abe0b7e::t_c36813419fddc4 210-221
+  s_9d37727abe0b7e::t_522f85909bafa3 135-140
+src/lib.rs
+  s_9d37727abe0b7e::t_522f85909bafa3 7951,7966-7968
+docs/python.md
+  s_9d37727abe0b7e::t_522f85909bafa3 216
+src/extractor/geometry.rs
+  s_9d37727abe0b7e::t_522f85909bafa3 272,278,285-291,296-337,342-348,354-360,363-369,379-385,395,405,423-429,441,449
+  s_9d37727abe0b7e::t_6b17766d51a14e 123-128,132,137-140,180,184-188
+napi/src/lib.rs
+  s_9d37727abe0b7e::t_522f85909bafa3 106-108
+src/extractor/mod.rs
+  s_9d37727abe0b7e::t_c36813419fddc4 664,1191-1197
+  s_9d37727abe0b7e::t_522f85909bafa3 663,665,1131-1133,1296-1301,3672-3684
+src/text_utils.rs
+  s_9d37727abe0b7e::t_522f85909bafa3 630-634,636,639,641,939-942,1899-1902,1904-1910
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "9b09c2ca9b78959976eaf7661dcfcfeae951e246",
+  "prompts": {},
+  "sessions": {
+    "s_9d37727abe0b7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc8426ba-5c23-49c3-a8f8-b78998896dc0",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
