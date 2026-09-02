@@ -510,6 +510,7 @@ fn extract_form_xobject_text_inner(
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: 0.0,
+                                    advance_known: true,
                                     item_type: ItemType::Image,
                                     mcid: None,
                                 });
@@ -758,6 +759,7 @@ fn extract_form_xobject_text_inner(
                                 is_underline: false,
                                 is_strikeout: false,
                                 rotation: geometry.rotation,
+                                advance_known: geometry.advance_known,
                                 item_type: ItemType::Text,
                                 mcid: None,
                             });
@@ -979,6 +981,7 @@ fn extract_form_xobject_text_inner(
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: geometry.rotation,
+                                    advance_known: geometry.advance_known,
                                     item_type: ItemType::Text,
                                     mcid: None,
                                 });

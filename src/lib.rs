@@ -837,6 +837,7 @@ mod ocr_header_footer_tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: types::ItemType::Text,
             mcid: None,
         }
@@ -5508,6 +5509,7 @@ mod text_cluster_column_undercount_tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -5786,6 +5788,7 @@ mod table_candidate_selection_tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -6618,6 +6621,7 @@ mod tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -7816,6 +7820,7 @@ mod rotated_run_region_tests {
             width,
             height,
             rotation,
+            advance_known: true,
             font: "Helvetica".to_string(),
             font_tag: "F1".to_string(),
             font_size: if rotation == 0.0 { height } else { width },
@@ -7849,7 +7854,8 @@ mod rotated_run_region_tests {
         // was widened to chars × 0.5em by `effective_width` and crossed
         // into the body region — the exclusive assignment then handed the
         // stamp to the body paragraph and left the margin empty.
-        let phantom = item(STAMP, 32.0, 200.0, 0.0, 20.0, 0.0);
+        let mut phantom = item(STAMP, 32.0, 200.0, 0.0, 20.0, 0.0);
+        phantom.advance_known = false;
         assert!(region_overlaps_item(&phantom, body));
         assert!(
             region_item_overlap_area(&phantom, body) > region_item_overlap_area(&phantom, margin)
@@ -7953,7 +7959,8 @@ mod rotated_run_region_tests {
 
     #[test]
     fn tsr_line_clustering_uses_the_estimated_height_of_unknown_advances() {
-        let stamp = item(STAMP, 12.0, 200.0, 20.0, 0.0, 90.0);
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, 0.0, 90.0);
+        stamp.advance_known = false;
         let lines = cluster_tsr_cell_text_lines(vec![stamp]);
         assert_eq!(lines.len(), 1);
         // 37 glyphs × 0.5em at 20pt: a real extent, not the 2.5pt floor.
@@ -7967,7 +7974,8 @@ mod rotated_run_region_tests {
         // matchable instead of letting it vanish from region extraction.
         let page_h = 792.0;
         let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
-        let stamp = item(STAMP, 12.0, 200.0, 20.0, 0.0, 90.0);
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, 0.0, 90.0);
+        stamp.advance_known = false;
         assert!(region_overlaps_item(&stamp, margin));
         assert!(region_item_overlap_area(&stamp, margin) > 0.0);
         assert!(tsr_region_contains_item(&stamp, margin));

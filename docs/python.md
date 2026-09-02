@@ -213,6 +213,7 @@ class TextItem:                      # extract_text_with_positions
     width: float
     height: float                    # axis-aligned box; y is the baseline for horizontal text
     rotation: float                  # baseline angle in degrees CCW: 0 horizontal, 90 bottom-to-top, 270 top-to-bottom
+    advance_known: bool              # False only for fonts without width metrics: the box is then just the em across the baseline
     font: str
     font_size: float
     page: int

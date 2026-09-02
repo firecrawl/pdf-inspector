@@ -102,6 +102,11 @@ pub struct TextItem {
     /// run's axis-aligned box, so a vertical run is tall and thin (height
     /// ≫ width) instead of zero-width.
     pub rotation: f64,
+    /// Whether the run's advance came from font metrics. `false` only when
+    /// the font carries no width information: the box then spans just the
+    /// em across the baseline (zero `width` for horizontal text, zero
+    /// `height` for vertical text) and says nothing about the run's length.
+    pub advance_known: bool,
     pub font: String,
     pub font_tag: String,
     pub font_size: f64,
@@ -521,6 +526,7 @@ pub fn extract_text_with_positions(
                     is_underline: item.is_underline,
                     is_strikeout: item.is_strikeout,
                     rotation: item.rotation as f64,
+                    advance_known: item.advance_known,
                     item_type,
                     link_url,
                     mcid: item.mcid,

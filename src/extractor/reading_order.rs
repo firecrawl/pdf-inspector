@@ -448,6 +448,7 @@ mod tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
         }

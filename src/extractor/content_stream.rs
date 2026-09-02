@@ -601,6 +601,7 @@ pub(crate) fn extract_page_text_items(
                                 is_underline: false,
                                 is_strikeout: false,
                                 rotation: geometry.rotation,
+                                advance_known: geometry.advance_known,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -831,6 +832,7 @@ pub(crate) fn extract_page_text_items(
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: geometry.rotation,
+                                    advance_known: geometry.advance_known,
                                     item_type: ItemType::Text,
                                     mcid: current_mcid(&marked_content_stack),
                                 });
@@ -948,6 +950,7 @@ pub(crate) fn extract_page_text_items(
                                 is_underline: false,
                                 is_strikeout: false,
                                 rotation: geometry.rotation,
+                                advance_known: geometry.advance_known,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -994,6 +997,7 @@ pub(crate) fn extract_page_text_items(
                                         is_underline: false,
                                         is_strikeout: false,
                                         rotation: 0.0,
+                                        advance_known: true,
                                         item_type: ItemType::Image,
                                         mcid: current_mcid(&marked_content_stack),
                                     });
@@ -1143,6 +1147,7 @@ pub(crate) fn extract_page_text_items(
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: geometry.rotation,
+                                    advance_known: geometry.advance_known,
                                     item_type: ItemType::Text,
                                     mcid: entry
                                         .mcid
@@ -2155,6 +2160,17 @@ end"#;
     }
 
     #[test]
+    fn font_without_widths_marks_the_advance_unknown() {
+        // The Hebrew test font carries no /Widths: the run's box is the em
+        // alone and `advance_known` says so, instead of a zero width that
+        // could also mean a genuine zero advance.
+        let items = extract_hebrew_items(b"BT /F1 12 Tf 100 700 Td <41424344> Tj ET");
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].advance_known);
+        assert_eq!((items[0].width, items[0].height), (0.0, 12.0));
+    }
+
+    #[test]
     fn rotated_hebrew_ops_stay_neutral() {
         // 90°-rotated text matrix: the advance has no horizontal component,
         // so the run carries no storage-order evidence and must pass through
@@ -2296,6 +2312,7 @@ BT /F1 12 Tf 72 672 Td (Body line three) Tj ET
         assert_close(stamp.width, 20.0, "width");
         assert_close(stamp.height, 192.0, "height");
         assert_close(stamp.font_size, 20.0, "font_size");
+        assert!(stamp.advance_known);
 
         // Upright text keeps its historical box: baseline y, em height,
         // advance width, no rotation.
@@ -2577,6 +2594,7 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             width: 12.0,
             height: 36.0,
             rotation: 90.0,
+            advance_known: true,
             font: "Helvetica".to_string(),
             font_tag: "F1".to_string(),
             font_size: 12.0,
@@ -2658,6 +2676,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (   ) Tj ET",
             width: 12.0,
             height: 36.0,
             rotation: 90.0,
+            advance_known: true,
             font: "Helvetica".to_string(),
             font_tag: "F1".to_string(),
             font_size: 12.0,

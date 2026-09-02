@@ -293,6 +293,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
+        advance_known: true,
         item_type: ItemType::Text,
         mcid: None,
     }
@@ -322,6 +323,7 @@ fn make_text_item_with_font(
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
+        advance_known: true,
         item_type: ItemType::Text,
         mcid: None,
     }

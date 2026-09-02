@@ -301,6 +301,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
             rotation: item.rotation,
+            advance_known: item.advance_known,
             item_type: item.item_type.clone(),
             mcid: item.mcid,
         });
@@ -325,6 +326,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
             rotation: item.rotation,
+            advance_known: item.advance_known,
             item_type: item.item_type.clone(),
             mcid: item.mcid,
         });
@@ -1503,6 +1505,7 @@ mod tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1524,6 +1527,7 @@ mod tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
         }

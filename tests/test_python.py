@@ -215,6 +215,7 @@ class TestExtractTextWithPositions:
         assert isinstance(item.width, float)
         assert isinstance(item.height, float)
         assert isinstance(item.rotation, float)
+        assert isinstance(item.advance_known, bool)
         assert isinstance(item.font, str)
         assert isinstance(item.font_size, float)
         assert isinstance(item.page, int)
@@ -540,6 +541,7 @@ class TestRotatedRunGeometry:
         assert stamp.height > 10 * stamp.width
         assert all(i.width > 0 for i in items if i.text.strip())
         assert all(i.rotation == 0.0 for i in items if i.text != ROTATED_STAMP_TEXT)
+        assert all(i.advance_known for i in items)
 
     def test_rotated_margin_run_assigned_to_margin_region_only(self):
         results = pdf_inspector.extract_text_in_regions(

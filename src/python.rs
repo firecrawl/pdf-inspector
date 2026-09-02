@@ -363,6 +363,12 @@ pub struct PyTextItem {
     /// axis-aligned box, so a vertical run is tall and thin.
     #[pyo3(get)]
     pub rotation: f32,
+    /// Whether the run's advance came from font metrics. False only when the
+    /// font carries no width information: the box then spans just the em
+    /// across the baseline (zero width for horizontal text, zero height for
+    /// vertical text) and says nothing about the run's length.
+    #[pyo3(get)]
+    pub advance_known: bool,
     #[pyo3(get)]
     pub font: String,
     #[pyo3(get)]
@@ -594,6 +600,7 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
             rotation: item.rotation,
+            advance_known: item.advance_known,
             item_type: item_type_str(&item.item_type),
             mcid: item.mcid,
         })

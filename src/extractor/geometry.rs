@@ -91,6 +91,8 @@ pub(crate) struct RunGeometry {
     pub(crate) width: f32,
     pub(crate) height: f32,
     pub(crate) rotation: f32,
+    /// Whether `advance_ts` was known: see `TextItem::advance_known`.
+    pub(crate) advance_known: bool,
 }
 
 /// Compute the axis-aligned box a shown run occupies in device space.
@@ -119,10 +121,9 @@ pub(crate) struct RunGeometry {
 /// box belongs above the baseline although the matrix says otherwise.
 ///
 /// An unknown advance contributes no extent: the box is then exactly one em
-/// turned by the baseline angle, which `text_utils::effective_width` and
-/// `effective_height` recognise as "advance unknown" and replace with an
-/// estimate along the run — whatever the angle, so a width-less oblique run
-/// is not shrunk to its em either.
+/// turned by the baseline angle, and `advance_known` records the fact so
+/// `text_utils::effective_width` and `effective_height` can lay an estimate
+/// along the run instead — whatever the angle.
 pub(crate) fn run_geometry(
     combined: &[f32; 6],
     advance_ts: Option<f32>,
@@ -170,6 +171,7 @@ pub(crate) fn run_geometry(
         width: x_max - x_min,
         height: y_max - y_min,
         rotation: baseline_rotation(combined[0], combined[1]),
+        advance_known: advance_ts.is_some(),
     }
 }
 
@@ -259,11 +261,17 @@ mod tests {
             (vertical.x, vertical.y, vertical.width, vertical.height),
             (90.0, 100.0, 10.0, 0.0)
         );
+        assert!(!vertical.advance_known);
         let upright = run_geometry(&[1.0, 0.0, 0.0, 1.0, 100.0, 100.0], None, 10.0, false);
         assert_eq!(
             (upright.x, upright.y, upright.width, upright.height),
             (100.0, 100.0, 0.0, 10.0)
         );
+        assert!(!upright.advance_known);
+        // A font that reports a zero advance is not "unknown".
+        let zero = run_geometry(&[1.0, 0.0, 0.0, 1.0, 100.0, 100.0], Some(0.0), 10.0, false);
+        assert!(zero.advance_known);
+        assert_eq!((zero.width, zero.height), (0.0, 10.0));
     }
 
     #[test]

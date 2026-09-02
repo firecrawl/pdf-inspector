@@ -97,6 +97,11 @@ class TextItem:
     page's x axis, in [0, 360): 0 for ordinary horizontal text, 90 for text
     reading bottom-to-top (a rotated margin stamp), 270 for top-to-bottom,
     180 for upside-down."""
+    advance_known: bool
+    """Whether the run's advance came from font metrics. False only when the
+    font carries no width information: the box then spans just the em across
+    the baseline (zero width for horizontal text, zero height for vertical
+    text) and says nothing about the run's length."""
     font: str
     font_tag: str
     font_size: float

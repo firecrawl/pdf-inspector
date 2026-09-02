@@ -72,6 +72,7 @@ assert.equal(typeof item.y, 'number');
 assert.equal(typeof item.width, 'number');
 assert.equal(typeof item.height, 'number');
 assert.equal(typeof item.rotation, 'number');
+assert.equal(typeof item.advanceKnown, 'boolean');
 assert.equal(typeof item.font, 'string');
 assert.equal(typeof item.fontSize, 'number');
 assert.equal(typeof item.page, 'number');
@@ -111,6 +112,7 @@ assert.ok(
   'no run with glyphs may be zero-width',
 );
 assert.ok(rotatedItems.filter(i => !i.text.startsWith('arXiv:')).every(i => i.rotation === 0));
+assert.ok(rotatedItems.every(i => i.advanceKnown === true), 'Helvetica carries metrics for every run');
 console.log('  extractTextWithPositions rotation: OK');
 
 // the stamp belongs to the margin box only, never to the body paragraph

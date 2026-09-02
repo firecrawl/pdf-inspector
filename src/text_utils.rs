@@ -186,12 +186,12 @@ pub(crate) fn sort_rtl_cell_items<T>(
 
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
-    // An upside-down line (180° runs) reads towards -x. Sort it by its
-    // mirrored position so the script-direction logic — RTL ordering and
-    // embedded-LTR restoration alike — sees the line in its own reading
-    // frame: upside-down LTR reads in descending x, upside-down RTL in
-    // ascending x.
-    let upside_down = !items.is_empty() && items.iter().all(|i| i.is_upside_down());
+    // An upside-down line of LTR runs (180°) reads towards -x: sort it by its
+    // mirrored position so the fragments come out in reading order. RTL lines
+    // are exempt: the common way to paint right-to-left text is a mirrored-x
+    // text matrix, which also reports 180° while the glyphs stand upright and
+    // the line already reads in the classic RTL order (descending x).
+    let upside_down = !rtl && !items.is_empty() && items.iter().all(|i| i.is_upside_down());
     let key = |item: &TextItem| {
         if upside_down {
             -(item.x + item.width)
@@ -627,61 +627,45 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
     base_size * scale
 }
 
-/// A run whose font carried no width information has an unknown advance.
-/// `run_geometry` then spans its box from the em vector alone, so the box is
-/// exactly one perpendicular em turned by `rotation`: `em·|sin θ|` wide,
-/// `em·|cos θ|` tall, and silent about the run's length — horizontal and
-/// vertical runs collapse to a zero width or height, oblique runs to an
-/// em-sized diamond. Recognised from the box itself, so the item model
-/// needs no extra flag: the box is proportional to `(|sin θ|, |cos θ|)`,
-/// and its diagonal *is* the perpendicular em, which the matrix may have
-/// shrunk below `font_size` (anisotropic or sheared text) but can never
-/// stretch above it. A known advance, however short, breaks the proportion
-/// except at exactly 45°, where it pushes the diagonal past `font_size`
-/// instead. Returns `(|sin θ|, |cos θ|, perpendicular em)` for such a box.
-fn unknown_advance_box(item: &TextItem) -> Option<(f32, f32, f32)> {
-    let (sin, cos) = item.rotation.to_radians().sin_cos();
-    let (sin, cos) = (sin.abs(), cos.abs());
-    let em = item.width.hypot(item.height);
-    let tolerance = 1e-3 * em.max(1.0);
-    let proportional = (item.width * cos - item.height * sin).abs() <= tolerance;
-    // A collapsed box (no em at all) never comes from `run_geometry`; leave
-    // it to the plain zero-extent fallbacks.
-    let em_fits = em > 0.0 && em <= item.font_size * 1.001 + 1e-3;
-    (proportional && em_fits).then_some((sin, cos, em))
-}
-
 /// Advance estimate for a run without font widths: half an em per glyph.
 fn estimated_advance(item: &TextItem) -> f32 {
     item.text.chars().count() as f32 * item.font_size * 0.5
 }
 
-/// The item's horizontal extent, estimating it only when the advance is
-/// genuinely unknown (see `unknown_advance_box`): the estimated advance is
-/// projected onto x and the em box added, so a vertical stamp never turns
-/// into a page-wide phantom line and an oblique run is not shrunk to its em.
+/// Box extents of a run whose advance is unknown (`TextItem::advance_known`
+/// is false). `run_geometry` spanned its box from the em across the baseline
+/// alone, so that box is one em turned by `rotation` and its diagonal is the
+/// em itself — which anisotropic or sheared matrices may have shrunk below
+/// `font_size`. The estimated advance is laid along the baseline and the em
+/// across it, giving `(width, height)`.
+fn estimated_extents(item: &TextItem) -> (f32, f32) {
+    let (sin, cos) = item.rotation.to_radians().sin_cos();
+    let (sin, cos) = (sin.abs(), cos.abs());
+    let em = item.width.hypot(item.height);
+    let advance = estimated_advance(item);
+    (advance * cos + em * sin, advance * sin + em * cos)
+}
+
+/// The item's horizontal extent: the real box when the advance came from
+/// font metrics, otherwise an estimate laid along the run — so a width-less
+/// vertical stamp never becomes a page-wide phantom line and a width-less
+/// oblique run is not shrunk to its em.
 pub(crate) fn effective_width(item: &TextItem) -> f32 {
-    match unknown_advance_box(item) {
-        Some((sin, cos, em)) => estimated_advance(item) * cos + em * sin,
-        // Boxes not shaped by `run_geometry` (synthetic or legacy items)
-        // keep the plain zero-extent fallbacks.
-        None if item.width > 0.0 => item.width,
-        None if item.is_horizontal() => estimated_advance(item),
-        None => item.font_size,
+    if item.advance_known {
+        item.width
+    } else {
+        estimated_extents(item).0
     }
 }
 
-/// The item's vertical extent, estimating it only when the advance is
-/// genuinely unknown (see `unknown_advance_box`) — the counterpart of
-/// `effective_width`. Left at its zero or em-sized box, a width-less rotated
-/// run could never overlap a region and would silently vanish from region
-/// extraction.
+/// The item's vertical extent — the counterpart of `effective_width`. Left
+/// at its em-only box, a width-less rotated run could never overlap a region
+/// and would silently vanish from region extraction.
 pub(crate) fn effective_height(item: &TextItem) -> f32 {
-    match unknown_advance_box(item) {
-        Some((sin, cos, em)) => estimated_advance(item) * sin + em * cos,
-        None if item.height > 0.0 => item.height,
-        None if item.is_horizontal() => item.font_size,
-        None => estimated_advance(item),
+    if item.advance_known {
+        item.height
+    } else {
+        estimated_extents(item).1
     }
 }
 
@@ -1390,6 +1374,7 @@ mod tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1591,6 +1576,7 @@ mod tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1714,6 +1700,7 @@ mod tests {
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
             });
@@ -1794,6 +1781,7 @@ mod tests {
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1882,6 +1870,7 @@ mod tests {
             width,
             height: font_size,
             rotation,
+            advance_known: true,
             font: String::new(),
             font_tag: String::new(),
             font_size,
@@ -1916,89 +1905,68 @@ mod tests {
         let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(texts, ["WORLD", "HELLO"]);
 
-        // Upside-down RTL text reads in ascending page x: the first word
-        // sits at the smallest x.
+        // An RTL line at 180° is the mirrored-x matrix producers use for
+        // right-to-left text, not upside-down glyphs: it keeps the classic
+        // RTL order, first word at the largest x.
         let mut first = geometry_item(30.0, 10.0, 180.0);
         first.text = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}".to_string();
-        first.x = 100.0;
+        first.x = 140.0;
         let mut second = geometry_item(30.0, 10.0, 180.0);
         second.text = "\u{05E2}\u{05D5}\u{05DC}\u{05DD}".to_string();
-        second.x = 140.0;
+        second.x = 100.0;
         let mut items = vec![second.clone(), first.clone()];
         sort_line_items(&mut items);
         assert_eq!(items[0].text, first.text);
         assert_eq!(items[1].text, second.text);
     }
 
-    #[test]
-    fn effective_height_estimates_only_unknown_vertical_advances() {
-        let mut vertical = geometry_item(10.0, 10.0, 90.0);
-        vertical.height = 0.0;
-        // "abcd" without font widths: chars × 0.5em along the advance.
-        assert_eq!(effective_height(&vertical), 20.0);
-        vertical.height = 55.0;
-        assert_eq!(effective_height(&vertical), 55.0);
-        let mut horizontal = geometry_item(0.0, 10.0, 0.0);
-        horizontal.height = 0.0;
-        assert_eq!(effective_height(&horizontal), 10.0);
+    /// The em-only box `run_geometry` leaves for a run without font widths.
+    fn unknown_advance_item(rotation: f32, font_size: f32, em: f32) -> TextItem {
+        let (sin, cos) = rotation.to_radians().sin_cos();
+        let mut item = geometry_item(em * sin.abs(), font_size, rotation);
+        item.height = em * cos.abs();
+        item.advance_known = false;
+        item
     }
 
     #[test]
-    fn oblique_runs_without_font_widths_get_an_advance_estimate_too() {
-        // A 45° run whose font has no widths: `run_geometry` left exactly the
-        // turned em box (7.07 × 7.07 for a 10pt em). "abcd" estimates a 20pt
-        // advance, so both extents grow to 20·cos45 + 10·sin45.
-        let em_side = 10.0 * 45.0_f32.to_radians().sin();
-        let mut diagonal = geometry_item(em_side, 10.0, 45.0);
-        diagonal.height = em_side;
-        let expected = 20.0 * 45.0_f32.to_radians().cos() + em_side;
+    fn unknown_advances_are_estimated_along_the_run() {
+        // "abcd" without font widths: half an em per glyph along the baseline,
+        // the em across it — whatever the angle.
+        let horizontal = unknown_advance_item(0.0, 10.0, 10.0);
+        assert!((effective_width(&horizontal) - 20.0).abs() < 1e-3);
+        assert!((effective_height(&horizontal) - 10.0).abs() < 1e-3);
+        let vertical = unknown_advance_item(90.0, 10.0, 10.0);
+        assert!((effective_width(&vertical) - 10.0).abs() < 1e-3);
+        assert!((effective_height(&vertical) - 20.0).abs() < 1e-3);
+        let (sin, cos) = 45.0_f32.to_radians().sin_cos();
+        let diagonal = unknown_advance_item(45.0, 10.0, 10.0);
+        let expected = 20.0 * cos + 10.0 * sin;
         assert!((effective_width(&diagonal) - expected).abs() < 1e-3);
         assert!((effective_height(&diagonal) - expected).abs() < 1e-3);
-        // The same run with a known advance keeps its box.
-        let mut known = geometry_item(30.0, 10.0, 45.0);
-        known.height = 25.0;
-        assert_eq!(effective_width(&known), 30.0);
-        assert_eq!(effective_height(&known), 25.0);
-        // A tiny but real horizontal advance is not "unknown".
+        // Anisotropic text: `font_size` carries the larger scale (24) while
+        // the em across the baseline is 12 — the box's own diagonal.
+        let (sin, cos) = 30.0_f32.to_radians().sin_cos();
+        let stretched = unknown_advance_item(30.0, 24.0, 12.0);
+        let advance = 4.0 * 0.5 * 24.0;
+        assert!((effective_width(&stretched) - (advance * cos + 12.0 * sin)).abs() < 1e-3);
+        assert!((effective_height(&stretched) - (advance * sin + 12.0 * cos)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn known_advances_are_never_estimated() {
+        // A font that reports a genuine zero advance keeps its zero width.
+        let zero = geometry_item(0.0, 10.0, 0.0);
+        assert_eq!(effective_width(&zero), 0.0);
+        assert_eq!(effective_height(&zero), 10.0);
+        // A short run at 45° keeps its real (square-ish) box.
+        let mut short = geometry_item(6.0, 10.0, 45.0);
+        short.height = 5.0;
+        assert_eq!(
+            (effective_width(&short), effective_height(&short)),
+            (6.0, 5.0)
+        );
         let thin = geometry_item(0.4, 10.0, 0.0);
         assert_eq!(effective_width(&thin), 0.4);
-        // A real 45° run whose box happens to be square is not "unknown"
-        // either: its diagonal exceeds the em.
-        let mut square = geometry_item(30.0, 10.0, 45.0);
-        square.height = 30.0;
-        assert_eq!(
-            (effective_width(&square), effective_height(&square)),
-            (30.0, 30.0)
-        );
-    }
-
-    #[test]
-    fn anisotropic_width_less_oblique_runs_are_recognised_from_their_box() {
-        // `[2 0 0 1]`-style text turned 30°: `font_size` reports the larger
-        // scale (24) while the perpendicular em is 12, so the no-advance box
-        // is 12·(sin30, cos30) = (6, 10.39). A `font_size` comparison misses
-        // it; the box's own diagonal is the em.
-        let (sin, cos) = 30.0_f32.to_radians().sin_cos();
-        let mut stretched = geometry_item(12.0 * sin, 24.0, 30.0);
-        stretched.height = 12.0 * cos;
-        let advance = 4.0 * 0.5 * 24.0;
-        let expected_w = advance * cos + 12.0 * sin;
-        let expected_h = advance * sin + 12.0 * cos;
-        assert!((effective_width(&stretched) - expected_w).abs() < 1e-3);
-        assert!((effective_height(&stretched) - expected_h).abs() < 1e-3);
-    }
-
-    #[test]
-    fn effective_width_estimates_only_unknown_horizontal_advances() {
-        // Known widths pass through whatever the orientation.
-        assert_eq!(effective_width(&geometry_item(30.0, 10.0, 0.0)), 30.0);
-        assert_eq!(effective_width(&geometry_item(30.0, 10.0, 90.0)), 30.0);
-        // Horizontal run without font widths: chars × 0.5em.
-        assert_eq!(effective_width(&geometry_item(0.0, 10.0, 0.0)), 20.0);
-        assert_eq!(effective_width(&geometry_item(0.0, 10.0, 180.0)), 20.0);
-        // Vertical run without font widths: its x-extent is one em — never
-        // a character-count phantom line.
-        assert_eq!(effective_width(&geometry_item(0.0, 10.0, 90.0)), 10.0);
-        assert_eq!(effective_width(&geometry_item(0.0, 10.0, 270.0)), 10.0);
     }
 }
