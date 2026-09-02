@@ -1,0 +1,21 @@
+src/extractor/xobjects.rs
+  s_9d37727abe0b7e::t_c6bb5ee76be93c 1010-1019
+src/extractor/content_stream.rs
+  s_9d37727abe0b7e::t_c6bb5ee76be93c 377,568,704,902-911,992,1243,1264-1274,1309,1313-1314,2891-2906
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "642027b2d9823fda54e3d4078a8d61cb5c59ce6b",
+  "prompts": {},
+  "sessions": {
+    "s_9d37727abe0b7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc8426ba-5c23-49c3-a8f8-b78998896dc0",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
