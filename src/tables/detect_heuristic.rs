@@ -69,7 +69,7 @@ fn merge_adjacent_items_preserving(
         while i < group.len() {
             let (first_idx, first_item) = group[i];
             let mut text = first_item.text.clone();
-            let mut end_x = first_item.x + first_item.measured_width();
+            let mut end_x = first_item.x + first_item.width;
             let mut box_right = first_item.x + first_item.width;
             let mut indices = vec![first_idx];
             let x_gap_max = first_item.font_size * 0.5;
@@ -127,7 +127,7 @@ fn merge_adjacent_items_preserving(
                     text.push(' ');
                 }
                 text.push_str(&next_item.text);
-                end_x = next_item.x + next_item.measured_width();
+                end_x = next_item.x + next_item.width;
                 box_right = box_right.max(next_item.x + next_item.width);
                 indices.push(next_idx);
                 j += 1;

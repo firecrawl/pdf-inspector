@@ -74,7 +74,12 @@ version and date. Earlier releases are described in their
 - Pages whose text reads top-to-bottom (clockwise) are turned against their
   own direction instead of the fixed counter-clockwise turn that mirrored
   word and line order; link and AcroForm widget boxes, page-box clipping, and
-  region matching follow the turned frame.
+  region matching follow the turned frame. Only runs within about 20° of an
+  axis vote on the turn, so a page of diagonal text keeps its frame, and so
+  does a page whose vertical runs split evenly between the two directions.
+- A run whose font carries no width metrics gets a half-em-per-painted-glyph
+  estimate laid along its baseline, and the text cursor moves by the same
+  estimate, so the runs that follow it no longer pile up on one origin.
 - ActualText runs shown under a scaled text matrix reported widths multiplied
   by the scale twice.
 - Form XObjects inherit the invoking stream's text rise and rendering mode

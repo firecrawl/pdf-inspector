@@ -219,7 +219,7 @@ class TextItem:                      # extract_text_with_positions
     width: float
     height: float                    # axis-aligned box; y is the baseline for horizontal text
     rotation: float                  # baseline angle in degrees CCW: 0 horizontal, 90 bottom-to-top, 270 top-to-bottom
-    advance_known: bool              # False only for fonts without width metrics: the extent along the baseline is then estimated
+    advance_known: bool              # False when the font has no width metrics or an ActualText advance could not be recovered: the extent along the baseline is then estimated
     font: str
     font_size: float
     page: int

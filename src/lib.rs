@@ -7984,7 +7984,7 @@ mod rotated_run_region_tests {
         // matchable instead of letting it vanish from region extraction.
         let page_h = 792.0;
         let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
-        // Extraction lays a half-em-per-character estimate along the run for a
+        // Extraction lays a half-em-per-glyph estimate along the run for a
         // width-less font and flags it (the content-stream tests cover the
         // parser side); region matching sees that box like any other.
         let estimated = STAMP.chars().count() as f32 * 0.5 * 20.0;

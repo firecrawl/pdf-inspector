@@ -182,8 +182,20 @@ pub(crate) fn run_geometry(
 }
 
 /// Advance estimate, in text-space units, for a run whose font carries no
-/// width metrics: half an em per decoded character. `font_size_ts` is the em in text
-/// space (the `Tf` size, times the Type3 scale where one applies).
+/// width metrics: half an em per painted glyph, counted from the string's
+/// codes (`glyphs`); a ligature decoding to two characters is still one
+/// glyph. Falls back to the decoded characters when no codes were seen.
+/// `font_size_ts` is the em in text space (the `Tf` size, times the Type3
+/// scale where one applies).
+pub(crate) fn estimated_advance_for_run(glyphs: usize, text: &str, font_size_ts: f32) -> f32 {
+    if glyphs > 0 {
+        estimated_advance_for_glyphs(glyphs, font_size_ts)
+    } else {
+        estimated_advance_ts(text, font_size_ts)
+    }
+}
+
+/// Advance estimate from the decoded text alone: half an em per character.
 pub(crate) fn estimated_advance_ts(text: &str, font_size_ts: f32) -> f32 {
     estimated_advance_for_glyphs(text.chars().count(), font_size_ts)
 }

@@ -111,9 +111,8 @@ pub struct TextItem {
     /// Whether the run's advance came from font metrics. `false` when the
     /// font carries no width information (or an ActualText span's advance
     /// could not be recovered): the box's extent along the baseline is then
-    /// an estimate of half an em per decoded character (per painted glyph for
-    /// an ActualText span, whose replacement text may differ in length), not
-    /// a measurement.
+    /// an estimate of half an em per painted glyph (an ActualText span counts
+    /// the glyphs it covers, not its replacement text), not a measurement.
     pub advance_known: bool,
     pub font: String,
     pub font_tag: String,

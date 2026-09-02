@@ -4,7 +4,7 @@
 //! No PDF parsing happens here — these are shared across the extraction
 //! and markdown pipelines.
 
-use crate::types::TextItem;
+use crate::types::{ItemType, TextItem};
 use unicode_normalization::UnicodeNormalization;
 
 /// Return whether text is an explicit page-number expression.
@@ -191,7 +191,13 @@ pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     // are exempt: the common way to paint right-to-left text is a mirrored-x
     // text matrix, which also reports 180° while the glyphs stand upright and
     // the line already reads in the classic RTL order (descending x).
-    let upside_down = !rtl && !items.is_empty() && items.iter().all(|i| i.is_upside_down());
+    // Non-text items on the line (links, form fields, images) are axis-aligned
+    // boxes reporting 0° and say nothing about the reading direction.
+    let mut text_runs = items
+        .iter()
+        .filter(|i| matches!(i.item_type, ItemType::Text));
+    let upside_down =
+        !rtl && text_runs.clone().next().is_some() && text_runs.all(|i| i.is_upside_down());
     let key = |item: &TextItem| {
         if upside_down {
             -(item.x + item.width)
@@ -627,7 +633,7 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
     base_size * scale
 }
 
-/// The item's horizontal extent. Since 1.18 the box already holds an
+/// The item's horizontal extent. The box already holds an
 /// estimate for runs whose font carries no width metrics (laid along the
 /// run at extraction, flagged by `TextItem::advance_known == false`), so
 /// this is the box itself; it stays the single seam for layout code that
@@ -937,7 +943,7 @@ pub(crate) fn should_join_items(
 
     // When we have accurate width from font metrics, use a tight threshold
     // Only measured widths earn the tight threshold: a width-less font's
-    // box is a half-em-per-character estimate (`advance_known == false`), which
+    // box is a half-em-per-glyph estimate (`advance_known == false`), which
     // stays on the loose heuristic it always used.
     if prev_item.width > 0.0 && prev_item.advance_known {
         let gap = if prev_item.x <= curr_item.x {
@@ -1874,7 +1880,7 @@ mod tests {
         let mut world = geometry_item(30.0, 10.0, 180.0);
         world.text = "WORLD".to_string();
         world.x = 260.0;
-        let mut items = vec![world, hello];
+        let mut items = vec![world.clone(), hello.clone()];
         sort_line_items(&mut items);
         let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(texts, ["HELLO", "WORLD"]);
@@ -1884,6 +1890,17 @@ mod tests {
         sort_line_items(&mut items);
         let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(texts, ["WORLD", "HELLO"]);
+
+        // A link box on the line is axis-aligned (0°) and must not defeat the
+        // mirrored sort of the text around it.
+        let mut link = geometry_item(5.0, 10.0, 0.0);
+        link.text = "link".to_string();
+        link.x = 291.0;
+        link.item_type = ItemType::Link("https://example.com/".to_string());
+        let mut items = vec![world, link, hello];
+        sort_line_items(&mut items);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["HELLO", "link", "WORLD"]);
 
         // An RTL line at 180° is the mirrored-x matrix producers use for
         // right-to-left text, not upside-down glyphs: it keeps the classic

@@ -674,8 +674,11 @@ fn order_extent(item: &TextItem) -> f32 {
 fn effective_merge_width(item: &TextItem) -> f32 {
     use crate::text_utils::is_cjk_char;
 
+    // An estimated box (font without widths) is the best extent there is for
+    // word-gap decisions — as it was when `effective_width` estimated it here;
+    // the Tw cap below only makes sense for measured widths.
     if !item.advance_known {
-        return item.measured_width();
+        return item.width;
     }
     if item.width <= 0.0 || item.font_size <= 0.0 {
         return item.width;
@@ -1097,6 +1100,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
             let mut box_right = first.x + first.width;
+            let mut box_left = first.x;
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
@@ -1206,6 +1210,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 }
                 text.push_str(&next.text);
                 box_right = box_right.max(next.x + next.width);
+                box_left = box_left.min(next.x);
                 let next_end = next.x + effective_merge_width(next);
                 end_x = if *preserve_stream_order {
                     end_x.max(next_end)
@@ -1217,14 +1222,18 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
             merged.push(TextItem {
                 text,
-                x: first.x,
+                // An estimated run's item is the union of the estimated boxes
+                // it merged, including any fragment that backtracked in x.
+                x: if first.advance_known {
+                    first.x
+                } else {
+                    box_left
+                },
                 y: first.y,
-                // Estimated runs contribute no width to the merge walk, so
-                // their item keeps the union of their estimated boxes instead.
                 width: if first.advance_known {
                     end_x - first.x
                 } else {
-                    box_right - first.x
+                    box_right - box_left
                 },
                 height: first.height,
                 font: first.font.clone(),
@@ -3518,18 +3527,43 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
 
     #[test]
     fn merged_estimated_runs_keep_the_union_of_their_boxes() {
-        // Two width-less runs whose starts almost coincide merge (their
-        // measured width is zero for the gap walk); the merged box must still
-        // reach the end of the later estimate.
-        let mut first = make_merge_item("ab", 100.0, 20.0);
+        // Two width-less runs positioned at their estimated advance (half an
+        // em per glyph at 12pt) walk like measured ones — gap 0, no space —
+        // and the merged item is the union of the two estimated boxes.
+        let mut first = make_merge_item("ab", 100.0, 12.0);
         first.advance_known = false;
-        let mut second = make_merge_item("cdefg", 102.0, 50.0);
+        let mut second = make_merge_item("cdefg", 112.0, 30.0);
         second.advance_known = false;
         let merged = merge_text_items(vec![first, second]);
         assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "abcdefg");
         assert!(!merged[0].advance_known);
+        assert!((merged[0].x - 100.0).abs() < 1e-3, "x = {}", merged[0].x);
         assert!(
-            (merged[0].width - 52.0).abs() < 1e-3,
+            (merged[0].width - 42.0).abs() < 1e-3,
+            "width = {}",
+            merged[0].width
+        );
+    }
+
+    #[test]
+    fn estimated_fragments_that_backtrack_keep_the_union_box() {
+        // Stream order "abc" (x 100), "de" (x 94, a backtrack), "fg" (x 118):
+        // whichever order the merge walks, the estimated item spans from the
+        // leftmost fragment to the rightmost box edge.
+        let mut a = make_merge_item("abc", 100.0, 18.0);
+        let mut b = make_merge_item("de", 94.0, 10.0);
+        let mut c = make_merge_item("fg", 118.0, 12.0);
+        for item in [&mut a, &mut b, &mut c] {
+            item.advance_known = false;
+            item.mcid = Some(1);
+        }
+        let merged = merge_text_items(vec![a, b, c]);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert!(!merged[0].advance_known);
+        assert!((merged[0].x - 94.0).abs() < 1e-3, "x = {}", merged[0].x);
+        assert!(
+            (merged[0].width - 36.0).abs() < 1e-3,
             "width = {}",
             merged[0].width
         );
