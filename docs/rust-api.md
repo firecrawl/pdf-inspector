@@ -531,7 +531,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
-| `TextItem` | Text with its axis-aligned box, baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false only for fonts without width metrics), font info, page number, and optional structure-tree `mcid` |
+| `TextItem` | Text with its axis-aligned box, baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false only for fonts without width metrics), `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline), font info, page number, and optional structure-tree `mcid` |
 | `PageRotation` | `Upright`, `Ccw`, `Cw`: how a predominantly rotated page's coordinate frame was turned so its text reads left-to-right |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |

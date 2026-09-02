@@ -937,7 +937,7 @@ pub(crate) fn should_join_items(
 
     // When we have accurate width from font metrics, use a tight threshold
     // Only measured widths earn the tight threshold: a width-less font's
-    // box is a half-em-per-glyph estimate (`advance_known == false`), which
+    // box is a half-em-per-character estimate (`advance_known == false`), which
     // stays on the loose heuristic it always used.
     if prev_item.width > 0.0 && prev_item.advance_known {
         let gap = if prev_item.x <= curr_item.x {
@@ -1352,6 +1352,7 @@ mod tests {
             advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1554,6 +1555,7 @@ mod tests {
             advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1678,6 +1680,7 @@ mod tests {
                 advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             });
             // Alternate between letter-gap and word-gap to create bimodal distribution
             x += w + if wi % 3 == 2 { word_gap } else { letter_gap };
@@ -1759,6 +1762,7 @@ mod tests {
             advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1839,6 +1843,7 @@ mod tests {
 
     fn geometry_item(width: f32, font_size: f32, rotation: f32) -> TextItem {
         TextItem {
+            baseline_shift: 0.0,
             text: "abcd".to_string(),
             x: 0.0,
             y: 0.0,

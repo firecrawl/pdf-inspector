@@ -154,6 +154,16 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
 ///   - dashed section-page IDs: "5-21", "A-1", "B--3", "TC-2" (common in
 ///     technical manuals)
 fn is_page_number_cell(cell: &str) -> bool {
+    // A label whose base has letters and carries a letter subscript or
+    // superscript (`V<sub>f</sub>`, `x<sub>i</sub>`) is never a page number,
+    // whatever its letters spell as roman numerals. On a digit-only base
+    // every span is a footnote marker (`12<sup>a</sup>`, `12<sup>1)</sup>`)
+    // and is dropped before the page-number test.
+    let base = super::cell_text::strip_script_spans(cell);
+    if base.chars().any(char::is_alphabetic) && super::cell_text::has_letter_script_span(cell) {
+        return false;
+    }
+    let cell = base;
     let tokens: Vec<&str> = cell.split_whitespace().collect();
     if tokens.is_empty() {
         return false;
@@ -320,29 +330,39 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             .map(|c| c.trim())
             .filter(|c| !c.is_empty())
             .collect();
-        let is_short_subheader = non_first_cells.len() == 1 && non_first_cells[0].len() <= 5;
+        // Lengths are measured without `<sup>`/`<sub>` tags (content kept):
+        // `IV<sub>subc</sub>` is the six-character token it looks like.
+        let plain_cells: Vec<std::borrow::Cow<'_, str>> = non_first_cells
+            .iter()
+            .map(|c| super::cell_text::strip_script_markup(c))
+            .collect();
+        let is_short_subheader = plain_cells.len() == 1 && plain_cells[0].len() <= 5;
         // Rows with multiple short-valued cells (e.g. numeric data in a lookup
         // table) are data rows with a merged/spanning first column, not text
         // overflow from the previous row.  Continuation rows typically have
         // longer descriptive text; data rows have short numeric values.
-        let avg_cell_len = if non_first_cells.is_empty() {
+        let avg_cell_len = if plain_cells.is_empty() {
             0.0
         } else {
-            non_first_cells.iter().map(|c| c.len()).sum::<usize>() as f32
-                / non_first_cells.len() as f32
+            plain_cells.iter().map(|c| c.len()).sum::<usize>() as f32 / plain_cells.len() as f32
         };
+        // Numeric-ness is judged on the value alone — a footnote marker is an
+        // annotation, so `12<sup>1)</sup>` is the number 12 and a cell that
+        // holds only a marker is a numeric row's annotation column.
         let numeric_cells = non_first_cells
             .iter()
             .filter(|c| {
-                c.chars().all(|ch| {
-                    ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
-                })
+                let value = super::cell_text::strip_marker_spans(c);
+                value.trim().is_empty()
+                    || value.chars().all(|ch| {
+                        ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
+                    })
             })
             .count();
         let looks_like_data_row = non_first_cells.len() >= 2
             && avg_cell_len <= 10.0
             && numeric_cells > non_first_cells.len() / 2;
-        let uppercase_leading_cells = non_first_cells
+        let uppercase_leading_cells = plain_cells
             .iter()
             .filter(|cell| starts_with_uppercase_word(cell))
             .count();
@@ -1045,5 +1065,15 @@ mod tests {
         );
         assert!(md.contains("4.3 Case studies and targeted evaluations\t86"));
         assert!(md.contains("4.5 White-box analyses\t113"));
+    }
+
+    #[test]
+    fn scripted_labels_are_not_page_numbers() {
+        assert!(!is_page_number_cell("V<sub>f</sub>"));
+        assert!(!is_page_number_cell("x<sub>i</sub>"));
+        assert!(is_page_number_cell("12<sup>1)</sup>"));
+        assert!(is_page_number_cell("12<sup>a</sup>"));
+        assert!(is_page_number_cell("xi<sup>1)</sup>"));
+        assert!(is_page_number_cell("xi"));
     }
 }

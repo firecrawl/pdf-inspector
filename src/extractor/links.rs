@@ -125,6 +125,7 @@ pub fn extract_page_links(doc: &Document, page_id: ObjectId, page_num: u32) -> V
                             advance_known: true,
                             item_type: ItemType::Link(url),
                             mcid: None,
+                            baseline_shift: 0.0,
                         });
                     }
                 }
@@ -461,6 +462,7 @@ pub(crate) fn walk_form_fields(
         advance_known: true,
         item_type: ItemType::FormField,
         mcid: None,
+        baseline_shift: 0.0,
     });
 }
 

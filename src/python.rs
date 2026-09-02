@@ -366,7 +366,9 @@ pub struct PyTextItem {
     /// Whether the run's advance came from font metrics. False when the font
     /// carries no width information (or an ActualText span's advance could
     /// not be recovered): the box's extent along the baseline is then an
-    /// estimate of half an em per painted glyph, not a measurement.
+    /// estimate of half an em per decoded character (per painted glyph for an
+    /// ActualText span, whose replacement text may differ in length), not a
+    /// measurement.
     #[pyo3(get)]
     pub advance_known: bool,
     #[pyo3(get)]
@@ -385,6 +387,11 @@ pub struct PyTextItem {
     pub is_underline: bool,
     #[pyo3(get)]
     pub is_strikeout: bool,
+    /// Signed baseline offset (points) of a super/subscript glyph run from
+    /// the body baseline it is attached to; 0.0 for normal text. Positive =
+    /// raised (superscript), negative = lowered (subscript).
+    #[pyo3(get)]
+    pub baseline_shift: f32,
     #[pyo3(get)]
     pub item_type: String,
     /// Marked Content ID from the content stream's BDC/BMC operator, None
@@ -601,6 +608,7 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             is_strikeout: item.is_strikeout,
             rotation: item.rotation,
             advance_known: item.advance_known,
+            baseline_shift: item.baseline_shift,
             item_type: item_type_str(&item.item_type),
             mcid: item.mcid,
         })

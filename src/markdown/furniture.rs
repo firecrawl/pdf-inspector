@@ -636,6 +636,7 @@ mod tests {
             advance_known: true,
             item_type: ItemType::Text,
             mcid,
+            baseline_shift: 0.0,
         }
     }
 

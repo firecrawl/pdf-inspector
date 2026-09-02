@@ -265,6 +265,7 @@ fn text_chars_to_items(chars: &[PageChar], page: u32) -> Vec<TextItem> {
             advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         });
     }
 

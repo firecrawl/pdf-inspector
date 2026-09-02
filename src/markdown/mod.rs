@@ -2696,6 +2696,7 @@ mod tests {
             advance_known: true,
             item_type: crate::types::ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 

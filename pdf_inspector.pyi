@@ -101,7 +101,8 @@ class TextItem:
     """Whether the run's advance came from font metrics. False when the font
     carries no width information (or an ActualText span's advance could not be
     recovered): the box's extent along the baseline is then an estimate of half
-    an em per painted glyph, not a measurement."""
+    an em per decoded character (per painted glyph for an ActualText span, whose
+    replacement text may differ in length), not a measurement."""
     font: str
     font_tag: str
     font_size: float
@@ -110,6 +111,12 @@ class TextItem:
     is_italic: bool
     is_underline: bool
     is_strikeout: bool
+    baseline_shift: float
+    """Signed baseline offset (points) of a super/subscript glyph run from the
+    body baseline it is attached to; 0.0 for normal text. Positive = raised
+    (superscript: footnote/affiliation markers, exponents), negative = lowered
+    (subscript). Digit-only markers beside a word are already fused into it as
+    Unicode super/subscript characters ("word²") and carry 0.0."""
     item_type: str
     mcid: Optional[int]
     """Marked Content ID from the content stream's BDC/BMC operator, None when

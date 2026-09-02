@@ -182,7 +182,7 @@ pub(crate) fn run_geometry(
 }
 
 /// Advance estimate, in text-space units, for a run whose font carries no
-/// width metrics: half an em per glyph. `font_size_ts` is the em in text
+/// width metrics: half an em per decoded character. `font_size_ts` is the em in text
 /// space (the `Tf` size, times the Type3 scale where one applies).
 pub(crate) fn estimated_advance_ts(text: &str, font_size_ts: f32) -> f32 {
     estimated_advance_for_glyphs(text.chars().count(), font_size_ts)

@@ -111,7 +111,9 @@ pub struct TextItem {
     /// Whether the run's advance came from font metrics. `false` when the
     /// font carries no width information (or an ActualText span's advance
     /// could not be recovered): the box's extent along the baseline is then
-    /// an estimate of half an em per painted glyph, not a measurement.
+    /// an estimate of half an em per decoded character (per painted glyph for
+    /// an ActualText span, whose replacement text may differ in length), not
+    /// a measurement.
     pub advance_known: bool,
     pub font: String,
     pub font_tag: String,
@@ -125,6 +127,13 @@ pub struct TextItem {
     /// Strikeout detected geometrically (rule crossing the glyphs at mid
     /// x-height).
     pub is_strikeout: bool,
+    /// Signed baseline offset (PDF points, y-up) of a super/subscript glyph
+    /// run from the body baseline it is attached to; `0` for normal text.
+    /// Positive = raised (superscript: footnote/affiliation markers,
+    /// exponents), negative = lowered (subscript). Emit `<sup>`/`<sub>` from
+    /// the sign. Digit-only markers beside a word are already fused into it
+    /// as Unicode super/subscript characters ("word²") and carry `0`.
+    pub baseline_shift: f64,
     pub item_type: ItemType,
     /// URL for link items, `None` for other types.
     pub link_url: Option<String>,
@@ -535,6 +544,7 @@ fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
         is_strikeout: item.is_strikeout,
         rotation: item.rotation as f64,
         advance_known: item.advance_known,
+        baseline_shift: item.baseline_shift as f64,
         item_type,
         link_url,
         mcid: item.mcid,

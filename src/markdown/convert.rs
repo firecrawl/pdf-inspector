@@ -1580,6 +1580,7 @@ mod tests {
             advance_known: true,
             item_type: crate::types::ItemType::Text,
             mcid,
+            baseline_shift: 0.0,
         }
     }
 

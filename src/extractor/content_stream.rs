@@ -628,6 +628,7 @@ pub(crate) fn extract_page_text_items(
                                 advance_known: geometry.advance_known,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
+                                baseline_shift: 0.0,
                             });
                         }
                     }
@@ -871,6 +872,7 @@ pub(crate) fn extract_page_text_items(
                                     advance_known: geometry.advance_known,
                                     item_type: ItemType::Text,
                                     mcid: current_mcid(&marked_content_stack),
+                                    baseline_shift: 0.0,
                                 });
                             }
                         }
@@ -1000,6 +1002,7 @@ pub(crate) fn extract_page_text_items(
                                 advance_known: geometry.advance_known,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
+                                baseline_shift: 0.0,
                             });
                         }
                     }
@@ -1047,6 +1050,7 @@ pub(crate) fn extract_page_text_items(
                                         advance_known: true,
                                         item_type: ItemType::Image,
                                         mcid: current_mcid(&marked_content_stack),
+                                        baseline_shift: 0.0,
                                     });
                                 }
                                 XObjectType::Form(form_id) => {
@@ -1060,6 +1064,7 @@ pub(crate) fn extract_page_text_items(
                                         &ctm,
                                         include_invisible,
                                         text_rendering_mode,
+                                        text_rise,
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
@@ -1215,6 +1220,7 @@ pub(crate) fn extract_page_text_items(
                                     mcid: entry
                                         .mcid
                                         .or_else(|| current_mcid(&marked_content_stack)),
+                                    baseline_shift: 0.0,
                                 });
                             }
                         }
@@ -2673,6 +2679,7 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
     #[test]
     fn image_placeholders_keep_zero_rotation_on_rotated_pages() {
         let text = |x: f32, y: f32| TextItem {
+            baseline_shift: 0.0,
             text: "run".to_string(),
             x,
             y,
@@ -2755,6 +2762,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (   ) Tj ET",
     #[test]
     fn single_rotated_run_next_to_an_image_does_not_turn_the_page() {
         let run = TextItem {
+            baseline_shift: 0.0,
             text: "stamp".to_string(),
             x: 188.0,
             y: 100.0,

@@ -239,6 +239,7 @@ pub(crate) fn extract_form_xobject_text(
     parent_ctm: &[f32; 6],
     include_invisible: bool,
     inherited_render_mode: i32,
+    inherited_text_rise: f32,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
@@ -251,6 +252,7 @@ pub(crate) fn extract_form_xobject_text(
         parent_ctm,
         include_invisible,
         inherited_render_mode,
+        inherited_text_rise,
         cmap_decisions,
         style_cache,
         0,
@@ -267,6 +269,7 @@ fn extract_form_xobject_text_inner(
     parent_ctm: &[f32; 6],
     include_invisible: bool,
     inherited_render_mode: i32,
+    inherited_text_rise: f32,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
@@ -395,10 +398,12 @@ fn extract_form_xobject_text_inner(
     let mut text_leading: f32 = 0.0; // TL parameter (text-space units)
     let mut char_spacing: f32 = 0.0; // Tc parameter
     let mut word_spacing: f32 = 0.0; // Tw parameter
-    let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift, unscaled)
-                                  // Tr is graphics state, so a form starts in the mode the invoking stream
-                                  // left it in: `3 Tr` set on the page or in an outer form hides the text
-                                  // drawn here too.
+                                     // Ts parameter (baseline shift, unscaled). Text state is graphics state,
+                                     // so a form starts with the rise in force where it was invoked.
+    let mut text_rise: f32 = inherited_text_rise;
+    // Tr is graphics state, so a form starts in the mode the invoking stream
+    // left it in: `3 Tr` set on the page or in an outer form hides the text
+    // drawn here too.
     let mut text_rendering_mode: i32 = inherited_render_mode;
     let mut in_text_block = false;
     let mut fill_is_white = false;
@@ -475,6 +480,7 @@ fn extract_form_xobject_text_inner(
                                         &ctm,
                                         include_invisible,
                                         text_rendering_mode,
+                                        text_rise,
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
@@ -513,6 +519,7 @@ fn extract_form_xobject_text_inner(
                                     advance_known: true,
                                     item_type: ItemType::Image,
                                     mcid: None,
+                                    baseline_shift: 0.0,
                                 });
                             }
                             None => {}
@@ -767,6 +774,7 @@ fn extract_form_xobject_text_inner(
                                 advance_known: geometry.advance_known,
                                 item_type: ItemType::Text,
                                 mcid: None,
+                                baseline_shift: 0.0,
                             });
                         }
                     }
@@ -997,6 +1005,7 @@ fn extract_form_xobject_text_inner(
                                     advance_known: geometry.advance_known,
                                     item_type: ItemType::Text,
                                     mcid: None,
+                                    baseline_shift: 0.0,
                                 });
                             }
                         }
@@ -1158,6 +1167,7 @@ mod tests {
             &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             false,
             0,
+            0.0,
             &mut CMapDecisionCache::new(),
             &mut FontStyleCache::new(),
             budget,
@@ -1660,6 +1670,40 @@ BT 3 Tr /F1 12 Tf 0 1 -1 0 240 100 Tm [(ALSO) -3000 (HIDDEN)] TJ ET";
         assert!(skipped_invisible);
         let (items, _) = extract_page(&doc, page_id, true);
         assert!(items.iter().any(|i| i.text == "Hidden"), "{items:?}");
+    }
+
+    #[test]
+    fn form_inherits_the_pages_text_rise() {
+        // `5 Ts` set by the page stream before `Do`: text state is graphics
+        // state, so the form's first run is raised until the form itself
+        // resets the rise.
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"BT 5 Ts ET q /X1 Do Q",
+            &[b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (raised) Tj 0 Ts (base) Tj ET"],
+        );
+        let (items, _) = extract_page(&doc, page_id, false);
+        let raised = find(&items, "raised");
+        let base = find(&items, "base");
+        assert!((raised.y - 505.0).abs() < 0.1, "raised y = {}", raised.y);
+        assert!((base.y - 500.0).abs() < 0.1, "base y = {}", base.y);
+    }
+
+    #[test]
+    fn nested_form_inherits_the_outer_forms_text_rise() {
+        // The outer form raises the baseline and invokes the inner form; the
+        // inner run is raised, the outer's own run at rise 0 is not.
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"q /X1 Do Q",
+            &[
+                b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (outer) Tj ET BT 5 Ts ET q /X2 Do Q",
+                b"BT /F1 12 Tf 1 0 0 1 100 400 Tm (inner) Tj ET",
+            ],
+        );
+        let (items, _) = extract_page(&doc, page_id, false);
+        let outer = find(&items, "outer");
+        let inner = find(&items, "inner");
+        assert!((outer.y - 500.0).abs() < 0.1, "outer y = {}", outer.y);
+        assert!((inner.y - 405.0).abs() < 0.1, "inner y = {}", inner.y);
     }
 
     #[test]
