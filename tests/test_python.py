@@ -553,3 +553,26 @@ class TestRotatedRunGeometry:
         assert not margin.needs_ocr
         assert "arXiv" not in body.text
         assert "The quick brown fox" in body.text
+
+
+# ---------------------------------------------------------------------------
+# extract_text_with_positions_and_rotations
+# ---------------------------------------------------------------------------
+
+
+class TestPositionedTextWithRotations:
+    def test_upright_page_reports_no_rotation(self):
+        positioned = pdf_inspector.extract_text_with_positions_and_rotations(
+            fixture_path("rotated_margin_stamp.pdf")
+        )
+        assert len(positioned.items) > 0
+        assert positioned.page_rotations == []
+
+    def test_rotated_page_reports_its_frame(self):
+        positioned = pdf_inspector.extract_text_with_positions_and_rotations_bytes(
+            fixture_bytes("tnagriculture_06_12.pdf")
+        )
+        assert len(positioned.items) > 0
+        frames = [(r.page, r.rotation) for r in positioned.page_rotations]
+        assert frames == [(1, "ccw")]
+        assert "PageRotation" in repr(positioned.page_rotations[0])

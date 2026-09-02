@@ -7,7 +7,7 @@ use crate::text_utils::{
     decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
 };
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
+use crate::types::{FontWidthInfo, ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -19,7 +19,8 @@ use super::fonts::{
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
 use super::geometry::{
-    estimated_advance_ts, normalize_degrees, rise_adjusted, run_geometry, PageRotation,
+    estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees, rise_adjusted,
+    run_geometry, PageRotation,
 };
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
@@ -119,6 +120,15 @@ fn transformed_stroke_width(
     let ndx = nx * ctm[0] + ny * ctm[2];
     let ndy = nx * ctm[1] + ny * ctm[3];
     user_width * (ndx * ndx + ndy * ndy).sqrt()
+}
+
+/// Number of glyphs a show operand paints: one per code, two bytes per code
+/// for CID fonts. Sizes the box of an ActualText span whose font carries no
+/// width metrics — the replacement string's length says nothing about what
+/// was painted.
+fn shown_glyph_count(raw: Option<&[u8]>, font: Option<&FontWidthInfo>) -> usize {
+    let code_size = if font.is_some_and(|f| f.is_cid) { 2 } else { 1 };
+    raw.map_or(0, |bytes| bytes.len().div_ceil(code_size))
 }
 
 /// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible)`
@@ -337,6 +347,9 @@ pub(crate) fn extract_page_text_items(
                                                            // the rise of its GLYPHS, not whatever rise is set by EMC time.
     let mut actual_text_start_rise: f32 = 0.0;
     let mut actual_text_glyph_rise: Option<f32> = None;
+    // Glyphs painted inside the current ActualText span: sizes the span's box
+    // when its font has no width metrics.
+    let mut actual_text_glyph_count: usize = 0;
     /// Get the innermost MCID from the marked content stack.
     fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
         stack.iter().rev().find_map(|e| e.mcid)
@@ -506,6 +519,10 @@ pub(crate) fn extract_page_text_items(
                             actual_text_glyph_tm = Some(text_matrix);
                             actual_text_glyph_rise = Some(text_rise);
                         }
+                        actual_text_glyph_count += shown_glyph_count(
+                            get_operand_bytes(&op.operands[0]),
+                            font_widths.get(&current_font),
+                        );
                         if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -745,6 +762,10 @@ pub(crate) fn extract_page_text_items(
                                     );
                                 }
                             }
+                            if suppress_glyph_extraction {
+                                actual_text_glyph_count +=
+                                    shown_glyph_count(get_operand_bytes(element), font_info);
+                            }
                             if !is_invisible {
                                 if let Some(text) = extract_text_from_operand(
                                     element,
@@ -876,6 +897,12 @@ pub(crate) fn extract_page_text_items(
                 if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
                     actual_text_glyph_tm = Some(text_matrix);
                     actual_text_glyph_rise = Some(text_rise);
+                }
+                if suppress_glyph_extraction {
+                    actual_text_glyph_count += shown_glyph_count(
+                        op.operands.first().and_then(get_operand_bytes),
+                        font_widths.get(&current_font),
+                    );
                 }
                 // Advance width, as for Tj — without it the item stays
                 // zero-width and geometric underline/strikeout detection
@@ -1095,6 +1122,7 @@ pub(crate) fn extract_page_text_items(
                     actual_text_start_rise = text_rise;
                     actual_text_glyph_tm = None; // reset — will be captured at first Tj/TJ
                     actual_text_glyph_rise = None;
+                    actual_text_glyph_count = 0;
                 }
                 marked_content_stack.push(MarkedContentEntry { actual_text, mcid });
             }
@@ -1139,8 +1167,14 @@ pub(crate) fn extract_page_text_items(
                             let geometry = run_geometry(
                                 &combined,
                                 advance_ts,
-                                estimated_advance_ts(
-                                    &at,
+                                // Size the estimate from what was painted; the
+                                // replacement text is only what gets emitted.
+                                estimated_advance_for_glyphs(
+                                    if actual_text_glyph_count > 0 {
+                                        actual_text_glyph_count
+                                    } else {
+                                        at.chars().count()
+                                    },
                                     current_font_size
                                         * type3_scales.get(&current_font).copied().unwrap_or(1.0),
                                 ),
@@ -2201,28 +2235,35 @@ end"#;
     }
 
     #[test]
-    fn actual_text_on_a_width_less_font_is_estimated_not_zero() {
+    fn actual_text_on_a_width_less_font_is_estimated_from_painted_glyphs() {
         // The text matrix never moves for a font without widths, so the
         // ActualText span's zero displacement must not pass for a genuine
-        // zero advance.
+        // zero advance — and the estimate follows the four painted glyphs,
+        // not the fourteen-character replacement.
         let items = extract_hebrew_items(
-            b"BT /F1 12 Tf 100 700 Td /Span <</ActualText (Shalom) >> BDC <41424344> Tj EMC ET",
+            b"BT /F1 12 Tf 100 700 Td /Span <</ActualText (Shalom Alaikum) >> BDC <41424344> Tj EMC ET",
         );
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].text, "Shalom");
+        assert_eq!(items[0].text, "Shalom Alaikum");
         assert!(!items[0].advance_known);
-        assert_eq!(items[0].width, 36.0);
+        assert_eq!(items[0].width, 24.0);
     }
 
     #[test]
     fn rotated_hebrew_ops_stay_neutral() {
         // 90°-rotated text matrix: the advance has no horizontal component,
         // so the run carries no storage-order evidence and must pass through
-        // unreversed.
+        // unreversed. The font has no widths, so the run's extent along the
+        // (vertical) baseline is the estimate: four glyphs × 6pt.
         let content = b"BT /F1 12 Tf 0 1 -1 0 100 700 Tm <41424344> Tj ET";
         let items = extract_hebrew_items(content);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, SHALOM_LOGICAL);
+        assert!(!items[0].advance_known);
+        assert_eq!(
+            (items[0].x, items[0].y, items[0].width, items[0].height),
+            (88.0, 700.0, 12.0, 24.0)
+        );
     }
 
     #[test]

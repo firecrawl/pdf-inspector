@@ -82,6 +82,12 @@ items = pdf_inspector.extract_text_with_positions("document.pdf")
 for item in items[:5]:
     print(f"'{item.text}' at ({item.x:.0f}, {item.y:.0f}) size={item.font_size}")
 
+# Pages whose text is predominantly rotated are re-based so it reads
+# left-to-right; ask for the frame of each such page alongside the items
+positioned = pdf_inspector.extract_text_with_positions_and_rotations("document.pdf")
+for frame in positioned.page_rotations:
+    print(f"page {frame.page} turned {frame.rotation}")
+
 # Per-page markdown (one Markdown string per page, plus layout metadata)
 result = pdf_inspector.extract_pages_markdown("document.pdf")
 for page in result.pages:

@@ -363,9 +363,10 @@ pub struct PyTextItem {
     /// axis-aligned box, so a vertical run is tall and thin.
     #[pyo3(get)]
     pub rotation: f32,
-    /// Whether the run's advance came from font metrics. False only when the
-    /// font carries no width information: the box's extent along the baseline
-    /// is then an estimate of half an em per glyph, not a measurement.
+    /// Whether the run's advance came from font metrics. False when the font
+    /// carries no width information (or an ActualText span's advance could
+    /// not be recovered): the box's extent along the baseline is then an
+    /// estimate of half an em per painted glyph, not a measurement.
     #[pyo3(get)]
     pub advance_known: bool,
     #[pyo3(get)]
@@ -870,6 +871,83 @@ fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<
     Ok(convert_text_items(items))
 }
 
+/// The coordinate frame of a page whose text was predominantly rotated.
+#[pyclass(name = "PageRotation")]
+#[derive(Clone)]
+pub struct PyPageRotation {
+    /// 1-indexed page number, matching TextItem.page.
+    #[pyo3(get)]
+    pub page: u32,
+    /// "ccw" when the page's runs read bottom-to-top and the frame was turned
+    /// so they read left-to-right, "cw" for runs reading top-to-bottom.
+    #[pyo3(get)]
+    pub rotation: String,
+}
+
+#[pymethods]
+impl PyPageRotation {
+    fn __repr__(&self) -> String {
+        format!(
+            "PageRotation(page={}, rotation='{}')",
+            self.page, self.rotation
+        )
+    }
+}
+
+/// Positioned text plus the frame of every page whose text was turned.
+#[pyclass(name = "PositionedText")]
+pub struct PyPositionedText {
+    #[pyo3(get)]
+    pub items: Vec<PyTextItem>,
+    /// One entry per re-based page; pages absent here are upright and their
+    /// items are in plain page coordinates.
+    #[pyo3(get)]
+    pub page_rotations: Vec<PyPageRotation>,
+}
+
+fn convert_page_rotations(
+    rotations: std::collections::HashMap<u32, crate::PageRotation>,
+) -> Vec<PyPageRotation> {
+    let mut out: Vec<PyPageRotation> = rotations
+        .into_iter()
+        .filter_map(|(page, rotation)| {
+            let rotation = match rotation {
+                crate::PageRotation::Upright => return None,
+                crate::PageRotation::Ccw => "ccw",
+                crate::PageRotation::Cw => "cw",
+            };
+            Some(PyPageRotation {
+                page,
+                rotation: rotation.to_string(),
+            })
+        })
+        .collect();
+    out.sort_by_key(|r| r.page);
+    out
+}
+
+/// Extract text with positions from a PDF file, together with the coordinate
+/// frame of every page whose text was predominantly rotated. Items on such a
+/// page are expressed in the turned frame (their dominant runs read
+/// left-to-right there); pages absent from `page_rotations` are upright.
+#[pyfunction]
+fn extract_text_with_positions_and_rotations(path: &str) -> PyResult<PyPositionedText> {
+    let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
+    extract_text_with_positions_and_rotations_bytes(&data)
+}
+
+/// Extract text with positions from bytes, together with the coordinate frame
+/// of every page whose text was predominantly rotated.
+#[pyfunction]
+fn extract_text_with_positions_and_rotations_bytes(data: &[u8]) -> PyResult<PyPositionedText> {
+    let (items, rotations) =
+        crate::extract_text_with_positions_and_rotations_mem(data).map_err(to_py_err)?;
+    Ok(PyPositionedText {
+        items: convert_text_items(items),
+        page_rotations: convert_page_rotations(rotations),
+    })
+}
+
 /// Extract text with position information from bytes.
 #[pyfunction]
 #[pyo3(signature = (data, pages=None))]
@@ -1034,6 +1112,16 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_positions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_positions_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        extract_text_with_positions_and_rotations,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        extract_text_with_positions_and_rotations_bytes,
+        m
+    )?)?;
+    m.add_class::<PyPageRotation>()?;
+    m.add_class::<PyPositionedText>()?;
     m.add_function(wrap_pyfunction!(extract_structure_elements, m)?)?;
     m.add_function(wrap_pyfunction!(extract_structure_elements_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions, m)?)?;

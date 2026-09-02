@@ -88,6 +88,12 @@ pub struct PdfClassification {
 }
 
 /// A positioned text item extracted from a PDF.
+///
+/// On a page whose text is predominantly rotated the extractor turns the
+/// coordinate frame so that text reads left-to-right; items on such a page
+/// are expressed in that turned frame, not in page coordinates. Use
+/// [`extractTextWithPositionsAndRotations`] to learn which pages were turned
+/// and which way.
 #[napi(object)]
 pub struct TextItem {
     pub text: String,
@@ -102,10 +108,10 @@ pub struct TextItem {
     /// run's axis-aligned box, so a vertical run is tall and thin (height
     /// ≫ width) instead of zero-width.
     pub rotation: f64,
-    /// Whether the run's advance came from font metrics. `false` only when
-    /// the font carries no width information: the box's extent along the
-    /// baseline is then an estimate of half an em per glyph, not a
-    /// measurement.
+    /// Whether the run's advance came from font metrics. `false` when the
+    /// font carries no width information (or an ActualText span's advance
+    /// could not be recovered): the box's extent along the baseline is then
+    /// an estimate of half an em per painted glyph, not a measurement.
     pub advance_known: bool,
     pub font: String,
     pub font_tag: String,
@@ -507,32 +513,85 @@ pub fn extract_text_with_positions(
                 .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?,
         };
 
-        Ok(items
+        Ok(items.into_iter().map(convert_text_item).collect())
+    })
+}
+
+fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
+    let (item_type, link_url) = convert_item_type(&item.item_type);
+    TextItem {
+        text: item.text,
+        x: item.x as f64,
+        y: item.y as f64,
+        width: item.width as f64,
+        height: item.height as f64,
+        font: item.font,
+        font_tag: item.font_tag,
+        font_size: item.font_size as f64,
+        page: item.page,
+        is_bold: item.is_bold,
+        is_italic: item.is_italic,
+        is_underline: item.is_underline,
+        is_strikeout: item.is_strikeout,
+        rotation: item.rotation as f64,
+        advance_known: item.advance_known,
+        item_type,
+        link_url,
+        mcid: item.mcid,
+    }
+}
+
+/// The coordinate frame of a page whose text was predominantly rotated.
+#[napi(object)]
+pub struct PageRotation {
+    /// 1-indexed page number, matching `TextItem.page`.
+    pub page: u32,
+    /// `"ccw"` when the page's runs read bottom-to-top and the frame was
+    /// turned so they read left-to-right, `"cw"` for runs reading
+    /// top-to-bottom.
+    pub rotation: String,
+}
+
+/// Positioned text plus the frame of every page whose text was turned.
+#[napi(object)]
+pub struct PositionedText {
+    pub items: Vec<TextItem>,
+    /// One entry per re-based page; pages absent here are upright and their
+    /// items are in plain page coordinates.
+    pub page_rotations: Vec<PageRotation>,
+}
+
+/// Extract text with positions from a PDF Buffer, together with the
+/// coordinate frame of every page whose text was predominantly rotated.
+/// Items on such a page are expressed in the turned frame (their dominant
+/// runs read left-to-right there); pages absent from `pageRotations` are
+/// upright.
+#[napi]
+pub fn extract_text_with_positions_and_rotations(buffer: Buffer) -> Result<PositionedText> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_text_with_positions_and_rotations", move || {
+        let (items, rotations) =
+            pdf_inspector::extract_text_with_positions_and_rotations_mem(&bytes)
+                .map_err(|e| to_napi_err(e, "extract_text_with_positions_and_rotations"))?;
+        let mut page_rotations: Vec<PageRotation> = rotations
             .into_iter()
-            .map(|item| {
-                let (item_type, link_url) = convert_item_type(&item.item_type);
-                TextItem {
-                    text: item.text,
-                    x: item.x as f64,
-                    y: item.y as f64,
-                    width: item.width as f64,
-                    height: item.height as f64,
-                    font: item.font,
-                    font_tag: item.font_tag,
-                    font_size: item.font_size as f64,
-                    page: item.page,
-                    is_bold: item.is_bold,
-                    is_italic: item.is_italic,
-                    is_underline: item.is_underline,
-                    is_strikeout: item.is_strikeout,
-                    rotation: item.rotation as f64,
-                    advance_known: item.advance_known,
-                    item_type,
-                    link_url,
-                    mcid: item.mcid,
-                }
+            .filter_map(|(page, rotation)| {
+                let rotation = match rotation {
+                    pdf_inspector::PageRotation::Upright => return None,
+                    pdf_inspector::PageRotation::Ccw => "ccw",
+                    pdf_inspector::PageRotation::Cw => "cw",
+                };
+                Some(PageRotation {
+                    page,
+                    rotation: rotation.to_string(),
+                })
             })
-            .collect())
+            .collect();
+        page_rotations.sort_by_key(|r| r.page);
+        Ok(PositionedText {
+            items: items.into_iter().map(convert_text_item).collect(),
+            page_rotations,
+        })
     })
 }
 

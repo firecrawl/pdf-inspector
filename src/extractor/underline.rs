@@ -361,11 +361,13 @@ fn is_underline_candidate(item: &TextItem) -> bool {
     // rotated header would otherwise read as an underline.
     // An estimated box (font without widths) says nothing about where the
     // glyphs end, so it cannot own a rule either — as when it was zero-width.
+    // Upright only: for a 180° run `y` is the box bottom, not the baseline the
+    // rule windows below are measured from.
     matches!(item.item_type, ItemType::Text)
         && !item.text.trim().is_empty()
         && item.width > 0.0
         && item.advance_known
-        && item.is_horizontal()
+        && item.is_upright()
 }
 
 fn rule_matches_item(rule: &Rule, item: &TextItem) -> bool {
@@ -1241,5 +1243,12 @@ mod tests {
         let mut items = vec![horizontal];
         mark_underlined_items(&mut items, &[], &lines, 1);
         assert!(items[0].is_underline);
+
+        // Upside-down (180°): `y` is the box bottom, not the baseline.
+        let mut flipped = item("Header", 100.0, 500.0, 10.0, 10.0);
+        flipped.rotation = 180.0;
+        let mut items = vec![flipped];
+        mark_underlined_items(&mut items, &[], &lines, 1);
+        assert!(!items[0].is_underline);
     }
 }

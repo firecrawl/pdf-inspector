@@ -343,74 +343,74 @@ fn extract_positioned_text_impl(
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
-        // the page and poisons font statistics. Rotated pages are left alone
-        // — their item coordinates are already transformed out of box space.
+        // the page and poisons font statistics. On a turned page the box is
+        // turned the same way, so the test runs in the items' own frame.
         let mut clipped_box: Option<(f32, f32, f32, f32)> = None;
-        if coords_rotated == geometry::PageRotation::Upright {
-            if let Some((bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
-                const TOL: f32 = 6.0;
-                let outside = |it: &TextItem| {
-                    let cx = it.x + it.width / 2.0;
-                    !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
-                };
-                // Only clip when the off-page material reads as coherent text
-                // (neighboring-page paragraphs). Curved/rotated display text
-                // leaves short glyph fragments with artifact coordinates
-                // outside the box, and those must stay.
-                let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
-                // Judge by character mass: paragraphs are dominated by long
-                // word runs even when interleaved with short math fragments,
-                // while glyph-confetti is short items through and through.
-                let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
-                let wordy_chars: usize = off
-                    .iter()
-                    .map(|it| it.text.trim().chars().count())
-                    .filter(|&n| n >= 4)
-                    .sum();
-                // Genuine neighboring-page content is cleanly separated from
-                // on-page text. When an off-page item continues an on-page
-                // line (same baseline, near-adjacent x), the coordinates are
-                // artifacts of transforms we mis-model — don't clip those.
-                let straddles = off.iter().any(|o| {
-                    items.iter().any(|i| {
-                        !outside(i)
-                            && (i.y - o.y).abs() <= 2.0
-                            && (o.x - (i.x + i.width)).abs() <= 10.0
-                    })
-                });
-                let coherent =
-                    off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
-                if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
-                    let before = items.len();
-                    items.retain(|it| !outside(it));
-                    if items.len() < before {
-                        debug!(
-                            "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
-                            page_num,
-                            before - items.len(),
-                            bx0,
-                            by0,
-                            bx1,
-                            by1
-                        );
-                        // Only prune off-page geometry when off-page text
-                        // existed — same neighboring-page content.
-                        let overlaps = |x: f32, y: f32, w: f32, h: f32| {
-                            let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
-                            let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
-                            x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
-                        };
-                        rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
-                        clipped_box = Some((bx0, by0, bx1, by1));
-                        lines.retain(|l| {
-                            overlaps(
-                                l.x1.min(l.x2),
-                                l.y1.min(l.y2),
-                                (l.x2 - l.x1).abs(),
-                                (l.y2 - l.y1).abs(),
-                            )
-                        });
-                    }
+        let page_box = get_page_box(doc, page_id).map(|(x0, y0, x1, y1)| {
+            let (mut x, mut y, mut w, mut h) = (x0, y0, x1 - x0, y1 - y0);
+            coords_rotated.rotate_box(&mut x, &mut y, &mut w, &mut h);
+            (x, y, x + w, y + h)
+        });
+        if let Some((bx0, by0, bx1, by1)) = page_box {
+            const TOL: f32 = 6.0;
+            let outside = |it: &TextItem| {
+                let cx = it.x + it.width / 2.0;
+                !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
+            };
+            // Only clip when the off-page material reads as coherent text
+            // (neighboring-page paragraphs). Curved/rotated display text
+            // leaves short glyph fragments with artifact coordinates
+            // outside the box, and those must stay.
+            let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
+            // Judge by character mass: paragraphs are dominated by long
+            // word runs even when interleaved with short math fragments,
+            // while glyph-confetti is short items through and through.
+            let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
+            let wordy_chars: usize = off
+                .iter()
+                .map(|it| it.text.trim().chars().count())
+                .filter(|&n| n >= 4)
+                .sum();
+            // Genuine neighboring-page content is cleanly separated from
+            // on-page text. When an off-page item continues an on-page
+            // line (same baseline, near-adjacent x), the coordinates are
+            // artifacts of transforms we mis-model — don't clip those.
+            let straddles = off.iter().any(|o| {
+                items.iter().any(|i| {
+                    !outside(i) && (i.y - o.y).abs() <= 2.0 && (o.x - (i.x + i.width)).abs() <= 10.0
+                })
+            });
+            let coherent = off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
+            if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
+                let before = items.len();
+                items.retain(|it| !outside(it));
+                if items.len() < before {
+                    debug!(
+                        "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
+                        page_num,
+                        before - items.len(),
+                        bx0,
+                        by0,
+                        bx1,
+                        by1
+                    );
+                    // Only prune off-page geometry when off-page text
+                    // existed — same neighboring-page content.
+                    let overlaps = |x: f32, y: f32, w: f32, h: f32| {
+                        let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
+                        let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
+                        x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
+                    };
+                    rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
+                    clipped_box = Some((bx0, by0, bx1, by1));
+                    lines.retain(|l| {
+                        overlaps(
+                            l.x1.min(l.x2),
+                            l.y1.min(l.y2),
+                            (l.x2 - l.x1).abs(),
+                            (l.y2 - l.y1).abs(),
+                        )
+                    });
                 }
             }
         }
@@ -657,6 +657,18 @@ pub(crate) fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
 ///
 /// Only applies to non-CJK items whose text contains spaces (where Tw
 /// contributes) and whose average width-per-character is abnormally high.
+/// Extent used to detect overlapping (backtracking) paint order: the merge
+/// width for measured runs, the estimated box for width-less ones — an
+/// estimate is still evidence of where a fragment ends, and taking it as zero
+/// would let a tagged widthless ActualText line be x-sorted out of order.
+fn order_extent(item: &TextItem) -> f32 {
+    if item.advance_known {
+        effective_merge_width(item)
+    } else {
+        item.width
+    }
+}
+
 fn effective_merge_width(item: &TextItem) -> f32 {
     use crate::text_utils::is_cjk_char;
 
@@ -758,13 +770,13 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
     let mut sorted_by_x = group.to_vec();
     sorted_by_x.sort_by(|a, b| a.x.total_cmp(&b.x));
     let cluster_start = sorted_by_x[0].x;
-    let mut cluster_end = cluster_start + effective_merge_width(sorted_by_x[0]);
+    let mut cluster_end = cluster_start + order_extent(sorted_by_x[0]);
     for item in sorted_by_x.iter().skip(1) {
         let gap = item.x - cluster_end;
         if gap > max_font_size * 2.5 {
             return false;
         }
-        cluster_end = cluster_end.max(item.x + effective_merge_width(item));
+        cluster_end = cluster_end.max(item.x + order_extent(item));
     }
     if cluster_end - cluster_start > max_font_size * 36.0 {
         return false;
@@ -777,7 +789,7 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
         let backtrack_threshold = font_size * 0.25;
         let previous_start = previous.x;
         let next_start = next.x;
-        let next_end = next.x + effective_merge_width(next);
+        let next_end = next.x + order_extent(next);
         if next_start < previous_start - backtrack_threshold
             && next_end > previous_start + backtrack_threshold
         {
@@ -1082,6 +1094,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let first = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
+            let mut box_right = first.x + first.width;
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
@@ -1175,6 +1188,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
+                box_right = box_right.max(next.x + next.width);
                 let next_end = next.x + effective_merge_width(next);
                 end_x = if *preserve_stream_order {
                     end_x.max(next_end)
@@ -1188,12 +1202,12 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 text,
                 x: first.x,
                 y: first.y,
-                // An estimated run contributes no width to the merge walk,
-                // so a lone one must keep its own estimated extent.
+                // Estimated runs contribute no width to the merge walk, so
+                // their item keeps the union of their estimated boxes instead.
                 width: if first.advance_known {
                     end_x - first.x
                 } else {
-                    (end_x - first.x).max(first.width)
+                    box_right - first.x
                 },
                 height: first.height,
                 font: first.font.clone(),
@@ -1293,12 +1307,7 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     let marks_ok = parent.is_strikeout == item.is_strikeout
                         && (parent.is_underline == item.is_underline
                             || (parent.is_underline && !item.is_underline));
-                    if parent.font_size >= sub_threshold
-                        && ends_with_letter
-                        && marks_ok
-                        && parent.advance_known
-                        && item.advance_known
-                    {
+                    if parent.font_size >= sub_threshold && ends_with_letter && marks_ok {
                         let parent_right = parent.x + parent.width;
                         let gap = item.x - parent_right;
                         // Subscripts must be tightly adjacent (within ~1pt)
@@ -3682,6 +3691,25 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
             2
         );
         assert_eq!(merge_text_items(vec![estimated, measured]).len(), 2);
+    }
+
+    #[test]
+    fn merged_estimated_runs_keep_the_union_of_their_boxes() {
+        // Two width-less runs whose starts almost coincide merge (their
+        // measured width is zero for the gap walk); the merged box must still
+        // reach the end of the later estimate.
+        let mut first = make_merge_item("ab", 100.0, 20.0);
+        first.advance_known = false;
+        let mut second = make_merge_item("cdefg", 102.0, 50.0);
+        second.advance_known = false;
+        let merged = merge_text_items(vec![first, second]);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert!(!merged[0].advance_known);
+        assert!(
+            (merged[0].width - 52.0).abs() < 1e-3,
+            "width = {}",
+            merged[0].width
+        );
     }
 
     #[test]

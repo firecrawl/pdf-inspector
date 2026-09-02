@@ -9,6 +9,7 @@ import {
   classifyPdfAsync,
   extractText,
   extractTextWithPositions,
+  extractTextWithPositionsAndRotations,
   extractStructureElements,
   extractTextInRegions,
   detectVectorGridInRegion,
@@ -123,6 +124,18 @@ assert.equal(stampRegions[0].regions[0].text.trim(), 'arXiv:2301.00001v1 [cs.CL]
 assert.ok(!stampRegions[0].regions[1].text.includes('arXiv'), 'stamp leaked into body region');
 assert.ok(stampRegions[0].regions[1].text.includes('The quick brown fox'));
 console.log('  extractTextInRegions rotated margin run: OK');
+
+// page frames: an upright page reports none; a page whose text is rotated
+// 90° counter-clockwise is re-based and reported as 'ccw'
+const upright = extractTextWithPositionsAndRotations(fixture);
+assert.ok(upright.items.length > 0);
+assert.deepEqual(upright.pageRotations, []);
+const rotatedPageFixture = readFileSync('../tests/fixtures/tnagriculture_06_12.pdf');
+const turned = extractTextWithPositionsAndRotations(rotatedPageFixture);
+assert.ok(turned.items.length > 0);
+assert.deepEqual(turned.pageRotations, [{ page: 1, rotation: 'ccw' }]);
+assert.ok(turned.items.every(i => i.page !== 1 || i.rotation === 0 || i.rotation === 270));
+console.log('  extractTextWithPositionsAndRotations: OK');
 
 // --- extractStructureElements ---
 console.log('Testing extractStructureElements...');

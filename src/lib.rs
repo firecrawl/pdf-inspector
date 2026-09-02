@@ -2875,6 +2875,13 @@ fn tsr_assign_orphan_items(
     if cap_x <= 0.0 || cap_y <= 0.0 {
         return;
     }
+    // The caps come from the cells' page-coordinate boxes; in a turned frame
+    // the page's horizontal extent runs along the frame's y axis and vice
+    // versa, so swap them (and the same-line tolerance derived from cap_y).
+    let (cap_x, cap_y) = match coord_space {
+        RegionCoordSpace::Standard => (cap_x, cap_y),
+        RegionCoordSpace::Rotated90Ccw | RegionCoordSpace::Rotated90Cw => (cap_y, cap_x),
+    };
     // Y-tolerance for "same line as a previous orphan" — multi-token branch
     // names like "Blue Valley Parkway" are 3 separate text items and should
     // all stack into the same cell. But two orphans on different rows of
@@ -7948,12 +7955,17 @@ mod rotated_run_region_tests {
 
     #[test]
     fn tsr_line_clustering_uses_the_estimated_height_of_unknown_advances() {
-        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, 370.0, 90.0);
+        let estimated = STAMP.chars().count() as f32 * 0.5 * 20.0;
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, estimated, 90.0);
         stamp.advance_known = false;
         let lines = cluster_tsr_cell_text_lines(vec![stamp]);
         assert_eq!(lines.len(), 1);
-        // 37 glyphs × 0.5em at 20pt: a real extent, not the 2.5pt floor.
-        assert!(lines[0].half_height > 100.0, "{}", lines[0].half_height);
+        // Half the estimated extent, not the 2.5pt floor.
+        assert!(
+            (lines[0].half_height - estimated * 0.5).abs() < 1e-3,
+            "{}",
+            lines[0].half_height
+        );
     }
 
     #[test]
@@ -7964,8 +7976,10 @@ mod rotated_run_region_tests {
         let page_h = 792.0;
         let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
         // Extraction lays a half-em-per-glyph estimate along the run for a
-        // width-less font and flags it; the box is what region matching sees.
-        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, 370.0, 90.0);
+        // width-less font and flags it (the content-stream tests cover the
+        // parser side); region matching sees that box like any other.
+        let estimated = STAMP.chars().count() as f32 * 0.5 * 20.0;
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, estimated, 90.0);
         stamp.advance_known = false;
         assert!(region_overlaps_item(&stamp, margin));
         assert!(region_item_overlap_area(&stamp, margin) > 0.0);

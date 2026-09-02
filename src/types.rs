@@ -131,13 +131,15 @@ pub struct TextItem {
     /// strays then report `270` on a counter-clockwise page and `90` on a
     /// clockwise one.
     pub rotation: f32,
-    /// Whether the run's advance came from font metrics. `false` only when
-    /// the font carries no width information: the box's extent along the
-    /// baseline is then an estimate of half an em per glyph, laid in the
-    /// direction the run reads, rather than a measurement. A font that
-    /// reports a genuine zero advance keeps `true`. Items that don't come
-    /// from a text matrix (images, links, form fields, OCR) always report
-    /// `true`.
+    /// Whether the run's advance came from font metrics. `false` when the
+    /// font carries no width information (or, for an ActualText span, when
+    /// the advance could not be recovered from the text matrix): the box's
+    /// extent along the baseline is then an estimate of half an em per
+    /// painted glyph — per character of the decoded text for ordinary runs —
+    /// laid in the direction the run reads, rather than a measurement. A
+    /// font that reports a genuine zero advance keeps `true`. Items that
+    /// don't come from a text matrix (images, links, form fields, OCR)
+    /// always report `true`.
     pub advance_known: bool,
     /// Font name: the `/BaseFont` family name ("ABCDEF+CMMI10"), which
     /// identifies the actual face (see `extractor::fonts::item_font_name`

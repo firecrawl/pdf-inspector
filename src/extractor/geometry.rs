@@ -185,7 +185,13 @@ pub(crate) fn run_geometry(
 /// width metrics: half an em per glyph. `font_size_ts` is the em in text
 /// space (the `Tf` size, times the Type3 scale where one applies).
 pub(crate) fn estimated_advance_ts(text: &str, font_size_ts: f32) -> f32 {
-    text.chars().count() as f32 * 0.5 * font_size_ts
+    estimated_advance_for_glyphs(text.chars().count(), font_size_ts)
+}
+
+/// The same estimate from a glyph count — for ActualText spans, whose
+/// replacement string can be longer or shorter than what was painted.
+pub(crate) fn estimated_advance_for_glyphs(glyphs: usize, font_size_ts: f32) -> f32 {
+    glyphs as f32 * 0.5 * font_size_ts
 }
 
 /// Angle of the text-space x axis `(a, b)` in device space, in degrees
