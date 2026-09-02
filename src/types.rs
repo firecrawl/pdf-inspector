@@ -207,8 +207,21 @@ pub(crate) fn script_edge_needs_space(
     if !(prev.is_script() || item.is_script()) {
         return None;
     }
+    if stacked_fraction_slash(prev, item) {
+        return Some(false);
+    }
+    // Different visual lines (a wrapped table cell): a run at the end of
+    // one line never attaches to the start of the next, whatever the x
+    // overlap says.
+    if (prev.line_y() - item.line_y()).abs() > prev.font_size.max(item.font_size) * 0.5 {
+        return Some(true);
+    }
     let curr = text.trim_start();
+    // `result` ends with the closing tag when the previous item is a run,
+    // so its raw text is inspected too for hyphens and open brackets.
     if result.ends_with([' ', '-', '(', '[', '{'])
+        || prev.text.ends_with(' ')
+        || prev.text.trim_end().ends_with(['-', '(', '[', '{'])
         || text.starts_with(' ')
         || curr.starts_with('-')
         || curr
@@ -224,6 +237,21 @@ pub(crate) fn script_edge_needs_space(
         prev.x - (item.x + item.width)
     };
     Some(gap >= prev.font_size.max(item.font_size) * SCRIPT_WORD_GAP)
+}
+
+/// A stacked case fraction: a digit-only superscript run directly followed
+/// by a digit-only subscript run that overlaps it horizontally — the
+/// numerator over the denominator, as TeX sets "3⅓". Rendered with a slash
+/// between the runs (`3 <sup>1</sup>/<sub>3</sub>`) instead of the runs
+/// being glued into one number.
+pub(crate) fn stacked_fraction_slash(prev: &TextItem, item: &TextItem) -> bool {
+    let digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+    prev.baseline_shift > 0.0
+        && item.baseline_shift < 0.0
+        && digits(prev.text.trim())
+        && digits(item.text.trim())
+        && item.x < prev.x + prev.width
+        && prev.x < item.x + item.width
 }
 
 /// Append an item's text, wrapping a super/subscript run in its tag.
@@ -313,25 +341,28 @@ impl TextLine {
             // and mixed nesting breaks that. A struck-and-underlined item is
             // emitted as struck text because deletion is the stronger semantic
             // distinction in redline documents.
-            let item_strikeout = if is_script {
-                current_strikeout
+            let own_strikeout = format_decorations && item.is_strikeout;
+            let own_underline = format_decorations && item.is_underline && !own_strikeout;
+            let own_bold = format_bold && item.is_bold && !own_underline && !own_strikeout;
+            let own_italic = format_italic && item.is_italic && !own_underline && !own_strikeout;
+            // A script run inherits whatever body style is open around it
+            // (see above) — its own bold/italic is noise (italic math indices
+            // would shatter into `*<sub>t</sub>*` fragments) — but a run
+            // carrying its own DECORATION, an underlined link marker in plain
+            // text, keeps it: decorations are drawn ink, not font styling.
+            let (item_strikeout, item_underline, item_bold, item_italic) = if is_script {
+                if own_strikeout || own_underline {
+                    (own_strikeout, own_underline, false, false)
+                } else {
+                    (
+                        current_strikeout,
+                        current_underline,
+                        current_bold,
+                        current_italic,
+                    )
+                }
             } else {
-                format_decorations && item.is_strikeout
-            };
-            let item_underline = if is_script {
-                current_underline
-            } else {
-                format_decorations && item.is_underline && !item_strikeout
-            };
-            let item_bold = if is_script {
-                current_bold
-            } else {
-                format_bold && item.is_bold && !item_underline && !item_strikeout
-            };
-            let item_italic = if is_script {
-                current_italic
-            } else {
-                format_italic && item.is_italic && !item_underline && !item_strikeout
+                (own_strikeout, own_underline, own_bold, own_italic)
             };
 
             // Close previous styles if they change
@@ -375,6 +406,9 @@ impl TextLine {
                 current_italic = true;
             }
 
+            if i > 0 && stacked_fraction_slash(&self.items[i - 1], item) {
+                result.push('/');
+            }
             push_item_text(&mut result, item, text_trimmed);
         }
 
@@ -416,6 +450,9 @@ impl TextLine {
                 )
             {
                 result.push(' ');
+            }
+            if i > 0 && stacked_fraction_slash(&self.items[i - 1], item) {
+                result.push('/');
             }
             push_item_text(&mut result, item, item.text.as_str());
         }
@@ -617,6 +654,35 @@ mod formatting_tests {
             nested,
         ]);
         assert_eq!(line.text(), "x<sup>2</sup><sup>n</sup>");
+    }
+
+    #[test]
+    fn stacked_digit_fraction_renders_with_a_slash() {
+        // "3 1/3 bits" set as a case fraction: numerator raised, denominator
+        // lowered, both at the same x. Never "3 <sup>13</sup>".
+        let mut num = script("1", 52.5, 3.7, 3.96);
+        num.font_size = 7.4;
+        let mut den = script("3", 52.5, 3.7, -4.0);
+        den.font_size = 7.4;
+        let line = line(vec![
+            body("about 3", 10.0, 40.8),
+            num,
+            den,
+            body("bits", 58.0, 20.0),
+        ]);
+        assert_eq!(line.text(), "about 3 <sup>1</sup>/<sub>3</sub> bits");
+    }
+
+    #[test]
+    fn decorated_script_run_keeps_its_own_underline() {
+        // An underlined (hyperlinked) footnote marker in plain text.
+        let mut marker = script("1", 58.0, 4.0, 4.3);
+        marker.is_underline = true;
+        let line = line(vec![body("word", 10.0, 48.0), marker]);
+        assert_eq!(
+            line.text_with_formatting(false, false, true),
+            "word<u><sup>1</sup></u>"
+        );
     }
 
     #[test]

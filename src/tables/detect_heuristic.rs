@@ -142,7 +142,7 @@ fn merge_adjacent_items_preserving(
                 // and body text is neither.
                 baseline_shift: if indices
                     .iter()
-                    .all(|index| items[*index].is_script() == first_item.is_script())
+                    .all(|index| items[*index].baseline_shift == first_item.baseline_shift)
                 {
                     first_item.baseline_shift
                 } else {

@@ -1077,6 +1077,21 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 if gap < -first.font_size * 0.5 && !preserve_stream_order {
                     break;
                 }
+                // Vertically stacked DIGITS at different baselines — the
+                // numerator over the denominator of a case fraction ("1"
+                // over "3") — are not one number even though they share the
+                // 5pt band and overlap in x. Letters keep merging: rotated
+                // running headers and diagram labels stack letters too, and
+                // splitting those only scatters fragments into body text.
+                let digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+                if !preserve_stream_order
+                    && (next.y - first.y).abs() > first.font_size * 0.3
+                    && gap < -effective_merge_width(next) * 0.5
+                    && digits(text.trim())
+                    && digits(next.text.trim())
+                {
+                    break;
+                }
                 // Insert space at word boundaries.
                 // Base threshold 0.08; raised to 0.13 for lowercase→lowercase
                 // junctions to accommodate Tc/Tw character-spacing adjustments
@@ -3036,6 +3051,43 @@ mod tests {
             mcid: None,
             baseline_shift: 0.0,
         }
+    }
+
+    #[test]
+    fn stacked_fraction_glyphs_are_not_merged_into_one_run() {
+        // "1" over "3" (a TeX case fraction): same x, baselines 8pt apart,
+        // both inside the body line's 5pt band. They are two items; the
+        // script detector then sees a superscript and a subscript.
+        let items = vec![
+            make_item_fs("about 3", 91.9, 511.3, 103.2, 10.0),
+            make_item_fs("1", 196.3, 515.2, 3.7, 7.4),
+            make_item_fs("3", 196.3, 507.3, 3.7, 7.4),
+            make_item_fs("bits", 201.5, 511.3, 18.0, 10.0),
+        ];
+        let merged = merge_text_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert!(texts.contains(&"1") && texts.contains(&"3"), "{texts:?}");
+        // Side-by-side same-size raised symbol still joins its word.
+        let items = vec![
+            make_item_fs("Freon", 100.0, 500.0, 26.0, 10.0),
+            make_item_fs("®", 126.0, 502.0, 6.0, 10.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Freon®");
+        // Stacked LETTERS in the same band (a rotated label beside body
+        // text) keep merging as before — only digit pairs are fractions.
+        let items = vec![
+            make_item_fs("x", 91.9, 511.3, 5.0, 10.0),
+            make_item_fs("a", 96.9, 515.2, 3.7, 7.4),
+            make_item_fs("r", 96.9, 507.3, 3.7, 7.4),
+        ];
+        let merged = merge_text_items(items);
+        assert!(
+            merged.iter().any(|i| i.text.contains("ar")),
+            "{:?}",
+            merged.iter().map(|i| i.text.as_str()).collect::<Vec<_>>()
+        );
     }
 
     /// Small caps as typesetters emit them: a full-size capital at 9.98pt

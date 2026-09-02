@@ -154,6 +154,7 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
 ///   - dashed section-page IDs: "5-21", "A-1", "B--3", "TC-2" (common in
 ///     technical manuals)
 fn is_page_number_cell(cell: &str) -> bool {
+    let cell = super::cell_text::strip_script_markup(cell);
     let tokens: Vec<&str> = cell.split_whitespace().collect();
     if tokens.is_empty() {
         return false;
@@ -314,11 +315,14 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         // section sub-header (e.g. "JAN", "FEB") than overflow text — don't merge it.
         // A row with content in many columns is a real data row with a merged/spanning
         // first-column cell (e.g. n₂ in a statistical table), not text overflow.
-        let non_first_cells: Vec<&str> = row
+        // Judged without `<sup>`/`<sub>` markup: a footnoted value such as
+        // `12<sup>1)</sup>` is still a short numeric cell.
+        let non_first_cells: Vec<std::borrow::Cow<'_, str>> = row
             .iter()
             .skip(1)
             .map(|c| c.trim())
             .filter(|c| !c.is_empty())
+            .map(super::cell_text::strip_script_markup)
             .collect();
         let is_short_subheader = non_first_cells.len() == 1 && non_first_cells[0].len() <= 5;
         // Rows with multiple short-valued cells (e.g. numeric data in a lookup

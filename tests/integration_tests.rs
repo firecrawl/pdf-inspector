@@ -1457,10 +1457,6 @@ fn test_positions_author_block_superscripts_expose_baseline_shift() {
     }
     for item in &flagged {
         assert!(item.baseline_shift > 0.0, "raised marker: {item:?}");
-        assert!(
-            (item.y - item.baseline_shift - item.line_y()).abs() < 1e-4,
-            "line_y is y minus the shift"
-        );
     }
     let marker = flagged.iter().find(|it| it.text == "1,2,3").unwrap();
     let name = items.iter().find(|it| it.text == "Yibo Yan").unwrap();

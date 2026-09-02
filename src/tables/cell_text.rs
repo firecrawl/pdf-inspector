@@ -22,18 +22,15 @@ pub(crate) fn cell_fragment(item: &TextItem, text: &str) -> String {
 /// Same logic as TextLine::text() but for table cells
 pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
     let mut result = String::new();
+    let mut last: Option<&TextItem> = None;
 
-    for (i, item) in items.iter().enumerate() {
+    for item in items {
         let text = item.text.trim();
         if text.is_empty() {
             continue;
         }
 
-        if result.is_empty() {
-            crate::types::push_item_text(&mut result, item, text);
-        } else {
-            let prev_item = items[i - 1];
-
+        if let Some(prev_item) = last {
             // Don't add space before/after hyphens
             let prev_ends_with_hyphen = result.ends_with('-');
             let curr_is_hyphen = text == "-";
@@ -72,11 +69,33 @@ pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
             if needs_space {
                 result.push(' ');
             }
+            if crate::types::stacked_fraction_slash(prev_item, item) {
+                result.push('/');
+            }
+            crate::types::push_item_text(&mut result, item, text);
+        } else {
             crate::types::push_item_text(&mut result, item, text);
         }
+        last = Some(item);
     }
 
     result
+}
+
+/// Cell text with `<sup>`/`<sub>` markup removed, for heuristics that
+/// classify a cell by its characters (page-number cells, numeric data rows):
+/// the tag names would otherwise read as letters and their brackets as
+/// extra length.
+pub(crate) fn strip_script_markup(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("<su") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.replace("<sup>", "")
+            .replace("</sup>", "")
+            .replace("<sub>", "")
+            .replace("</sub>", ""),
+    )
 }
 
 /// Append one item to a cell that is being built incrementally (row/column
@@ -93,6 +112,9 @@ pub(crate) fn push_cell_item<'a>(
     item: &'a TextItem,
     text: &str,
 ) {
+    if text.trim().is_empty() {
+        return;
+    }
     if !cell.is_empty() {
         let needs_space = match last {
             Some(prev) => crate::types::script_edge_needs_space(prev, item, cell, text),
@@ -100,6 +122,9 @@ pub(crate) fn push_cell_item<'a>(
         };
         if needs_space.unwrap_or(true) {
             cell.push(' ');
+        }
+        if last.is_some_and(|prev| crate::types::stacked_fraction_slash(prev, item)) {
+            cell.push('/');
         }
     }
     crate::types::push_item_text(cell, item, text);
@@ -239,6 +264,64 @@ mod tests {
         push_cell_item(&mut text, &mut last, &a, a.text.trim());
         push_cell_item(&mut text, &mut last, &b, b.text.trim());
         assert_eq!(text, "Hello World");
+    }
+
+    #[test]
+    fn push_cell_item_skips_whitespace_only_fragments() {
+        let w = cell("word", 100.0, 24.0, 500.0, 10.0, 0.0);
+        let blank = cell(" ", 124.0, 2.0, 500.0, 10.0, 0.0);
+        let m = cell("1", 124.0, 3.6, 503.5, 6.5, 3.5);
+        let mut text = String::new();
+        let mut last = None;
+        for it in [&w, &blank, &m] {
+            push_cell_item(&mut text, &mut last, it, it.text.trim());
+        }
+        assert_eq!(text, "word<sup>1</sup>");
+    }
+
+    #[test]
+    fn join_cell_items_spacing_uses_the_last_nonempty_item() {
+        let w = cell("word", 100.0, 24.0, 500.0, 10.0, 0.0);
+        let blank = cell(" ", 124.0, 2.0, 500.0, 10.0, 0.0);
+        let m = cell("1", 124.0, 3.6, 503.5, 6.5, 3.5);
+        assert_eq!(join_cell_items(&[&w, &blank, &m]), "word<sup>1</sup>");
+    }
+
+    #[test]
+    fn script_at_a_wrapped_line_end_does_not_attach_to_the_next_line() {
+        // Cell wraps: "value" + raised "1" on line 1, "next" starts line 2
+        // under the marker. Different visual lines keep their separator.
+        let v = cell("value", 100.0, 26.0, 500.0, 10.0, 0.0);
+        let m = cell("1", 126.0, 3.6, 503.5, 6.5, 3.5);
+        let next = cell("next", 100.0, 22.0, 488.0, 10.0, 0.0);
+        assert_eq!(join_cell_items(&[&v, &m, &next]), "value<sup>1</sup> next");
+        let mut text = String::new();
+        let mut last = None;
+        for it in [&v, &m, &next] {
+            push_cell_item(&mut text, &mut last, it, it.text.trim());
+        }
+        assert_eq!(text, "value<sup>1</sup> next");
+    }
+
+    #[test]
+    fn stacked_fraction_in_a_cell_renders_with_a_slash() {
+        let three = cell("3", 100.0, 5.0, 500.0, 10.0, 0.0);
+        let num = cell("1", 106.5, 3.7, 503.96, 7.4, 3.96);
+        let den = cell("3", 106.5, 3.7, 496.0, 7.4, -4.0);
+        assert_eq!(
+            join_cell_items(&[&three, &num, &den]),
+            "3 <sup>1</sup>/<sub>3</sub>"
+        );
+    }
+
+    #[test]
+    fn strip_script_markup_removes_only_the_tags() {
+        assert_eq!(strip_script_markup("12<sup>1)</sup>"), "121)");
+        assert_eq!(strip_script_markup("V<sub>f</sub> m/s"), "Vf m/s");
+        assert!(matches!(
+            strip_script_markup("plain"),
+            std::borrow::Cow::Borrowed("plain")
+        ));
     }
 
     #[test]

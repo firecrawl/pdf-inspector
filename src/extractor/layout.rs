@@ -505,9 +505,10 @@ impl ProseLineStats {
             return;
         }
         self.total_lines += 1;
-        self.total_items += line_items.len();
+        // Marker runs ride on a line, they are not table-like items.
+        self.total_items += line_items.iter().filter(|i| !i.is_script()).count();
 
-        let line_y = line_items[0].y;
+        let line_y = line_items[0].line_y();
         let line_height = line_items
             .iter()
             .map(|i| i.height)

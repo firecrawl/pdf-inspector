@@ -402,9 +402,9 @@ pub(crate) fn build_region_graph(items: Vec<TextItem>, band: ColumnFlowBand) -> 
     let mut right = Vec::new();
     let mut below = Vec::new();
     for item in items {
-        if item.y > band.y_top {
+        if item.line_y() > band.y_top {
             above.push(item);
-        } else if item.y < band.y_bottom {
+        } else if item.line_y() < band.y_bottom {
             below.push(item);
         } else if item.x + effective_width(&item) / 2.0 < band.split_x {
             left.push(item);

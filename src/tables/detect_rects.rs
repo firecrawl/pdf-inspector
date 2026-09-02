@@ -1127,8 +1127,8 @@ fn detect_stacked_box_table(
             return None;
         }
         in_box.sort_by(|a, b| {
-            b.1.y
-                .partial_cmp(&a.1.y)
+            b.1.line_y()
+                .partial_cmp(&a.1.line_y())
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
                     a.1.x

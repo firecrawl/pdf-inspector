@@ -420,13 +420,17 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             let run_left = items[run.glyphs[0]].x;
             let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
             let anchor = &mut items[run.anchor];
+            // The fused item spans the union of word and marker: a kerned
+            // marker may end inside the word's advance or start before it.
+            let anchor_right = item_right(anchor);
             if run.anchor_on_left {
                 anchor.text.push_str(&mapped);
-                anchor.width = run_right - anchor.x;
+                anchor.width = anchor_right.max(run_right) - anchor.x;
             } else {
                 anchor.text = mapped + &anchor.text;
-                anchor.width = item_right(anchor) - run_left;
-                anchor.x = run_left;
+                let left = anchor.x.min(run_left);
+                anchor.width = anchor_right - left;
+                anchor.x = left;
             }
             for &g in &run.glyphs {
                 remove[g] = true;
@@ -803,6 +807,28 @@ mod tests {
             merged[1]
         );
         assert!((merged[1].line_y() - 500.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn fusion_spans_the_union_of_word_and_marker() {
+        // A kerned marker ending inside the word's advance must not shrink
+        // the fused item.
+        let items = vec![
+            make_item_fs("word", 78.0, 499.0, 12.0, 8.0),
+            make_item_fs("2", 87.0, 502.5, 2.0, 4.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(texts(&merged), vec!["word²"]);
+        assert!((merged[0].width - 12.0).abs() < 1e-3, "{}", merged[0].width);
+        // Leading marker starting inside the word's box keeps the word's x.
+        let items = vec![
+            make_item_fs("1", 76.5, 653.5, 3.9, 6.97),
+            make_item_fs("Hong Kong", 75.9, 650.0, 50.0, 9.96),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(texts(&merged), vec!["¹Hong Kong"]);
+        assert!((merged[0].x - 75.9).abs() < 1e-3);
+        assert!((merged[0].width - 50.0).abs() < 1e-3);
     }
 
     #[test]
