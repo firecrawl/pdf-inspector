@@ -281,6 +281,26 @@ fn ends_like_incomplete_phrase(cell: &str) -> bool {
         || lower.ends_with('/')
 }
 
+/// Data cells a row must carry beyond its first cell to be kept as a table
+/// row instead of extracted as a footnote. Excludes the first cell so a bare
+/// marker and a marker followed by label text behave identically.
+const MIN_DATA_CELLS_FOR_ROW: usize = 1;
+
+/// A cell is data if it looks like a numeric value, including scientific
+/// notation (`2,41E+02`) and grouping whitespace (`1 000`). Prose and unit
+/// labels (`kW`, `kg/s`) are not.
+fn is_data_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.is_empty() || !trimmed.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    trimmed.chars().all(|c| {
+        c.is_ascii_digit()
+            || c.is_whitespace()
+            || matches!(c, ',' | '.' | '-' | '+' | '%' | '(' | ')' | 'e' | 'E')
+    })
+}
+
 /// Clean up table cells: merge continuation rows, extract footnotes, remove empty rows
 fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
     let mut cleaned: Vec<Vec<String>> = Vec::new();
@@ -292,9 +312,11 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             continue;
         }
 
-        // Check if this row is a footnote (starts with (1), (2), etc. or just a number reference)
+        // Footnote only when the row has too few data cells beyond the first
+        // (a data row whose label starts with a marker must stay in the table).
         let first_cell = row.first().map(|s| s.trim()).unwrap_or("");
-        if is_footnote_row(first_cell) {
+        let data_cells = row.iter().skip(1).filter(|c| is_data_cell(c)).count();
+        if data_cells < MIN_DATA_CELLS_FOR_ROW && is_footnote_row(first_cell) {
             // Combine all cells into a single footnote line
             let footnote_text: String = row
                 .iter()
@@ -585,6 +607,106 @@ mod tests {
         assert_eq!(footnotes.len(), 1);
         assert!(footnotes[0].contains("(1)"));
         assert!(footnotes[0].contains("See appendix"));
+    }
+
+    #[test]
+    fn test_clean_table_cells_footnote_marker_with_data_cells_kept() {
+        let cells = vec![
+            vec![
+                "Measurement".into(),
+                "Unit".into(),
+                "Q1".into(),
+                "Q2".into(),
+                "Q3".into(),
+            ],
+            vec![
+                "Mass flow".into(),
+                "kg/s".into(),
+                "3,10E+00".into(),
+                "3,35E-01".into(),
+                "4,23E-01".into(),
+            ],
+            vec![
+                "1) Heat output".into(),
+                "kW".into(),
+                "2,41E+02".into(),
+                "2,74E+01".into(),
+                "6,69E+00".into(),
+            ],
+            vec![
+                "Pressure drop".into(),
+                "kPa".into(),
+                "1,91E+03".into(),
+                "3,96E+02".into(),
+                "8,67E+01".into(),
+            ],
+        ];
+        let (cleaned, footnotes) = clean_table_cells(&cells);
+        assert_eq!(footnotes.len(), 0);
+        assert_eq!(cleaned.len(), 4);
+        assert_eq!(cleaned[2][0], "1) Heat output");
+        assert_eq!(cleaned[2][2], "2,41E+02");
+    }
+
+    #[test]
+    fn test_clean_table_cells_two_column_marker_label_row_kept() {
+        let cells = vec![
+            vec!["Header".into(), "Value".into()],
+            vec!["Data".into(), "100".into()],
+            vec!["1) Item".into(), "42".into()],
+        ];
+        let (cleaned, footnotes) = clean_table_cells(&cells);
+        assert_eq!(footnotes.len(), 0);
+        assert_eq!(cleaned.len(), 3);
+        assert_eq!(cleaned[2][0], "1) Item");
+        assert_eq!(cleaned[2][1], "42");
+    }
+
+    #[test]
+    fn test_clean_table_cells_grouped_whitespace_values_kept() {
+        let cells = vec![
+            vec!["Header".into(), "A".into(), "B".into()],
+            vec!["1) Heat output".into(), "1 000".into(), "2 000".into()],
+        ];
+        let (cleaned, footnotes) = clean_table_cells(&cells);
+        assert_eq!(footnotes.len(), 0);
+        assert_eq!(cleaned.len(), 2);
+        assert_eq!(cleaned[1][1], "1 000");
+    }
+
+    #[test]
+    fn test_clean_table_cells_lone_marker_still_extracted_as_footnote() {
+        let cells = vec![
+            vec!["Header".into(), "Value".into()],
+            vec!["Data".into(), "100".into()],
+            vec!["1)".into(), "Note text".into()],
+        ];
+        let (cleaned, footnotes) = clean_table_cells(&cells);
+        assert_eq!(footnotes.len(), 1);
+        assert_eq!(cleaned.len(), 2);
+    }
+
+    // --- is_data_cell ---
+
+    #[test]
+    fn test_is_data_cell_numeric_values() {
+        assert!(is_data_cell("100"));
+        assert!(is_data_cell("3,10E+00"));
+        assert!(is_data_cell("2,41E+02"));
+        assert!(is_data_cell("-12.5"));
+        assert!(is_data_cell("50%"));
+        assert!(is_data_cell("1,000.00"));
+        assert!(is_data_cell("1 000"));
+        assert!(is_data_cell("2 500 000"));
+    }
+
+    #[test]
+    fn test_is_data_cell_prose_and_units() {
+        assert!(!is_data_cell(""));
+        assert!(!is_data_cell("kW"));
+        assert!(!is_data_cell("kg/s"));
+        assert!(!is_data_cell("Heat output"));
+        assert!(!is_data_cell("See appendix"));
     }
 
     #[test]
