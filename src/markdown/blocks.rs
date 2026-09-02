@@ -150,16 +150,14 @@ impl BlockRecorder {
         let mut have_prev = false;
 
         // `remove_page_numbers` decides by line isolation, and a single-item
-        // fragment is always isolated — so a legitimate list item whose text
-        // is page-number-shaped ("- 5 -") would be dropped here even though
-        // the document-level pass keeps it (its list neighbors break the
-        // isolation). List items are already positively classified content;
-        // never run folio removal on them.
+        // fragment is always isolated. Preserve page-number-shaped list items
+        // only when an adjacent list fragment on the same page makes them
+        // non-isolated in the document-level pass.
         let list_item_options = MarkdownOptions {
             remove_page_numbers: false,
             ..options.clone()
         };
-        for block in raw_blocks {
+        for (index, block) in raw_blocks.iter().enumerate() {
             if block.start >= block.end || block.end > raw.len() {
                 continue;
             }
@@ -168,7 +166,9 @@ impl BlockRecorder {
             };
             let content_start = block.start + (fragment.len() - fragment.trim_start().len());
             let content_end = block.start + fragment.trim_end().len();
-            let fragment_options = if block.kind == RawBlockKind::ListItem {
+            let fragment_options = if block.kind == RawBlockKind::ListItem
+                && has_neighboring_list_content(&raw_blocks, index, raw)
+            {
                 &list_item_options
             } else {
                 options
@@ -221,6 +221,39 @@ impl BlockRecorder {
     pub(crate) fn take_output(&mut self) -> LayoutBlocksOutput {
         self.finished.take().unwrap_or_default()
     }
+}
+
+fn has_neighboring_list_content(blocks: &[RawBlock], index: usize, raw: &str) -> bool {
+    let block = &blocks[index];
+    let neighbors = [index.checked_sub(1), index.checked_add(1)];
+
+    neighbors.into_iter().flatten().any(|neighbor_index| {
+        let Some(neighbor) = blocks.get(neighbor_index) else {
+            return false;
+        };
+        if neighbor.kind != RawBlockKind::ListItem || neighbor.page != block.page {
+            return false;
+        }
+
+        let (left, right) = if neighbor_index < index {
+            (neighbor, block)
+        } else {
+            (block, neighbor)
+        };
+        let Some(left_fragment) = raw.get(left.start..left.end) else {
+            return false;
+        };
+        let Some(right_fragment) = raw.get(right.start..right.end) else {
+            return false;
+        };
+        let left_content_end = left.start + left_fragment.trim_end().len();
+        let right_content_start =
+            right.start + (right_fragment.len() - right_fragment.trim_start().len());
+        raw.get(left_content_end..right_content_start)
+            .is_some_and(|separator| {
+                separator.chars().all(char::is_whitespace) && separator.matches('\n').count() == 1
+            })
+    })
 }
 
 fn union_bbox(
@@ -492,6 +525,20 @@ mod tests {
         assert_eq!(output.markdown, "- one\n- 5 -\n- two\n");
         assert_eq!(output.blocks.len(), 3);
         assert_eq!(&output.markdown[6..11], "- 5 -");
+    }
+
+    #[test]
+    fn finish_drops_isolated_page_number_shaped_list_item() {
+        let mut recorder = BlockRecorder::new();
+        let raw = "- one\n\n- 5 -\n\nAfter.\n";
+        recorder.push_fragment(RawBlockKind::ListItem, 1, 0, 6, None, false, true);
+        recorder.push_fragment(RawBlockKind::ListItem, 1, 7, 13, None, false, true);
+        recorder.push_fragment(RawBlockKind::Text, 1, 14, 20, None, false, true);
+        recorder.finish(raw, &MarkdownOptions::default());
+        let output = recorder.take_output();
+
+        assert_eq!(output.markdown, "- one\n\nAfter.\n");
+        assert_eq!(output.blocks.len(), 2);
     }
 
     #[test]

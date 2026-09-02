@@ -585,7 +585,7 @@ pub struct LayoutBlockJs {
     /// origin, or `None` when no positioned geometry is available.
     pub bbox: Option<Vec<f64>>,
     /// `[start, end)` byte offsets into the result's `markdown`.
-    pub markdown_span: Vec<u32>,
+    pub markdown_span: Vec<f64>,
     /// Provenance of the block's text; always `"native_text"`.
     pub source: String,
     /// Layout-model confidence; always `None` (no layout model runs).
@@ -636,7 +636,7 @@ pub fn extract_layout_blocks(buffer: Buffer) -> Result<LayoutBlocksResultJs> {
                     bbox: block
                         .bbox
                         .map(|bbox| bbox.iter().map(|&v| v as f64).collect()),
-                    markdown_span: vec![block.markdown_span.0 as u32, block.markdown_span.1 as u32],
+                    markdown_span: markdown_span_to_js(block.markdown_span),
                     source: block.source,
                     layout_confidence: block.layout_confidence.map(f64::from),
                     ocr_confidence: block.ocr_confidence.map(f64::from),
@@ -646,6 +646,10 @@ pub fn extract_layout_blocks(buffer: Buffer) -> Result<LayoutBlocksResultJs> {
             page_count: result.page_count,
         })
     })
+}
+
+fn markdown_span_to_js((start, end): (usize, usize)) -> Vec<f64> {
+    vec![start as f64, end as f64]
 }
 
 /// Extract text within bounding-box regions from a PDF.
@@ -1207,4 +1211,18 @@ pub fn extract_pages_markdown_async(
         bytes: buffer.to_vec(),
         pages,
     })
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod tests {
+    use super::markdown_span_to_js;
+
+    #[test]
+    fn markdown_span_does_not_wrap_at_u32_boundary() {
+        let start = u32::MAX as usize + 1;
+        assert_eq!(
+            markdown_span_to_js((start, start + 1)),
+            vec![4294967296.0, 4294967297.0]
+        );
+    }
 }

@@ -156,6 +156,7 @@ const fatalUtf8 = new TextDecoder('utf-8', { fatal: true });
 let prevSpanEnd = 0;
 for (const block of layoutBlocks.blocks) {
   const [start, end] = block.markdownSpan;
+  assert.ok(Number.isSafeInteger(start) && Number.isSafeInteger(end));
   assert.ok(start >= prevSpanEnd && start < end && end <= markdownBytes.length);
   assert.ok(fatalUtf8.decode(markdownBytes.subarray(start, end)).trim().length > 0);
   prevSpanEnd = end;
