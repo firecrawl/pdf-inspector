@@ -1,0 +1,151 @@
+src/tables/mod.rs
+  s_8ac8f3a6d59f12::t_bfa827f715cbdd 5,126,153-158,504,537-542
+  s_8ac8f3a6d59f12::t_19bf4b1941ca39 100-106,313,337,1056-1057,1061,1064
+  s_8ac8f3a6d59f12::t_55fe3d089726a7 146,533-535
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 1521,1542
+napi/package.json
+  s_8ac8f3a6d59f12::t_7f168f2a436a2c 3,55-60
+Cargo.toml
+  s_8ac8f3a6d59f12::t_7f168f2a436a2c 3
+src/extractor/layout.rs
+  s_8ac8f3a6d59f12::t_cce3635ef45ccb 593,601,603,609,2930-2932,2940-2943,2953,3035
+  s_8ac8f3a6d59f12::t_b0cd92321a37bc 2934
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 3080,3829
+src/lib.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 839,5447,5725,6557
+  s_8ac8f3a6d59f12::t_cce3635ef45ccb 3668-3672,3681,3686
+  s_8ac8f3a6d59f12::t_b0cd92321a37bc 3674
+src/markdown/analysis.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 857
+src/markdown/furniture.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 637
+src/text_utils.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 1332,1533,1656,1736
+tests/snapshots/thermo-freon12.md
+  s_8ac8f3a6d59f12::t_bcf15d0469ebc2 17-21,25-26,41-42,48
+  s_8ac8f3a6d59f12::t_4f91a78f0c6f17 52
+src/vision/pdfium.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 266
+napi/src/lib.rs
+  s_8ac8f3a6d59f12::t_b9f445d166fb8a 110-116,523
+src/python.rs
+  s_8ac8f3a6d59f12::t_b9f445d166fb8a 375-379,594
+src/types.rs
+  s_8ac8f3a6d59f12::t_6f926b7468fee6 145-171,186-189,235,237,241-243,248-249,300-302,316-335,356,398-399,418,440-444,450,508-512,516-526,530-531,533-571,573-599,606,620-628
+  s_8ac8f3a6d59f12::t_3e51bae9a4cf69 190-228,445-449
+  s_8ac8f3a6d59f12::t_150d57977c3d28 229,233-234,236,238-240,244-247,303-308,378,400-404,410,416-417,420,513-515,527-529,532,572,600-601,607-619
+  s_8ac8f3a6d59f12::t_6d66d122fdc046 230-232
+  s_8ac8f3a6d59f12::t_b0cd92321a37bc 411-415,602-605
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 495
+src/tables/cell_text.rs
+  s_8ac8f3a6d59f12::t_bfa827f715cbdd 1-256
+wasm/Cargo.lock
+  ai_agent 728,744
+src/markdown/heading.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 529,689
+tests/snapshots/shannon-entropy-p1-2.md
+  s_8ac8f3a6d59f12::t_bcf15d0469ebc2 20,23,33
+src/vision/pipeline.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 1152
+src/tables/financial.rs
+  s_8ac8f3a6d59f12::t_19bf4b1941ca39 116
+wasm/Cargo.toml
+  s_8ac8f3a6d59f12::t_7f168f2a436a2c 3
+docs/python.md
+  s_8ac8f3a6d59f12::t_b9f445d166fb8a 222
+src/markdown/mod.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 2697
+src/extractor/xobjects.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 475,696,901
+pdf_inspector.pyi
+  s_8ac8f3a6d59f12::t_b9f445d166fb8a 101-106
+napi/Cargo.toml
+  s_8ac8f3a6d59f12::t_7f168f2a436a2c 3
+tests/integration_tests.rs
+  s_8ac8f3a6d59f12::t_d97a07ba6ce8c1 294,323
+  s_8ac8f3a6d59f12::t_dc34568a1e2543 1347-1365,1368-1374,1378-1381,1384-1418,1424-1428,1431,1434-1435,1437-1451,1453-1466,1476,1485,1490-1491
+  s_8ac8f3a6d59f12::t_4a1e7a37b368c8 1366-1367,1376-1377,1382-1383,1429-1430,1432-1433,1436,1452
+  s_8ac8f3a6d59f12::t_b0cd92321a37bc 1375,1419-1423,1467-1475,1477-1484,1486-1489
+napi/bun.lock
+  ai_agent 11-16
+src/vision/fusion.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 622,1254,1272,1300,1318
+src/extractor/mod.rs
+  s_8ac8f3a6d59f12::t_1e3ca35c267465 12,42
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 1135,1319,1556,1574,1592,2380,2398,2416,2445,2463,2481,2512,2550,2589,2607,2625,2651,2792,2810,2838,2856,2900,2948,2996,3037
+src/tables/detect_lines.rs
+  s_8ac8f3a6d59f12::t_bfa827f715cbdd 12,448,466-471,871,876-881,991,998-1003
+  s_8ac8f3a6d59f12::t_19bf4b1941ca39 229-233
+  s_8ac8f3a6d59f12::t_cb2763e18c1578 314,317
+  s_8ac8f3a6d59f12::t_6dd532554bec42 1395
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 2142
+src/tables/detect_rects.rs
+  s_8ac8f3a6d59f12::t_19bf4b1941ca39 1155-1162
+  s_8ac8f3a6d59f12::t_88ff9f14243c58 1720-1721,1723,1757-1758,1767-1772,1774-1781
+  s_8ac8f3a6d59f12::t_6dd532554bec42 1752
+  s_8ac8f3a6d59f12::t_bfa827f715cbdd 1773
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 3584,5286,5599
+src/markdown/preprocess.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 254
+src/tables/grid.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 475,818,858
+src/markdown/convert.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 1581
+tests/snapshots/author_block_superscripts.md
+  s_8ac8f3a6d59f12::t_b0cd92321a37bc 1-2,8
+  s_8ac8f3a6d59f12::t_4a1e7a37b368c8 3-7
+napi/Cargo.lock
+  ai_agent 2046,2071
+src/bin/pdf2md.rs
+  s_8ac8f3a6d59f12::t_cce3635ef45ccb 82,96,288,297
+src/tables/detect_heuristic.rs
+  s_8ac8f3a6d59f12::t_bfa827f715cbdd 6,10
+  s_8ac8f3a6d59f12::t_19bf4b1941ca39 34-37,140-150
+  s_8ac8f3a6d59f12::t_6dd532554bec42 1018,1060
+  s_8ac8f3a6d59f12::t_8e60136a76c3d3 2226-2230
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 2258,2402
+pyproject.toml
+  s_8ac8f3a6d59f12::t_7f168f2a436a2c 9
+docs/rust-api.md
+  s_8ac8f3a6d59f12::t_b9f445d166fb8a 532
+src/extractor/reading_order.rs
+  s_8ac8f3a6d59f12::t_cce3635ef45ccb 71,76,79-80,83
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 453
+CHANGELOG.md
+  s_8ac8f3a6d59f12::t_6dadb0066d3a6e 1-21,26-48,53-55
+  s_8ac8f3a6d59f12::t_45b2f5eeeba506 22-25
+  s_8ac8f3a6d59f12::t_6d66d122fdc046 49-52
+src/extractor/links.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 126,461
+src/extractor/content_stream.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 614,848,970,1016
+  s_8ac8f3a6d59f12::t_9d5e27f8fd9c56 1137
+src/extractor/scripts.rs
+  s_8ac8f3a6d59f12::t_1e3ca35c267465 1-353,379,381-406,408-441,443,445-666,671-681,686-784,806-820
+  s_8ac8f3a6d59f12::t_034d717fce8f7d 354-378,380,407,442,785-805
+  s_8ac8f3a6d59f12::t_956fefac2bef80 444,667-670,682-685
+src/tables/detect_struct.rs
+  s_8ac8f3a6d59f12::t_6dd532554bec42 474,479-480
+  s_8ac8f3a6d59f12::t_19bf4b1941ca39 490-494
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 606
+site/index.html
+  s_8ac8f3a6d59f12::t_7f168f2a436a2c 978
+src/extractor/underline.rs
+  s_8ac8f3a6d59f12::t_b5179a0d11265a 716
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8b4edb72d70c7c95a32a05f79db90bfa9d5ad4ed",
+  "prompts": {},
+  "sessions": {
+    "s_8ac8f3a6d59f12": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5323a606-1557-4d25-ab13-436045d9d2c7",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
