@@ -2,9 +2,10 @@
 
 Notable changes to pdf-inspector. Every distribution (Rust crate, Python
 package, Node package and platform packages, WebAssembly package) shares one
-version, set by a separate release pull request (`scripts/version.py`), which
-stamps the `Unreleased` section with that version. Earlier releases are
-described in their [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
+version. A separate release pull request bumps the manifests with
+`scripts/version.py` and renames the `Unreleased` section below to that
+version and date. Earlier releases are described in their
+[GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
 ## [Unreleased]
 
