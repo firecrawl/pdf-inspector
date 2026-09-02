@@ -2,10 +2,11 @@
 
 Notable changes to pdf-inspector. Every distribution (Rust crate, Python
 package, Node package and platform packages, WebAssembly package) shares one
-version. Releases before 1.18.0 are described in their
-[GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
+version, set by a separate release pull request (`scripts/version.py`), which
+stamps the `Unreleased` section with that version. Earlier releases are
+described in their [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## [1.18.0] - 2026-09-01
+## [Unreleased]
 
 ### Added
 
