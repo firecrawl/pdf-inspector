@@ -4381,6 +4381,42 @@ fn test_extract_pages_markdown_ocrs_page_with_vector_outlined_text() {
     );
 }
 
+/// Regression: a "searchable image" scan - a full-page raster with the real
+/// body text embedded as an invisible (Tr 3) layer beneath it, and only a
+/// small amount of genuinely visible chrome (a document-ID stamp) - was
+/// misclassified. The lightweight detector counted the invisible layer's
+/// text-show operators toward `text_operator_count` with no regard to
+/// render mode, so a page with a substantial invisible body classified as
+/// TextBased and silently returned only the visible stamp. Once invisible
+/// operators stopped counting toward that total, the small visible stamp's
+/// diverse characters alone could defeat the `alphanum_ok` gate, landing on
+/// ImageBased instead - which routes to a fresh real-OCR render rather than
+/// recovering the higher-fidelity layer already embedded in the file. Both
+/// symptoms need Mixed classification, the only `pdf_type` whose recovery
+/// path retries extraction with invisible text included. Common in
+/// government "searchable image" FOIA releases.
+#[test]
+fn test_classify_and_extract_agree_on_scan_with_invisible_ocr_layer() {
+    let buf = std::fs::read("tests/fixtures/scan_with_invisible_ocr_layer.pdf").unwrap();
+
+    let cls = pdf_inspector::detector::detect_pdf_type_mem(&buf).expect("fixture should classify");
+    assert_eq!(
+        cls.pdf_type,
+        PdfType::Mixed,
+        "a scan with a small visible stamp and a hidden OCR-layer body must \
+         classify as Mixed, not TextBased or ImageBased, got: {:?}",
+        cls.pdf_type
+    );
+    assert!(cls.pages_needing_ocr.contains(&1));
+
+    let ext = extract_pages_markdown_mem(&buf, None).expect("fixture should extract");
+    let page = &ext.pages[0];
+    assert!(
+        page.needs_ocr,
+        "extract_pages_markdown must agree with classify_pdf that this page needs OCR/recovery"
+    );
+}
+
 #[test]
 fn pdf_options_debug_redacts_password() {
     let opts = PdfOptions::new().password("secret123");
