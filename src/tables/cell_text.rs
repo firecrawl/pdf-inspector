@@ -82,10 +82,8 @@ pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
     result
 }
 
-/// Cell text with `<sup>`/`<sub>` markup removed, for heuristics that
-/// classify a cell by its characters (page-number cells, numeric data rows):
-/// the tag names would otherwise read as letters and their brackets as
-/// extra length.
+/// Cell text with the `<sup>`/`<sub>` tags removed but their content kept,
+/// for length-based heuristics: `IV<sub>subc</sub>` measures as `IVsubc`.
 pub(crate) fn strip_script_markup(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains("<su") {
         return std::borrow::Cow::Borrowed(text);
@@ -96,6 +94,37 @@ pub(crate) fn strip_script_markup(text: &str) -> std::borrow::Cow<'_, str> {
             .replace("<sub>", "")
             .replace("</sub>", ""),
     )
+}
+
+/// Cell text with `<sup>…</sup>` / `<sub>…</sub>` spans removed — tags AND
+/// their content — for heuristics that classify a cell by its characters
+/// (page-number cells, numeric data rows). A marker is an annotation on the
+/// cell, not part of its value: `12<sup>1)</sup>` is the page number 12,
+/// while `x<sub>i</sub>` must not become the roman numeral `xi`.
+pub(crate) fn strip_script_spans(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("<su") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("<su") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open..];
+        let tag_end = after.find('>').map(|i| i + 1).unwrap_or(after.len());
+        let tag = &after[..tag_end];
+        let close = match tag {
+            "<sup>" => Some("</sup>"),
+            "<sub>" => Some("</sub>"),
+            _ => None,
+        };
+        let body = &after[tag_end..];
+        rest = match close.and_then(|c| body.find(c).map(|i| i + c.len())) {
+            Some(skip) => &body[skip..],
+            None => body,
+        };
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Append one item to a cell that is being built incrementally (row/column
@@ -316,10 +345,18 @@ mod tests {
 
     #[test]
     fn strip_script_markup_removes_only_the_tags() {
+        assert_eq!(strip_script_markup("IV<sub>subc</sub>"), "IVsubc");
         assert_eq!(strip_script_markup("12<sup>1)</sup>"), "121)");
-        assert_eq!(strip_script_markup("V<sub>f</sub> m/s"), "Vf m/s");
+    }
+
+    #[test]
+    fn strip_script_spans_drops_markers_with_their_content() {
+        assert_eq!(strip_script_spans("12<sup>1)</sup>"), "12");
+        assert_eq!(strip_script_spans("x<sub>i</sub>"), "x");
+        assert_eq!(strip_script_spans("V<sub>f</sub> m/s"), "V m/s");
+        assert_eq!(strip_script_spans("a<sup>1</sup>b<sub>2</sub>c"), "abc");
         assert!(matches!(
-            strip_script_markup("plain"),
+            strip_script_spans("plain"),
             std::borrow::Cow::Borrowed("plain")
         ));
     }

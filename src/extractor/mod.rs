@@ -1083,7 +1083,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 // 5pt band and overlap in x. Letters keep merging: rotated
                 // running headers and diagram labels stack letters too, and
                 // splitting those only scatters fragments into body text.
-                let digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+                let digits = |t: &str| !t.is_empty() && t.chars().all(char::is_numeric);
                 if !preserve_stream_order
                     && (next.y - first.y).abs() > first.font_size * 0.3
                     && gap < -effective_merge_width(next) * 0.5

@@ -245,9 +245,10 @@ pub(crate) fn script_edge_needs_space(
 /// between the runs (`3 <sup>1</sup>/<sub>3</sub>`) instead of the runs
 /// being glued into one number.
 pub(crate) fn stacked_fraction_slash(prev: &TextItem, item: &TextItem) -> bool {
-    let digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+    let digits = |t: &str| !t.is_empty() && t.chars().all(char::is_numeric);
     prev.baseline_shift > 0.0
         && item.baseline_shift < 0.0
+        && (prev.line_y() - item.line_y()).abs() <= prev.font_size.max(item.font_size) * 0.5
         && digits(prev.text.trim())
         && digits(item.text.trim())
         && item.x < prev.x + prev.width
@@ -351,18 +352,25 @@ impl TextLine {
             // carrying its own DECORATION, an underlined link marker in plain
             // text, keeps it: decorations are drawn ink, not font styling.
             let (item_strikeout, item_underline, item_bold, item_italic) = if is_script {
-                if own_strikeout || own_underline {
-                    (own_strikeout, own_underline, false, false)
-                } else {
-                    (
-                        current_strikeout,
-                        current_underline,
-                        current_bold,
-                        current_italic,
-                    )
-                }
+                (
+                    current_strikeout,
+                    current_underline,
+                    current_bold,
+                    current_italic,
+                )
             } else {
                 (own_strikeout, own_underline, own_bold, own_italic)
+            };
+            // A run's own decoration is emitted around the run itself and
+            // closed right after it, so it never leaks onto the next run.
+            let own_script_tag = if !is_script || current_strikeout || current_underline {
+                None
+            } else if own_strikeout {
+                Some("s")
+            } else if own_underline {
+                Some("u")
+            } else {
+                None
             };
 
             // Close previous styles if they change
@@ -409,7 +417,18 @@ impl TextLine {
             if i > 0 && stacked_fraction_slash(&self.items[i - 1], item) {
                 result.push('/');
             }
-            push_item_text(&mut result, item, text_trimmed);
+            match own_script_tag {
+                Some(tag) => {
+                    result.push('<');
+                    result.push_str(tag);
+                    result.push('>');
+                    push_item_text(&mut result, item, text_trimmed);
+                    result.push_str("</");
+                    result.push_str(tag);
+                    result.push('>');
+                }
+                None => push_item_text(&mut result, item, text_trimmed),
+            }
         }
 
         // Close any remaining open styles
@@ -683,6 +702,29 @@ mod formatting_tests {
             line.text_with_formatting(false, false, true),
             "word<u><sup>1</sup></u>"
         );
+    }
+
+    #[test]
+    fn own_decoration_does_not_leak_onto_the_next_run() {
+        let mut first = script("1", 58.0, 4.0, 4.3);
+        first.is_underline = true;
+        let second = script("2", 80.0, 4.0, 4.3);
+        let line = line(vec![body("word", 10.0, 48.0), first, second]);
+        assert_eq!(
+            line.text_with_formatting(false, false, true),
+            "word<u><sup>1</sup></u> <sup>2</sup>"
+        );
+    }
+
+    #[test]
+    fn fraction_slash_needs_one_visual_line() {
+        // Opposite-sign digit runs on different lines are not a fraction.
+        let mut num = script("1", 52.5, 3.7, 3.96);
+        num.font_size = 7.4;
+        let mut den = script("3", 52.5, 3.7, -4.0);
+        den.font_size = 7.4;
+        den.y -= 12.0; // anchored to the next line's body
+        assert!(!super::stacked_fraction_slash(&num, &den));
     }
 
     #[test]

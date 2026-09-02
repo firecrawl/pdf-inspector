@@ -429,7 +429,7 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             } else {
                 anchor.text = mapped + &anchor.text;
                 let left = anchor.x.min(run_left);
-                anchor.width = anchor_right - left;
+                anchor.width = anchor_right.max(run_right) - left;
                 anchor.x = left;
             }
             for &g in &run.glyphs {

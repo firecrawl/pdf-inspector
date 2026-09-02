@@ -1145,7 +1145,8 @@ fn detect_stacked_box_table(
         let mut runs = 1usize;
         for pair in in_box.windows(2) {
             let (prev, item) = (pair[0].1, pair[1].1);
-            if (prev.y - item.y).abs() <= 2.0 && item.x - (prev.x + prev.width) > 15.0 {
+            if (prev.line_y() - item.line_y()).abs() <= 2.0 && item.x - (prev.x + prev.width) > 15.0
+            {
                 runs += 1;
             }
         }
