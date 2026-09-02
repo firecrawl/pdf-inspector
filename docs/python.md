@@ -219,6 +219,7 @@ class TextItem:                      # extract_text_with_positions
     is_italic: bool
     is_underline: bool
     is_strikeout: bool
+    baseline_shift: float            # super/subscript offset from the body baseline (0.0 = normal text; >0 raised, <0 lowered)
     item_type: str
     mcid: int | None                 # marked-content ID for tagged PDFs (None otherwise)
 

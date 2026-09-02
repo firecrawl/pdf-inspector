@@ -590,7 +590,7 @@ fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
 
         // Sort by Y descending (top of page = higher Y in PDF coords)
         let mut sorted: Vec<&TextItem> = col_items;
-        sorted.sort_by(|a, b| b.y.total_cmp(&a.y));
+        sorted.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()));
 
         // Group into lines by Y-proximity and measure fill + item count
         let mut stats = ProseLineStats::default();
@@ -598,15 +598,15 @@ fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
         let mut line_y = f32::NAN;
 
         for item in &sorted {
-            if line_items.is_empty() || (line_y - item.y).abs() < Y_TOL {
+            if line_items.is_empty() || (line_y - item.line_y()).abs() < Y_TOL {
                 if line_items.is_empty() {
-                    line_y = item.y;
+                    line_y = item.line_y();
                 }
                 line_items.push(item);
             } else {
                 stats.flush_line(&line_items, col, col_width);
                 line_items.clear();
-                line_y = item.y;
+                line_y = item.line_y();
                 line_items.push(item);
             }
         }
@@ -2927,15 +2927,20 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
     let use_y_sorting = should_use_y_sorting(&items);
 
     let items = if use_y_sorting {
-        // Sort by Y descending (top to bottom in PDF coords)
+        // Sort by Y descending (top to bottom in PDF coords). Script glyphs
+        // sort by their anchor's baseline so a raised footnote marker lands
+        // beside its word instead of ahead of the whole line.
         let mut sorted = items;
-        sorted.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+        sorted.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()).then(a.x.total_cmp(&b.x)));
         sorted
     } else {
         items
     };
 
-    // Group items into lines
+    // Group items into lines. Baselines are compared through `line_y`, which
+    // snaps super/subscript runs to the body baseline they belong to; a
+    // fixed 3pt window on raw `y` split 4-5pt raised markers into their own
+    // orphan "line".
     let mut lines: Vec<TextLine> = Vec::new();
     let y_tolerance = 3.0;
 
@@ -2945,7 +2950,7 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
             if last_line.page != item.page {
                 return false;
             }
-            let y_diff = (last_line.y - item.y).abs();
+            let y_diff = (last_line.y - item.line_y()).abs();
             if y_diff >= y_tolerance {
                 return false;
             }
@@ -3027,7 +3032,7 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
             lines.last_mut().unwrap().items.push(item);
         } else {
             // Create new line
-            let y = item.y;
+            let y = item.line_y();
             let page = item.page;
             lines.push(TextLine {
                 items: vec![item],
@@ -3072,6 +3077,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -3820,6 +3826,7 @@ mod tests {
                     is_strikeout: false,
                     item_type: ItemType::Text,
                     mcid: None,
+                    baseline_shift: 0.0,
                 });
             }
             y -= 14.0;

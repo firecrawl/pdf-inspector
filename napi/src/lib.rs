@@ -107,6 +107,13 @@ pub struct TextItem {
     /// Strikeout detected geometrically (rule crossing the glyphs at mid
     /// x-height).
     pub is_strikeout: bool,
+    /// Signed baseline offset (PDF points, y-up) of a super/subscript glyph
+    /// run from the body baseline it is attached to; `0` for normal text.
+    /// Positive = raised (superscript: footnote/affiliation markers,
+    /// exponents), negative = lowered (subscript). Emit `<sup>`/`<sub>` from
+    /// the sign. Digit-only markers beside a word are already fused into it
+    /// as Unicode super/subscript characters ("word²") and carry `0`.
+    pub baseline_shift: f64,
     pub item_type: ItemType,
     /// URL for link items, `None` for other types.
     pub link_url: Option<String>,
@@ -513,6 +520,7 @@ pub fn extract_text_with_positions(
                     is_italic: item.is_italic,
                     is_underline: item.is_underline,
                     is_strikeout: item.is_strikeout,
+                    baseline_shift: item.baseline_shift as f64,
                     item_type,
                     link_url,
                     mcid: item.mcid,

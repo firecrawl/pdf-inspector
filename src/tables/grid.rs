@@ -349,60 +349,6 @@ pub(crate) fn find_row_index(rows: &[f32], y: f32) -> Option<usize> {
         .map(|(idx, _)| idx)
 }
 
-/// Join cell items with subscript/superscript-aware spacing
-/// Same logic as TextLine::text() but for table cells
-pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
-    let mut result = String::new();
-
-    for (i, item) in items.iter().enumerate() {
-        let text = item.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-
-        if result.is_empty() {
-            result.push_str(text);
-        } else {
-            let prev_item = items[i - 1];
-
-            // Don't add space before/after hyphens
-            let prev_ends_with_hyphen = result.ends_with('-');
-            let curr_is_hyphen = text == "-";
-            let curr_starts_with_hyphen = text.starts_with('-');
-            let prev_ends_with_open_delimiter =
-                result.ends_with('(') || result.ends_with('[') || result.ends_with('{');
-            let curr_starts_with_close_delimiter =
-                text.starts_with(')') || text.starts_with(']') || text.starts_with('}');
-
-            // Detect subscript/superscript: smaller font size and/or Y offset
-            let font_ratio = item.font_size / prev_item.font_size;
-            let reverse_font_ratio = prev_item.font_size / item.font_size;
-            let y_diff = (item.y - prev_item.y).abs();
-
-            // Current item is subscript/superscript (smaller than previous)
-            let is_sub_super = font_ratio < 0.85 && y_diff > 1.0;
-            // Previous item was subscript/superscript (returning to normal size)
-            let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
-
-            if prev_ends_with_hyphen
-                || curr_is_hyphen
-                || curr_starts_with_hyphen
-                || is_sub_super
-                || was_sub_super
-                || prev_ends_with_open_delimiter
-                || curr_starts_with_close_delimiter
-            {
-                result.push_str(text);
-            } else {
-                result.push(' ');
-                result.push_str(text);
-            }
-        }
-    }
-
-    result
-}
-
 /// Recover a header row for small-font tables by looking at body-font items
 /// just above the table's first row.
 ///
@@ -526,6 +472,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -714,56 +661,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
-    // --- join_cell_items ---
-
-    #[test]
-    fn test_join_cell_items_single_item() {
-        let item = make_item("Hello", 100.0, 500.0, 10.0);
-        assert_eq!(join_cell_items(&[&item]), "Hello");
-    }
-
-    #[test]
-    fn test_join_cell_items_multiple_spaced() {
-        let a = make_item("Hello", 100.0, 500.0, 10.0);
-        let b = make_item("World", 150.0, 500.0, 10.0);
-        assert_eq!(join_cell_items(&[&a, &b]), "Hello World");
-    }
-
-    #[test]
-    fn test_join_cell_items_hyphen_no_space() {
-        let a = make_item("pre", 100.0, 500.0, 10.0);
-        let b = make_item("-", 120.0, 500.0, 10.0);
-        let c = make_item("fix", 130.0, 500.0, 10.0);
-        assert_eq!(join_cell_items(&[&a, &b, &c]), "pre-fix");
-    }
-
-    #[test]
-    fn test_join_cell_items_parenthetical_no_inner_spaces() {
-        let a = make_item("The first sentence", 100.0, 500.0, 10.0);
-        let b = make_item("(", 190.0, 500.0, 10.0);
-        let c = make_item("twice", 195.0, 500.0, 10.0);
-        let d = make_item(")", 220.0, 500.0, 10.0);
-        assert_eq!(
-            join_cell_items(&[&a, &b, &c, &d]),
-            "The first sentence (twice)"
-        );
-    }
-
-    #[test]
-    fn test_join_cell_items_subscript_no_space() {
-        let a = make_item("H", 100.0, 500.0, 12.0);
-        let b = make_item("2", 110.0, 497.0, 8.0); // smaller font, Y offset
-        assert_eq!(join_cell_items(&[&a, &b]), "H2");
-    }
-
-    #[test]
-    fn test_join_cell_items_empty_items_skipped() {
-        let a = make_item("Hello", 100.0, 500.0, 10.0);
-        let b = make_item("  ", 120.0, 500.0, 10.0);
-        let c = make_item("World", 150.0, 500.0, 10.0);
-        assert_eq!(join_cell_items(&[&a, &b, &c]), "Hello World");
-    }
-
     // --- recover_header_row ---
 
     #[test]
@@ -918,6 +815,7 @@ mod tests {
                         is_strikeout: false,
                         item_type: ItemType::Text,
                         mcid: None,
+                        baseline_shift: 0.0,
                         page: 1,
                     },
                 ));
@@ -957,6 +855,7 @@ mod tests {
                         is_strikeout: false,
                         item_type: ItemType::Text,
                         mcid: None,
+                        baseline_shift: 0.0,
                         page: 1,
                     },
                 ));

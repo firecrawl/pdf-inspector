@@ -98,6 +98,12 @@ class TextItem:
     is_italic: bool
     is_underline: bool
     is_strikeout: bool
+    baseline_shift: float
+    """Signed baseline offset (points) of a super/subscript glyph run from the
+    body baseline it is attached to; 0.0 for normal text. Positive = raised
+    (superscript: footnote/affiliation markers, exponents), negative = lowered
+    (subscript). Digit-only markers beside a word are already fused into it as
+    Unicode super/subscript characters ("word²") and carry 0.0."""
     item_type: str
     mcid: Optional[int]
     """Marked Content ID from the content stream's BDC/BMC operator, None when

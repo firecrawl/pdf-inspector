@@ -713,6 +713,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 

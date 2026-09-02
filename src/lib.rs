@@ -836,6 +836,7 @@ mod ocr_header_footer_tests {
             is_strikeout: false,
             item_type: types::ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -3664,21 +3665,25 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 
     // Simple extraction: the caller (fire-pdf) already handles reading order
     // and column splitting via the layout model. We just need to sort items
-    // top-to-bottom, left-to-right and group into lines.
+    // top-to-bottom, left-to-right and group into lines. Baselines go
+    // through `line_y`, which snaps super/subscript glyph runs onto the body
+    // baseline they are attached to: sorting raw `y` put every raised
+    // affiliation marker of an author line ahead of the names, and the 3pt
+    // window then emitted them as an orphan ",2,3,2,4,*" line.
     let mut sorted = matched;
-    sorted.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+    sorted.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()).then(a.x.total_cmp(&b.x)));
 
     let y_tolerance = 3.0;
     let mut lines: Vec<extractor::TextLine> = Vec::new();
 
     for item in sorted {
         let should_merge = lines.last().is_some_and(|last_line: &extractor::TextLine| {
-            last_line.page == item.page && (last_line.y - item.y).abs() < y_tolerance
+            last_line.page == item.page && (last_line.y - item.line_y()).abs() < y_tolerance
         });
         if should_merge {
             lines.last_mut().unwrap().items.push(item);
         } else {
-            let y = item.y;
+            let y = item.line_y();
             let page = item.page;
             lines.push(extractor::TextLine {
                 items: vec![item],
@@ -5439,6 +5444,7 @@ mod text_cluster_column_undercount_tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -5716,6 +5722,7 @@ mod table_candidate_selection_tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -6547,6 +6554,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 

@@ -529,7 +529,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
-| `TextItem` | Text with position, font info, page number, and optional structure-tree `mcid` |
+| `TextItem` | Text with position, font info, page number, optional structure-tree `mcid`, and `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline) |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |

@@ -526,6 +526,7 @@ mod tests {
                 is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             }],
             y,
             page: 1,
@@ -685,6 +686,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         });
         let lines = vec![
             parent,

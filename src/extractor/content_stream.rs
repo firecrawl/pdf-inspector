@@ -611,6 +611,7 @@ pub(crate) fn extract_page_text_items(
                                 is_strikeout: false,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
+                                baseline_shift: 0.0,
                             });
                         }
                     }
@@ -844,6 +845,7 @@ pub(crate) fn extract_page_text_items(
                                     is_strikeout: false,
                                     item_type: ItemType::Text,
                                     mcid: current_mcid(&marked_content_stack),
+                                    baseline_shift: 0.0,
                                 });
                             }
                         }
@@ -965,6 +967,7 @@ pub(crate) fn extract_page_text_items(
                                 is_strikeout: false,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
+                                baseline_shift: 0.0,
                             });
                         }
                     }
@@ -1010,6 +1013,7 @@ pub(crate) fn extract_page_text_items(
                                         is_strikeout: false,
                                         item_type: ItemType::Image,
                                         mcid: current_mcid(&marked_content_stack),
+                                        baseline_shift: 0.0,
                                     });
                                 }
                                 XObjectType::Form(form_id) => {
@@ -1130,6 +1134,7 @@ pub(crate) fn extract_page_text_items(
                                     mcid: entry
                                         .mcid
                                         .or_else(|| current_mcid(&marked_content_stack)),
+                                    baseline_shift: 0.0,
                                 });
                             }
                         }

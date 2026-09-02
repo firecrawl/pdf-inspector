@@ -1329,6 +1329,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1529,6 +1530,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1651,6 +1653,7 @@ mod tests {
                 is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             });
             // Alternate between letter-gap and word-gap to create bimodal distribution
             x += w + if wi % 3 == 2 { word_gap } else { letter_gap };
@@ -1730,6 +1733,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 

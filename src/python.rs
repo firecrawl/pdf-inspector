@@ -372,6 +372,11 @@ pub struct PyTextItem {
     pub is_underline: bool,
     #[pyo3(get)]
     pub is_strikeout: bool,
+    /// Signed baseline offset (points) of a super/subscript glyph run from
+    /// the body baseline it is attached to; 0.0 for normal text. Positive =
+    /// raised (superscript), negative = lowered (subscript).
+    #[pyo3(get)]
+    pub baseline_shift: f32,
     #[pyo3(get)]
     pub item_type: String,
     /// Marked Content ID from the content stream's BDC/BMC operator, None
@@ -586,6 +591,7 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             is_italic: item.is_italic,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            baseline_shift: item.baseline_shift,
             item_type: item_type_str(&item.item_type),
             mcid: item.mcid,
         })

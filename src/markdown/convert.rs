@@ -1578,6 +1578,7 @@ mod tests {
             is_strikeout: false,
             item_type: crate::types::ItemType::Text,
             mcid,
+            baseline_shift: 0.0,
         }
     }
 

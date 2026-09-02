@@ -1152,12 +1152,14 @@ fn detect_stacked_box_table(
         if runs >= 2 {
             multi_run_boxes += 1;
         }
-        let text = in_box
-            .iter()
-            .map(|(_, it)| it.text.trim())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let mut text = String::new();
+        let mut last = None;
+        for (_, it) in &in_box {
+            let trimmed = it.text.trim();
+            if !trimmed.is_empty() {
+                super::cell_text::push_cell_item(&mut text, &mut last, it, trimmed);
+            }
+        }
         if text.is_empty() || text.chars().count() > 120 {
             return None;
         }
@@ -1715,9 +1717,10 @@ pub(crate) fn assign_items_to_grid(
         if item.page != page {
             continue;
         }
-        // Use item center for assignment
+        // Use item center for assignment; a super/subscript run is assigned
+        // by the body baseline it belongs to, not its own raised/lowered one.
         let cx = item.x + item.width / 2.0;
-        let cy = item.y;
+        let cy = item.line_y();
 
         // Find column: cx must be between col_edges[c] and col_edges[c+1]
         let col = (0..num_cols).find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0);
@@ -1746,13 +1749,13 @@ pub(crate) fn assign_items_to_grid(
                 crate::text_utils::sort_rtl_cell_items(
                     col_items,
                     |(_, i)| i.x,
-                    |(_, i)| i.y,
+                    |(_, i)| i.line_y(),
                     |(_, i)| i.text.as_str(),
                 );
             } else {
                 col_items.sort_by(|a, b| {
-                    b.1.y
-                        .partial_cmp(&a.1.y)
+                    b.1.line_y()
+                        .partial_cmp(&a.1.line_y())
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| {
                             a.1.x
@@ -1761,12 +1764,21 @@ pub(crate) fn assign_items_to_grid(
                         })
                 });
             }
-            let text = col_items
-                .iter()
-                .map(|(_, item)| item.text.trim())
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
+            // A cell holding a super/subscript run goes through the shared
+            // cell joiner so the run keeps its markup and edge spacing
+            // ("V<sub>f</sub>", "Total<sup>2</sup>"); plain cells keep the
+            // space join they always had.
+            let text = if col_items.iter().any(|(_, item)| item.is_script()) {
+                let refs: Vec<&TextItem> = col_items.iter().map(|(_, item)| *item).collect();
+                super::cell_text::join_cell_items(&refs)
+            } else {
+                col_items
+                    .iter()
+                    .map(|(_, item)| item.text.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
             let text = remove_inner_delimiter_spaces(&text);
             row_cells.push(text);
         }
@@ -3569,6 +3581,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -5270,6 +5283,7 @@ mod tests {
                     is_strikeout: false,
                     item_type: crate::types::ItemType::Text,
                     mcid: None,
+                    baseline_shift: 0.0,
                 });
             }
         }
@@ -5582,6 +5596,7 @@ mod tests {
                 is_strikeout: false,
                 item_type: crate::types::ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             });
         }
         let rects: Vec<crate::types::PdfRect> = page_rects

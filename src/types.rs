@@ -142,6 +142,33 @@ pub struct TextItem {
     /// Marked Content ID from the content stream's BDC/BMC operator.
     /// Used to link this item to the PDF structure tree for tagged PDFs.
     pub mcid: Option<i64>,
+    /// Signed baseline offset, in points, of a superscript/subscript glyph
+    /// run from the baseline of the body text it is attached to. Zero for
+    /// normal text. Positive = raised above the anchor's baseline
+    /// (superscript: footnote and affiliation markers, exponents), negative =
+    /// lowered (subscript: chemistry indices, math). Extraction sets it when
+    /// a short run is small relative to a tightly adjacent larger neighbor
+    /// and sits at a real baseline offset from it; a digit-only run beside a
+    /// word is instead fused into that word as Unicode super/subscript
+    /// characters ("H₂O", "word²") and never carries a shift. `y` stays the
+    /// glyph's own baseline; [`TextItem::line_y`] gives the anchor's.
+    pub baseline_shift: f32,
+}
+
+impl TextItem {
+    /// Baseline of the visual line this item belongs to: `y` for normal
+    /// text, the anchor's baseline for a super/subscript glyph run (`y`
+    /// minus `baseline_shift`). Line grouping compares this instead of `y`
+    /// so raised and lowered markers stay on their body line.
+    pub fn line_y(&self) -> f32 {
+        self.y - self.baseline_shift
+    }
+
+    /// `true` for a glyph run flagged as a super- or subscript of a larger
+    /// neighbor (non-zero `baseline_shift`).
+    pub fn is_script(&self) -> bool {
+        self.baseline_shift != 0.0
+    }
 }
 
 /// A line of text (grouped text items)
@@ -154,6 +181,70 @@ pub struct TextLine {
     /// Default 0.10 for normal PDFs; higher for Canva-style PDFs.
     #[doc(hidden)]
     pub adaptive_threshold: f32,
+}
+
+/// Gap, as a fraction of the larger font size, from which a script glyph and
+/// its normal-sized neighbor are separate words. Attached markers sit at
+/// ~0 gap (kerned ones slightly negative); a word space is ≥ 0.2 em.
+const SCRIPT_WORD_GAP: f32 = 0.12;
+/// Spacing at the edge of a super/subscript run — the single policy shared
+/// by line rendering (`TextLine::text`) and table-cell joining. `None` when
+/// neither item is a script run, so the caller's ordinary rules apply.
+///
+/// A run's glyphs arrive pre-joined by extraction, so only the boundary
+/// between a run and its neighbor is decided here, by the measured gap: a
+/// footnote marker hugs the word before it ("word<sup>1</sup>"), a leading
+/// affiliation marker hugs the word after it ("<sup>1,2</sup>Hong Kong"),
+/// and a word space after a marker survives ("<sup>2</sup> next"). Existing
+/// whitespace, hyphen junctions, open brackets before and closing
+/// punctuation after a run never take a space.
+pub(crate) fn script_edge_needs_space(
+    prev: &TextItem,
+    item: &TextItem,
+    result: &str,
+    text: &str,
+) -> Option<bool> {
+    if !(prev.is_script() || item.is_script()) {
+        return None;
+    }
+    let curr = text.trim_start();
+    if result.ends_with([' ', '-', '(', '[', '{'])
+        || text.starts_with(' ')
+        || curr.starts_with('-')
+        || curr
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'))
+    {
+        return Some(false);
+    }
+    let gap = if prev.x <= item.x {
+        item.x - (prev.x + prev.width)
+    } else {
+        prev.x - (item.x + item.width)
+    };
+    Some(gap >= prev.font_size.max(item.font_size) * SCRIPT_WORD_GAP)
+}
+
+/// Append an item's text, wrapping a super/subscript run in its tag.
+/// Shared by line rendering and table-cell joining so both emit the same
+/// markup for a run.
+pub(crate) fn push_item_text(result: &mut String, item: &TextItem, text: &str) {
+    let tag = if item.baseline_shift > 0.0 {
+        "sup"
+    } else if item.baseline_shift < 0.0 {
+        "sub"
+    } else {
+        result.push_str(text);
+        return;
+    };
+    result.push('<');
+    result.push_str(tag);
+    result.push('>');
+    result.push_str(text);
+    result.push_str("</");
+    result.push_str(tag);
+    result.push('>');
 }
 
 impl TextLine {
@@ -206,6 +297,15 @@ impl TextLine {
             // space_already_exists), but we still need to emit the space since
             // we push text_trimmed below (which strips it).
             let has_leading_space = text.starts_with(' ');
+            let emit_space =
+                needs_space || (has_leading_space && !result.is_empty() && !result.ends_with(' '));
+
+            // A super/subscript run is wrapped in `<sup>`/`<sub>` (see
+            // `text_plain`). It neither opens nor closes the other styles: a
+            // footnote marker inside a bold name keeps the bold run intact
+            // ("**Yibo Yan<sup>1</sup>, Jiahao Huo**") instead of splitting
+            // it around the marker.
+            let is_script = item.is_script();
 
             // Check for style changes. Source decorations are exclusive:
             // `<u>`/`<s>` content stays free of `**`/`*` markers — consumers
@@ -213,10 +313,26 @@ impl TextLine {
             // and mixed nesting breaks that. A struck-and-underlined item is
             // emitted as struck text because deletion is the stronger semantic
             // distinction in redline documents.
-            let item_strikeout = format_decorations && item.is_strikeout;
-            let item_underline = format_decorations && item.is_underline && !item_strikeout;
-            let item_bold = format_bold && item.is_bold && !item_underline && !item_strikeout;
-            let item_italic = format_italic && item.is_italic && !item_underline && !item_strikeout;
+            let item_strikeout = if is_script {
+                current_strikeout
+            } else {
+                format_decorations && item.is_strikeout
+            };
+            let item_underline = if is_script {
+                current_underline
+            } else {
+                format_decorations && item.is_underline && !item_strikeout
+            };
+            let item_bold = if is_script {
+                current_bold
+            } else {
+                format_bold && item.is_bold && !item_underline && !item_strikeout
+            };
+            let item_italic = if is_script {
+                current_italic
+            } else {
+                format_italic && item.is_italic && !item_underline && !item_strikeout
+            };
 
             // Close previous styles if they change
             if current_italic && !item_italic {
@@ -237,7 +353,7 @@ impl TextLine {
             }
 
             // Add space: either from spacing logic or preserved from item text
-            if needs_space || (has_leading_space && !result.is_empty() && !result.ends_with(' ')) {
+            if emit_space {
                 result.push(' ');
             }
 
@@ -259,7 +375,7 @@ impl TextLine {
                 current_italic = true;
             }
 
-            result.push_str(text_trimmed);
+            push_item_text(&mut result, item, text_trimmed);
         }
 
         // Close any remaining open styles
@@ -279,22 +395,29 @@ impl TextLine {
         result
     }
 
-    /// Get plain text without formatting
+    /// Get plain text without formatting.
+    ///
+    /// A super/subscript run (an item with a non-zero `baseline_shift`;
+    /// extraction materializes each run as one item) is wrapped in
+    /// `<sup>…</sup>` / `<sub>…</sub>`: without the tags the marker digits
+    /// would be indistinguishable from the body text they follow
+    /// ("Yibo Yan1,2,3" vs "Yibo Yan<sup>1,2,3</sup>").
     fn text_plain(&self) -> String {
         let single_char_threshold = self.adaptive_threshold;
 
         let mut result = String::new();
         for (i, item) in self.items.iter().enumerate() {
-            let text = item.text.as_str();
-            if i == 0 {
-                result.push_str(text);
-            } else {
-                let prev_item = &self.items[i - 1];
-                if self.needs_space_between(prev_item, item, &result, single_char_threshold) {
-                    result.push(' ');
-                }
-                result.push_str(text);
+            if i > 0
+                && self.needs_space_between(
+                    &self.items[i - 1],
+                    item,
+                    &result,
+                    single_char_threshold,
+                )
+            {
+                result.push(' ');
             }
+            push_item_text(&mut result, item, item.text.as_str());
         }
         result
     }
@@ -314,6 +437,18 @@ impl TextLine {
         let curr_is_hyphen = text.trim() == "-";
         let curr_starts_with_hyphen = text.starts_with('-');
 
+        // Check if space already exists
+        let prev_ends_with_space = result.ends_with(' ');
+        let curr_starts_with_space = text.starts_with(' ');
+        let space_already_exists = prev_ends_with_space || curr_starts_with_space;
+
+        // Script runs flagged by extraction share one edge-spacing policy
+        // with table cells (see `script_edge_needs_space`). The blanket
+        // suppression below is for unflagged size changes only.
+        if let Some(needs_space) = script_edge_needs_space(prev_item, item, result, text) {
+            return needs_space;
+        }
+
         // Detect subscript/superscript: smaller font size and/or Y offset
         let font_ratio = item.font_size / prev_item.font_size;
         let reverse_font_ratio = prev_item.font_size / item.font_size;
@@ -324,11 +459,6 @@ impl TextLine {
 
         // Use position-based spacing detection
         let should_join = should_join_items(prev_item, item, single_char_threshold);
-
-        // Check if space already exists
-        let prev_ends_with_space = result.ends_with(' ');
-        let curr_starts_with_space = text.starts_with(' ');
-        let space_already_exists = prev_ends_with_space || curr_starts_with_space;
 
         // Add space unless one of these conditions applies
         !(prev_ends_with_hyphen
@@ -362,6 +492,7 @@ mod formatting_tests {
             is_strikeout: strikeout,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -372,6 +503,129 @@ mod formatting_tests {
             page: 1,
             adaptive_threshold: 0.1,
         }
+    }
+
+    /// A body-text item at 12pt on the shared baseline.
+    fn body(text: &str, x: f32, width: f32) -> TextItem {
+        item(text, x, width, false)
+    }
+
+    /// A script run at 8pt, `shift` points off the 12pt body baseline
+    /// (positive = raised), as `merge_subscript_items` materializes it: one
+    /// item per run.
+    fn script(text: &str, x: f32, width: f32, shift: f32) -> TextItem {
+        let mut it = item(text, x, width, false);
+        it.font_size = 8.0;
+        it.height = 8.0;
+        it.y += shift;
+        it.baseline_shift = shift;
+        it
+    }
+
+    #[test]
+    fn script_run_is_wrapped_in_one_sup_span() {
+        // Author block: "Yibo Yan" + the raised "1,2" run + body ", " +
+        // "Jiahao Huo". The marker run is one <sup> span attached to the
+        // name, and the body comma follows without a space.
+        let line = line(vec![
+            body("Yibo Yan", 10.0, 48.0),
+            script("1,2", 58.0, 10.0, 4.3),
+            body(",", 68.0, 3.0),
+            body("Jiahao Huo", 74.5, 60.0),
+        ]);
+        assert_eq!(line.text(), "Yibo Yan<sup>1,2</sup>, Jiahao Huo");
+        assert_eq!(
+            line.text_with_formatting(true, true, true),
+            "Yibo Yan<sup>1,2</sup>, Jiahao Huo"
+        );
+    }
+
+    #[test]
+    fn word_space_after_script_run_follows_geometry() {
+        let line = line(vec![
+            body("word", 10.0, 24.0),
+            script("2", 34.0, 4.0, 4.0),
+            body("next", 41.5, 24.0),
+        ]);
+        assert_eq!(line.text(), "word<sup>2</sup> next");
+
+        // Tight junction after the marker: no space ("x<sup>2</sup>y").
+        let line = super::TextLine {
+            items: vec![
+                body("x", 10.0, 6.0),
+                script("2", 16.2, 4.0, 4.0),
+                body("y", 20.4, 6.0),
+            ],
+            y: 100.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(line.text(), "x<sup>2</sup>y");
+    }
+
+    #[test]
+    fn leading_script_run_attaches_to_following_word() {
+        // Affiliation line: markers lead their institution, and a word space
+        // before the run (after the previous institution's comma) survives.
+        let line = line(vec![
+            body("University,", 10.0, 60.0),
+            script("1,2", 73.4, 10.2, 3.5),
+            body("Hong Kong", 83.6, 54.0),
+        ]);
+        assert_eq!(line.text(), "University, <sup>1,2</sup>Hong Kong");
+    }
+
+    #[test]
+    fn lowered_run_uses_sub_tag() {
+        let line = line(vec![body("x", 10.0, 6.0), script("max", 16.0, 12.0, -2.4)]);
+        assert_eq!(line.text(), "x<sub>max</sub>");
+    }
+
+    #[test]
+    fn script_span_does_not_split_a_bold_run() {
+        let mut name = body("Yibo Yan", 10.0, 48.0);
+        name.is_bold = true;
+        let mut rest = body(", Jiahao Huo", 62.0, 66.0);
+        rest.is_bold = true;
+        let line = line(vec![name, script("1", 58.0, 4.0, 4.3), rest]);
+        assert_eq!(
+            line.text_with_formatting(true, false, false),
+            "**Yibo Yan<sup>1</sup>, Jiahao Huo**"
+        );
+        assert_eq!(line.text(), "Yibo Yan<sup>1</sup>, Jiahao Huo");
+    }
+
+    #[test]
+    fn separated_script_items_get_separate_spans() {
+        // Two runs with a real gap between them (nothing else on the line)
+        // are two spans with a space, never "<sup>1 2</sup>".
+        let line = line(vec![
+            script("1", 10.0, 4.0, 4.0),
+            script("2", 40.0, 4.0, 4.0),
+        ]);
+        assert_eq!(line.text(), "<sup>1</sup> <sup>2</sup>");
+    }
+
+    #[test]
+    fn touching_runs_of_different_size_are_separate_spans_without_space() {
+        // Nested script: "n" (6pt) attached to the superscript "2" (8pt).
+        let mut nested = script("n", 20.2, 3.0, 6.0);
+        nested.font_size = 6.0;
+        let line = line(vec![
+            body("x", 10.0, 6.0),
+            script("2", 16.2, 4.0, 4.0),
+            nested,
+        ]);
+        assert_eq!(line.text(), "x<sup>2</sup><sup>n</sup>");
+    }
+
+    #[test]
+    fn line_y_snaps_scripts_to_the_anchor_baseline() {
+        let raised = script("1", 58.0, 4.0, 4.3);
+        assert!((raised.y - 104.3).abs() < 1e-4);
+        assert!((raised.line_y() - 100.0).abs() < 1e-4);
+        assert!(raised.is_script());
+        assert!(!body("Yibo Yan", 10.0, 48.0).is_script());
     }
 
     #[test]
