@@ -322,6 +322,98 @@ class TestExtractStructureElements:
 
 
 # ---------------------------------------------------------------------------
+# extract_layout_blocks / extract_layout_blocks_bytes
+# ---------------------------------------------------------------------------
+
+
+ALLOWED_BLOCK_TYPES = {
+    "title",
+    "section_header",
+    "text",
+    "list_item",
+    "caption",
+    "code",
+    "table",
+    "picture",
+}
+
+
+class TestExtractLayoutBlocks:
+    def test_file(self):
+        result = pdf_inspector.extract_layout_blocks(
+            fixture_path("thermo-freon12.pdf")
+        )
+        assert result.pdf_type == "text_based"
+        assert result.page_count == 3
+        assert len(result.markdown) > 0
+        assert len(result.blocks) > 0
+        assert all(b.block_type in ALLOWED_BLOCK_TYPES for b in result.blocks)
+
+    def test_spans_ground_the_markdown(self):
+        result = pdf_inspector.extract_layout_blocks(
+            fixture_path("thermo-freon12.pdf")
+        )
+        md = result.markdown.encode("utf-8")
+        prev_end = 0
+        for block in result.blocks:
+            start, end = block.markdown_span
+            assert 0 <= start < end <= len(md)
+            assert start >= prev_end  # non-overlapping, ascending
+            assert md[start:end].decode("utf-8").strip()
+            prev_end = end
+
+    def test_bbox_normalized(self):
+        result = pdf_inspector.extract_layout_blocks(
+            fixture_path("thermo-freon12.pdf")
+        )
+        assert any(b.bbox is not None for b in result.blocks)
+        for block in result.blocks:
+            assert 1 <= block.page <= result.page_count
+            if block.bbox is None:
+                continue
+            x0, y0, x1, y1 = block.bbox
+            assert 0.0 <= x0 <= x1 <= 1.0
+            assert 0.0 <= y0 <= y1 <= 1.0
+
+    def test_provenance(self):
+        result = pdf_inspector.extract_layout_blocks(
+            fixture_path("thermo-freon12.pdf")
+        )
+        assert all(b.source == "native_text" for b in result.blocks)
+        assert all(b.layout_confidence is None for b in result.blocks)
+        assert all(b.ocr_confidence is None for b in result.blocks)
+        headers = [b for b in result.blocks if b.block_type == "section_header"]
+        assert all(
+            b.label is not None and b.label.startswith("H") for b in headers
+        )
+
+    def test_table_blocks_detected(self):
+        result = pdf_inspector.extract_layout_blocks(
+            fixture_path("thermo-freon12.pdf")
+        )
+        tables = [b for b in result.blocks if b.block_type == "table"]
+        assert len(tables) > 0
+        start, end = tables[0].markdown_span
+        assert "|" in result.markdown.encode("utf-8")[start:end].decode("utf-8")
+
+    def test_bytes(self):
+        data = fixture_bytes("thermo-freon12.pdf")
+        result = pdf_inspector.extract_layout_blocks_bytes(data)
+        assert len(result.blocks) > 0
+
+    def test_repr(self):
+        result = pdf_inspector.extract_layout_blocks(
+            fixture_path("thermo-freon12.pdf")
+        )
+        assert "LayoutBlocksResult" in repr(result)
+        assert "LayoutBlock" in repr(result.blocks[0])
+
+    def test_not_a_pdf(self):
+        with pytest.raises(ValueError):
+            pdf_inspector.extract_layout_blocks_bytes(b"not a pdf")
+
+
+# ---------------------------------------------------------------------------
 # extract_text_in_regions / extract_text_in_regions_bytes
 # ---------------------------------------------------------------------------
 

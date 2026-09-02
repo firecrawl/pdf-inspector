@@ -411,6 +411,79 @@ pub struct PyStructureElement {
     pub role: String,
 }
 
+/// One typed layout block from the Full-mode Markdown pipeline.
+#[pyclass(name = "LayoutBlock")]
+#[derive(Clone)]
+pub struct PyLayoutBlock {
+    /// Hosted block type: "title", "section_header", "text", "list_item",
+    /// "caption", "code", "table", or "picture".
+    #[pyo3(get)]
+    pub block_type: String,
+    /// Heading level label ("H2".."H6") for section_header blocks, None
+    /// otherwise.
+    #[pyo3(get)]
+    pub label: Option<String>,
+    /// 1-indexed page number the block was emitted from.
+    #[pyo3(get)]
+    pub page: u32,
+    /// Normalized (x0, y0, x1, y1) in 0-1 page space with a top-left
+    /// origin, or None when no positioned geometry is available.
+    #[pyo3(get)]
+    pub bbox: Option<(f32, f32, f32, f32)>,
+    /// [start, end) byte offsets into the result's markdown.
+    #[pyo3(get)]
+    pub markdown_span: (usize, usize),
+    /// Provenance of the block's text; always "native_text".
+    #[pyo3(get)]
+    pub source: String,
+    /// Layout-model confidence; always None (no layout model runs).
+    #[pyo3(get)]
+    pub layout_confidence: Option<f32>,
+    /// OCR confidence; always None (the text is native, not OCR output).
+    #[pyo3(get)]
+    pub ocr_confidence: Option<f32>,
+}
+
+#[pymethods]
+impl PyLayoutBlock {
+    fn __repr__(&self) -> String {
+        format!(
+            "LayoutBlock(type='{}', page={}, span={:?})",
+            self.block_type, self.page, self.markdown_span
+        )
+    }
+}
+
+/// Markdown plus typed layout blocks whose spans index into it.
+#[pyclass(name = "LayoutBlocksResult")]
+pub struct PyLayoutBlocksResult {
+    /// Markdown assembled from the recorded fragments; block spans are
+    /// byte offsets into this string.
+    #[pyo3(get)]
+    pub markdown: String,
+    /// Typed blocks in reading order with non-overlapping ascending spans.
+    #[pyo3(get)]
+    pub blocks: Vec<PyLayoutBlock>,
+    /// 'text_based', 'scanned', 'image_based', or 'mixed'.
+    #[pyo3(get)]
+    pub pdf_type: String,
+    /// Total page count.
+    #[pyo3(get)]
+    pub page_count: u32,
+}
+
+#[pymethods]
+impl PyLayoutBlocksResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "LayoutBlocksResult(pdf_type='{}', pages={}, blocks={})",
+            self.pdf_type,
+            self.page_count,
+            self.blocks.len()
+        )
+    }
+}
+
 #[pymethods]
 impl PyStructureElement {
     fn __repr__(&self) -> String {
@@ -601,6 +674,28 @@ fn convert_structure_elements(elements: Vec<crate::StructureElement>) -> Vec<PyS
             role: e.role,
         })
         .collect()
+}
+
+fn to_py_layout_blocks_result(result: crate::LayoutBlocksResult) -> PyLayoutBlocksResult {
+    PyLayoutBlocksResult {
+        markdown: result.markdown,
+        blocks: result
+            .blocks
+            .into_iter()
+            .map(|block| PyLayoutBlock {
+                block_type: block.block_type.as_str().to_string(),
+                label: block.label,
+                page: block.page,
+                bbox: block.bbox.map(|[x0, y0, x1, y1]| (x0, y0, x1, y1)),
+                markdown_span: block.markdown_span,
+                source: block.source,
+                layout_confidence: block.layout_confidence,
+                ocr_confidence: block.ocr_confidence,
+            })
+            .collect(),
+        pdf_type: pdf_type_str(result.pdf_type),
+        page_count: result.page_count,
+    }
 }
 
 fn parse_page_regions(
@@ -991,6 +1086,37 @@ fn extract_structure_elements_bytes(
     Ok(convert_structure_elements(elements))
 }
 
+/// Extract Markdown plus typed layout blocks from a PDF file.
+///
+/// Runs the same Full-mode extract+convert pipeline as [`process_pdf`]
+/// (no layout model) and records each emitted fragment as a typed block
+/// with a normalized 0-1 page-space bbox (top-left origin) and an exact
+/// [start, end) byte span into the returned markdown — enough to ground
+/// citations both in the text and on the page.
+///
+/// For scanned/image-based PDFs the result carries the classification with
+/// empty markdown and no blocks.
+///
+/// Args:
+///     path: Path to the PDF file.
+///
+/// Returns:
+///     LayoutBlocksResult with markdown, blocks, pdf_type, and page_count.
+#[pyfunction]
+fn extract_layout_blocks(path: &str) -> PyResult<PyLayoutBlocksResult> {
+    let result = crate::extract_layout_blocks(path).map_err(to_py_err)?;
+    Ok(to_py_layout_blocks_result(result))
+}
+
+/// Extract Markdown plus typed layout blocks from PDF bytes.
+///
+/// See [`extract_layout_blocks`] for details.
+#[pyfunction]
+fn extract_layout_blocks_bytes(data: &[u8]) -> PyResult<PyLayoutBlocksResult> {
+    let result = crate::extract_layout_blocks_mem(data).map_err(to_py_err)?;
+    Ok(to_py_layout_blocks_result(result))
+}
+
 /// Python module definition.
 #[pymodule]
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1004,6 +1130,8 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfClassification>()?;
     m.add_class::<PyTextItem>()?;
     m.add_class::<PyStructureElement>()?;
+    m.add_class::<PyLayoutBlock>()?;
+    m.add_class::<PyLayoutBlocksResult>()?;
     m.add_class::<PyRegionText>()?;
     m.add_class::<PyPageRegionTexts>()?;
     m.add_class::<PyPageMarkdown>()?;
@@ -1022,6 +1150,8 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_with_positions_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_structure_elements, m)?)?;
     m.add_function(wrap_pyfunction!(extract_structure_elements_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_layout_blocks, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_layout_blocks_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_pages_markdown, m)?)?;

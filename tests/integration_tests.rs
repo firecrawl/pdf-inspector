@@ -1532,6 +1532,267 @@ fn test_extract_structure_elements_untagged_pdf_empty() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// extract_layout_blocks / extract_layout_blocks_mem
+// ---------------------------------------------------------------------------
+
+/// Spans must be ascending, non-overlapping, in-bounds byte ranges whose
+/// slices carry non-whitespace content.
+fn assert_layout_block_spans_valid(result: &pdf_inspector::LayoutBlocksResult) {
+    let markdown = result.markdown.as_bytes();
+    let mut prev_end = 0usize;
+    for block in &result.blocks {
+        let (start, end) = block.markdown_span;
+        assert!(
+            start >= prev_end && start < end && end <= markdown.len(),
+            "invalid span {:?} after {} in {} bytes of markdown",
+            block.markdown_span,
+            prev_end,
+            markdown.len()
+        );
+        let slice = std::str::from_utf8(&markdown[start..end]).expect("span on char boundary");
+        assert!(
+            !slice.trim().is_empty(),
+            "span {:?} slices to whitespace",
+            block.markdown_span
+        );
+        prev_end = end;
+    }
+}
+
+/// Simple document built with lopdf: a large title, two body lines, and
+/// two bullet list items.
+fn synthetic_layout_blocks_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    let text = |ops: &mut Vec<Operation>, x: i64, y: i64, size: i64, s: &str| {
+        ops.push(Operation::new("BT", vec![]));
+        ops.push(Operation::new("Tf", vec!["F1".into(), size.into()]));
+        ops.push(Operation::new("Td", vec![x.into(), y.into()]));
+        ops.push(Operation::new("Tj", vec![Object::string_literal(s)]));
+        ops.push(Operation::new("ET", vec![]));
+    };
+
+    let mut operations = Vec::new();
+    text(&mut operations, 72, 720, 24, "Annual Report");
+    text(
+        &mut operations,
+        72,
+        676,
+        11,
+        "This is the opening paragraph of the report body text.",
+    );
+    text(
+        &mut operations,
+        72,
+        662,
+        11,
+        "It continues on a second wrapped line for the same paragraph.",
+    );
+    text(&mut operations, 72, 620, 11, "- First finding of the year");
+    text(&mut operations, 72, 606, 11, "- Second finding of the year");
+
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_extract_layout_blocks_synthetic_pdf() {
+    use pdf_inspector::LayoutBlockType;
+
+    let buf = synthetic_layout_blocks_pdf();
+    let result = pdf_inspector::extract_layout_blocks_mem(&buf).unwrap();
+
+    assert_eq!(result.page_count, 1);
+    assert!(!result.markdown.is_empty());
+    assert_layout_block_spans_valid(&result);
+
+    let title = result
+        .blocks
+        .iter()
+        .find(|b| b.block_type == LayoutBlockType::Title)
+        .expect("title block");
+    let (start, end) = title.markdown_span;
+    assert_eq!(&result.markdown[start..end], "# Annual Report");
+    assert_eq!(title.block_type.as_str(), "title");
+
+    let list_items: Vec<_> = result
+        .blocks
+        .iter()
+        .filter(|b| b.block_type == LayoutBlockType::ListItem)
+        .collect();
+    assert_eq!(list_items.len(), 2, "blocks: {:?}", result.blocks);
+    let (start, end) = list_items[0].markdown_span;
+    assert_eq!(&result.markdown[start..end], "- First finding of the year");
+
+    let paragraph = result
+        .blocks
+        .iter()
+        .find(|b| b.block_type == LayoutBlockType::Text)
+        .expect("text block");
+    let (start, end) = paragraph.markdown_span;
+    assert!(
+        result.markdown[start..end].contains("second wrapped line"),
+        "wrapped lines should merge into one text block: {:?}",
+        &result.markdown[start..end]
+    );
+
+    for block in &result.blocks {
+        assert_eq!(block.page, 1);
+        assert_eq!(block.source, "native_text");
+        assert!(block.layout_confidence.is_none());
+        assert!(block.ocr_confidence.is_none());
+        let [x0, y0, x1, y1] = block.bbox.expect("synthetic text has geometry");
+        assert!(
+            (0.0..=1.0).contains(&x0)
+                && (0.0..=1.0).contains(&y1)
+                && x0 <= x1
+                && y0 <= y1
+                && x1 <= 1.0,
+            "bbox must be normalized 0-1: {:?}",
+            block.bbox
+        );
+    }
+
+    // Top-left origin: the 24pt title at the top of the page must have a
+    // smaller normalized y than the list items near the middle.
+    let list_bbox = list_items[0].bbox.unwrap();
+    assert!(
+        title.bbox.unwrap()[1] < list_bbox[1],
+        "title should sit above the list in top-left page space"
+    );
+}
+
+#[test]
+fn test_extract_layout_blocks_fixture_grounds_native_text() {
+    use pdf_inspector::LayoutBlockType;
+
+    let result = pdf_inspector::extract_layout_blocks("tests/fixtures/thermo-freon12.pdf").unwrap();
+    assert_eq!(result.pdf_type, pdf_inspector::PdfType::TextBased);
+    assert_eq!(result.page_count, 3);
+    assert!(!result.blocks.is_empty());
+    assert_layout_block_spans_valid(&result);
+
+    // The blocks must cover essentially all of the emitted markdown —
+    // only inter-block separators are outside spans.
+    let covered: usize = result
+        .blocks
+        .iter()
+        .map(|b| b.markdown_span.1 - b.markdown_span.0)
+        .sum();
+    assert!(
+        covered * 10 >= result.markdown.len() * 9,
+        "blocks should cover >=90% of the markdown ({} of {})",
+        covered,
+        result.markdown.len()
+    );
+
+    // This fixture has ruled tables; they must surface as table blocks
+    // whose spans slice to pipe tables.
+    let table = result
+        .blocks
+        .iter()
+        .find(|b| b.block_type == LayoutBlockType::Table)
+        .expect("table block");
+    let (start, end) = table.markdown_span;
+    assert!(result.markdown[start..end].contains('|'));
+
+    // Section headers carry their heading level as a label.
+    let header = result
+        .blocks
+        .iter()
+        .find(|b| b.block_type == LayoutBlockType::SectionHeader)
+        .expect("section_header block");
+    assert!(header
+        .label
+        .as_deref()
+        .is_some_and(|label| label.starts_with('H')));
+
+    for block in &result.blocks {
+        assert!((1..=3).contains(&block.page));
+        if let Some([x0, y0, x1, y1]) = block.bbox {
+            assert!((0.0..=1.0).contains(&x0) && x0 <= x1 && x1 <= 1.0);
+            assert!((0.0..=1.0).contains(&y0) && y0 <= y1 && y1 <= 1.0);
+        }
+    }
+}
+
+#[test]
+fn test_extract_layout_blocks_markdown_matches_default_output() {
+    // Per-fragment postprocess can in principle diverge from the
+    // document-level pass at fragment boundaries, but on this snapshot
+    // fixture the two must agree byte-for-byte — a strong regression
+    // signal that recording never changes what the convert loop emits.
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let default = pdf_inspector::process_pdf_mem(&buf)
+        .unwrap()
+        .markdown
+        .unwrap();
+    let blocks = pdf_inspector::extract_layout_blocks_mem(&buf).unwrap();
+    assert_eq!(default, blocks.markdown);
+}
+
+#[test]
+fn test_extract_layout_blocks_image_based_pdf_is_empty() {
+    let buf = std::fs::read("tests/fixtures/scan_with_native_header_text.pdf").unwrap();
+    let result = pdf_inspector::extract_layout_blocks_mem(&buf).unwrap();
+    assert_eq!(result.pdf_type, pdf_inspector::PdfType::ImageBased);
+    assert!(result.markdown.is_empty());
+    assert!(result.blocks.is_empty());
+}
+
 #[test]
 fn test_identity_h_no_tounicode_suppresses_garbage() {
     // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no

@@ -11,6 +11,7 @@ use super::analysis::{
     detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment, is_toc_entry_line,
     is_toc_marker_heading,
 };
+use super::blocks::{line_bbox, BlockRecorder, RawBlockKind};
 use super::classify::{format_list_item, is_caption_line, is_list_item, starts_with_bullet_marker};
 use super::heading::classify_heading_sequences;
 use super::postprocess::clean_markdown;
@@ -44,6 +45,9 @@ pub(super) struct PositionedMarkdown {
     x: f32,
     markdown: String,
     chart_order: Option<ChartProseOrder>,
+    /// Union bbox `(x0, y0, x1, y1)` of the block's source items in PDF
+    /// points (y-up). Only consumed by layout-block recording.
+    bbox: Option<(f32, f32, f32, f32)>,
 }
 
 impl PositionedMarkdown {
@@ -58,7 +62,13 @@ impl PositionedMarkdown {
             x,
             markdown,
             chart_order,
+            bbox: None,
         }
+    }
+
+    pub(super) fn with_bbox(mut self, bbox: Option<(f32, f32, f32, f32)>) -> Self {
+        self.bbox = bbox;
+        self
     }
 }
 
@@ -637,7 +647,15 @@ fn count_table_columns(table_md: &str) -> usize {
     0
 }
 
+fn positioned_block_kind(kind: PositionedBlockKind) -> RawBlockKind {
+    match kind {
+        PositionedBlockKind::Table => RawBlockKind::Table,
+        PositionedBlockKind::Image => RawBlockKind::Picture,
+    }
+}
+
 /// Flush any remaining tables and images for a given page
+#[allow(clippy::too_many_arguments)]
 fn flush_page_tables_and_images(
     page: u32,
     page_blocks: &HashMap<u32, Vec<PositionedBlockRef<'_>>>,
@@ -645,6 +663,7 @@ fn flush_page_tables_and_images(
     inserted_images: &mut HashSet<(u32, usize)>,
     output: &mut String,
     in_paragraph: &mut bool,
+    recorder: &mut Option<&mut BlockRecorder>,
 ) {
     let Some(blocks) = page_blocks.get(&page) else {
         return;
@@ -662,7 +681,19 @@ fn flush_page_tables_and_images(
             *in_paragraph = false;
         }
         output.push('\n');
+        let frag_start = output.len();
         output.push_str(&block.markdown);
+        if let Some(r) = recorder.as_deref_mut() {
+            r.push_fragment(
+                positioned_block_kind(kind),
+                page,
+                frag_start,
+                output.len(),
+                block.bbox,
+                false,
+                false,
+            );
+        }
         output.push('\n');
         match kind {
             PositionedBlockKind::Table => {
@@ -676,6 +707,7 @@ fn flush_page_tables_and_images(
 }
 
 /// Convert text lines to markdown, inserting tables and images at appropriate Y positions
+#[cfg(test)]
 pub(super) fn to_markdown_from_lines_with_tables_and_images(
     lines: Vec<TextLine>,
     options: MarkdownOptions,
@@ -686,6 +718,38 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     struct_roles: Option<
         &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
     >,
+) -> String {
+    to_markdown_from_lines_with_tables_and_images_recorded(
+        lines,
+        options,
+        page_tables,
+        page_images,
+        page_chart_regions,
+        band_split_pages,
+        struct_roles,
+        None,
+    )
+}
+
+/// [`to_markdown_from_lines_with_tables_and_images`] with optional layout
+/// block recording. With `recorder: None` the behavior — including the
+/// returned Markdown bytes — is identical to the plain function. With a
+/// recorder, every emitted fragment is additionally recorded and the
+/// recorder is finished against the raw output before postprocessing, so
+/// the caller can take a [`super::blocks::LayoutBlocksOutput`] whose spans
+/// are exact.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn to_markdown_from_lines_with_tables_and_images_recorded(
+    lines: Vec<TextLine>,
+    options: MarkdownOptions,
+    page_tables: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
+    page_images: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
+    page_chart_regions: &std::collections::HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    band_split_pages: &HashSet<u32>,
+    struct_roles: Option<
+        &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
+    >,
+    mut recorder: Option<&mut BlockRecorder>,
 ) -> String {
     if lines.is_empty() && page_tables.is_empty() && page_images.is_empty() {
         return String::new();
@@ -772,25 +836,50 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut last_list_x: Option<f32> = None;
     // Code lines accumulate here and the fence is emitted only when the
     // block flushes with content — an empty ``` ``` pair can never appear.
-    fn flush_code_block(output: &mut String, pending_code: &mut String) {
+    fn flush_code_block(
+        output: &mut String,
+        pending_code: &mut String,
+        recorder: &mut Option<&mut BlockRecorder>,
+        page: u32,
+        bbox: &mut Option<(f32, f32, f32, f32)>,
+    ) {
         let trimmed = pending_code.trim();
+        let frag_start = output.len();
         // A fragment too short to be code — a lone ® or stray glyph set in
         // a mono face — reads better as plain text than as a fenced block.
-        if trimmed.chars().count() < 3 {
+        let kind = if trimmed.chars().count() < 3 {
             if !trimmed.is_empty() {
                 output.push_str(trimmed);
                 output.push_str("\n\n");
             }
+            RawBlockKind::Text
         } else {
             output.push_str("```\n");
             output.push_str(pending_code);
             output.push_str("```\n");
+            RawBlockKind::Code
+        };
+        if output.len() > frag_start {
+            if let Some(r) = recorder.as_deref_mut() {
+                r.push_fragment(
+                    kind,
+                    page,
+                    frag_start,
+                    output.len(),
+                    bbox.take(),
+                    false,
+                    false,
+                );
+            }
         }
+        *bbox = None;
         pending_code.clear();
     }
 
     let mut in_code_block = false;
     let mut pending_code = String::new();
+    let mut pending_code_page = 0u32;
+    let mut pending_code_bbox: Option<(f32, f32, f32, f32)> = None;
     let mut prev_had_dot_leaders = false;
     let mut paragraph_in_wrapped_bold_run = false;
     let mut toc_suppress_page: Option<u32> = None;
@@ -824,7 +913,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             // Flush current page's remaining tables and images
             if current_page > 0 {
                 if in_code_block {
-                    flush_code_block(&mut output, &mut pending_code);
+                    flush_code_block(
+                        &mut output,
+                        &mut pending_code,
+                        &mut recorder,
+                        pending_code_page,
+                        &mut pending_code_bbox,
+                    );
                     in_code_block = false;
                 }
                 flush_page_tables_and_images(
@@ -834,6 +929,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     &mut inserted_images,
                     &mut output,
                     &mut in_paragraph,
+                    &mut recorder,
                 );
                 if in_paragraph {
                     output.push_str("\n\n");
@@ -858,6 +954,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     &mut inserted_images,
                     &mut output,
                     &mut in_paragraph,
+                    &mut recorder,
                 );
                 if in_paragraph {
                     output.push_str("\n\n");
@@ -891,7 +988,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     // precedes it in reading order. A code line after the
                     // block reopens a new fence naturally.
                     if in_code_block {
-                        flush_code_block(&mut output, &mut pending_code);
+                        flush_code_block(
+                            &mut output,
+                            &mut pending_code,
+                            &mut recorder,
+                            pending_code_page,
+                            &mut pending_code_bbox,
+                        );
                         in_code_block = false;
                     }
                     if in_paragraph {
@@ -900,7 +1003,19 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                         paragraph_in_wrapped_bold_run = false;
                     }
                     output.push('\n');
+                    let frag_start = output.len();
                     output.push_str(&block.markdown);
+                    if let Some(r) = recorder.as_deref_mut() {
+                        r.push_fragment(
+                            positioned_block_kind(kind),
+                            current_page,
+                            frag_start,
+                            output.len(),
+                            block.bbox,
+                            false,
+                            false,
+                        );
+                    }
                     output.push('\n');
                     match kind {
                         PositionedBlockKind::Table => {
@@ -979,7 +1094,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
         // Close code block when transitioning to non-code
         if in_code_block && !is_code_line {
-            flush_code_block(&mut output, &mut pending_code);
+            flush_code_block(
+                &mut output,
+                &mut pending_code,
+                &mut recorder,
+                pending_code_page,
+                &mut pending_code_bbox,
+            );
             in_code_block = false;
         }
 
@@ -993,7 +1114,19 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
+            let frag_start = output.len();
             output.push_str(trimmed);
+            if let Some(r) = recorder.as_deref_mut() {
+                r.push_fragment(
+                    RawBlockKind::Caption,
+                    line.page,
+                    frag_start,
+                    output.len(),
+                    line_bbox(line),
+                    false,
+                    false,
+                );
+            }
             output.push_str("\n\n");
             continue;
         }
@@ -1117,7 +1250,19 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             } else {
                 plain_text.clone()
             };
+            let frag_start = output.len();
             output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
+            if let Some(r) = recorder.as_deref_mut() {
+                r.push_fragment(
+                    RawBlockKind::Heading(level),
+                    line.page,
+                    frag_start,
+                    output.len(),
+                    line_bbox(line),
+                    false,
+                    false,
+                );
+            }
             if is_toc_marker_heading(plain_trimmed) {
                 toc_suppress_page = Some(line.page);
             }
@@ -1141,8 +1286,20 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
+            let frag_start = output.len();
             output.push_str(&format!("- {}", trimmed));
             output.push('\n');
+            if let Some(r) = recorder.as_deref_mut() {
+                r.push_fragment(
+                    RawBlockKind::ListItem,
+                    line.page,
+                    frag_start,
+                    output.len(),
+                    line_bbox(line),
+                    false,
+                    true,
+                );
+            }
             in_list = true;
             last_list_x = line.items.first().map(|i| i.x);
             continue;
@@ -1156,8 +1313,20 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 paragraph_in_wrapped_bold_run = false;
             }
             let formatted = format_list_item(trimmed);
+            let frag_start = output.len();
             output.push_str(&formatted);
             output.push('\n');
+            if let Some(r) = recorder.as_deref_mut() {
+                r.push_fragment(
+                    RawBlockKind::ListItem,
+                    line.page,
+                    frag_start,
+                    output.len(),
+                    line_bbox(line),
+                    false,
+                    true,
+                );
+            }
             in_list = true;
             last_list_x = line.items.first().map(|i| i.x);
             continue;
@@ -1183,8 +1352,20 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     output.pop();
                     output.push(' ');
                 }
+                let frag_start = output.len();
                 output.push_str(trimmed);
                 output.push('\n');
+                if let Some(r) = recorder.as_deref_mut() {
+                    r.push_fragment(
+                        RawBlockKind::ListItem,
+                        line.page,
+                        frag_start,
+                        output.len(),
+                        line_bbox(line),
+                        true,
+                        true,
+                    );
+                }
                 continue;
             } else {
                 in_list = false;
@@ -1202,7 +1383,19 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
+            let frag_start = output.len();
             output.push_str(&format!("> {}\n", trimmed));
+            if let Some(r) = recorder.as_deref_mut() {
+                r.push_fragment(
+                    RawBlockKind::Text,
+                    line.page,
+                    frag_start,
+                    output.len(),
+                    line_bbox(line),
+                    false,
+                    false,
+                );
+            }
             continue;
         }
 
@@ -1213,6 +1406,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
+            if !in_code_block {
+                pending_code_page = line.page;
+            }
+            pending_code_bbox = super::blocks::union_line_bbox(pending_code_bbox, line);
             in_code_block = true;
             pending_code.push_str(plain_trimmed);
             pending_code.push('\n');
@@ -1221,6 +1418,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
         // Regular text - join lines within same paragraph with space
         let cur_dot_leaders = has_dot_leaders(plain_trimmed);
+        let was_in_paragraph = in_paragraph;
+        let frag_start = output.len();
         if in_paragraph {
             if cur_dot_leaders || prev_had_dot_leaders {
                 output.push('\n');
@@ -1229,6 +1428,17 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             }
         }
         output.push_str(trimmed);
+        if let Some(r) = recorder.as_deref_mut() {
+            r.push_fragment(
+                RawBlockKind::Text,
+                line.page,
+                frag_start,
+                output.len(),
+                line_bbox(line),
+                was_in_paragraph,
+                true,
+            );
+        }
         paragraph_in_wrapped_bold_run = if in_paragraph {
             paragraph_in_wrapped_bold_run || line_in_wrapped_bold_run
         } else {
@@ -1240,7 +1450,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
     // Close any trailing code block
     if in_code_block {
-        flush_code_block(&mut output, &mut pending_code);
+        flush_code_block(
+            &mut output,
+            &mut pending_code,
+            &mut recorder,
+            pending_code_page,
+            &mut pending_code_bbox,
+        );
     }
 
     // Flush current page and any remaining pages with tables/images
@@ -1252,6 +1468,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         &mut inserted_images,
         &mut output,
         &mut in_paragraph,
+        &mut recorder,
     );
     for &p in &all_content_pages {
         if p <= current_page {
@@ -1264,12 +1481,20 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             &mut inserted_images,
             &mut output,
             &mut in_paragraph,
+            &mut recorder,
         );
     }
 
     // Close final paragraph
     if in_paragraph {
         output.push('\n');
+    }
+
+    // Blocks are finished against the raw output; per-fragment cleaning in
+    // `BlockRecorder::finish` keeps their spans exact while the default
+    // return value below goes through the usual document-level postprocess.
+    if let Some(r) = recorder {
+        r.finish(&output, &options);
     }
 
     // Clean up and post-process

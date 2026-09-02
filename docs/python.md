@@ -113,6 +113,16 @@ headings = [
     for item in pdf_inspector.extract_text_with_positions("tagged.pdf")
     if item.mcid is not None and roles.get((item.page, item.mcid), "").startswith("H")
 ]
+
+# Markdown plus typed layout blocks for citation grounding. Same Full-mode
+# pipeline as process_pdf (no layout model); each block carries a normalized
+# 0-1 page-space bbox (top-left origin) and an exact [start, end) byte span
+# into the returned markdown:
+result = pdf_inspector.extract_layout_blocks("document.pdf")
+md = result.markdown.encode("utf-8")
+for block in result.blocks:
+    start, end = block.markdown_span
+    print(block.block_type, block.page, md[start:end].decode("utf-8"))
 ```
 
 ## API reference
@@ -137,6 +147,8 @@ headings = [
 | `extract_pages_markdown_bytes(data, pages=None)` | Per-page Markdown from bytes |
 | `extract_structure_elements(path, pages=None)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_bytes(data, pages=None)` | Structure-tree elements from bytes |
+| `extract_layout_blocks(path)` | Markdown + typed layout blocks with bbox and markdown spans |
+| `extract_layout_blocks_bytes(data)` | Layout blocks from bytes |
 
 ## Types
 
@@ -226,6 +238,23 @@ class StructureElement:              # extract_structure_elements
     page: int                        # 1-indexed (matches TextItem.page)
     mcid: int
     role: str                        # "H1".."H6", "P", "Table", ... (resolved via /RoleMap)
+
+class LayoutBlocksResult:            # extract_layout_blocks
+    markdown: str                    # block spans are byte offsets into this string
+    blocks: list[LayoutBlock]        # reading order, non-overlapping ascending spans
+    pdf_type: str
+    page_count: int
+
+class LayoutBlock:
+    block_type: str                  # "title" | "section_header" | "text" | "list_item"
+                                     #   | "caption" | "code" | "table" | "picture"
+    label: str | None                # "H2".."H6" for section_header blocks
+    page: int                        # 1-indexed
+    bbox: tuple[float, float, float, float] | None  # normalized 0-1, top-left origin
+    markdown_span: tuple[int, int]   # [start, end) byte offsets into markdown
+    source: str                      # always "native_text"
+    layout_confidence: float | None  # always None (no layout model runs)
+    ocr_confidence: float | None     # always None (native text, not OCR)
 
 class RegionText:                    # extract_text_in_regions
     text: str

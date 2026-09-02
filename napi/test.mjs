@@ -10,6 +10,7 @@ import {
   extractText,
   extractTextWithPositions,
   extractStructureElements,
+  extractLayoutBlocks,
   extractTextInRegions,
   detectVectorGridInRegion,
   extractPagesMarkdown,
@@ -124,6 +125,51 @@ assert.ok(page1Elements.every(e => e.page === 1));
 // untagged PDFs yield an empty array
 assert.deepEqual(extractStructureElements(fixture), []);
 console.log('  extractStructureElements: OK');
+
+// --- extractLayoutBlocks ---
+console.log('Testing extractLayoutBlocks...');
+const layoutBlocks = extractLayoutBlocks(fixture);
+assert.equal(layoutBlocks.pdfType, 'TextBased');
+assert.equal(layoutBlocks.pageCount, 3);
+assert.ok(layoutBlocks.markdown.length > 0);
+assert.ok(layoutBlocks.blocks.length > 0);
+const allowedBlockTypes = new Set([
+  'title',
+  'section_header',
+  'text',
+  'list_item',
+  'caption',
+  'code',
+  'table',
+  'picture',
+]);
+assert.ok(layoutBlocks.blocks.every(b => allowedBlockTypes.has(b.blockType)));
+assert.ok(layoutBlocks.blocks.every(b => b.source === 'native_text'));
+assert.ok(layoutBlocks.blocks.every(b => b.layoutConfidence === undefined));
+assert.ok(layoutBlocks.blocks.every(b => b.ocrConfidence === undefined));
+
+// Spans are byte offsets into the payload's own markdown: ascending,
+// non-overlapping, and each slice is non-empty content.
+const markdownBytes = Buffer.from(layoutBlocks.markdown, 'utf8');
+let prevSpanEnd = 0;
+for (const block of layoutBlocks.blocks) {
+  const [start, end] = block.markdownSpan;
+  assert.ok(start >= prevSpanEnd && start < end && end <= markdownBytes.length);
+  assert.ok(markdownBytes.subarray(start, end).toString('utf8').trim().length > 0);
+  prevSpanEnd = end;
+}
+
+// Bboxes are normalized 0-1 page space (top-left origin).
+assert.ok(layoutBlocks.blocks.some(b => b.bbox !== undefined));
+for (const block of layoutBlocks.blocks) {
+  assert.ok(block.page >= 1 && block.page <= layoutBlocks.pageCount);
+  if (block.bbox === undefined) continue;
+  const [x0, y0, x1, y1] = block.bbox;
+  assert.ok(x0 >= 0 && x0 <= x1 && x1 <= 1);
+  assert.ok(y0 >= 0 && y0 <= y1 && y1 <= 1);
+}
+assert.ok(layoutBlocks.blocks.some(b => b.blockType === 'table'));
+console.log('  extractLayoutBlocks: OK');
 
 // --- extractTextInRegions ---
 console.log('Testing extractTextInRegions...');

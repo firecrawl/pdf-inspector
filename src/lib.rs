@@ -292,7 +292,7 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
     let (doc, page_count) =
         load_document_from_path_with_password(&path, options.password.as_deref())?;
 
-    process_document(doc, page_count, options, start)
+    process_document(doc, page_count, options, start, None)
 }
 
 /// Process a PDF from a memory buffer with full extraction.
@@ -318,7 +318,7 @@ pub fn process_pdf_mem_with_options(
     let (doc, page_count) =
         load_document_from_mem_with_password(buffer, options.password.as_deref())?;
 
-    process_document(doc, page_count, options, start)
+    process_document(doc, page_count, options, start, None)
 }
 
 // =========================================================================
@@ -961,6 +961,233 @@ pub fn extract_structure_elements<P: AsRef<Path>>(
     validate_pdf_file(&path)?;
     let buffer = std::fs::read(path.as_ref())?;
     extract_structure_elements_mem(&buffer, pages)
+}
+
+// =========================================================================
+// Layout blocks (Markdown + typed blocks with spans, for citation grounding)
+// =========================================================================
+
+/// Hosted layout type of a [`LayoutBlock`].
+///
+/// Names follow the hosted layout-block vocabulary. Only the types the
+/// native Full-mode pipeline actually emits are present: furniture (page
+/// headers, footers, folios) is stripped before conversion and is never
+/// invented here, and no ML layout model runs — everything is derived from
+/// the same classification the Markdown convert loop already performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutBlockType {
+    /// Top-tier heading (`#`).
+    Title,
+    /// Lower-tier heading (`##`–`######`); [`LayoutBlock::label`] carries
+    /// the level ("H2".."H6").
+    SectionHeader,
+    /// Body paragraph (also block quotes and short mono fragments demoted
+    /// to plain text).
+    Text,
+    /// Bulleted or numbered list item, including wrapped continuations.
+    ListItem,
+    /// Figure/table caption or source citation line.
+    Caption,
+    /// Fenced code block.
+    Code,
+    /// Markdown pipe table.
+    Table,
+    /// Image placeholder (only emitted when images are included).
+    Picture,
+}
+
+impl LayoutBlockType {
+    /// Hosted type name ("title", "section_header", "text", "list_item",
+    /// "caption", "code", "table", "picture").
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LayoutBlockType::Title => "title",
+            LayoutBlockType::SectionHeader => "section_header",
+            LayoutBlockType::Text => "text",
+            LayoutBlockType::ListItem => "list_item",
+            LayoutBlockType::Caption => "caption",
+            LayoutBlockType::Code => "code",
+            LayoutBlockType::Table => "table",
+            LayoutBlockType::Picture => "picture",
+        }
+    }
+}
+
+/// One typed layout block from the Full-mode Markdown pipeline.
+///
+/// Produced by [`extract_layout_blocks`] / [`extract_layout_blocks_mem`].
+/// `markdown_span` grounds the block in the accompanying
+/// [`LayoutBlocksResult::markdown`]; `bbox` grounds it on the source page.
+#[derive(Debug, Clone)]
+pub struct LayoutBlock {
+    /// Hosted block type.
+    pub block_type: LayoutBlockType,
+    /// Heading level label ("H2".."H6") for
+    /// [`LayoutBlockType::SectionHeader`], `None` otherwise.
+    pub label: Option<String>,
+    /// 1-indexed page number the block was emitted from.
+    pub page: u32,
+    /// Normalized `[x0, y0, x1, y1]` in 0–1 page space with a top-left
+    /// origin (y grows downward), derived from the source `TextItem`,
+    /// table, or image coordinates. `None` when the page box is unknown or
+    /// the block has no positioned source items.
+    pub bbox: Option<[f32; 4]>,
+    /// `[start, end)` byte offsets into [`LayoutBlocksResult::markdown`].
+    pub markdown_span: (usize, usize),
+    /// Provenance of the block's text. Always `"native_text"` for this
+    /// pipeline (no OCR, no layout model).
+    pub source: String,
+    /// Layout-model confidence. Always `None`: no layout model runs.
+    pub layout_confidence: Option<f32>,
+    /// OCR confidence. Always `None`: the text is native, not OCR output.
+    pub ocr_confidence: Option<f32>,
+}
+
+/// Result of [`extract_layout_blocks`] / [`extract_layout_blocks_mem`].
+#[derive(Debug)]
+pub struct LayoutBlocksResult {
+    /// Markdown assembled from the recorded fragments. Block spans index
+    /// into this string. Content matches the default `process_pdf` output
+    /// up to post-processing scope (cleanup passes run per fragment here so
+    /// spans stay exact; the default pipeline runs them document-wide).
+    pub markdown: String,
+    /// Typed blocks in reading order, with non-overlapping ascending spans.
+    pub blocks: Vec<LayoutBlock>,
+    /// The detected PDF type.
+    pub pdf_type: PdfType,
+    /// Total page count.
+    pub page_count: u32,
+}
+
+fn layout_block_type_and_label(
+    kind: markdown::blocks::RawBlockKind,
+) -> (LayoutBlockType, Option<String>) {
+    use markdown::blocks::RawBlockKind;
+    match kind {
+        RawBlockKind::Heading(1) => (LayoutBlockType::Title, None),
+        RawBlockKind::Heading(level) => (
+            LayoutBlockType::SectionHeader,
+            Some(format!("H{}", level.clamp(2, 6))),
+        ),
+        RawBlockKind::Text => (LayoutBlockType::Text, None),
+        RawBlockKind::ListItem => (LayoutBlockType::ListItem, None),
+        RawBlockKind::Caption => (LayoutBlockType::Caption, None),
+        RawBlockKind::Code => (LayoutBlockType::Code, None),
+        RawBlockKind::Table => (LayoutBlockType::Table, None),
+        RawBlockKind::Picture => (LayoutBlockType::Picture, None),
+    }
+}
+
+/// Normalize a PDF-space bbox (y-up) into 0–1 page space with a top-left
+/// origin, clamped to the page box.
+fn normalize_layout_bbox(
+    bbox: (f32, f32, f32, f32),
+    page_box: (f32, f32, f32, f32),
+) -> Option<[f32; 4]> {
+    let (px0, py0, px1, py1) = page_box;
+    let width = px1 - px0;
+    let height = py1 - py0;
+    if !(width > 0.0 && height > 0.0) {
+        return None;
+    }
+    let x0 = ((bbox.0 - px0) / width).clamp(0.0, 1.0);
+    let x1 = ((bbox.2 - px0) / width).clamp(0.0, 1.0);
+    // Flip: PDF y grows upward, normalized page space grows downward.
+    let y0 = ((py1 - bbox.3) / height).clamp(0.0, 1.0);
+    let y1 = ((py1 - bbox.1) / height).clamp(0.0, 1.0);
+    Some([x0, y0, x1, y1])
+}
+
+/// Extract Firecrawl-compatible layout blocks from a PDF in memory.
+///
+/// Runs the existing Full-mode extract+convert pipeline (same reading
+/// order, heading classifier, table insertion, and furniture stripping as
+/// [`process_pdf_mem`] — no layout model) and records each fragment the
+/// Markdown convert loop emits as a typed [`LayoutBlock`] with:
+///
+/// - `markdown_span`: exact `[start, end)` byte offsets into the returned
+///   [`LayoutBlocksResult::markdown`], for citation grounding;
+/// - `bbox`: normalized 0–1 page-space coordinates (top-left origin) from
+///   the existing `TextItem` / table / image geometry;
+/// - `source`: always `"native_text"`; confidence fields stay `None`
+///   because no layout or OCR model produces a real score.
+///
+/// The default [`process_pdf_mem`] Markdown output is unaffected: recording
+/// is a parallel observation of the same conversion pass. For Scanned or
+/// ImageBased PDFs (or when extraction yields no trustworthy text) the
+/// result carries the classification with empty `markdown` and `blocks`.
+pub fn extract_layout_blocks_mem(buffer: &[u8]) -> Result<LayoutBlocksResult, PdfError> {
+    let start = ProcessingTimer::start();
+    validate_pdf_bytes(buffer)?;
+    let (doc, page_count) = load_document_from_mem(buffer)?;
+
+    // Page boxes are needed for bbox normalization and the document is
+    // consumed by processing, so collect them first.
+    let page_boxes: HashMap<u32, (f32, f32, f32, f32)> = doc
+        .get_pages()
+        .iter()
+        .filter_map(|(&page, &page_id)| {
+            extractor::get_page_box(&doc, page_id).map(|page_box| (page, page_box))
+        })
+        .collect();
+
+    let mut sink: Option<markdown::blocks::LayoutBlocksOutput> = None;
+    let result = process_document(
+        doc,
+        page_count,
+        PdfOptions::default(),
+        start,
+        Some(&mut sink),
+    )?;
+
+    // Scanned/ImageBased PDFs and garbage-text upgrades drop the Markdown;
+    // the blocks payload must follow the same trust decision.
+    if result.markdown.is_none() {
+        return Ok(LayoutBlocksResult {
+            markdown: String::new(),
+            blocks: Vec::new(),
+            pdf_type: result.pdf_type,
+            page_count: result.page_count,
+        });
+    }
+
+    let output = sink.unwrap_or_default();
+    let blocks = output
+        .blocks
+        .into_iter()
+        .map(|block| {
+            let (block_type, label) = layout_block_type_and_label(block.kind);
+            let bbox = block.bbox.and_then(|bbox| {
+                page_boxes
+                    .get(&block.page)
+                    .and_then(|&page_box| normalize_layout_bbox(bbox, page_box))
+            });
+            LayoutBlock {
+                block_type,
+                label,
+                page: block.page,
+                bbox,
+                markdown_span: block.span,
+                source: "native_text".to_string(),
+                layout_confidence: None,
+                ocr_confidence: None,
+            }
+        })
+        .collect();
+
+    Ok(LayoutBlocksResult {
+        markdown: output.markdown,
+        blocks,
+        pdf_type: result.pdf_type,
+        page_count: result.page_count,
+    })
+}
+
+/// Path-based wrapper for [`extract_layout_blocks_mem`].
+pub fn extract_layout_blocks<P: AsRef<Path>>(path: P) -> Result<LayoutBlocksResult, PdfError> {
+    validate_pdf_file(&path)?;
+    let buffer = std::fs::read(path.as_ref())?;
+    extract_layout_blocks_mem(&buffer)
 }
 
 // =========================================================================
@@ -4163,11 +4390,17 @@ fn strip_leading_pdf_container_bytes(buf: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Core processing pipeline operating on a pre-loaded document.
+///
+/// `layout_blocks` is an optional sink for layout-block recording (see
+/// [`extract_layout_blocks_mem`]). When present and the Full-mode Markdown
+/// conversion runs, it is filled with the recorded blocks payload; the
+/// returned `markdown` stays byte-identical to a run without the sink.
 fn process_document(
     doc: Document,
     page_count: u32,
     options: PdfOptions,
     start: ProcessingTimer,
+    layout_blocks: Option<&mut Option<markdown::blocks::LayoutBlocksOutput>>,
 ) -> Result<PdfProcessResult, PdfError> {
     // Step 1 — Detection (cheap: scans content streams for text operators)
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
@@ -4401,21 +4634,35 @@ fn process_document(
             let md = if options.mode == ProcessMode::Analyze {
                 None
             } else {
-                Some(markdown::to_markdown_from_items_with_rects_and_lines(
-                    items,
-                    options.markdown,
-                    &rects,
-                    &lines,
-                    markdown::MarkdownDocumentContext {
-                        page_thresholds: &page_thresholds,
-                        struct_roles: struct_roles.as_ref(),
-                        struct_tables: &struct_tables,
-                        page_count,
-                        prefiltered_page_number_pages: Some(&removed_pages),
-                        prefiltered_page_number_mask: Some(removal_mask.as_slice()),
-                        precomputed_chart_regions: Some(&chart_regions),
-                    },
-                ))
+                let context = markdown::MarkdownDocumentContext {
+                    page_thresholds: &page_thresholds,
+                    struct_roles: struct_roles.as_ref(),
+                    struct_tables: &struct_tables,
+                    page_count,
+                    prefiltered_page_number_pages: Some(&removed_pages),
+                    prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                    precomputed_chart_regions: Some(&chart_regions),
+                };
+                if let Some(sink) = layout_blocks {
+                    let (md, blocks) =
+                        markdown::to_markdown_with_layout_blocks_from_items_with_rects_and_lines(
+                            items,
+                            options.markdown,
+                            &rects,
+                            &lines,
+                            context,
+                        );
+                    *sink = Some(blocks);
+                    Some(md)
+                } else {
+                    Some(markdown::to_markdown_from_items_with_rects_and_lines(
+                        items,
+                        options.markdown,
+                        &rects,
+                        &lines,
+                        context,
+                    ))
+                }
             };
 
             let enc = !ocr_reasons_by_page.is_empty()

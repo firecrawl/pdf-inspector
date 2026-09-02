@@ -258,6 +258,59 @@ fn extract_items_json(
         .map(|items| format_items_json(&items))
 }
 
+fn optional_confidence_json(value: Option<f32>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn format_layout_blocks_json(result: &pdf_inspector::LayoutBlocksResult) -> String {
+    let pdf_type = match result.pdf_type {
+        pdf_inspector::PdfType::TextBased => "text_based",
+        pdf_inspector::PdfType::Scanned => "scanned",
+        pdf_inspector::PdfType::ImageBased => "image_based",
+        pdf_inspector::PdfType::Mixed => "mixed",
+    };
+    let blocks = result
+        .blocks
+        .iter()
+        .map(|block| {
+            let label = block
+                .label
+                .as_ref()
+                .map(|label| format!(r#""{}""#, json_escape(label)))
+                .unwrap_or_else(|| "null".to_string());
+            let bbox = block
+                .bbox
+                .map(|[x0, y0, x1, y1]| {
+                    format!(r#"{{"x0":{x0:.4},"y0":{y0:.4},"x1":{x1:.4},"y1":{y1:.4}}}"#)
+                })
+                .unwrap_or_else(|| "null".to_string());
+            format!(
+                r#"{{"type":"{}","label":{},"page":{},"bbox":{},"markdownSpan":[{},{}],"source":"{}","confidence":{{"layout":{},"ocr":{}}}}}"#,
+                block.block_type.as_str(),
+                label,
+                block.page,
+                bbox,
+                block.markdown_span.0,
+                block.markdown_span.1,
+                json_escape(&block.source),
+                optional_confidence_json(block.layout_confidence),
+                optional_confidence_json(block.ocr_confidence),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"schema_version":1,"pdf_type":"{}","page_count":{},"markdown":"{}","blocks":[{}]}}"#,
+        pdf_type,
+        result.page_count,
+        json_escape(&result.markdown),
+        blocks,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{extract_items_json, format_items_json, format_ocr_error_json};
@@ -403,6 +456,7 @@ fn main() {
         eprintln!("Options:");
         eprintln!("  --json              Output result as JSON");
         eprintln!("  --items-json        Output positioned TextItem JSON");
+        eprintln!("  --layout-blocks-json  Output Markdown plus typed layout blocks JSON");
         eprintln!("  --raw               Output only markdown (no headers)");
         eprintln!(
             "  --compact           Collapse token-heavy source formatting such as dot leaders"
@@ -424,6 +478,7 @@ fn main() {
     let pdf_path = &args[1];
     let json_output = args.iter().any(|a| a == "--json");
     let items_json_output = args.iter().any(|a| a == "--items-json");
+    let layout_blocks_json_output = args.iter().any(|a| a == "--layout-blocks-json");
     let raw_output = args.iter().any(|a| a == "--raw");
     let compact_output = args.iter().any(|a| a == "--compact");
     let page_numbers = args.iter().any(|a| a == "--pages");
@@ -485,9 +540,10 @@ fn main() {
     }
 
     if let Some(mode) = ocr_mode_argument {
-        if items_json_output || detect_only || analyze {
+        if items_json_output || layout_blocks_json_output || detect_only || analyze {
             exit_ocr_error(
-                "--ocr cannot be combined with --items-json, --detect-only, or --analyze",
+                "--ocr cannot be combined with --items-json, --layout-blocks-json, \
+                 --detect-only, or --analyze",
                 json_output,
             );
         }
@@ -598,6 +654,27 @@ fn main() {
     if items_json_output {
         match extract_items_json(pdf_path, page_filter.as_ref(), password.as_deref()) {
             Ok(json) => println!("{}", json),
+            Err(e) => {
+                println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if layout_blocks_json_output {
+        if page_filter.is_some() || password.is_some() || detect_only || analyze {
+            println!(
+                r#"{{"error":"{}"}}"#,
+                json_escape(
+                    "--layout-blocks-json cannot be combined with --select-pages, \
+                     --password, --detect-only, or --analyze"
+                )
+            );
+            process::exit(1);
+        }
+        match pdf_inspector::extract_layout_blocks(pdf_path) {
+            Ok(result) => println!("{}", format_layout_blocks_json(&result)),
             Err(e) => {
                 println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));
                 process::exit(1);

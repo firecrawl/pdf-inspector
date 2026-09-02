@@ -570,6 +570,81 @@ pub fn extract_structure_elements(
     })
 }
 
+/// One typed layout block from the Full-mode Markdown pipeline.
+#[napi(object)]
+pub struct LayoutBlockJs {
+    /// Hosted block type: "title", "section_header", "text", "list_item",
+    /// "caption", "code", "table", or "picture".
+    pub block_type: String,
+    /// Heading level label ("H2".."H6") for section_header blocks, `None`
+    /// otherwise.
+    pub label: Option<String>,
+    /// 1-indexed page number the block was emitted from.
+    pub page: u32,
+    /// Normalized `[x0, y0, x1, y1]` in 0–1 page space with a top-left
+    /// origin, or `None` when no positioned geometry is available.
+    pub bbox: Option<Vec<f64>>,
+    /// `[start, end)` byte offsets into the result's `markdown`.
+    pub markdown_span: Vec<u32>,
+    /// Provenance of the block's text; always `"native_text"`.
+    pub source: String,
+    /// Layout-model confidence; always `None` (no layout model runs).
+    pub layout_confidence: Option<f64>,
+    /// OCR confidence; always `None` (the text is native, not OCR output).
+    pub ocr_confidence: Option<f64>,
+}
+
+/// Markdown plus typed layout blocks whose spans index into it.
+#[napi(object)]
+pub struct LayoutBlocksResultJs {
+    /// Markdown assembled from the recorded fragments; block spans are
+    /// byte offsets into this string.
+    pub markdown: String,
+    /// Typed blocks in reading order with non-overlapping ascending spans.
+    pub blocks: Vec<LayoutBlockJs>,
+    pub pdf_type: PdfType,
+    pub page_count: u32,
+}
+
+/// Extract Markdown plus typed layout blocks for citation grounding.
+///
+/// Runs the same Full-mode extract+convert pipeline as [`processPdf`]
+/// (no layout model) and records each emitted fragment as a typed block
+/// with a normalized 0–1 page-space bbox (top-left origin) and an exact
+/// `[start, end)` byte span into the returned markdown.
+///
+/// For scanned/image-based PDFs the result carries the classification with
+/// empty `markdown` and no blocks.
+#[napi]
+pub fn extract_layout_blocks(buffer: Buffer) -> Result<LayoutBlocksResultJs> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_layout_blocks", move || {
+        let result = pdf_inspector::extract_layout_blocks_mem(&bytes)
+            .map_err(|e| to_napi_err(e, "extract_layout_blocks"))?;
+        Ok(LayoutBlocksResultJs {
+            markdown: result.markdown,
+            blocks: result
+                .blocks
+                .into_iter()
+                .map(|block| LayoutBlockJs {
+                    block_type: block.block_type.as_str().to_string(),
+                    label: block.label,
+                    page: block.page,
+                    bbox: block
+                        .bbox
+                        .map(|bbox| bbox.iter().map(|&v| v as f64).collect()),
+                    markdown_span: vec![block.markdown_span.0 as u32, block.markdown_span.1 as u32],
+                    source: block.source,
+                    layout_confidence: block.layout_confidence.map(f64::from),
+                    ocr_confidence: block.ocr_confidence.map(f64::from),
+                })
+                .collect(),
+            pdf_type: convert_pdf_type(result.pdf_type),
+            page_count: result.page_count,
+        })
+    })
+}
+
 /// Extract text within bounding-box regions from a PDF.
 ///
 /// For hybrid OCR: layout model detects regions in rendered images,

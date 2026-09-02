@@ -1272,7 +1272,7 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
 /// Visible page box: CropBox if present, else MediaBox, walking page-tree
 /// inheritance (both attributes are inheritable). Returns normalized
 /// (x0, y0, x1, y1) in PDF space.
-fn get_page_box(doc: &Document, page_id: ObjectId) -> Option<(f32, f32, f32, f32)> {
+pub(crate) fn get_page_box(doc: &Document, page_id: ObjectId) -> Option<(f32, f32, f32, f32)> {
     fn find_box(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Vec<f32>> {
         let mut id = page_id;
         for _ in 0..32 {
