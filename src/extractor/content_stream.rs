@@ -561,7 +561,9 @@ pub(crate) fn extract_page_text_items(
                     // may have moved the position to the correct line — the BDC-entry
                     // position (actual_text_start_tm) can be on the previous line.
                     if suppress_glyph_extraction {
-                        if actual_text_glyph_tm.is_none() {
+                        // The first *painted* glyph decides the span's position
+                        // and state; an empty show is not it.
+                        if actual_text_glyph_tm.is_none() && glyph_count > 0 {
                             actual_text_glyph_tm = Some(text_matrix);
                             actual_text_glyph_rise = Some(text_rise);
                             actual_text_glyph_font = Some(current_font.clone());
@@ -697,7 +699,19 @@ pub(crate) fn extract_page_text_items(
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
                         // Capture first-glyph position for ActualText
-                        if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
+                        let paints_a_glyph = op
+                            .operands
+                            .first()
+                            .and_then(|o| o.as_array().ok())
+                            .is_some_and(|elements| {
+                                elements.iter().any(|e| {
+                                    get_operand_bytes(e).is_some_and(|raw| !raw.is_empty())
+                                })
+                            });
+                        if suppress_glyph_extraction
+                            && actual_text_glyph_tm.is_none()
+                            && paints_a_glyph
+                        {
                             actual_text_glyph_tm = Some(text_matrix);
                             actual_text_glyph_rise = Some(text_rise);
                             actual_text_glyph_font = Some(current_font.clone());
@@ -985,7 +999,14 @@ pub(crate) fn extract_page_text_items(
                 text_matrix = line_matrix;
                 // Capture first-glyph position for ActualText AFTER the
                 // line move — the BDC-entry matrix is on the previous line.
-                if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
+                if suppress_glyph_extraction
+                    && actual_text_glyph_tm.is_none()
+                    && op
+                        .operands
+                        .last()
+                        .and_then(get_operand_bytes)
+                        .is_some_and(|raw| !raw.is_empty())
+                {
                     actual_text_glyph_tm = Some(text_matrix);
                     actual_text_glyph_rise = Some(text_rise);
                     actual_text_glyph_font = Some(current_font.clone());
@@ -2905,6 +2926,22 @@ BT /F1 -12 Tf 0 1 -1 0 130 100 Tm /Span <</ActualText (Up) >> BDC (UP) Tj /F1 12
             assert_close(item.font_size, 12.0, "font_size");
             assert!(item.advance_known);
         }
+    }
+
+    #[test]
+    fn actual_text_span_captures_its_state_at_the_first_painted_glyph() {
+        // An empty `Tj` and a numeric-only `TJ` at 12pt precede the glyphs,
+        // which are painted at 24pt after the cursor moved 6pt: the
+        // replacement takes the painting size and position, not the state of
+        // the shows that painted nothing.
+        let (items, _) = extract_simple_page(
+            b"BT /F1 12 Tf 100 700 Td /Span <</ActualText (AB) >> BDC () Tj [-500] TJ /F1 24 Tf (AB) Tj EMC ET",
+        );
+        let ab = find_item(&items, "AB");
+        assert_close(ab.font_size, 24.0, "font_size");
+        assert_close(ab.x, 106.0, "x");
+        assert_close(ab.width, 28.8, "width");
+        assert!(ab.advance_known);
     }
 
     #[test]
