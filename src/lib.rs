@@ -3994,6 +3994,7 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
     add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
+    add_repair_candidate(&mut candidates, normalize_xref_entry_stride(buf), buf);
 
     let stripped = strip_leading_pdf_container_bytes(buf);
     if let Some(stripped_buf) = stripped.as_deref() {
@@ -4008,9 +4009,114 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
             recover_startxref_pointer(stripped_buf),
             buf,
         );
+        add_repair_candidate(
+            &mut candidates,
+            normalize_xref_entry_stride(stripped_buf),
+            buf,
+        );
     }
 
     candidates
+}
+
+/// Repairs classic xref entries whose EOL is not the spec's exactly two
+/// bytes — a bare `LF` (19-byte stride) or a `SP CR LF` (21) — including a
+/// table that mixes both: lopdf rejects the file, pypdf/pdfium/pdfjs read it. Rebuilds the table in place with `SP LF`
+/// entries; offsets and `startxref` stay valid because nothing else moves.
+/// Same scope as `recover_startxref_pointer` (last classic table only);
+/// `None` when the stride is already correct or the table is ambiguous.
+fn normalize_xref_entry_stride(buf: &[u8]) -> Option<Vec<u8>> {
+    let table_pos = find_last_valid_xref_table_start(buf)?;
+    let mut pos = table_pos + b"xref".len();
+
+    let mut rebuilt: Vec<u8> = b"xref\n".to_vec();
+    let mut saw_malformed = false;
+
+    fn skip_ws(buf: &[u8], mut pos: usize) -> usize {
+        while buf.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        pos
+    }
+    fn read_number(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
+        let start = pos;
+        while buf.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        if pos == start {
+            return None;
+        }
+        std::str::from_utf8(&buf[start..pos])
+            .ok()?
+            .parse()
+            .ok()
+            .map(|n| (n, pos))
+    }
+
+    loop {
+        let header_start = skip_ws(buf, pos);
+        if buf[header_start..].starts_with(b"trailer") {
+            pos = header_start;
+            break;
+        }
+        let (start_id, after_id) = read_number(buf, header_start)?;
+        let sep = skip_ws(buf, after_id);
+        if sep == after_id {
+            return None;
+        }
+        let (count, after_count) = read_number(buf, sep)?;
+        rebuilt.extend_from_slice(format!("{start_id} {count}\n").as_bytes());
+
+        let mut entry_pos = skip_ws(buf, after_count);
+        for _ in 0..count {
+            // 18 content bytes, then a 2-byte EOL (spec) or 1 (malformed).
+            let entry = buf.get(entry_pos..entry_pos + 18)?;
+            let (offset, after_offset) = read_number(entry, 0)?;
+            if after_offset != 10 || entry.get(10) != Some(&b' ') {
+                return None;
+            }
+            let (generation, after_generation) = read_number(entry, 11)?;
+            if after_generation != 16 || entry.get(16) != Some(&b' ') {
+                return None;
+            }
+            let kind = *entry.get(17)?;
+            if kind != b'n' && kind != b'f' {
+                return None;
+            }
+            entry_pos += 18;
+            let eol_len = match (
+                buf.get(entry_pos),
+                buf.get(entry_pos + 1),
+                buf.get(entry_pos + 2),
+            ) {
+                // Longest first: `SP CR LF` must not be read as `SP CR`, which
+                // would leave the next entry starting on the stray `LF`.
+                (Some(b' '), Some(b'\r'), Some(b'\n')) => 3,
+                (Some(b'\r'), Some(b'\n'), _) => 2,
+                (Some(b' '), Some(b'\r' | b'\n'), _) => 2,
+                (Some(b'\r' | b'\n'), _, _) => 1,
+                _ => return None,
+            };
+            if eol_len != 2 {
+                saw_malformed = true;
+            }
+            entry_pos += eol_len;
+            rebuilt.extend_from_slice(
+                format!("{offset:010} {generation:05} {} \n", kind as char).as_bytes(),
+            );
+        }
+        pos = entry_pos;
+    }
+
+    if !saw_malformed {
+        return None;
+    }
+
+    let mut repaired = Vec::with_capacity(buf.len() + rebuilt.len());
+    repaired.extend_from_slice(&buf[..table_pos]);
+    repaired.extend_from_slice(&rebuilt);
+    repaired.extend_from_slice(&buf[pos..]);
+    Some(repaired)
 }
 
 /// Some PDF writers emit a `startxref` pointer that doesn't actually point

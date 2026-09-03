@@ -4577,6 +4577,40 @@ fn test_process_pdf_recovers_corrupted_startxref_pointer() {
     );
 }
 
+#[test]
+fn test_process_pdf_recovers_bare_lf_xref_entries() {
+    // Bare-LF xref entries (19-byte stride, offsets correct); pypdf, pdfium
+    // and pdfjs all read such files.
+    let result =
+        process_pdf_with_options("tests/fixtures/bare_lf_xref_entries.pdf", PdfOptions::new())
+            .expect("bare-LF xref entries should be recoverable, like pypdf/pdfium");
+
+    assert_eq!(result.page_count, 1);
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Synthetic xref stride test"),
+        "recovered document should extract its real text, got: {md:?}"
+    );
+}
+
+#[test]
+fn test_process_pdf_recovers_mixed_eol_xref_entries() {
+    // A table mixing bare-LF (19-byte) and `SP CR LF` (21-byte) entries: the
+    // longest EOL must be consumed first or the next entry starts on a stray LF.
+    let result = process_pdf_with_options(
+        "tests/fixtures/mixed_eol_xref_entries.pdf",
+        PdfOptions::new(),
+    )
+    .expect("mixed-EOL xref entries should be recoverable, like pypdf/pdfium");
+
+    assert_eq!(result.page_count, 1);
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Mixed EOL stride test"),
+        "recovered document should extract its real text, got: {md:?}"
+    );
+}
+
 /// Regression for #227: `extract_pages_markdown`'s per-page `needs_ocr`
 /// must agree with `classify_pdf`/`detect_pdf_type` on the same page. The
 /// fixture is a full-page raster "scan" with a single line of genuine
