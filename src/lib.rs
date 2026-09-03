@@ -64,8 +64,8 @@ use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use text_quality::{
-    analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
-    region_items_have_decoding_issue,
+    analyze_text_quality, compute_distinct_n, detect_encoding_issues, is_cid_garbage,
+    is_garbage_text, region_items_have_decoding_issue,
 };
 use tounicode::FontCMaps;
 
@@ -119,6 +119,9 @@ pub const OCR_REASON_NO_TEXT: &str = "no_text";
 /// rather than real text operators, so it cannot be extracted as characters.
 pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
 
+/// OCR reason emitted when extracted text layer contains severe repetition loops.
+pub const OCR_REASON_SUSPECTED_REPEATED_TEXT: &str = "suspected_repeated_text";
+
 // =========================================================================
 // Result type
 // =========================================================================
@@ -156,6 +159,8 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+    /// Uniqueness ratio of line n-grams (0.0–1.0), or `None` if markdown was not generated.
+    pub distinct_n: Option<f32>,
 }
 
 // =========================================================================
@@ -4197,6 +4202,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            distinct_n: None,
         });
     }
 
@@ -4213,6 +4219,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            distinct_n: None,
         });
     }
 
@@ -4530,6 +4537,8 @@ fn process_document(
         markdown
     };
 
+    let distinct_n = markdown.as_ref().map(|md| compute_distinct_n(md, 3, 50));
+
     Ok(PdfProcessResult {
         pdf_type,
         markdown,
@@ -4547,6 +4556,7 @@ fn process_document(
         confidence,
         layout,
         has_encoding_issues,
+        distinct_n,
     })
 }
 

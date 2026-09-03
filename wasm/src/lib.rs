@@ -49,6 +49,7 @@ export interface PdfProcessResult {
   confidence: number;
   layout: LayoutComplexity;
   hasEncodingIssues: boolean;
+  distinctN?: number;
 }
 
 export interface PdfClassification {
@@ -130,6 +131,7 @@ struct WasmPdfProcessResult {
     confidence: f64,
     layout: WasmLayoutComplexity,
     has_encoding_issues: bool,
+    distinct_n: Option<f32>,
 }
 
 impl From<PdfProcessResult> for WasmPdfProcessResult {
@@ -149,6 +151,7 @@ impl From<PdfProcessResult> for WasmPdfProcessResult {
             confidence: value.confidence as f64,
             layout: value.layout.into(),
             has_encoding_issues: value.has_encoding_issues,
+            distinct_n: value.distinct_n,
         }
     }
 }
