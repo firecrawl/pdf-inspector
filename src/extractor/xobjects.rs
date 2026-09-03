@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
-    extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
+    extract_text_from_operand, get_font_cmap_lookup_key, get_operand_bytes, CMapDecisionCache,
     FontStyleCache,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -290,7 +290,7 @@ fn extract_form_xobject_text_inner(
 
     // Build font base names and ToUnicode refs for the form
     let mut font_base_names: HashMap<String, String> = HashMap::new();
-    let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+    let mut font_tounicode_refs: HashMap<String, u64> = HashMap::new();
     let mut inline_cmaps: HashMap<String, crate::tounicode::CMapEntry> = HashMap::new();
 
     let mut font_style_flags: HashMap<String, (bool, bool)> = HashMap::new();
@@ -309,7 +309,7 @@ fn extract_form_xobject_text_inner(
         match font_dict.get(b"ToUnicode") {
             Ok(tounicode) => {
                 if let Ok(obj_ref) = tounicode.as_reference() {
-                    font_tounicode_refs.insert(resource_name, obj_ref.0);
+                    font_tounicode_refs.insert(resource_name, u64::from(obj_ref.0));
                 } else if let Object::Stream(s) = tounicode {
                     let data = s
                         .decompressed_content()
@@ -322,8 +322,8 @@ fn extract_form_xobject_text_inner(
                 }
             }
             Err(_) => {
-                if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
-                    font_tounicode_refs.insert(resource_name, ff2_obj_num);
+                if let Some(cmap_lookup_key) = get_font_cmap_lookup_key(doc, font_dict) {
+                    font_tounicode_refs.insert(resource_name, cmap_lookup_key);
                 }
             }
         }

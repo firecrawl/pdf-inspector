@@ -15,7 +15,7 @@ pub(crate) enum CMapChoice {
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct CMapDecisionCache {
-    decisions: HashMap<u32, CMapDecision>,
+    decisions: HashMap<u64, CMapDecision>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -31,20 +31,20 @@ impl CMapDecisionCache {
         Self::default()
     }
 
-    pub(crate) fn get_choice(&self, obj_num: u32) -> Option<CMapChoice> {
-        self.decisions.get(&obj_num).and_then(|d| d.choice)
+    pub(crate) fn get_choice(&self, lookup_key: u64) -> Option<CMapChoice> {
+        self.decisions.get(&lookup_key).and_then(|d| d.choice)
     }
 
     pub(crate) fn consider(
         &mut self,
-        obj_num: u32,
+        lookup_key: u64,
         primary: &str,
         remapped: &str,
         bytes_len: usize,
     ) -> Option<CMapChoice> {
         const SAMPLE_TARGET_BYTES: usize = 240;
 
-        let entry = self.decisions.entry(obj_num).or_default();
+        let entry = self.decisions.entry(lookup_key).or_default();
         entry.sample_bytes = entry.sample_bytes.saturating_add(bytes_len);
         entry.primary_sample.push_str(primary);
         entry.remapped_sample.push_str(remapped);
@@ -923,11 +923,17 @@ fn is_ligature_char(ch: char) -> bool {
     )
 }
 
-/// Get the CMap lookup key for an Identity-H/V CID font without ToUnicode.
-/// Returns the object number used by `collect_cmaps_from_fonts` to store the CMap:
-/// - FontFile2 or FontFile3 obj_num (for embedded font cmap)
-/// - CIDFont dict obj_num (for predefined CIDSystemInfo-based mapping)
-pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<u32> {
+/// Get the cache key used by `collect_cmaps_from_fonts` for a font without
+/// ToUnicode.
+///
+/// This is usually a PDF object number (`FontFile2`/`FontFile3` or the
+/// descendant CIDFont). For a predefined non-identity Type0 encoding it is a
+/// synthetic, namespaced encoding-identity key; callers must not interpret it
+/// as an object number.
+pub(crate) fn get_font_cmap_lookup_key(
+    doc: &Document,
+    font_dict: &lopdf::Dictionary,
+) -> Option<u64> {
     let subtype = font_dict
         .get(b"Subtype")
         .ok()
@@ -936,7 +942,8 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
     // Type0 (CID) fonts
     if subtype == Some(b"Type0") {
         let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
-        if encoding != b"Identity-H" && encoding != b"Identity-V" {
+        let is_identity = encoding == b"Identity-H" || encoding == b"Identity-V";
+        if !is_identity && !crate::tounicode::is_predefined_encoding_cmap(encoding) {
             return None;
         }
         let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
@@ -944,28 +951,35 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
         if desc_fonts.is_empty() {
             return None;
         }
+        if !is_identity {
+            return crate::tounicode::type0_predefined_cmap_lookup_key(font_dict, &desc_fonts[0]);
+        }
         let cid_font_dict = resolve_dict(doc, &desc_fonts[0])?;
-        let font_descriptor_obj = cid_font_dict.get(b"FontDescriptor").ok()?;
-        let font_descriptor = resolve_dict(doc, font_descriptor_obj)?;
+        let font_descriptor = cid_font_dict
+            .get(b"FontDescriptor")
+            .ok()
+            .and_then(|obj| resolve_dict(doc, obj));
 
         // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF)
-        if let Some(ff_ref) = font_descriptor
-            .get(b"FontFile2")
-            .ok()
-            .and_then(|o| o.as_reference().ok())
-            .or_else(|| {
-                font_descriptor
-                    .get(b"FontFile3")
-                    .ok()
-                    .and_then(|o| o.as_reference().ok())
-            })
-        {
-            return Some(ff_ref.0);
+        if let Some(font_descriptor) = font_descriptor {
+            if let Some(ff_ref) = font_descriptor
+                .get(b"FontFile2")
+                .ok()
+                .and_then(|o| o.as_reference().ok())
+                .or_else(|| {
+                    font_descriptor
+                        .get(b"FontFile3")
+                        .ok()
+                        .and_then(|o| o.as_reference().ok())
+                })
+            {
+                return Some(u64::from(ff_ref.0));
+            }
         }
 
         // Fallback: use DescendantFonts[0] obj_num (for predefined CIDSystemInfo mapping)
         if let Object::Reference(r) = &desc_fonts[0] {
-            return Some(r.0);
+            return Some(u64::from(r.0));
         }
         return None;
     }
@@ -983,7 +997,7 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
                 .ok()
                 .and_then(|o| o.as_reference().ok())
         })
-        .map(|r| r.0)
+        .map(|r| u64::from(r.0))
 }
 
 /// Document-scoped memo of embedded-font style flags, keyed by the
@@ -1158,7 +1172,7 @@ pub(crate) fn extract_text_from_operand(
     current_font: &str,
     base_font_name: Option<&str>,
     font_cmaps: &FontCMaps,
-    font_tounicode_refs: &std::collections::HashMap<String, u32>,
+    font_tounicode_refs: &std::collections::HashMap<String, u64>,
     inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
     font_encodings: &PageFontEncodings,
     encoding_cache: &HashMap<String, Encoding<'_>>,
@@ -1294,7 +1308,7 @@ pub(crate) fn extract_text_from_operand(
 
             // Look up CMap by ToUnicode object reference
             if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
-                if let Some(entry) = font_cmaps.get_by_obj(obj_num) {
+                if let Some(entry) = font_cmaps.get_by_cmap_lookup_key(obj_num) {
                     has_cmap = true;
                     if let Some(decoded) = decode_with_entry(entry) {
                         return Some(decoded);
@@ -2153,7 +2167,7 @@ mod tests {
         let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
 
         let font_cmaps = FontCMaps::default();
-        let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let mut font_tounicode_refs: HashMap<String, u64> = HashMap::new();
         font_tounicode_refs.insert("F0".to_string(), 999);
         let inline_cmaps = HashMap::new();
         let font_encodings: PageFontEncodings = HashMap::new();
@@ -2200,7 +2214,7 @@ mod tests {
         let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
 
         let font_cmaps = FontCMaps::default();
-        let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let mut font_tounicode_refs: HashMap<String, u64> = HashMap::new();
         font_tounicode_refs.insert("F1".to_string(), 999);
         let inline_cmaps = HashMap::new();
         let font_encodings: PageFontEncodings = HashMap::new();
@@ -2235,7 +2249,7 @@ mod tests {
         let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
 
         let font_cmaps = FontCMaps::default();
-        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let font_tounicode_refs: HashMap<String, u64> = HashMap::new();
         let inline_cmaps = HashMap::new();
         let font_encodings: PageFontEncodings = HashMap::new();
         let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();

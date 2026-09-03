@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
-    descriptor_style_flags, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
+    descriptor_style_flags, extract_text_from_operand, get_font_cmap_lookup_key, get_operand_bytes,
     CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
@@ -190,7 +190,7 @@ pub(crate) fn extract_page_text_items(
     // Build maps of font resource names to their base font names and ToUnicode object refs
     let mut font_base_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut font_tounicode_refs: std::collections::HashMap<String, u32> =
+    let mut font_tounicode_refs: std::collections::HashMap<String, u64> =
         std::collections::HashMap::new();
     let mut inline_cmaps: std::collections::HashMap<String, crate::tounicode::CMapEntry> =
         std::collections::HashMap::new();
@@ -215,7 +215,7 @@ pub(crate) fn extract_page_text_items(
         match font_dict.get(b"ToUnicode") {
             Ok(tounicode) => {
                 if let Ok(obj_ref) = tounicode.as_reference() {
-                    font_tounicode_refs.insert(resource_name, obj_ref.0);
+                    font_tounicode_refs.insert(resource_name, u64::from(obj_ref.0));
                 } else if let Object::Stream(s) = tounicode {
                     let data = s
                         .decompressed_content()
@@ -228,8 +228,8 @@ pub(crate) fn extract_page_text_items(
                 }
             }
             Err(_) => {
-                if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
-                    font_tounicode_refs.insert(resource_name, ff2_obj_num);
+                if let Some(cmap_lookup_key) = get_font_cmap_lookup_key(doc, font_dict) {
+                    font_tounicode_refs.insert(resource_name, cmap_lookup_key);
                 }
             }
         }

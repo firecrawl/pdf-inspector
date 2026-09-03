@@ -4270,6 +4270,160 @@ fn test_synthetic_type0_broken_tounicode_emits_fffd_not_latin1_mojibake() {
     );
 }
 
+fn synthetic_type0_predefined_cmap_pdf_without_tounicode(
+    encoding: &'static str,
+    base_font: &'static str,
+    content_bytes: Vec<u8>,
+) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let cid_font_id = doc.new_object_id();
+    let descriptor_id = doc.new_object_id();
+    let cid_system_info_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => base_font,
+            "Encoding" => encoding,
+            "DescendantFonts" => vec![cid_font_id.into()],
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        cid_system_info_id,
+        dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("GB1"),
+            "Supplement" => 2,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        cid_font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => base_font,
+            "CIDSystemInfo" => cid_system_info_id,
+            "FontDescriptor" => descriptor_id,
+            "DW" => 1000,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        descriptor_id,
+        dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => base_font,
+            "Flags" => 4,
+            "FontBBox" => vec![Object::Integer(-100), Object::Integer(-100), 1000.into(), 1000.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 800,
+            "Descent" => Object::Integer(-200),
+            "CapHeight" => 700,
+            "StemV" => 80,
+        }
+        .into(),
+    );
+
+    let operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F0".into(), 12.into()]),
+        Operation::new("Td", vec![50.into(), 100.into()]),
+        Operation::new(
+            "Tj",
+            vec![Object::String(
+                content_bytes,
+                lopdf::StringFormat::Hexadecimal,
+            )],
+        ),
+        Operation::new("ET", vec![]),
+    ];
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F0" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_type0_gbk_euc_h_without_tounicode_decodes_predefined_cmap() {
+    let content_bytes = vec![0xB6, 0xAB, 0xB7, 0xBD];
+    let buf = synthetic_type0_predefined_cmap_pdf_without_tounicode(
+        "GBK-EUC-H",
+        "FZXBSJW--GB1-0",
+        content_bytes,
+    );
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    let combined: String = items.iter().map(|i| i.text.as_str()).collect();
+    assert_eq!(
+        combined, "东方",
+        "GBK-EUC-H character codes should decode through Adobe-GB1 predefined CMaps"
+    );
+
+    // A one-operation fixture is intentionally too small to exercise the
+    // detector's full-page heuristics; the assertions above cover the font
+    // decoding failure reported by the issue.
+}
+
+#[test]
+fn test_type0_unigb_ucs2_h_without_tounicode_decodes_unicode_codes() {
+    let text = "电子发票 G342 郴州西";
+    let content_bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let buf = synthetic_type0_predefined_cmap_pdf_without_tounicode(
+        "UniGB-UCS2-H",
+        "SimSun",
+        content_bytes,
+    );
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    let combined: String = items.iter().map(|i| i.text.as_str()).collect();
+    assert_eq!(
+        combined, text,
+        "UniGB-UCS2-H character codes should decode through Adobe-GB1 predefined CMaps"
+    );
+}
+
 // ============================================================================
 // Image XObject emission
 // ============================================================================

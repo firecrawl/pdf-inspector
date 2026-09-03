@@ -24,6 +24,8 @@ pub struct ToUnicodeCMap {
     pub ranges: Vec<(u16, u16, u32)>,
     /// Byte width of source codes (1 or 2), determined from codespace and CMap entries
     pub code_byte_length: u8,
+    /// Code spaces that can have different byte lengths in a mixed-width CMap.
+    code_spaces: Vec<EncodingCodeSpace>,
     /// When true, unmapped CIDs are interpreted as Unicode codepoints directly.
     /// Used as a last resort for Identity-H fonts without ToUnicode/cmap/glyph names.
     pub cid_passthrough: bool,
@@ -452,6 +454,29 @@ impl ToUnicodeCMap {
         let mut result = String::new();
         let mut unmapped_count = 0usize;
 
+        if self.has_variable_code_lengths() {
+            let mut total = 0usize;
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                total += 1;
+                let Some((consumed, code)) = self.match_code_space(&bytes[offset..]) else {
+                    unmapped_count += 1;
+                    offset += 1;
+                    continue;
+                };
+
+                match self.lookup(code) {
+                    Some(text) if !text.contains('\u{FFFD}') => result.push_str(&text),
+                    _ => unmapped_count += 1,
+                }
+                offset += consumed;
+            }
+            if total > 0 && unmapped_count > total / 2 {
+                return String::new();
+            }
+            return result;
+        }
+
         if self.code_byte_length == 1 {
             // Single-byte codes: each byte is a code
             for &b in bytes {
@@ -512,6 +537,33 @@ impl ToUnicodeCMap {
         }
 
         result
+    }
+
+    fn has_variable_code_lengths(&self) -> bool {
+        let mut lengths = self.code_spaces.iter().map(|space| space.byte_length);
+        let Some(first) = lengths.next() else {
+            return false;
+        };
+        lengths.any(|length| length != first)
+    }
+
+    fn match_code_space(&self, bytes: &[u8]) -> Option<(usize, u16)> {
+        let max_length = bytes.len().min(2);
+        for length in (1..=max_length).rev() {
+            let code = match length {
+                1 => u16::from(bytes[0]),
+                2 => u16::from_be_bytes([bytes[0], bytes[1]]),
+                _ => continue,
+            };
+            if self
+                .code_spaces
+                .iter()
+                .any(|space| space.byte_length == length as u8 && space.contains(code))
+            {
+                return Some((length, code));
+            }
+        }
+        None
     }
 
     /// Get the minimum source CID across all mappings (char_map + ranges).
@@ -1367,12 +1419,25 @@ impl<'a> BinaryCMapStream<'a> {
         loop {
             let b = self.read_byte().ok_or("unexpected EOF in bcmap")?;
             let last = (b & 0x80) == 0;
-            n = (n << 7) | (b & 0x7f) as u32;
+            n = n
+                .checked_mul(128)
+                .and_then(|shifted| shifted.checked_add(u32::from(b & 0x7f)))
+                .ok_or_else(|| "number outside 32-bit range in bcmap".to_string())?;
             if last {
                 break;
             }
         }
         Ok(n)
+    }
+
+    fn read_signed(&mut self) -> Result<i32, String> {
+        let number = self.read_number()?;
+        let decoded = if number & 1 == 0 {
+            i64::from(number >> 1)
+        } else {
+            !(i64::from(number >> 1))
+        };
+        i32::try_from(decoded).map_err(|_| "signed number outside 32-bit range".to_string())
     }
 
     fn read_hex_number(&mut self, size: usize) -> Result<Vec<u8>, String> {
@@ -1431,6 +1496,23 @@ fn hex_to_u32(bytes: &[u8]) -> u32 {
     n
 }
 
+fn hex_to_u16(bytes: &[u8]) -> Option<u16> {
+    u16::try_from(hex_to_u32(bytes)).ok()
+}
+
+fn inc_hex(value: &mut [u8]) -> bool {
+    if value.iter().all(|&byte| byte == 0xff) {
+        return false;
+    }
+    let mut carry = 1u16;
+    for byte in value.iter_mut().rev() {
+        carry += u16::from(*byte);
+        *byte = (carry & 0xff) as u8;
+        carry >>= 8;
+    }
+    carry == 0
+}
+
 fn add_hex(a: &mut [u8], b: &[u8]) {
     let mut c = 0u16;
     for i in (0..a.len()).rev() {
@@ -1463,9 +1545,23 @@ fn bytes_to_unicode_string(bytes: &[u8]) -> Option<String> {
 }
 
 #[derive(Debug, Clone)]
+struct EncodingCodeSpace {
+    start: u16,
+    end: u16,
+    byte_length: u8,
+}
+
+impl EncodingCodeSpace {
+    fn contains(&self, code: u16) -> bool {
+        self.start <= code && code <= self.end
+    }
+}
+
+#[derive(Debug, Clone)]
 struct EncodingCMap {
     map: HashMap<u16, u16>,
     code_byte_length: u8,
+    code_spaces: Vec<EncodingCodeSpace>,
     is_identity: bool,
 }
 
@@ -1475,7 +1571,13 @@ fn build_fallback_tounicode_from_encoding(
 ) -> Option<ToUnicodeCMap> {
     let encoding = build_encoding_cmap_from_font(font_dict, doc)?;
     let ordering = get_cid_system_info_ordering(font_dict, doc)?;
-    let ucs2 = build_cmap_from_builtin_cmap(&ordering)?;
+    let ucs2 = if ordering == "GB1" {
+        get_descendant_cid_font(font_dict, doc)
+            .and_then(|cid_font_dict| build_cmap_from_cid_system_info(cid_font_dict, doc))
+    } else {
+        build_cmap_from_builtin_cmap(&ordering)
+    };
+    let ucs2 = ucs2?;
 
     if encoding.is_identity {
         // Identity mapping: charcode == CID
@@ -1492,6 +1594,7 @@ fn build_fallback_tounicode_from_encoding(
         return None;
     }
     cmap.code_byte_length = encoding.code_byte_length;
+    cmap.code_spaces = encoding.code_spaces;
     Some(cmap)
 }
 
@@ -1525,11 +1628,12 @@ fn build_encoding_cmap_from_font(
                 return Some(EncodingCMap {
                     map: HashMap::new(),
                     code_byte_length: 2,
+                    code_spaces: Vec::new(),
                     is_identity: true,
                 });
             }
             let enc_name = String::from_utf8_lossy(enc).to_string();
-            load_builtin_encoding_cmap(&enc_name)
+            load_builtin_encoding_cmap(&enc_name).ok()
         }
         Object::Reference(r) => {
             let obj = doc.get_object(*r).ok()?;
@@ -1552,36 +1656,99 @@ fn parse_encoding_cmap_object(obj: &Object, doc: &Document) -> Option<EncodingCM
     }
 }
 
-fn load_builtin_encoding_cmap(name: &str) -> Option<EncodingCMap> {
-    let data = read_builtin_cmap_file(&format!("{}.bcmap", name))?;
-    parse_binary_cmap_encoding(&data).ok()
+fn load_builtin_encoding_cmap(name: &str) -> Result<EncodingCMap, String> {
+    let file_name =
+        builtin_cmap_file_name(name).ok_or_else(|| format!("unsafe CMap name: {name}"))?;
+    let data = read_builtin_cmap_file(&file_name)
+        .ok_or_else(|| format!("missing built-in CMap: {file_name}"))?;
+    parse_binary_cmap_encoding(&data)
+}
+
+fn read_cid(stream: &mut BinaryCMapStream<'_>) -> Result<u16, String> {
+    u16::try_from(stream.read_number()?).map_err(|_| "CID outside 16-bit range".to_string())
+}
+
+/// Whether `/Encoding` names a predefined CMap shipped with pdf-inspector.
+///
+/// Unlike an embedded CMap stream, these names are selected from an untrusted
+/// PDF dictionary and must never be interpreted as filesystem paths.
+pub(crate) fn is_predefined_encoding_cmap(name: &[u8]) -> bool {
+    let name = str::from_utf8(name).ok().is_some_and(|name| {
+        builtin_cmap_file_name(name).is_some_and(|file_name| builtin_cmap_file_exists(&file_name))
+    });
+    name
+}
+
+/// Build a namespaced lookup key for a predefined Type0 encoding.
+///
+/// Multiple Type0 fonts can share both a CIDFont and an embedded font program
+/// while using different `/Encoding` CMaps. Unlike Identity encodings, their
+/// character-code mappings are not interchangeable, so the encoding and font
+/// identity must participate in the key. The high bit namespaces this synthetic
+/// 64-bit key away from PDF object numbers used by other fallback CMaps.
+pub(crate) fn type0_predefined_cmap_lookup_key(
+    font_dict: &lopdf::Dictionary,
+    descendant_font: &Object,
+) -> Option<u64> {
+    let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
+    let Object::Reference(descendant) = descendant_font else {
+        return None;
+    };
+
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let empty_base_font = [];
+    let base_font = font_dict
+        .get(b"BaseFont")
+        .ok()
+        .and_then(|value| value.as_name().ok())
+        .unwrap_or(&empty_base_font);
+    for value in [
+        encoding,
+        base_font,
+        &descendant.0.to_be_bytes(),
+        &descendant.1.to_be_bytes(),
+    ] {
+        for byte in value {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    Some(hash | 1u64 << 63)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn builtin_cmap_file_exists(name: &str) -> bool {
+    find_bcmaps_dir()
+        .map(|dir| dir.join(name).is_file())
+        .unwrap_or(false)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn builtin_cmap_file_exists(name: &str) -> bool {
+    BUILTIN_CMAPS.get_file(name).is_some()
+}
+
+fn builtin_cmap_file_name(name: &str) -> Option<String> {
+    let safe = !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | '_' | '+' | '#'));
+    safe.then(|| format!("{name}.bcmap"))
 }
 
 fn parse_encoding_cmap_stream(data: &[u8]) -> Option<EncodingCMap> {
     let text = String::from_utf8_lossy(data);
     let mut src_hex_lengths: Vec<usize> = Vec::new();
     let mut codespace_byte_len: Option<u8> = None;
+    let mut code_spaces = Vec::new();
 
     if let Some(cs_start) = text.find("begincodespacerange") {
         let section_start = cs_start + "begincodespacerange".len();
         if let Some(cs_end) = text[section_start..].find("endcodespacerange") {
             let section = &text[section_start..section_start + cs_end];
-            let mut in_hex = false;
-            let mut hex_len = 0;
-            for c in section.chars() {
-                if c == '<' {
-                    in_hex = true;
-                    hex_len = 0;
-                } else if c == '>' {
-                    if in_hex && hex_len > 0 {
-                        let byte_len = (hex_len + 1) / 2;
-                        codespace_byte_len = Some(byte_len as u8);
-                    }
-                    in_hex = false;
-                } else if in_hex && c.is_ascii_hexdigit() {
-                    hex_len += 1;
-                }
-            }
+            let (byte_len, spaces) = parse_encoding_code_spaces(section);
+            codespace_byte_len = byte_len;
+            code_spaces = spaces;
         }
     }
 
@@ -1637,8 +1804,55 @@ fn parse_encoding_cmap_stream(data: &[u8]) -> Option<EncodingCMap> {
     Some(EncodingCMap {
         map,
         code_byte_length,
+        code_spaces,
         is_identity: false,
     })
+}
+
+fn parse_encoding_code_spaces(section: &str) -> (Option<u8>, Vec<EncodingCodeSpace>) {
+    let mut hex_strings = Vec::new();
+    let mut in_hex = false;
+    let mut hex = String::new();
+    for ch in section.chars() {
+        if ch == '<' {
+            in_hex = true;
+            hex.clear();
+        } else if ch == '>' {
+            if in_hex && !hex.is_empty() {
+                hex_strings.push(hex.clone());
+            }
+            in_hex = false;
+        } else if in_hex {
+            hex.push(ch);
+        }
+    }
+
+    let mut max_byte_len: Option<u8> = None;
+    let mut spaces = Vec::new();
+    for pair in hex_strings.chunks(2) {
+        let Some((start_hex, end_hex)) = pair.first().zip(pair.get(1)) else {
+            break;
+        };
+        if start_hex.len() != end_hex.len() || start_hex.len() > 4 {
+            continue;
+        }
+        let Some((start, end)) = parse_hex_u16(start_hex).zip(parse_hex_u16(end_hex)) else {
+            continue;
+        };
+        if start > end {
+            continue;
+        }
+
+        let byte_len = start_hex.len().div_ceil(2).max(1) as u8;
+        max_byte_len = max_byte_len.map_or(Some(byte_len), |current| Some(current.max(byte_len)));
+        spaces.push(EncodingCodeSpace {
+            start,
+            end,
+            byte_length: byte_len,
+        });
+    }
+
+    (max_byte_len, spaces)
 }
 
 fn parse_cidchar_section(
@@ -1774,8 +1988,11 @@ fn assign_encoding_cid(
 fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
     let mut stream = BinaryCMapStream::new(data);
     let _header = stream.read_byte().ok_or("unexpected EOF in bcmap header")?;
+
     let mut map: HashMap<u16, u16> = HashMap::new();
+    let mut assigned = 0usize;
     let mut max_code_size: u8 = 1;
+    let mut code_spaces = Vec::new();
     let mut use_cmap: Option<String> = None;
 
     while let Some(b) = stream.read_byte() {
@@ -1793,82 +2010,158 @@ fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
             }
             continue;
         }
-        let _sequence = (b & 0x10) != 0;
+
+        let sequence = (b & 0x10) != 0;
         let data_size = (b & 0x0f) as usize;
         if data_size + 1 > 16 {
             return Err("invalid dataSize in bcmap".to_string());
         }
         max_code_size = max_code_size.max((data_size + 1) as u8);
         let subitems = stream.read_number()? as usize;
+
         match typ {
-            2 => {
-                // cidchar
-                let mut prev_code: u32 = 0;
-                for i in 0..subitems {
-                    let code_bytes = stream.read_hex_number(data_size)?;
-                    let code = hex_to_u32(&code_bytes);
-                    let cid = stream.read_number()? as u16;
-                    if i == 0 {
-                        prev_code = code;
-                        map.insert(code as u16, cid);
-                        continue;
-                    }
-                    if _sequence {
-                        prev_code = prev_code.saturating_add(1);
-                        map.insert(prev_code as u16, cid);
+            // Codespace and notdef ranges do not contribute CID mappings, but
+            // their differential operands must be consumed exactly.
+            0 | 1 => {
+                let mut previous_end = Vec::new();
+                for item in 0..subitems {
+                    let start = if item == 0 {
+                        stream.read_hex_bytes(data_size + 1)?
                     } else {
-                        map.insert(code as u16, cid);
-                        prev_code = code;
+                        if previous_end.is_empty() || !inc_hex(&mut previous_end) {
+                            return Err("code range overflows in bcmap".to_string());
+                        }
+                        if !sequence {
+                            let delta = stream.read_hex_number(data_size)?;
+                            add_hex(&mut previous_end, &delta);
+                        }
+                        previous_end.clone()
+                    };
+
+                    let end_delta = stream.read_hex_number(data_size)?;
+                    let mut end = start.clone();
+                    add_hex(&mut end, &end_delta);
+                    if typ == 0 {
+                        let start_code = hex_to_u16(&start)
+                            .ok_or_else(|| "codespace start outside 16-bit range".to_string())?;
+                        let end_code = hex_to_u16(&end)
+                            .ok_or_else(|| "codespace end outside 16-bit range".to_string())?;
+                        if start_code > end_code {
+                            return Err("inverted codespace range in bcmap".to_string());
+                        }
+                        code_spaces.push(EncodingCodeSpace {
+                            start: start_code,
+                            end: end_code,
+                            byte_length: start.len() as u8,
+                        });
+                    }
+                    previous_end = end;
+                    if typ == 1 {
+                        let _ = stream.read_number()?;
+                    }
+                }
+            }
+            2 => {
+                let mut previous_code = Vec::new();
+                let mut previous_cid = 0i64;
+                for item in 0..subitems {
+                    if item == 0 {
+                        previous_code = stream.read_hex_bytes(data_size + 1)?;
+                        previous_cid = i64::from(read_cid(&mut stream)?);
+                    } else {
+                        if !inc_hex(&mut previous_code) {
+                            return Err("code outside 16-bit range in cidchar".to_string());
+                        }
+                        if !sequence {
+                            let delta = stream.read_hex_number(data_size)?;
+                            add_hex(&mut previous_code, &delta);
+                        }
+                        previous_cid += 1 + i64::from(stream.read_signed()?);
+                    }
+
+                    let code = hex_to_u16(&previous_code)
+                        .ok_or_else(|| "code outside 16-bit range in cidchar".to_string())?;
+                    let cid = u16::try_from(previous_cid)
+                        .map_err(|_| "CID outside 16-bit range in cidchar".to_string())?;
+                    if !assign_encoding_cid(&mut map, code, cid, &mut assigned) {
+                        return Err("encoding CMap exceeds bounded expansion".to_string());
                     }
                 }
             }
             3 => {
-                // cidrange
-                for _ in 0..subitems {
-                    let start = stream.read_hex_number(data_size)?;
+                let mut start = Vec::new();
+                let mut end = Vec::new();
+                for item in 0..subitems {
+                    if item == 0 {
+                        start = stream.read_hex_bytes(data_size + 1)?;
+                    } else {
+                        if !inc_hex(&mut end) {
+                            return Err("range start outside 16-bit range".to_string());
+                        }
+                        if sequence {
+                            start.clone_from(&end);
+                        } else {
+                            let start_delta = stream.read_hex_number(data_size)?;
+                            start.clone_from(&end);
+                            add_hex(&mut start, &start_delta);
+                        }
+                    }
+
                     let end_delta = stream.read_hex_number(data_size)?;
-                    let mut end = start.clone();
+                    end.clone_from(&start);
                     add_hex(&mut end, &end_delta);
-                    let cid_start = stream.read_number()? as u16;
-                    let start_code = hex_to_u32(&start) as u16;
-                    let end_code = hex_to_u32(&end) as u16;
+                    let start_code = hex_to_u16(&start)
+                        .ok_or_else(|| "range start outside 16-bit range".to_string())?;
+                    let end_code = hex_to_u16(&end)
+                        .ok_or_else(|| "range end outside 16-bit range".to_string())?;
+                    let cid_start = read_cid(&mut stream)?;
+                    if start_code > end_code {
+                        continue;
+                    }
+
                     let mut cid = cid_start;
                     for code in start_code..=end_code {
-                        map.insert(code, cid);
+                        if !assign_encoding_cid(&mut map, code, cid, &mut assigned) {
+                            return Err("encoding CMap exceeds bounded expansion".to_string());
+                        }
                         cid = cid.saturating_add(1);
                     }
                 }
             }
-            _ => {
-                // Skip other types
-                for _ in 0..subitems {
-                    let _ = stream.read_hex_number(data_size)?;
-                    let _ = stream.read_hex_number(data_size)?;
-                    let _ = stream.read_number()?;
-                }
-            }
+            _ => return Err(format!("unsupported bcmap record type {typ}")),
         }
     }
 
     if let Some(name) = use_cmap {
-        if let Some(base) = load_builtin_encoding_cmap(&name) {
-            let mut merged = base.map;
-            merged.extend(map);
-            return Ok(EncodingCMap {
-                map: merged,
-                code_byte_length: base.code_byte_length.max(max_code_size),
-                is_identity: false,
-            });
-        }
+        let base = load_builtin_encoding_cmap(&name)?;
+        let mut merged = base.map;
+        merged.extend(map);
+        let mut merged_code_spaces = base.code_spaces;
+        merged_code_spaces.extend(code_spaces);
+        let code_byte_length = merged_code_spaces
+            .iter()
+            .map(|space| space.byte_length)
+            .max()
+            .unwrap_or(base.code_byte_length.max(max_code_size));
+        return Ok(EncodingCMap {
+            map: merged,
+            code_byte_length,
+            code_spaces: merged_code_spaces,
+            is_identity: false,
+        });
     }
 
     Ok(EncodingCMap {
         map,
-        code_byte_length: max_code_size,
+        code_byte_length: code_spaces
+            .iter()
+            .map(|space| space.byte_length)
+            .max()
+            .unwrap_or(max_code_size),
+        code_spaces,
         is_identity: false,
     })
 }
-
 fn load_builtin_cmap_by_name(name: &str) -> Option<ToUnicodeCMap> {
     if !name.ends_with("UCS2") {
         return None;
@@ -2014,7 +2307,19 @@ fn build_cmap_from_cid_system_info(
             );
             Some(cmap)
         }
-        "Japan1" | "GB1" | "CNS1" => build_cmap_from_builtin_cmap(&ordering),
+        "GB1" => {
+            use crate::adobe_gb1::ADOBE_GB1_CID_TO_UNICODE;
+            let mut cmap = ToUnicodeCMap::new();
+            for &(cid, unicode) in ADOBE_GB1_CID_TO_UNICODE.iter() {
+                if let Some(ch) = char::from_u32(unicode as u32) {
+                    cmap.char_map.insert(cid, ch.to_string());
+                }
+            }
+            cmap.code_byte_length = 2;
+            debug!("Adobe-GB1 predefined CMap: {} entries", cmap.char_map.len());
+            Some(cmap)
+        }
+        "Japan1" | "CNS1" => build_cmap_from_builtin_cmap(&ordering),
         _ => None,
     }
 }
@@ -2023,7 +2328,7 @@ fn build_cmap_from_cid_system_info(
 #[derive(Debug, Default, Clone)]
 pub struct FontCMaps {
     /// Map of ToUnicode object number to CMap
-    by_obj_num: HashMap<u32, CMapEntry>,
+    by_obj_num: HashMap<u64, CMapEntry>,
 }
 
 /// Primary CMap plus optional alternative variants.
@@ -2062,7 +2367,7 @@ impl FontCMaps {
         page_filter: Option<&HashSet<u32>>,
         skip_truetype_fallback: bool,
     ) -> Self {
-        let mut by_obj_num: HashMap<u32, CMapEntry> = HashMap::new();
+        let mut by_obj_num: HashMap<u64, CMapEntry> = HashMap::new();
 
         for (page_num, &page_id) in doc.get_pages().iter() {
             if let Some(filter) = page_filter {
@@ -2094,7 +2399,7 @@ impl FontCMaps {
     fn collect_cmaps_from_fonts(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        by_obj_num: &mut HashMap<u64, CMapEntry>,
     ) {
         Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, false);
     }
@@ -2102,7 +2407,7 @@ impl FontCMaps {
     fn collect_cmaps_from_fonts_inner(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        by_obj_num: &mut HashMap<u64, CMapEntry>,
         skip_truetype_fallback: bool,
     ) {
         // First pass: collect ToUnicode CMaps
@@ -2115,7 +2420,7 @@ impl FontCMaps {
                 Some(r) => r,
                 None => continue,
             };
-            let obj_num = obj_ref.0;
+            let obj_num = u64::from(obj_ref.0);
             if by_obj_num.contains_key(&obj_num) {
                 continue;
             }
@@ -2136,7 +2441,7 @@ impl FontCMaps {
                     cmap.ranges.len()
                 );
                 let (mut primary, mut remapped) =
-                    try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+                    try_remap_subset_cmap(cmap, font_dict, doc, obj_ref.0);
 
                 // Only build expensive fallbacks when the primary CMap is sparse.
                 // build_fallback_cmap_for_type0 can take seconds on large embedded
@@ -2207,8 +2512,10 @@ impl FontCMaps {
             }
         }
 
-        // Second pass: Identity-H/V fonts without ToUnicode
-        // Try: (1) embedded TrueType/OpenType cmap, (2) predefined CID→Unicode mapping
+        // Second pass: Type0 fonts without ToUnicode
+        // For Identity-H/V, try an embedded TrueType/OpenType cmap and then the
+        // predefined CID→Unicode mapping. For other predefined encodings such
+        // as GBK-EUC-H, compose encoding code→CID and collection CID→Unicode.
         // Skip entirely in fast mode — these fonts require expensive TrueType parsing.
         if skip_truetype_fallback {
             return;
@@ -2225,7 +2532,8 @@ impl FontCMaps {
                 Some(name) => name,
                 None => continue,
             };
-            if encoding != b"Identity-H" && encoding != b"Identity-V" {
+            let is_identity = encoding == b"Identity-H" || encoding == b"Identity-V";
+            if !is_identity && !is_predefined_encoding_cmap(encoding) {
                 continue;
             }
             // Navigate: DescendantFonts[0]
@@ -2277,46 +2585,80 @@ impl FontCMaps {
                     })
             });
 
-            // The lookup key must match what get_font_file2_obj_num() returns:
-            // font file obj_num if present, else CIDFont dict obj_num
-            let lookup_key = font_file_ref
-                .map(|r| r.0)
-                .unwrap_or_else(|| match &desc_fonts[0] {
-                    Object::Reference(r) => r.0,
-                    _ => 0,
-                });
+            // The lookup key must match what get_font_cmap_lookup_key() returns:
+            // a namespaced encoding identity for predefined CMaps, otherwise the
+            // font file obj_num or CIDFont dict obj_num.
+            let lookup_key = if !is_identity {
+                let Some(key) = type0_predefined_cmap_lookup_key(font_dict, &desc_fonts[0]) else {
+                    continue;
+                };
+                key
+            } else {
+                font_file_ref
+                    .map(|r| u64::from(r.0))
+                    .unwrap_or_else(|| match &desc_fonts[0] {
+                        Object::Reference(r) => u64::from(r.0),
+                        _ => 0,
+                    })
+            };
             if lookup_key == 0 || by_obj_num.contains_key(&lookup_key) {
                 continue;
             }
 
+            // A non-identity predefined encoding carries character codes, not
+            // CIDs. Composition through both shipped CMaps is cheaper and more
+            // direct than trying to interpret an embedded font program.
+            if !is_identity {
+                if let Some(cmap) = build_fallback_tounicode_from_encoding(font_dict, doc) {
+                    debug!(
+                        "Predefined encoding CMap obj={:<6} ({}) char_map={}",
+                        lookup_key,
+                        String::from_utf8_lossy(encoding),
+                        cmap.char_map.len()
+                    );
+                    by_obj_num.insert(
+                        lookup_key,
+                        CMapEntry {
+                            primary: cmap,
+                            remapped: None,
+                            fallback: None,
+                        },
+                    );
+                    resolved = true;
+                }
+            }
+
             // Try parsing embedded TrueType/OpenType cmap
-            if let Some(ff_ref) = font_file_ref {
-                if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                    let data = match stream.decompressed_content() {
-                        Ok(d) => d,
-                        Err(_) => stream.content.clone(),
-                    };
-                    if let Some(cmap) = build_cmap_from_truetype(&data) {
-                        debug!(
-                            "TrueType CMap obj={:<6} (embedded font) char_map={}",
-                            lookup_key,
-                            cmap.char_map.len()
-                        );
-                        by_obj_num.insert(
-                            lookup_key,
-                            CMapEntry {
-                                primary: cmap,
-                                remapped: None,
-                                fallback: None,
-                            },
-                        );
-                        resolved = true;
+            if !resolved {
+                if let Some(ff_ref) = font_file_ref {
+                    if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
+                        let data = match stream.decompressed_content() {
+                            Ok(d) => d,
+                            Err(_) => stream.content.clone(),
+                        };
+                        if let Some(cmap) = build_cmap_from_truetype(&data) {
+                            debug!(
+                                "TrueType CMap obj={:<6} (embedded font) char_map={}",
+                                lookup_key,
+                                cmap.char_map.len()
+                            );
+                            by_obj_num.insert(
+                                lookup_key,
+                                CMapEntry {
+                                    primary: cmap,
+                                    remapped: None,
+                                    fallback: None,
+                                },
+                            );
+                            resolved = true;
+                        }
                     }
                 }
             }
 
-            // Fallback: predefined CID→Unicode mapping from CIDSystemInfo
-            if !resolved {
+            // Identity encodings can use CIDSystemInfo directly because their
+            // character codes are already CIDs.
+            if !resolved && is_identity {
                 if let Some(cmap) = build_cmap_from_cid_system_info(cid_font_dict, doc) {
                     debug!(
                         "Predefined CMap obj={:<6} (CIDSystemInfo) char_map={}",
@@ -2410,7 +2752,7 @@ impl FontCMaps {
                 Some(r) => r,
                 None => continue,
             };
-            let lookup_key = ff_ref.0;
+            let lookup_key = u64::from(ff_ref.0);
             if by_obj_num.contains_key(&lookup_key) {
                 continue;
             }
@@ -2440,7 +2782,7 @@ impl FontCMaps {
     fn collect_cmaps_from_xobjects(
         doc: &Document,
         page_id: ObjectId,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        by_obj_num: &mut HashMap<u64, CMapEntry>,
     ) {
         let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
             Ok(r) => r,
@@ -2463,7 +2805,7 @@ impl FontCMaps {
     fn walk_xobject_fonts(
         resources: &lopdf::Dictionary,
         doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        by_obj_num: &mut HashMap<u64, CMapEntry>,
         visited: &mut HashSet<ObjectId>,
     ) {
         let xobject_dict = match resources.get(b"XObject") {
@@ -2526,7 +2868,11 @@ impl FontCMaps {
 
     /// Get a CMap by ToUnicode object number
     pub fn get_by_obj(&self, obj_num: u32) -> Option<&CMapEntry> {
-        self.by_obj_num.get(&obj_num)
+        self.by_obj_num.get(&u64::from(obj_num))
+    }
+
+    pub(crate) fn get_by_cmap_lookup_key(&self, lookup_key: u64) -> Option<&CMapEntry> {
+        self.by_obj_num.get(&lookup_key)
     }
 }
 
@@ -2663,6 +3009,7 @@ fn build_fallback_cmap_for_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     #[test]
     fn test_parse_bfchar_2byte() {
@@ -3481,5 +3828,164 @@ endbfrange
         assert!(enc.map.len() <= MAX_CID_W_EXPANSION);
         assert_eq!(enc.map.get(&0), Some(&0));
         assert_eq!(enc.map.get(&65535), Some(&65535));
+    }
+
+    #[test]
+    fn gbk_euc_h_binary_cmap_maps_issue_code_points() {
+        let encoding = load_builtin_encoding_cmap("GBK-EUC-H").unwrap();
+
+        assert_eq!(encoding.code_byte_length, 2);
+        assert_eq!(encoding.map.get(&0xB6AB), Some(&1514));
+        assert_eq!(encoding.map.get(&0xB7BD), Some(&1626));
+        assert!(encoding.map.len() > 20_000);
+    }
+
+    #[test]
+    fn gbk_euc_h_preserves_mixed_width_code_spaces() {
+        let encoding = load_builtin_encoding_cmap("GBK-EUC-H").unwrap();
+        let lengths: HashSet<_> = encoding
+            .code_spaces
+            .iter()
+            .map(|space| space.byte_length)
+            .collect();
+
+        assert_eq!(lengths, HashSet::from([1, 2]));
+        assert_eq!(encoding.map.get(&0x42), Some(&847));
+
+        let mut cmap = ToUnicodeCMap::new();
+        cmap.char_map.insert(0x41, "A".to_string());
+        cmap.char_map.insert(0x42, "B".to_string());
+        cmap.char_map.insert(0x43, "C".to_string());
+        cmap.char_map.insert(0x44, "D".to_string());
+        cmap.char_map.insert(0xB6AB, "\u{4E1C}".to_string());
+        cmap.code_byte_length = encoding.code_byte_length;
+        cmap.code_spaces = encoding.code_spaces;
+
+        assert_eq!(cmap.decode_cids(b"ABCD"), "ABCD");
+        assert_eq!(cmap.decode_cids(b"AB\xb6\xabCD"), "AB\u{4E1C}CD");
+    }
+
+    #[test]
+    fn embedded_encoding_cmap_preserves_mixed_width_code_spaces() {
+        let data = b"\
+            2 begincodespacerange\n\
+            <20> <7e>\n\
+            <8140> <fffc>\n\
+            endcodespacerange\n\
+            2 begincidchar\n\
+            <41> 1\n\
+            <8140> 2\n\
+            endcidchar\n";
+        let encoding = parse_encoding_cmap_stream(data).unwrap();
+        let lengths: HashSet<_> = encoding
+            .code_spaces
+            .iter()
+            .map(|space| space.byte_length)
+            .collect();
+
+        assert_eq!(lengths, HashSet::from([1, 2]));
+        assert_eq!(encoding.code_spaces[0].start, 0x20);
+        assert_eq!(encoding.code_spaces[0].end, 0x7e);
+        assert_eq!(encoding.code_spaces[1].start, 0x8140);
+        assert_eq!(encoding.code_spaces[1].end, 0xfffc);
+    }
+
+    #[test]
+    fn shared_cid_font_predefined_encodings_get_distinct_cmaps() {
+        let mut doc = Document::with_version("1.7");
+        let cid_system_info_id = doc.add_object(dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("GB1"),
+            "Supplement" => 2,
+        });
+        let cid_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "SimSun",
+            "CIDSystemInfo" => cid_system_info_id,
+        });
+
+        let gbk_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "SimSun",
+            "Encoding" => "GBK-EUC-H",
+            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+        });
+        let unigb_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "SimSun",
+            "Encoding" => "UniGB-UCS2-H",
+            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+        });
+
+        let mut fonts = std::collections::BTreeMap::new();
+        for (name, font_id) in [
+            (b"F1".to_vec(), gbk_font_id),
+            (b"F2".to_vec(), unigb_font_id),
+        ] {
+            fonts.insert(name, doc.get_dictionary(font_id).unwrap());
+        }
+        let gbk_font = doc.get_dictionary(gbk_font_id).unwrap().clone();
+        let unigb_font = doc.get_dictionary(unigb_font_id).unwrap().clone();
+        let descendant = Object::Reference(cid_font_id);
+        let gbk_key = type0_predefined_cmap_lookup_key(&gbk_font, &descendant).unwrap();
+        let unigb_key = type0_predefined_cmap_lookup_key(&unigb_font, &descendant).unwrap();
+        assert_ne!(gbk_key, unigb_key);
+        assert_ne!(gbk_key & (1u64 << 63), 0);
+        assert_ne!(unigb_key & (1u64 << 63), 0);
+
+        let mut by_obj_num = HashMap::new();
+        FontCMaps::collect_cmaps_from_fonts_inner(&fonts, &doc, &mut by_obj_num, false);
+        let gbk_entry = by_obj_num.get(&gbk_key).expect("GBK encoding CMap");
+        let unigb_entry = by_obj_num.get(&unigb_key).expect("UniGB encoding CMap");
+        assert!(gbk_entry.primary.char_map.len() > 20_000);
+        assert!(unigb_entry.primary.char_map.len() > 20_000);
+    }
+
+    #[test]
+    fn predefined_cmap_lookup_keys_do_not_use_a_narrow_hash() {
+        // These identities collide in the low 31 bits of 32-bit FNV-1a.
+        // A wider namespaced hash must keep both fonts addressable.
+        let gbk_font = dictionary! {
+            "Encoding" => Object::Name(b"GBK-EUC-H".to_vec()),
+            "BaseFont" => Object::Name(b"xiAzqv".to_vec()),
+        };
+        let unigb_font = dictionary! {
+            "Encoding" => Object::Name(b"UniGB-UCS2-H".to_vec()),
+            "BaseFont" => Object::Name(b"mzN86S".to_vec()),
+        };
+        let descendant = Object::Reference((12, 0));
+
+        let gbk_key = type0_predefined_cmap_lookup_key(&gbk_font, &descendant).unwrap();
+        let unigb_key = type0_predefined_cmap_lookup_key(&unigb_font, &descendant).unwrap();
+
+        assert_ne!(gbk_key, unigb_key);
+    }
+
+    #[test]
+    fn inc_hex_rejects_increment_past_the_16_bit_domain() {
+        let mut code = [0xff, 0xff];
+        assert!(!inc_hex(&mut code));
+        assert_eq!(code, [0xff, 0xff]);
+    }
+
+    #[test]
+    fn read_signed_decodes_high_unsigned_values_without_truncation() {
+        // 0x80000000 is a positive zigzag value; casting through i32 would
+        // incorrectly turn it into a negative delta.
+        let mut stream = BinaryCMapStream::new(&[0x88, 0x80, 0x80, 0x80, 0x00]);
+        assert_eq!(stream.read_signed().unwrap(), 1_073_741_824);
+        let mut overflowing = BinaryCMapStream::new(&[0x90, 0x80, 0x80, 0x80, 0x00]);
+        assert!(overflowing.read_signed().is_err());
+    }
+
+    #[test]
+    fn adobe_gb1_prefers_plain_ideographs_for_reverse_mapping() {
+        use crate::adobe_gb1::lookup_gb1;
+
+        assert_eq!(lookup_gb1(1514), Some('东'));
+        assert_eq!(lookup_gb1(1626), Some('方'));
     }
 }
