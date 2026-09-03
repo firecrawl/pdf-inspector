@@ -637,11 +637,14 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
 /// The item's horizontal extent for layout heuristics. The box already
 /// holds an estimate for runs whose font carries no width metrics (laid
 /// along the run at extraction, flagged by `TextItem::advance_known ==
-/// false`), so a positive width is taken as is. A box without one — a
-/// genuine zero advance, or a merged item whose fragments ran backwards —
-/// still gets the classic half-em-per-character stand-in, as it always did:
-/// column detection and region routing need an extent to reason with, and a
-/// zero or negative one would reshape a page around a single fragment.
+/// false`), so a positive width is taken as is. A box without one gets the
+/// classic half-em-per-character stand-in, as it always did — whether the
+/// width is negative (a merged item whose fragments ran backwards) or a
+/// measured zero: a glyph drawn with a zero advance (an Arabic hamza or a
+/// combining mark positioned by hand) still covers a glyph's worth of page,
+/// and column detection and region routing need that footprint or they
+/// displace it into another line and split the word. The stand-in is a
+/// layout extent only; the item's box keeps its measured width.
 pub(crate) fn effective_width(item: &TextItem) -> f32 {
     if item.width > 0.0 {
         item.width
@@ -1957,10 +1960,12 @@ mod tests {
     fn extent_helpers_pass_the_box_through() {
         // Estimates for width-less fonts are laid into the box at extraction
         // and flagged, so the helpers never second-guess a positive width;
-        // only a box without one falls back to half an em per character.
+        // a box without one — measured zero or backwards — falls back to
+        // half an em per character so layout has a footprint to reason with.
         let mut zero = geometry_item(0.0, 10.0, 0.0);
         zero.text = "ab".to_string();
         zero.font_size = 10.0;
+        assert!(zero.advance_known);
         assert_eq!(
             (effective_width(&zero), effective_height(&zero)),
             (10.0, 10.0)
@@ -1968,6 +1973,9 @@ mod tests {
         let mut backwards = zero.clone();
         backwards.width = -1.7;
         assert_eq!(effective_width(&backwards), 10.0);
+        let mut unmeasured = zero.clone();
+        unmeasured.advance_known = false;
+        assert_eq!(effective_width(&unmeasured), 10.0);
         let mut estimated = geometry_item(20.0, 10.0, 0.0);
         estimated.advance_known = false;
         assert_eq!(effective_width(&estimated), 20.0);

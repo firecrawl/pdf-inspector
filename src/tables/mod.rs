@@ -460,69 +460,95 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         }
     }
 
-    // Group items into per-column lines to check newspaper vs tabular
-    let mut col_buckets: Vec<Vec<TextItem>> = vec![Vec::new(); columns.len()];
-    let mut spanning_items: Vec<TextItem> = Vec::new();
-    for item in items {
-        if item.page != page {
-            continue;
-        }
-        // Check if item spans multiple columns
-        let item_left = item.x;
-        let item_right = item.x + item.width;
-        let mut spans = 0;
-        for col in &columns {
-            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
-            if overlap > 0.0 {
-                spans += 1;
+    // Group items into per-column lines to check newspaper vs tabular.
+    // Items in `excluded` (vertical runs standing across other rows, found
+    // below once the rows are known) take no part in the grouping.
+    let y_tol = 5.0;
+    let group = |excluded: &std::collections::HashSet<usize>| {
+        let mut col_buckets: Vec<Vec<TextItem>> = vec![Vec::new(); columns.len()];
+        let mut spanning_items: Vec<TextItem> = Vec::new();
+        for (item_idx, item) in items.iter().enumerate() {
+            if item.page != page || excluded.contains(&item_idx) {
+                continue;
             }
-        }
-        if spans > 1 {
-            spanning_items.push(item.clone());
-            continue;
-        }
-        // Assign to best-overlap column
-        let mut best_col = 0;
-        let mut best_overlap = f32::NEG_INFINITY;
-        for (ci, col) in columns.iter().enumerate() {
-            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
-            if overlap > best_overlap {
-                best_overlap = overlap;
-                best_col = ci;
+            // Check if item spans multiple columns
+            let item_left = item.x;
+            let item_right = item.x + item.width;
+            let mut spans = 0;
+            for col in &columns {
+                let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+                if overlap > 0.0 {
+                    spans += 1;
+                }
             }
+            if spans > 1 {
+                spanning_items.push(item.clone());
+                continue;
+            }
+            // Assign to best-overlap column
+            let mut best_col = 0;
+            let mut best_overlap = f32::NEG_INFINITY;
+            for (ci, col) in columns.iter().enumerate() {
+                let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+                if overlap > best_overlap {
+                    best_overlap = overlap;
+                    best_col = ci;
+                }
+            }
+            col_buckets[best_col].push(item.clone());
         }
-        col_buckets[best_col].push(item.clone());
-    }
 
-    let thresholds = HashMap::new();
-    let per_column_lines: Vec<Vec<crate::types::TextLine>> = col_buckets
+        let thresholds = HashMap::new();
+        let per_column_lines: Vec<Vec<crate::types::TextLine>> = col_buckets
+            .iter()
+            .map(|bucket| {
+                group_into_lines_with_thresholds(
+                    bucket.clone(),
+                    &thresholds,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .collect();
+
+        // Collect all unique Y positions across all columns (row boundaries)
+        let mut row_ys: Vec<f32> = Vec::new();
+        for col_lines in &per_column_lines {
+            for line in col_lines {
+                let y = line.y;
+                if !row_ys.iter().any(|&ry| (ry - y).abs() < y_tol) {
+                    row_ys.push(y);
+                }
+            }
+        }
+        row_ys.sort_by(|a, b| b.total_cmp(a));
+        (per_column_lines, row_ys)
+    };
+
+    // First pass finds the rows; a vertical run standing across two or more
+    // other rows (a running head beside a turned table) is then excluded and
+    // the rows collected again, so its foot seeds no phantom row either.
+    let (mut per_column_lines, mut row_ys) = group(&std::collections::HashSet::new());
+    let crossing: std::collections::HashSet<usize> = items
         .iter()
-        .map(|bucket| {
-            group_into_lines_with_thresholds(
-                bucket.clone(),
-                &thresholds,
-                &std::collections::HashSet::new(),
-            )
+        .enumerate()
+        .filter(|(_, item)| {
+            item.page == page && {
+                let own = row_ys
+                    .iter()
+                    .position(|&ry| (ry - item.line_y()).abs() < y_tol);
+                crosses_other_rows(item, &row_ys, own)
+            }
         })
+        .map(|(idx, _)| idx)
         .collect();
+    if !crossing.is_empty() {
+        (per_column_lines, row_ys) = group(&crossing);
+    }
 
     // Must be tabular (not newspaper) layout
     if is_newspaper_layout(&per_column_lines, &columns) {
         return None;
     }
-
-    // Collect all unique Y positions across all columns (row boundaries)
-    let y_tol = 5.0;
-    let mut row_ys: Vec<f32> = Vec::new();
-    for col_lines in &per_column_lines {
-        for line in col_lines {
-            let y = line.y;
-            if !row_ys.iter().any(|&ry| (ry - y).abs() < y_tol) {
-                row_ys.push(y);
-            }
-        }
-    }
-    row_ys.sort_by(|a, b| b.total_cmp(a));
 
     if row_ys.len() < 3 || row_ys.len() > 40 {
         return None;
@@ -563,9 +589,8 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         let row = row_ys
             .iter()
             .position(|&ry| (ry - item.line_y()).abs() < y_tol);
-        // A vertical run standing across other rows (a running head beside a
-        // turned table) is not cell content.
-        if crosses_other_rows(item, &row_ys, row) {
+        // Vertical runs standing across other rows were excluded above.
+        if crossing.contains(&item_idx) {
             continue;
         }
         if let Some(row) = row {
@@ -1533,6 +1558,38 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn column_table_leaves_out_a_vertical_run_across_rows() {
+        // A 4x5 grid of short cells (the builder wants four page columns),
+        // plus a vertical run whose foot sits just below the last row and
+        // whose extent covers every row: a running head beside a turned
+        // table. It fills no cell and seeds no row.
+        let mut grid: Vec<TextItem> = Vec::new();
+        for (r, y) in [700.0, 680.0, 660.0, 640.0, 620.0].into_iter().enumerate() {
+            for (c, x) in [60.0, 180.0, 300.0, 420.0].into_iter().enumerate() {
+                grid.push(make_item(&format!("{}{}", r + 1, c + 1), x, y, 10.0));
+            }
+        }
+        let columns = crate::extractor::detect_columns(&grid, 1, false);
+        assert!(columns.len() >= 4, "columns detected: {}", columns.len());
+        let plain = try_build_table_from_columns(&grid, 1).expect("grid is a table");
+        assert_eq!(plain.cells.len(), 5);
+
+        let mut head = make_item("Running head", 60.0, 613.0, 8.0);
+        head.rotation = 90.0;
+        head.width = 8.0;
+        head.height = 100.0;
+        let mut with_head = grid.clone();
+        with_head.push(head);
+        let table = try_build_table_from_columns(&with_head, 1).expect("still a table");
+        assert_eq!(table.cells.len(), 5, "{:?}", table.cells);
+        assert!(
+            table.cells.iter().flatten().all(|c| !c.contains("Running")),
+            "{:?}",
+            table.cells
+        );
+    }
+
     use super::*;
     use crate::types::{ItemType, TextItem};
 
