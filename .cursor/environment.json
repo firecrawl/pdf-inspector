@@ -1,0 +1,5 @@
+{
+  "name": "pdf-inspector",
+  "install": "./scripts/cloud-agent-install.sh",
+  "repositoryDependencies": ["github.com/firecrawl/pdf-evals"]
+}
