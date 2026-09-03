@@ -471,13 +471,13 @@ pub fn detect_tables_from_struct_tree(
                     crate::text_utils::sort_rtl_cell_items(
                         &mut cell_items,
                         |(_, i)| i.x,
-                        |(_, i)| i.y,
+                        |(_, i)| i.line_y(),
                         |(_, i)| i.text.as_str(),
                     );
                 } else {
                     cell_items.sort_by(|a, b| {
-                        b.1.y
-                            .partial_cmp(&a.1.y)
+                        b.1.line_y()
+                            .partial_cmp(&a.1.line_y())
                             .unwrap_or(std::cmp::Ordering::Equal)
                             .then(
                                 a.1.x
@@ -487,11 +487,11 @@ pub fn detect_tables_from_struct_tree(
                     });
                 }
 
-                let text: String = cell_items
-                    .iter()
-                    .map(|(_, item)| item.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let mut text = String::new();
+                let mut last = None;
+                for (_, item) in &cell_items {
+                    super::cell_text::push_cell_item(&mut text, &mut last, item, &item.text);
+                }
 
                 let item_indices = cell_items.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
                 let x = cell_items.iter().map(|(_, item)| item.x).reduce(f32::min);
@@ -603,6 +603,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid,
+            baseline_shift: 0.0,
         }
     }
 

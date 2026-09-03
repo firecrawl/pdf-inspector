@@ -68,18 +68,19 @@ fn page_x_bounds(items: &[TextItem], images: &[ImageRegion]) -> Option<(f32, f32
 fn group_rows(items: &[TextItem]) -> Vec<Row<'_>> {
     const Y_TOLERANCE: f32 = 3.0;
     let mut sorted: Vec<&TextItem> = items.iter().collect();
-    sorted.sort_by(|left, right| right.y.total_cmp(&left.y));
+    sorted.sort_by(|left, right| right.line_y().total_cmp(&left.line_y()));
     let mut rows: Vec<Row<'_>> = Vec::new();
     for item in sorted {
         if let Some(row) = rows
             .last_mut()
-            .filter(|row| (row.y - item.y).abs() <= Y_TOLERANCE)
+            .filter(|row| (row.y - item.line_y()).abs() <= Y_TOLERANCE)
         {
             row.items.push(item);
-            row.y = row.items.iter().map(|member| member.y).sum::<f32>() / row.items.len() as f32;
+            row.y = row.items.iter().map(|member| member.line_y()).sum::<f32>()
+                / row.items.len() as f32;
         } else {
             rows.push(Row {
-                y: item.y,
+                y: item.line_y(),
                 items: vec![item],
             });
         }
@@ -401,9 +402,9 @@ pub(crate) fn build_region_graph(items: Vec<TextItem>, band: ColumnFlowBand) -> 
     let mut right = Vec::new();
     let mut below = Vec::new();
     for item in items {
-        if item.y > band.y_top {
+        if item.line_y() > band.y_top {
             above.push(item);
-        } else if item.y < band.y_bottom {
+        } else if item.line_y() < band.y_bottom {
             below.push(item);
         } else if item.x + effective_width(&item) / 2.0 < band.split_x {
             left.push(item);
@@ -449,6 +450,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 

@@ -301,6 +301,15 @@ jobs:
           assert result.pages[0].markdown.strip()
           PY
 
+      # The wheel installed above is the release build of the Python bindings,
+      # so the binding test suite runs here instead of paying for a second
+      # release build in its own job.
+      - name: Run Python binding tests
+        shell: bash
+        run: |
+          python -m pip install 'pytest>=8,<10'
+          python -m pytest tests/test_python.py -q
+
   wasm:
     name: WebAssembly
     runs-on: blacksmith-4vcpu-ubuntu-2404

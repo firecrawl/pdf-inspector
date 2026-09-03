@@ -25,8 +25,8 @@ CI and every publishing workflow run this check before building or publishing.
 
 ## Release steps
 
-1. Choose the next shared semantic version, describe the release in
-   `CHANGELOG.md`, and run `scripts/version.py`.
+1. Choose the next shared semantic version, rename the `Unreleased` section of
+   `CHANGELOG.md` to it, and run `scripts/version.py`.
 2. Review the manifest and lockfile changes in the version-bump pull request.
 3. Merge the pull request to `main`.
 4. The crates.io, PyPI, Node, and WASM workflows independently build and

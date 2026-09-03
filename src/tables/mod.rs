@@ -2,6 +2,7 @@
 //!
 //! Detects tabular data in PDF text items and converts to markdown tables.
 
+mod cell_text;
 mod detect_heuristic;
 mod detect_lines;
 pub(crate) mod detect_rects;
@@ -96,8 +97,13 @@ pub(crate) fn try_build_rect_guided_table(
         }
     }
 
-    // 3. Derive row boundaries from item Y positions (5pt tolerance)
-    let mut y_values: Vec<f32> = expanded_items.iter().map(|(item, _)| item.y).collect();
+    // 3. Derive row boundaries from item Y positions (5pt tolerance). Body
+    //    baselines (`line_y`) on both sides — here and in the assignment
+    //    below — so a raised marker never opens a phantom row of its own.
+    let mut y_values: Vec<f32> = expanded_items
+        .iter()
+        .map(|(item, _)| item.line_y())
+        .collect();
     y_values.sort_by(|a, b| b.total_cmp(a)); // descending
     let mut row_boundaries: Vec<f32> = Vec::new();
     for y in &y_values {
@@ -117,6 +123,7 @@ pub(crate) fn try_build_rect_guided_table(
     let n_rows = row_boundaries.len();
     let n_cols = col_boundaries.len();
     let mut cells: Vec<Vec<String>> = vec![vec![String::new(); n_cols]; n_rows];
+    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; n_cols]; n_rows];
     let mut used_indices: Vec<usize> = Vec::new();
 
     // Compute max X to exclude legend text beyond the table area
@@ -136,18 +143,19 @@ pub(crate) fn try_build_rect_guided_table(
         // Find row (nearest Y within tolerance)
         let row = row_boundaries
             .iter()
-            .position(|&ry| (ry - item.y).abs() <= 5.0);
+            .position(|&ry| (ry - item.line_y()).abs() <= 5.0);
         // Find column: rightmost boundary ≤ item.x + tolerance.
         // 4pt tolerance catches annotation items (e.g. "Memorial Day") that sit
         // slightly before the next column boundary.
         let col = col_boundaries.iter().rposition(|&cx| item.x >= cx - 4.0);
 
         if let (Some(r), Some(c)) = (row, col) {
-            let cell = &mut cells[r][c];
-            if !cell.is_empty() {
-                cell.push(' ');
-            }
-            cell.push_str(item.text.trim());
+            cell_text::push_cell_item(
+                &mut cells[r][c],
+                &mut last_items[r][c],
+                item,
+                item.text.trim(),
+            );
             used_indices.push(*orig_idx);
         }
     }
@@ -302,6 +310,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_strikeout: item.is_strikeout,
             item_type: item.item_type.clone(),
             mcid: item.mcid,
+            baseline_shift: item.baseline_shift,
         });
     }
 
@@ -325,6 +334,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_strikeout: item.is_strikeout,
             item_type: item.item_type.clone(),
             mcid: item.mcid,
+            baseline_shift: item.baseline_shift,
         });
     }
 
@@ -491,6 +501,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
     // Build cell grid
     let col_xs: Vec<f32> = columns.iter().map(|c| c.x_min).collect();
     let mut cells: Vec<Vec<String>> = vec![vec![String::new(); columns.len()]; row_ys.len()];
+    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; columns.len()]; row_ys.len()];
     let mut item_indices: Vec<usize> = Vec::new();
 
     for (item_idx, item) in items.iter().enumerate() {
@@ -519,12 +530,16 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         let col = best_col.unwrap();
 
         // Find row
-        let row = row_ys.iter().position(|&ry| (ry - item.y).abs() < y_tol);
+        let row = row_ys
+            .iter()
+            .position(|&ry| (ry - item.line_y()).abs() < y_tol);
         if let Some(row) = row {
-            if !cells[row][col].is_empty() {
-                cells[row][col].push(' ');
-            }
-            cells[row][col].push_str(&item.text);
+            cell_text::push_cell_item(
+                &mut cells[row][col],
+                &mut last_items[row][col],
+                item,
+                &item.text,
+            );
             item_indices.push(item_idx);
         }
     }
@@ -1038,14 +1053,15 @@ fn infer_key_value_split_x(rows: &[VisualRow], median_font_size: f32) -> Option<
 }
 
 fn join_row_item_text(items: &[&RowItem]) -> String {
-    let mut parts = Vec::new();
+    let mut text = String::new();
+    let mut last = None;
     for item in items {
         let trimmed = item.item.text.trim();
         if !trimmed.is_empty() {
-            parts.push(trimmed);
+            cell_text::push_cell_item(&mut text, &mut last, &item.item, trimmed);
         }
     }
-    normalize_cell_text(&parts.join(" "))
+    normalize_cell_text(&text)
 }
 
 fn normalize_cell_text(text: &str) -> String {
@@ -1502,6 +1518,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1522,6 +1539,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 

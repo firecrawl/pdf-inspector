@@ -79,7 +79,7 @@ fn format_items_json(items: &[TextItem]) -> String {
                 _ => String::new(),
             };
             format!(
-                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"is_strikeout":{},"item_type":"{}","mcid":{}{}}}"#,
+                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"is_strikeout":{},"baseline_shift":{:.2},"item_type":"{}","mcid":{}{}}}"#,
                 json_escape(&item.text),
                 item.page,
                 item.x,
@@ -93,6 +93,7 @@ fn format_items_json(items: &[TextItem]) -> String {
                 item.is_italic,
                 item.is_underline,
                 item.is_strikeout,
+                item.baseline_shift,
                 item_type_label(&item.item_type),
                 mcid,
                 link_url,
@@ -284,6 +285,7 @@ mod tests {
             is_strikeout: true,
             item_type: ItemType::Text,
             mcid: Some(7),
+            baseline_shift: 3.5,
         }];
 
         let json = format_items_json(&items);
@@ -292,6 +294,7 @@ mod tests {
         assert!(json.contains(r#""page":2"#));
         assert!(json.contains(r#""x":12.35"#));
         assert!(json.contains(r#""is_underline":true"#));
+        assert!(json.contains(r#""baseline_shift":3.50"#));
         assert!(json.contains(r#""item_type":"text""#));
         assert!(json.contains(r#""mcid":7"#));
     }

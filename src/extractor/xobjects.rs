@@ -472,6 +472,7 @@ fn extract_form_xobject_text_inner(
                                     is_strikeout: false,
                                     item_type: ItemType::Image,
                                     mcid: None,
+                                    baseline_shift: 0.0,
                                 });
                             }
                             None => {}
@@ -692,6 +693,7 @@ fn extract_form_xobject_text_inner(
                                 is_strikeout: false,
                                 item_type: ItemType::Text,
                                 mcid: None,
+                                baseline_shift: 0.0,
                             });
                         }
                     }
@@ -896,6 +898,7 @@ fn extract_form_xobject_text_inner(
                                     is_strikeout: false,
                                     item_type: ItemType::Text,
                                     mcid: None,
+                                    baseline_shift: 0.0,
                                 });
                             }
                         }

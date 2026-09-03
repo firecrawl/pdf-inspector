@@ -299,6 +299,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         is_strikeout: false,
         item_type: ItemType::Text,
         mcid: None,
+        baseline_shift: 0.0,
     }
 }
 
@@ -327,6 +328,7 @@ fn make_text_item_with_font(
         is_strikeout: false,
         item_type: ItemType::Text,
         mcid: None,
+        baseline_shift: 0.0,
     }
 }
 
@@ -1348,6 +1350,147 @@ fn test_snapshot_hebrew_logical_order() {
         output.contains("שלום עולם") && output.contains("דוח על הסיכונים"),
         "logical-order Hebrew must stay in logical order, got: {output}"
     );
+}
+
+/// Academic front matter: 11.96pt author names with 7.97pt affiliation
+/// markers raised 4.3pt (the commas inside a marker run come from a second
+/// font), affiliation lines whose markers LEAD their institution, a title
+/// whose asterisk is raised more than the 5pt rough-line window, and body
+/// text with a chemistry subscript and single footnote references.
+///
+/// Every marker must stay on its visual line, attached to its word: either
+/// fused as Unicode ("Huo¹", "H₂O", "¹Hong Kong") or wrapped as
+/// `<sup>…</sup>` when the run carries separators or symbols ("1,2,3",
+/// "2,*"). A fixed 3pt baseline window used to emit the raised markers as
+/// their own orphan line (",2,3,2,4,*") above the names.
+#[test]
+fn test_snapshot_author_block_superscripts() {
+    let output = assert_snapshot("author_block_superscripts");
+    assert!(
+        output.contains("Yibo Yan<sup>1,2,3</sup>, Jiahao Huo¹, Guanbo Feng¹,"),
+        "multi-glyph marker run must stay with its name: {output}"
+    );
+    assert!(
+        output.contains("Mingdong Ou<sup>2,4</sup>, Yi Cao<sup>2,*</sup>,")
+            && output.contains("Wei Zhang³, Ling Chen<sup>1,4</sup>"),
+        "symbol markers must stay with their name: {output}"
+    );
+    assert!(
+        output.contains("¹Hong Kong University of Science and Technology (Guangzhou), ²Alibaba Cloud Computing,"),
+        "leading markers must attach to the FOLLOWING word: {output}"
+    );
+    assert!(
+        output.contains(
+            "<sup>3,4</sup>Some Institute of Technology, <sup>*</sup>Corresponding author,"
+        ) && output.contains("⁴Institute for Advanced Study"),
+        "leading multi-glyph markers must attach to the following word: {output}"
+    );
+    assert!(
+        output.contains("Water is H₂O and the result² holds.")
+            && output.contains("See note¹² for details.")
+            && output.contains("Energy E = mc² as usual."),
+        "chemistry subscripts and single footnote references keep fusing: {output}"
+    );
+    assert!(
+        output.contains("A Fixture Title<sup>*</sup>"),
+        "a marker raised beyond the 5pt rough-line window still attaches: {output}"
+    );
+    assert!(
+        !output.lines().any(is_orphan_marker_line),
+        "no orphan marker line may remain: {output}"
+    );
+}
+
+/// A line made only of marker glyphs (digits, commas, asterisks, script
+/// tags) — what the old fixed-window grouping produced.
+fn is_orphan_marker_line(line: &str) -> bool {
+    let stripped = line
+        .replace("<sup>", "")
+        .replace("</sup>", "")
+        .replace("<sub>", "")
+        .replace("</sub>", "");
+    let stripped = stripped.trim();
+    !stripped.is_empty()
+        && stripped
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, ',' | '*' | ' ' | '¹' | '²' | '³' | '⁴'))
+}
+
+/// The region-text path (`extractTextInRegions`, what fire-pdf consumes)
+/// groups lines on its own: one output line per visual line, markers
+/// adjacent to their words, no orphan marker line.
+#[test]
+fn test_extract_regions_author_block_superscripts_one_line_per_visual_line() {
+    let buf = std::fs::read("tests/fixtures/author_block_superscripts.pdf").unwrap();
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let text = &regions[0].regions[0].text;
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "A Fixture Title<sup>*</sup>",
+            "Yibo Yan<sup>1,2,3</sup>, Jiahao Huo¹, Guanbo Feng¹,",
+            "Mingdong Ou<sup>2,4</sup>, Yi Cao<sup>2,*</sup>,",
+            "Wei Zhang³, Ling Chen<sup>1,4</sup>",
+            "¹Hong Kong University of Science and Technology (Guangzhou), ²Alibaba Cloud Computing,",
+            "<sup>3,4</sup>Some Institute of Technology, <sup>*</sup>Corresponding author,",
+            "⁴Institute for Advanced Study",
+            "Water is H₂O and the result² holds.",
+            "See note¹² for details.",
+            "Energy E = mc² as usual.",
+        ],
+        "region text: {text}"
+    );
+    assert!(!regions[0].regions[0].needs_ocr);
+}
+
+/// Positioned items expose the marker geometry: unfused runs carry a
+/// positive `baseline_shift` and snap to the body baseline via `line_y`.
+#[test]
+fn test_positions_author_block_superscripts_expose_baseline_shift() {
+    let buf = std::fs::read("tests/fixtures/author_block_superscripts.pdf").unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+
+    let flagged: Vec<&TextItem> = items.iter().filter(|it| it.is_script()).collect();
+    let flagged_texts: Vec<&str> = flagged.iter().map(|it| it.text.as_str()).collect();
+    for expected in ["1,2,3", "2,4", "2,*", "1,4", "3,4", "*"] {
+        assert!(
+            flagged_texts.contains(&expected),
+            "expected {expected:?} among flagged runs {flagged_texts:?}"
+        );
+    }
+    for item in &flagged {
+        assert!(item.baseline_shift > 0.0, "raised marker: {item:?}");
+    }
+    let marker = flagged.iter().find(|it| it.text == "1,2,3").unwrap();
+    let name = items.iter().find(|it| it.text == "Yibo Yan").unwrap();
+    assert!(
+        (marker.line_y() - name.y).abs() < 0.01,
+        "marker snaps to its name's baseline"
+    );
+    assert!(
+        (marker.baseline_shift - 4.3).abs() < 0.05,
+        "shift is the raw raise: {}",
+        marker.baseline_shift
+    );
+
+    // Fused runs carry no shift and no separate item (the name arrives
+    // already merged with the body comma before it).
+    assert!(items
+        .iter()
+        .any(|it| it.text.ends_with("Jiahao Huo¹") && !it.is_script()));
+    assert!(items
+        .iter()
+        .any(|it| it.text.starts_with("¹Hong Kong University") && !it.is_script()));
+    assert!(items.iter().any(|it| it.text == "See note¹²"));
+    assert!(items.iter().any(|it| it.text == "Water is H₂"));
+    assert!(!items
+        .iter()
+        .any(|it| it.text == "12" || it.text == "1" || it.text == "2"));
 }
 
 /// First two pages of Shannon's "A Mathematical Theory of Communication"
@@ -4529,7 +4672,7 @@ fn test_positions_are_relative_to_cropbox_origin() {
     assert!(text.contains("Visible glyph"), "got {text:?}");
     assert!(!text.contains("Second line"), "got {text:?}");
 
-    // The same box in raw MediaBox coordinates (the pre-1.18 frame) lands on
+    // The same box in raw MediaBox coordinates (the previous frame) lands on
     // a different line — the silent mis-selection the shared frame fixes.
     let raw_region = [
         120.0,
@@ -4581,7 +4724,7 @@ fn test_positions_unchanged_when_cropbox_matches_mediabox() {
     assert_close(anchor.x, 72.0);
     assert_close(anchor.y, 700.0);
 
-    // Real fixture without a CropBox: pinned to the pre-1.18 output.
+    // Real fixture without a CropBox: pinned to the previous output.
     let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
     let items = extract_text_with_positions_mem(&buf).unwrap();
     let title = items
