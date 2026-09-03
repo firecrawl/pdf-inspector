@@ -487,6 +487,36 @@ for item in extract_text_with_positions("tagged.pdf")? {
 }
 ```
 
+Extract Markdown plus typed layout blocks for citation grounding. This runs
+the same Full-mode pipeline as `process_pdf` (no layout model) and records
+each fragment the Markdown converter emits — headings, paragraphs, list
+items, captions, code, tables, images — as a block with a normalized 0–1
+page-space bbox (top-left origin) and an exact `[start, end)` byte span into
+the returned markdown:
+
+```rust
+use pdf_inspector::{extract_layout_blocks, LayoutBlockType};
+
+let result = extract_layout_blocks("document.pdf")?;
+for block in &result.blocks {
+    let (start, end) = block.markdown_span;
+    let text = &result.markdown[start..end];
+    // block.block_type: Title | SectionHeader | Text | ListItem | Caption
+    //                   | Code | Table | Picture
+    // block.label: Some("H2".."H6") for SectionHeader blocks
+    // block.bbox: Some([x0, y0, x1, y1]) normalized to the page box
+    // block.source: "native_text"; confidence fields stay None (no model)
+    println!("p{} {}: {}", block.page, block.block_type.as_str(), text);
+}
+```
+
+Spans are ascending and non-overlapping, so slicing `result.markdown` with
+them recovers the document in reading order. Unlike the default
+`process_pdf` Markdown, the payload includes image placeholders so figures
+surface as `picture` blocks. Scanned/image-based PDFs return the
+classification with empty `markdown` and no blocks. The default
+`process_pdf` output is unaffected by recording.
+
 ## Processing modes
 
 | Mode | What it does | Returns |
@@ -514,6 +544,8 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | `extract_pages_markdown_mem(bytes, pages)` | Per-page Markdown from bytes |
 | `extract_structure_elements(path, pages)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_mem(bytes, pages)` | Structure-tree elements from bytes |
+| `extract_layout_blocks(path)` | Markdown + typed layout blocks with bbox and markdown spans |
+| `extract_layout_blocks_mem(bytes)` | Layout blocks from bytes |
 
 Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
 
@@ -531,6 +563,9 @@ Low-level detection functions are also available via the `detector` module (`det
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
 | `TextItem` | Text with position, font info, page number, optional structure-tree `mcid`, and `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline) |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
+| `LayoutBlocksResult` | Markdown plus typed layout blocks whose byte spans index into it |
+| `LayoutBlock` | One block: type, label, page, normalized bbox, markdown_span, source, confidences |
+| `LayoutBlockType` | `Title`, `SectionHeader`, `Text`, `ListItem`, `Caption`, `Code`, `Table`, `Picture` |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |

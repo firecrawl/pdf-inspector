@@ -120,6 +120,39 @@ class StructureElement:
     role: str
     """Standard structure type name ("H1".."H6", "P", "Table", "TD", ...)."""
 
+class LayoutBlock:
+    """One typed layout block from the Full-mode Markdown pipeline."""
+    block_type: str
+    """Hosted block type: "title", "section_header", "text", "list_item",
+    "caption", "code", "table", or "picture"."""
+    label: Optional[str]
+    """Heading level label ("H2".."H6") for section_header blocks, None
+    otherwise."""
+    page: int
+    """1-indexed page number the block was emitted from."""
+    bbox: Optional[tuple[float, float, float, float]]
+    """Normalized (x0, y0, x1, y1) in 0-1 page space with a top-left origin,
+    or None when no positioned geometry is available."""
+    markdown_span: tuple[int, int]
+    """[start, end) byte offsets into LayoutBlocksResult.markdown."""
+    source: str
+    """Provenance of the block's text; always "native_text"."""
+    layout_confidence: Optional[float]
+    """Layout-model confidence; always None (no layout model runs)."""
+    ocr_confidence: Optional[float]
+    """OCR confidence; always None (the text is native, not OCR output)."""
+
+class LayoutBlocksResult:
+    """Markdown plus typed layout blocks whose spans index into it."""
+    markdown: str
+    """Markdown assembled from the recorded fragments; block spans are byte
+    offsets into this string."""
+    blocks: list[LayoutBlock]
+    """Typed blocks in reading order with non-overlapping ascending spans."""
+    pdf_type: str
+    """'text_based', 'scanned', 'image_based', or 'mixed'."""
+    page_count: int
+
 class RegionText:
     """Extracted text for a single region."""
     text: str
@@ -251,6 +284,29 @@ def extract_structure_elements_bytes(data: bytes, pages: Optional[list[int]] = N
     """Extract structure-tree element references from tagged PDF bytes.
 
     See :func:`extract_structure_elements` for details.
+    """
+    ...
+
+def extract_layout_blocks(path: str) -> LayoutBlocksResult:
+    """Extract Markdown plus typed layout blocks from a PDF file.
+
+    Runs the same Full-mode extract+convert pipeline as :func:`process_pdf`
+    (no layout model) and records each emitted fragment as a typed block with
+    a normalized 0-1 page-space bbox (top-left origin) and an exact
+    [start, end) byte span into the returned markdown.
+
+    Unlike the default process_pdf markdown, the payload includes image
+    placeholders so figures surface as "picture" blocks.
+
+    For scanned/image-based PDFs the result carries the classification with
+    empty markdown and no blocks.
+    """
+    ...
+
+def extract_layout_blocks_bytes(data: bytes) -> LayoutBlocksResult:
+    """Extract Markdown plus typed layout blocks from PDF bytes.
+
+    See :func:`extract_layout_blocks` for details.
     """
     ...
 
