@@ -478,6 +478,25 @@ pub fn extract_pages_markdown_mem(
     .map(|extraction| extraction.result)
 }
 
+/// Same as [`extract_pages_markdown_mem`], decrypting with `password` if the
+/// document is encrypted. `None` falls back to the empty password
+/// (owner-only encryption).
+pub fn extract_pages_markdown_mem_with_password(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        password,
+        &MarkdownOptions::default(),
+        false,
+        false,
+    )
+    .map(|(result, _)| result)
+}
+
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 pub(crate) fn extract_pages_markdown_mem_for_ocr(
     buffer: &[u8],
@@ -885,9 +904,20 @@ pub fn extract_pages_markdown<P: AsRef<Path>>(
     path: P,
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_with_password(path, pages, None)
+}
+
+/// Same as [`extract_pages_markdown`], decrypting with `password` if the
+/// document is encrypted. `None` falls back to the empty password
+/// (owner-only encryption).
+pub fn extract_pages_markdown_with_password<P: AsRef<Path>>(
+    path: P,
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+) -> Result<PagesExtractionResult, PdfError> {
     validate_pdf_file(&path)?;
     let buffer = std::fs::read(path.as_ref())?;
-    extract_pages_markdown_mem(&buffer, pages)
+    extract_pages_markdown_mem_with_password(&buffer, pages, password)
 }
 
 // =========================================================================
