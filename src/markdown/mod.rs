@@ -1044,6 +1044,66 @@ fn rect_cluster_spans_band_boundary(
     })
 }
 
+/// True when explicit vector-grid geometry proves that a proposed text gutter
+/// cuts through one ruled table. Physical cell boundaries outrank the
+/// text-only side-by-side guess; independent tables remain in separate bands.
+fn line_grid_spans_band_boundary(lines: &[PdfLine], page: u32, bands: &[(f32, f32)]) -> bool {
+    if bands.len() < 2 {
+        return false;
+    }
+    let boundaries: Vec<f32> = bands[..bands.len() - 1].iter().map(|&(_, hi)| hi).collect();
+    let mut horizontal_rules: Vec<(f32, f32, f32)> = lines
+        .iter()
+        .filter(|line| line.page == page)
+        .filter_map(|line| {
+            let dx = (line.x2 - line.x1).abs();
+            let dy = (line.y2 - line.y1).abs();
+            (dx >= 20.0 && dy / dx <= 2.0_f32.to_radians().tan()).then_some((
+                (line.y1 + line.y2) / 2.0,
+                line.x1.min(line.x2),
+                line.x1.max(line.x2),
+            ))
+        })
+        .collect();
+    horizontal_rules.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.total_cmp(&right.1))
+    });
+
+    boundaries.into_iter().any(|boundary| {
+        let mut crossing_rows = Vec::new();
+        let mut index = 0;
+        while index < horizontal_rules.len() {
+            let y = horizontal_rules[index].0;
+            let mut group_end = index + 1;
+            while group_end < horizontal_rules.len()
+                && (horizontal_rules[group_end].0 - y).abs() <= 2.0
+            {
+                group_end += 1;
+            }
+
+            let mut span = (horizontal_rules[index].1, horizontal_rules[index].2);
+            for &(_, left, right) in &horizontal_rules[index + 1..group_end] {
+                if left <= span.1 + 6.0 {
+                    span.1 = span.1.max(right);
+                } else {
+                    if span.0 < boundary && span.1 > boundary {
+                        break;
+                    }
+                    span = (left, right);
+                }
+            }
+            if span.0 < boundary && span.1 > boundary {
+                crossing_rows.push(y);
+            }
+            index = group_end;
+        }
+        crossing_rows.len() >= 3
+    })
+}
+
 fn split_from_hint_regions(items: &[TextItem], rects: &[PdfRect], page: u32) -> Vec<(f32, f32)> {
     use crate::tables::{cluster_rects, RectHintRegion};
 
@@ -1674,12 +1734,15 @@ fn convert_items_with_rects_lines_and_table_output(
         // safely from folios; cleaned evidence is reserved for column and
         // final non-table layout decisions.
         let mut bands = split_side_by_side(&page_items);
-        // A rect table crossing a proposed split boundary means the "gutter"
-        // is really the gap between ruled and borderless table columns —
-        // splitting there cleaves the table in half. Veto the split.
-        if !bands.is_empty() && rect_cluster_spans_band_boundary(&page_items, rects, page, &bands) {
+        // Explicit table geometry crossing a proposed split boundary means the
+        // "gutter" is really a cell gap. Veto before band-local detection can
+        // accept plausible partial tables and discard the remaining columns.
+        if !bands.is_empty()
+            && (rect_cluster_spans_band_boundary(&page_items, rects, page, &bands)
+                || line_grid_spans_band_boundary(pdf_lines, page, &bands))
+        {
             log::debug!(
-                "page {}: side-by-side split vetoed by spanning rect cluster",
+                "page {}: side-by-side split vetoed by spanning table geometry",
                 page
             );
             bands.clear();
@@ -2702,6 +2765,48 @@ mod tests {
         let mut it = make_item(x, y, page);
         it.width = width;
         it
+    }
+
+    fn make_rule(x1: f32, y1: f32, x2: f32, y2: f32) -> PdfLine {
+        PdfLine {
+            x1,
+            y1,
+            x2,
+            y2,
+            page: 1,
+        }
+    }
+
+    #[test]
+    fn independent_side_by_side_line_grids_do_not_veto_band_split() {
+        let mut lines = Vec::new();
+        for (left, right) in [(50.0, 200.0), (300.0, 450.0)] {
+            for y in [400.0, 370.0, 335.0] {
+                lines.push(make_rule(left, y, right, y));
+            }
+            for x in [left, (left + right) / 2.0, right] {
+                lines.push(make_rule(x, 335.0, x, 400.0));
+            }
+        }
+
+        assert!(
+            !line_grid_spans_band_boundary(&lines, 1, &[(50.0, 200.0), (300.0, 450.0)]),
+            "disjoint ruled tables must retain their physical gutter"
+        );
+    }
+
+    #[test]
+    fn connected_line_grid_vetoes_band_split() {
+        let lines: Vec<PdfLine> = [400.0, 370.0, 335.0]
+            .into_iter()
+            .map(|y| make_rule(50.0, y, 450.0, y))
+            .collect();
+
+        assert!(line_grid_spans_band_boundary(
+            &lines,
+            1,
+            &[(50.0, 200.0), (300.0, 450.0)]
+        ));
     }
 
     #[test]

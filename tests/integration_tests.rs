@@ -1505,6 +1505,26 @@ fn test_snapshot_shannon_entropy() {
     assert_snapshot("shannon-entropy-p1-2");
 }
 
+#[test]
+fn test_wrapped_cell_keeps_ruled_table_intact() {
+    let buf = std::fs::read("tests/fixtures/wrapped_cell_ruled_table.pdf").unwrap();
+    let result = process_pdf_mem(&buf).unwrap();
+    let markdown = result.markdown.unwrap_or_default();
+
+    assert!(
+        markdown.contains("|Code|Operation Description|Book Value|Tax Base|Tax|Exempt|Other|"),
+        "wrapped cells must not split a seven-column ruled table: {markdown}"
+    );
+    assert!(
+        markdown.contains("|1004|Acquisition of transport services"),
+        "wrapped row must remain separate from the total row: {markdown}"
+    );
+    assert!(
+        markdown.contains("|T O T A L||10,000.00|8,000.00|1,440.00|0.00|2,000.00|"),
+        "all totals must retain their row and column identity: {markdown}"
+    );
+}
+
 // ============================================================================
 // Pages Needing OCR Tests
 // ============================================================================
