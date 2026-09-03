@@ -1034,6 +1034,9 @@ fn detect_table_in_region(
     for (idx, item) in items {
         let col = find_column_index(&columns, item.x);
         let row = find_row_index(&rows, item.line_y());
+        if super::crosses_other_rows(item, &rows, row) {
+            continue;
+        }
 
         if let (Some(col), Some(row)) = (col, row) {
             cell_items[row][col].push(item);

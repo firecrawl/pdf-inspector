@@ -3,6 +3,32 @@
 //! Detects tabular data in PDF text items and converts to markdown tables.
 
 mod cell_text;
+
+/// Whether a vertical run stands across several rows of a table beyond the
+/// one its foot is in. A rotated column header rises from its header row and
+/// crosses no other row, and a short row-group label spanning two rows stays
+/// glued to the row it touches, so both fill a cell as before; a running head
+/// or margin note standing beside a table on a page whose frame was turned
+/// covers many row baselines and must not be poured into whichever cell its
+/// foot happens to touch. `row_baselines` are the table's row positions,
+/// `own_row` the one the item was assigned to. Horizontal runs never cross
+/// rows this way.
+pub(crate) fn crosses_other_rows(
+    item: &crate::types::TextItem,
+    row_baselines: &[f32],
+    own_row: Option<usize>,
+) -> bool {
+    if item.is_horizontal() {
+        return false;
+    }
+    let (foot, head) = (item.y + 2.0, item.y + item.height - 2.0);
+    row_baselines
+        .iter()
+        .enumerate()
+        .filter(|(row, &baseline)| Some(*row) != own_row && baseline > foot && baseline < head)
+        .count()
+        >= 2
+}
 mod detect_heuristic;
 mod detect_lines;
 pub(crate) mod detect_rects;
@@ -537,6 +563,11 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         let row = row_ys
             .iter()
             .position(|&ry| (ry - item.line_y()).abs() < y_tol);
+        // A vertical run standing across other rows (a running head beside a
+        // turned table) is not cell content.
+        if crosses_other_rows(item, &row_ys, row) {
+            continue;
+        }
         if let Some(row) = row {
             cell_text::push_cell_item(
                 &mut cells[row][col],

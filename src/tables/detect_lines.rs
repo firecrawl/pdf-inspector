@@ -449,8 +449,12 @@ fn build_text_anchor_table(
     let mut item_indices = Vec::new();
     let mut wide_items = 0usize;
     let mut measured_items = 0usize;
+    let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
     for (row_index, (_, row)) in rows.iter().enumerate() {
         for (item_index, item) in row {
+            if super::crosses_other_rows(item, &row_baselines, Some(row_index)) {
+                continue;
+            }
             let column = anchors
                 .iter()
                 .enumerate()
@@ -870,8 +874,12 @@ fn build_dense_row_anchor_table(
     let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
     let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
     let mut item_indices = Vec::new();
+    let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
     for (row_index, (_, row)) in rows.iter().enumerate() {
         for (item_index, item) in row {
+            if super::crosses_other_rows(item, &row_baselines, Some(row_index)) {
+                continue;
+            }
             let column = nearest_anchor_column(item, &anchors)?;
             push_cell_item(
                 &mut cells[row_index][column],

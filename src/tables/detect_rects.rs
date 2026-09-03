@@ -1714,6 +1714,11 @@ pub(crate) fn assign_items_to_grid(
         vec![vec![Vec::new(); num_cols]; num_rows];
     let mut indices = Vec::new();
 
+    // Row bands as baselines for the vertical-run test: a run standing
+    // across rows is judged by the bands it covers.
+    let row_centers: Vec<f32> = (0..num_rows)
+        .map(|r| (row_edges[r] + row_edges[r + 1]) / 2.0)
+        .collect();
     for (idx, item) in items.iter().enumerate() {
         if item.page != page {
             continue;
@@ -1727,6 +1732,9 @@ pub(crate) fn assign_items_to_grid(
         let col = (0..num_cols).find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0);
         // Find row: cy must be between row_edges[r+1] (bottom) and row_edges[r] (top)
         let row = (0..num_rows).find(|&r| cy >= row_edges[r + 1] - 2.0 && cy <= row_edges[r] + 2.0);
+        if super::crosses_other_rows(item, &row_centers, row) {
+            continue;
+        }
 
         if let (Some(c), Some(r)) = (col, row) {
             cell_items[r][c].push((idx, item));
@@ -4419,6 +4427,33 @@ mod tests {
     }
 
     // --- assign_items_to_grid ---
+
+    #[test]
+    fn long_vertical_runs_never_fill_a_cell() {
+        // A journal running head standing beside a turned table (a 200pt
+        // vertical run) covers the other row's band and must not be poured
+        // into the cell its foot touches; a rotated column header, 40pt tall
+        // and confined to its own header row, still fills its cell.
+        let mut running_head = make_item("Diversity and Distributions, 1-15", 15.0, 45.0, 9.0);
+        running_head.rotation = 90.0;
+        running_head.width = 9.0;
+        running_head.height = 200.0;
+        let mut header = make_item("Total", 55.0, 75.0, 9.0);
+        header.rotation = 90.0;
+        header.width = 9.0;
+        header.height = 40.0;
+        let items = vec![running_head, header, make_item("A", 15.0, 85.0, 10.0)];
+        let col_edges = vec![10.0, 50.0, 90.0];
+        let row_edges = vec![120.0, 70.0, 55.0, 40.0];
+        let (cells, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(indices, vec![1, 2]);
+        assert_eq!(cells[0][0], "A");
+        assert_eq!(cells[0][1], "Total");
+        assert!(
+            cells.iter().flatten().all(|c| !c.contains("Diversity")),
+            "{cells:?}"
+        );
+    }
 
     #[test]
     fn test_assign_items_basic() {
