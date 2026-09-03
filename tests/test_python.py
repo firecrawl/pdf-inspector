@@ -67,6 +67,44 @@ class TestProcessPdf:
         # title can be None or str
         assert result.title is None or isinstance(result.title, str)
 
+    def test_strip_headers_footers_keeps_running_furniture_when_off(self):
+        # p1244-1996.pdf repeats its per-page form header; by default the
+        # furniture pass removes the repeats, with the flag off they stay.
+        path = fixture_path("p1244-1996.pdf")
+        header = "Tips received"
+        default = pdf_inspector.process_pdf(path).markdown
+        kept = pdf_inspector.process_pdf(path, strip_headers_footers=False).markdown
+        assert kept.count(header) > default.count(header)
+
+    def test_remove_page_numbers_keeps_page_number_text_when_off(self):
+        path = fixture_path("multiline_indent_cell_rect_grid.pdf")
+        default = pdf_inspector.process_pdf(path).markdown
+        kept = pdf_inspector.process_pdf(path, remove_page_numbers=False).markdown
+        assert "Page 101" not in default
+        assert "Page 101" in kept
+
+    def test_markdown_kwargs_default_to_current_behavior(self):
+        path = fixture_path("thermo-freon12.pdf")
+        default = pdf_inspector.process_pdf(path)
+        explicit = pdf_inspector.process_pdf(
+            path, strip_headers_footers=True, remove_page_numbers=True
+        )
+        assert explicit.markdown == default.markdown
+
+    def test_markdown_kwargs_are_keyword_only(self):
+        with pytest.raises(TypeError):
+            pdf_inspector.process_pdf(
+                fixture_path("thermo-freon12.pdf"), None, False
+            )
+
+    def test_bytes_variant_accepts_markdown_kwargs(self):
+        data = fixture_bytes("p1244-1996.pdf")
+        kept = pdf_inspector.process_pdf_bytes(data, strip_headers_footers=False)
+        from_file = pdf_inspector.process_pdf(
+            fixture_path("p1244-1996.pdf"), strip_headers_footers=False
+        )
+        assert kept.markdown == from_file.markdown
+
 
 # ---------------------------------------------------------------------------
 # process_pdf_bytes

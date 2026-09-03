@@ -63,6 +63,14 @@ print(result.markdown)       # Markdown string or None
 # Process specific pages only
 result = pdf_inspector.process_pdf("document.pdf", pages=[1, 3, 5])
 
+# Keep running headers/footers and standalone page-number text
+# (both are removed by default)
+result = pdf_inspector.process_pdf(
+    "document.pdf",
+    strip_headers_footers=False,
+    remove_page_numbers=False,
+)
+
 # Process from bytes (no filesystem needed)
 with open("document.pdf", "rb") as f:
     result = pdf_inspector.process_pdf_bytes(f.read())
@@ -121,8 +129,8 @@ headings = [
 
 | Function | Description |
 |---|---|
-| `process_pdf(path, pages=None)` | Full processing (detect + extract + markdown) |
-| `process_pdf_bytes(data, pages=None)` | Full processing from bytes |
+| `process_pdf(path, pages=None, *, strip_headers_footers=True, remove_page_numbers=True)` | Full processing (detect + extract + markdown) |
+| `process_pdf_bytes(data, pages=None, *, strip_headers_footers=True, remove_page_numbers=True)` | Full processing from bytes |
 | `process_pdf_with_ocr(path, **options)` | Native extraction + selective OCR with provenance |
 | `process_pdf_with_ocr_bytes(data, **options)` | Native extraction + selective OCR from bytes |
 | `detect_pdf(path)` | Fast detection only (returns PdfResult) |
