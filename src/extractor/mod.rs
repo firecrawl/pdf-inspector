@@ -791,7 +791,7 @@ fn effective_merge_width(item: &TextItem) -> f32 {
 }
 
 fn is_standalone_bullet_text(text: &str) -> bool {
-    matches!(text.trim(), "•" | "○" | "●" | "◦")
+    crate::markdown::classify::is_standalone_bullet_glyph(text)
 }
 
 fn first_text_char(text: &str) -> Option<char> {
@@ -1618,6 +1618,20 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "• The MSA LoS project");
+    }
+
+    #[test]
+    fn merge_items_preserves_square_bullet_stream_order_with_backtracking() {
+        let items = vec![
+            with_mcid(make_merge_item("▪", 79.4, 5.0)),
+            with_mcid(make_merge_item("The MS", 91.0, 32.6)),
+            with_mcid(make_merge_item("A LoS project", 84.4, 70.0)),
+        ];
+
+        let merged = merge_text_items(items);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "▪ The MSA LoS project");
     }
 
     #[test]

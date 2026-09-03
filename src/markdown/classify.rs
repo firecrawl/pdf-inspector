@@ -1,5 +1,25 @@
 //! Line classification: captions, lists, code detection.
 
+pub(crate) const BULLET_GLYPHS: &[char] =
+    &['•', '●', '○', '◦', '▪', '▫', '◆', '◇', '■', '□', '‣', '⁃'];
+
+/// True when `text` is exactly one `BULLET_GLYPHS` entry (standalone marker).
+pub(crate) fn is_standalone_bullet_glyph(text: &str) -> bool {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(c), None) if BULLET_GLYPHS.contains(&c)
+    )
+}
+
+fn starts_with_bullet_glyph_and_space(text: &str) -> bool {
+    BULLET_GLYPHS.iter().any(|glyph| {
+        text.strip_prefix(*glyph)
+            .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
 /// Check if text is a figure/table caption or source citation
 pub(crate) fn is_caption_line(text: &str) -> bool {
     let trimmed = text.trim();
@@ -64,7 +84,7 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
     false
 }
 
-/// Check if text starts with an unambiguous bullet marker (●, •, ○, ◦).
+/// Check if text starts with an unambiguous bullet marker (●, •, ○, ◦, ▪, …).
 ///
 /// Narrower than [`is_list_item`]: it excludes numbered/lettered patterns
 /// like `1.` or `a)`, which legitimately appear as section headings in many
@@ -72,10 +92,7 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
 /// also demoting numbered headings.
 pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with("• ")
-        || trimmed.starts_with("● ")
-        || trimmed.starts_with("○ ")
-        || trimmed.starts_with("◦ ")
+    starts_with_bullet_glyph_and_space(trimmed)
         || trimmed.starts_with("- ")
         || trimmed.starts_with("* ")
 }
@@ -85,12 +102,9 @@ pub(crate) fn is_list_item(text: &str) -> bool {
     let trimmed = text.trim_start();
 
     // Bullet patterns
-    if trimmed.starts_with("• ")
+    if starts_with_bullet_glyph_and_space(trimmed)
         || trimmed.starts_with("- ")
         || trimmed.starts_with("* ")
-        || trimmed.starts_with("○ ")
-        || trimmed.starts_with("● ")
-        || trimmed.starts_with("◦ ")
     {
         return true;
     }
@@ -127,7 +141,7 @@ pub(crate) fn format_list_item(text: &str) -> String {
 
     // Convert various bullet styles to markdown
     // Note: bullet characters like • are multi-byte in UTF-8, use char indices
-    for bullet in &['•', '○', '●', '◦'] {
+    for bullet in BULLET_GLYPHS {
         if let Some(rest) = trimmed.strip_prefix(*bullet) {
             return format!("- {}", rest.trim_start());
         }
@@ -301,6 +315,7 @@ mod tests {
             "- **Label:** rest of line"
         );
         assert_eq!(format_list_item("*● Italic:* rest"), "- *Italic:* rest");
+        assert_eq!(format_list_item("**▪ Label:** rest"), "- **Label:** rest");
     }
 
     #[test]
@@ -309,9 +324,37 @@ mod tests {
     }
 
     #[test]
-    fn is_list_item_with_bullet_space() {
+    fn is_list_item_extended_bullet_glyphs() {
+        for &glyph in BULLET_GLYPHS {
+            let text = format!("{glyph} Item");
+            assert!(is_list_item(&text), "{text}");
+            assert!(starts_with_bullet_marker(&text), "{text}");
+            assert_eq!(format_list_item(&text), "- Item", "{text}");
+        }
+    }
+
+    #[test]
+    fn is_list_item_preserves_original_styles() {
         assert!(is_list_item("● Item"));
         assert!(is_list_item("• Item"));
         assert!(is_list_item("- Item"));
+        assert!(is_list_item("* Item"));
+        assert!(is_list_item("1. Item"));
+        assert!(is_list_item("a) Item"));
+    }
+
+    #[test]
+    fn is_list_item_rejects_non_bullets() {
+        assert!(!is_list_item("▪Item"));
+        assert!(!is_list_item("Item ▪"));
+        assert!(!is_list_item("· Item"));
+        assert_eq!(format_list_item("· Item"), "· Item");
+        assert!(!is_list_item("– Item"));
+        assert!(!is_list_item("— Item"));
+        assert!(!is_list_item("not a list"));
+        assert!(!is_list_item("**bold** not a list"));
+        assert!(!starts_with_bullet_marker("· Item"));
+        assert!(!starts_with_bullet_marker("– Item"));
+        assert!(!starts_with_bullet_marker("— Item"));
     }
 }
