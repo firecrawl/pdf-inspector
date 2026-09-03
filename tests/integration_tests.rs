@@ -163,6 +163,109 @@ fn make_recurring_contextual_folio_pdf() -> Vec<u8> {
     pdf
 }
 
+/// Three A4 pages carrying digit-only body content in both margins.
+///
+/// Shaped as contents entries rather than a grid, because table detection is
+/// handed the unfiltered items and hands the digits back: a fixture whose rows
+/// look tabular passes on every build and proves nothing. Each digit also sits
+/// far from its label, past the same-line context gap that rescues a digit
+/// standing beside words — the gap that makes the upstream issue's own repro
+/// pass unchanged.
+///
+/// The contents number at y=740 is inside the US-Letter top band (720) and
+/// outside A4's (769.89). The body digit at y=103 is the mirror case: outside
+/// the calibrated bottom band, inside a bottom band scaled up by A4's height
+/// (106.3). Each page carries its own pair, because lines that repeat
+/// verbatim across pages are collapsed as running material and only the first
+/// would survive to be checked.
+///
+/// The real folio is the digit at y=800, and it is written as a running head
+/// beside words on purpose: `markdown::postprocess` deletes an isolated
+/// digit-only line without consulting the bands at all, so a folio standing
+/// alone would be stripped whatever the geometry decided and would prove
+/// nothing about it.
+fn make_a4_margin_body_digits_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>",
+    );
+    for page_index in 0usize..3 {
+        let page_id = 3 + page_index * 2;
+        let content_id = page_id + 1;
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            page_id,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /Font << /F1 9 0 R >> >> /Contents {content_id} 0 R >>"
+            ),
+        );
+        let page_number = page_index + 1;
+        let contents_number = 20 + page_number;
+        let body_digit = 90 + page_number;
+        let heading = ["Introduction", "Methods", "Results"][page_index];
+        let footing = ["alpha", "beta", "gamma"][page_index];
+        let content = format!(
+            "BT /F1 9 Tf \
+             1 0 0 1 72 740 Tm ({heading}) Tj 1 0 0 1 500 740 Tm ({contents_number}) Tj \
+             1 0 0 1 72 400 Tm (Body prose {footing} carrying no digits) Tj \
+             1 0 0 1 72 103 Tm (Risk indicator {footing}) Tj 1 0 0 1 500 103 Tm ({body_digit}) Tj \
+             1 0 0 1 72 800 Tm ({page_number}) Tj 1 0 0 1 110 800 Tm (Company report) Tj ET"
+        );
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            content_id,
+            &format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                content.len(),
+                content
+            ),
+        );
+    }
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        9,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
 fn make_pdf_with_malformed_unselected_page() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
@@ -3721,6 +3824,74 @@ fn test_extract_pages_markdown_uses_document_wide_folio_context() {
             "recurring contextual folio survived on page {}: {}",
             index + 1,
             page.markdown
+        );
+    }
+}
+
+/// Numbers as the Markdown presents them, so a table cell and a bare word
+/// compare the same way. Splitting on whitespace alone would leave `|14|`.
+fn number_tokens(markdown: &str) -> Vec<&str> {
+    markdown
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '.')
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+#[test]
+fn test_extract_pages_markdown_keeps_a4_body_digits_in_both_margins() {
+    let pdf = make_a4_margin_body_digits_pdf();
+    let result = extract_pages_markdown_mem(&pdf, None).unwrap();
+
+    assert_eq!(result.pages.len(), 3);
+    for (index, page) in result.pages.iter().enumerate() {
+        let tokens = number_tokens(&page.markdown);
+        let page_number = (index + 1).to_string();
+        let contents_number = (21 + index).to_string();
+        let body_digit = (91 + index).to_string();
+        assert!(
+            tokens.contains(&contents_number.as_str()),
+            "A4 contents entry below the top margin of page {page_number} lost \
+             its number to the folio filter: {}",
+            page.markdown
+        );
+        assert!(
+            tokens.contains(&body_digit.as_str()),
+            "A4 body digit above the footer margin on page {page_number} was \
+             removed as a folio: {}",
+            page.markdown
+        );
+        assert!(
+            page.markdown.contains("Company report"),
+            "the running head itself must survive on page {page_number}: {}",
+            page.markdown
+        );
+        assert!(
+            !tokens.contains(&page_number.as_str()),
+            "the real folio on page {page_number} survived: {}",
+            page.markdown
+        );
+    }
+}
+
+#[test]
+fn test_process_pdf_keeps_a4_body_digits_in_both_margins() {
+    // The same page through the `pdf2md` entry point, which reaches the folio
+    // filter by a different route than `extract_pages_markdown`.
+    let pdf = make_a4_margin_body_digits_pdf();
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::new()).unwrap();
+    let markdown = result.markdown.expect("pdf2md mode produces Markdown");
+    let tokens = number_tokens(&markdown);
+
+    for expected in ["21", "22", "23", "91", "92", "93"] {
+        assert!(
+            tokens.contains(&expected),
+            "A4 body digit {expected} was removed as a folio: {markdown}"
+        );
+    }
+    for folio in ["1", "2", "3"] {
+        assert!(
+            !tokens.contains(&folio),
+            "folio {folio} survived: {markdown}"
         );
     }
 }

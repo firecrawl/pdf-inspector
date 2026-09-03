@@ -1428,6 +1428,7 @@ pub fn to_markdown_from_items_with_rects_and_page_count(
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
             precomputed_chart_regions: None,
+            page_bounds: &HashMap::new(),
         },
     )
 }
@@ -1448,6 +1449,10 @@ pub(crate) struct MarkdownDocumentContext<'a> {
     /// Optional chart masks shared with layout analysis so the geometry is
     /// detected once and interpreted identically by both pipelines.
     pub(crate) precomputed_chart_regions: Option<&'a PageChartRegions>,
+    /// Vertical extent of each page's visible box, so the folio bands match
+    /// the page's real height. Empty on the items-only entry points, whose
+    /// callers hold no document to measure.
+    pub(crate) page_bounds: &'a crate::extractor::PageVerticalBounds,
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -1494,6 +1499,10 @@ pub(crate) fn complete_table_markdown_from_items(
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
             precomputed_chart_regions: None,
+            // OCR fusion hands in items recovered from a rendered page, not
+            // a document, so there is no page box to measure: the folio
+            // bands stay at their US-Letter calibration.
+            page_bounds: &HashMap::new(),
         },
         TableOutputMode::CompleteTables,
     );
@@ -1533,6 +1542,7 @@ fn convert_items_with_rects_lines_and_table_output(
         prefiltered_page_number_pages,
         prefiltered_page_number_mask,
         precomputed_chart_regions,
+        page_bounds,
     } = context;
 
     if items.is_empty() {
@@ -1994,7 +2004,9 @@ fn convert_items_with_rects_lines_and_table_output(
             });
             let has_structural_elements = band_rects.len() >= 6 || band_lines.len() >= 4;
             if !band_has_tables && !has_structural_elements {
-                if let Some(table) = crate::tables::try_build_table_from_columns(band_items, page) {
+                if let Some(table) =
+                    crate::tables::try_build_table_from_columns(band_items, page, page_bounds)
+                {
                     for &idx in &table.item_indices {
                         if let Some(&page_idx) = band_index_map.get(idx) {
                             if let Some(&(global_idx, _)) = group.get(page_idx) {
@@ -2232,6 +2244,7 @@ fn convert_items_with_rects_lines_and_table_output(
         crate::extractor::filter_markdown_page_numbers_with_removed_pages(
             non_table_items.into_iter().map(|(_, item)| item).collect(),
             document_page_count,
+            page_bounds,
         )
         .0
     };
@@ -2246,6 +2259,7 @@ fn convert_items_with_rects_lines_and_table_output(
             &table_page_set,
             &page_chart_map,
             &page_image_regions,
+            page_bounds,
         )
     } else {
         // Separate items into physical-band pages, chart/prose pages, and
@@ -2275,6 +2289,7 @@ fn convert_items_with_rects_lines_and_table_output(
                 &table_page_set,
                 &page_chart_map,
                 &page_image_regions,
+                page_bounds,
             );
         // Process each split page's bands independently, then interleave
         // by Y position so paired zones (e.g. left/right months) appear together.
@@ -2298,6 +2313,7 @@ fn convert_items_with_rects_lines_and_table_output(
                             page_thresholds,
                             &table_page_set,
                             &page_chart_map,
+                            page_bounds,
                         ),
                     );
                 }
@@ -2332,6 +2348,7 @@ fn convert_items_with_rects_lines_and_table_output(
                                 page_thresholds,
                                 &table_page_set,
                                 &page_chart_map,
+                                page_bounds,
                             ),
                         );
                     }
@@ -2373,6 +2390,7 @@ fn convert_items_with_rects_lines_and_table_output(
                         page_thresholds,
                         &table_page_set,
                         &page_chart_map,
+                        page_bounds,
                     ),
                 );
                 remaining = below;
@@ -2745,6 +2763,7 @@ mod tests {
                 prefiltered_page_number_pages: Some(&removed_pages),
                 prefiltered_page_number_mask: Some(&removal_mask),
                 precomputed_chart_regions: None,
+                page_bounds: &HashMap::new(),
             },
         );
 

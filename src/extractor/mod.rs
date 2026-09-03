@@ -231,6 +231,13 @@ pub(crate) fn extract_page_text_items_in_page_box(
 /// Per-page adaptive join thresholds from Canva-style letter-spacing detection.
 pub(crate) type PageThresholds = HashMap<u32, f32>;
 
+/// Per-page `(y0, y1)` extent of the visible box, so the folio bands can be
+/// measured from the page's real top edge. Ordered bottom-then-top. The alias
+/// is documentation, not enforcement — a swapped pair still type-checks, and
+/// what saves it is that a negative height fails the guard in
+/// `layout::page_number_bands` and falls back to the calibrated constants.
+pub(crate) type PageVerticalBounds = HashMap<u32, (f32, f32)>;
+
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
 ///
 /// Also returns per-page adaptive join thresholds for Canva-style pages.
@@ -327,7 +334,11 @@ fn extract_positioned_text_with_folio_context_impl(
         None,
         CoordinateFrame::UserSpace,
     )?;
-    if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
+    if !layout::needs_document_page_number_context(
+        &selected_items,
+        doc.get_pages().len(),
+        &page_vertical_bounds(doc),
+    ) {
         return Ok((
             (selected_items, selected_rects, selected_lines),
             page_thresholds,
@@ -1321,6 +1332,22 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
     }
 }
 
+/// Vertical extent (y0, y1) of each page's visible box, for measuring the
+/// page-number bands from the page's real top edge. The box is the same one
+/// [`visible_page_box`] resolves for the positioned-item frame — `CropBox ∩
+/// MediaBox` with page-tree inheritance — but the values stay in raw PDF user
+/// space, because the markdown pipeline the bands serve never leaves it.
+/// Pages without a resolvable box are absent, which keeps the calibrated
+/// absolute bands for them.
+pub(crate) fn page_vertical_bounds(doc: &Document) -> PageVerticalBounds {
+    doc.get_pages()
+        .into_iter()
+        .filter_map(|(page_num, page_id)| {
+            visible_page_box(doc, page_id).map(|page_box| (page_num, (page_box.y0, page_box.y1)))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1867,6 +1894,7 @@ mod tests {
                     &HashMap::new(),
                     &HashSet::new(),
                     &HashMap::new(),
+                    &HashMap::new(),
                 ),
             );
         }
@@ -2140,6 +2168,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(lines.len(), 1);
@@ -2163,6 +2192,7 @@ mod tests {
             items,
             &HashMap::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
         );
 

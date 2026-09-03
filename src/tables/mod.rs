@@ -358,7 +358,11 @@ pub(crate) enum TableDetectionMode {
 /// purely by text alignment — common in exam/reference tables.
 ///
 /// Requires ≥3 columns, ≥3 rows, and ≥40% cell fill rate.
-pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Option<Table> {
+pub(crate) fn try_build_table_from_columns(
+    items: &[TextItem],
+    page: u32,
+    page_bounds: &crate::extractor::PageVerticalBounds,
+) -> Option<Table> {
     use crate::extractor::{
         detect_columns, group_into_lines_with_thresholds, is_newspaper_layout, ColumnRegion,
     };
@@ -472,6 +476,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
                 bucket.clone(),
                 &thresholds,
                 &std::collections::HashSet::new(),
+                page_bounds,
             )
         })
         .collect();
@@ -1642,7 +1647,8 @@ mod tests {
             make_char("MPa", 514.7, 374.6, 10.0, 18.4),
         ];
 
-        let table = try_build_table_from_columns(&items, 1).unwrap();
+        let table =
+            try_build_table_from_columns(&items, 1, &std::collections::HashMap::new()).unwrap();
         let md = table_to_markdown(&table);
 
         assert!(
