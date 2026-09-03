@@ -25,7 +25,9 @@ version and date. Earlier releases are described in their
   through one shared cell-text module, and items are assigned to cells by the
   body baseline they belong to, so `V<sub>f</sub>` and `$1,234<sup>1</sup>`
   survive inside tables too.
-
+- `tests/fixtures/cropbox_offset_origin.pdf`, a page whose CropBox origin is
+  not `(0, 0)`, with Rust, Node and Python tests pinning the shared coordinate
+  frame described under Changed.
 - `TextItem::rotation`: the run's baseline angle in degrees counter-clockwise,
   in `[0, 360)` (`0` horizontal, `90` reading bottom-to-top, `270`
   top-to-bottom, `180` upside-down), and `TextItem::advance_known`, which is
@@ -101,6 +103,27 @@ version and date. Earlier releases are described in their
 
 ### Changed
 
+- **Coordinate frame of positioned output — consumer action may be required.**
+  `extract_text_with_positions*` (Rust), `extractTextWithPositions` (Node),
+  `extract_text_with_positions[_bytes]` (Python) and `pdf2md --items-json` now
+  report `x`/`y` relative to the page's visible page box — `CropBox ∩ MediaBox`,
+  else the MediaBox — with the box's lower-left corner as the origin. Image,
+  link and form-field items shift the same way. Previously the values were raw
+  content-stream coordinates, so on pages whose CropBox (or MediaBox) origin is
+  not `(0, 0)` every item was displaced from anything rendered from the CropBox,
+  and consumers intersecting items with rendered regions silently selected the
+  wrong text.
+- The region APIs interpret their inputs relative to the same box:
+  `extract_text_in_regions*`, `extract_tables_in_regions*`,
+  `detect_vector_grid_in_region*` and the TSR crop bboxes
+  (`TsrTableInput.crop_pdf_pt_bbox`) are top-left-origin PDF points relative to
+  the visible page box, and `StructuredCell.page_pt_bbox` is returned in it.
+  These previously flipped `y` with the MediaBox height and ignored the box
+  origin.
+- Pages whose CropBox equals the MediaBox and whose MediaBox origin is `(0, 0)`
+  — the vast majority — produce identical output. Consumers that compensated
+  for the CropBox origin themselves must drop that adjustment. `/Rotate` is
+  still not applied.
 - Rust: `TextItem` gained the required public field `baseline_shift`, so code
   that builds a `TextItem` with a struct literal must add it (`0.0` for normal
   text). This follows the precedent of `font_tag` in 1.16.0; the Python and

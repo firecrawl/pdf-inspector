@@ -84,10 +84,23 @@ class PdfClassification:
     confidence: float
 
 class TextItem:
-    """A positioned text item extracted from a PDF."""
+    """A positioned text item extracted from a PDF.
+
+    ``x``/``y`` are PDF points relative to the page's visible page box
+    (``CropBox ∩ MediaBox``, else the MediaBox; a CropBox that does not overlap
+    the MediaBox is ignored, and a page without a MediaBox is measured against
+    US Letter), origin at the box's lower-left corner with ``y`` growing upward.
+    :func:`extract_text_in_regions` reads its regions relative to the same box
+    but from its top-left corner with ``y`` growing downward; flip with the box
+    height. Pages whose text is drawn rotated by 90° are normalized into a
+    synthetic landscape frame before the shift, and ``/Rotate`` is not applied.
+    """
     text: str
     x: float
+    """Left edge, in PDF points from the visible page box's left edge."""
     y: float
+    """Baseline for text (rect bottom edge for image, link and form-field
+    items), in PDF points from the visible page box's bottom edge."""
     width: float
     height: float
     """Axis-aligned box in PDF points (y-up): for horizontal text `y` is the
@@ -264,11 +277,31 @@ def extract_text_bytes(data: bytes) -> str:
     ...
 
 def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) -> list[TextItem]:
-    """Extract text with position information."""
+    """Extract text with position information.
+
+    ``x``/``y`` are PDF points relative to the page's visible page box
+    (``CropBox ∩ MediaBox``, else the MediaBox), origin at its lower-left
+    corner with ``y`` up. :func:`extract_text_in_regions` reads regions
+    relative to the same box from its top-left corner, so flip with the box
+    height ``h``: for text items ``y`` is the baseline and
+    ``[x, h - y - height, x + width, h - y]`` covers the glyph band above it
+    (descenders fall below); for image, link and form-field items ``y`` is the
+    rect bottom and that box is exact. Pages whose text is drawn rotated by
+    90° are normalized into a synthetic landscape frame, where this does not
+    apply.
+
+    Args:
+        path: Path to the PDF file.
+        pages: Optional list of 1-indexed pages (matching ``TextItem.page``).
+            When ``None`` (default), the whole document is returned.
+    """
     ...
 
 def extract_text_with_positions_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[TextItem]:
-    """Extract text with position information from bytes."""
+    """Extract text with position information from bytes.
+
+    See :func:`extract_text_with_positions` for the coordinate frame.
+    """
     ...
 
 def extract_structure_elements(path: str, pages: Optional[list[int]] = None) -> list[StructureElement]:
@@ -301,6 +334,10 @@ def extract_text_in_regions(
     Args:
         path: Path to the PDF file.
         page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
+            Coordinates are PDF points with top-left origin, relative to the
+            visible page box (``CropBox ∩ MediaBox``, else the MediaBox) — the
+            same box :func:`extract_text_with_positions` reports items in,
+            flipped to a top-left origin (``y_top = box_height - y``).
     """
     ...
 
@@ -313,6 +350,7 @@ def extract_text_in_regions_bytes(
     Args:
         data: PDF file contents as bytes.
         page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
+            Coordinates: see :func:`extract_text_in_regions`.
     """
     ...
 

@@ -96,20 +96,41 @@ pub struct PdfRect {
 /// A text item with position information.
 ///
 /// `x`, `y`, `width`, `height` describe the item's axis-aligned box in PDF
-/// user space (points, y-up). For ordinary horizontal text the box runs from
-/// the baseline one em upward and spans the run's advance, which is what
-/// every consumer historically assumed. A run shown with a rotated text
-/// matrix gets the bounding box of its rotated glyph run instead — tall and
-/// thin for a vertical margin stamp — and reports the angle in `rotation`.
+/// points, y-up. For ordinary horizontal text the box runs from the baseline
+/// one em upward and spans the run's advance, which is what every consumer
+/// historically assumed. A run shown with a rotated text matrix gets the
+/// bounding box of its rotated glyph run instead — tall and thin for a
+/// vertical margin stamp — and reports the angle in `rotation`.
+///
+/// # Coordinate frame
+///
+/// Items returned by the public position APIs (`extract_text_with_positions*`)
+/// are relative to the page's **visible page box** —
+/// `CropBox ∩ MediaBox` when the page has a CropBox, else the MediaBox; a
+/// CropBox that does not overlap the MediaBox is ignored, and a page without
+/// a MediaBox is measured against US Letter (see `extractor::page_box`) —
+/// with the box's lower-left corner as the origin and `y` growing upward.
+/// A renderer's page image and the region APIs use the same box from its
+/// top-left corner with `y` growing downward, so flipping `y` by the box
+/// height lets items and rendered regions be intersected directly. Raw
+/// content-stream coordinates differ whenever the CropBox or MediaBox origin
+/// is not `(0, 0)`. A page whose text is predominantly rotated has its frame
+/// turned so the text reads left-to-right (`PageRotation`, reported by
+/// `extract_text_with_positions_and_rotations_mem`) and the shift is turned
+/// the same way; `/Rotate` is not applied. Inside the markdown pipeline
+/// items stay in raw user space.
 #[derive(Debug, Clone)]
 pub struct TextItem {
     /// The text content
     pub text: String,
-    /// Left edge of the item's box.
+    /// Left edge of the item's box, in PDF points from the visible page
+    /// box's left edge (see the coordinate frame note on [`TextItem`]).
     pub x: f32,
-    /// Bottom edge of the item's box (PDF coordinates, origin at
-    /// bottom-left). For horizontal text this is the baseline; descenders
-    /// are not included.
+    /// Bottom edge of the item's box, in PDF points from the visible page
+    /// box's bottom edge with `y` growing upward (see the coordinate frame
+    /// note on [`TextItem`]). For horizontal text this is the baseline;
+    /// descenders are not included. Image, link and form-field items carry
+    /// their rect's bottom edge.
     pub y: f32,
     /// Horizontal extent of the box: the advance for horizontal text, the
     /// em size for a vertical run. Zero only for a horizontal run whose font

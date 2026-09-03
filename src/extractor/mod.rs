@@ -9,6 +9,7 @@ mod fonts;
 pub(crate) mod geometry;
 mod layout;
 mod links;
+pub(crate) mod page_box;
 mod reading_order;
 mod scripts;
 pub(crate) mod underline;
@@ -25,6 +26,7 @@ use std::path::Path;
 
 use content_stream::extract_page_text_items;
 use links::{extract_form_fields, extract_page_links};
+pub(crate) use page_box::{visible_page_box, PageBox};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
 pub use crate::text_utils::{is_bold_font, is_italic_font};
@@ -77,7 +79,21 @@ fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
         .map_err(|e| PdfError::Parse(e.to_string()))
 }
 
-/// Extract text with position information from PDF file
+/// Extract text with position information from a PDF file.
+///
+/// # Coordinate frame
+///
+/// Every positioned item (text, image placeholder, link, form field) is
+/// reported in PDF points relative to the page's **visible page box**:
+/// `CropBox ∩ MediaBox` when the page has a CropBox, else the MediaBox. The
+/// box's lower-left corner is the origin and `y` grows upward. A renderer's
+/// page image and the region APIs ([`crate::extract_text_in_regions_mem`]
+/// and friends) use the same box from its top-left corner with `y` growing
+/// downward, so flipping `y` by the box height moves between the two. Raw
+/// content-stream coordinates differ whenever the CropBox or MediaBox origin
+/// is not `(0, 0)`. Pages whose text is drawn rotated by 90° are normalized
+/// into a synthetic landscape frame before the shift; `/Rotate` is not
+/// applied. See [`TextItem`] for the full note.
 pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextItem>, PdfError> {
     extract_text_with_positions_pages(path, None)
 }
@@ -85,7 +101,8 @@ pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextIt
 /// Extract text with positions from a file, limited to specific pages.
 ///
 /// `page_filter` is an optional set of 1-indexed page numbers to process.
-/// When `None`, all pages are processed.
+/// When `None`, all pages are processed. Coordinates: see
+/// [`extract_text_with_positions`].
 pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
@@ -99,7 +116,8 @@ pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
 /// decrypting with `password` when the PDF is encrypted.
 ///
 /// `page_filter` is an optional set of 1-indexed page numbers to process.
-/// When `None`, all pages are processed.
+/// When `None`, all pages are processed. Coordinates: see
+/// [`extract_text_with_positions`].
 pub fn extract_text_with_positions_pages_with_password<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
@@ -119,16 +137,18 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let (extraction, _thresholds, _gid_pages, _page_rotations) =
-        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
+        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
 
-/// Extract text with positions from memory buffer
+/// Extract text with positions from a memory buffer. Coordinates: see
+/// [`extract_text_with_positions`].
 pub fn extract_text_with_positions_mem(buffer: &[u8]) -> Result<Vec<TextItem>, PdfError> {
     extract_text_with_positions_mem_pages(buffer, None)
 }
 
-/// Extract text with positions from memory buffer, limited to specific pages.
+/// Extract text with positions from a memory buffer, limited to specific
+/// pages. Coordinates: see [`extract_text_with_positions`].
 pub fn extract_text_with_positions_mem_pages(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
@@ -153,7 +173,7 @@ pub fn extract_text_with_positions_and_rotations_mem(
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let ((items, _rects, _lines), _thresholds, _gid_pages, page_rotations) =
-        extract_positioned_text_from_doc(&doc, &font_cmaps, None)?;
+        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, None)?;
     Ok((items, page_rotations))
 }
 
@@ -166,8 +186,64 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let (extraction, _thresholds, _gid_pages, _page_rotations) =
-        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
+        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
+}
+
+/// One page's geometry in the visible-page-box frame, from
+/// [`extract_page_text_items_in_page_box`].
+pub(crate) struct PageBoxExtraction {
+    pub(crate) items: Vec<TextItem>,
+    pub(crate) rects: Vec<PdfRect>,
+    pub(crate) lines: Vec<PdfLine>,
+    /// Fonts with unresolvable gid-encoded glyphs were encountered.
+    pub(crate) has_gid_fonts: bool,
+    /// How the page's frame was turned so its text reads left-to-right
+    /// (see `content_stream::correct_rotated_page`); `Upright` when it was
+    /// not.
+    pub(crate) coords_rotated: geometry::PageRotation,
+    /// Invisible (Tr 3) text was skipped and could be recovered with
+    /// `include_invisible`.
+    pub(crate) skipped_invisible: bool,
+    /// The visible page box the geometry was shifted into; its height is the
+    /// flip height for top-left-origin region inputs.
+    pub(crate) page_box: PageBox,
+}
+
+/// Page-scoped extraction for the region APIs: `extract_page_text_items`
+/// followed by the visible-page-box shift every one of them must apply, so
+/// no caller can translate items but forget rects, or skip the rotated
+/// shift. Region bounds then flip `y` with `page_box.height()`.
+pub(crate) fn extract_page_text_items_in_page_box(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
+) -> Result<PageBoxExtraction, PdfError> {
+    let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
+    let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, skipped_invisible) =
+        extract_page_text_items(
+            doc,
+            page_id,
+            page_num,
+            font_cmaps,
+            include_invisible,
+            style_cache,
+            form_budget,
+        )?;
+    page_box.translate_page(&mut items, &mut rects, &mut lines, coords_rotated);
+    Ok(PageBoxExtraction {
+        items,
+        rects,
+        lines,
+        has_gid_fonts,
+        coords_rotated,
+        skipped_invisible,
+        page_box,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +266,46 @@ pub(crate) fn extract_positioned_text_from_doc(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None)
+    extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        None,
+        CoordinateFrame::UserSpace,
+    )
+}
+
+/// [`extract_positioned_text_from_doc`] with every page's geometry shifted
+/// into the visible-page-box frame — what the public position APIs return.
+/// A page whose frame was turned (see `PageRotation`) gets the equivalently
+/// turned shift, so its items, links and form fields agree with region
+/// bounds computed from the visible box.
+pub(crate) fn extract_positioned_text_from_doc_in_page_box(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+    extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        None,
+        CoordinateFrame::VisiblePageBox,
+    )
+}
+
+/// Coordinate frame of the geometry a positioned-text extraction returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoordinateFrame {
+    /// Raw PDF user space, as written in the content stream. The markdown
+    /// pipeline works here; its page-edge heuristics never leave it.
+    UserSpace,
+    /// The visible page box ([`PageBox`]) with its lower-left corner as the
+    /// origin — the frame of a rendered page image. Public position APIs
+    /// return this so items can be intersected with rendered regions.
+    VisiblePageBox,
 }
 
 /// Extract selected pages and gather document-wide folio evidence only when a
@@ -220,7 +335,14 @@ fn extract_positioned_text_with_folio_context_impl(
     include_invisible: bool,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     let Some(required_pages) = page_filter else {
-        return extract_positioned_text_impl(doc, font_cmaps, None, include_invisible, None);
+        return extract_positioned_text_impl(
+            doc,
+            font_cmaps,
+            None,
+            include_invisible,
+            None,
+            CoordinateFrame::UserSpace,
+        );
     };
 
     let (
@@ -234,6 +356,7 @@ fn extract_positioned_text_with_folio_context_impl(
         Some(required_pages),
         include_invisible,
         None,
+        CoordinateFrame::UserSpace,
     )?;
     if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
         return Ok((
@@ -261,6 +384,7 @@ fn extract_positioned_text_with_folio_context_impl(
         Some(&context_pages),
         include_invisible,
         Some(required_pages),
+        CoordinateFrame::UserSpace,
     )?;
     selected_items.extend(context_items);
     selected_rects.extend(context_rects);
@@ -283,7 +407,14 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
+    extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        None,
+        false,
+        Some(required_pages),
+        CoordinateFrame::UserSpace,
+    )
 }
 
 fn extract_positioned_text_impl(
@@ -292,6 +423,7 @@ fn extract_positioned_text_impl(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
+    frame: CoordinateFrame,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
@@ -305,6 +437,8 @@ fn extract_positioned_text_impl(
     // Pages whose coordinate frame was turned (see `PageRotation`): the
     // document-level annotation items appended below must follow.
     let mut page_rotations: PageRotations = HashMap::new();
+    // Visible page box per extracted page, for the form-field shift below.
+    let mut page_boxes: HashMap<u32, PageBox> = HashMap::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -347,13 +481,14 @@ fn extract_positioned_text_impl(
         // outside the CropBox. Extracting it interleaves invisible text into
         // the page and poisons font statistics. On a turned page the box is
         // turned the same way, so the test runs in the items' own frame.
+        let page_box = visible_page_box(doc, page_id);
         let mut clipped_box: Option<(f32, f32, f32, f32)> = None;
-        let page_box = get_page_box(doc, page_id).map(|(x0, y0, x1, y1)| {
-            let (mut x, mut y, mut w, mut h) = (x0, y0, x1 - x0, y1 - y0);
+        let clip_box = page_box.map(|b| {
+            let (mut x, mut y, mut w, mut h) = (b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
             coords_rotated.rotate_box(&mut x, &mut y, &mut w, &mut h);
             (x, y, x + w, y + h)
         });
-        if let Some((bx0, by0, bx1, by1)) = page_box {
+        if let Some((bx0, by0, bx1, by1)) = clip_box {
             const TOL: f32 = 6.0;
             let outside = |it: &TextItem| {
                 let cx = it.x + it.width / 2.0;
@@ -450,6 +585,13 @@ fn extract_positioned_text_impl(
                 );
             }
         }
+        // Public position APIs report geometry relative to the visible page
+        // box; the markdown pipeline stays in raw user space.
+        let frame_box = page_box.unwrap_or(PageBox::LETTER);
+        if frame == CoordinateFrame::VisiblePageBox {
+            frame_box.translate_page(&mut items, &mut rects, &mut lines, coords_rotated);
+        }
+        page_boxes.insert(*page_num, frame_box);
         all_items.extend(items);
         all_rects.extend(rects);
         all_lines.extend(lines);
@@ -472,20 +614,38 @@ fn extract_positioned_text_impl(
                 cx >= bx0 - 6.0 && cx <= bx1 + 6.0 && cy >= by0 - 6.0 && cy <= by1 + 6.0
             });
         }
+        if frame == CoordinateFrame::VisiblePageBox {
+            // The link rects were turned with the page above, so they take
+            // the same turned shift as the page's items.
+            frame_box.translate_items(&mut links, coords_rotated);
+        }
         all_items.extend(links);
     }
 
     // Extract AcroForm field values. Widgets on a turned page turn with it,
-    // like links, so positional consumers keep them on the text they cover.
-    let form_items = extract_form_fields(doc, &page_id_to_num)
+    // like links, so positional consumers keep them on the text they cover;
+    // in the visible-box frame they take the page's (turned) shift as well.
+    let form_items: Vec<TextItem> = extract_form_fields(doc, &page_id_to_num)
         .into_iter()
         .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)))
         .map(|mut item| {
-            if let Some(rotation) = page_rotations.get(&item.page) {
-                rotation.rotate_box(&mut item.x, &mut item.y, &mut item.width, &mut item.height);
+            let rotation = page_rotations
+                .get(&item.page)
+                .copied()
+                .unwrap_or(geometry::PageRotation::Upright);
+            rotation.rotate_box(&mut item.x, &mut item.y, &mut item.width, &mut item.height);
+            if frame == CoordinateFrame::VisiblePageBox {
+                let frame_box = page_boxes.get(&item.page).copied().unwrap_or_else(|| {
+                    pages
+                        .get(&item.page)
+                        .and_then(|&id| visible_page_box(doc, id))
+                        .unwrap_or(PageBox::LETTER)
+                });
+                frame_box.translate_items(std::slice::from_mut(&mut item), rotation);
             }
             item
-        });
+        })
+        .collect();
     all_items.extend(form_items);
 
     Ok((
@@ -1265,46 +1425,6 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
         Object::Real(r) => Some(*r),
         _ => None,
     }
-}
-
-/// Visible page box: CropBox if present, else MediaBox, walking page-tree
-/// inheritance (both attributes are inheritable). Returns normalized
-/// (x0, y0, x1, y1) in PDF space.
-fn get_page_box(doc: &Document, page_id: ObjectId) -> Option<(f32, f32, f32, f32)> {
-    fn find_box(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Vec<f32>> {
-        let mut id = page_id;
-        for _ in 0..32 {
-            let dict = doc.get_dictionary(id).ok()?;
-            if let Ok(obj) = dict.get(key) {
-                let arr = match obj {
-                    Object::Array(a) => Some(a.clone()),
-                    Object::Reference(r) => match doc.get_object(*r) {
-                        Ok(Object::Array(a)) => Some(a.clone()),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                if let Some(arr) = arr {
-                    let vals: Vec<f32> = arr.iter().filter_map(get_number).collect();
-                    if vals.len() >= 4 {
-                        return Some(vals);
-                    }
-                }
-            }
-            match dict.get(b"Parent") {
-                Ok(Object::Reference(p)) => id = *p,
-                _ => return None,
-            }
-        }
-        None
-    }
-    let v = find_box(doc, page_id, b"CropBox").or_else(|| find_box(doc, page_id, b"MediaBox"))?;
-    Some((
-        v[0].min(v[2]),
-        v[1].min(v[3]),
-        v[0].max(v[2]),
-        v[1].max(v[3]),
-    ))
 }
 
 #[cfg(test)]

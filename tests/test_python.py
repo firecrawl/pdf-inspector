@@ -347,6 +347,61 @@ class TestExtractStructureElements:
 
 
 # ---------------------------------------------------------------------------
+# Coordinate frame: positions and regions share the visible page box
+# ---------------------------------------------------------------------------
+
+
+class TestVisiblePageBoxFrame:
+    """Positions and regions are relative to the visible page box (CropBox)."""
+
+    FIXTURE = "cropbox_offset_origin.pdf"
+
+    @staticmethod
+    def _glyph(items):
+        glyph = next(
+            (item for item in items if item.text.strip() == "Visible glyph"), None
+        )
+        assert glyph is not None, (
+            f"fixture glyph missing from {[item.text for item in items]}"
+        )
+        return glyph
+
+    def test_positions_are_relative_to_cropbox_origin(self):
+        # MediaBox [0 0 400 500], CropBox [50 60 350 460]; the glyph is
+        # written at raw (120, 300), so a CropBox render puts it at (70, 240)
+        # from the box's lower-left corner.
+        glyph = self._glyph(
+            pdf_inspector.extract_text_with_positions(fixture_path(self.FIXTURE))
+        )
+        assert glyph.x == pytest.approx(70.0, abs=0.01)
+        assert glyph.y == pytest.approx(240.0, abs=0.01)
+        from_bytes = self._glyph(
+            pdf_inspector.extract_text_with_positions_bytes(
+                fixture_bytes(self.FIXTURE)
+            )
+        )
+        assert (from_bytes.x, from_bytes.y) == (glyph.x, glyph.y)
+
+    def test_regions_read_the_same_frame(self):
+        glyph = self._glyph(
+            pdf_inspector.extract_text_with_positions(fixture_path(self.FIXTURE))
+        )
+        visible_height = 400.0  # the CropBox is 300 x 400
+        region = [
+            glyph.x,
+            visible_height - glyph.y - glyph.height,
+            glyph.x + glyph.width,
+            visible_height - glyph.y,
+        ]
+        results = pdf_inspector.extract_text_in_regions(
+            fixture_path(self.FIXTURE), [(0, [region])]
+        )
+        text = results[0].regions[0].text
+        assert "Visible glyph" in text
+        assert "Second line" not in text
+
+
+# ---------------------------------------------------------------------------
 # extract_text_in_regions / extract_text_in_regions_bytes
 # ---------------------------------------------------------------------------
 

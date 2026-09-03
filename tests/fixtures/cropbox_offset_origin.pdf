@@ -1,0 +1,35 @@
+%PDF-1.3
+%¿÷¢þ
+1 0 obj
+<< /Pages 2 0 R /Type /Catalog >>
+endobj
+2 0 obj
+<< /Count 1 /Kids [ 3 0 R ] /Type /Pages >>
+endobj
+3 0 obj
+<< /Contents 4 0 R /CropBox [ 50 60 350 460 ] /MediaBox [ 0 0 400 500 ] /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Type /Page >>
+endobj
+4 0 obj
+<< /Length 149 >>
+stream
+BT /F1 12 Tf 120 300 Td (Visible glyph) Tj ET
+BT /F1 12 Tf 120 280 Td (Second line of text) Tj ET
+BT /F1 12 Tf 120 260 Td (Third line of text) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /BaseFont /Helvetica /Subtype /Type1 /Type /Font >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000123 00000 n 
+0000000278 00000 n 
+0000000478 00000 n 
+trailer << /Root 1 0 R /Size 6 /ID [<31415926535897932384626433832795><31415926535897932384626433832795>] >>
+startxref
+548
+%%EOF

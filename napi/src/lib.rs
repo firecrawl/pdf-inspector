@@ -89,15 +89,27 @@ pub struct PdfClassification {
 
 /// A positioned text item extracted from a PDF.
 ///
+/// `x`/`y` are PDF points relative to the page's **visible page box**
+/// (`CropBox ∩ MediaBox`, else the MediaBox; a CropBox that does not overlap
+/// the MediaBox is ignored, and a page without a MediaBox is measured against
+/// US Letter), origin at the box's lower-left corner with `y` growing upward.
+/// [`extractTextInRegions`] reads its regions relative to the same box but
+/// from its top-left corner with `y` growing downward; flip with the box
+/// height. `/Rotate` is not applied.
+///
 /// On a page whose text is predominantly rotated the extractor turns the
-/// coordinate frame so that text reads left-to-right; items on such a page
-/// are expressed in that turned frame, not in page coordinates. Use
+/// coordinate frame so that text reads left-to-right, and the shift into the
+/// visible page box is turned the same way; items on such a page are
+/// expressed in that turned frame. Use
 /// [`extract_text_with_positions_and_rotations`] (`extractTextWithPositionsAndRotations`
 /// in JavaScript) to learn which pages were turned and which way.
 #[napi(object)]
 pub struct TextItem {
     pub text: String,
+    /// Left edge, in PDF points from the visible page box's left edge.
     pub x: f64,
+    /// Baseline for text (rect bottom edge for image, link and form-field
+    /// items), in PDF points from the visible page box's bottom edge.
     pub y: f64,
     pub width: f64,
     pub height: f64,
@@ -147,7 +159,9 @@ pub struct TextItem {
 #[napi(object)]
 pub struct PageRegions {
     pub page: u32,
-    /// Each bbox is [x1, y1, x2, y2] in PDF points, top-left origin.
+    /// Each bbox is [x1, y1, x2, y2] in PDF points, top-left origin of the
+    /// visible page box (`CropBox ∩ MediaBox`, else the MediaBox) — the
+    /// frame of a rendered page image.
     pub regions: Vec<Vec<f64>>,
 }
 
@@ -501,6 +515,11 @@ pub fn extract_text(buffer: Buffer) -> Result<String> {
 }
 
 /// Extract text with position information from a PDF Buffer.
+///
+/// Items are reported in PDF points relative to the page's visible page box
+/// (`CropBox ∩ MediaBox`, else the MediaBox) with the box's lower-left
+/// corner as origin — see [`TextItem`]. `pages` is 1-indexed (matching
+/// `TextItem.page`); omit it for the whole document.
 #[napi]
 pub fn extract_text_with_positions(
     buffer: Buffer,
@@ -661,7 +680,13 @@ pub fn extract_structure_elements(
 /// Each region result includes `needsOcr` — set when the extracted text
 /// is unreliable (empty, GID-encoded fonts, garbage, encoding issues).
 ///
-/// Coordinates are PDF points with top-left origin.
+/// Coordinates are PDF points with top-left origin, relative to the visible
+/// page box (`CropBox ∩ MediaBox`, else the MediaBox) — the same box
+/// [`extractTextWithPositions`] reports items in, flipped to a top-left
+/// origin: a positioned `y` becomes `boxHeight - y`. For text items `y` is
+/// the baseline, so `[x, boxHeight - y - height, x + width, boxHeight - y]`
+/// covers the glyph band above the baseline; for image, link and form-field
+/// items `y` is the rect bottom and that box is exact.
 #[napi]
 pub fn extract_text_in_regions(
     buffer: Buffer,
@@ -686,7 +711,8 @@ pub fn extract_text_in_regions(
 /// `needsOcr` is `false`. When no table is found, `text` is empty and
 /// `needsOcr` is `true` so the caller can fall back to GPU OCR.
 ///
-/// Coordinates are PDF points with top-left origin.
+/// Coordinates are PDF points with top-left origin, relative to the visible
+/// page box (see `extractTextInRegions`).
 #[napi]
 pub fn extract_tables_in_regions(
     buffer: Buffer,
@@ -708,7 +734,8 @@ pub fn extract_tables_in_regions(
 /// `null` when the region does not contain a valid vector grid.
 ///
 /// `pageIdx` is 0-indexed. `regionPdfPtBbox` is `[x1,y1,x2,y2]` in PDF
-/// points with top-left origin. `renderDpi` is the DPI of the crop image that
+/// points with top-left origin, relative to the visible page box (see
+/// `extractTextInRegions`). `renderDpi` is the DPI of the crop image that
 /// will consume the returned cell bboxes.
 #[napi]
 pub fn detect_vector_grid_in_region(
@@ -761,7 +788,8 @@ pub struct TsrTableInputJs {
     /// 0-indexed page number where the crop was taken from.
     pub page: u32,
     /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
-    /// top-left origin.
+    /// top-left origin, relative to the visible page box (see
+    /// `extractTextInRegions`).
     pub crop_pdf_pt_bbox: Vec<f64>,
     /// DPI the crop image was rendered at (e.g. `200.0`).
     pub render_dpi: f64,
@@ -811,7 +839,8 @@ pub struct StructuredCellJs {
     /// Text extracted from the native PDF for this cell (may be empty).
     pub text: String,
     /// Axis-aligned bbox `[x1, y1, x2, y2]` in page PDF-points, top-left
-    /// origin. Useful for debug overlays or per-cell post-processing.
+    /// origin, relative to the visible page box (the crop's own frame).
+    /// Useful for debug overlays or per-cell post-processing.
     pub page_pt_bbox: Vec<f64>,
 }
 
