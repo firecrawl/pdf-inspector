@@ -2110,15 +2110,24 @@ pub(crate) fn find_first_table_row(
         // Otherwise skip this sparse row
     }
 
-    // Collect item indices from excluded rows
+    // Collect item indices from excluded rows.
+    //
+    // Reuse find_row_index's nearest-row assignment (the same one used to
+    // build cell_items above) rather than a flat "within 15pt of any
+    // excluded row_y" check. The flat check can misclassify an item that's
+    // actually nearest to — and already assigned to — a *retained* row: a
+    // compact table (adjacent rows <15pt apart) can have items from the
+    // first real transaction row sitting within 15pt of an excluded
+    // metadata row above it. Excluding by nearest-row match instead keeps
+    // that item's exclusion status consistent with which row it's
+    // rendered in, so it can't end up simultaneously "excluded" (rendered
+    // as prose) and present in the retained table's cells (rendered in
+    // the table too) — see #399.
     if first_table_row > 0 {
-        let y_tolerance = 15.0;
         for (idx, item) in original_items {
-            // Check if this item is in one of the excluded rows
-            for row_y in rows.iter().take(first_table_row) {
-                if (item.y - *row_y).abs() < y_tolerance {
+            if let Some(row) = find_row_index(rows, item.y) {
+                if row < first_table_row {
                     excluded_items.insert(*idx);
-                    break;
                 }
             }
         }
@@ -2257,6 +2266,52 @@ mod tests {
             mcid: None,
             baseline_shift: 0.0,
         }
+    }
+
+    #[test]
+    fn find_first_table_row_does_not_exclude_compact_transaction_row_items() {
+        // Regression for #399: a metadata row ("Account:" / "Detail:") at
+        // y=100 sits only 12pt above the first real transaction row
+        // ("04/21/26" / "$17.01") at y=88 — inside the old flat 15pt
+        // exclusion tolerance. The metadata row is correctly identified as
+        // excluded (form-label pattern), but its items must not sweep up
+        // the transaction row's items just because they're geometrically
+        // close: those items are also retained inside the table's cells,
+        // so double-counting them as "excluded" (prose) duplicates the row
+        // in the final Markdown (once as prose, once in the table).
+        let account_label = make_item("Account:", 50.0, 100.0, 10.0, 60.0);
+        let detail_label = make_item("Detail:", 200.0, 100.0, 10.0, 50.0);
+        let date = make_item("04/21/26", 50.0, 88.0, 10.0, 60.0);
+        let amount = make_item("$17.01", 200.0, 88.0, 10.0, 50.0);
+
+        let items = vec![
+            (0usize, &account_label),
+            (1usize, &detail_label),
+            (2usize, &date),
+            (3usize, &amount),
+        ];
+
+        let rows = vec![100.0, 88.0];
+        let cell_items: Vec<Vec<Vec<&TextItem>>> = vec![
+            vec![vec![&account_label], vec![&detail_label]],
+            vec![vec![&date], vec![&amount]],
+        ];
+
+        let (first_table_row, excluded_items) = find_first_table_row(&cell_items, &rows, &items);
+
+        assert_eq!(
+            first_table_row, 1,
+            "the metadata row should be skipped, retaining the transaction row as row 0"
+        );
+        assert!(
+            !excluded_items.contains(&2) && !excluded_items.contains(&3),
+            "transaction row items must not be excluded just because they're within \
+             15pt of the excluded metadata row above them, got excluded={excluded_items:?}"
+        );
+        assert!(
+            excluded_items.contains(&0) && excluded_items.contains(&1),
+            "the metadata row's own items must still be excluded, got excluded={excluded_items:?}"
+        );
     }
 
     #[test]
