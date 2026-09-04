@@ -2457,9 +2457,9 @@ fn order_columns_with_policy(
 
             if is_newspaper {
                 // Newspaper: columns are independent text flows.
-                // 1. Split each column into its densest cluster (core) and stragglers
-                // 2. Use core columns to determine the above/below threshold
-                // 3. Emit: above items → core columns sequentially → below items
+                // 1. Split each column into its densest cluster (core) and stragglers.
+                // 2. Promote only true top matter above all column starts.
+                // 3. Emit: above items → each complete column flow → below spanning items.
                 let mut core_columns: Vec<Vec<TextLine>> = Vec::new();
                 let mut col_stragglers: Vec<Vec<TextLine>> = Vec::new();
                 for col in per_column_lines {
@@ -2478,12 +2478,15 @@ fn order_columns_with_policy(
                     col_stragglers.push(stragglers);
                 }
 
-                // col_top = min of max Y across core columns
-                let col_top = core_columns
+                // Use the highest core top as the top-matter cutoff. A column
+                // that starts lower because of a figure or large gap should not
+                // pull another column's opening prose above the abstract/title
+                // area; those fragments still belong to that column's flow.
+                let top_matter_cutoff = core_columns
                     .iter()
                     .filter(|c| !c.is_empty())
                     .map(|c| c.iter().map(|l| l.y).fold(f32::NEG_INFINITY, f32::max))
-                    .fold(f32::INFINITY, f32::min);
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let margin = 5.0;
 
                 let mut above: Vec<TextLine> = Vec::new();
@@ -2491,36 +2494,36 @@ fn order_columns_with_policy(
 
                 // Spanning items: above or below the column region
                 for line in spanning_lines {
-                    if line.y > col_top + margin {
+                    if line.y > top_matter_cutoff + margin {
                         above.push(line);
                     } else {
                         below_spanning.push(line);
                     }
                 }
 
-                // Column stragglers above col_top go to "above";
-                // below col_top they stay with their column to avoid
-                // re-interleaving when sorted by Y.
-                let mut col_below: Vec<Vec<TextLine>> = vec![Vec::new(); core_columns.len()];
-                for (ci, stragglers) in col_stragglers.into_iter().enumerate() {
+                let mut column_flows: Vec<Vec<TextLine>> = Vec::with_capacity(core_columns.len());
+                for (ci, mut flow) in core_columns.into_iter().enumerate() {
+                    let stragglers = col_stragglers
+                        .get_mut(ci)
+                        .map(std::mem::take)
+                        .unwrap_or_default();
                     for line in stragglers {
-                        if line.y > col_top + margin {
+                        if line.y > top_matter_cutoff + margin {
                             above.push(line);
                         } else {
-                            col_below[ci].push(line);
+                            flow.push(line);
                         }
                     }
+                    flow.sort_by(|a, b| b.y.total_cmp(&a.y));
+                    column_flows.push(flow);
                 }
 
                 above.sort_by(|a, b| b.y.total_cmp(&a.y));
                 below_spanning.sort_by(|a, b| b.y.total_cmp(&a.y));
 
                 all_lines.extend(above);
-                for col in core_columns {
+                for col in column_flows {
                     all_lines.extend(col);
-                }
-                for cb in col_below {
-                    all_lines.extend(cb);
                 }
                 all_lines.extend(below_spanning);
             } else {
@@ -4121,5 +4124,64 @@ mod tests {
         let mask = identify_spanning_lines(&items, &cols);
         let spanning_count = mask.iter().filter(|&&m| m).count();
         assert_eq!(spanning_count, 0, "Narrow header should NOT be pre-masked");
+    }
+
+    #[test]
+    fn newspaper_keeps_staggered_right_column_fragment_in_column_flow() {
+        let mut items = Vec::new();
+
+        for i in 0..30 {
+            let text = if i == 0 {
+                "ABSTRACT".to_string()
+            } else {
+                format!("Left body line {i}")
+            };
+            let mut item = make_item(1, 54.0, 588.0 - i as f32 * 10.0, &text);
+            item.width = 220.0;
+            items.push(item);
+        }
+
+        for i in 0..4 {
+            let text = if i == 0 {
+                "options, people often need comments".to_string()
+            } else {
+                format!("Right opening fragment {i}")
+            };
+            let mut item = make_item(1, 318.0, 592.0 - i as f32 * 10.0, &text);
+            item.width = 220.0;
+            items.push(item);
+        }
+
+        for i in 0..20 {
+            let text = if i == 0 {
+                "Figure 1 caption starts here".to_string()
+            } else {
+                format!("Right lower body line {i}")
+            };
+            let mut item = make_item(1, 318.0, 330.0 - i as f32 * 10.0, &text);
+            item.width = 220.0;
+            items.push(item);
+        }
+
+        let lines = group_into_lines_with_thresholds(items, &HashMap::new(), &HashSet::new());
+        let texts: Vec<String> = lines.iter().map(TextLine::text).collect();
+        let abstract_pos = texts.iter().position(|text| text == "ABSTRACT").unwrap();
+        let options_pos = texts
+            .iter()
+            .position(|text| text.starts_with("options, people often"))
+            .unwrap();
+        let figure_pos = texts
+            .iter()
+            .position(|text| text.starts_with("Figure 1 caption"))
+            .unwrap();
+
+        assert!(
+            abstract_pos < options_pos,
+            "right-column opening fragment must not be promoted above the abstract: {texts:?}"
+        );
+        assert!(
+            options_pos < figure_pos,
+            "right-column opening fragment should stay before the lower right-column core"
+        );
     }
 }
