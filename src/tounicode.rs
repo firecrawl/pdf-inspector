@@ -29,6 +29,27 @@ pub struct ToUnicodeCMap {
     pub cid_passthrough: bool,
 }
 
+/// Detect whether a parsed ToUnicode CMap is a degenerate full-range identity
+/// bfrange (`<0000> <FFFF> <0000>`) with no other mappings.
+///
+/// Some PDF producers (notably dompdf) emit this single range as the entire
+/// ToUnicode, asserting that every CID equals its Unicode codepoint.  For
+/// subset CIDFontType2 fonts where CIDs are renumbered GIDs, that identity is
+/// false, and the range silently corrupts roughly a third of CJK characters
+/// into Latin-1 mojibake.  The correct mapping must come from the embedded
+/// TrueType `cmap` table instead.
+///
+/// Returns `true` when the CMap consists of exactly one range covering the
+/// full 16-bit CID space with a base offset of 0, and has no `char_map`
+/// entries.  The caller should treat such a CMap as absent.
+fn is_degenerate_identity_bfrange(cmap: &ToUnicodeCMap) -> bool {
+    cmap.char_map.is_empty()
+        && cmap.ranges.len() == 1
+        && cmap.ranges[0].0 == 0
+        && cmap.ranges[0].1 == 0xFFFF
+        && cmap.ranges[0].2 == 0
+}
+
 pub(crate) fn build_cmap_entry_from_stream(
     data: &[u8],
     font_dict: &lopdf::Dictionary,
@@ -36,48 +57,55 @@ pub(crate) fn build_cmap_entry_from_stream(
     obj_num: u32,
 ) -> Option<CMapEntry> {
     if let Some(cmap) = ToUnicodeCMap::parse(data) {
-        let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
-        let mut fallback = build_fallback_tounicode_from_encoding(font_dict, doc)
-            .or_else(|| build_fallback_cmap_for_type0(font_dict, doc))
-            .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
+        if is_degenerate_identity_bfrange(&cmap) {
+            debug!(
+                "ToUnicode obj={}: full-range identity bfrange detected; treating as absent",
+                obj_num
+            );
+        } else {
+            let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+            let mut fallback = build_fallback_tounicode_from_encoding(font_dict, doc)
+                .or_else(|| build_fallback_cmap_for_type0(font_dict, doc))
+                .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
 
-        let primary_entries = primary.char_map.len() + primary.ranges.len();
-        if primary_entries < 10 {
-            if let Some(fb) = fallback.take() {
-                debug!(
-                    "ToUnicode CMap obj={} too sparse ({} entries); using fallback",
-                    obj_num, primary_entries
-                );
-                remapped = Some(primary);
-                primary = fb;
-            }
-        }
-
-        // When a sequential remap was applied and a TrueType fallback has more
-        // entries than the primary ToUnicode CMap, prefer the TrueType cmap.
-        // Subset fonts number GIDs by document encounter order, so the sorted
-        // sequential remap scrambles characters.  The TrueType cmap table maps
-        // the real GID→Unicode and is authoritative.
-        if remapped.is_some() {
-            if let Some(ref fb) = fallback {
-                let fb_entries = fb.char_map.len() + fb.ranges.len();
-                if fb_entries > primary_entries {
+            let primary_entries = primary.char_map.len() + primary.ranges.len();
+            if primary_entries < 10 {
+                if let Some(fb) = fallback.take() {
                     debug!(
-                        "ToUnicode CMap obj={}: TrueType fallback ({} entries) > primary ({}); promoting over sequential remap",
-                        obj_num, fb_entries, primary_entries
+                        "ToUnicode CMap obj={} too sparse ({} entries); using fallback",
+                        obj_num, primary_entries
                     );
-                    let old_remap = remapped.take().unwrap();
-                    remapped = fallback.take();
-                    fallback = Some(old_remap);
+                    remapped = Some(primary);
+                    primary = fb;
                 }
             }
-        }
 
-        return Some(CMapEntry {
-            primary,
-            remapped,
-            fallback,
-        });
+            // When a sequential remap was applied and a TrueType fallback has more
+            // entries than the primary ToUnicode CMap, prefer the TrueType cmap.
+            // Subset fonts number GIDs by document encounter order, so the sorted
+            // sequential remap scrambles characters.  The TrueType cmap table maps
+            // the real GID→Unicode and is authoritative.
+            if remapped.is_some() {
+                if let Some(ref fb) = fallback {
+                    let fb_entries = fb.char_map.len() + fb.ranges.len();
+                    if fb_entries > primary_entries {
+                        debug!(
+                            "ToUnicode CMap obj={}: TrueType fallback ({} entries) > primary ({}); promoting over sequential remap",
+                            obj_num, fb_entries, primary_entries
+                        );
+                        let old_remap = remapped.take().unwrap();
+                        remapped = fallback.take();
+                        fallback = Some(old_remap);
+                    }
+                }
+            }
+
+            return Some(CMapEntry {
+                primary,
+                remapped,
+                fallback,
+            });
+        } // else: degenerate identity bfrange - fall through to fallback
     }
 
     let fallback = build_fallback_cmap_for_type0(font_dict, doc)
@@ -2128,6 +2156,30 @@ impl FontCMaps {
                 Err(_) => stream.content.clone(),
             };
             if let Some(cmap) = ToUnicodeCMap::parse(&data) {
+                if is_degenerate_identity_bfrange(&cmap) {
+                    let fallback = if skip_truetype_fallback {
+                        build_fallback_cmap_for_simple(font_dict, doc)
+                    } else {
+                        build_fallback_cmap_for_type0(font_dict, doc)
+                            .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
+                    };
+                    if let Some(fb) = fallback {
+                        debug!(
+                            "ToUnicode CMap obj={} is a full-range identity bfrange; using fallback (entries={})",
+                            obj_num,
+                            fb.char_map.len()
+                        );
+                        by_obj_num.insert(
+                            obj_num,
+                            CMapEntry {
+                                primary: fb,
+                                remapped: None,
+                                fallback: None,
+                            },
+                        );
+                    }
+                    continue;
+                }
                 debug!(
                     "CMap obj={:<6} code_byte_length={} char_map={} ranges={}",
                     obj_num,
@@ -3481,5 +3533,102 @@ endbfrange
         assert!(enc.map.len() <= MAX_CID_W_EXPANSION);
         assert_eq!(enc.map.get(&0), Some(&0));
         assert_eq!(enc.map.get(&65535), Some(&65535));
+    }
+
+    #[test]
+    fn is_degenerate_identity_bfrange_detects_full_range_identity() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfrange
+<0000> <FFFF> <0000>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert!(is_degenerate_identity_bfrange(&cmap));
+    }
+
+    #[test]
+    fn degenerate_identity_bfrange_is_treated_as_absent() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfrange
+<0000> <FFFF> <0000>
+endbfrange
+"#;
+        let font_dict = lopdf::Dictionary::new();
+        let doc = lopdf::Document::new();
+
+        assert!(
+            build_cmap_entry_from_stream(cmap_content.as_bytes(), &font_dict, &doc, 1).is_none()
+        );
+    }
+
+    #[test]
+    fn is_degenerate_identity_bfrange_rejects_nonzero_base() {
+        // Same range but with a non-zero base offset: not identity
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfrange
+<0000> <FFFF> <0020>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert!(!is_degenerate_identity_bfrange(&cmap));
+    }
+
+    #[test]
+    fn is_degenerate_identity_bfrange_rejects_partial_range() {
+        // Partial range: not the degenerate full-range identity
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfrange
+<0020> <007E> <0020>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert!(!is_degenerate_identity_bfrange(&cmap));
+    }
+
+    #[test]
+    fn is_degenerate_identity_bfrange_rejects_bfchar_entries() {
+        // Full-range identity bfrange PLUS bfchar entries: not degenerate
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfchar
+<0041> <0041>
+endbfchar
+1 beginbfrange
+<0000> <FFFF> <0000>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert!(!is_degenerate_identity_bfrange(&cmap));
+    }
+
+    #[test]
+    fn is_degenerate_identity_bfrange_rejects_normal_tounicode() {
+        // Normal CJK ToUnicode with real mappings
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+3 beginbfchar
+<0001> <4E00>
+<0002> <4E01>
+<0003> <4E02>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert!(!is_degenerate_identity_bfrange(&cmap));
     }
 }
