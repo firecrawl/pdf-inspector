@@ -1007,14 +1007,21 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
                 .map(|(_, i)| i.text.trim())
                 .collect::<Vec<_>>()
                 .join(" ");
-            let body = match text.split_once(char::is_whitespace) {
-                Some((first, rest))
-                    if first
+            let is_section_number = |token: &str| {
+                token.len() <= 10
+                    && token.chars().any(|c| c.is_ascii_digit())
+                    && token
                         .chars()
-                        .all(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | ')' | '(')) =>
-                {
-                    rest
-                }
+                        .all(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | ')' | '('))
+                    && token
+                        .split(|c: char| !c.is_ascii_digit())
+                        .all(|group| group.len() <= 3)
+            };
+            let body = match text.split_once(char::is_whitespace) {
+                // A section number is digit groups of at most three digits
+                // with dots or a list suffix ("4.3.3.4", "2.", "1)"); a year
+                // ("2023:") is a four-digit group and stays in the count.
+                Some((first, rest)) if is_section_number(first) => rest,
                 _ => text.as_str(),
             };
             let (letters, digits) = body.chars().fold((0usize, 0usize), |(l, d), c| {
@@ -1035,7 +1042,33 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
             (has_title && compact).then_some(last.x + last.width)
         })
         .collect();
+    // Entries that start with a year ("2020: Q1 revenue") are the rows of a
+    // period table whose last column happens to climb, not a contents list.
+    let year_led = row_items
+        .iter()
+        .zip(&numbered)
+        .filter(|(row, n)| {
+            n.is_some()
+                && row.first().is_some_and(|(_, i)| {
+                    let digits: String = i
+                        .text
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    digits.len() == 4 && digits.starts_with(['1', '2'])
+                })
+        })
+        .count();
     let mut right_edges: Vec<f32> = numbered.iter().flatten().copied().collect();
+    if year_led * 2 > right_edges.len() {
+        debug!(
+            "  contents list rejected: {} of {} entries start with a year",
+            year_led,
+            right_edges.len()
+        );
+        return None;
+    }
     // Leading and trailing rows without a number are not part of the list;
     // within it, entries must make up a fair share of the rows — a contents
     // page with the authors under every entry and part titles between the
@@ -1092,13 +1125,15 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
     let mut title_x = f32::INFINITY;
     let mut number_x = Vec::new();
     for (row, is_numbered) in row_items[first..=last].iter().zip(&numbered[first..=last]) {
+        // The shared edge was judged for the block as a whole; a row whose
+        // number sits a little off it is still an entry and keeps its tab.
         let (title_items, page) = match is_numbered {
-            Some(edge) if (edge - median_edge).abs() <= 8.0 => {
+            Some(_) => {
                 let (_, number) = row.last()?;
                 number_x.push(number.x);
                 (&row[..row.len() - 1], number.text.trim().to_string())
             }
-            _ => (&row[..], String::new()),
+            None => (&row[..], String::new()),
         };
         // Leader dots between a title and its page number are the leader,
         // not the title — `format_toc_as_list` drops dots-only cells, and a
@@ -1155,7 +1190,9 @@ fn detect_table_in_region(
     // A contents list — entries ending in right-aligned page numbers, with
     // author or part-title rows between them — is left-heavy by nature and
     // would be thrown out below as a paragraph. It has its own shape.
-    if let Some(table) = detect_contents_list(&geometry_items) {
+    // Every item takes part, scripts included: a footnote marker on an
+    // entry belongs to that entry's title, not to the text flow.
+    if let Some(table) = detect_contents_list(items) {
         return Some(table);
     }
     let columns = find_column_boundaries(&geometry_items, mode);
@@ -2500,11 +2537,15 @@ mod tests {
             contents_item("97", 350.0, 301.6, 12.0),
             contents_item("6.8 USAMO 2026", 68.0, 288.6, 80.0),
             contents_item("191", 350.0, 288.6, 18.0),
+            // A footnote marker on an entry, and a page number 6pt off the edge.
+            contents_item("5 Digital archives", 68.0, 275.6, 90.0),
+            contents_item("1", 158.5, 279.6, 3.0),
+            contents_item("120", 344.0, 275.6, 18.0),
         ];
         let indexed: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
         let table = detect_contents_list(&indexed).expect("contents list");
         assert_eq!(table.kind, crate::tables::TableKind::Toc);
-        assert_eq!(table.cells.len(), 13, "{:?}", table.cells);
+        assert_eq!(table.cells.len(), 14, "{:?}", table.cells);
         assert_eq!(table.cells[0], vec!["List of figures", "vii"]);
         assert_eq!(table.cells[5], vec!["Lise Jaillant, Claire Warwick", ""]);
         assert_eq!(table.cells[6], vec!["1 The National Archives (UK)", "15"]);
@@ -2520,6 +2561,9 @@ mod tests {
         // digits: short titles with dotted numbers and years are entries.
         assert_eq!(table.cells[11], vec!["4.3.3.4 MASK", "97"]);
         assert_eq!(table.cells[12], vec!["6.8 USAMO 2026", "191"]);
+        // The marker stays in its title and a number a little off the shared
+        // edge still gets its own cell.
+        assert_eq!(table.cells[13], vec!["5 Digital archives 1", "120"]);
         assert_eq!(table.item_indices.len(), items.len());
     }
 
@@ -2585,6 +2629,19 @@ mod tests {
             })
             .collect();
         let indexed: Vec<(usize, &TextItem)> = statistics.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … period rows keep their year in the digit count and stay data …
+        let periods: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item(&format!("20{}: Q1 revenue", 20 + r), 68.0, y, 90.0),
+                    contents_item(&format!("{}", 100 + r * 20), 350.0, y, 18.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = periods.iter().enumerate().collect();
         assert!(detect_contents_list(&indexed).is_none());
 
         // … a table header whose rows all end in the same value is no list …
