@@ -150,6 +150,61 @@ pub(crate) fn merge_heading_lines(
 /// Merge drop caps with the appropriate line.
 /// A drop cap is a single large letter at the start of a paragraph.
 /// Due to PDF coordinate sorting, the drop cap may appear AFTER the line it belongs to.
+/// True when the text ends a sentence, as opposed to merely ending in a
+/// period. An abbreviation or list marker ("e.g.", "Fig.", "Mr.", "1.")
+/// closes with a period mid-sentence, so treating those as paragraph
+/// boundaries would let a drop cap be prepended to a continuation.
+fn ends_sentence(text: &str) -> bool {
+    let t = text.trim_end();
+    if t.ends_with(['!', '?']) {
+        return true;
+    }
+    let Some(stripped) = t.strip_suffix('.') else {
+        return false;
+    };
+    let last = stripped.split_whitespace().next_back().unwrap_or("");
+    if last.is_empty() {
+        return false;
+    }
+
+    // Abbreviations carry an internal period between very short segments
+    // ("e.g.", "i.e.", "U.S."). Domains and decimals have the same shape but
+    // longer or numeric segments ("example.com.", "3.14."), and those end
+    // sentences perfectly well, so require every segment to be short and
+    // alphabetic before reading the internal period as an abbreviation.
+    if last.contains('.')
+        && last
+            .split('.')
+            .filter(|seg| !seg.is_empty())
+            // Characters, not bytes: a two-letter non-ASCII abbreviation
+            // ("т.е.", "ú.d.") measures four or more bytes and would
+            // otherwise be read as a completed sentence.
+            .all(|seg| seg.chars().count() <= 2 && seg.chars().all(char::is_alphabetic))
+    {
+        return false;
+    }
+
+    // Enumerators stand alone on their line ("1.", "ii.", "IV."). A number
+    // or numeral in the tail of a sentence does not — "published in 2020.",
+    // "He scored 5." and "after World War II." all end sentences, and
+    // treating them as markers would block a legitimate drop-cap merge.
+    if stripped.split_whitespace().count() == 1 {
+        let is_numeric = last.chars().all(|c| c.is_ascii_digit());
+        let is_roman = last
+            .chars()
+            .all(|c| matches!(c.to_ascii_uppercase(), 'I' | 'V' | 'X' | 'L' | 'C'));
+        if is_numeric || is_roman {
+            return false;
+        }
+    }
+
+    const ABBREVIATIONS: &[&str] = &[
+        "Fig", "No", "Mr", "Mrs", "Ms", "Dr", "St", "vs", "etc", "al", "Ed", "Eq", "Ch", "pp",
+        "Vol", "cf", "Prof", "Inc", "Ltd", "Jr", "Sr",
+    ];
+    !ABBREVIATIONS.iter().any(|a| a.eq_ignore_ascii_case(last))
+}
+
 pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextLine> {
     let mut result: Vec<TextLine> = Vec::with_capacity(lines.len());
 
@@ -168,6 +223,169 @@ pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextL
                 .next()
                 .map(|c| c.is_uppercase())
                 .unwrap_or(false);
+
+        // Embedded drop cap: a two-line cap's baseline aligns with the
+        // paragraph's SECOND line, so Y-grouping puts the glyph at the start
+        // of that line rather than on a line of its own. Left there it
+        // surfaces mid-sentence once the paragraph is joined — Shannon's
+        // "A Mathematical Theory of Communication" reads "...which exchange
+        // T bandwidth for signal-to-noise ratio...". Detect it, prepend the
+        // character to the paragraph's first line, and drop it from this one.
+        //
+        // The size gate is 1.8x rather than 2.5x because bitmap (Type3) caps
+        // report their glyph bbox rather than the em box, so a two-line cap
+        // can measure as little as ~1.9x the body size.
+        if line.items.len() > 1 {
+            let first = &line.items[0];
+            // The remainder must be a substantive body run: a lone label or
+            // math fragment beside a large glyph is not a drop-cap paragraph.
+            let rest_letters: usize = line.items[1..]
+                .iter()
+                .map(|i| i.text.chars().filter(|c| c.is_alphabetic()).count())
+                .sum();
+            let is_embedded_cap = first.font_size >= base_size * 1.8
+                && first.text.trim().chars().count() == 1
+                && first
+                    .text
+                    .trim()
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_uppercase)
+                && line.items[1..]
+                    .iter()
+                    .all(|i| i.font_size < base_size * 1.5)
+                && line.items[1..].iter().any(|i| i.x > first.x)
+                && rest_letters >= 8;
+            if is_embedded_cap {
+                let drop_char = first.text.trim().chars().next().unwrap();
+                let cap_x = first.x;
+                let line_y = line.y;
+                // Text on the cap's own line, pushed right to clear the glyph.
+                let rest_x = line.items[1].x;
+
+                // Walk up the run of lines the cap has indented. A drop cap
+                // pushes every line it covers to the right of the glyph, so
+                // the paragraph's first line is the TOPMOST line sharing that
+                // indent — however many lines the cap spans. Using the indent
+                // rather than the cap's font size is what makes this work for
+                // three- and four-line initials as well as two-line ones;
+                // deriving a line count from the em size does not survive
+                // contact with real documents, where 36-47pt initials sit
+                // over 11-14pt leading.
+                //
+                // A cap in a different column has no such run (its neighbours
+                // sit at an unrelated x), so it is left alone — which is
+                // correct when the cap's own line already carries the rest of
+                // the word.
+                const INDENT_TOLERANCE: f32 = 2.0;
+                const MAX_CAP_LINES: usize = 8;
+                let max_step = base_size * 2.5;
+                let mut target_idx = result.len();
+                let mut expected_y = line_y;
+                while target_idx > 0 && result.len() - target_idx < MAX_CAP_LINES {
+                    let cand = &result[target_idx - 1];
+                    let step = cand.y - expected_y;
+                    let shares_indent = cand
+                        .items
+                        .first()
+                        .is_some_and(|i| (i.x - rest_x).abs() <= INDENT_TOLERANCE);
+                    if cand.page != line.page || step <= 0.0 || step > max_step || !shares_indent {
+                        break;
+                    }
+                    expected_y = cand.y;
+                    target_idx -= 1;
+                }
+
+                // The topmost line of the run is the paragraph's first line.
+                // The line above THAT tells us whether it starts a paragraph.
+                let before_target = target_idx
+                    .checked_sub(1)
+                    .and_then(|i| result.get(i))
+                    .filter(|l| l.page == line.page)
+                    .map(|l| (l.text().trim_end().to_string(), l.y));
+                // Leading within the run: the step from the target down to the
+                // next line of the paragraph, which is the cap's own line when
+                // the run is a single line.
+                let run_step = result
+                    .get(target_idx)
+                    .map(|t| {
+                        let below_y = result.get(target_idx + 1).map_or(line_y, |b| b.y);
+                        t.y - below_y
+                    })
+                    .unwrap_or(0.0);
+                let step_for_gap = if run_step > 0.0 {
+                    run_step
+                } else {
+                    base_size * 1.2
+                };
+
+                let target = (target_idx < result.len())
+                    .then(|| &mut result[target_idx])
+                    .filter(|prev| {
+                        let prev_text = prev.text();
+                        let prev_trimmed = prev_text.trim();
+                        // A hyphen on the line above means the target resumes
+                        // a split word, so it continues a paragraph rather
+                        // than starting one (polkuja_ylakoulu: "ylakou-" +
+                        // "lulaisten").
+                        //
+                        // Case cannot serve as a continuation signal here: the
+                        // target legitimately starts lowercase, because the
+                        // cap removes the word's first letter and leaves
+                        // "ver the course..." for "Over".
+                        let continues_previous = before_target
+                            .as_ref()
+                            .is_some_and(|(b, _)| b.ends_with('-'));
+                        // The target must START a paragraph: extra leading
+                        // above it, a completed sentence on the line above, or
+                        // nothing above it at all.
+                        let starts_paragraph = match before_target.as_ref() {
+                            None => true,
+                            Some((text, y)) => {
+                                y - prev.y > step_for_gap * 1.15 || ends_sentence(text)
+                            }
+                        };
+                        !continues_previous
+                            && starts_paragraph
+                            && prev.page == line.page
+                            && prev.y > line_y
+                            // Indented past the cap glyph, not merely to its
+                            // right by an arbitrary amount.
+                            && prev
+                                .items
+                                .first()
+                                .is_some_and(|i| i.x > cap_x && i.x - cap_x <= first.font_size * 2.0)
+                            // Body text, so headings, labels and table
+                            // fragments are never rewritten.
+                            && prev_trimmed
+                                .chars()
+                                .next()
+                                .is_some_and(char::is_alphabetic)
+                            && prev_trimmed.chars().filter(|c| c.is_alphabetic()).count() >= 8
+                    });
+                if let Some(prev_line) = target {
+                    if let Some(first_item) = prev_line.items.first_mut() {
+                        // A mid-word cap ("T" + "HE recent") joins directly.
+                        // Leading whitespace only marks a word boundary when
+                        // the cap is itself a single-letter word, since the
+                        // paragraph's indent can also arrive as whitespace.
+                        const SINGLE_LETTER_WORDS: &[char] = &['A', 'I', 'O', 'U', 'Y', 'E'];
+                        let had_leading_ws = first_item.text.starts_with(char::is_whitespace)
+                            && SINGLE_LETTER_WORDS.contains(&drop_char);
+                        let rest = first_item.text.trim_start().to_string();
+                        first_item.text = if had_leading_ws {
+                            format!("{} {}", drop_char, rest)
+                        } else {
+                            format!("{}{}", drop_char, rest)
+                        };
+                    }
+                    let mut line = line.clone();
+                    line.items.remove(0);
+                    result.push(line);
+                    continue;
+                }
+            }
+        }
 
         if is_drop_cap {
             let drop_char = trimmed.chars().next().unwrap();
@@ -264,6 +482,314 @@ mod tests {
             page,
             adaptive_threshold: 0.10,
         }
+    }
+
+    fn make_item_at(text: &str, font_size: f32, x: f32) -> TextItem {
+        let mut item = make_item(text, font_size, None);
+        item.x = x;
+        item.width = text.len() as f32 * font_size * 0.5;
+        item
+    }
+
+    #[test]
+    fn embedded_drop_cap_moves_to_paragraph_start() {
+        // A two-line cap baseline-aligns with the paragraph's SECOND line,
+        // so it lands as that line's first item (Shannon entropy.pdf p.1).
+        let first_line = TextLine {
+            items: vec![make_item_at(
+                "HE recent development which exchange",
+                10.0,
+                90.0,
+            )],
+            // 16pt baseline step under a 25pt cap: a genuine two-line cap.
+            y: 716.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let second_line = TextLine {
+            items: vec![
+                make_item_at("T", 25.0, 72.0),
+                make_item_at("bandwidth for signal-to-noise ratio", 10.0, 90.0),
+            ],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let result = merge_drop_caps(vec![first_line, second_line], 10.0);
+        assert_eq!(result.len(), 2);
+        assert!(
+            result[0].text().starts_with("THE recent"),
+            "cap should prepend to the paragraph start: {}",
+            result[0].text()
+        );
+        assert!(
+            result[1].text().starts_with("bandwidth"),
+            "cap must be removed from the second line: {}",
+            result[1].text()
+        );
+    }
+
+    #[test]
+    fn embedded_drop_cap_walks_a_multi_line_initial_to_the_paragraph_start() {
+        // A 47pt initial over 13pt leading covers four lines, so the
+        // paragraph's first line is three lines above the cap rather than
+        // immediately above it (polkuja_ylakoulu). The indented run, not the
+        // cap's em size, is what locates it.
+        let mut lines = vec![TextLine {
+            items: vec![make_item_at("Previous paragraph ends here.", 10.0, 72.0)],
+            y: 766.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        }];
+        for (i, text) in [
+            "rilaiset mediasisallot ovat tarkea osa",
+            "useimpien ylakoululaisten elamaa ja",
+            "muuta tekstia jatkuu tassa viela",
+        ]
+        .iter()
+        .enumerate()
+        {
+            lines.push(TextLine {
+                items: vec![make_item_at(text, 10.0, 90.0)],
+                y: 753.0 - 13.0 * i as f32,
+                page: 1,
+                adaptive_threshold: 0.10,
+            });
+        }
+        lines.push(TextLine {
+            items: vec![
+                make_item_at("E", 47.0, 72.0),
+                make_item_at("loppuosa tekstista tassa", 10.0, 90.0),
+            ],
+            y: 714.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        });
+
+        let result = merge_drop_caps(lines, 10.0);
+        assert!(
+            result[1].text().starts_with("Erilaiset"),
+            "cap belongs on the topmost line of the indented run: {}",
+            result[1].text()
+        );
+        assert!(
+            result[2].text().starts_with("useimpien"),
+            "intervening run lines must be untouched: {}",
+            result[2].text()
+        );
+        assert!(
+            result[4].text().starts_with("loppuosa"),
+            "cap must be removed from its own line: {}",
+            result[4].text()
+        );
+    }
+
+    #[test]
+    fn embedded_drop_cap_ignores_non_paragraph_neighbours() {
+        // Same geometry, but the preceding line is a short label rather than
+        // body text, so it must not be rewritten.
+        let label = TextLine {
+            items: vec![make_item_at("Fig. 2", 10.0, 90.0)],
+            y: 716.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let second_line = TextLine {
+            items: vec![
+                make_item_at("T", 25.0, 72.0),
+                make_item_at("bandwidth for signal-to-noise ratio", 10.0, 90.0),
+            ],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let result = merge_drop_caps(vec![label, second_line], 10.0);
+        assert_eq!(result[0].text().trim(), "Fig. 2");
+        assert!(
+            result[1].text().starts_with('T'),
+            "cap stays put: {}",
+            result[1].text()
+        );
+    }
+
+    #[test]
+    fn embedded_drop_cap_keeps_a_space_for_standalone_word_caps() {
+        // Leading whitespace on the paragraph's first item marks the cap as
+        // a word of its own rather than the first letter of one.
+        let mut lead = make_item_at("long time ago in a galaxy far away", 10.0, 90.0);
+        lead.text = " long time ago in a galaxy far away".to_string();
+        let first_line = TextLine {
+            items: vec![lead],
+            y: 716.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let second_line = TextLine {
+            items: vec![
+                make_item_at("A", 25.0, 72.0),
+                make_item_at("continued here with more body text", 10.0, 90.0),
+            ],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let result = merge_drop_caps(vec![first_line, second_line], 10.0);
+        assert!(
+            result[0].text().starts_with("A long time ago"),
+            "standalone-word cap keeps one space: {}",
+            result[0].text()
+        );
+    }
+
+    #[test]
+    fn embedded_drop_cap_skips_hyphenation_continuation_targets() {
+        // The line above the RUN ends on a hyphen, so the run's topmost line
+        // resumes a split word rather than starting a paragraph. It sits at
+        // the paragraph margin (x=72), outside the cap's indent, so it is not
+        // part of the run itself.
+        let split_word = TextLine {
+            items: vec![make_item_at(
+                "mediasisallot ovat osa useimpien ylakou-",
+                10.0,
+                72.0,
+            )],
+            y: 728.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let run_top = TextLine {
+            items: vec![make_item_at(
+                "lulaisten elamaa ja muuta tekstia",
+                10.0,
+                90.0,
+            )],
+            y: 714.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let cap_line = TextLine {
+            items: vec![
+                make_item_at("E", 25.0, 72.0),
+                make_item_at("jatkuu tassa lisaa leipatekstia", 10.0, 90.0),
+            ],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let result = merge_drop_caps(vec![split_word, run_top, cap_line], 10.0);
+        assert!(
+            result[1].text().starts_with("lulaisten"),
+            "a run resuming a split word must not receive the cap: {}",
+            result[1].text()
+        );
+        assert!(
+            result[2].text().starts_with('E'),
+            "cap stays put when no valid target exists: {}",
+            result[2].text()
+        );
+    }
+
+    #[test]
+    fn embedded_drop_cap_indent_is_not_a_word_boundary() {
+        // The paragraph's first line is indented to clear the cap, and that
+        // indent can arrive as leading whitespace. A mid-word cap must still
+        // join directly — "T HE recent" would be the defect this fixes.
+        let mut lead = make_item_at("HE recent development and more body text", 10.0, 90.0);
+        lead.text = "  HE recent development and more body text".to_string();
+        let first_line = TextLine {
+            items: vec![lead],
+            y: 716.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let cap_line = TextLine {
+            items: vec![
+                make_item_at("T", 25.0, 72.0),
+                make_item_at("bandwidth for signal-to-noise ratio", 10.0, 90.0),
+            ],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let result = merge_drop_caps(vec![first_line, cap_line], 10.0);
+        assert!(
+            result[0].text().starts_with("THE recent"),
+            "indent must not be read as a word boundary: {}",
+            result[0].text()
+        );
+    }
+
+    #[test]
+    fn ends_sentence_rejects_abbreviations_and_markers() {
+        use super::ends_sentence;
+        assert!(ends_sentence("This completes the thought."));
+        assert!(ends_sentence("Is that so?"));
+        assert!(ends_sentence("Stop!"));
+        // Periods that do not end a sentence.
+        assert!(!ends_sentence("as shown in Fig."));
+        assert!(!ends_sentence("see e.g."));
+        // Non-ASCII abbreviations. The two-CHARACTER segment is the case
+        // that distinguishes a character count from a byte count: "пр" is
+        // 2 chars but 4 bytes, so a byte-based bound would reject it and
+        // read the line as a completed sentence.
+        assert!(!ends_sentence("и т.пр."));
+        assert!(!ends_sentence("см. т.е."));
+        assert!(!ends_sentence("napr. ú.d."));
+        assert!(!ends_sentence("reviewed by Dr."));
+        // Standalone enumerators, any case.
+        assert!(!ends_sentence("1."));
+        assert!(!ends_sentence("IV."));
+        assert!(!ends_sentence("ii."));
+        assert!(!ends_sentence("xii."));
+        // Numbers and numerals that genuinely end a sentence must count,
+        // or a legitimate drop-cap merge is blocked.
+        assert!(ends_sentence("The paper was published in 2020."));
+        assert!(ends_sentence("He scored 5."));
+        assert!(ends_sentence("after World War II."));
+        assert!(ends_sentence("the constant equals 3.14."));
+        assert!(ends_sentence("documented at example.com."));
+        assert!(!ends_sentence("a trailing clause with no period"));
+    }
+
+    #[test]
+    fn embedded_drop_cap_allows_first_paragraph_on_a_new_page() {
+        // The line two back is on the previous page, so its y is unrelated
+        // and must not be used as leading evidence.
+        let prev_page_tail = TextLine {
+            items: vec![make_item_at(
+                "tail of the previous page body text",
+                10.0,
+                90.0,
+            )],
+            y: 90.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+        let first_line = TextLine {
+            items: vec![make_item_at(
+                "HE recent development which exchange",
+                10.0,
+                90.0,
+            )],
+            y: 716.0,
+            page: 2,
+            adaptive_threshold: 0.10,
+        };
+        let cap_line = TextLine {
+            items: vec![
+                make_item_at("T", 25.0, 72.0),
+                make_item_at("bandwidth for signal-to-noise ratio", 10.0, 90.0),
+            ],
+            y: 700.0,
+            page: 2,
+            adaptive_threshold: 0.10,
+        };
+        let result = merge_drop_caps(vec![prev_page_tail, first_line, cap_line], 10.0);
+        assert!(
+            result[1].text().starts_with("THE recent"),
+            "a page break must not suppress the merge: {}",
+            result[1].text()
+        );
     }
 
     #[test]
