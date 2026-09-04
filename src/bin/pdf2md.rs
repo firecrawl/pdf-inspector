@@ -3,8 +3,8 @@
 use pdf_inspector::extractor::ItemType;
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 use pdf_inspector::vision::{
-    process_pdf_with_ocr, ModelDownloadPolicy, OcrMode, OcrOptions, OcrPdfOptions, OcrPdfResult,
-    PageContentSource, RenderOptions,
+    process_pdf_with_ocr, ModelDownloadPolicy, OcrMode, OcrModelSet, OcrOptions, OcrPdfOptions,
+    OcrPdfResult, PageContentSource, RenderOptions,
 };
 use pdf_inspector::{
     extract_text_with_positions_pages_with_password, process_pdf_with_options, LayoutComplexity,
@@ -426,6 +426,9 @@ fn main() {
         eprintln!("  --ocr-min-confidence N  Drop OCR spans below N (default: 0)");
         eprintln!("  --ocr-hosted-threshold N  Recommend hosted parsing below N (default: 0.5)");
         eprintln!("  --ocr-model-dir DIR Use a package-managed local model directory");
+        eprintln!(
+            "  --ocr-model-set ID  Pinned model set: pp-ocrv6-small (default) or pp-ocrv5-korean"
+        );
         eprintln!("  --ocr-offline       Never download missing OCR models");
         process::exit(1);
     }
@@ -482,6 +485,7 @@ fn main() {
         "--ocr-min-confidence",
         "--ocr-hosted-threshold",
         "--ocr-model-dir",
+        "--ocr-model-set",
         "--ocr-offline",
     ]
     .iter()
@@ -539,11 +543,32 @@ fn main() {
                     exit_ocr_error(&error, json_output);
                 });
 
+            let model_set = argument_value(&args, "--ocr-model-set")
+                .unwrap_or_else(|error| {
+                    exit_ocr_error(&error, json_output);
+                })
+                .map(|value| {
+                    OcrModelSet::parse(value).unwrap_or_else(|| {
+                        let expected: Vec<&str> =
+                            OcrModelSet::ALL.iter().map(|set| set.id()).collect();
+                        exit_ocr_error(
+                            &format!(
+                                "invalid --ocr-model-set {value:?}; expected one of: {}",
+                                expected.join(", ")
+                            ),
+                            json_output,
+                        );
+                    })
+                });
+
             let mut ocr = OcrOptions::new()
                 .mode(mode)
                 .minimum_confidence(minimum_confidence);
             if let Some(directory) = model_directory {
                 ocr = ocr.model_directory(directory);
+            }
+            if let Some(model_set) = model_set {
+                ocr = ocr.model_set(model_set);
             }
             if args.iter().any(|argument| argument == "--ocr-offline") {
                 ocr = ocr.model_downloads(ModelDownloadPolicy::Offline);

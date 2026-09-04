@@ -125,7 +125,9 @@ separate `model-cache` feature adds pinned artifact management:
 
 - `PageRenderer` and `OcrEngine` traits;
 - renderer-neutral owned page buffers and affine pixel↔PDF transforms;
-- `OcrOptions` and opt-in `Off`/`Auto`/`Force` routing modes;
+- `OcrOptions` and opt-in `Off`/`Auto`/`Force` routing modes, plus
+  `OcrModelSet` to choose the pinned model set (default PP-OCRv6 Small, or
+  PP-OCRv5 Korean);
 - positioned OCR results and per-page provenance types; and
 - a versioned PP-OCRv6 Small manifest with checksum-verified, locked, atomic
   model-cache installation and explicit offline-directory overrides.
@@ -431,8 +433,12 @@ pdf2md document.pdf --ocr auto --ocr-offline --ocr-model-dir /opt/models/pp-ocrv
 ```
 
 CLI controls include `--ocr-dpi`, `--ocr-min-confidence`,
-`--ocr-hosted-threshold`, `--select-pages`, and the existing encrypted-PDF
-`--password` option. JSON output has `schema_version: 1` and includes per-page Markdown, source/model
+`--ocr-hosted-threshold`, `--ocr-model-set`, `--select-pages`, and the
+existing encrypted-PDF `--password` option. `--ocr-model-set` (Rust:
+`OcrOptions::model_set`, see `OcrModelSet`) picks the pinned model set;
+`pp-ocrv6-small` is the default and `pp-ocrv5-korean` adds Korean. The
+[OCR runtime setup guide](https://github.com/firecrawl/pdf-inspector/blob/main/docs/ocr-runtime.md#model-sets)
+lists the files and scripts of every set. JSON output has `schema_version: 1` and includes per-page Markdown, source/model
 provenance, confidence, timings, warnings, routed pages, and hosted-fallback
 recommendations. Page numbers in `OcrPdfResult` and its per-page provenance
 are 1-indexed, matching the PDF page numbers accepted by
