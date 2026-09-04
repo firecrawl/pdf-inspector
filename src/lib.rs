@@ -4312,10 +4312,13 @@ fn process_document(
             options.page_filter.as_ref(),
         );
 
-        // For Mixed/template PDFs: if normal extraction produces garbage text
-        // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
-        // This unlocks OCR text layers behind scanned images.
-        if pdf_type == PdfType::Mixed {
+        // For Mixed/template PDFs, and for TextBased PDFs whose only text is an invisible
+        // (Tr=3) OCR layer (e.g. ocrmypdf output, which is classified TextBased): if normal
+        // extraction produces garbage or empty text, retry with invisible (Tr=3) text
+        // included. This unlocks OCR text layers behind scanned images. Normal TextBased
+        // PDFs are unaffected — the retry only fires when the visible sample is
+        // garbage/empty in the check below, which a real visible-text layer never is.
+        if pdf_type == PdfType::Mixed || pdf_type == PdfType::TextBased {
             if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _)| e) {
                 let sample: String = items
                     .iter()
