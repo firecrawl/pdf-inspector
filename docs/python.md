@@ -123,6 +123,13 @@ headings = [
 ]
 ```
 
+`detect_pdf*` and `classify_pdf*` are fast structural classifiers. They do not
+extract text or validate font/character encoding, so
+`pages_needing_ocr == []` is not a text-quality verdict. For OCR routing that
+includes broken or garbled encodings, use `extract_pages_markdown*` or the full
+`process_pdf*` APIs. Use `process_pdf_with_ocr*` when those routing decisions
+should also run selective OCR.
+
 ## API reference
 
 | Function | Description |
@@ -131,10 +138,10 @@ headings = [
 | `process_pdf_bytes(data, pages=None)` | Full processing from bytes |
 | `process_pdf_with_ocr(path, **options)` | Native extraction + selective OCR with provenance |
 | `process_pdf_with_ocr_bytes(data, **options)` | Native extraction + selective OCR from bytes |
-| `detect_pdf(path)` | Fast detection only (returns PdfResult) |
-| `detect_pdf_bytes(data)` | Fast detection from bytes |
-| `classify_pdf(path)` | Lightweight classification (returns PdfClassification) |
-| `classify_pdf_bytes(data)` | Lightweight classification from bytes |
+| `detect_pdf(path)` | Fast structural detection only; no text-quality analysis (returns PdfResult) |
+| `detect_pdf_bytes(data)` | Fast structural detection from bytes; no text-quality analysis |
+| `classify_pdf(path)` | Lightweight structural classification; no text-quality analysis (returns PdfClassification) |
+| `classify_pdf_bytes(data)` | Lightweight structural classification from bytes; no text-quality analysis |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_bytes(data)` | Plain text extraction from bytes |
 | `extract_text_with_positions(path, pages=None)` | Text with X/Y coords (visible-page-box frame) and font info |
@@ -213,7 +220,7 @@ class OcrPdfResult:                  # process_pdf_with_ocr / bytes
 class PdfClassification:             # classify_pdf
     pdf_type: str
     page_count: int
-    pages_needing_ocr: list[int]     # 0-indexed
+    pages_needing_ocr: list[int]     # 0-indexed structural signals only
     confidence: float
 
 class TextItem:                      # extract_text_with_positions

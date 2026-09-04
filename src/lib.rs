@@ -383,14 +383,21 @@ pub struct PdfClassification {
     pub pdf_type: PdfType,
     /// Total page count.
     pub page_count: u32,
-    /// 0-indexed page numbers that need OCR (scanned/image pages).
+    /// 0-indexed page numbers that need OCR based on structural signals such
+    /// as scanned/image pages. Lightweight classification does not extract
+    /// text, so an empty list is not a verdict on text encoding quality.
     pub pages_needing_ocr: Vec<u32>,
     /// Detection confidence score (0.0–1.0).
     pub confidence: f32,
 }
 
 /// Classify a PDF from a memory buffer without extracting text.
-/// Returns the PDF type and which pages need OCR (~10-50ms).
+/// Returns the PDF type and pages with structural OCR signals (~10-50ms).
+///
+/// This fast path does not validate extracted-text encoding quality. Use
+/// [`extract_pages_markdown_mem`] when encoding-quality OCR routing is needed,
+/// or [`process_pdf_mem_with_options`] with [`ProcessMode::Analyze`] to run
+/// text-quality analysis without generating Markdown.
 pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem(buffer)?;
@@ -6657,6 +6664,13 @@ mod tests {
         }
     }
 
+    fn test_text_item_with_font(page: u32, font: &str, text: &str) -> TextItem {
+        TextItem {
+            font: font.to_string(),
+            ..test_text_item_on_page(page, text)
+        }
+    }
+
     fn test_image_item(width: f32, height: f32) -> TextItem {
         TextItem {
             item_type: ItemType::Image,
@@ -6929,6 +6943,23 @@ mod tests {
             .collect()
     }
 
+    fn digit_heavy_caesar_garble() -> String {
+        let mut garbled = String::new();
+        let mut letters = 0usize;
+        for ch in caesar_shift(CAESAR_PROSE, 8).chars() {
+            if ch.is_ascii_alphanumeric() || ch.is_whitespace() {
+                garbled.push(ch);
+            }
+            if ch.is_ascii_alphabetic() {
+                letters += 1;
+                if letters.is_multiple_of(17) {
+                    garbled.push('7');
+                }
+            }
+        }
+        garbled
+    }
+
     #[test]
     fn test_mixed_case_caesar_shift_flagged() {
         assert!(detect_encoding_issues(&caesar_shift(CAESAR_PROSE, 3)));
@@ -7002,6 +7033,246 @@ mod tests {
         let items: Vec<TextItem> = SHIFTED_CIPHER_TEXT
             .split_whitespace()
             .map(|chunk| test_text_item_on_page(1, chunk))
+            .collect();
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+    }
+
+    #[test]
+    fn test_text_quality_flags_garbled_font_on_mixed_page() {
+        let healthy = CAESAR_PROSE.repeat(3);
+        let garbled = caesar_shift(CAESAR_PROSE, 8);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "FixtureFont", &garbled),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+        assert_eq!(
+            quality.reasons_by_page.get(&1).cloned(),
+            Some(vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()])
+        );
+    }
+
+    #[test]
+    fn test_text_quality_allows_clean_multi_font_page() {
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", CAESAR_PROSE),
+            test_text_item_with_font(1, "TimesRoman", &CAESAR_PROSE.repeat(2)),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_structured_ascii_in_dedicated_fonts() {
+        let healthy = CAESAR_PROSE.repeat(3);
+        let mixed_case_code = "myXMLParser ".repeat(20);
+        let uppercase_code = "MYXMLPARSER ".repeat(20);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "CodeFont", &mixed_case_code),
+            test_text_item_with_font(2, "Helvetica", &healthy),
+            test_text_item_with_font(2, "AcronymFont", &uppercase_code),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    const BASE64_BINARY_SAMPLE: &str =
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==";
+    const BASE64_PROSE_SAMPLE: &str =
+        "VGhlIHJlZ2lzdHJhbnQgaGVyZWJ5IGFncmVlcyB0byBmdXJuaXNoIGEgY29weSBvZiBhbnkgc3VjaCBpbnN0cnVtZW50IHRvIHRoZSBDb21taXNzaW9uIHVwb24gcmVxdWVzdC4gVGhpcyBjZXJ0aWZpY2F0ZSBvZiBkZXNpZ25hdGlvbnMgd2FzIGZpbGVkIEZlYnJ1YXJ5IHdpdGggcmVzcGVjdCB0byBTZXJpZXMgUHJlZmVycmVkIFN0b2NrIGFuZCBpbmNvcnBvcmF0ZWQgaGVyZWluIGJ5IHJlZmVyZW5jZSB0byB0aGUgYW5udWFsIHJlcG9ydCBvbiBmb3JtIGZvciB0aGUgcGVyaW9kIGVuZGVkIERlY2VtYmVyIGFzIGFtZW5kZWQgYW5kIHJlc3RhdGVkIHRoZXJlYWZ0ZXIu";
+
+    #[test]
+    fn test_text_quality_allows_base64_in_dedicated_font() {
+        let healthy = CAESAR_PROSE.repeat(3);
+        let mut items = Vec::new();
+        for (index, base64) in [BASE64_BINARY_SAMPLE, BASE64_PROSE_SAMPLE]
+            .into_iter()
+            .enumerate()
+        {
+            let page = index as u32 + 1;
+            items.push(test_text_item_with_font(page, "Helvetica", &healthy));
+            items.push(test_text_item_with_font(page, "DataFont", base64));
+        }
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_chunked_base64_in_dedicated_font() {
+        // PDF content streams may split one Base64 token into many Tj/TJ
+        // fragments. Classification must not depend on those item boundaries.
+        let healthy = CAESAR_PROSE.repeat(3);
+        let mut items = Vec::new();
+        for (index, base64) in [BASE64_BINARY_SAMPLE, BASE64_PROSE_SAMPLE]
+            .into_iter()
+            .enumerate()
+        {
+            let page = index as u32 + 1;
+            items.push(test_text_item_with_font(page, "Helvetica", &healthy));
+            items.extend(base64.as_bytes().chunks(16).map(|chunk| {
+                test_text_item_with_font(
+                    page,
+                    "DataFont",
+                    std::str::from_utf8(chunk).expect("Base64 is ASCII"),
+                )
+            }));
+        }
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_line_wrapped_base64_in_dedicated_font() {
+        // MIME-style Base64 wraps at 76 characters. Those long encoded lines
+        // are not the explicitly delimited short words required for a
+        // digit/symbol-heavy font sample to be classified as prose.
+        let wrapped = BASE64_PROSE_SAMPLE
+            .as_bytes()
+            .chunks(76)
+            .map(|chunk| std::str::from_utf8(chunk).expect("Base64 is ASCII"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let healthy = CAESAR_PROSE.repeat(3);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "DataFont", &wrapped),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_short_wrapped_base64_in_dedicated_font() {
+        let healthy = CAESAR_PROSE.repeat(3);
+        let mut items = Vec::new();
+        for (index, base64) in [BASE64_BINARY_SAMPLE, BASE64_PROSE_SAMPLE]
+            .into_iter()
+            .enumerate()
+        {
+            let page = index as u32 + 1;
+            let wrapped = base64
+                .as_bytes()
+                .chunks(16)
+                .map(|chunk| std::str::from_utf8(chunk).expect("Base64 is ASCII"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            items.push(test_text_item_with_font(page, "Helvetica", &healthy));
+            items.push(test_text_item_with_font(page, "DataFont", &wrapped));
+        }
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_flags_spaceless_garbled_font_on_mixed_page() {
+        // Removing separators must not make genuine shifted prose look like a
+        // structured token and bypass the per-font detector.
+        let healthy = CAESAR_PROSE.repeat(3);
+        let spaceless_garble: String = SHIFTED_CIPHER_TEXT
+            .chars()
+            .filter(char::is_ascii_alphabetic)
+            .collect();
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "BrokenFont", &spaceless_garble),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+    }
+
+    #[test]
+    fn test_text_quality_flags_digit_heavy_garbled_font_on_mixed_page() {
+        // Broken maps can also shift identifiers and quantities. Keep the
+        // real word boundaries but remove punctuation and inject enough
+        // digits to satisfy the former broad Base64 exemption.
+        let digit_heavy_garble = digit_heavy_caesar_garble();
+        let healthy = CAESAR_PROSE.repeat(3);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "BrokenIdFont", &digit_heavy_garble),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+    }
+
+    #[test]
+    fn test_text_quality_flags_word_item_garbled_font_on_mixed_page() {
+        // Some PDFs emit each visible word as its own text-showing item
+        // without carrying a trailing space in the extracted string.
+        let healthy = CAESAR_PROSE.repeat(3);
+        let digit_heavy_garble = digit_heavy_caesar_garble();
+        let mut items = vec![test_text_item_with_font(1, "Helvetica", &healthy)];
+        items.extend(
+            digit_heavy_garble
+                .split_whitespace()
+                .map(|word| test_text_item_with_font(1, "BrokenIdFont", word)),
+        );
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+    }
+
+    #[test]
+    fn test_text_quality_flags_uniform_case_garbled_fonts_on_mixed_pages() {
+        let healthy = CAESAR_PROSE.repeat(3);
+        let lowercase_garble = caesar_shift(&CAESAR_PROSE.to_lowercase(), 5);
+        let uppercase_garble = caesar_shift(&CAESAR_PROSE.to_uppercase(), 7);
+        let items = vec![
+            test_text_item_with_font(1, "Helvetica", &healthy),
+            test_text_item_with_font(1, "BrokenLowerFont", &lowercase_garble),
+            test_text_item_with_font(2, "Helvetica", &healthy),
+            test_text_item_with_font(2, "BrokenUpperFont", &uppercase_garble),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_text_quality_cipher_stats_still_accumulate_across_fonts() {
+        let items: Vec<TextItem> = SHIFTED_CIPHER_TEXT
+            .split_whitespace()
+            .enumerate()
+            .map(|(index, chunk)| {
+                let font = match index % 4 {
+                    0 => "FixtureFontA",
+                    1 => "FixtureFontB",
+                    2 => "FixtureFontC",
+                    _ => "FixtureFontD",
+                };
+                test_text_item_with_font(1, font, chunk)
+            })
             .collect();
 
         let quality = analyze_text_quality(&items);
