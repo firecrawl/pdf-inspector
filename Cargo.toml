@@ -29,8 +29,8 @@ name = "pdf_inspector"
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-# Transitive via unicode-normalization (lopdf → stringprep). 1.13.0 does not
-# compile on the pinned toolchain ("cannot find macro `vec`"); keep the
+# Reached through unicode-normalization — a direct dependency here and
+# lopdf → stringprep's. 1.13.0 does not compile on the pinned toolchain ("cannot find macro `vec`"); keep the
 # resolver below it until a fixed release or a toolchain bump.
 tinyvec = { version = "~1.12", default-features = false }
 # Python bindings
