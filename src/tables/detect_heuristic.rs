@@ -987,6 +987,12 @@ fn strip_leader(title: &str) -> &str {
     }
 }
 
+/// The entry's page number is the row's rightmost text item; a script after
+/// it (a footnote marker) belongs to the entry, not to the page number.
+fn page_item(row: &[(usize, &TextItem)]) -> Option<usize> {
+    row.iter().rposition(|(_, i)| !i.is_script())
+}
+
 fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
     let rows = find_row_boundaries(items);
     if rows.len() < 4 {
@@ -1013,7 +1019,7 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
             // starting after every other item ends — set in roughly the entry's
             // size and never a script. A footnote marker raised off the line
             // below, small and at the left margin, is none of those.
-            let page_at = row.iter().rposition(|(_, i)| !i.is_script())?;
+            let page_at = page_item(row)?;
             let (_, last) = &row[page_at];
             // Everything else is the title — scripts included, so a footnote
             // marker after the page number stays with its entry — but only
@@ -1182,7 +1188,7 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
         .iter()
         .zip(&numbered)
         .filter(|(_, n)| n.is_some())
-        .filter_map(|(row, _)| page_number_value(row.last()?.1.text.trim()))
+        .filter_map(|(row, _)| page_number_value(row[page_item(row)?].1.text.trim()))
         .collect();
     let (first_value, last_value) = (*values.first()?, *values.last()?);
     values.sort_unstable();
@@ -1218,7 +1224,7 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
         // number sits a little off it is still an entry and keeps its tab.
         let (title_items, page) = match is_numbered {
             Some(_) => {
-                let page_at = row.iter().rposition(|(_, i)| !i.is_script())?;
+                let page_at = page_item(row)?;
                 let (_, number) = row[page_at];
                 number_x.push(number.x);
                 let title_items: Vec<(usize, &TextItem)> = row
@@ -2697,9 +2703,10 @@ mod tests {
             let y = 500.0 - r as f32 * 13.0;
             items.push(contents_item(title, 68.0, y, 150.0));
             items.push(contents_item(page, 350.0, y, 12.0));
-            if r == 1 {
-                // A footnote marker after the page number.
-                let mut marker = contents_item("3", 364.0, y + 4.0, 3.0);
+            if r == 5 {
+                // A footnote marker after the page number, reading as a page
+                // number smaller than the first entry\'s.
+                let mut marker = contents_item("1", 364.0, y + 4.0, 3.0);
                 marker.font_size = 6.0;
                 marker.height = 6.0;
                 marker.baseline_shift = 4.0;
@@ -2711,8 +2718,9 @@ mod tests {
         assert_eq!(table.cells.len(), 6, "{:?}", table.cells);
         assert_eq!(table.cells[0], vec!["Chapter 1 Introduction", "10"]);
         // The page number is the last text item; the marker after it stays
-        // with its entry.
-        assert_eq!(table.cells[1], vec!["Chapter 2 Data protection 3", "25"]);
+        // with its entry and never stands in for the page.
+        assert_eq!(table.cells[1], vec!["Chapter 2 Data protection", "25"]);
+        assert_eq!(table.cells[5], vec!["Chapter 6 Outlook 1", "90"]);
         assert_eq!(table.item_indices.len(), items.len());
         // A leader run goes; a title's own full stop stays.
         assert_eq!(table.cells[2], vec!["Chapter 3 Methods", "41"]);
