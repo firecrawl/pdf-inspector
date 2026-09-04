@@ -995,9 +995,27 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
     let numbered: Vec<Option<f32>> = row_items
         .iter()
         .map(|row| {
+            // The page number is the row's last item — rightmost by its right edge,
+            // starting after every other item ends — set in roughly the entry's
+            // size and never a script. A footnote marker raised off the line
+            // below, small and at the left margin, is none of those.
             let (_, last) = row.last()?;
-            page_number_value(last.text.trim())?;
             let title = &row[..row.len() - 1];
+            let title_end = title
+                .iter()
+                .map(|(_, i)| i.x + i.width)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if last.is_script() || last.x < title_end - 1.0 {
+                return None;
+            }
+            let mut sizes: Vec<f32> = title.iter().map(|(_, i)| i.font_size).collect();
+            sizes.sort_by(|a, b| a.total_cmp(b));
+            if let Some(&median) = sizes.get(sizes.len() / 2) {
+                if last.font_size < median * 0.75 {
+                    return None;
+                }
+            }
+            page_number_value(last.text.trim())?;
             // An entry's title is text: more letters than digits once its
             // leading section number ("4.3.3.4", "2.") is set aside. A data
             // row of a statistical table ("2023: Jan ...... 6,202 2,328 …")
@@ -1060,6 +1078,41 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
                 })
         })
         .count();
+    // Two contents columns side by side put a second entry after the first
+    // one's page number on the same row ("The MTU Group 47 Glossary 347"):
+    // an interior bare number followed by a capitalised word, in rows whose
+    // interior numbers climb down the page. That is not one list; the
+    // generic path keeps rendering it as it did.
+    let interior_numbers: Vec<u32> = row_items
+        .iter()
+        .filter_map(|row| {
+            let text = row
+                .iter()
+                .map(|(_, i)| i.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let tokens: Vec<&str> = text.split_whitespace().collect();
+            tokens.windows(2).skip(1).find_map(|pair| {
+                let value = pair[0]
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+                    .then(|| page_number_value(pair[0]))
+                    .flatten()?;
+                pair[1]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_uppercase())
+                    .then_some(value)
+            })
+        })
+        .collect();
+    if interior_numbers.len() >= 3 && interior_numbers.windows(2).all(|w| w[1] >= w[0]) {
+        debug!(
+            "  contents list rejected: {} rows hold a second column's entry",
+            interior_numbers.len()
+        );
+        return None;
+    }
     let mut right_edges: Vec<f32> = numbered.iter().flatten().copied().collect();
     if year_led * 2 > right_edges.len() {
         debug!(
@@ -2537,10 +2590,16 @@ mod tests {
             contents_item("97", 350.0, 301.6, 12.0),
             contents_item("6.8 USAMO 2026", 68.0, 288.6, 80.0),
             contents_item("191", 350.0, 288.6, 18.0),
-            // A footnote marker on an entry, and a page number 6pt off the edge.
+            // A footnote marker on an entry, and a page number 14pt off the edge.
             contents_item("5 Digital archives", 68.0, 275.6, 90.0),
-            contents_item("1", 158.5, 279.6, 3.0),
-            contents_item("120", 344.0, 275.6, 18.0),
+            {
+                let mut marker = contents_item("1", 158.5, 279.6, 3.0);
+                marker.font_size = 6.0;
+                marker.height = 6.0;
+                marker.baseline_shift = 4.0;
+                marker
+            },
+            contents_item("120", 330.0, 275.6, 18.0),
         ];
         let indexed: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
         let table = detect_contents_list(&indexed).expect("contents list");
@@ -2561,9 +2620,20 @@ mod tests {
         // digits: short titles with dotted numbers and years are entries.
         assert_eq!(table.cells[11], vec!["4.3.3.4 MASK", "97"]);
         assert_eq!(table.cells[12], vec!["6.8 USAMO 2026", "191"]);
-        // The marker stays in its title and a number a little off the shared
-        // edge still gets its own cell.
+        // The marker stays in its title and a number 14pt off the shared edge
+        // still gets its own cell.
         assert_eq!(table.cells[13], vec!["5 Digital archives 1", "120"]);
+
+        // Through the region entry point the marker is a script item; it
+        // still lands in its entry's title rather than in the text flow.
+        let marker_idx = items.iter().position(|i| i.baseline_shift != 0.0).unwrap();
+        let via_region = detect_table_in_region(&indexed, TableDetectionMode::BodyFont, &|idx| {
+            idx == marker_idx
+        })
+        .expect("contents list through the region entry point");
+        assert_eq!(via_region.kind, crate::tables::TableKind::Toc);
+        assert_eq!(via_region.cells[13], vec!["5 Digital archives 1", "120"]);
+        assert!(via_region.item_indices.contains(&marker_idx));
         assert_eq!(table.item_indices.len(), items.len());
     }
 
@@ -2629,6 +2699,48 @@ mod tests {
             })
             .collect();
         let indexed: Vec<(usize, &TextItem)> = statistics.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … a footnote block whose raised markers land at the ends of the
+        // lines above them is prose, not a list …
+        // The markers are 6.5pt, at the left margin, raised 4.5pt off the
+        // footnote below — and not flagged as scripts.
+        let footnotes: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 11.5;
+                let mut marker = contents_item(&format!("{}", 68 + r), 72.0, y - 7.0, 6.5);
+                marker.font_size = 6.5;
+                marker.height = 6.5;
+                [
+                    contents_item(
+                        "stick to a mere analogy between desire and perception",
+                        72.0,
+                        y,
+                        218.9,
+                    ),
+                    marker,
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = footnotes.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … two contents columns side by side are not one list …
+        let two_columns: Vec<TextItem> = (0..6)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item(
+                        &format!("The MTU Group {} Glossary of engine terms", 47 + r * 12),
+                        68.0,
+                        y,
+                        260.0,
+                    ),
+                    contents_item(&format!("{}", 347 + r), 350.0, y, 18.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = two_columns.iter().enumerate().collect();
         assert!(detect_contents_list(&indexed).is_none());
 
         // … period rows keep their year in the digit count and stay data …
