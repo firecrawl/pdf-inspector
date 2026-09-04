@@ -959,6 +959,184 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
 /// but they remain eligible for cell assignment, so legitimate cell content
 /// (exponents in an engineering-notation table, footnote markers) stays in
 /// the cell it belongs to instead of leaking out into the reading order.
+/// A contents list without dot leaders: rows whose rightmost item is a
+/// page number (arabic or roman) sitting on one right edge, possibly with
+/// rows that carry no number between them — the authors under a chapter
+/// entry, a part title. Such a page has most of its items in the title
+/// column, which the generic column finder rejects as paragraph text, so the
+/// list is built here as a two-column table and classified by the same rules
+/// as every other contents table (`is_table_of_contents`); anything that
+/// fails them falls through to the generic path.
+/// Characters that draw a contents leader: full stops, the one-dot leader,
+/// the middle dot Japanese documents use, and the ellipsis.
+fn is_leader_char(c: char) -> bool {
+    matches!(c, '.' | '\u{2024}' | '\u{00B7}' | '\u{2026}' | ' ')
+}
+
+fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
+    let rows = find_row_boundaries(items);
+    if rows.len() < 4 {
+        return None;
+    }
+    let mut row_items: Vec<Vec<(usize, &TextItem)>> = vec![Vec::new(); rows.len()];
+    for &(idx, item) in items {
+        if let Some(row) = find_row_index(&rows, item.line_y()) {
+            row_items[row].push((idx, item));
+        }
+    }
+    for row in &mut row_items {
+        row.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+    }
+    // A numbered row ends in a page number and has a text title before it —
+    // one contiguous title, at most preceded by a short chapter or section
+    // number. A row whose title is broken by column-sized gaps is a data row
+    // whose last cell happens to be a small number (a feature matrix's "x"
+    // marks read as roman ten, a course table's credits), not an entry.
+    let numbered: Vec<Option<f32>> = row_items
+        .iter()
+        .map(|row| {
+            let (_, last) = row.last()?;
+            page_number_value(last.text.trim())?;
+            let title = &row[..row.len() - 1];
+            // An entry's title is text: more letters than digits once its
+            // leading section number ("4.3.3.4", "2.") is set aside. A data
+            // row of a statistical table ("2023: Jan ...... 6,202 2,328 …")
+            // ending in a small number is digits through and through.
+            let text = title
+                .iter()
+                .map(|(_, i)| i.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let body = match text.split_once(char::is_whitespace) {
+                Some((first, rest))
+                    if first
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | ')' | '(')) =>
+                {
+                    rest
+                }
+                _ => text.as_str(),
+            };
+            let (letters, digits) = body.chars().fold((0usize, 0usize), |(l, d), c| {
+                (
+                    l + c.is_alphabetic() as usize,
+                    d + c.is_ascii_digit() as usize,
+                )
+            });
+            let has_title = letters > digits;
+            let breaks: Vec<usize> = title
+                .windows(2)
+                .enumerate()
+                .filter(|(_, pair)| pair[1].1.x - (pair[0].1.x + pair[0].1.width) > 20.0)
+                .map(|(i, _)| i)
+                .collect();
+            let compact =
+                breaks.is_empty() || (breaks == [0] && title[0].1.text.trim().chars().count() <= 6);
+            (has_title && compact).then_some(last.x + last.width)
+        })
+        .collect();
+    let mut right_edges: Vec<f32> = numbered.iter().flatten().copied().collect();
+    // Leading and trailing rows without a number are not part of the list;
+    // within it, entries must make up a fair share of the rows — a contents
+    // page with the authors under every entry and part titles between the
+    // chapters is still well over a third entries, a page of prose with a
+    // few numbered lines is not.
+    let first = numbered.iter().position(Option::is_some)?;
+    let last = numbered.iter().rposition(Option::is_some)?;
+    let span_rows = last - first + 1;
+    if right_edges.len() < 4 || right_edges.len() * 5 < span_rows * 2 {
+        debug!(
+            "  contents list rejected: {} numbered rows of {}",
+            right_edges.len(),
+            span_rows
+        );
+        return None;
+    }
+    // A contents list runs through the document: its page numbers take at
+    // least three distinct values and end higher than they start. A table
+    // header whose rows all end in the same small number ("20 years and
+    // over" columns) or a rank column counting back down does neither.
+    let mut values: Vec<u32> = row_items
+        .iter()
+        .zip(&numbered)
+        .filter(|(_, n)| n.is_some())
+        .filter_map(|(row, _)| page_number_value(row.last()?.1.text.trim()))
+        .collect();
+    let (first_value, last_value) = (*values.first()?, *values.last()?);
+    values.sort_unstable();
+    values.dedup();
+    if values.len() < 3 || last_value <= first_value {
+        debug!(
+            "  contents list rejected: page values {:?} do not run through a document",
+            values
+        );
+        return None;
+    }
+    // The page numbers share a right edge.
+    right_edges.sort_by(|a, b| a.total_cmp(b));
+    let median_edge = right_edges[right_edges.len() / 2];
+    let aligned = right_edges
+        .iter()
+        .filter(|&&e| (e - median_edge).abs() <= 8.0)
+        .count();
+    if aligned * 5 < right_edges.len() * 4 {
+        debug!(
+            "  contents list rejected: {} of {} page numbers on the shared edge",
+            aligned,
+            right_edges.len()
+        );
+        return None;
+    }
+    let mut cells = Vec::new();
+    let mut item_indices = Vec::new();
+    let mut title_x = f32::INFINITY;
+    let mut number_x = Vec::new();
+    for (row, is_numbered) in row_items[first..=last].iter().zip(&numbered[first..=last]) {
+        let (title_items, page) = match is_numbered {
+            Some(edge) if (edge - median_edge).abs() <= 8.0 => {
+                let (_, number) = row.last()?;
+                number_x.push(number.x);
+                (&row[..row.len() - 1], number.text.trim().to_string())
+            }
+            _ => (&row[..], String::new()),
+        };
+        // Leader dots between a title and its page number are the leader,
+        // not the title — `format_toc_as_list` drops dots-only cells, and a
+        // trailing run of leader characters on the title is dropped here for
+        // the same reason, so a leadered contents page renders as it always
+        // did.
+        let title = title_items
+            .iter()
+            .map(|(_, i)| i.text.trim())
+            .filter(|t| !t.is_empty() && !t.chars().all(is_leader_char))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_end_matches(is_leader_char)
+            .to_string();
+        if let Some((_, i)) = title_items.first() {
+            title_x = title_x.min(i.x);
+        }
+        item_indices.extend(row.iter().map(|(idx, _)| *idx));
+        cells.push(vec![title, page]);
+    }
+    number_x.sort_by(|a, b| a.total_cmp(b));
+    let columns = vec![title_x, number_x[number_x.len() / 2]];
+    let table = Table::new(columns, rows[first..=last].to_vec(), cells, item_indices);
+    if table.kind != super::TableKind::Toc {
+        debug!(
+            "  contents list rejected: {} rows do not classify as a contents table",
+            table.rows.len()
+        );
+        return None;
+    }
+    debug!(
+        "contents list detected: {} rows, {} numbered",
+        table.rows.len(),
+        right_edges.len()
+    );
+    Some(table)
+}
+
 fn detect_table_in_region(
     items: &[(usize, &TextItem)],
     mode: TableDetectionMode,
@@ -973,6 +1151,12 @@ fn detect_table_in_region(
     // A region that is *entirely* scripts has no table structure at all.
     if geometry_items.is_empty() {
         return None;
+    }
+    // A contents list — entries ending in right-aligned page numbers, with
+    // author or part-title rows between them — is left-heavy by nature and
+    // would be thrown out below as a paragraph. It has its own shape.
+    if let Some(table) = detect_contents_list(&geometry_items) {
+        return Some(table);
     }
     let columns = find_column_boundaries(&geometry_items, mode);
     let min_cols = 2;
@@ -2258,6 +2442,177 @@ fn try_add_label_column(
 
 #[cfg(test)]
 mod tests {
+    fn contents_item(text: &str, x: f32, y: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height: 9.5,
+            font: "Body".to_string(),
+            font_tag: String::new(),
+            font_size: 9.5,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: crate::types::ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    #[test]
+    fn contents_list_with_author_rows_between_entries_is_a_toc() {
+        // The shape of a book's contents page: entry titles at the left,
+        // page numbers sharing a right edge at 362pt, and the chapter
+        // authors on their own rows without a number. Too left-heavy for
+        // the generic column finder, but a contents list all the same.
+        let items = vec![
+            contents_item("List of figures", 68.0, 483.6, 52.0),
+            contents_item("vii", 352.0, 483.6, 10.0),
+            contents_item("List of tables", 68.0, 470.6, 48.0),
+            contents_item("ix", 354.6, 470.6, 7.4),
+            contents_item("List of abbreviations", 68.0, 457.6, 79.0),
+            contents_item("x", 357.2, 457.6, 4.8),
+            contents_item("List of contributors", 68.0, 444.6, 74.0),
+            contents_item("xi", 354.6, 444.6, 7.4),
+            contents_item("Introduction", 68.0, 418.6, 50.0),
+            contents_item("1", 356.0, 418.6, 6.0),
+            contents_item("Lise Jaillant, Claire Warwick", 81.0, 405.6, 120.0),
+            contents_item("1", 68.0, 379.6, 6.0),
+            contents_item("The National Archives (UK)", 81.0, 379.6, 110.0),
+            contents_item("15", 350.0, 379.6, 12.0),
+            contents_item("Lise Jaillant and Annalina Caputo", 81.0, 366.6, 130.0),
+            contents_item("2", 68.0, 340.6, 6.0),
+            contents_item("Computer vision and cultural heritage", 81.0, 340.6, 150.0),
+            contents_item("41", 350.0, 340.6, 12.0),
+            contents_item("3 Machine learning ..........", 68.0, 327.6, 200.0),
+            contents_item("........", 270.0, 327.6, 60.0),
+            contents_item("61", 350.0, 327.6, 12.0),
+            contents_item("4 Digital mapping ···········", 68.0, 314.6, 200.0),
+            contents_item("93", 350.0, 314.6, 12.0),
+            contents_item("4.3.3.4", 68.0, 301.6, 30.0),
+            contents_item("MASK", 100.0, 301.6, 30.0),
+            contents_item("97", 350.0, 301.6, 12.0),
+            contents_item("6.8 USAMO 2026", 68.0, 288.6, 80.0),
+            contents_item("191", 350.0, 288.6, 18.0),
+        ];
+        let indexed: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
+        let table = detect_contents_list(&indexed).expect("contents list");
+        assert_eq!(table.kind, crate::tables::TableKind::Toc);
+        assert_eq!(table.cells.len(), 13, "{:?}", table.cells);
+        assert_eq!(table.cells[0], vec!["List of figures", "vii"]);
+        assert_eq!(table.cells[5], vec!["Lise Jaillant, Claire Warwick", ""]);
+        assert_eq!(table.cells[6], vec!["1 The National Archives (UK)", "15"]);
+        assert_eq!(
+            table.cells[8],
+            vec!["2 Computer vision and cultural heritage", "41"]
+        );
+        // Leader dots — full stops or middle dots, glued to the title or in
+        // their own item — are not part of the entry.
+        assert_eq!(table.cells[9], vec!["3 Machine learning", "61"]);
+        assert_eq!(table.cells[10], vec!["4 Digital mapping", "93"]);
+        // A section number is set aside before letters are weighed against
+        // digits: short titles with dotted numbers and years are entries.
+        assert_eq!(table.cells[11], vec!["4.3.3.4 MASK", "97"]);
+        assert_eq!(table.cells[12], vec!["6.8 USAMO 2026", "191"]);
+        assert_eq!(table.item_indices.len(), items.len());
+    }
+
+    #[test]
+    fn contents_list_needs_page_numbers_on_one_edge_and_enough_of_them() {
+        // Amounts with thousands separators are not page numbers …
+        let data: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Revenue segment", 68.0, y, 70.0),
+                    contents_item("1,234", 340.0, y, 24.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = data.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … three numbered rows are too few …
+        let short: Vec<TextItem> = (0..3)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Chapter title", 68.0, y, 70.0),
+                    contents_item(&format!("{}", 10 + r * 7), 350.0, y, 12.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = short.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … a data row with columns between the title and its last number is
+        // no entry (a feature matrix whose "x" marks read as roman ten) …
+        let matrix: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Edge Port Module (EPORT)", 68.0, y, 110.0),
+                    contents_item("x", 220.0, y, 6.0),
+                    contents_item("x", 280.0, y, 6.0),
+                    contents_item("x", 340.0, y, 6.0),
+                    contents_item("x", 400.0, y, 6.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = matrix.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … a statistical table's data rows, digits through and through, are
+        // no entries even when they end in a small number …
+        let statistics: Vec<TextItem> = (0..6)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item(
+                        &format!("2023: Jan ...... 6,{}02 2,328 2,292 1,583 4,698", r),
+                        68.0,
+                        y,
+                        260.0,
+                    ),
+                    contents_item(&format!("{}", 160 + r * 9), 350.0, y, 12.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = statistics.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … a table header whose rows all end in the same value is no list …
+        let header: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Both sexes 16 years and over", 68.0, y, 140.0),
+                    contents_item("20", 350.0, y, 12.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = header.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … and numbers scattered across the row are a data column, not a list.
+        let ragged: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Chapter title", 68.0, y, 70.0),
+                    contents_item(&format!("{}", 10 + r * 7), 250.0 + r as f32 * 30.0, y, 12.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = ragged.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+    }
 
     fn make_item(text: &str, x: f32, y: f32, font_size: f32, width: f32) -> TextItem {
         TextItem {

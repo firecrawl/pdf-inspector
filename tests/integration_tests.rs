@@ -5029,3 +5029,48 @@ BT /F1 12 Tf 0 -1 1 0 320 704 Tm (LINE) Tj ET";
         );
     }
 }
+
+#[test]
+fn test_contents_page_without_leaders_lists_one_entry_per_line() {
+    // A contents page in the style of an edited volume: entry titles at the
+    // left, page numbers right-aligned at x = 400 with no dot leaders, and
+    // the chapter authors on their own lines between the entries. The
+    // entries must come out one per line with the page number tab-separated,
+    // not interleaved into a two-column paragraph.
+    let content = "BT /F1 14 Tf 72 720 Td (Contents) Tj ET\n\
+BT /F1 12 Tf 72 690 Td (List of figures) Tj ET\n\
+BT /F1 12 Tf 378.4 690 Td (vii) Tj ET\n\
+BT /F1 12 Tf 72 672 Td (List of tables) Tj ET\n\
+BT /F1 12 Tf 385.6 672 Td (ix) Tj ET\n\
+BT /F1 12 Tf 72 654 Td (List of contributors) Tj ET\n\
+BT /F1 12 Tf 385.6 654 Td (xi) Tj ET\n\
+BT /F1 12 Tf 72 630 Td (Introduction) Tj ET\n\
+BT /F1 12 Tf 392.8 630 Td (1) Tj ET\n\
+BT /F1 12 Tf 90 615 Td (Lise Jaillant and Claire Warwick) Tj ET\n\
+BT /F1 12 Tf 72 594 Td (1 The National Archives) Tj ET\n\
+BT /F1 12 Tf 385.6 594 Td (15) Tj ET\n\
+BT /F1 12 Tf 90 579 Td (Katherine Aske and Annalina Caputo) Tj ET\n\
+BT /F1 12 Tf 72 558 Td (2 Computer vision and cultural heritage) Tj ET\n\
+BT /F1 12 Tf 385.6 558 Td (41) Tj ET\n\
+BT /F1 12 Tf 90 543 Td (Catherine Nicole Coleman) Tj ET\n\
+BT /F1 12 Tf 72 522 Td (3 Machine learning at the National Library) Tj ET\n\
+BT /F1 12 Tf 385.6 522 Td (61) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    for entry in [
+        "List of figures\tvii",
+        "List of tables\tix",
+        "List of contributors\txi",
+        "Introduction\t1",
+        "1 The National Archives\t15",
+        "2 Computer vision and cultural heritage\t41",
+        "3 Machine learning at the National Library\t61",
+    ] {
+        assert!(md.contains(entry), "missing {entry:?} in {md}");
+    }
+    assert!(md.contains("Lise Jaillant and Claire Warwick"), "{md}");
+    assert!(
+        !md.contains("List of figures vii List of tables"),
+        "entries interleaved into a paragraph: {md}"
+    );
+}
