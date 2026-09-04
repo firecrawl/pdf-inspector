@@ -113,6 +113,11 @@ version and date. Earlier releases are described in their
 
 ### Changed
 
+- `OcrOptions` gained the public `model_set` field. Construct it through
+  `OcrOptions::new()`/`Default` and the builder methods, as the docs show;
+  a struct literal that spells out every field needs the new field. This
+  follows the crate's existing practice for public structs (`TextItem`
+  gained `rotation`, `advance_known`, and `baseline_shift` in this cycle).
 - **Coordinate frame of positioned output — consumer action may be required.**
   `extract_text_with_positions*` (Rust), `extractTextWithPositions` (Node),
   `extract_text_with_positions[_bytes]` (Python) and `pdf2md --items-json` now
