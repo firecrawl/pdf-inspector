@@ -29,6 +29,57 @@ pub enum ModelDownloadPolicy {
     Offline,
 }
 
+/// Selects the pinned model set an OCR engine loads.
+///
+/// Every variant maps to exactly one checksum-verified model manifest, so
+/// downloads, offline directories, and the in-process engine cache stay
+/// deterministic per set. Detection models are script-agnostic; the variants
+/// differ in the recognition model and its character dictionary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OcrModelSet {
+    /// PP-OCRv6 Small: Latin scripts, Simplified and Traditional Chinese, and
+    /// Japanese. This is the default and preserves existing behavior.
+    #[default]
+    PpOcrV6Small,
+    /// PP-OCRv5 Korean: all 11,172 Hangul syllables plus Latin letters and
+    /// digits, paired with the PP-OCRv5 mobile detector.
+    PpOcrV5Korean,
+}
+
+impl OcrModelSet {
+    /// Every supported model set, in identifier order.
+    pub const ALL: &'static [OcrModelSet] =
+        &[OcrModelSet::PpOcrV6Small, OcrModelSet::PpOcrV5Korean];
+
+    /// Stable identifier, equal to the `id` of the manifest the set resolves to.
+    pub fn id(self) -> &'static str {
+        match self {
+            OcrModelSet::PpOcrV6Small => "pp-ocrv6-small",
+            OcrModelSet::PpOcrV5Korean => "pp-ocrv5-korean",
+        }
+    }
+
+    /// Parses an identifier as printed by [`OcrModelSet::id`].
+    ///
+    /// Matching ignores case and surrounding whitespace and accepts `_` in
+    /// place of `-`, so `PP_OCRv5_Korean` resolves to
+    /// [`OcrModelSet::PpOcrV5Korean`].
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+        OcrModelSet::ALL
+            .iter()
+            .copied()
+            .find(|set| set.id() == normalized)
+    }
+}
+
+impl std::fmt::Display for OcrModelSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
 /// OCR engine configuration independent of a particular runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OcrOptions {
@@ -40,6 +91,8 @@ pub struct OcrOptions {
     pub model_directory: Option<PathBuf>,
     /// Whether a missing pinned artifact may be downloaded.
     pub model_downloads: ModelDownloadPolicy,
+    /// Which pinned model set the engine loads.
+    pub model_set: OcrModelSet,
 }
 
 impl Default for OcrOptions {
@@ -49,6 +102,7 @@ impl Default for OcrOptions {
             minimum_confidence: 0.0,
             model_directory: None,
             model_downloads: ModelDownloadPolicy::IfMissing,
+            model_set: OcrModelSet::PpOcrV6Small,
         }
     }
 }
@@ -80,6 +134,12 @@ impl OcrOptions {
     /// Sets the missing-model download policy.
     pub fn model_downloads(mut self, policy: ModelDownloadPolicy) -> Self {
         self.model_downloads = policy;
+        self
+    }
+
+    /// Selects the pinned model set the OCR engine loads.
+    pub fn model_set(mut self, model_set: OcrModelSet) -> Self {
+        self.model_set = model_set;
         self
     }
 }
@@ -268,5 +328,31 @@ mod tests {
             options.model_directory,
             Some(PathBuf::from("/models/pp-ocr"))
         );
+    }
+
+    #[test]
+    fn model_set_defaults_to_pp_ocr_v6_small() {
+        assert_eq!(OcrOptions::default().model_set, OcrModelSet::PpOcrV6Small);
+        assert_eq!(OcrModelSet::default(), OcrModelSet::PpOcrV6Small);
+        let options = OcrOptions::new().model_set(OcrModelSet::PpOcrV5Korean);
+        assert_eq!(options.model_set, OcrModelSet::PpOcrV5Korean);
+    }
+
+    #[test]
+    fn model_set_identifiers_round_trip() {
+        for set in OcrModelSet::ALL {
+            assert_eq!(OcrModelSet::parse(set.id()), Some(*set));
+            assert_eq!(set.to_string(), set.id());
+        }
+        assert_eq!(
+            OcrModelSet::parse(" PP_OCRv5_Korean "),
+            Some(OcrModelSet::PpOcrV5Korean)
+        );
+        assert_eq!(
+            OcrModelSet::parse("pp-ocrv6-small"),
+            Some(OcrModelSet::PpOcrV6Small)
+        );
+        assert_eq!(OcrModelSet::parse("korean"), None);
+        assert_eq!(OcrModelSet::parse(""), None);
     }
 }
