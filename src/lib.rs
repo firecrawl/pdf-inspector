@@ -4315,7 +4315,18 @@ fn process_document(
         // For Mixed/template PDFs: if normal extraction produces garbage text
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
-        if pdf_type == PdfType::Mixed {
+        //
+        // TextBased documents join that retry on the EMPTY branch only. An
+        // `ocrmypdf` file lands exactly there: every page carries show-text
+        // operators, so the detector calls the document TextBased, yet all of
+        // that text is an invisible (Tr 3) OCR layer which the visible-only
+        // pass drops — markdown came back empty while `has_text` was true.
+        // Requiring an empty visible pass mirrors the region extractor's
+        // `skipped_invisible && !has_visible_text` gate and cannot change
+        // output for documents that already extract text. The garbage branch
+        // stays Mixed-only: on TextBased it would let a noisy-but-real text
+        // layer be replaced by its invisible twin.
+        if pdf_type == PdfType::Mixed || pdf_type == PdfType::TextBased {
             if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _)| e) {
                 let sample: String = items
                     .iter()
@@ -4328,7 +4339,26 @@ fn process_document(
                     .take(200)
                     .map(|item| item.text.as_str())
                     .collect();
-                if is_garbage_text(&sample) || sample.trim().is_empty() {
+                // `[Image: ...]` placeholders are synthesized for image
+                // XObjects: they mark that pixels exist, not that text was
+                // read, so a scanned page's visible pass is "empty" despite
+                // carrying them (same rule as `non_placeholder_alnum`).
+                let has_visible_text = items
+                    .iter()
+                    .filter(|item| {
+                        options
+                            .page_filter
+                            .as_ref()
+                            .is_none_or(|filter| filter.contains(&item.page))
+                    })
+                    .any(|item| {
+                        !matches!(item.item_type, types::ItemType::Image)
+                            && !item.text.trim().is_empty()
+                    });
+                let mixed_retry = pdf_type == PdfType::Mixed
+                    && (is_garbage_text(&sample) || sample.trim().is_empty());
+                let text_based_retry = pdf_type == PdfType::TextBased && !has_visible_text;
+                if mixed_retry || text_based_retry {
                     extractor::extract_positioned_text_include_invisible_with_folio_context(
                         &doc,
                         &font_cmaps,
@@ -4337,13 +4367,18 @@ fn process_document(
                 } else {
                     result
                 }
-            } else {
-                // Normal extraction failed — try invisible as fallback
+            } else if pdf_type == PdfType::Mixed {
+                // Normal extraction failed — try invisible as fallback.
+                // TextBased keeps propagating the error (see `extracted?`
+                // below): a failed parse there is a real failure, not a
+                // missing OCR layer.
                 extractor::extract_positioned_text_include_invisible_with_folio_context(
                     &doc,
                     &font_cmaps,
                     options.page_filter.as_ref(),
                 )
+            } else {
+                result
             }
         } else {
             result

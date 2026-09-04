@@ -1991,6 +1991,63 @@ fn test_extract_regions_mem_recovers_invisible_ocr_layer() {
     );
 }
 
+/// The markdown path must recover the same invisible (Tr 3) OCR layer the
+/// region extractor already serves. An `ocrmypdf` file classifies as
+/// TextBased — every page carries show-text operators — so the Mixed-only
+/// invisible retry never fired and the markdown came back empty while
+/// `has_text` was true.
+#[test]
+fn test_process_pdf_mem_recovers_invisible_ocr_layer_on_text_based() {
+    let buf = make_pdf_with_custom_text_layer(3, None, Some(&ocr_page_lines()), false);
+    let result = process_pdf_mem(&buf).unwrap();
+    assert_eq!(
+        result.pdf_type,
+        PdfType::TextBased,
+        "a full OCR layer must classify as TextBased — that is the case the \
+         Mixed-only retry missed"
+    );
+    let markdown = result.markdown.unwrap_or_default();
+    assert!(
+        markdown.contains("quick brown fox"),
+        "invisible OCR layer should reach the markdown, got: {markdown:?}"
+    );
+}
+
+/// A page-sized OCR layer: enough show-text operators (>= 10 on a page that
+/// also carries an image) and enough character diversity for the detector to
+/// call the document TextBased, the way a real `ocrmypdf` page does.
+fn ocr_page_lines() -> Vec<&'static str> {
+    vec![
+        "The quick brown fox jumps over the lazy dog",
+        "Pack my box with five dozen liquor jugs",
+        "How vexingly quick daft zebras jump",
+        "Sphinx of black quartz judge my vow",
+        "Jackdaws love my big sphinx of quartz",
+        "The five boxing wizards jump quickly",
+        "Bright vixens jump dozy fowl quack",
+        "Quick zephyrs blow vexing daft Jim",
+        "Two driven jocks help fax my big quiz",
+        "Waltz bad nymph for quick jigs vex",
+        "Glib jocks quiz nymph to vex dwarf",
+        "Sympathizing would fix Quaker objectives",
+    ]
+}
+
+/// The recovery above must not double-serve a page that already extracts
+/// visible text: the invisible pass returns visible items too, so a retry
+/// there would duplicate every visible word.
+#[test]
+fn test_process_pdf_mem_visible_text_keeps_single_copy() {
+    let buf = make_pdf_with_custom_text_layer(0, None, Some(&ocr_page_lines()), false);
+    let result = process_pdf_mem(&buf).unwrap();
+    let markdown = result.markdown.unwrap_or_default();
+    assert_eq!(
+        markdown.matches("quick brown fox").count(),
+        1,
+        "visible text must appear exactly once, got: {markdown:?}"
+    );
+}
+
 /// ANY visible text on the page — even a single short line — must block the
 /// invisible-layer adoption entirely: the invisible pass returns visible
 /// items too, so adopting it alongside visible text would duplicate the
