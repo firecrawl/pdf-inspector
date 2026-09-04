@@ -973,6 +973,20 @@ fn is_leader_char(c: char) -> bool {
     matches!(c, '.' | '\u{2024}' | '\u{00B7}' | '\u{2026}' | ' ')
 }
 
+/// Drops a trailing leader run — three or more dots, or an ellipsis — and
+/// keeps the full stop that ends a title of its own.
+fn strip_leader(title: &str) -> &str {
+    let kept = title.trim_end_matches(is_leader_char);
+    let run = &title[kept.len()..];
+    let dots =
+        run.chars().filter(|c| !c.is_whitespace()).count() + 2 * run.matches('\u{2026}').count();
+    if dots >= 3 {
+        kept.trim_end()
+    } else {
+        title.trim_end()
+    }
+}
+
 fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
     let rows = find_row_boundaries(items);
     if rows.len() < 4 {
@@ -999,16 +1013,30 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
             // starting after every other item ends — set in roughly the entry's
             // size and never a script. A footnote marker raised off the line
             // below, small and at the left margin, is none of those.
-            let (_, last) = row.last()?;
-            let title = &row[..row.len() - 1];
-            let title_end = title
+            let page_at = row.iter().rposition(|(_, i)| !i.is_script())?;
+            let (_, last) = &row[page_at];
+            // Everything else is the title — scripts included, so a footnote
+            // marker after the page number stays with its entry — but only
+            // the text items shape it.
+            let title: Vec<(usize, &TextItem)> = row
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| *k != page_at)
+                .map(|(_, it)| *it)
+                .collect();
+            let text_items: Vec<(usize, &TextItem)> = title
+                .iter()
+                .filter(|(_, i)| !i.is_script())
+                .copied()
+                .collect();
+            let title_end = text_items
                 .iter()
                 .map(|(_, i)| i.x + i.width)
                 .fold(f32::NEG_INFINITY, f32::max);
-            if last.is_script() || last.x < title_end - 1.0 {
+            if last.x < title_end - 1.0 {
                 return None;
             }
-            let mut sizes: Vec<f32> = title.iter().map(|(_, i)| i.font_size).collect();
+            let mut sizes: Vec<f32> = text_items.iter().map(|(_, i)| i.font_size).collect();
             sizes.sort_by(|a, b| a.total_cmp(b));
             if let Some(&median) = sizes.get(sizes.len() / 2) {
                 if last.font_size < median * 0.75 {
@@ -1020,7 +1048,7 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
             // leading section number ("4.3.3.4", "2.") is set aside. A data
             // row of a statistical table ("2023: Jan ...... 6,202 2,328 …")
             // ending in a small number is digits through and through.
-            let text = title
+            let text = text_items
                 .iter()
                 .map(|(_, i)| i.text.trim())
                 .collect::<Vec<_>>()
@@ -1049,14 +1077,14 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
                 )
             });
             let has_title = letters > digits;
-            let breaks: Vec<usize> = title
+            let breaks: Vec<usize> = text_items
                 .windows(2)
                 .enumerate()
                 .filter(|(_, pair)| pair[1].1.x - (pair[0].1.x + pair[0].1.width) > 20.0)
                 .map(|(i, _)| i)
                 .collect();
-            let compact =
-                breaks.is_empty() || (breaks == [0] && title[0].1.text.trim().chars().count() <= 6);
+            let compact = breaks.is_empty()
+                || (breaks == [0] && text_items[0].1.text.trim().chars().count() <= 6);
             (has_title && compact).then_some(last.x + last.width)
         })
         .collect();
@@ -1106,7 +1134,15 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
             })
         })
         .collect();
-    if interior_numbers.len() >= 3 && interior_numbers.windows(2).all(|w| w[1] >= w[0]) {
+    // The number sits inside the title's own text item on such a page, so
+    // there is no item boundary to measure; the sequence tells instead. A
+    // chapter label ("Chapter 1 Introduction", "Chapter 2 …") climbs by
+    // exactly one down the page, a second column's page numbers do not.
+    let chapter_labels = interior_numbers.windows(2).all(|w| w[1] == w[0] + 1);
+    if interior_numbers.len() >= 3
+        && !chapter_labels
+        && interior_numbers.windows(2).all(|w| w[1] >= w[0])
+    {
         debug!(
             "  contents list rejected: {} rows hold a second column's entry",
             interior_numbers.len()
@@ -1182,25 +1218,31 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
         // number sits a little off it is still an entry and keeps its tab.
         let (title_items, page) = match is_numbered {
             Some(_) => {
-                let (_, number) = row.last()?;
+                let page_at = row.iter().rposition(|(_, i)| !i.is_script())?;
+                let (_, number) = row[page_at];
                 number_x.push(number.x);
-                (&row[..row.len() - 1], number.text.trim().to_string())
+                let title_items: Vec<(usize, &TextItem)> = row
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != page_at)
+                    .map(|(_, it)| *it)
+                    .collect();
+                (title_items, number.text.trim().to_string())
             }
-            None => (&row[..], String::new()),
+            None => (row.to_vec(), String::new()),
         };
         // Leader dots between a title and its page number are the leader,
         // not the title — `format_toc_as_list` drops dots-only cells, and a
         // trailing run of leader characters on the title is dropped here for
         // the same reason, so a leadered contents page renders as it always
         // did.
-        let title = title_items
+        let joined = title_items
             .iter()
             .map(|(_, i)| i.text.trim())
             .filter(|t| !t.is_empty() && !t.chars().all(is_leader_char))
             .collect::<Vec<_>>()
-            .join(" ")
-            .trim_end_matches(is_leader_char)
-            .to_string();
+            .join(" ");
+        let title = strip_leader(&joined).to_string();
         if let Some((_, i)) = title_items.first() {
             title_x = title_x.min(i.x);
         }
@@ -2635,6 +2677,47 @@ mod tests {
         assert_eq!(via_region.cells[13], vec!["5 Digital archives 1", "120"]);
         assert!(via_region.item_indices.contains(&marker_idx));
         assert_eq!(table.item_indices.len(), items.len());
+    }
+
+    #[test]
+    fn contents_list_keeps_chapter_labels_trailing_markers_and_full_stops() {
+        // "Chapter n" labels climb by one down the page, as a second column's
+        // page numbers would — but a label is part of the title.
+        let titles = [
+            "Chapter 1 Introduction",
+            "Chapter 2 Data protection",
+            "Chapter 3 Methods ......",
+            "Chapter 4 Results . . . .",
+            "Chapter 5 Conclusions.",
+            "Chapter 6 Outlook",
+        ];
+        let pages = ["10", "25", "41", "58", "77", "90"];
+        let mut items: Vec<TextItem> = Vec::new();
+        for (r, (title, page)) in titles.iter().zip(pages).enumerate() {
+            let y = 500.0 - r as f32 * 13.0;
+            items.push(contents_item(title, 68.0, y, 150.0));
+            items.push(contents_item(page, 350.0, y, 12.0));
+            if r == 1 {
+                // A footnote marker after the page number.
+                let mut marker = contents_item("3", 364.0, y + 4.0, 3.0);
+                marker.font_size = 6.0;
+                marker.height = 6.0;
+                marker.baseline_shift = 4.0;
+                items.push(marker);
+            }
+        }
+        let indexed: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
+        let table = detect_contents_list(&indexed).expect("chapter-labelled contents list");
+        assert_eq!(table.cells.len(), 6, "{:?}", table.cells);
+        assert_eq!(table.cells[0], vec!["Chapter 1 Introduction", "10"]);
+        // The page number is the last text item; the marker after it stays
+        // with its entry.
+        assert_eq!(table.cells[1], vec!["Chapter 2 Data protection 3", "25"]);
+        assert_eq!(table.item_indices.len(), items.len());
+        // A leader run goes; a title's own full stop stays.
+        assert_eq!(table.cells[2], vec!["Chapter 3 Methods", "41"]);
+        assert_eq!(table.cells[3], vec!["Chapter 4 Results", "58"]);
+        assert_eq!(table.cells[4], vec!["Chapter 5 Conclusions.", "77"]);
     }
 
     #[test]
