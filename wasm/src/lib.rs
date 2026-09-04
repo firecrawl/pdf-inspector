@@ -1,6 +1,6 @@
 use pdf_inspector::{
-    LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions, PdfProcessResult, PdfType,
-    ProcessMode,
+    LayoutComplexity, MarkdownProfile, PageOcrReasons, PageRegionResult, PdfOptions,
+    PdfProcessResult, PdfType, ProcessMode, RegionText,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -59,10 +59,45 @@ export interface PdfClassification {
   confidence: number;
 }
 
+export interface PageRegions {
+  /** 0-indexed page number, matching the native Node.js API. */
+  page: number;
+  /** Each bbox is `[x1, y1, x2, y2]` in PDF points with top-left origin. */
+  regions: number[][];
+}
+
+export interface RegionText {
+  text: string;
+  /** `true` when the extracted text is unreliable (empty, GID-encoded fonts, garbage, encoding issues) and OCR should be used instead. */
+  needsOcr: boolean;
+  /** Machine-readable OCR reason when the cause is known. */
+  ocrReason?: string;
+}
+
+export interface PageRegionTexts {
+  /** 0-indexed page number. */
+  page: number;
+  regions: RegionText[];
+}
+
 export function processPdf(data: Uint8Array, options?: ProcessOptions): PdfProcessResult;
 export function detectPdf(data: Uint8Array, options?: Pick<ProcessOptions, "password">): PdfProcessResult;
 export function classifyPdf(data: Uint8Array): PdfClassification;
 export function extractText(data: Uint8Array): string;
+/**
+ * Extract text within bounding-box regions from a PDF.
+ *
+ * For hybrid OCR: a layout model detects regions in rendered page images, and
+ * this extracts the PDF text that falls within those regions — skipping GPU OCR
+ * for text-based pages.
+ *
+ * Pages are 0-indexed, matching the native Node.js API. Each bbox is
+ * `[x1, y1, x2, y2]` in PDF points with top-left origin. Each region result
+ * carries `needsOcr`, set when the extracted text is unreliable (empty,
+ * GID-encoded fonts, garbage, encoding issues), so the caller can fall back to
+ * GPU OCR.
+ */
+export function extractTextInRegions(data: Uint8Array, pageRegions: PageRegions[]): PageRegionTexts[];
 export function version(): string;
 "#;
 
@@ -162,6 +197,47 @@ struct WasmPdfClassification {
     confidence: f64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WasmPageRegions {
+    page: u32,
+    regions: Vec<Vec<f64>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmRegionText {
+    text: String,
+    needs_ocr: bool,
+    ocr_reason: Option<String>,
+}
+
+impl From<RegionText> for WasmRegionText {
+    fn from(value: RegionText) -> Self {
+        Self {
+            text: value.text,
+            needs_ocr: value.needs_ocr,
+            ocr_reason: value.ocr_reason,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmPageRegionTexts {
+    page: u32,
+    regions: Vec<WasmRegionText>,
+}
+
+impl From<PageRegionResult> for WasmPageRegionTexts {
+    fn from(value: PageRegionResult) -> Self {
+        Self {
+            page: value.page,
+            regions: value.regions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 fn pdf_type_name(pdf_type: PdfType) -> &'static str {
     match pdf_type {
         PdfType::TextBased => "TextBased",
@@ -222,6 +298,30 @@ fn serialize<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(value).map_err(|error| js_error("serialize result", error))
 }
 
+fn deserialize_page_regions(value: JsValue) -> Result<Vec<WasmPageRegions>, JsValue> {
+    serde_wasm_bindgen::from_value(value).map_err(|error| js_error("invalid page regions", error))
+}
+
+fn parse_page_regions(page_regions: &[WasmPageRegions]) -> Vec<(u32, Vec<[f32; 4]>)> {
+    page_regions
+        .iter()
+        .map(|pr| {
+            let bboxes: Vec<[f32; 4]> = pr
+                .regions
+                .iter()
+                .map(|r| {
+                    if r.len() != 4 {
+                        [0.0, 0.0, 0.0, 0.0]
+                    } else {
+                        [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32]
+                    }
+                })
+                .collect();
+            (pr.page, bboxes)
+        })
+        .collect()
+}
+
 fn initialize() {
     console_error_panic_hook::set_once();
 }
@@ -278,6 +378,27 @@ pub fn extract_text(data: &[u8]) -> Result<String, JsValue> {
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+/// Extract text within bounding-box regions from a PDF.
+///
+/// For hybrid OCR: a layout model detects regions in rendered page images,
+/// this extracts PDF text within those regions — skipping GPU OCR for
+/// text-based pages.
+///
+/// Each region result includes `needsOcr` — set when the extracted text is
+/// unreliable (empty, GID-encoded fonts, garbage, encoding issues).
+///
+/// Pages are 0-indexed. Coordinates are PDF points with top-left origin.
+#[wasm_bindgen(js_name = extractTextInRegions, skip_typescript)]
+pub fn extract_text_in_regions(data: &[u8], page_regions: JsValue) -> Result<JsValue, JsValue> {
+    initialize();
+    let page_regions = deserialize_page_regions(page_regions)?;
+    let regions = parse_page_regions(&page_regions);
+    let results = pdf_inspector::extract_text_in_regions_mem(data, &regions)
+        .map_err(|error| js_error("extract text in regions", error))?;
+    let output: Vec<WasmPageRegionTexts> = results.into_iter().map(Into::into).collect();
+    serialize(&output)
 }
 
 /// Return the WebAssembly package version.
@@ -416,6 +537,109 @@ mod tests {
         let text = extract_text(&synthetic_korea1_pdf()).expect("extract predefined CMap text");
 
         assert_eq!(text, "가\n42");
+    }
+
+    fn build_page_regions(entries: &[(u32, Vec<Vec<f64>>)]) -> JsValue {
+        let arr = js_sys::Array::new();
+        for (page, regions) in entries {
+            let entry = js_sys::Object::new();
+            Reflect::set(
+                &entry,
+                &JsValue::from_str("page"),
+                &JsValue::from_f64(*page as f64),
+            )
+            .expect("set page");
+            let regions_arr = js_sys::Array::new();
+            for region in regions {
+                let bbox = js_sys::Array::new();
+                for value in region {
+                    bbox.push(&JsValue::from_f64(*value));
+                }
+                regions_arr.push(&bbox);
+            }
+            Reflect::set(&entry, &JsValue::from_str("regions"), &regions_arr).expect("set regions");
+            arr.push(&entry);
+        }
+        arr.into()
+    }
+
+    fn first_region(result: &JsValue, page_index: u32) -> JsValue {
+        let pages = js_sys::Array::from(result);
+        let page = pages.get(page_index);
+        let regions = js_sys::Array::from(
+            &Reflect::get(&page, &JsValue::from_str("regions")).expect("regions"),
+        );
+        regions.get(0)
+    }
+
+    #[wasm_bindgen_test]
+    fn extracts_text_within_a_region() {
+        let input = build_page_regions(&[(0, vec![vec![0.0, 0.0, 10000.0, 10000.0]])]);
+        let result = extract_text_in_regions(TEXT_PDF, input).expect("extract text in regions");
+        let region = first_region(&result, 0);
+        let text = Reflect::get(&region, &JsValue::from_str("text"))
+            .expect("text")
+            .as_string()
+            .expect("text string");
+        let needs_ocr = Reflect::get(&region, &JsValue::from_str("needsOcr"))
+            .expect("needsOcr")
+            .as_bool()
+            .expect("needsOcr bool");
+
+        assert!(!text.trim().is_empty());
+        assert!(!needs_ocr);
+    }
+
+    #[wasm_bindgen_test]
+    fn empty_region_needs_ocr() {
+        let input = build_page_regions(&[(0, vec![vec![5000.0, 5000.0, 5001.0, 5001.0]])]);
+        let result = extract_text_in_regions(TEXT_PDF, input).expect("extract text in regions");
+        let region = first_region(&result, 0);
+        let text = Reflect::get(&region, &JsValue::from_str("text"))
+            .expect("text")
+            .as_string()
+            .expect("text string");
+        let needs_ocr = Reflect::get(&region, &JsValue::from_str("needsOcr"))
+            .expect("needsOcr")
+            .as_bool()
+            .expect("needsOcr bool");
+
+        assert!(text.trim().is_empty());
+        assert!(needs_ocr);
+    }
+
+    #[wasm_bindgen_test]
+    fn malformed_bbox_does_not_panic() {
+        let input = build_page_regions(&[(0, vec![vec![1.0, 2.0, 3.0]])]);
+        let result = extract_text_in_regions(TEXT_PDF, input).expect("extract text in regions");
+        let region = first_region(&result, 0);
+
+        assert!(Reflect::get(&region, &JsValue::from_str("needsOcr"))
+            .expect("needsOcr")
+            .as_bool()
+            .expect("needsOcr bool"));
+    }
+
+    #[wasm_bindgen_test]
+    fn echoes_requested_page_numbers() {
+        let input = build_page_regions(&[
+            (0, vec![vec![0.0, 0.0, 10000.0, 10000.0]]),
+            (3, vec![vec![0.0, 0.0, 10.0, 10.0]]),
+        ]);
+        let result = extract_text_in_regions(TEXT_PDF, input).expect("extract text in regions");
+        let pages = js_sys::Array::from(&result);
+
+        let first = Reflect::get(&pages.get(0), &JsValue::from_str("page"))
+            .expect("page")
+            .as_f64()
+            .expect("page number");
+        let second = Reflect::get(&pages.get(1), &JsValue::from_str("page"))
+            .expect("page")
+            .as_f64()
+            .expect("page number");
+
+        assert_eq!(first, 0.0);
+        assert_eq!(second, 3.0);
     }
 
     #[wasm_bindgen_test]
