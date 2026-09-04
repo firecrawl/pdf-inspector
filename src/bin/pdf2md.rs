@@ -417,6 +417,9 @@ fn main() {
             "  --compact           Collapse token-heavy source formatting such as dot leaders"
         );
         eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
+        eprintln!(
+            "  --formula-latex     Rewrite native math glyph runs into $...$ LaTeX (experimental)"
+        );
         eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
         eprintln!("  --password PW       Password for an encrypted PDF");
         eprintln!("  --detect-only       Only detect PDF type (no extraction)");
@@ -436,6 +439,7 @@ fn main() {
     let raw_output = args.iter().any(|a| a == "--raw");
     let compact_output = args.iter().any(|a| a == "--compact");
     let page_numbers = args.iter().any(|a| a == "--pages");
+    let formula_latex = args.iter().any(|a| a == "--formula-latex");
     let detect_only = args.iter().any(|a| a == "--detect-only");
     let analyze = args.iter().any(|a| a == "--analyze");
     let ocr_mode_argument = argument_value(&args, "--ocr").unwrap_or_else(|error| {
@@ -553,6 +557,7 @@ fn main() {
                 markdown.profile = pdf_inspector::MarkdownProfile::Compact;
             }
             markdown.include_page_numbers = page_numbers;
+            markdown.formula_latex = formula_latex;
             let mut pdf_options = OcrPdfOptions::new()
                 .render(RenderOptions::new().dpi(dpi))
                 .ocr(ocr)
@@ -628,6 +633,7 @@ fn main() {
         options.markdown.profile = pdf_inspector::MarkdownProfile::Compact;
     }
     options.markdown.include_page_numbers = page_numbers;
+    options.markdown.formula_latex = formula_latex;
     if let Some(pages) = page_filter {
         options.page_filter = Some(pages);
     }
