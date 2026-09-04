@@ -4,6 +4,7 @@
 //! by sampling content streams for text operators (Tj/TJ) without loading
 //! all objects.
 
+use crate::stream_decode::stream_content_for_scan;
 use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -765,10 +766,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
-                Ok(data) => data,
-                Err(_) => stream.content.clone(),
-            };
+            let content = stream_content_for_scan(stream);
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
@@ -1303,9 +1301,7 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
+                    let content = stream_content_for_scan(stream);
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
                     let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
@@ -3918,6 +3914,121 @@ mod tests {
         assert!(
             analysis.has_decodable_text_fonts,
             "P3: inherited decodable font should be detected as used"
+        );
+    }
+
+    fn flate_content(plain: &[u8]) -> lopdf::Stream {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use lopdf::dictionary;
+        use std::io::Write;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(plain).unwrap();
+        lopdf::Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            encoder.finish().unwrap(),
+        )
+    }
+
+    #[test]
+    fn flate_page_content_still_finds_text_operators() {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        let content_id = doc.add_object(Object::Stream(flate_content(
+            b"BT /F1 12 Tf (Hello world) Tj ET",
+        )));
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(font_id),
+                    },
+                },
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.text_operator_count > 0,
+            "bounded Flate decode must still see ordinary page text operators"
+        );
+    }
+
+    #[test]
+    fn flate_form_xobject_still_finds_text_operators() {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        let form_id = doc.add_object(Object::Stream(flate_content(
+            b"BT /F1 12 Tf (Form text) Tj ET",
+        )));
+        if let Object::Stream(form) = doc.objects.get_mut(&form_id).unwrap() {
+            form.dict.set("Type", Object::Name(b"XObject".to_vec()));
+            form.dict.set("Subtype", Object::Name(b"Form".to_vec()));
+            form.dict.set(
+                "Resources",
+                dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(font_id),
+                    },
+                },
+            );
+        }
+        let page_content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            b"/Fm0 Do".to_vec(),
+        )));
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! {
+                        "Fm0" => Object::Reference(form_id),
+                    },
+                },
+                "Contents" => Object::Reference(page_content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.text_operator_count > 0,
+            "bounded Flate decode must still see Form XObject text operators"
         );
     }
 }
