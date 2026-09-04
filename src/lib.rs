@@ -67,7 +67,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use text_quality::{
     analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
-    region_items_have_decoding_issue,
+    markdown_encoding_issues_with_evidence, region_items_have_decoding_issue,
 };
 use tounicode::FontCMaps;
 
@@ -671,8 +671,15 @@ fn extract_pages_markdown_mem_impl(
             )
         };
 
+        // `analyze_text_quality` has already weighed this page's replacement
+        // characters against the density policy — `has_text_quality_issue`
+        // carries that verdict. Re-testing the markdown with the strict
+        // `detect_encoding_issues` would overturn it on a single unmappable
+        // glyph and blank the page below, so the markdown pass uses the same
+        // evidence policy (issue #202).
         let has_decoding_issue = has_text_quality_issue
-            || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
+            || (!md.is_empty()
+                && (is_cid_garbage(&md) || markdown_encoding_issues_with_evidence(&md)));
         if has_decoding_issue {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,
@@ -6842,6 +6849,88 @@ mod tests {
         // Under threshold of 10 total dollars — should not trigger
         let text = "a$b c$d e$f";
         assert!(!detect_encoding_issues(text));
+    }
+
+    /// Body prose used to build realistic page-sized markdown in the
+    /// evidence-gate tests below. 57 chars, 46 of them non-whitespace.
+    const EVIDENCE_TEST_BODY: &str = "Samples are kept in the cold room and logged on arrival. ";
+
+    /// Issue #202: one unmappable glyph must not invalidate a whole page.
+    ///
+    /// This is the case `test_text_quality_allows_isolated_replacement_character`
+    /// already protects at the item level, asserted here on the markdown the
+    /// per-page gate actually inspects. The strict entry point deliberately
+    /// still fires — the divergence is the point of the fix.
+    #[test]
+    fn test_markdown_evidence_allows_isolated_replacement_char() {
+        let md = format!(
+            "\u{FFFD} -18 C. Check the seal before use.\n\n{}",
+            EVIDENCE_TEST_BODY.repeat(12)
+        );
+
+        assert!(detect_encoding_issues(&md));
+        assert!(!markdown_encoding_issues_with_evidence(&md));
+    }
+
+    /// Three scattered symbol glyphs on a ~700-char page sit far below the
+    /// 250 bps density floor, so `replacement_spans >= 3` alone must not
+    /// route the page to OCR.
+    #[test]
+    fn test_markdown_evidence_allows_scattered_replacement_chars() {
+        let chunk = EVIDENCE_TEST_BODY.repeat(5);
+        let md = format!("{chunk}\u{FFFD}{chunk}\u{FFFD}{chunk}\u{FFFD}");
+
+        assert_eq!(md.matches('\u{FFFD}').count(), 3);
+        assert!(!markdown_encoding_issues_with_evidence(&md));
+    }
+
+    /// A genuinely broken text layer still routes to OCR: 12 replacement
+    /// characters at >= 500 bps trips `enough_bad_text`. Kept above the
+    /// 80-char floor so this exercises the density rule, not the
+    /// short-page rule.
+    #[test]
+    fn test_markdown_evidence_flags_dense_replacement_chars() {
+        let md = format!(
+            "{}{}",
+            "\u{FFFD}".repeat(12),
+            "Broken glyph run in the table header cells and totals row. ".repeat(2)
+        );
+
+        assert!(md.chars().filter(|c| !c.is_whitespace()).count() > 80);
+        assert!(markdown_encoding_issues_with_evidence(&md));
+    }
+
+    /// On a page that is nothing but a short broken fragment, a run of two
+    /// is already enough evidence (`chars <= 80` branch).
+    #[test]
+    fn test_markdown_evidence_flags_short_page_replacement_run() {
+        assert!(markdown_encoding_issues_with_evidence(
+            "Fig \u{FFFD}\u{FFFD} 3"
+        ));
+    }
+
+    /// Only the U+FFFD heuristic is weighed by evidence. Dollar-as-space
+    /// stays strict.
+    #[test]
+    fn test_markdown_evidence_still_flags_dollar_as_space() {
+        let garbled = "Last$advanced$Book$Programm$3th$Workshop$on$Chest$Wall$Deformities$and$More";
+        assert!(markdown_encoding_issues_with_evidence(garbled));
+    }
+
+    #[test]
+    fn test_markdown_evidence_allows_clean_text() {
+        assert!(!markdown_encoding_issues_with_evidence(
+            "Normal markdown text with no issues."
+        ));
+    }
+
+    /// Regression guard for the other three `detect_encoding_issues` call
+    /// sites (region text, table candidates, document-level flag), which
+    /// keep the strict single-character policy.
+    #[test]
+    fn test_detect_encoding_issues_stays_strict_on_single_fffd() {
+        let md = format!("{}\u{FFFD}", EVIDENCE_TEST_BODY.repeat(12));
+        assert!(detect_encoding_issues(&md));
     }
 
     /// Real garbled output from ParseBench `text_simple__att10k.pdf`: a broken
