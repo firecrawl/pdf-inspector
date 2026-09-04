@@ -47,6 +47,12 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- A contents page whose entries end in right-aligned page numbers without dot
+  leaders — an edited volume's table of contents with the chapter authors on
+  their own lines — is rendered as a contents list, one entry per line with
+  its page number tab-separated, instead of being read as a two-column page
+  whose titles and numbers interleave into a paragraph.
+
 - Raised and lowered marker glyphs no longer form their own line. Line
   grouping — the Markdown pipeline and `extract_text_in_regions`
   (`extractTextInRegions`) alike — compares baselines through `line_y()`, so
