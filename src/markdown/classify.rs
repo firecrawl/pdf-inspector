@@ -364,4 +364,13 @@ mod tests {
         assert!(!starts_with_bullet_marker("▪Item"));
         assert!(!starts_with_bullet_marker("‣Item"));
     }
+
+    #[test]
+    fn is_list_item_with_hyphen_bullet() {
+        // U+2043 HYPHEN BULLET — recognized by extractor is_bare_list_marker
+        // but was missing from classify.rs BULLET_MARKERS (issue #475 review).
+        assert!(is_list_item("⁃ Item"));
+        assert!(starts_with_bullet_marker("⁃ Item"));
+        assert_eq!(format_list_item("⁃ Item"), "- Item");
+    }
 }
