@@ -518,16 +518,14 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations) =
-        if let Some(required_pages) = required_pages.as_ref() {
-            extractor::extract_positioned_text_for_document_analysis(
-                &doc,
-                &font_cmaps,
-                required_pages,
-            )?
-        } else {
-            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
-        };
+    let analysis = if let Some(required_pages) = required_pages.as_ref() {
+        extractor::extract_positioned_text_for_document_analysis(&doc, &font_cmaps, required_pages)?
+    } else {
+        extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
+    };
+    let (all_items, all_rects, all_lines) = analysis.extraction;
+    let page_thresholds = analysis.thresholds;
+    let gid_pages = analysis.gid_encoded_pages;
     let text_quality = analyze_text_quality(&all_items);
 
     // Resolve page numbers with full-document context before partitioning.
@@ -4315,20 +4313,60 @@ fn process_document(
         // For Mixed/template PDFs: if normal extraction produces garbage text
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
-        if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _)| e) {
-                let sample: String = items
-                    .iter()
-                    .filter(|item| {
-                        options
-                            .page_filter
-                            .as_ref()
-                            .is_none_or(|filter| filter.contains(&item.page))
-                    })
-                    .take(200)
-                    .map(|item| item.text.as_str())
-                    .collect();
-                if is_garbage_text(&sample) || sample.trim().is_empty() {
+        //
+        // TextBased documents join that retry on the EMPTY branch only. An
+        // `ocrmypdf` file lands exactly there: every page carries show-text
+        // operators, so the detector calls the document TextBased, yet all of
+        // that text is an invisible (Tr 3) OCR layer which the visible-only
+        // pass drops — markdown came back empty while `has_text` was true.
+        // That branch takes the region extractor's gate whole, both halves
+        // (`skipped_invisible && !has_visible_text`), so it cannot change
+        // output for documents that already extract text. The garbage branch
+        // stays Mixed-only: on TextBased it would let a noisy-but-real text
+        // layer be replaced by its invisible twin.
+        if pdf_type == PdfType::Mixed || pdf_type == PdfType::TextBased {
+            if let Ok(extracted) = result.as_ref() {
+                let (items, _rects, _lines) = &extracted.extraction;
+                let selected = |item: &types::TextItem| {
+                    options
+                        .page_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.contains(&item.page))
+                };
+                // Each gate is built only on the branch that consumes it:
+                // `sample` joins up to 200 items into a String and the
+                // visible-text test scans every item, so neither type pays
+                // for the other's evidence (review catch).
+                let retry = match pdf_type {
+                    PdfType::Mixed => {
+                        let sample: String = items
+                            .iter()
+                            .filter(|item| selected(item))
+                            .take(200)
+                            .map(|item| item.text.as_str())
+                            .collect();
+                        is_garbage_text(&sample) || sample.trim().is_empty()
+                    }
+                    // Two conditions, same pair the region extractor uses at
+                    // `skipped_invisible && !has_visible_text` above: some
+                    // page must actually have SUPPRESSED a Tr 3 layer — a
+                    // blank or image-only page has nothing to recover and
+                    // must not pay for a second content-stream parse — and
+                    // the visible pass must have read nothing. `[Image: ...]`
+                    // placeholders are synthesized for image XObjects: they
+                    // mark that pixels exist, not that text was read, so a
+                    // scanned page's visible pass is "empty" despite carrying
+                    // them (same rule as `non_placeholder_alnum`).
+                    PdfType::TextBased => {
+                        extracted.skipped_invisible
+                            && !items.iter().filter(|item| selected(item)).any(|item| {
+                                !matches!(item.item_type, types::ItemType::Image)
+                                    && !item.text.trim().is_empty()
+                            })
+                    }
+                    _ => false,
+                };
+                if retry {
                     extractor::extract_positioned_text_include_invisible_with_folio_context(
                         &doc,
                         &font_cmaps,
@@ -4337,13 +4375,18 @@ fn process_document(
                 } else {
                     result
                 }
-            } else {
-                // Normal extraction failed — try invisible as fallback
+            } else if pdf_type == PdfType::Mixed {
+                // Normal extraction failed — try invisible as fallback.
+                // TextBased keeps propagating the error (see `extracted?`
+                // below): a failed parse there is a real failure, not a
+                // missing OCR layer.
                 extractor::extract_positioned_text_include_invisible_with_folio_context(
                     &doc,
                     &font_cmaps,
                     options.page_filter.as_ref(),
                 )
+            } else {
+                result
             }
         } else {
             result
@@ -4384,7 +4427,12 @@ fn process_document(
         text_quality_pages,
         text_quality_reasons_by_page,
     ) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages, _page_rotations)) => {
+        Some(extractor::PositionedExtraction {
+            extraction: (items, rects, lines),
+            thresholds: page_thresholds,
+            gid_encoded_pages,
+            ..
+        }) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
             // For TextBased PDFs with pages flagged for OCR (Identity-H or

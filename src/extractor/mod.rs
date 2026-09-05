@@ -136,9 +136,8 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages, _page_rotations) =
-        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
-    Ok(extraction)
+    let extracted = extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
+    Ok(extracted.extraction)
 }
 
 /// Extract text with positions from a memory buffer. Coordinates: see
@@ -172,9 +171,9 @@ pub fn extract_text_with_positions_and_rotations_mem(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let ((items, _rects, _lines), _thresholds, _gid_pages, page_rotations) =
-        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, None)?;
-    Ok((items, page_rotations))
+    let extracted = extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, None)?;
+    let (items, _rects, _lines) = extracted.extraction;
+    Ok((items, extracted.page_rotations))
 }
 
 /// Extract text with positions and rectangles from memory buffer.
@@ -185,9 +184,8 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages, _page_rotations) =
-        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
-    Ok(extraction)
+    let extracted = extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
+    Ok(extracted.extraction)
 }
 
 /// One page's geometry in the visible-page-box frame, from
@@ -258,6 +256,22 @@ pub(crate) type PageThresholds = HashMap<u32, f32>;
 /// are upright.
 pub(crate) type PageRotations = HashMap<u32, geometry::PageRotation>;
 
+/// What a document-level positioned-text extraction reports — the same shape
+/// [`PageBoxExtraction`] gives one page, so `skipped_invisible` survives the
+/// document walk instead of being dropped per page.
+pub(crate) struct PositionedExtraction {
+    pub(crate) extraction: PageExtraction,
+    pub(crate) thresholds: PageThresholds,
+    pub(crate) gid_encoded_pages: HashSet<u32>,
+    pub(crate) page_rotations: PageRotations,
+    /// Some extracted page carried invisible (Tr 3) text that this pass
+    /// suppressed, so an `include_invisible` retry has something to recover.
+    /// False when the pass already included invisible text — nothing was
+    /// skipped — and false for a blank or image-only page, which is what
+    /// makes it a usable gate on that retry.
+    pub(crate) skipped_invisible: bool,
+}
+
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
 ///
 /// Also returns per-page adaptive join thresholds for Canva-style pages.
@@ -265,7 +279,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -285,7 +299,7 @@ pub(crate) fn extract_positioned_text_from_doc_in_page_box(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -315,7 +329,7 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
 }
 
@@ -324,7 +338,7 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
 }
 
@@ -333,7 +347,7 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     let Some(required_pages) = page_filter else {
         return extract_positioned_text_impl(
             doc,
@@ -345,12 +359,17 @@ fn extract_positioned_text_with_folio_context_impl(
         );
     };
 
-    let (
-        (mut selected_items, mut selected_rects, mut selected_lines),
-        mut page_thresholds,
+    let PositionedExtraction {
+        extraction: (mut selected_items, mut selected_rects, mut selected_lines),
+        thresholds: mut page_thresholds,
         mut gid_encoded_pages,
         mut page_rotations,
-    ) = extract_positioned_text_impl(
+        // Only the SELECTED pages' verdict travels on: context pages are
+        // folio evidence, not extraction targets, so an invisible layer on
+        // one of them says nothing about the pages the caller asked for.
+        // Same scoping as the caller's own visible-text test.
+        skipped_invisible,
+    } = extract_positioned_text_impl(
         doc,
         font_cmaps,
         Some(required_pages),
@@ -359,12 +378,13 @@ fn extract_positioned_text_with_folio_context_impl(
         CoordinateFrame::UserSpace,
     )?;
     if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
-        return Ok((
-            (selected_items, selected_rects, selected_lines),
-            page_thresholds,
+        return Ok(PositionedExtraction {
+            extraction: (selected_items, selected_rects, selected_lines),
+            thresholds: page_thresholds,
             gid_encoded_pages,
             page_rotations,
-        ));
+            skipped_invisible,
+        });
     }
 
     let context_pages: HashSet<u32> = doc
@@ -373,12 +393,13 @@ fn extract_positioned_text_with_folio_context_impl(
         .copied()
         .filter(|page| !required_pages.contains(page))
         .collect();
-    let (
-        (context_items, context_rects, context_lines),
-        context_thresholds,
-        context_gid_pages,
-        context_rotations,
-    ) = extract_positioned_text_impl(
+    let PositionedExtraction {
+        extraction: (context_items, context_rects, context_lines),
+        thresholds: context_thresholds,
+        gid_encoded_pages: context_gid_pages,
+        page_rotations: context_rotations,
+        skipped_invisible: _context_skipped_invisible,
+    } = extract_positioned_text_impl(
         doc,
         font_cmaps,
         Some(&context_pages),
@@ -392,12 +413,13 @@ fn extract_positioned_text_with_folio_context_impl(
     page_thresholds.extend(context_thresholds);
     gid_encoded_pages.extend(context_gid_pages);
     page_rotations.extend(context_rotations);
-    Ok((
-        (selected_items, selected_rects, selected_lines),
-        page_thresholds,
+    Ok(PositionedExtraction {
+        extraction: (selected_items, selected_rects, selected_lines),
+        thresholds: page_thresholds,
         gid_encoded_pages,
         page_rotations,
-    ))
+        skipped_invisible,
+    })
 }
 
 /// Extract all pages for document-wide analysis while allowing malformed
@@ -406,7 +428,7 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     doc: &Document,
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -424,7 +446,7 @@ fn extract_positioned_text_impl(
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
     frame: CoordinateFrame,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
@@ -439,6 +461,10 @@ fn extract_positioned_text_impl(
     let mut page_rotations: PageRotations = HashMap::new();
     // Visible page box per extracted page, for the form-field shift below.
     let mut page_boxes: HashMap<u32, PageBox> = HashMap::new();
+    // Did ANY extracted page suppress invisible (Tr 3) text? The retry that
+    // consumes this re-extracts the whole selection, so one page with a
+    // recoverable layer is enough to make it worth paying for.
+    let mut skipped_invisible_anywhere = false;
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -459,7 +485,7 @@ fn extract_positioned_text_impl(
             &mut style_cache,
             &mut FormWalkBudget::new(),
         );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
+        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, skipped_invisible) =
             match page_result {
                 Ok(extraction) => extraction,
                 Err(error)
@@ -473,6 +499,7 @@ fn extract_positioned_text_impl(
                 }
                 Err(error) => return Err(error),
             };
+        skipped_invisible_anywhere |= skipped_invisible;
         if coords_rotated != geometry::PageRotation::Upright {
             page_rotations.insert(*page_num, coords_rotated);
         }
@@ -648,12 +675,13 @@ fn extract_positioned_text_impl(
         .collect();
     all_items.extend(form_items);
 
-    Ok((
-        (all_items, all_rects, all_lines),
-        page_thresholds,
+    Ok(PositionedExtraction {
+        extraction: (all_items, all_rects, all_lines),
+        thresholds: page_thresholds,
         gid_encoded_pages,
         page_rotations,
-    ))
+        skipped_invisible: skipped_invisible_anywhere,
+    })
 }
 
 fn suppress_table_underlines(
@@ -3590,9 +3618,12 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, page_rotations) =
-            extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
-        assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
+        let extracted = extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+        let (items, _, _) = extracted.extraction;
+        assert_eq!(
+            extracted.page_rotations.get(&1),
+            Some(&geometry::PageRotation::Ccw)
+        );
         let field = items
             .iter()
             .find(|i| matches!(i.item_type, ItemType::FormField))
@@ -3613,6 +3644,117 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
             (100.0, -200.0, 40.0, 12.0)
         );
         assert_eq!(link.rotation, 0.0);
+    }
+
+    /// A document of `pages` single-stream pages, each with the same Type1
+    /// font as `/F1`.
+    fn doc_with_page_contents(pages: &[&[u8]]) -> lopdf::Document {
+        use lopdf::{dictionary, Object, Stream};
+
+        let mut doc = lopdf::Document::new();
+        let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths),
+        });
+        let page_ids: Vec<Object> = pages
+            .iter()
+            .map(|content| {
+                let content_id = doc.add_object(Object::Stream(Stream::new(
+                    dictionary! {},
+                    content.to_vec(),
+                )));
+                Object::Reference(doc.add_object(dictionary! {
+                    "Type" => "Page",
+                    "Contents" => Object::Reference(content_id),
+                    "Resources" => dictionary! {
+                        "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                    },
+                    "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                }))
+            })
+            .collect();
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(page_ids.len() as i64),
+            "Kids" => Object::Array(page_ids),
+        });
+        for (_, page_id) in doc.get_pages() {
+            let page = doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+            page.set("Parent", Object::Reference(pages_id));
+        }
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn document_extraction_reports_an_invisible_layer_from_any_page() {
+        use crate::tounicode::FontCMaps;
+
+        // `process_document` gates its `include_invisible` retry on this
+        // flag, so the document walk must carry a page's verdict out instead
+        // of dropping it: page 2 hides its text behind `3 Tr` the way an
+        // `ocrmypdf` page does, and one such page is enough.
+        let doc = doc_with_page_contents(&[
+            b"BT /F1 12 Tf 72 700 Td (Visible) Tj ET",
+            b"BT 3 Tr /F1 12 Tf 72 700 Td (Hidden) Tj ET",
+        ]);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let visible = extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+        let texts: Vec<&str> = visible
+            .extraction
+            .0
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(texts, ["Visible"]);
+        assert!(visible.skipped_invisible);
+
+        // And the retry that flag unlocks does recover the hidden layer —
+        // having already included it, that pass skipped nothing.
+        let with_invisible = extract_positioned_text_impl(
+            &doc,
+            &font_cmaps,
+            None,
+            true,
+            None,
+            CoordinateFrame::UserSpace,
+        )
+        .unwrap();
+        assert!(
+            with_invisible
+                .extraction
+                .0
+                .iter()
+                .any(|i| i.text == "Hidden"),
+            "{:?}",
+            with_invisible.extraction.0
+        );
+        assert!(!with_invisible.skipped_invisible);
+    }
+
+    #[test]
+    fn document_extraction_reports_nothing_skipped_without_an_invisible_layer() {
+        use crate::tounicode::FontCMaps;
+
+        // The negative half of the gate: a page that simply has no text must
+        // not claim a recoverable layer, or every blank and image-only
+        // document would pay for a second content-stream parse.
+        let doc = doc_with_page_contents(&[
+            b"BT /F1 12 Tf 72 700 Td (Visible) Tj ET",
+            b"q 1 0 0 1 0 0 cm Q",
+        ]);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let extracted = extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+        assert!(!extracted.skipped_invisible);
     }
 
     #[test]
