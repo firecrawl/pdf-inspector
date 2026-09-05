@@ -75,8 +75,8 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
 /// like `1.` or `a)`, which legitimately appear as section headings in many
 /// documents. Used by the heading classifier to reject bullet lines without
 /// also demoting numbered headings.
-const BULLET_MARKERS: [&str; 11] = [
-    "•", "●", "○", "◦", "▪", "▫", "◆", "◇", "■", "□", "‣",
+const BULLET_MARKERS: [&str; 12] = [
+    "•", "●", "○", "◦", "▪", "▫", "◆", "◇", "■", "□", "‣", "⁃",
 ];
 
 pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
