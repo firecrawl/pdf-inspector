@@ -25,7 +25,9 @@
 //!   distribution is a permutation of natural language ([`CipherGarbleStats`]).
 
 use crate::types::TextItem;
-use crate::{add_ocr_reason, OCR_REASON_SUSPECTED_GARBLED_TEXT};
+use crate::{
+    add_ocr_reason, OCR_REASON_SUSPECTED_GARBLED_TEXT, OCR_REASON_SUSPECTED_REPEATED_TEXT,
+};
 use std::collections::BTreeMap;
 
 /// Detect broken font encodings in extracted markdown text.
@@ -233,12 +235,13 @@ pub(crate) struct TextQualityReport {
 }
 
 #[derive(Debug, Default)]
-struct PageTextQualityEvidence {
+struct PageTextQualityEvidence<'a> {
     chars: usize,
     replacement_chars: usize,
     replacement_spans: usize,
     longest_replacement_run: usize,
     cipher_garble: CipherGarbleStats,
+    items: Vec<&'a TextItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +260,7 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         }
 
         let evidence = evidence_by_page.entry(item.page).or_default();
+        evidence.items.push(item);
         evidence.chars += item.text.chars().filter(|ch| !ch.is_whitespace()).count();
         evidence.cipher_garble.add_text(&item.text);
 
@@ -289,6 +293,17 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
                 page,
                 OCR_REASON_SUSPECTED_GARBLED_TEXT,
             );
+        } else {
+            let line_strings = group_spans_into_lines(&evidence.items);
+            let line_refs: Vec<&str> = line_strings.iter().map(|s| s.as_str()).collect();
+            let res = compute_distinct_n_lines_details(&line_refs, 3, 50);
+            if res.total_ngrams >= 10 && res.score < 0.50 {
+                add_ocr_reason(
+                    &mut reasons_by_page,
+                    page,
+                    OCR_REASON_SUSPECTED_REPEATED_TEXT,
+                );
+            }
         }
     }
 
@@ -298,6 +313,55 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         pages_needing_ocr,
         reasons_by_page,
     }
+}
+
+fn group_spans_into_lines(items: &[&TextItem]) -> Vec<String> {
+    let valid_items: Vec<&&TextItem> = items
+        .iter()
+        .filter(|item| !item.text.trim().is_empty())
+        .collect();
+
+    if valid_items.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = valid_items;
+    sorted.sort_by(|a, b| {
+        b.y.partial_cmp(&a.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+    let mut current_y = sorted[0].y;
+    let mut last_x: Option<f32> = None;
+
+    for item in sorted {
+        let is_new_y_band = (item.y - current_y).abs() > 3.0;
+        let is_wrapped_x =
+            last_x.is_some_and(|lx| item.x <= lx && (lx - item.x) > 10.0);
+
+        if is_new_y_band || is_wrapped_x {
+            if !current_line.is_empty() {
+                lines.push(current_line);
+                current_line = String::new();
+            }
+            current_y = item.y;
+        }
+
+        if !current_line.is_empty() {
+            current_line.push(' ');
+        }
+        current_line.push_str(item.text.trim());
+        last_x = Some(item.x);
+    }
+
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    lines
 }
 
 pub(crate) fn region_items_have_decoding_issue(items: &[TextItem]) -> bool {
@@ -517,4 +581,226 @@ pub(crate) fn is_cid_garbage(text: &str) -> bool {
     // page to OCR.
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
     total >= 20 && high_latin * 5 >= total * 2 && ascii_letters * 3 < total
+}
+
+/// Compute the distinct-n ratio over a sequence of text lines/spans.
+///
+/// Returns the ratio of unique line n-grams to total line n-grams within a
+/// sliding window.
+///
+/// Normalization:
+/// - Empty/whitespace-only lines are ignored.
+/// - Lines are trimmed and case-folded (lowercase) for comparison.
+///
+/// If `total_ngrams == 0`, returns `1.0`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DistinctNResult {
+    pub(crate) score: f32,
+    pub(crate) total_ngrams: usize,
+}
+
+pub(crate) fn compute_distinct_n(text: &str, n: usize, window_size: usize) -> f32 {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    compute_distinct_n_lines(&lines, n, window_size)
+}
+
+pub(crate) fn compute_distinct_n_lines(lines: &[&str], n: usize, window_size: usize) -> f32 {
+    compute_distinct_n_lines_details(lines, n, window_size).score
+}
+
+pub(crate) fn compute_distinct_n_lines_details(
+    lines: &[&str],
+    n: usize,
+    window_size: usize,
+) -> DistinctNResult {
+    if n == 0 || lines.len() < n {
+        return DistinctNResult {
+            score: 1.0,
+            total_ngrams: 0,
+        };
+    }
+
+    let norm_lines: Vec<String> = lines.iter().map(|l| l.to_lowercase()).collect();
+    let win_size = if window_size == 0 {
+        norm_lines.len()
+    } else {
+        window_size
+    };
+    let mut total_ngrams = 0usize;
+    let mut unique_ngrams = 0usize;
+
+    let mut window_start = 0;
+    while window_start < norm_lines.len() {
+        let window_end = (window_start + win_size).min(norm_lines.len());
+        let window_slice = &norm_lines[window_start..window_end];
+
+        if window_slice.len() >= n {
+            let mut seen = std::collections::HashSet::new();
+            for window in window_slice.windows(n) {
+                total_ngrams += 1;
+                if seen.insert(window) {
+                    unique_ngrams += 1;
+                }
+            }
+        }
+
+        if window_end >= norm_lines.len() {
+            break;
+        }
+        let step = (win_size / 2).max(1);
+        window_start += step;
+    }
+
+    let score = if total_ngrams == 0 {
+        1.0
+    } else {
+        (unique_ngrams as f64 / total_ngrams as f64) as f32
+    };
+
+    DistinctNResult {
+        score,
+        total_ngrams,
+    }
+}
+
+#[cfg(test)]
+mod distinct_n_tests {
+    use super::*;
+    use crate::types::{ItemType, TextItem};
+
+    #[test]
+    fn test_compute_distinct_n_unique_text() {
+        let text = "Line one of document\nLine two of document\nLine three of document\nLine four of document\nLine five of document";
+        let score = compute_distinct_n(text, 3, 50);
+        assert!((score - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_compute_distinct_n_repeated_text() {
+        let text = "Repeated line A\nRepeated line B\nRepeated line C\n".repeat(10);
+        let score = compute_distinct_n(&text, 3, 50);
+        assert!(score < 0.30, "Expected low distinct_n score, got {}", score);
+    }
+
+    #[test]
+    fn test_analyze_text_quality_flags_repeated_text() {
+        let mut items = Vec::new();
+        for i in 0..12 {
+            let y_pos = 500.0 - (i as f32 * 20.0);
+            let line_text = if i % 2 == 0 {
+                "Repeated paragraph line A"
+            } else {
+                "Repeated paragraph line B"
+            };
+            items.push(TextItem {
+                text: line_text.into(),
+                x: 10.0,
+                y: y_pos,
+                width: 100.0,
+                height: 12.0,
+                font: "Helvetica".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            });
+        }
+
+        let report = analyze_text_quality(&items);
+        assert!(report.has_encoding_issues);
+        assert!(report.pages_needing_ocr.contains(&1));
+        let reasons = report.reasons_by_page.get(&1).unwrap();
+        assert!(reasons.contains(&OCR_REASON_SUSPECTED_REPEATED_TEXT.to_string()));
+    }
+
+    #[test]
+    fn test_compute_distinct_n_window_size_one() {
+        let text = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
+        // Ensure small window_size=1 does not infinite loop or panic
+        let score = compute_distinct_n(text, 1, 1);
+        assert!(score >= 0.0 && score <= 1.0);
+    }
+
+    #[test]
+    fn test_group_spans_into_lines() {
+        let item1 = TextItem {
+            text: "Hello ".into(),
+            x: 10.0,
+            y: 100.0,
+            width: 30.0,
+            height: 10.0,
+            font: "Helvetica".into(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        };
+        let item_empty = TextItem {
+            text: "   ".into(),
+            x: 40.0,
+            y: 100.0,
+            width: 10.0,
+            height: 10.0,
+            font: "Helvetica".into(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        };
+        let item2 = TextItem {
+            text: "World".into(),
+            x: 50.0,
+            y: 100.0,
+            width: 30.0,
+            height: 10.0,
+            font: "Helvetica".into(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        };
+        let item3 = TextItem {
+            text: "Next line".into(),
+            x: 10.0,
+            y: 80.0,
+            width: 50.0,
+            height: 10.0,
+            font: "Helvetica".into(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        };
+
+        let items = vec![&item1, &item_empty, &item2, &item3];
+        let lines = group_spans_into_lines(&items);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "Hello World");
+        assert_eq!(lines[1], "Next line");
+    }
 }
