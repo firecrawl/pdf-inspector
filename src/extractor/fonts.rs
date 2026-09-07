@@ -1110,9 +1110,19 @@ fn embedded_style_flags(doc: &Document, ff_ref: ObjectId) -> (bool, bool) {
         return (false, false);
     };
     if let Ok(face) = ttf_parser::Face::parse(&data, 0) {
+        // PDF subsetters can remove OS/2 while retaining the bold bit in
+        // head.macStyle. Face::is_bold only reads OS/2; use the legacy flag
+        // when that table is unavailable, without overriding an explicit
+        // regular OS/2 face. The parsed face has already validated head.
+        let mac_bold = face.tables().os2.is_none()
+            && face
+                .raw_face()
+                .table(ttf_parser::Tag::from_bytes(b"head"))
+                .and_then(|head| head.get(44..46))
+                .is_some_and(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]) & 1 != 0);
         (
             face.is_italic() || face.italic_angle().abs() >= 4.0,
-            face.is_bold(),
+            face.is_bold() || mac_bold,
         )
     } else if let Some(name) = cff_font_name(&data) {
         // FontFile3 is bare CFF (no sfnt container) — ttf_parser
@@ -1936,6 +1946,77 @@ mod tests {
             descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
             (false, false)
         );
+    }
+
+    /// Synthetic sfnt containing just the tables needed to parse a face.
+    /// No source-document font bytes are needed for these style tests.
+    fn sfnt_with_style(mac_style: u16, os2_selection: Option<u16>) -> Vec<u8> {
+        let mut head = vec![0u8; 54];
+        head[18..20].copy_from_slice(&1000u16.to_be_bytes()); // unitsPerEm
+        head[44..46].copy_from_slice(&mac_style.to_be_bytes());
+        let hhea = vec![0u8; 36];
+        let mut maxp = vec![0u8; 6];
+        maxp[..4].copy_from_slice(&0x00005000u32.to_be_bytes());
+        maxp[4..6].copy_from_slice(&1u16.to_be_bytes()); // numGlyphs
+        let mut tables = vec![(*b"head", head), (*b"hhea", hhea), (*b"maxp", maxp)];
+        if let Some(selection) = os2_selection {
+            let mut os2 = vec![0u8; 78]; // version 0
+            os2[62..64].copy_from_slice(&selection.to_be_bytes());
+            tables.push((*b"OS/2", os2));
+        }
+        tables.sort_by_key(|(tag, _)| *tag);
+        let count = tables.len();
+        let mut data = vec![0u8; 12 + count * 16];
+        data[..4].copy_from_slice(&0x00010000u32.to_be_bytes());
+        data[4..6].copy_from_slice(&(count as u16).to_be_bytes());
+        for (i, (tag, table)) in tables.into_iter().enumerate() {
+            let offset = data.len() as u32;
+            let record = 12 + i * 16;
+            data[record..record + 4].copy_from_slice(&tag);
+            data[record + 8..record + 12].copy_from_slice(&offset.to_be_bytes());
+            data[record + 12..record + 16].copy_from_slice(&(table.len() as u32).to_be_bytes());
+            data.extend_from_slice(&table);
+            while !data.len().is_multiple_of(4) {
+                data.push(0);
+            }
+        }
+        data
+    }
+
+    fn descriptor_flags_from_sfnt(mac_style: u16, os2_selection: Option<u16>) -> (bool, bool) {
+        let mut doc = Document::with_version("1.4");
+        let font_file = doc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            sfnt_with_style(mac_style, os2_selection),
+        ));
+        let descriptor = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "ABCDEF+OpaqueFace",
+            "Flags" => 4,
+            "ItalicAngle" => 0,
+            "FontFile2" => font_file,
+        });
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "ABCDEF+OpaqueFace",
+            "FontDescriptor" => descriptor,
+        };
+        descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new())
+    }
+
+    #[test]
+    fn embedded_mac_bold_without_os2_survives_opaque_subset_names() {
+        assert_eq!(descriptor_flags_from_sfnt(1, None), (false, true));
+        assert_eq!(descriptor_flags_from_sfnt(0, None), (false, false));
+        // Italic and other macStyle bits must not imply bold.
+        assert_eq!(descriptor_flags_from_sfnt(2, None), (false, false));
+    }
+
+    #[test]
+    fn embedded_os2_bold_remains_authoritative() {
+        assert_eq!(descriptor_flags_from_sfnt(0, Some(1 << 5)), (false, true));
+        assert_eq!(descriptor_flags_from_sfnt(1, Some(1 << 6)), (false, false));
     }
 
     #[test]

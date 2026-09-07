@@ -1285,14 +1285,9 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 {
                     break;
                 }
-                // Never merge across style boundaries: the merged item
-                // carries `first`'s flags, so absorbing a styled run into a
-                // plain neighbor (or vice versa) silently erases the styling
-                // that markdown emission and downstream inline-styling need —
-                // and OR-ing underline instead would stretch `<u>` spans over
-                // neighboring plain text.
-                if next.is_bold != first.is_bold
-                    || next.is_italic != first.is_italic
+                // Preserve the existing join behavior at non-bold style
+                // boundaries, including italic fragments within formulas.
+                if next.is_italic != first.is_italic
                     || next.is_underline != first.is_underline
                     || next.is_strikeout != first.is_strikeout
                 {
@@ -1365,8 +1360,40 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     Some((run_end, floor)) if j <= run_end => floor,
                     _ => threshold,
                 };
-                if !small_caps_join && (needs_bullet_space || gap > effective_threshold) {
+                let bold_boundary = next.is_bold != first.is_bold;
+                let explicit_bold_space = bold_boundary
+                    && (text.ends_with(char::is_whitespace)
+                        || next.text.starts_with(char::is_whitespace));
+                // Numeric fragments have their own joining thresholds in
+                // line assembly. Injecting a word space here would split a
+                // number whose decimal point or digits use a bold font.
+                let numeric_boundary = bold_boundary
+                    && match (text.chars().last(), next.text.chars().next()) {
+                        (Some(p), Some(c)) if p.is_ascii_digit() => {
+                            c.is_ascii_digit() || matches!(c, '.' | ',' | '%')
+                        }
+                        (Some('.' | ','), Some(c)) if c.is_ascii_digit() => {
+                            let prefix = &text[..text.len() - 1];
+                            // A separate decimal glyph can start a fractional
+                            // number even without a preceding integer run.
+                            prefix.trim().is_empty()
+                                || prefix.chars().last().is_some_and(|c| c.is_ascii_digit())
+                        }
+                        (Some('+' | '-'), Some(c)) => c.is_ascii_digit(),
+                        _ => false,
+                    };
+                if !small_caps_join
+                    && (needs_bullet_space || (gap > effective_threshold && !numeric_boundary))
+                    && !explicit_bold_space
+                {
                     text.push(' ');
+                }
+                // Keep bold runs separate, but preserve the same word-space
+                // decision as an unstyled merge. Otherwise the later line
+                // assembler's wider joining threshold can glue words when
+                // newly recovered font flags split a previously merged run.
+                if bold_boundary {
+                    break;
                 }
                 text.push_str(&next.text);
                 box_right = box_right.max(next.x + next.width);
@@ -1603,6 +1630,146 @@ mod tests {
         assert!(merged[1].is_italic && !merged[1].is_underline);
         assert!(merged[2].is_underline && !merged[2].is_italic);
         assert!(!merged[3].is_underline && !merged[3].is_italic);
+    }
+
+    #[test]
+    fn recovered_bold_preserves_word_spacing_at_style_boundary() {
+        // A 0.1-em gap is a word boundary in merging, but the later line
+        // assembler joins gaps below 0.15 em. Recovering bold must not lose
+        // the space that the original all-plain merge would have emitted.
+        let plain = vec![
+            make_merge_item("KEY", 100.0, 24.0),
+            make_merge_item("Body", 125.2, 24.0),
+        ];
+        let original = merge_text_items(plain.clone());
+        let mut styled = plain;
+        styled[0].is_bold = true;
+        let recovered = merge_text_items(styled);
+        assert_eq!(original[0].text, "KEY Body");
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered[0].is_bold && !recovered[1].is_bold);
+        assert_eq!(recovered[0].text, "KEY ");
+        assert_eq!(recovered[1].text, "Body");
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            original[0].text
+        );
+        let line = TextLine {
+            items: recovered,
+            y: 100.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(line.text(), "KEY Body");
+        assert_eq!(
+            line.text_with_formatting(true, false, false),
+            "**KEY** Body"
+        );
+    }
+
+    #[test]
+    fn recovered_bold_keeps_zero_gap_word_fragments_joined() {
+        let plain = vec![
+            make_merge_item("un", 100.0, 12.0),
+            make_merge_item("known", 112.0, 30.0),
+        ];
+        let original = merge_text_items(plain.clone());
+        let mut styled = plain;
+        styled[0].is_bold = true;
+        let recovered = merge_text_items(styled);
+        assert_eq!(original[0].text, "unknown");
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered[0].is_bold && !recovered[1].is_bold);
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            original[0].text
+        );
+        let line = TextLine {
+            items: recovered,
+            y: 100.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(line.text(), "unknown");
+        assert_eq!(line.text_with_formatting(true, false, false), "**un**known");
+    }
+
+    #[test]
+    fn bold_numeric_fragments_keep_line_assembly_spacing() {
+        for (parts, gap, expected) in [
+            (
+                vec![("0", false), (".", true), ("86", false)],
+                1.2,
+                "0**.**86",
+            ),
+            (vec![("0.", true), ("86", false)], 1.2, "**0.**86"),
+            (vec![(".", true), ("42", false)], 1.2, "**.**42"),
+            (
+                vec![("12 ", false), (".", true), ("55", false)],
+                1.2,
+                "12 **.**55",
+            ),
+            (
+                vec![("12", false), (" .", true), ("55", false)],
+                1.2,
+                "12 **.**55",
+            ),
+            (vec![("1", false), ("23", true)], 1.2, "1**23**"),
+            (vec![("12", true), ("%", false)], 1.2, "**12**%"),
+            (vec![("+", true), ("12", false)], 1.2, "**+**12"),
+            (
+                vec![("1", false), (",", true), ("25", false)],
+                1.2,
+                "1**,**25",
+            ),
+            (vec![("Done.", true), ("2", false)], 1.2, "**Done.** 2"),
+            (vec![("0. ", true), ("86", false)], 1.2, "**0.** 86"),
+            (vec![("0.", true), ("86", false)], 4.8, "**0.** 86"),
+            (vec![("KEY ", true), ("Body", false)], 1.2, "**KEY** Body"),
+            (vec![("KEY", true), (" Body", false)], 1.2, "**KEY** Body"),
+        ] {
+            let mut x = 100.0;
+            let items = parts
+                .into_iter()
+                .map(|(text, bold)| {
+                    let width = text.len() as f32 * 6.0;
+                    let mut item = make_merge_item(text, x, width);
+                    item.is_bold = bold;
+                    x += width + gap;
+                    item
+                })
+                .collect();
+            let line = TextLine {
+                items: merge_text_items(items),
+                y: 100.0,
+                page: 1,
+                adaptive_threshold: 0.1,
+            };
+            assert_eq!(line.text_with_formatting(true, false, false), expected);
+            assert_eq!(line.text(), expected.replace("**", ""));
+        }
+    }
+
+    #[test]
+    fn non_bold_style_boundaries_keep_existing_spacing() {
+        for style in 0..3 {
+            let mut first = make_merge_item("KEY", 100.0, 24.0);
+            match style {
+                0 => first.is_italic = true,
+                1 => first.is_underline = true,
+                _ => first.is_strikeout = true,
+            }
+            let merged = merge_text_items(vec![first, make_merge_item("Body", 125.2, 24.0)]);
+            assert_eq!(merged.len(), 2);
+            assert_eq!(merged[0].text, "KEY");
+            assert_eq!(merged[1].text, "Body");
+        }
     }
 
     #[test]
