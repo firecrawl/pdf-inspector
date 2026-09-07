@@ -1195,6 +1195,8 @@ pub(crate) fn extract_page_text_items(
                                         page_num,
                                         font_cmaps,
                                         &ctm,
+                                        &fonts,
+                                        &xobjects,
                                         include_invisible,
                                         text_rendering_mode,
                                         text_rise,
