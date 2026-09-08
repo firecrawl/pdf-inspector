@@ -462,10 +462,57 @@ fn has_enclosing_double_quotes(lines: &[TextLine]) -> bool {
     let text = text.trim();
     [('“', '”'), ('"', '"')].iter().any(|&(open, close)| {
         text.strip_prefix(open)
-            .and_then(|body| body.strip_suffix(close))
+            .and_then(|body| body.split_once(close))
             // Two independently quoted titles are not one quoted paragraph.
-            .is_some_and(|body| !body.contains(open) && !body.contains(close))
+            .is_some_and(|(body, suffix)| !body.contains(open) && is_quote_suffix(suffix))
     })
+}
+
+fn is_quote_suffix(mut suffix: &str) -> bool {
+    loop {
+        suffix = suffix.trim_start();
+        let Some(first) = suffix.chars().next() else {
+            return true;
+        };
+        match first {
+            // Accept punctuation and recognizable footnote markers, never
+            // arbitrary prose or another quotation after the closing quote.
+            '.' | ',' | ';' | ':' | '!' | '?' | '…' | '*' | '†' | '‡' | '⁰' | '¹' | '²' | '³'
+            | '⁴' | '⁵' | '⁶' | '⁷' | '⁸' | '⁹' => {
+                suffix = &suffix[first.len_utf8()..];
+            }
+            '[' | '(' => {
+                let close = if first == '[' { ']' } else { ')' };
+                let Some((reference, rest)) = suffix[1..].split_once(close) else {
+                    return false;
+                };
+                if !is_numeric_quote_reference(reference, first == '[') {
+                    return false;
+                }
+                suffix = rest;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn is_numeric_quote_reference(mut reference: &str, allow_list: bool) -> bool {
+    loop {
+        reference = reference.trim_start();
+        let digits = reference.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        reference = reference[digits..].trim_start();
+        if reference.is_empty() {
+            return true;
+        }
+        let separator = reference.chars().next().unwrap();
+        if !allow_list || !matches!(separator, ',' | '-' | '–') {
+            return false;
+        }
+        reference = &reference[separator.len_utf8()..];
+    }
 }
 
 fn is_body_size_all_bold_line(line: &TextLine, base_size: f32) -> bool {
@@ -2231,6 +2278,98 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn quoted_prose_suffixes_preserve_text_and_style_in_both_renderers() {
+        for (open, close) in [('“', '”'), ('"', '"')] {
+            for suffix in [
+                ".",
+                ",",
+                ";",
+                ":",
+                "!",
+                "?",
+                "…",
+                " [1]",
+                " [1, 2]",
+                " [1–3]",
+                " [1-3, 5]",
+                " (1)",
+                "¹",
+                "¹²",
+                "*",
+                "†",
+                "‡",
+                ". [1]†",
+                " [1].",
+            ] {
+                let first = format!(
+                    "{open}Every member keeps a careful record of each decision and its supporting evidence"
+                );
+                let last = format!(
+                    "so that anyone can review the work and understand how the result was reached{close}{suffix}"
+                );
+                let lines = quoted_prose_fixture(&first, &last, 13.0, true);
+                let options = MarkdownOptions {
+                    base_font_size: Some(12.0),
+                    ..MarkdownOptions::default()
+                };
+                let outputs = [
+                    to_markdown_from_lines(lines.clone(), options.clone()),
+                    to_markdown_from_lines_with_tables_and_images(
+                        lines,
+                        options,
+                        HashMap::new(),
+                        HashMap::new(),
+                        &HashMap::new(),
+                        &HashSet::new(),
+                        None,
+                    ),
+                ];
+                for md in outputs {
+                    let paragraph = md
+                        .split("\n\n")
+                        .find(|p| p.contains("Every member"))
+                        .unwrap();
+                    assert!(paragraph.starts_with(&format!("***{open}Every")), "{md}");
+                    assert!(paragraph.ends_with(&format!("{close}{suffix}***")), "{md}");
+                    assert_eq!(paragraph.replace("***", ""), format!("{first} {last}"));
+                    assert!(!paragraph.lines().any(|line| line.starts_with('#')), "{md}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_prose_suffixes_reject_prose_and_malformed_references() {
+        for suffix in [
+            " and another statement follows",
+            " 2024",
+            " (use this carefully)",
+            " (Smith, 2024)",
+            " [note]",
+            " []",
+            " [1,]",
+            " [1-]",
+            " [1,,2]",
+            " [1",
+            " (1, 2)",
+            " (1",
+            " [1] followed by prose",
+            " “Another title”",
+            " \"Another title\"",
+        ] {
+            assert!(!is_quote_suffix(suffix), "{suffix}");
+            let first =
+                "“Every member keeps a careful record of each decision and its supporting evidence";
+            let last = format!(
+                "so that anyone can review the work and understand how the result was reached.”{suffix}"
+            );
+            let lines = quoted_prose_fixture(first, &last, 13.0, true);
+            let (_, quoted) = find_wrapped_bold_paragraph_lines(&lines, 12.0, 20.0);
+            assert!(quoted.is_empty(), "{suffix}");
         }
     }
 

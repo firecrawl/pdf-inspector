@@ -1132,7 +1132,7 @@ fn extract_form_xobject_text_inner(
 /// Get fonts from a Form XObject's Resources
 pub(crate) fn get_form_fonts<'a>(
     doc: &'a Document,
-    form_dict: &lopdf::Dictionary,
+    form_dict: &'a lopdf::Dictionary,
 ) -> std::collections::BTreeMap<Vec<u8>, &'a lopdf::Dictionary> {
     let mut fonts = std::collections::BTreeMap::new();
 
@@ -1168,10 +1168,13 @@ pub(crate) fn get_form_fonts<'a>(
 
     // Collect fonts
     for (name, value) in font_dict.iter() {
-        if let Ok(obj_ref) = value.as_reference() {
-            if let Ok(dict) = doc.get_dictionary(obj_ref) {
-                fonts.insert(name.clone(), dict);
-            }
+        let dict = match value {
+            Object::Reference(id) => doc.get_dictionary(*id).ok(),
+            Object::Dictionary(dict) => Some(dict),
+            _ => None,
+        };
+        if let Some(dict) = dict {
+            fonts.insert(name.clone(), dict);
         }
     }
 
@@ -1903,6 +1906,96 @@ BT 3 Tr /F1 12 Tf 0 1 -1 0 240 100 Tm [(ALSO) -3000 (HIDDEN)] TJ ET";
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "Alpha");
         assert!(!items[0].is_bold);
+    }
+
+    #[test]
+    fn inline_form_fonts_match_referenced_style_and_geometry() {
+        for (subtype, name, mode, text, bold, italic) in [
+            ("Type1", "Helvetica", 2, "Alpha", true, false),
+            ("Type1", "Helvetica-BoldOblique", 0, "Alpha", true, true),
+            ("Type1", "Wingdings", 2, "A", false, false),
+            ("Type3", "Shape", 2, "A", false, false),
+        ] {
+            let content = format!("0.3 w {mode} Tr BT /F1 12 Tf 72 700 Td ({text}) Tj ET");
+            let (mut referenced_doc, page_id) =
+                doc_with_page_and_forms(b"/X1 Do", &[content.as_bytes()]);
+            let glyph = referenced_doc.add_object(Stream::new(
+                dictionary! {},
+                b"600 0 0 0 600 700 d1 0 0 600 700 re f".to_vec(),
+            ));
+            let font = referenced_doc.get_dictionary_mut((1, 0)).unwrap();
+            font.set("Subtype", Object::Name(subtype.as_bytes().to_vec()));
+            font.set("BaseFont", Object::Name(name.as_bytes().to_vec()));
+            if subtype == "Type3" {
+                font.set(
+                    "FontMatrix",
+                    vec![
+                        0.001.into(),
+                        0.into(),
+                        0.into(),
+                        0.001.into(),
+                        0.into(),
+                        0.into(),
+                    ],
+                );
+                font.set("FontBBox", vec![0.into(), 0.into(), 600.into(), 700.into()]);
+                font.set("CharProcs", dictionary! { "A" => Object::Reference(glyph) });
+                font.set(
+                    "Encoding",
+                    dictionary! { "Differences" => vec![65.into(), Object::Name(b"A".to_vec())] },
+                );
+            }
+            let direct_font = font.clone();
+            let mut inline_doc = referenced_doc.clone();
+            inline_doc
+                .get_object_mut((2, 0))
+                .unwrap()
+                .as_stream_mut()
+                .unwrap()
+                .dict
+                .get_mut(b"Resources")
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .get_mut(b"Font")
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .set("F1", direct_font);
+            let (referenced_items, _) = extract_page(&referenced_doc, page_id, false);
+            let (inline_items, _) = extract_page(&inline_doc, page_id, false);
+            assert_eq!(referenced_items.len(), 1, "{name}");
+            assert_eq!(inline_items.len(), 1, "{name}");
+            let expected = &referenced_items[0];
+            let actual = &inline_items[0];
+            assert_eq!(actual.text, text, "{name}");
+            assert_eq!((actual.is_bold, actual.is_italic), (bold, italic), "{name}");
+            assert_eq!(
+                (
+                    &actual.font,
+                    actual.font_size,
+                    actual.width,
+                    actual.height,
+                    actual.x,
+                    actual.y,
+                    actual.is_bold,
+                    actual.is_italic,
+                    actual.advance_known
+                ),
+                (
+                    &expected.font,
+                    expected.font_size,
+                    expected.width,
+                    expected.height,
+                    expected.x,
+                    expected.y,
+                    expected.is_bold,
+                    expected.is_italic,
+                    expected.advance_known
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]
