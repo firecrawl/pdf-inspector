@@ -7,7 +7,9 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## [Unreleased]
+## [1.18.0] - 2026-09-07
+
+Changes since 1.17.0.
 
 ### Added
 
@@ -47,6 +49,15 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- Object-stream decompression is bounded during loading with lopdf 0.44,
+  preventing excessive memory use. Oversized streams are skipped, and
+  documents with no readable pages fail cleanly.
+- Embedded TrueType fonts recover bold styling from `head.macStyle` when
+  OS/2 metadata is unavailable, while explicit OS/2 styling remains
+  authoritative. Word spacing and numeric continuity survive bold boundaries.
+- PDFs with 19-byte classic cross-reference entries ending in a bare LF or
+  CR now load through a repair pass instead of failing with `invalid file
+  trailer`.
 - Raised and lowered marker glyphs no longer form their own line. Line
   grouping — the Markdown pipeline and `extract_text_in_regions`
   (`extractTextInRegions`) alike — compares baselines through `line_y()`, so
@@ -126,7 +137,7 @@ version and date. Earlier releases are described in their
   still not applied.
 - Rust: `TextItem` gained the required public field `baseline_shift`, so code
   that builds a `TextItem` with a struct literal must add it (`0.0` for normal
-  text). This follows the precedent of `font_tag` in 1.16.0; the Python and
+  text). This follows the precedent of `font_tag` in 1.17.0; the Python and
   Node bindings are unaffected.
 - Snapshot fixtures `thermo-freon12` and `shannon-entropy-p1-2` updated for
   the corrected script handling (`Freon<sup>®</sup>`, `V<sub>f</sub>`,
@@ -141,3 +152,16 @@ version and date. Earlier releases are described in their
   `extract_text_with_positions_and_rotations_mem` to
   `collect_text_in_region_in_frame`, or use `extract_text_in_regions_mem`,
   which handles both turns itself.
+
+### Included pull requests
+
+- [#452](https://github.com/firecrawl/pdf-inspector/pull/452): Faster cross-platform CI.
+- [#453](https://github.com/firecrawl/pdf-inspector/pull/453): Faster release publishing.
+- [#478](https://github.com/firecrawl/pdf-inspector/pull/478): Bounded object-stream decompression.
+- [#488](https://github.com/firecrawl/pdf-inspector/pull/488): Superscript/subscript handling and baseline metadata.
+- [#489](https://github.com/firecrawl/pdf-inspector/pull/489): Password-aware Python fixture tests.
+- [#490](https://github.com/firecrawl/pdf-inspector/pull/490): Python binding tests in CI.
+- [#487](https://github.com/firecrawl/pdf-inspector/pull/487): Positions and regions relative to the visible page box.
+- [#486](https://github.com/firecrawl/pdf-inspector/pull/486): Rotated-text bounds and rotation metadata.
+- [#507](https://github.com/firecrawl/pdf-inspector/pull/507): Embedded bold-font metadata recovery.
+- [#508](https://github.com/firecrawl/pdf-inspector/pull/508): Repair classic cross-reference tables with short entries.
