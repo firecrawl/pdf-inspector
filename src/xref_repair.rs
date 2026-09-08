@@ -31,32 +31,32 @@ use std::collections::HashSet;
 /// understands (cross-reference streams, hybrid `/XRefStm` files,
 /// mismatched section counts), or when the chain is implausibly long.
 pub(crate) fn rebuild_short_xref_entries(buf: &[u8]) -> Option<Vec<u8>> {
-    const MAX_CHAIN: usize = 64;
-    const MAX_ENTRIES: usize = 5_000_000;
-
-    let start = last_startxref_offset(buf)?;
-    let mut tables: Vec<ClassicXrefTable> = Vec::new();
-    let mut seen = HashSet::new();
-    let mut next = Some(start);
-    let mut saw_short = false;
-    let mut total_entries = 0usize;
-    while let Some(off) = next {
-        if tables.len() >= MAX_CHAIN || !seen.insert(off) {
-            return None;
+    // A `startxref` whose in-range offset lands on garbage (a corrupted
+    // pointer, a stray keyword in trailing junk) must not end the repair:
+    // try the next candidate further back. A pointer that lands on a real
+    // cross-reference structure we do not handle — an xref stream, a hybrid
+    // file — is different: it names the document's current revision, and
+    // rebuilding an older classic chain behind it would resurrect a stale
+    // revision. Stop there and leave the file to lopdf.
+    //
+    // The table and entry budgets are shared across every candidate, so a
+    // crafted tail cannot multiply the work by planting many pointers.
+    let mut budget = ChainBudget::default();
+    let mut parsed = None;
+    for start in startxref_candidates(buf) {
+        match parse_xref_chain(buf, start, &mut budget) {
+            ChainOutcome::Parsed(chain) => {
+                parsed = Some(chain);
+                break;
+            }
+            ChainOutcome::Unsupported => return None,
+            ChainOutcome::Garbage => continue,
         }
-        let table = parse_classic_xref_table(buf, off)?;
-        total_entries += table
-            .sections
-            .iter()
-            .map(|s| s.entries.len())
-            .sum::<usize>();
-        if total_entries > MAX_ENTRIES {
-            return None;
-        }
-        saw_short |= table.has_short_entries;
-        next = table.prev;
-        tables.push(table);
     }
+    let (tables, total_entries, saw_short) = parsed?;
+    // The first chain that parses is the document's answer: when it is
+    // already conforming there is nothing to repair, and an older pointer
+    // behind it (a previous incremental save) must not be resurrected.
     if !saw_short {
         return None;
     }
@@ -117,19 +117,19 @@ struct ClassicXrefTable {
     has_short_entries: bool,
 }
 
-/// Offset named by the `startxref` keyword that belongs to the document's
-/// final `%%EOF` marker.
+/// Offsets named by `startxref` keywords, newest first, starting from the
+/// one that belongs to the document's final `%%EOF` marker.
 ///
 /// The marker is located anywhere in the buffer (not just a fixed tail
 /// window, so a file with kilobytes of trailing data still resolves), and
-/// the keyword is searched backwards from it in one pass. The keyword must
-/// begin a line, optionally indented with spaces or tabs — that is what the
-/// file format requires and what keeps a `startxref` inside a `%` comment, a
-/// string or a longer token (`notstartxref`) from being taken for the
-/// pointer. A keyword whose offset is missing, unparsable or out of range is
-/// skipped and the scan continues backwards, so trailing malformed metadata
-/// never hides an earlier valid pointer.
-fn last_startxref_offset(buf: &[u8]) -> Option<usize> {
+/// keywords are yielded walking backwards from it in one pass. A keyword
+/// must begin a line, optionally indented with spaces or tabs — that is what
+/// the file format requires and what keeps a `startxref` inside a `%`
+/// comment, a string or a longer token (`notstartxref`) from being taken for
+/// a pointer. Keywords whose offset is missing, unparsable or out of range
+/// are skipped. Whether an offset actually leads to a parseable table is the
+/// caller's decision, so a bogus pointer never hides an earlier valid one.
+fn startxref_candidates(buf: &[u8]) -> impl Iterator<Item = usize> + '_ {
     const KEYWORD: &[u8] = b"startxref";
     const EOF: &[u8] = b"%%EOF";
     let search_end = buf
@@ -139,31 +139,95 @@ fn last_startxref_offset(buf: &[u8]) -> Option<usize> {
     // One backwards walk over the buffer: `at` only ever decreases, so the
     // cost is linear however many bogus keywords a hostile file plants.
     let mut at = search_end.saturating_sub(KEYWORD.len()) + 1;
-    while at > 0 {
-        at -= 1;
-        if !buf[at..].starts_with(KEYWORD) {
-            continue;
+    std::iter::from_fn(move || {
+        while at > 0 {
+            at -= 1;
+            if !buf[at..].starts_with(KEYWORD) {
+                continue;
+            }
+            let after = at + KEYWORD.len();
+            if !buf.get(after).is_some_and(u8::is_ascii_whitespace) || !starts_a_line(buf, at) {
+                continue;
+            }
+            let pos = skip_ws(buf, after);
+            let digits_end = skip_digits(buf, pos);
+            if digits_end == pos || digits_end > search_end {
+                continue;
+            }
+            let Some(offset) = std::str::from_utf8(&buf[pos..digits_end])
+                .ok()
+                .and_then(|d| d.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            if offset < buf.len() {
+                return Some(offset);
+            }
         }
-        let after = at + KEYWORD.len();
-        if !buf.get(after).is_some_and(u8::is_ascii_whitespace) || !starts_a_line(buf, at) {
-            continue;
-        }
-        let pos = skip_ws(buf, after);
-        let digits_end = skip_digits(buf, pos);
-        if digits_end == pos || digits_end > search_end {
-            continue;
-        }
-        let Some(offset) = std::str::from_utf8(&buf[pos..digits_end])
-            .ok()
-            .and_then(|d| d.parse::<usize>().ok())
-        else {
-            continue;
-        };
-        if offset < buf.len() {
-            return Some(offset);
+        None
+    })
+}
+/// Work budget shared by every chain a single repair attempts.
+struct ChainBudget {
+    tables: usize,
+    entries: usize,
+}
+
+impl Default for ChainBudget {
+    fn default() -> Self {
+        Self {
+            tables: 64,
+            entries: 5_000_000,
         }
     }
-    None
+}
+
+enum ChainOutcome {
+    /// Tables newest first, total entry count, whether any has 19-byte entries.
+    Parsed((Vec<ClassicXrefTable>, usize, bool)),
+    /// The pointer names a cross-reference structure this repair does not
+    /// handle (xref stream, hybrid file, a classic table it cannot fully
+    /// parse, or a chain over budget). The document's current revision lives
+    /// there, so no older pointer may be tried.
+    Unsupported,
+    /// The pointer lands on bytes that are no cross-reference structure at
+    /// all; an earlier pointer may still be valid.
+    Garbage,
+}
+
+/// Walks the `startxref` → `/Prev` chain from `start`.
+fn parse_xref_chain(buf: &[u8], start: usize, budget: &mut ChainBudget) -> ChainOutcome {
+    let mut tables: Vec<ClassicXrefTable> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut next = Some(start);
+    let mut saw_short = false;
+    let mut total_entries = 0usize;
+    while let Some(off) = next {
+        if budget.tables == 0 || !seen.insert(off) {
+            return ChainOutcome::Unsupported;
+        }
+        let table = match parse_classic_xref_table(buf, off) {
+            TableOutcome::Table(table) => table,
+            TableOutcome::Unsupported => return ChainOutcome::Unsupported,
+            // Garbage behind a /Prev is a broken chain, not a broken pointer.
+            TableOutcome::Garbage if tables.is_empty() => return ChainOutcome::Garbage,
+            TableOutcome::Garbage => return ChainOutcome::Unsupported,
+        };
+        // Only real tables draw on the budget: a pointer that lands on
+        // garbage is rejected in a few bytes and must not be able to starve
+        // the valid pointer behind it.
+        budget.tables -= 1;
+        let entries: usize = table.sections.iter().map(|s| s.entries.len()).sum();
+        if entries > budget.entries {
+            return ChainOutcome::Unsupported;
+        }
+        budget.entries -= entries;
+        total_entries += entries;
+        saw_short |= table.has_short_entries;
+        next = table.prev;
+        tables.push(table);
+    }
+    ChainOutcome::Parsed((tables, total_entries, saw_short))
 }
 
 /// Whether the token at `pos` is the first thing on its line, allowing
@@ -199,12 +263,48 @@ fn parse_uint<T: std::str::FromStr>(buf: &[u8], pos: usize) -> Option<(T, usize)
     Some((value, end))
 }
 
+enum TableOutcome {
+    Table(ClassicXrefTable),
+    Unsupported,
+    Garbage,
+}
+
 /// Parses one classic cross-reference table starting at `off` (the `xref`
 /// keyword), including its trailer dictionary. Accepts both conforming
 /// 20-byte entries and the 19-byte bare-LF/CR variants, and reports whether
-/// any of the latter were seen. `None` for anything it does not fully
-/// understand — a partial parse must never become a "repair".
-fn parse_classic_xref_table(buf: &[u8], off: usize) -> Option<ClassicXrefTable> {
+/// any of the latter were seen.
+///
+/// When the table cannot be fully parsed the outcome decides whether an
+/// earlier `startxref` may be tried, and the rule is deliberately
+/// conservative. Anything that could be a cross-reference structure — the
+/// `xref` keyword, or an indirect object header `N G obj` (where a
+/// cross-reference stream would live) — is `Unsupported`, even when it is
+/// malformed or turns out to be an ordinary object: a pointer that lands
+/// there may well name the document's current revision, and rebuilding an
+/// older chain behind it would silently load stale contents. Only bytes
+/// that are neither are `Garbage`. The cost of being wrong in this
+/// direction is a file that stays unrepaired, exactly as it is today; the
+/// cost in the other direction is wrong output.
+fn parse_classic_xref_table(buf: &[u8], off: usize) -> TableOutcome {
+    let Some(table) = parse_classic_xref_table_inner(buf, off) else {
+        let pos = skip_ws(buf, off);
+        return if buf[pos..].starts_with(b"xref") || is_indirect_object_header(buf, pos) {
+            TableOutcome::Unsupported
+        } else {
+            TableOutcome::Garbage
+        };
+    };
+    TableOutcome::Table(table)
+}
+
+/// Whether `pos` starts an indirect object header, `N G obj`.
+fn is_indirect_object_header(buf: &[u8], pos: usize) -> bool {
+    parse_uint::<u64>(buf, pos)
+        .and_then(|(_, p)| parse_uint::<u32>(buf, skip_ws(buf, p)))
+        .is_some_and(|(_, p)| buf[skip_ws(buf, p)..].starts_with(b"obj"))
+}
+
+fn parse_classic_xref_table_inner(buf: &[u8], off: usize) -> Option<ClassicXrefTable> {
     let mut pos = skip_ws(buf, off);
     if !buf[pos..].starts_with(b"xref") {
         return None;
@@ -562,53 +662,148 @@ mod tests {
     }
 
     #[test]
-    fn last_startxref_offset_anchors_on_the_final_eof() {
+    fn startxref_candidates_anchor_on_the_final_eof() {
         // A stray `startxref 999` after the final %%EOF (trailing junk, a
         // viewer note) must not win over the keyword paired with the marker.
         let buf = b"%PDF-1.4\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\nstartxref\n9\n%%EOF\n% note: startxref 999\n";
-        assert_eq!(last_startxref_offset(buf), Some(9));
+        assert_eq!(startxref_candidates(buf).next(), Some(9));
         // The keyword must be a standalone token.
         assert_eq!(
-            last_startxref_offset(b"%PDF-1.4\nnotstartxref\n9\n%%EOF\n"),
+            startxref_candidates(b"%PDF-1.4\nnotstartxref\n9\n%%EOF\n").next(),
             None
         );
         assert_eq!(
-            last_startxref_offset(b"%PDF-1.4\nstartxrefs\n9\n%%EOF\n"),
+            startxref_candidates(b"%PDF-1.4\nstartxrefs\n9\n%%EOF\n").next(),
             None
         );
         // A keyword followed by no digits before %%EOF is skipped, not misread.
         assert_eq!(
-            last_startxref_offset(b"%PDF-1.4\nstartxref\n7\nstartxref\n%%EOF\n"),
+            startxref_candidates(b"%PDF-1.4\nstartxref\n7\nstartxref\n%%EOF\n").next(),
             Some(7)
         );
         // Without any %%EOF the last standalone keyword still resolves.
-        assert_eq!(last_startxref_offset(b"%PDF-1.4\nstartxref\n5\n"), Some(5));
+        assert_eq!(
+            startxref_candidates(b"%PDF-1.4\nstartxref\n5\n").next(),
+            Some(5)
+        );
         // Leading spaces or tabs on the keyword's line are fine.
         assert_eq!(
-            last_startxref_offset(b"%PDF-1.4\n  \tstartxref\n8\n%%EOF\n"),
+            startxref_candidates(b"%PDF-1.4\n  \tstartxref\n8\n%%EOF\n").next(),
             Some(8)
         );
         // A `startxref` inside a comment line is not a pointer.
         assert_eq!(
-            last_startxref_offset(b"%PDF-1.4\nstartxref\n3\n% startxref\n999\n%%EOF\n"),
+            startxref_candidates(b"%PDF-1.4\nstartxref\n3\n% startxref\n999\n%%EOF\n").next(),
             Some(3)
         );
         // An unparsable or out-of-range offset is skipped, not fatal.
         assert_eq!(
-            last_startxref_offset(
+            startxref_candidates(
                 b"%PDF-1.4\nstartxref\n4\nstartxref\n99999999999999999999999\n%%EOF\n"
-            ),
+            )
+            .next(),
             Some(4)
         );
         assert_eq!(
-            last_startxref_offset(b"%PDF-1.4\nstartxref\n4\nstartxref\n500000\n%%EOF\n"),
+            startxref_candidates(b"%PDF-1.4\nstartxref\n4\nstartxref\n500000\n%%EOF\n").next(),
             Some(4)
         );
         // The final %%EOF is found beyond any fixed tail window.
         let mut long_tail = b"%PDF-1.4\nstartxref\n6\n%%EOF\n".to_vec();
         long_tail.extend(std::iter::repeat_n(b'x', 5000));
         long_tail.extend_from_slice(b"\nstartxref\n999\n");
-        assert_eq!(last_startxref_offset(&long_tail), Some(6));
+        assert_eq!(startxref_candidates(&long_tail).next(), Some(6));
+    }
+
+    #[test]
+    fn startxref_candidates_yield_earlier_pointers_after_a_bogus_one() {
+        let buf = b"%PDF-1.4\nstartxref\n3\nstartxref\n12\n%%EOF\n";
+        assert_eq!(startxref_candidates(buf).collect::<Vec<_>>(), vec![12, 3]);
+    }
+
+    #[test]
+    fn short_xref_entries_load_when_the_last_startxref_points_at_garbage() {
+        // An incremental save gone wrong: a trailing `startxref` whose
+        // in-range offset lands in the middle of an object. The repair must
+        // fall back to the earlier, valid pointer rather than give up.
+        let mut doc = synthetic_pdf_with_xref_terminator("\n", false);
+        doc.extend_from_slice(b"startxref\n20\n%%EOF\n");
+        let repaired = rebuild_short_xref_entries(&doc).expect("earlier pointer should be used");
+        assert!(repaired.starts_with(&doc));
+        let (_, pages) = load_document_from_mem(&doc).expect("loads through the repair path");
+        assert_eq!(pages, 1);
+    }
+
+    #[test]
+    fn rebuild_stops_when_the_newest_pointer_is_an_xref_stream() {
+        // Newest revision uses a cross-reference stream this repair does not
+        // handle; the older classic chain behind it must NOT be rebuilt, or
+        // lopdf would load the stale revision.
+        let mut doc = synthetic_pdf_with_xref_terminator("\n", false);
+        let stream_obj = doc.len();
+        doc.extend_from_slice(
+            b"5 0 obj\n<< /Type /XRef /Size 6 /W [1 2 1] /Root 1 0 R >>\nstream\nendstream\nendobj\n",
+        );
+        doc.extend_from_slice(format!("startxref\n{stream_obj}\n%%EOF\n").as_bytes());
+        assert!(rebuild_short_xref_entries(&doc).is_none());
+    }
+
+    #[test]
+    fn rebuild_stops_when_the_newest_table_is_a_hybrid_file() {
+        let mut doc = synthetic_pdf_with_xref_terminator("\n", false);
+        let table = doc.len();
+        doc.extend_from_slice(
+            b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 6 /Root 1 0 R /XRefStm 99 >>\n",
+        );
+        doc.extend_from_slice(format!("startxref\n{table}\n%%EOF\n").as_bytes());
+        assert!(rebuild_short_xref_entries(&doc).is_none());
+    }
+
+    #[test]
+    fn bogus_pointers_do_not_starve_the_valid_one() {
+        // 100 in-range `startxref` pointers into unrelated bytes, then the
+        // real short-entry table further back: the repair must still happen.
+        let mut doc = synthetic_pdf_with_xref_terminator("\n", false);
+        for _ in 0..100 {
+            doc.extend_from_slice(b"startxref\n20\n");
+        }
+        doc.extend_from_slice(b"%%EOF\n");
+        assert!(rebuild_short_xref_entries(&doc).is_some());
+        let (_, pages) = load_document_from_mem(&doc).expect("loads through the repair path");
+        assert_eq!(pages, 1);
+    }
+
+    #[test]
+    fn a_pointer_at_an_object_header_stops_the_search() {
+        // Conservative by design: a pointer landing on `N G obj` might be a
+        // malformed xref stream naming the current revision, so the older
+        // short-entry chain behind it is left alone (see
+        // `parse_classic_xref_table`).
+        let mut doc = synthetic_pdf_with_xref_terminator("\n", false);
+        let catalog = doc.windows(7).position(|w| w == b"1 0 obj").unwrap();
+        doc.extend_from_slice(format!("startxref\n{catalog}\n%%EOF\n").as_bytes());
+        assert!(rebuild_short_xref_entries(&doc).is_none());
+    }
+
+    #[test]
+    fn a_pointer_at_the_xref_keyword_stops_the_search() {
+        // Same conservative rule for the `xref` keyword, malformed or not.
+        let mut doc = synthetic_pdf_with_xref_terminator("\n", false);
+        let junk = doc.len();
+        doc.extend_from_slice(b"xref\nnot a table\n");
+        doc.extend_from_slice(format!("startxref\n{junk}\n%%EOF\n").as_bytes());
+        assert!(rebuild_short_xref_entries(&doc).is_none());
+    }
+
+    #[test]
+    fn a_pointer_into_plain_junk_falls_back_to_the_earlier_pointer() {
+        let mut doc = synthetic_pdf_with_xref_terminator("\n", false);
+        let junk = doc.len();
+        doc.extend_from_slice(b"% viewer note\n");
+        doc.extend_from_slice(format!("startxref\n{junk}\n%%EOF\n").as_bytes());
+        assert!(rebuild_short_xref_entries(&doc).is_some());
+        let (_, pages) = load_document_from_mem(&doc).expect("loads through the repair path");
+        assert_eq!(pages, 1);
     }
 
     #[test]
