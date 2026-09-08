@@ -409,8 +409,9 @@ fn find_wrapped_bold_paragraph_lines(
     lines: &[TextLine],
     base_size: f32,
     para_threshold: f32,
-) -> HashSet<usize> {
+) -> (HashSet<usize>, HashSet<usize>) {
     let mut set = HashSet::new();
+    let mut quoted = HashSet::new();
     let mut i = 0usize;
 
     while i < lines.len() {
@@ -432,16 +433,39 @@ fn find_wrapped_bold_paragraph_lines(
         }
 
         let line_count = end - start + 1;
-        if line_count >= 3 && word_count > 20 {
+        // A long enclosed quotation is prose even when it wraps to only two
+        // lines. Keep its indices separate so only this case also vetoes
+        // font-tier promotion; the existing unquoted paragraph policy stays.
+        let quoted_prose =
+            line_count >= 2 && word_count > 20 && has_enclosing_double_quotes(&lines[start..=end]);
+        if (line_count >= 3 && word_count > 20) || quoted_prose {
             for idx in start..=end {
                 set.insert(idx);
+                if quoted_prose {
+                    quoted.insert(idx);
+                }
             }
         }
 
         i = end + 1;
     }
 
-    set
+    (set, quoted)
+}
+
+fn has_enclosing_double_quotes(lines: &[TextLine]) -> bool {
+    let text = lines
+        .iter()
+        .map(TextLine::text)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = text.trim();
+    [('“', '”'), ('"', '"')].iter().any(|&(open, close)| {
+        text.strip_prefix(open)
+            .and_then(|body| body.strip_suffix(close))
+            // Two independently quoted titles are not one quoted paragraph.
+            .is_some_and(|body| !body.contains(open) && !body.contains(close))
+    })
 }
 
 fn is_body_size_all_bold_line(line: &TextLine, base_size: f32) -> bool {
@@ -730,7 +754,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // between paragraphs at body font size. Inspired by opendataloader's
     // lookahead in HeadingProcessor (prevNode/nextNode context).
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
-    let wrapped_bold_paragraph_lines =
+    let (wrapped_bold_paragraph_lines, wrapped_quoted_paragraph_lines) =
         find_wrapped_bold_paragraph_lines(&lines, base_size, para_threshold);
 
     let mut sequence_excluded_lines = wrapped_bold_paragraph_lines.clone();
@@ -1033,6 +1057,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             .is_some_and(StructRole::is_non_heading_content);
         let heuristic_heading = if options.detect_headers
             && !non_heading_role
+            && !wrapped_quoted_paragraph_lines.contains(&line_idx)
             && !is_code_line
             && !looks_like_list_continuation
             && plain_trimmed.len() > 3
@@ -1302,7 +1327,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
 
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
-    let wrapped_bold_paragraph_lines =
+    let (wrapped_bold_paragraph_lines, wrapped_quoted_paragraph_lines) =
         find_wrapped_bold_paragraph_lines(&lines, base_size, para_threshold);
     let sequence_heading_levels = classify_heading_sequences(
         &lines,
@@ -1397,6 +1422,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // Detect headers by font size
         // Skip very short text (drop caps/labels) and very long text (body paragraphs)
         if options.detect_headers
+            && !wrapped_quoted_paragraph_lines.contains(&line_idx)
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
             && !is_toc_entry_line(plain_trimmed)
@@ -2124,6 +2150,142 @@ mod tests {
             md.contains("technique.**\n\nA photon is a single excitation"),
             "body paragraph should be separated from bold abstract: {md}"
         );
+    }
+
+    fn quoted_prose_fixture(first: &str, last: &str, size: f32, italic: bool) -> Vec<TextLine> {
+        let mut lines: Vec<_> = (0..10)
+            .map(|i| {
+                line_at(
+                    "Regular paragraph text provides the surrounding document context.",
+                    1,
+                    740.0 - i as f32 * 14.0,
+                )
+            })
+            .collect();
+        for (index, text) in [first, last].iter().enumerate() {
+            let mut item = make_item(text, 1, Some(index as i64));
+            item.y = 540.0 - index as f32 * 14.0;
+            item.font_size = size;
+            item.is_bold = true;
+            item.is_italic = italic;
+            lines.push(make_line(vec![item]));
+        }
+        lines.push(line_at(
+            "Ordinary body text follows the quotation.",
+            1,
+            480.0,
+        ));
+        lines
+    }
+
+    #[test]
+    fn quoted_bold_prose_stays_one_formatted_paragraph_in_both_renderers() {
+        let first =
+            "Every member keeps a careful record of each decision and its supporting evidence";
+        let last = "so that anyone can review the work and understand how the result was reached.";
+        for (open, close) in [('“', '”'), ('"', '"')] {
+            for size in [12.0, 13.0] {
+                for italic in [false, true] {
+                    let first = format!("{open}{first}");
+                    let last = format!("{last}{close}");
+                    let lines = quoted_prose_fixture(&first, &last, size, italic);
+                    let options = MarkdownOptions {
+                        base_font_size: Some(12.0),
+                        ..MarkdownOptions::default()
+                    };
+                    let outputs = [
+                        to_markdown_from_lines(lines.clone(), options.clone()),
+                        to_markdown_from_lines_with_tables_and_images(
+                            lines,
+                            options,
+                            HashMap::new(),
+                            HashMap::new(),
+                            &HashMap::new(),
+                            &HashSet::new(),
+                            None,
+                        ),
+                    ];
+                    for md in outputs {
+                        let paragraph = md
+                            .split("\n\n")
+                            .find(|p| p.contains("Every member"))
+                            .unwrap();
+                        let markers = if italic { "***" } else { "**" };
+                        assert!(
+                            paragraph.starts_with(&format!("{markers}{open}Every")),
+                            "{md}"
+                        );
+                        assert!(
+                            paragraph.ends_with(&format!("reached.{close}{markers}")),
+                            "{md}"
+                        );
+                        assert_eq!(
+                            paragraph
+                                .replace('*', "")
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            format!("{first} {last}")
+                        );
+                        assert!(!paragraph.lines().any(|line| line.starts_with('#')), "{md}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_prose_guard_keeps_quote_and_heading_boundaries() {
+        let first =
+            "“Every member keeps a careful record of each decision and its supporting evidence";
+        let last = "so that anyone can review the work and understand how the result was reached.”";
+        for (left, right, size) in [
+            ("“Collected Notes", "and Practical Examples”", 13.0),
+            (first, last, 16.0),
+            (first, "so that anyone can review the work and understand how the result was reached.", 13.0),
+            (first, "so that anyone can review the work and understand how the result was reached.\"", 13.0),
+            ("“Every Member Keeps a Careful Record of Each Decision and Its Supporting Evidence”", "“Readers Can Review the Work and Understand How the Final Result Was Reached”", 13.0),
+        ] {
+            let lines = quoted_prose_fixture(left, right, size, true);
+            let (_, quoted) = find_wrapped_bold_paragraph_lines(&lines, 12.0, 20.0);
+            assert!(quoted.is_empty(), "{left} / {right}");
+        }
+
+        let options = MarkdownOptions {
+            base_font_size: Some(12.0),
+            ..MarkdownOptions::default()
+        };
+        for lines in [
+            quoted_prose_fixture("“Collected Notes", "and Practical Examples”", 13.0, false),
+            quoted_prose_fixture(first, last, 16.0, true),
+        ] {
+            let md = to_markdown_from_lines_with_tables_and_images(
+                lines,
+                options.clone(),
+                HashMap::new(),
+                HashMap::new(),
+                &HashMap::new(),
+                &HashSet::new(),
+                None,
+            );
+            assert!(
+                md.lines()
+                    .any(|line| line.starts_with('#') && line.contains('“')),
+                "{md}"
+            );
+        }
+        let roles = HashMap::from([(1, HashMap::from([(0, StructRole::H2), (1, StructRole::H2)]))]);
+        let md = to_markdown_from_lines_with_tables_and_images(
+            quoted_prose_fixture(first, last, 13.0, true),
+            options,
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(&roles),
+        );
+        assert!(md.contains("## “Every member"), "{md}");
+        assert!(md.contains("## so that anyone"), "{md}");
     }
 
     #[test]

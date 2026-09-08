@@ -1,6 +1,7 @@
 //! Form XObject and image XObject extraction.
 
 use super::fonts::descriptor_style_flags;
+use super::text_paint::{PaintResources, TextPaint};
 use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_italic_font};
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, TextItem};
@@ -243,6 +244,7 @@ pub(crate) fn extract_form_xobject_text(
     include_invisible: bool,
     inherited_render_mode: i32,
     inherited_text_rise: f32,
+    inherited_text_paint: TextPaint,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
@@ -256,6 +258,7 @@ pub(crate) fn extract_form_xobject_text(
         include_invisible,
         inherited_render_mode,
         inherited_text_rise,
+        inherited_text_paint,
         cmap_decisions,
         style_cache,
         0,
@@ -273,6 +276,7 @@ fn extract_form_xobject_text_inner(
     include_invisible: bool,
     inherited_render_mode: i32,
     inherited_text_rise: f32,
+    inherited_text_paint: TextPaint,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
@@ -311,6 +315,21 @@ fn extract_form_xobject_text_inner(
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict);
+    let paint_resources = PaintResources::form(doc, &stream.dict);
+    // Unknown font resources may be Type3; infer stroke weight only for
+    // positively resolved ordinary text fonts.
+    let paintable_fonts: std::collections::HashSet<String> = form_fonts
+        .iter()
+        .filter(|(_, font)| {
+            font.get(b"Subtype")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .is_some_and(|subtype| {
+                    matches!(subtype, b"Type0" | b"Type1" | b"MMType1" | b"TrueType")
+                })
+        })
+        .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+        .collect();
     let (font_encodings, _has_gid_fonts) = build_font_encodings(doc, &form_fonts, font_cmaps);
 
     // Build font width info for the form
@@ -408,6 +427,7 @@ fn extract_form_xobject_text_inner(
     // left it in: `3 Tr` set on the page or in an outer form hides the text
     // drawn here too.
     let mut text_rendering_mode: i32 = inherited_render_mode;
+    let mut text_paint = inherited_text_paint;
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
@@ -421,6 +441,7 @@ fn extract_form_xobject_text_inner(
         word_spacing: f32,
         text_rise: f32,
         text_rendering_mode: i32,
+        text_paint: TextPaint,
         text_leading: f32,
         current_font: String,
         current_font_size: f32,
@@ -432,6 +453,7 @@ fn extract_form_xobject_text_inner(
         if !budget.charge_operation() {
             break;
         }
+        text_paint.observe(&op.operator, &op.operands, &paint_resources);
         match op.operator.as_str() {
             "q" => {
                 ctm_stack.push(GraphicsState {
@@ -440,6 +462,7 @@ fn extract_form_xobject_text_inner(
                     word_spacing,
                     text_rise,
                     text_rendering_mode,
+                    text_paint,
                     text_leading,
                     current_font: current_font.clone(),
                     current_font_size,
@@ -453,6 +476,7 @@ fn extract_form_xobject_text_inner(
                     word_spacing = saved.word_spacing;
                     text_rise = saved.text_rise;
                     text_rendering_mode = saved.text_rendering_mode;
+                    text_paint = saved.text_paint;
                     text_leading = saved.text_leading;
                     current_font = saved.current_font;
                     current_font_size = saved.current_font_size;
@@ -484,6 +508,7 @@ fn extract_form_xobject_text_inner(
                                         include_invisible,
                                         text_rendering_mode,
                                         text_rise,
+                                        text_paint,
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
@@ -793,7 +818,15 @@ fn extract_form_xobject_text_inner(
                                 font_tag: current_font.clone(),
                                 font_size: rendered_size,
                                 page: page_num,
-                                is_bold: is_bold_font(base_font) || desc_bold,
+                                is_bold: is_bold_font(base_font)
+                                    || desc_bold
+                                    || (paintable_fonts.contains(&current_font)
+                                        && text_paint.adds_bold(
+                                            &text,
+                                            rendered_size,
+                                            base_font,
+                                            &ctm,
+                                        )),
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
@@ -1062,7 +1095,15 @@ fn extract_form_xobject_text_inner(
                                     font_tag: current_font.clone(),
                                     font_size: rendered_size,
                                     page: page_num,
-                                    is_bold: is_bold_font(base_font) || desc_bold,
+                                    is_bold: is_bold_font(base_font)
+                                        || desc_bold
+                                        || (paintable_fonts.contains(&current_font)
+                                            && text_paint.adds_bold(
+                                                text,
+                                                rendered_size,
+                                                base_font,
+                                                &ctm,
+                                            )),
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
@@ -1232,6 +1273,7 @@ mod tests {
             false,
             0,
             0.0,
+            TextPaint::default(),
             &mut CMapDecisionCache::new(),
             &mut FontStyleCache::new(),
             budget,
@@ -1715,6 +1757,152 @@ BT 3 Tr /F1 12 Tf 0 1 -1 0 240 100 Tm [(ALSO) -3000 (HIDDEN)] TJ ET";
         let (items, _) = extract_page(&doc, page_id, true);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "Hidden");
+    }
+
+    #[test]
+    fn form_inherits_fill_stroke_weight_and_restores_it() {
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"0.3 w 2 Tr BT ET /X1 Do 0 Tr /X2 Do",
+            &[
+                b"BT /F1 12 Tf 72 700 Td (Lead) Tj ET q 0 Tr BT /F1 12 Tf 72 680 Td (Plain) Tj ET Q BT /F1 12 Tf 72 660 Td (Restored) Tj ET",
+                b"BT /F1 12 Tf 72 640 Td (Body) Tj ET",
+            ],
+        );
+        let (items, _) = extract_page(&doc, page_id, false);
+        let styles: Vec<_> = items.iter().map(|i| (i.text.as_str(), i.is_bold)).collect();
+        assert_eq!(
+            styles,
+            [
+                ("Lead", true),
+                ("Plain", false),
+                ("Restored", true),
+                ("Body", false)
+            ]
+        );
+    }
+
+    #[test]
+    fn form_graphics_states_are_scoped_and_restored() {
+        let (mut doc, page_id) = doc_with_page_and_forms(
+            b"/State gs 0.3 w 2 Tr /X1 Do /X2 Do",
+            &[
+                b"/State gs BT /F1 12 Tf 72 700 Td (Plain) Tj ET",
+                b"/State gs BT /F1 12 Tf 72 680 Td (Lead) Tj ET
+                  q /Missing gs BT /F1 12 Tf 72 660 Td (Unknown) Tj ET Q
+                  BT /F1 12 Tf 72 640 Td (Restored) Tj ET",
+            ],
+        );
+        doc.get_dictionary_mut(page_id)
+            .unwrap()
+            .get_mut(b"Resources")
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "ExtGState",
+                dictionary! { "State" => dictionary! { "SM" => 0.02 } },
+            );
+        for (id, state) in [
+            ((2, 0), dictionary! { "ca" => 0.5 }),
+            ((3, 0), dictionary! { "OPM" => 1 }),
+        ] {
+            doc.get_object_mut(id)
+                .unwrap()
+                .as_stream_mut()
+                .unwrap()
+                .dict
+                .get_mut(b"Resources")
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .set("ExtGState", dictionary! { "State" => state });
+        }
+        let (items, _) = extract_page(&doc, page_id, false);
+        let styles: Vec<_> = items.iter().map(|i| (i.text.as_str(), i.is_bold)).collect();
+        assert_eq!(
+            styles,
+            [
+                ("Plain", false),
+                ("Lead", true),
+                ("Unknown", false),
+                ("Restored", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_form_resolves_indirect_paint_resources_without_leaking_state() {
+        let (mut doc, page_id) = doc_with_page_and_forms(
+            b"0.3 w 2 Tr /X1 Do",
+            &[
+                b"/Tone cs 0.2 0.3 0.4 sc /Tone CS 0.2 0.3 0.4 SC /State gs
+                  BT /F1 12 Tf 72 700 Td (Outer) Tj ET /X2 Do
+                  0.2 0.3 0.4 rg BT /F1 12 Tf 72 660 Td (Restored) Tj ET",
+                b"/Tone cs 0 sc /Tone CS 0 SC /State gs
+                  BT /F1 12 Tf 72 680 Td (Inner) Tj ET",
+            ],
+        );
+        for (id, color_space, state) in [
+            ((2, 0), "DeviceRGB", dictionary! { "SM" => 0.02 }),
+            ((3, 0), "DeviceGray", dictionary! { "OPM" => 1 }),
+        ] {
+            let mut resources = doc
+                .get_object(id)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .dict
+                .get(b"Resources")
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .clone();
+            let space_id = doc.add_object(Object::Name(color_space.as_bytes().to_vec()));
+            let state_id = doc.add_object(state);
+            let spaces_id = doc.add_object(dictionary! { "Tone" => Object::Reference(space_id) });
+            let states_id = doc.add_object(dictionary! { "State" => Object::Reference(state_id) });
+            resources.set("ColorSpace", Object::Reference(spaces_id));
+            resources.set("ExtGState", Object::Reference(states_id));
+            let resources_id = doc.add_object(resources);
+            doc.get_object_mut(id)
+                .unwrap()
+                .as_stream_mut()
+                .unwrap()
+                .dict
+                .set("Resources", Object::Reference(resources_id));
+        }
+        let (items, _) = extract_page(&doc, page_id, false);
+        assert_eq!(
+            items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+            ["Outer", "Inner", "Restored"]
+        );
+        assert!(items.iter().all(|i| i.is_bold));
+    }
+
+    #[test]
+    fn form_fill_stroke_covers_all_show_operators() {
+        for show in [
+            "(Styled) Tj",
+            "[(Sty) (led)] TJ",
+            "(Styled) '",
+            "0 0 (Styled) \"",
+        ] {
+            let content = format!("BT /F1 12 Tf 72 700 Td {show} ET");
+            let (doc, page_id) =
+                doc_with_page_and_forms(b"0.3 w 2 Tr /X1 Do", &[content.as_bytes()]);
+            let (items, _) = extract_page(&doc, page_id, false);
+            assert_eq!(items.len(), 1, "{show}: {items:?}");
+            assert_eq!(items[0].text, "Styled");
+            assert!(items[0].is_bold, "{show}: {items:?}");
+        }
+    }
+
+    #[test]
+    fn unresolved_form_font_does_not_gain_painted_bold() {
+        let items = form_items(b"0.3 w 2 Tr BT /Missing 12 Tf 72 700 Td (Alpha) Tj ET");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "Alpha");
+        assert!(!items[0].is_bold);
     }
 
     #[test]
