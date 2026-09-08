@@ -338,6 +338,121 @@ fn actual_text_unions_painted_bounds_when_horizontal_scales_change_sign() {
 }
 
 #[test]
+fn actual_text_unions_painted_bounds_when_font_sizes_change_sign() {
+    for (font, advance) in [("F1", 14.4), ("F2", 12.0)] {
+        for (shows, x, y, width, height) in [
+            (
+                format!("(AB) Tj /{font} -12 Tf (CD) Tj"),
+                100.0,
+                288.0,
+                advance,
+                24.0,
+            ),
+            (
+                format!("[(AB) -100 (CD)] TJ /{font} -12 Tf [(EFGH)] TJ"),
+                100.0,
+                288.0,
+                advance * 2.0 + 1.2,
+                24.0,
+            ),
+            (
+                format!("(AB) Tj /{font} -12 Tf 20 TL (CD) '"),
+                100.0 - advance,
+                268.0,
+                advance * 2.0,
+                44.0,
+            ),
+            (
+                format!("(AB) Tj q /{font} -12 Tf (CD) Tj Q (EF) Tj"),
+                100.0,
+                288.0,
+                advance,
+                24.0,
+            ),
+            // With a negative Tz, flipping Tf also reverses the advance.
+            (
+                format!("-100 Tz (AB) Tj /{font} -12 Tf (CD) Tj"),
+                100.0 - advance,
+                288.0,
+                advance,
+                24.0,
+            ),
+            // Flipping both signs preserves advance direction, but reverses
+            // glyph-up: the existing vertical bounds union must survive.
+            (
+                format!("(AB) Tj /{font} -12 Tf -100 Tz (CD) Tj"),
+                100.0,
+                288.0,
+                advance * 2.0,
+                24.0,
+            ),
+        ] {
+            let extracted = items(&pdf(
+                &format!("BT /{font} 12 Tf 100 Tz 1 0 0 1 100 300 Tm /Span << /ActualText (REPLACEMENT) >> BDC {shows} EMC ET"),
+                0,
+                "",
+                false,
+            ));
+            let text = find(&extracted, "REPLACEMENT");
+            close(text.x, x);
+            close(text.y, y);
+            close(text.width, width);
+            close(text.height, height);
+            assert_eq!(text.advance_known, font == "F1");
+        }
+    }
+}
+
+#[test]
+fn actual_text_zero_scale_does_not_vote_for_a_reflection() {
+    for (font, advance) in [("F1", 14.4), ("F2", 12.0)] {
+        for zero_scale in ["0", "-0.0"] {
+            let extracted = items(&pdf(
+                &format!("BT /{font} 12 Tf 100 Tz 1 0 0 1 100 300 Tm /Span << /ActualText (REPLACEMENT) >> BDC
+                    (AB) Tj q /{font} -12 Tf {zero_scale} Tz (CD) Tj Q (EF) Tj EMC ET"),
+                0,
+                "",
+                false,
+            ));
+            let text = find(&extracted, "REPLACEMENT");
+            close(text.x, 100.0);
+            close(text.y, 300.0);
+            close(text.width, advance * 2.0);
+            close(text.height, 12.0);
+            assert_eq!(text.advance_known, font == "F1");
+        }
+    }
+}
+
+#[test]
+fn actual_text_zero_scale_strokes_keep_their_vertical_reflection() {
+    for (font, advance) in [("F1", 14.4), ("F2", 12.0)] {
+        for zero_scale in ["0", "-0.0"] {
+            for render_mode in [1, 2, 5, 6] {
+                for show in ["(CD) Tj", "[(CD)] TJ", "20 TL (CD) '"] {
+                    let extracted = items(&pdf(
+                        &format!("BT /{font} 12 Tf 100 Tz 1 0 0 1 100 300 Tm /Span << /ActualText (REPLACEMENT) >> BDC
+                            (AB) Tj q /{font} -12 Tf {zero_scale} Tz {render_mode} Tr 2 w {show} Q (EF) Tj EMC ET"),
+                        0,
+                        "",
+                        false,
+                    ));
+                    let text = find(&extracted, "REPLACEMENT");
+                    let next_line = show.contains('\'');
+                    close(text.x, 100.0);
+                    close(text.y, if next_line { 268.0 } else { 288.0 });
+                    // Quote resets the cursor to the next line's start;
+                    // the other operators leave it after AB.
+                    close(text.width, if next_line { advance } else { advance * 2.0 });
+                    close(text.height, if next_line { 44.0 } else { 24.0 });
+                    assert_eq!(text.advance_known, font == "F1");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn reflected_vertical_runs_choose_the_same_page_frame_inside_forms() {
     for scale in [-100, 100] {
         for font_size in [-12, 12] {

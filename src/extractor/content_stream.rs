@@ -157,23 +157,47 @@ pub(crate) fn estimated_string_advance_ts(
         + spaces as f32 * word_spacing
 }
 
-/// A reflected `Tz` inside ActualText can walk the cursor back over text
-/// already painted. Keep those run bounds so their advances cannot cancel
-/// the replacement item's footprint. Constant-direction spans retain the
-/// existing displacement-based geometry.
+/// Reflections from `Tf` or `Tz` inside ActualText can walk the cursor back
+/// over painted text or flip its glyph-up axis. Keep those run bounds so
+/// cancelled advances cannot hide the replacement item's footprint. Spans
+/// without reflection changes retain the existing displacement geometry.
 #[derive(Default)]
 struct ActualTextBounds {
-    first_scale: Option<f32>,
-    changed_direction: bool,
+    first_advance_reflection: Option<bool>,
+    first_up_reflection: Option<bool>,
+    changed_reflection: bool,
     bounds: Option<[f32; 4]>,
 }
 
 impl ActualTextBounds {
-    fn include(&mut self, geometry: RunGeometry, scale: f32) {
-        if let Some(first) = self.first_scale {
-            self.changed_direction |= first.is_sign_negative() != scale.is_sign_negative();
+    fn reflection_changed(first: &mut Option<bool>, reflection: bool) -> bool {
+        if let Some(first) = first {
+            *first != reflection
         } else {
-            self.first_scale = Some(scale);
+            *first = Some(reflection);
+            false
+        }
+    }
+
+    fn include(&mut self, geometry: RunGeometry, scale: f32, font_size: f32, render_mode: i32) {
+        // Tf reflects both axes; Tz reflects only the advance axis. Track
+        // both: flipping Tf and Tz together still flips glyph-up. A zero
+        // scale has no advance direction. Its collapsed outline has no
+        // fill area, but stroking it can still paint along the glyph-up axis.
+        if scale == 0.0 && !matches!(render_mode, 1 | 2 | 5 | 6) {
+            return;
+        }
+        if font_size != 0.0 {
+            if scale != 0.0 {
+                self.changed_reflection |= Self::reflection_changed(
+                    &mut self.first_advance_reflection,
+                    font_size.is_sign_negative() ^ scale.is_sign_negative(),
+                );
+            }
+            self.changed_reflection |= Self::reflection_changed(
+                &mut self.first_up_reflection,
+                font_size.is_sign_negative(),
+            );
         }
         let run = [
             geometry.x,
@@ -193,7 +217,7 @@ impl ActualTextBounds {
     }
 
     fn apply_to(&self, geometry: &mut RunGeometry) {
-        if self.changed_direction {
+        if self.changed_reflection {
             if let Some([x1, y1, x2, y2]) = self.bounds {
                 geometry.x = x1;
                 geometry.y = y1;
@@ -649,6 +673,8 @@ pub(crate) fn extract_page_text_items(
                                     horizontal_scale,
                                 ),
                                 horizontal_scale,
+                                current_font_size,
+                                text_rendering_mode,
                             );
                         }
                         let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
@@ -959,6 +985,8 @@ pub(crate) fn extract_page_text_items(
                                             horizontal_scale,
                                         ),
                                         horizontal_scale,
+                                        current_font_size,
+                                        text_rendering_mode,
                                     );
                                 }
                             }
@@ -1186,6 +1214,8 @@ pub(crate) fn extract_page_text_items(
                             horizontal_scale,
                         ),
                         horizontal_scale,
+                        current_font_size,
+                        text_rendering_mode,
                     );
                 }
                 if text_rendering_mode == 3
