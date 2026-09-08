@@ -350,7 +350,6 @@ fn classify_indirect_object_header(buf: &[u8], pos: usize) -> HeaderScan {
     // token of the wrong kind is a definite "no".
     let over_slack_digits =
         |p: usize| skip_digits(&buf[..buf.len().min(p + slack + 1)], p) - p > slack;
-    let over_slack_ws = |p: usize| skip_ws(&buf[..buf.len().min(p + slack + 1)], p) - p > slack;
 
     let Some((_, p)) = parse_uint_bounded::<u64>(buf, pos, slack) else {
         return if over_slack_digits(pos) {
