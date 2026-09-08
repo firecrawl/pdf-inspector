@@ -1,0 +1,20 @@
+tests/horizontal_scale.rs
+  s_71c929625d5bb5::t_053aa63562f1fc 208-212,214-234
+  s_71c929625d5bb5::t_6c632f0a0b2b52 213
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "df99c8b7516e844efd5b1360338c90c3ab8fcbaa",
+  "prompts": {},
+  "sessions": {
+    "s_71c929625d5bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07e0b-7f1a-7a32-89d1-741d50f7b458",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
