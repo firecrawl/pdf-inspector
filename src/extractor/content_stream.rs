@@ -22,6 +22,7 @@ use super::geometry::{
     estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees, reading_direction,
     rise_adjusted, scaled_run_geometry, PageRotation, RunGeometry,
 };
+use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -273,6 +274,21 @@ pub(crate) fn extract_page_text_items(
 
     // Get fonts for encoding
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
+    let paint_resources = PaintResources::page(doc, page_id);
+    // Unknown font resources may be Type3; infer stroke weight only for
+    // positively resolved ordinary text fonts.
+    let paintable_fonts: std::collections::HashSet<String> = fonts
+        .iter()
+        .filter(|(_, font)| {
+            font.get(b"Subtype")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .is_some_and(|subtype| {
+                    matches!(subtype, b"Type0" | b"Type1" | b"MMType1" | b"TrueType")
+                })
+        })
+        .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+        .collect();
 
     // Build font encoding maps from Differences arrays
     let (font_encodings, has_gid_fonts) = build_font_encodings(doc, &fonts, font_cmaps);
@@ -401,11 +417,13 @@ pub(crate) fn extract_page_text_items(
                                           // so an include_invisible retry is attempted only when it can recover.
     let mut skipped_invisible = false;
     let mut line_width: f32 = 1.0;
+    let mut text_paint = TextPaint::default();
     #[derive(Clone)]
     struct SavedGraphicsState {
         ctm: [f32; 6],
         text_rendering_mode: i32,
         line_width: f32,
+        text_paint: TextPaint,
         char_spacing: f32,
         word_spacing: f32,
         horizontal_scale: f32,
@@ -463,6 +481,7 @@ pub(crate) fn extract_page_text_items(
 
     for op in &content.operations {
         trace!("{} {:?}", op.operator, op.operands);
+        text_paint.observe(&op.operator, &op.operands, &paint_resources);
         match op.operator.as_str() {
             "q" => {
                 // Save graphics state
@@ -470,6 +489,7 @@ pub(crate) fn extract_page_text_items(
                     ctm,
                     text_rendering_mode,
                     line_width,
+                    text_paint,
                     char_spacing,
                     word_spacing,
                     horizontal_scale,
@@ -485,6 +505,7 @@ pub(crate) fn extract_page_text_items(
                     ctm = saved.ctm;
                     text_rendering_mode = saved.text_rendering_mode;
                     line_width = saved.line_width;
+                    text_paint = saved.text_paint;
                     char_spacing = saved.char_spacing;
                     word_spacing = saved.word_spacing;
                     horizontal_scale = saved.horizontal_scale;
@@ -518,6 +539,8 @@ pub(crate) fn extract_page_text_items(
                 in_text_block = true;
                 text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
                 line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+                // Keep the existing invisible-layer extraction policy. The
+                // separate paint state retains Tr for weight inference.
                 text_rendering_mode = 0;
             }
             "ET" => {
@@ -775,7 +798,15 @@ pub(crate) fn extract_page_text_items(
                                 font_tag: current_font.clone(),
                                 font_size: rendered_size,
                                 page: page_num,
-                                is_bold: is_bold_font(base_font) || desc_bold,
+                                is_bold: is_bold_font(base_font)
+                                    || desc_bold
+                                    || (paintable_fonts.contains(&current_font)
+                                        && text_paint.adds_bold(
+                                            &text,
+                                            rendered_size,
+                                            base_font,
+                                            &ctm,
+                                        )),
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
@@ -1114,7 +1145,15 @@ pub(crate) fn extract_page_text_items(
                                     font_tag: current_font.clone(),
                                     font_size: rendered_size,
                                     page: page_num,
-                                    is_bold: is_bold_font(base_font) || desc_bold,
+                                    is_bold: is_bold_font(base_font)
+                                        || desc_bold
+                                        || (paintable_fonts.contains(&current_font)
+                                            && text_paint.adds_bold(
+                                                text,
+                                                rendered_size,
+                                                base_font,
+                                                &ctm,
+                                            )),
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
@@ -1296,7 +1335,15 @@ pub(crate) fn extract_page_text_items(
                                 font_tag: current_font.clone(),
                                 font_size: rendered_size,
                                 page: page_num,
-                                is_bold: is_bold_font(base_font) || desc_bold,
+                                is_bold: is_bold_font(base_font)
+                                    || desc_bold
+                                    || (paintable_fonts.contains(&current_font)
+                                        && text_paint.adds_bold(
+                                            &text,
+                                            rendered_size,
+                                            base_font,
+                                            &ctm,
+                                        )),
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
@@ -1367,6 +1414,7 @@ pub(crate) fn extract_page_text_items(
                                         text_rendering_mode,
                                         text_rise,
                                         horizontal_scale,
+                                        text_paint,
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
@@ -2129,6 +2177,203 @@ mod tests {
         )
         .unwrap();
         items
+    }
+
+    #[test]
+    fn painted_bold_survives_text_objects_and_graphics_state() {
+        let items = extract_simple_items(
+            b"
+            0.3 w 2 Tr BT /F1 12 Tf 72 700 Td (Lead) Tj ET
+            BT /F1 12 Tf 72 680 Td (Still bold) Tj ET
+            q 0 Tr BT /F1 12 Tf 72 660 Td (Plain) Tj ET Q
+            BT /F1 12 Tf 72 640 Td (Restored) Tj ET
+            0 Tr BT /F1 12 Tf 72 620 Td (Body) Tj ET",
+        );
+        let styles: Vec<_> = items.iter().map(|i| (i.text.as_str(), i.is_bold)).collect();
+        assert_eq!(
+            styles,
+            [
+                ("Lead", true),
+                ("Still bold", true),
+                ("Plain", false),
+                ("Restored", true),
+                ("Body", false)
+            ]
+        );
+    }
+
+    #[test]
+    fn painted_bold_covers_supported_page_show_operators() {
+        for show in ["(Styled) Tj", "[(Sty) (led)] TJ", "(Styled) '"] {
+            let content = format!("0.3 w 2 Tr BT /F1 12 Tf 72 700 Td {show} ET");
+            let items = extract_simple_items(content.as_bytes());
+            assert_eq!(items.len(), 1, "{show}: {items:?}");
+            assert_eq!(items[0].text, "Styled");
+            assert!(items[0].is_bold, "{show}: {items:?}");
+        }
+    }
+
+    #[test]
+    fn painted_bold_restores_paint_and_preserves_explicit_font_styles() {
+        let items = extract_simple_items(
+            b"0.3 w 2 Tr BT /F1 12 Tf 72 700 Td (Lead) Tj ET
+              q 1 0 0 RG BT /F1 12 Tf 72 680 Td (Outline) Tj ET Q
+              BT /F1 12 Tf 72 660 Td (Restored) Tj ET",
+        );
+        assert_eq!(
+            items.iter().map(|i| i.is_bold).collect::<Vec<_>>(),
+            [true, false, true]
+        );
+
+        for (subtype, name, expected_bold, expected_italic) in [
+            ("Type1", "Helvetica-BoldOblique", true, true),
+            ("Type3", "Helvetica", false, false),
+            ("Unknown", "Helvetica", false, false),
+            ("Type1", "Wingdings", false, false),
+        ] {
+            let (mut doc, page_id) =
+                simple_doc_with_content(b"0.3 w 2 Tr BT /F1 12 Tf 72 700 Td (A) Tj ET");
+            let font = doc.get_object_mut((1, 0)).unwrap().as_dict_mut().unwrap();
+            font.set("Subtype", Object::Name(subtype.as_bytes().to_vec()));
+            font.set("BaseFont", Object::Name(name.as_bytes().to_vec()));
+            let font_cmaps = FontCMaps::from_doc(&doc);
+            let ((items, _, _), _, _, _) = extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &font_cmaps,
+                false,
+                &mut FontStyleCache::new(),
+                &mut FormWalkBudget::new(),
+            )
+            .unwrap();
+            assert_eq!(items.len(), 1, "{name}");
+            assert_eq!(items[0].is_bold, expected_bold, "{name}");
+            assert_eq!(items[0].is_italic, expected_italic, "{name}");
+        }
+    }
+
+    #[test]
+    fn stroke_only_clip_and_hairline_text_do_not_gain_bold() {
+        for setup in [
+            "0 Tr",
+            "1 Tr",
+            "3 Tr",
+            "4 Tr",
+            "5 Tr",
+            "7 Tr",
+            "0 w 2 Tr",
+            "0.001 w 2 Tr",
+            "1 0 0 RG 2 Tr",
+            "[1 2] 0 d 2 Tr",
+            "/Unknown gs 2 Tr",
+        ] {
+            let content = format!("{setup} BT /F1 12 Tf 72 700 Td (Body) Tj ET");
+            let items = extract_simple_items(content.as_bytes());
+            assert!(items.iter().all(|i| !i.is_bold), "{setup}: {items:?}");
+        }
+        let items = extract_simple_items(b"0.3 w 6 Tr BT /F1 12 Tf 72 700 Td (Weighted) Tj ET");
+        assert!(items[0].is_bold);
+    }
+
+    #[test]
+    fn painted_bold_preserves_word_boundary_and_plain_text() {
+        let items =
+            extract_simple_items(b"BT /F1 12 Tf 72 700 Td 0.3 w 2 Tr (Lead) Tj 0 Tr ( body) Tj ET");
+        assert_eq!(items.len(), 2);
+        let line = crate::types::TextLine {
+            items,
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(line.text(), "Lead body");
+        assert_eq!(
+            line.text_with_formatting(true, false, false),
+            "**Lead** body"
+        );
+    }
+
+    #[test]
+    fn painted_bold_preserves_invisible_layer_extraction_policy() {
+        let items = extract_simple_items(
+            b"0.3 w 3 Tr BT /F1 12 Tf 72 700 Td (First) Tj ET
+              BT /F1 12 Tf 72 680 Td 3 Tr (Hidden) Tj ET
+              BT /F1 12 Tf 72 660 Td (Layer body) Tj ET",
+        );
+        assert_eq!(
+            items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+            ["First", "Layer body"]
+        );
+        assert!(items.iter().all(|i| !i.is_bold));
+    }
+
+    #[test]
+    fn unresolved_ancestor_type3_font_does_not_gain_painted_bold() {
+        use lopdf::{dictionary, Stream};
+
+        let (mut doc, page_id) =
+            simple_doc_with_content(b"0.3 w 2 Tr BT /F1 12 Tf 72 700 Td (A) Tj ET");
+        let glyph = doc.add_object(Stream::new(
+            dictionary! {},
+            b"600 0 0 0 600 700 d1 0 0 600 700 re f".to_vec(),
+        ));
+        let font = doc.get_object_mut((1, 0)).unwrap().as_dict_mut().unwrap();
+        font.set("Subtype", "Type3");
+        font.set(
+            "FontMatrix",
+            vec![
+                0.001.into(),
+                0.into(),
+                0.into(),
+                0.001.into(),
+                0.into(),
+                0.into(),
+            ],
+        );
+        font.set("FontBBox", vec![0.into(), 0.into(), 600.into(), 700.into()]);
+        font.set("CharProcs", dictionary! { "A" => Object::Reference(glyph) });
+        font.set(
+            "Encoding",
+            dictionary! { "Differences" => vec![65.into(), Object::Name(b"A".to_vec())] },
+        );
+
+        let resources = doc
+            .get_dictionary_mut(page_id)
+            .unwrap()
+            .remove(b"Resources")
+            .unwrap();
+        let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let parent = doc
+            .get_dictionary(catalog)
+            .unwrap()
+            .get(b"Pages")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        doc.get_dictionary_mut(parent)
+            .unwrap()
+            .set("Resources", resources);
+        doc.get_dictionary_mut(page_id)
+            .unwrap()
+            .set("Parent", Object::Reference(parent));
+        // Direct ancestor resources are not resolved by the current font
+        // reader. An unresolved name must not bypass the Type3 exclusion.
+        assert!(doc.get_page_fonts(page_id).unwrap().is_empty());
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "A");
+        assert!(!items[0].is_bold);
     }
 
     #[test]

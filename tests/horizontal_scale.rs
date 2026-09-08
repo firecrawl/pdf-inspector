@@ -205,6 +205,34 @@ fn nested_forms_inherit_the_invoking_streams_horizontal_scale() {
 }
 
 #[test]
+fn horizontal_scale_and_painted_bold_inherit_and_restore_together() {
+    for depth in [0, 1, 2, 3] {
+        for scale in [50, -100] {
+            let extracted = items(&pdf(
+                "BT /F1 12 Tf 1 0 0 1 100 300 Tm (ALPHA) Tj ET
+                 q 200 Tz 0 Tr 0 w 0.5 g 1 G [1] 0 d /Unknown gs
+                 BT /F1 12 Tf 1 0 0 1 100 250 Tm (BRAVO) Tj ET Q
+                 BT /F1 12 Tf 1 0 0 1 100 200 Tm [(DELTA)] TJ ET",
+                depth,
+                &format!("0.36 w BT 2 Tr {scale} Tz ET"),
+                false,
+            ));
+            for text in ["ALPHA", "DELTA"] {
+                let item = find(&extracted, text);
+                close(item.x, if scale < 0 { 64.0 } else { 100.0 });
+                close(item.width, 36.0 * (scale as f32 / 100.0).abs());
+                close(item.height, 12.0);
+                assert!(item.is_bold, "depth {depth}, scale {scale}, text {text}");
+            }
+            let plain = find(&extracted, "BRAVO");
+            close(plain.x, 100.0);
+            close(plain.width, 72.0);
+            assert!(!plain.is_bold);
+        }
+    }
+}
+
+#[test]
 fn horizontal_scale_composes_with_rotated_runs_and_visible_page_offsets() {
     // Three horizontal shows keep this a page with marginalia rather than
     // a predominantly rotated page whose coordinate frame is rebased.

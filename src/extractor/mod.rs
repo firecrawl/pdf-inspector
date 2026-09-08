@@ -12,6 +12,7 @@ mod links;
 pub(crate) mod page_box;
 mod reading_order;
 mod scripts;
+mod text_paint;
 pub(crate) mod underline;
 mod xobjects;
 
