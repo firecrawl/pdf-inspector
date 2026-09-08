@@ -305,6 +305,7 @@ assert.equal(ocrOff.pages.length, 3);
 assert.deepEqual(ocrOff.pagesRoutedToOcr, []);
 assert.ok(ocrOff.pages.every(page => page.provenance.source === 'Native'));
 assert.ok(ocrOff.pages.every(page => page.provenance.ocrModel === undefined));
+assert.ok(ocrOff.pages.every(page => Array.isArray(page.spans) && page.spans.length === 0));
 assert.ok(ocrOff.markdown.length > 0);
 
 // Auto must preserve the lightweight path for clean text PDFs.

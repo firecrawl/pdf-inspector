@@ -14,7 +14,8 @@ use crate::types::{ItemType, PdfRect, TextItem};
 use crate::PageMarkdown;
 
 use super::{
-    OcrRun, PageContentSource, PageProvenance, RoutedOcrPage, VisionTimings, DEFAULT_RENDER_DPI,
+    OcrRun, OcrSpan, PageContentSource, PageProvenance, RenderedPage, RoutedOcrPage, VisionTimings,
+    DEFAULT_RENDER_DPI,
 };
 
 /// OCR assembly and hosted-fallback policy.
@@ -80,6 +81,10 @@ pub struct FusedPageMarkdown {
     pub page_number: u32,
     /// Final page Markdown.
     pub markdown: String,
+    /// Accepted OCR spans with PDF-space geometry, in recognition order.
+    /// Empty unless OCR ran for the page; independent of which content
+    /// (native, OCR, or fused) the Markdown above settled on.
+    pub spans: Vec<OcrTextSpan>,
     /// Native/OCR source, model, timing, and fallback metadata.
     pub provenance: PageProvenance,
 }
@@ -401,6 +406,10 @@ fn fuse_ocr_pages_impl(
         pages.push(FusedPageMarkdown {
             page_number,
             markdown,
+            spans: ocr_by_page
+                .get(&page_number)
+                .map(|page| ocr_text_spans(page))
+                .unwrap_or_default(),
             provenance: PageProvenance {
                 page_number,
                 source,
@@ -580,6 +589,27 @@ fn assess_text_candidate(markdown: &str) -> Option<TextCandidateQuality> {
     })
 }
 
+/// One positioned OCR recognition result in PDF page space.
+///
+/// Same coordinate frame as [`TextItem`]: PDF points, axis-aligned box.
+/// Rendered for consumers that place recognized text themselves
+/// (selectable text layers, highlight geometries, confidence heatmaps).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrTextSpan {
+    /// Recognized line text, trimmed.
+    pub text: String,
+    /// Axis-aligned box, same frame as [`TextItem`].
+    pub x: f32,
+    /// Axis-aligned box, same frame as [`TextItem`].
+    pub y: f32,
+    /// Axis-aligned box, same frame as [`TextItem`].
+    pub width: f32,
+    /// Axis-aligned box, same frame as [`TextItem`].
+    pub height: f32,
+    /// Recognition confidence in the inclusive range 0–1.
+    pub confidence: f32,
+}
+
 /// Converts recognized line polygons to ordinary PDF-space text items.
 fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
     let mut discarded = 0usize;
@@ -589,20 +619,10 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             discarded += 1;
             continue;
         }
-        let Some((left, top, right, bottom)) = image_quad_bounds(
-            &span.polygon.points,
-            page.rendered.width(),
-            page.rendered.height(),
-        ) else {
+        let Some(rect) = ocr_span_rect(span, &page.rendered) else {
             discarded += 1;
             continue;
         };
-        let rect = page.rendered.pixel_rect_to_pdf_rect(
-            f64::from(left),
-            f64::from(top),
-            f64::from(right - left),
-            f64::from(bottom - top),
-        );
         items.push(TextItem {
             text: span.text.trim().to_string(),
             x: rect.x,
@@ -635,6 +655,45 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             .then(first.x.total_cmp(&second.x))
     });
     (items, discarded)
+}
+
+/// Shared geometry for an OCR span: bitmap polygon to PDF-space rect.
+/// Returns `None` for empty text or unusable geometry (same acceptance
+/// rules as [`ocr_text_items`]).
+fn ocr_span_rect(span: &OcrSpan, rendered: &RenderedPage) -> Option<PdfRect> {
+    if span.text.trim().is_empty() {
+        return None;
+    }
+    let (left, top, right, bottom) =
+        image_quad_bounds(&span.polygon.points, rendered.width(), rendered.height())?;
+    Some(rendered.pixel_rect_to_pdf_rect(
+        f64::from(left),
+        f64::from(top),
+        f64::from(right - left),
+        f64::from(bottom - top),
+    ))
+}
+
+/// Accepted OCR spans with PDF-space geometry, in recognition order
+/// (top-to-bottom seed, same order the Markdown assembly consumes).
+/// Unlike the Markdown assembly above, this keeps per-span confidence so
+/// consumers can threshold or visualize recognition quality themselves.
+fn ocr_text_spans(page: &RoutedOcrPage) -> Vec<OcrTextSpan> {
+    page.ocr
+        .spans
+        .iter()
+        .filter_map(|span| {
+            let rect = ocr_span_rect(span, &page.rendered)?;
+            Some(OcrTextSpan {
+                text: span.text.trim().to_string(),
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                confidence: span.confidence.clamp(0.0, 1.0),
+            })
+        })
+        .collect()
 }
 
 fn image_quad_bounds(
@@ -1371,6 +1430,40 @@ mod tests {
             "test-ocr"
         );
         assert!(!result.pages[0].provenance.hosted_recommended);
+    }
+
+    #[test]
+    fn fused_pages_carry_ocr_spans_with_geometry() {
+        let native = [native(0, "", true)];
+        let run = run(vec![routed_page(
+            1,
+            vec![
+                positioned_span("Alpha line", 10.0, 10.0, 190.0, 22.0),
+                positioned_span("   ", 10.0, 30.0, 190.0, 42.0),
+                positioned_span("Beta line", 10.0, 50.0, 190.0, 62.0),
+            ],
+            Some(0.9),
+        )]);
+
+        let result = fuse_ocr_pages(&native, &run, 1, &OcrFusionOptions::new()).unwrap();
+
+        assert_eq!(result.pages[0].provenance.source, PageContentSource::Ocr);
+        // Empty-text span dropped; text and confidence pass through.
+        let spans = &result.pages[0].spans;
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].text, "Alpha line");
+        assert_eq!(spans[1].text, "Beta line");
+        for span in spans {
+            assert!((span.confidence - 0.9).abs() < f32::EPSILON);
+            assert!(span.width > 100.0 && span.height > 0.0);
+        }
+        // Same frame as TextItem: image top-to-bottom becomes PDF y-down-to-up,
+        // boxes stay inside the 200x100 page.
+        assert!(spans[0].y > spans[1].y);
+        for span in spans {
+            assert!((0.0..=200.0).contains(&span.x));
+            assert!((0.0..=100.0).contains(&span.y));
+        }
     }
 
     #[test]

@@ -51,11 +51,22 @@ class OcrPageProvenance:
     warnings: list[str]
     hosted_recommended: bool
 
+class OcrTextSpan:
+    """Positioned OCR recognition result, same coordinate frame as TextItem (PDF points, axis-aligned box)."""
+    text: str
+    x: float
+    y: float
+    width: float
+    height: float
+    confidence: float
+
 class OcrPageResult:
     """Final Markdown and provenance for one page."""
     page_number: int
     """1-indexed page number."""
     markdown: str
+    spans: list[OcrTextSpan]
+    """Accepted OCR spans with geometry; empty unless OCR ran for the page."""
     provenance: OcrPageProvenance
 
 class OcrPdfResult:

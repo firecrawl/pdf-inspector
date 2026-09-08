@@ -131,6 +131,31 @@ pub struct PyOcrPageProvenance {
     pub hosted_recommended: bool,
 }
 
+/// Positioned OCR recognition result, same coordinate frame as TextItem
+/// (PDF points, axis-aligned box).
+#[pyclass(name = "OcrTextSpan")]
+#[derive(Clone)]
+pub struct PyOcrTextSpan {
+    /// Recognized line text, trimmed.
+    #[pyo3(get)]
+    pub text: String,
+    /// Axis-aligned box, same frame as TextItem.
+    #[pyo3(get)]
+    pub x: f32,
+    /// Axis-aligned box, same frame as TextItem.
+    #[pyo3(get)]
+    pub y: f32,
+    /// Axis-aligned box, same frame as TextItem.
+    #[pyo3(get)]
+    pub width: f32,
+    /// Axis-aligned box, same frame as TextItem.
+    #[pyo3(get)]
+    pub height: f32,
+    /// Recognition confidence in the inclusive range 0–1.
+    #[pyo3(get)]
+    pub confidence: f32,
+}
+
 /// Final Markdown and provenance for one page.
 #[pyclass(name = "OcrPageResult")]
 #[derive(Clone)]
@@ -140,6 +165,9 @@ pub struct PyOcrPageResult {
     pub page_number: u32,
     #[pyo3(get)]
     pub markdown: String,
+    /// Accepted OCR spans with geometry; empty unless OCR ran for the page.
+    #[pyo3(get)]
+    pub spans: Vec<PyOcrTextSpan>,
     #[pyo3(get)]
     pub provenance: PyOcrPageProvenance,
 }
@@ -557,6 +585,18 @@ fn to_py_ocr_result(result: crate::vision::OcrPdfResult) -> PyOcrPdfResult {
                 PyOcrPageResult {
                     page_number: page.page_number,
                     markdown: page.markdown,
+                    spans: page
+                        .spans
+                        .into_iter()
+                        .map(|span| PyOcrTextSpan {
+                            text: span.text,
+                            x: span.x,
+                            y: span.y,
+                            width: span.width,
+                            height: span.height,
+                            confidence: span.confidence,
+                        })
+                        .collect(),
                     provenance: PyOcrPageProvenance {
                         page_number: provenance.page_number,
                         source: page_content_source_str(provenance.source),

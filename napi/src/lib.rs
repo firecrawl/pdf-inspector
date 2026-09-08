@@ -240,12 +240,33 @@ pub struct OcrPageProvenance {
     pub hosted_recommended: bool,
 }
 
+/// Positioned OCR recognition result, same coordinate frame as TextItem
+/// (PDF points, axis-aligned box). For text layers, highlight geometries,
+/// and confidence visualization without re-running OCR.
+#[napi(object)]
+pub struct OcrTextSpan {
+    /// Recognized line text, trimmed.
+    pub text: String,
+    /// Axis-aligned box, same frame as TextItem.
+    pub x: f64,
+    /// Axis-aligned box, same frame as TextItem.
+    pub y: f64,
+    /// Axis-aligned box, same frame as TextItem.
+    pub width: f64,
+    /// Axis-aligned box, same frame as TextItem.
+    pub height: f64,
+    /// Recognition confidence in the inclusive range 0–1.
+    pub confidence: f64,
+}
+
 /// Final Markdown and provenance for one page.
 #[napi(object)]
 pub struct OcrPageResult {
     /// 1-indexed page number.
     pub page_number: u32,
     pub markdown: String,
+    /// Accepted OCR spans with geometry; empty unless OCR ran for the page.
+    pub spans: Vec<OcrTextSpan>,
     pub provenance: OcrPageProvenance,
 }
 
@@ -370,6 +391,18 @@ fn to_napi_ocr_result(result: pdf_inspector::vision::OcrPdfResult) -> OcrPdfResu
                 OcrPageResult {
                     page_number: page.page_number,
                     markdown: page.markdown,
+                    spans: page
+                        .spans
+                        .into_iter()
+                        .map(|span| OcrTextSpan {
+                            text: span.text,
+                            x: f64::from(span.x),
+                            y: f64::from(span.y),
+                            width: f64::from(span.width),
+                            height: f64::from(span.height),
+                            confidence: f64::from(span.confidence),
+                        })
+                        .collect(),
                     provenance: OcrPageProvenance {
                         page_number: provenance.page_number,
                         source: convert_page_content_source(provenance.source),
