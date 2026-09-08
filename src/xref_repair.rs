@@ -298,10 +298,12 @@ fn parse_classic_xref_table(buf: &[u8], off: usize) -> TableOutcome {
         let Some(pos) = skip_ws_bounded(buf, off, POINTER_TARGET_SLACK) else {
             return TableOutcome::Unsupported;
         };
-        return if buf[pos..].starts_with(b"xref") || is_indirect_object_header(buf, pos) {
-            TableOutcome::Unsupported
-        } else {
-            TableOutcome::Garbage
+        if buf[pos..].starts_with(b"xref") {
+            return TableOutcome::Unsupported;
+        }
+        return match classify_indirect_object_header(buf, pos) {
+            HeaderScan::Header | HeaderScan::Undecidable => TableOutcome::Unsupported,
+            HeaderScan::NotHeader => TableOutcome::Garbage,
         };
     };
     TableOutcome::Table(table)
@@ -332,14 +334,52 @@ fn parse_uint_bounded<T: std::str::FromStr>(
     Some((value, end))
 }
 
-/// Whether `pos` starts an indirect object header, `N G obj`.
-fn is_indirect_object_header(buf: &[u8], pos: usize) -> bool {
+enum HeaderScan {
+    Header,
+    NotHeader,
+    /// A token or gap exceeded the constant-time slack; the bytes may or may
+    /// not be an object header, and the caller must not treat them as junk.
+    Undecidable,
+}
+
+/// Whether `pos` starts an indirect object header, `N G obj`, decided within
+/// `POINTER_TARGET_SLACK` bytes per token and gap.
+fn classify_indirect_object_header(buf: &[u8], pos: usize) -> HeaderScan {
     let slack = POINTER_TARGET_SLACK;
-    parse_uint_bounded::<u64>(buf, pos, slack)
-        .and_then(|(_, p)| skip_ws_bounded(buf, p, slack))
-        .and_then(|p| parse_uint_bounded::<u32>(buf, p, slack))
-        .and_then(|(_, p)| skip_ws_bounded(buf, p, slack))
-        .is_some_and(|p| buf[p..].starts_with(b"obj"))
+    // A digit run or whitespace gap longer than the slack is undecidable; a
+    // token of the wrong kind is a definite "no".
+    let over_slack_digits =
+        |p: usize| skip_digits(&buf[..buf.len().min(p + slack + 1)], p) - p > slack;
+    let over_slack_ws = |p: usize| skip_ws(&buf[..buf.len().min(p + slack + 1)], p) - p > slack;
+
+    let Some((_, p)) = parse_uint_bounded::<u64>(buf, pos, slack) else {
+        return if over_slack_digits(pos) {
+            HeaderScan::Undecidable
+        } else {
+            HeaderScan::NotHeader
+        };
+    };
+    let Some(p) = skip_ws_bounded(buf, p, slack) else {
+        return HeaderScan::Undecidable;
+    };
+    if p == pos || buf.get(p).is_none_or(|b| !b.is_ascii_digit()) {
+        return HeaderScan::NotHeader;
+    }
+    let Some((_, p)) = parse_uint_bounded::<u32>(buf, p, slack) else {
+        return if over_slack_digits(p) {
+            HeaderScan::Undecidable
+        } else {
+            HeaderScan::NotHeader
+        };
+    };
+    let Some(p) = skip_ws_bounded(buf, p, slack) else {
+        return HeaderScan::Undecidable;
+    };
+    if buf[p..].starts_with(b"obj") {
+        HeaderScan::Header
+    } else {
+        HeaderScan::NotHeader
+    }
 }
 
 fn parse_classic_xref_table_inner(buf: &[u8], off: usize) -> Option<ClassicXrefTable> {
@@ -863,6 +903,20 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn an_object_header_with_a_long_gap_is_undecidable_and_stops_the_search() {
+        // `5` followed by 200 spaces then `0 obj`: might be a (badly written)
+        // xref stream header, cannot be told apart in constant time, so the
+        // search must stop rather than fall back.
+        let mut doc = synthetic_pdf_with_xref_terminator("\n", false);
+        let target = doc.len();
+        doc.extend_from_slice(b"5");
+        doc.extend(std::iter::repeat_n(b' ', 200));
+        doc.extend_from_slice(b"0 obj\n<< /Type /XRef >>\nendobj\n");
+        doc.extend_from_slice(format!("startxref\n{target}\n%%EOF\n").as_bytes());
+        assert!(rebuild_short_xref_entries(&doc).is_none());
     }
 
     #[test]
