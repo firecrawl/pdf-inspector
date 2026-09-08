@@ -287,7 +287,17 @@ enum TableOutcome {
 /// cost in the other direction is wrong output.
 fn parse_classic_xref_table(buf: &[u8], off: usize) -> TableOutcome {
     let Some(table) = parse_classic_xref_table_inner(buf, off) else {
-        let pos = skip_ws(buf, off);
+        // Bounded skips keep every rejected candidate O(1), so many bogus
+        // pointers cannot make the repair re-scan a long run each time. A
+        // target buried under more whitespace than the bound is undecidable
+        // in constant time, and undecidable means `Unsupported`: stopping is
+        // the safe side. Once any candidate lands on something that looks
+        // like a cross-reference structure the search ends, so the fuller
+        // scans in `parse_classic_xref_table_inner` run at most once per
+        // repair.
+        let Some(pos) = skip_ws_bounded(buf, off, POINTER_TARGET_SLACK) else {
+            return TableOutcome::Unsupported;
+        };
         return if buf[pos..].starts_with(b"xref") || is_indirect_object_header(buf, pos) {
             TableOutcome::Unsupported
         } else {
@@ -297,15 +307,43 @@ fn parse_classic_xref_table(buf: &[u8], off: usize) -> TableOutcome {
     TableOutcome::Table(table)
 }
 
+/// Most whitespace a pointer target may be preceded by, and the most digits
+/// an object number or generation may have, before the target is dismissed
+/// as garbage. Real files use a handful of bytes for either.
+const POINTER_TARGET_SLACK: usize = 64;
+
+/// `skip_ws` that gives up after `max` bytes of whitespace.
+fn skip_ws_bounded(buf: &[u8], pos: usize, max: usize) -> Option<usize> {
+    let end = skip_ws(&buf[..buf.len().min(pos + max + 1)], pos);
+    (end - pos <= max).then_some(end)
+}
+
+/// `parse_uint` that rejects digit runs longer than `max`.
+fn parse_uint_bounded<T: std::str::FromStr>(
+    buf: &[u8],
+    pos: usize,
+    max: usize,
+) -> Option<(T, usize)> {
+    let end = skip_digits(&buf[..buf.len().min(pos + max + 1)], pos);
+    if end == pos || end - pos > max {
+        return None;
+    }
+    let value = std::str::from_utf8(&buf[pos..end]).ok()?.parse().ok()?;
+    Some((value, end))
+}
+
 /// Whether `pos` starts an indirect object header, `N G obj`.
 fn is_indirect_object_header(buf: &[u8], pos: usize) -> bool {
-    parse_uint::<u64>(buf, pos)
-        .and_then(|(_, p)| parse_uint::<u32>(buf, skip_ws(buf, p)))
-        .is_some_and(|(_, p)| buf[skip_ws(buf, p)..].starts_with(b"obj"))
+    let slack = POINTER_TARGET_SLACK;
+    parse_uint_bounded::<u64>(buf, pos, slack)
+        .and_then(|(_, p)| skip_ws_bounded(buf, p, slack))
+        .and_then(|p| parse_uint_bounded::<u32>(buf, p, slack))
+        .and_then(|(_, p)| skip_ws_bounded(buf, p, slack))
+        .is_some_and(|p| buf[p..].starts_with(b"obj"))
 }
 
 fn parse_classic_xref_table_inner(buf: &[u8], off: usize) -> Option<ClassicXrefTable> {
-    let mut pos = skip_ws(buf, off);
+    let mut pos = skip_ws_bounded(buf, off, POINTER_TARGET_SLACK)?;
     if !buf[pos..].starts_with(b"xref") {
         return None;
     }
@@ -804,6 +842,27 @@ mod tests {
         assert!(rebuild_short_xref_entries(&doc).is_some());
         let (_, pages) = load_document_from_mem(&doc).expect("loads through the repair path");
         assert_eq!(pages, 1);
+    }
+
+    #[test]
+    fn a_pointer_into_a_long_whitespace_run_stops_in_constant_time() {
+        // 100 pointers into a 1 MiB whitespace run: undecidable in constant
+        // time, so the first one stops the search (conservative), and the
+        // run is not re-scanned per pointer.
+        let mut doc = synthetic_pdf_with_xref_terminator("\n", false);
+        let run = doc.len();
+        doc.extend(std::iter::repeat_n(b' ', 1 << 20));
+        for _ in 0..100 {
+            doc.extend_from_slice(format!("startxref\n{run}\n").as_bytes());
+        }
+        doc.extend_from_slice(b"%%EOF\n");
+        let started = std::time::Instant::now();
+        assert!(rebuild_short_xref_entries(&doc).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
