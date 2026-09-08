@@ -14,7 +14,7 @@ use super::fonts::{
     CMapDecisionCache, FontStyleCache,
 };
 use super::geometry::{
-    baseline_rotation, estimated_advance_ts, reading_direction, rise_adjusted, run_geometry,
+    baseline_rotation, estimated_advance_ts, reading_direction, rise_adjusted, scaled_run_geometry,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -243,6 +243,7 @@ pub(crate) fn extract_form_xobject_text(
     include_invisible: bool,
     inherited_render_mode: i32,
     inherited_text_rise: f32,
+    inherited_horizontal_scale: f32,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
@@ -256,6 +257,7 @@ pub(crate) fn extract_form_xobject_text(
         include_invisible,
         inherited_render_mode,
         inherited_text_rise,
+        inherited_horizontal_scale,
         cmap_decisions,
         style_cache,
         0,
@@ -273,6 +275,7 @@ fn extract_form_xobject_text_inner(
     include_invisible: bool,
     inherited_render_mode: i32,
     inherited_text_rise: f32,
+    inherited_horizontal_scale: f32,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
@@ -403,6 +406,7 @@ fn extract_form_xobject_text_inner(
     let mut word_spacing: f32 = 0.0; // Tw parameter
                                      // Ts parameter (baseline shift, unscaled). Text state is graphics state,
                                      // so a form starts with the rise in force where it was invoked.
+    let mut horizontal_scale: f32 = inherited_horizontal_scale;
     let mut text_rise: f32 = inherited_text_rise;
     // Tr is graphics state, so a form starts in the mode the invoking stream
     // left it in: `3 Tr` set on the page or in an outer form hides the text
@@ -419,6 +423,7 @@ fn extract_form_xobject_text_inner(
         ctm: [f32; 6],
         char_spacing: f32,
         word_spacing: f32,
+        horizontal_scale: f32,
         text_rise: f32,
         text_rendering_mode: i32,
         text_leading: f32,
@@ -438,6 +443,7 @@ fn extract_form_xobject_text_inner(
                     ctm,
                     char_spacing,
                     word_spacing,
+                    horizontal_scale,
                     text_rise,
                     text_rendering_mode,
                     text_leading,
@@ -451,6 +457,7 @@ fn extract_form_xobject_text_inner(
                     ctm = saved.ctm;
                     char_spacing = saved.char_spacing;
                     word_spacing = saved.word_spacing;
+                    horizontal_scale = saved.horizontal_scale;
                     text_rise = saved.text_rise;
                     text_rendering_mode = saved.text_rendering_mode;
                     text_leading = saved.text_leading;
@@ -484,6 +491,7 @@ fn extract_form_xobject_text_inner(
                                         include_invisible,
                                         text_rendering_mode,
                                         text_rise,
+                                        horizontal_scale,
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
@@ -569,6 +577,13 @@ fn extract_form_xobject_text_inner(
                 // the caller asked for the hidden layer.
                 if let Some(mode) = op.operands.first().and_then(get_number) {
                     text_rendering_mode = mode as i32;
+                }
+            }
+            "Tz" => {
+                if let Some(scale) = op.operands.first().and_then(get_number) {
+                    if scale.is_finite() {
+                        horizontal_scale = scale / 100.0;
+                    }
                 }
             }
             "Ts" => {
@@ -681,8 +696,8 @@ fn extract_form_xobject_text_inner(
                                     char_spacing,
                                     word_spacing,
                                 );
-                                text_matrix[4] += w_ts * text_matrix[0];
-                                text_matrix[5] += w_ts * text_matrix[1];
+                                text_matrix[4] += w_ts * horizontal_scale * text_matrix[0];
+                                text_matrix[5] += w_ts * horizontal_scale * text_matrix[1];
                             }
                         } else {
                             // No width metrics: move by the estimate the run
@@ -695,8 +710,8 @@ fn extract_form_xobject_text_inner(
                                 char_spacing,
                                 word_spacing,
                             );
-                            text_matrix[4] += estimate_ts * text_matrix[0];
-                            text_matrix[5] += estimate_ts * text_matrix[1];
+                            text_matrix[4] += estimate_ts * horizontal_scale * text_matrix[0];
+                            text_matrix[5] += estimate_ts * horizontal_scale * text_matrix[1];
                         }
                         continue;
                     }
@@ -741,22 +756,25 @@ fn extract_form_xobject_text_inner(
                         } else {
                             estimated_advance_ts(&text, em_ts)
                         };
-                        let geometry = run_geometry(
+                        let geometry = scaled_run_geometry(
                             &combined,
                             advance_ts,
                             fallback_ts,
                             rendered_size.copysign(current_font_size),
                             type3_y_flips.contains(&current_font),
+                            horizontal_scale,
                         );
                         // Without width metrics the cursor moves by the same
                         // estimate the run's box carries.
                         let cursor_ts = advance_ts.unwrap_or(fallback_ts);
-                        text_matrix[4] += cursor_ts * text_matrix[0];
-                        text_matrix[5] += cursor_ts * text_matrix[1];
+                        text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
+                        text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
                         // Only create text item for non-whitespace; whitespace
                         // still advances the text matrix above so gap detection works
                         if !text.trim().is_empty() {
-                            run_rotations.push(geometry.rotation);
+                            let (dir_x, dir_y) =
+                                reading_direction(&combined, current_font_size * horizontal_scale);
+                            run_rotations.push(baseline_rotation(dir_x, dir_y));
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -773,7 +791,7 @@ fn extract_form_xobject_text_inner(
                             if crate::text_utils::is_visual_rtl_candidate(&text)
                                 && combined[0].abs() > combined[1].abs()
                             {
-                                if combined[0] > 0.0 {
+                                if combined[0] * horizontal_scale > 0.0 {
                                     rtl_visual_candidates.push(items.len());
                                 } else {
                                     *rtl_logical_ops += 1;
@@ -972,7 +990,8 @@ fn extract_form_xobject_text_inner(
                         }
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
-                            let (dir_x, dir_y) = reading_direction(&combined, current_font_size);
+                            let (dir_x, dir_y) =
+                                reading_direction(&combined, current_font_size * horizontal_scale);
                             run_rotations.push(baseline_rotation(dir_x, dir_y));
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
@@ -984,10 +1003,12 @@ fn extract_form_xobject_text_inner(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
-                            let scale_x = text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2];
+                            let scale_x = (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])
+                                * horizontal_scale;
                             // Rotated matrices carry no horizontal evidence:
                             // stay neutral unless the advance is x-dominant.
-                            let scale_y = text_matrix[0] * ctm[1] + text_matrix[1] * ctm[3];
+                            let scale_y = (text_matrix[0] * ctm[1] + text_matrix[1] * ctm[3])
+                                * horizontal_scale;
                             let horizontal_advance = scale_x.abs() > scale_y.abs();
                             // The op-wide backtrack marker votes once per op —
                             // per-sub-run geometry (mirrored matrices) still
@@ -999,12 +1020,12 @@ fn extract_form_xobject_text_inner(
                                     text_matrix[1],
                                     text_matrix[2],
                                     text_matrix[3],
-                                    text_matrix[4] + start_w * text_matrix[0],
-                                    text_matrix[5] + start_w * text_matrix[1],
+                                    text_matrix[4] + start_w * horizontal_scale * text_matrix[0],
+                                    text_matrix[5] + start_w * horizontal_scale * text_matrix[1],
                                 ];
                                 let combined_mat =
                                     multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
-                                let geometry = run_geometry(
+                                let geometry = scaled_run_geometry(
                                     &combined_mat,
                                     font_info.map(|_| end_w - start_w),
                                     // A measured sub-run's advance is the `Some`
@@ -1033,6 +1054,7 @@ fn extract_form_xobject_text_inner(
                                     },
                                     rendered_size.copysign(current_font_size),
                                     type3_y_flips.contains(&current_font),
+                                    horizontal_scale,
                                 );
                                 if horizontal_advance
                                     && crate::text_utils::is_visual_rtl_candidate(text)
@@ -1076,8 +1098,8 @@ fn extract_form_xobject_text_inner(
                         }
                         // Always advance the text matrix by the total width —
                         // measured, or estimated for a font without metrics.
-                        text_matrix[4] += total_width_ts * text_matrix[0];
-                        text_matrix[5] += total_width_ts * text_matrix[1];
+                        text_matrix[4] += total_width_ts * horizontal_scale * text_matrix[0];
+                        text_matrix[5] += total_width_ts * horizontal_scale * text_matrix[1];
                     }
                 }
             }
@@ -1232,6 +1254,7 @@ mod tests {
             false,
             0,
             0.0,
+            1.0,
             &mut CMapDecisionCache::new(),
             &mut FontStyleCache::new(),
             budget,

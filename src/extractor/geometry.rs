@@ -138,6 +138,31 @@ pub(crate) fn reading_direction(combined: &[f32; 6], font_size: f32) -> (f32, f3
     }
 }
 
+/// Apply the text state's horizontal scale (`Tz`) to a run without scaling
+/// its height. Advances and spacing are measured before `Tz`; a negative
+/// scale also reflects the baseline axis used to determine orientation.
+pub(crate) fn scaled_run_geometry(
+    combined: &[f32; 6],
+    advance_ts: Option<f32>,
+    fallback_advance_ts: f32,
+    em: f32,
+    glyph_up_flipped: bool,
+    horizontal_scale: f32,
+) -> RunGeometry {
+    let mut reflected = *combined;
+    if horizontal_scale < 0.0 {
+        reflected[0] = -reflected[0];
+        reflected[1] = -reflected[1];
+    }
+    run_geometry(
+        &reflected,
+        advance_ts.map(|advance| advance * horizontal_scale.abs()),
+        fallback_advance_ts * horizontal_scale.abs(),
+        em,
+        glyph_up_flipped,
+    )
+}
+
 /// `em` is the rendered font size, negative when the `Tf` size was.
 pub(crate) fn run_geometry(
     combined: &[f32; 6],

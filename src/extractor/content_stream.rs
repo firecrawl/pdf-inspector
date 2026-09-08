@@ -20,7 +20,7 @@ use super::fonts::{
 };
 use super::geometry::{
     estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees, reading_direction,
-    rise_adjusted, run_geometry, PageRotation,
+    rise_adjusted, scaled_run_geometry, PageRotation, RunGeometry,
 };
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
@@ -155,6 +155,53 @@ pub(crate) fn estimated_string_advance_ts(
     estimated_advance_for_glyphs(glyphs, em_ts)
         + glyphs as f32 * char_spacing
         + spaces as f32 * word_spacing
+}
+
+/// A reflected `Tz` inside ActualText can walk the cursor back over text
+/// already painted. Keep those run bounds so their advances cannot cancel
+/// the replacement item's footprint. Constant-direction spans retain the
+/// existing displacement-based geometry.
+#[derive(Default)]
+struct ActualTextBounds {
+    first_scale: Option<f32>,
+    changed_direction: bool,
+    bounds: Option<[f32; 4]>,
+}
+
+impl ActualTextBounds {
+    fn include(&mut self, geometry: RunGeometry, scale: f32) {
+        if let Some(first) = self.first_scale {
+            self.changed_direction |= first.is_sign_negative() != scale.is_sign_negative();
+        } else {
+            self.first_scale = Some(scale);
+        }
+        let run = [
+            geometry.x,
+            geometry.y,
+            geometry.x + geometry.width,
+            geometry.y + geometry.height,
+        ];
+        self.bounds = Some(match self.bounds {
+            Some(bounds) => [
+                bounds[0].min(run[0]),
+                bounds[1].min(run[1]),
+                bounds[2].max(run[2]),
+                bounds[3].max(run[3]),
+            ],
+            None => run,
+        });
+    }
+
+    fn apply_to(&self, geometry: &mut RunGeometry) {
+        if self.changed_direction {
+            if let Some([x1, y1, x2, y2]) = self.bounds {
+                geometry.x = x1;
+                geometry.y = y1;
+                geometry.width = x2 - x1;
+                geometry.height = y2 - y1;
+            }
+        }
+    }
 }
 
 /// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible)`
@@ -337,6 +384,7 @@ pub(crate) fn extract_page_text_items(
         line_width: f32,
         char_spacing: f32,
         word_spacing: f32,
+        horizontal_scale: f32,
         text_rise: f32,
         text_leading: f32,
         current_font: String,
@@ -350,6 +398,7 @@ pub(crate) fn extract_page_text_items(
     let mut text_leading: f32 = 0.0; // TL parameter (in text-space units)
     let mut char_spacing: f32 = 0.0; // Tc parameter (extra spacing per character, unscaled)
     let mut word_spacing: f32 = 0.0; // Tw parameter (extra spacing per space char, unscaled)
+    let mut horizontal_scale: f32 = 1.0; // Tz, stored as a ratio
     let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift for super/subscripts, unscaled)
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -371,6 +420,8 @@ pub(crate) fn extract_page_text_items(
     let mut actual_text_glyph_tm: Option<[f32; 6]> = None; // text matrix at first glyph inside BDC
                                                            // Text rise in effect at each captured matrix — the item must render at
                                                            // the rise of its GLYPHS, not whatever rise is set by EMC time.
+    let mut actual_text_start_scale: f32 = 1.0;
+    let mut actual_text_glyph_scale: Option<f32> = None;
     let mut actual_text_start_rise: f32 = 0.0;
     let mut actual_text_glyph_rise: Option<f32> = None;
     let mut actual_text_glyph_font: Option<String> = None; // font that painted the span's first glyph
@@ -380,6 +431,7 @@ pub(crate) fn extract_page_text_items(
                                                 // Glyphs painted inside the current ActualText span: sizes the span's box
                                                 // when its font has no width metrics.
     let mut actual_text_glyph_count: usize = 0;
+    let mut actual_text_bounds = ActualTextBounds::default();
     /// Get the innermost MCID from the marked content stack.
     fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
         stack.iter().rev().find_map(|e| e.mcid)
@@ -396,6 +448,7 @@ pub(crate) fn extract_page_text_items(
                     line_width,
                     char_spacing,
                     word_spacing,
+                    horizontal_scale,
                     text_rise,
                     text_leading,
                     current_font: current_font.clone(),
@@ -410,6 +463,7 @@ pub(crate) fn extract_page_text_items(
                     line_width = saved.line_width;
                     char_spacing = saved.char_spacing;
                     word_spacing = saved.word_spacing;
+                    horizontal_scale = saved.horizontal_scale;
                     text_rise = saved.text_rise;
                     text_leading = saved.text_leading;
                     current_font = saved.current_font;
@@ -481,6 +535,13 @@ pub(crate) fn extract_page_text_items(
                 // Set word spacing (extra space added for each space character)
                 if let Some(tw) = op.operands.first().and_then(get_number) {
                     word_spacing = tw;
+                }
+            }
+            "Tz" => {
+                if let Some(scale) = op.operands.first().and_then(get_number) {
+                    if scale.is_finite() {
+                        horizontal_scale = scale / 100.0;
+                    }
                 }
             }
             "Ts" => {
@@ -568,13 +629,31 @@ pub(crate) fn extract_page_text_items(
                             actual_text_glyph_rise = Some(text_rise);
                             actual_text_glyph_font = Some(current_font.clone());
                             actual_text_glyph_font_size = Some(current_font_size);
+                            actual_text_glyph_scale = Some(horizontal_scale);
                         }
                         actual_text_glyph_count += glyph_count;
                         actual_text_glyphs_measured &= w_ts_opt.is_some();
-                        actual_text_estimate_ts += estimate_ts;
+                        actual_text_estimate_ts += estimate_ts * horizontal_scale;
+                        if glyph_count > 0 {
+                            let combined =
+                                multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
+                            actual_text_bounds.include(
+                                scaled_run_geometry(
+                                    &combined,
+                                    w_ts_opt,
+                                    estimate_ts,
+                                    rendered_size.copysign(current_font_size),
+                                    type3_y_flips.contains(&current_font),
+                                    horizontal_scale,
+                                ),
+                                horizontal_scale,
+                            );
+                        }
                         let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
-                        text_matrix[4] += cursor_ts * text_matrix[0];
-                        text_matrix[5] += cursor_ts * text_matrix[1];
+                        text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
+                        text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
                         continue;
                     }
                     // Skip invisible (Tr=3) text but still advance text matrix.
@@ -590,8 +669,8 @@ pub(crate) fn extract_page_text_items(
                             skipped_invisible = true;
                         }
                         let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
-                        text_matrix[4] += cursor_ts * text_matrix[0];
-                        text_matrix[5] += cursor_ts * text_matrix[1];
+                        text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
+                        text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
                         continue;
                     }
                     if let Some(text) = extract_text_from_operand(
@@ -610,7 +689,7 @@ pub(crate) fn extract_page_text_items(
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                        let geometry = run_geometry(
+                        let geometry = scaled_run_geometry(
                             &combined,
                             w_ts_opt,
                             if glyph_count > 0 {
@@ -620,15 +699,18 @@ pub(crate) fn extract_page_text_items(
                             },
                             rendered_size.copysign(current_font_size),
                             type3_y_flips.contains(&current_font),
+                            horizontal_scale,
                         );
                         let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
-                        text_matrix[4] += cursor_ts * text_matrix[0];
-                        text_matrix[5] += cursor_ts * text_matrix[1];
+                        text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
+                        text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
                         // Only create text item for non-whitespace; whitespace
                         // still advances the text matrix above so gap detection works
                         if !text.trim().is_empty() {
-                            rotation_votes
-                                .cast_direction(reading_direction(&combined, current_font_size));
+                            rotation_votes.cast_direction(reading_direction(
+                                &combined,
+                                current_font_size * horizontal_scale,
+                            ));
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -646,7 +728,7 @@ pub(crate) fn extract_page_text_items(
                                 // horizontal evidence and stay neutral — same
                                 // dominance test as the rotation votes above.
                                 if combined[0].abs() > combined[1].abs() {
-                                    if combined[0] > 0.0 {
+                                    if combined[0] * horizontal_scale > 0.0 {
                                         rtl_visual_candidates.push(items.len());
                                     } else {
                                         rtl_logical_ops += 1;
@@ -716,6 +798,7 @@ pub(crate) fn extract_page_text_items(
                             actual_text_glyph_rise = Some(text_rise);
                             actual_text_glyph_font = Some(current_font.clone());
                             actual_text_glyph_font_size = Some(current_font_size);
+                            actual_text_glyph_scale = Some(horizontal_scale);
                         }
 
                         // Compute space threshold based on font metrics when available
@@ -818,6 +901,7 @@ pub(crate) fn extract_page_text_items(
                             }
                             let element_glyphs =
                                 shown_glyph_count(get_operand_bytes(element), font_info);
+                            let element_start_width_ts = total_width_ts;
                             // The estimate this element would carry without
                             // metrics: its own size, scale, and spacing.
                             let element_estimate_ts = estimated_string_advance_ts(
@@ -847,7 +931,36 @@ pub(crate) fn extract_page_text_items(
                             if suppress_glyph_extraction {
                                 actual_text_glyph_count += element_glyphs;
                                 actual_text_glyphs_measured &= font_info.is_some();
-                                actual_text_estimate_ts += element_estimate_ts;
+                                actual_text_estimate_ts += element_estimate_ts * horizontal_scale;
+                                if element_glyphs > 0 {
+                                    let mut offset_tm = text_matrix;
+                                    offset_tm[4] +=
+                                        element_start_width_ts * horizontal_scale * text_matrix[0];
+                                    offset_tm[5] +=
+                                        element_start_width_ts * horizontal_scale * text_matrix[1];
+                                    let combined = multiply_matrices(
+                                        &rise_adjusted(&offset_tm, text_rise),
+                                        &ctm,
+                                    );
+                                    let rendered_size =
+                                        effective_font_size(current_font_size, &combined)
+                                            * type3_scales
+                                                .get(&current_font)
+                                                .copied()
+                                                .unwrap_or(1.0);
+                                    actual_text_bounds.include(
+                                        scaled_run_geometry(
+                                            &combined,
+                                            font_info
+                                                .map(|_| total_width_ts - element_start_width_ts),
+                                            element_estimate_ts,
+                                            rendered_size.copysign(current_font_size),
+                                            type3_y_flips.contains(&current_font),
+                                            horizontal_scale,
+                                        ),
+                                        horizontal_scale,
+                                    );
+                                }
                             }
                             if !is_invisible {
                                 if let Some(text) = extract_text_from_operand(
@@ -878,8 +991,10 @@ pub(crate) fn extract_page_text_items(
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
-                            rotation_votes
-                                .cast_direction(reading_direction(&combined, current_font_size));
+                            rotation_votes.cast_direction(reading_direction(
+                                &combined,
+                                current_font_size * horizontal_scale,
+                            ));
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
@@ -890,10 +1005,12 @@ pub(crate) fn extract_page_text_items(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
-                            let scale_x = text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2];
+                            let scale_x = (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])
+                                * horizontal_scale;
                             // Rotated matrices carry no horizontal evidence:
                             // stay neutral unless the advance is x-dominant.
-                            let scale_y = text_matrix[0] * ctm[1] + text_matrix[1] * ctm[3];
+                            let scale_y = (text_matrix[0] * ctm[1] + text_matrix[1] * ctm[3])
+                                * horizontal_scale;
                             let horizontal_advance = scale_x.abs() > scale_y.abs();
                             // The op-wide backtrack marker votes once per op —
                             // per-sub-run geometry (mirrored matrices) still
@@ -905,12 +1022,12 @@ pub(crate) fn extract_page_text_items(
                                     text_matrix[1],
                                     text_matrix[2],
                                     text_matrix[3],
-                                    text_matrix[4] + start_w * text_matrix[0],
-                                    text_matrix[5] + start_w * text_matrix[1],
+                                    text_matrix[4] + start_w * horizontal_scale * text_matrix[0],
+                                    text_matrix[5] + start_w * horizontal_scale * text_matrix[1],
                                 ];
                                 let combined =
                                     multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
-                                let geometry = run_geometry(
+                                let geometry = scaled_run_geometry(
                                     &combined,
                                     font_info.map(|_| end_w - start_w),
                                     // A measured sub-run's advance is the `Some`
@@ -939,6 +1056,7 @@ pub(crate) fn extract_page_text_items(
                                     },
                                     rendered_size.copysign(current_font_size),
                                     type3_y_flips.contains(&current_font),
+                                    horizontal_scale,
                                 );
                                 if horizontal_advance
                                     && crate::text_utils::is_visual_rtl_candidate(text)
@@ -982,8 +1100,8 @@ pub(crate) fn extract_page_text_items(
                         }
                         // Always advance the text matrix by the total width —
                         // measured, or estimated for a font without metrics.
-                        text_matrix[4] += total_width_ts * text_matrix[0];
-                        text_matrix[5] += total_width_ts * text_matrix[1];
+                        text_matrix[4] += total_width_ts * horizontal_scale * text_matrix[0];
+                        text_matrix[5] += total_width_ts * horizontal_scale * text_matrix[1];
                     }
                 }
             }
@@ -1011,6 +1129,7 @@ pub(crate) fn extract_page_text_items(
                     actual_text_glyph_rise = Some(text_rise);
                     actual_text_glyph_font = Some(current_font.clone());
                     actual_text_glyph_font_size = Some(current_font_size);
+                    actual_text_glyph_scale = Some(horizontal_scale);
                 }
                 if suppress_glyph_extraction {
                     actual_text_glyph_count += shown_glyph_count(
@@ -1024,7 +1143,7 @@ pub(crate) fn extract_page_text_items(
                         current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0),
                         char_spacing,
                         word_spacing,
-                    );
+                    ) * horizontal_scale;
                 }
                 // Advance width, as for Tj — without it the item stays
                 // zero-width and geometric underline/strikeout detection
@@ -1053,6 +1172,22 @@ pub(crate) fn extract_page_text_items(
                     char_spacing,
                     word_spacing,
                 );
+                if suppress_glyph_extraction && glyph_count > 0 {
+                    let combined = multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                    let rendered_size = effective_font_size(current_font_size, &combined)
+                        * type3_scales.get(&current_font).copied().unwrap_or(1.0);
+                    actual_text_bounds.include(
+                        scaled_run_geometry(
+                            &combined,
+                            w_ts_opt,
+                            estimate_ts,
+                            rendered_size.copysign(current_font_size),
+                            type3_y_flips.contains(&current_font),
+                            horizontal_scale,
+                        ),
+                        horizontal_scale,
+                    );
+                }
                 if text_rendering_mode == 3
                     && !include_invisible
                     && op
@@ -1082,11 +1217,13 @@ pub(crate) fn extract_page_text_items(
                         if !text.trim().is_empty() {
                             let combined =
                                 multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
-                            rotation_votes
-                                .cast_direction(reading_direction(&combined, current_font_size));
+                            rotation_votes.cast_direction(reading_direction(
+                                &combined,
+                                current_font_size * horizontal_scale,
+                            ));
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                            let geometry = run_geometry(
+                            let geometry = scaled_run_geometry(
                                 &combined,
                                 w_ts_opt,
                                 if glyph_count > 0 {
@@ -1096,6 +1233,7 @@ pub(crate) fn extract_page_text_items(
                                 },
                                 rendered_size.copysign(current_font_size),
                                 type3_y_flips.contains(&current_font),
+                                horizontal_scale,
                             );
                             let base_font = font_base_names
                                 .get(&current_font)
@@ -1108,7 +1246,7 @@ pub(crate) fn extract_page_text_items(
                             if crate::text_utils::is_visual_rtl_candidate(&text)
                                 && combined[0].abs() > combined[1].abs()
                             {
-                                if combined[0] > 0.0 {
+                                if combined[0] * horizontal_scale > 0.0 {
                                     rtl_visual_candidates.push(items.len());
                                 } else {
                                     rtl_logical_ops += 1;
@@ -1144,8 +1282,8 @@ pub(crate) fn extract_page_text_items(
                 // Advance regardless of visibility so later show-text
                 // operators on the same line stay positioned (as for Tj).
                 let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
-                text_matrix[4] += cursor_ts * text_matrix[0];
-                text_matrix[5] += cursor_ts * text_matrix[1];
+                text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
+                text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
             }
             "Do" => {
                 // XObject invocation - could be an image or form
@@ -1198,6 +1336,7 @@ pub(crate) fn extract_page_text_items(
                                         include_invisible,
                                         text_rendering_mode,
                                         text_rise,
+                                        horizontal_scale,
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
@@ -1257,6 +1396,8 @@ pub(crate) fn extract_page_text_items(
                 if actual_text.is_some() {
                     suppress_glyph_extraction = true;
                     actual_text_start_tm = Some(text_matrix);
+                    actual_text_start_scale = horizontal_scale;
+                    actual_text_glyph_scale = None;
                     actual_text_start_rise = text_rise;
                     actual_text_glyph_tm = None; // reset — will be captured at first Tj/TJ
                     actual_text_glyph_rise = None;
@@ -1265,6 +1406,7 @@ pub(crate) fn extract_page_text_items(
                     actual_text_glyphs_measured = true;
                     actual_text_estimate_ts = 0.0;
                     actual_text_glyph_count = 0;
+                    actual_text_bounds = ActualTextBounds::default();
                 }
                 marked_content_stack.push(MarkedContentEntry { actual_text, mcid });
             }
@@ -1320,19 +1462,30 @@ pub(crate) fn extract_page_text_items(
                                         None
                                     }
                                 };
-                            let geometry = run_geometry(
+                            // The cursor displacement and accumulated estimate
+                            // already include each painted run's Tz. Only its
+                            // sign is needed here to preserve glyph orientation.
+                            let paint_scale = actual_text_glyph_scale
+                                .take()
+                                .unwrap_or(actual_text_start_scale);
+                            let reflection = if paint_scale < 0.0 { -1.0 } else { 1.0 };
+                            let mut geometry = scaled_run_geometry(
                                 &combined,
-                                advance_ts,
+                                advance_ts.map(|advance| advance * reflection),
                                 // Size the estimate from what was painted, each
                                 // run at its own size and spacing; the
                                 // replacement text is only what gets emitted.
-                                actual_text_estimate_ts,
+                                actual_text_estimate_ts * reflection,
                                 rendered_size.copysign(paint_size),
                                 type3_y_flips.contains(&paint_font),
+                                reflection,
                             );
+                            actual_text_bounds.apply_to(&mut geometry);
                             if !at.trim().is_empty() {
-                                rotation_votes
-                                    .cast_direction(reading_direction(&combined, paint_size));
+                                rotation_votes.cast_direction(reading_direction(
+                                    &combined,
+                                    paint_size * paint_scale,
+                                ));
                                 let base_font = font_base_names
                                     .get(&current_font)
                                     .map(|s| s.as_str())
