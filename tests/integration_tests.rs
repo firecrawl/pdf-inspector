@@ -1331,6 +1331,42 @@ fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
 }
 
+/// Whether the table header is rendered correctly
+#[test]
+fn test_custom_table_header() {
+    // The contains checks restate the intent independently of the snapshot
+    // file, so a bad snapshot refresh can't silently bless reversed output.
+    let output = assert_snapshot("custom_table");
+    assert!(
+        output.contains("|Grupo de parâmetros|Nome|Abreviação|CBC|CBC+ DIFF|") && output.contains("|Grupo de parâmetros|Nome|Abreviação|CBC|CBC+ DIFF|\n|---|---|---|---|---|"),
+        "table-title must extract in order of appereance, got: {output}"
+    );
+}
+
+/// Whether the table header is rendered correctly
+#[test]
+fn test_custom_table_first_row() {
+    // The contains checks restate the intent independently of the snapshot
+    // file, so a bad snapshot refresh can't silently bless reversed output.
+    let output = assert_snapshot("custom_table_II");
+    assert!(
+        output.contains("|saber sobre o uso previsto e os parâmetros do BC-5150|Capítulo 2 Como entender seu analisador|"),
+        "custom-table-first-row must extract first row, got: {output}"
+    );
+}
+
+/// Whether the table header is rendered correctly
+#[test]
+fn test_body_before_table() {
+    // The contains checks restate the intent independently of the snapshot
+    // file, so a bad snapshot refresh can't silently bless reversed output.
+    let output = assert_snapshot("custom_table_II");
+    assert!(
+        output.contains("Este manual do operador é composto por 11 capítulos e 3 apêndices. Consulte a tabela abaixo para encontrar as informações necessárias."),
+        "body-before-table must extract in the body before the table, got: {output}"
+    );
+}
+
 /// Base-Hebrew text stored in visual (screen left-to-right) order: each show
 /// op's characters are reversed relative to reading order and ops paint
 /// left-to-right across the line. Extraction must reverse each run back to
