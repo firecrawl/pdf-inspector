@@ -21,6 +21,10 @@ pub(crate) type FontEncodingMap = HashMap<u8, char>;
 pub(crate) struct FontEncoding {
     pub(crate) differences: FontEncodingMap,
     pub(crate) identity_overrides: FontEncodingMap,
+    /// Codes whose embedded glyph has no outline but a positive advance:
+    /// painted, they leave a gap and nothing else, so they read as spaces
+    /// whatever the font's ToUnicode claims (see `blank_glyph_codes`).
+    pub(crate) blank_codes: std::collections::HashSet<u8>,
 }
 
 /// All font encodings for a page

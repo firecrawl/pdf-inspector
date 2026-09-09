@@ -333,7 +333,8 @@ fn extract_form_xobject_text_inner(
         })
         .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
         .collect();
-    let (font_encodings, _has_gid_fonts) = build_font_encodings(doc, &form_fonts, font_cmaps);
+    let (font_encodings, _has_gid_fonts) =
+        build_font_encodings(doc, &form_fonts, font_cmaps, style_cache);
 
     // Build font width info for the form
     let font_widths = build_font_widths(doc, &form_fonts);
