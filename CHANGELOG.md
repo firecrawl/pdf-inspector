@@ -7,6 +7,38 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [1.19.0] - 2026-09-09
+
+Changes since 1.18.0.
+
+### Added
+
+- Rust `TextItem::legacy_symbol_rewrite` and optional Node `legacySymbolRewrite`
+  identify text changed by legacy symbol cleanup. Merged and split items retain
+  this evidence; a false or absent marker does not guarantee decoding accuracy.
+  ([#519](https://github.com/firecrawl/pdf-inspector/pull/519))
+
+### Fixed
+
+- Preserve bold emphasis simulated by filling and stroking text, including
+  nested forms, and retain inline styling in long quoted prose.
+  ([#511](https://github.com/firecrawl/pdf-inspector/pull/511))
+- Apply horizontal text scaling (`Tz`) to bounds and advances, including
+  reflected text and nested forms, so scaled text lands in the correct region.
+  ([#510](https://github.com/firecrawl/pdf-inspector/pull/510))
+- Recover narrowly verified stale Unicode mappings in embedded subset fonts
+  while preserving valid semantic mappings and ligatures.
+  ([#516](https://github.com/firecrawl/pdf-inspector/pull/516))
+- Keep independently positioned text runs separate when their measured advances
+  lie inside distinct rectangular clipping regions, including visual-order RTL.
+  ([#518](https://github.com/firecrawl/pdf-inspector/pull/518))
+
+### Changed
+
+- Rust `TextItem` literals must include the new `legacy_symbol_rewrite` field
+  (`false` for items without legacy symbol cleanup). The Node field is optional
+  and emitted only when cleanup changed a character.
+
 ## [1.18.0] - 2026-09-07
 
 Changes since 1.17.0.
