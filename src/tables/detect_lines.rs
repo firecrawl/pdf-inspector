@@ -2139,6 +2139,7 @@ mod tests {
             height: 10.0,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page,
             is_bold: false,

@@ -1141,6 +1141,7 @@ mod tests {
             height,
             font: "PDFium native text".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: height,
             page: 1,
             is_bold: false,

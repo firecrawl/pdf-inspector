@@ -1201,7 +1201,7 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
     )
 }
 
-/// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.
+/// Decode a PDF string and record whether legacy symbol cleanup changed a character.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_text_from_operand(
     obj: &Object,
@@ -1214,7 +1214,7 @@ pub(crate) fn extract_text_from_operand(
     encoding_cache: &HashMap<String, Encoding<'_>>,
     cmap_decisions: &mut CMapDecisionCache,
     font_widths: &PageFontWidths,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let is_type0_cid_font = font_widths
         .get(current_font)
         .is_some_and(|info| info.is_cid);
@@ -1487,9 +1487,12 @@ pub(crate) fn extract_text_from_operand(
         }
     })();
     result.map(|text| {
-        let text = clean_symbol_pua(text);
+        let (text, legacy_symbol_rewrite) = clean_symbol_pua(text);
         let text = remap_texcm_math_symbols(text, base_font_name);
-        normalize_cp1252_controls(text, use_cp1252_fallback)
+        (
+            normalize_cp1252_controls(text, use_cp1252_fallback),
+            legacy_symbol_rewrite,
+        )
     })
 }
 
@@ -1619,20 +1622,22 @@ fn should_use_cp1252_single_byte_fallback(
     !non_cp1252_names.iter().any(|name| font_name.contains(name))
 }
 
-/// Replace PUA characters in the F000-F0FF range with standard Unicode equivalents.
-/// These come from Symbol/Wingdings fonts whose ToUnicode CMaps map to PUA.
-fn clean_symbol_pua(text: String) -> String {
+/// Apply the existing private-use cleanup without changing its output.
+/// The boolean records an actual heuristic rewrite, not a proven Unicode alias.
+fn clean_symbol_pua(text: String) -> (String, bool) {
     if !text.chars().any(|c| ('\u{F000}'..='\u{F0FF}').contains(&c)) {
-        return text;
+        return (text, false);
     }
-    text.chars()
+    let mut rewritten = false;
+    let text = text
+        .chars()
         .map(|c| {
             let code = c as u32;
             if !(0xF000..=0xF0FF).contains(&code) {
                 return c;
             }
             let low = code - 0xF000;
-            match low {
+            let replacement = match low {
                 // Common bullets
                 0xA1 | 0xA7 | 0xB7 => '\u{2022}',
                 // Checkmark
@@ -1640,9 +1645,12 @@ fn clean_symbol_pua(text: String) -> String {
                 // Printable ASCII range and Latin-1 above: strip F000 offset
                 0x20..=0xFF => char::from_u32(low).unwrap_or(c),
                 _ => c,
-            }
+            };
+            rewritten |= replacement != c;
+            replacement
         })
-        .collect()
+        .collect();
+    (text, rewritten)
 }
 
 fn decode_symbol_fallback(bytes: &[u8], base_font_name: Option<&str>) -> Option<String> {
@@ -2296,7 +2304,7 @@ mod tests {
             &font_widths,
         );
 
-        let text = result.expect("CID font fallback should still emit a marker");
+        let (text, _) = result.expect("CID font fallback should still emit a marker");
         assert!(
             !text.contains('\u{00CD}') && !text.contains('\u{00D9}'),
             "CID font with unparseable CMap leaked Latin-1 mojibake: {text:?}"
@@ -2330,7 +2338,7 @@ mod tests {
         let mut font_widths: PageFontWidths = HashMap::new();
         font_widths.insert("F1".to_string(), make_font_info(&[], 1000, false));
 
-        let text = extract_text_from_operand(
+        let (text, _) = extract_text_from_operand(
             &obj,
             "F1",
             None,
@@ -2351,6 +2359,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cleanup_evidence_tracks_changes_without_changing_aliases() {
+        for (source, expected, rewritten) in [
+            ("AΩμ$•✓", "AΩμ$•✓", false),
+            ("\u{f057}\u{f0b7}\u{f0fc}", "W•✓", true),
+            ("\u{f010}\u{e123}", "\u{f010}\u{e123}", false),
+            ("Price \u{f024}", "Price $", true),
+        ] {
+            assert_eq!(
+                clean_symbol_pua(source.to_string()),
+                (expected.to_string(), rewritten)
+            );
+        }
+    }
+
+    #[test]
     fn simple_font_single_byte_fallback_maps_cp1252_punctuation() {
         let bytes = vec![b'l', 0x92_u8, b'a', b'c', b'a', b'd'];
         let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
@@ -2363,7 +2386,7 @@ mod tests {
         let mut decisions = CMapDecisionCache::new();
         let font_widths: PageFontWidths = HashMap::new();
 
-        let text = extract_text_from_operand(
+        let (text, _) = extract_text_from_operand(
             &obj,
             "F1",
             None,

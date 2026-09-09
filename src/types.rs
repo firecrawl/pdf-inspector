@@ -184,6 +184,12 @@ pub struct TextItem {
     /// that don't originate from a content-stream show operator (images,
     /// links, form fields, OCR).
     pub font_tag: String,
+    /// At least one source character was changed by the legacy private-use
+    /// symbol cleanup. This is decoding provenance, not an OCR verdict:
+    /// the rewritten value must not be assumed to be an authoritative
+    /// Unicode alias. Merged items retain evidence from every contributing run;
+    /// later text splits conservatively retain their source run's evidence.
+    pub legacy_symbol_rewrite: bool,
     /// Font size
     pub font_size: f32,
     /// Page number (1-indexed)
@@ -666,6 +672,7 @@ mod formatting_tests {
             height: 12.0,
             font: "F1".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,

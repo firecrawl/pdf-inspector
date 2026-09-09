@@ -722,7 +722,7 @@ pub(crate) fn extract_page_text_items(
                         text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
                         continue;
                     }
-                    if let Some(text) = extract_text_from_operand(
+                    if let Some((text, legacy_symbol_rewrite)) = extract_text_from_operand(
                         &op.operands[0],
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -796,6 +796,7 @@ pub(crate) fn extract_page_text_items(
                                 )
                                 .to_string(),
                                 font_tag: current_font.clone(),
+                                legacy_symbol_rewrite,
                                 font_size: rendered_size,
                                 page: page_num,
                                 is_bold: is_bold_font(base_font)
@@ -870,8 +871,9 @@ pub(crate) fn extract_page_text_items(
 
                         // Track sub-items for column-gap splitting:
                         // (text, start_width_ts, end_width_ts)
-                        let mut sub_items: Vec<(String, f32, f32, f32)> = Vec::new();
+                        let mut sub_items: Vec<(String, f32, f32, f32, bool)> = Vec::new();
                         let mut current_text = String::new();
+                        let mut current_symbol_rewrite = false;
                         let mut current_estimate_ts: f32 = 0.0; // metric-less estimate of `current_text`
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
@@ -903,6 +905,7 @@ pub(crate) fn extract_page_text_items(
                                             sub_start_width_ts,
                                             total_width_ts,
                                             std::mem::take(&mut current_estimate_ts),
+                                            std::mem::take(&mut current_symbol_rewrite),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -939,6 +942,7 @@ pub(crate) fn extract_page_text_items(
                                             sub_start_width_ts,
                                             total_width_ts,
                                             std::mem::take(&mut current_estimate_ts),
+                                            std::mem::take(&mut current_symbol_rewrite),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -1022,19 +1026,22 @@ pub(crate) fn extract_page_text_items(
                                 }
                             }
                             if !is_invisible {
-                                if let Some(text) = extract_text_from_operand(
-                                    element,
-                                    &current_font,
-                                    font_base_names.get(&current_font).map(|s| s.as_str()),
-                                    font_cmaps,
-                                    &font_tounicode_refs,
-                                    &inline_cmaps,
-                                    &font_encodings,
-                                    &encoding_cache,
-                                    &mut cmap_decisions,
-                                    &font_widths,
-                                ) {
+                                if let Some((text, legacy_symbol_rewrite)) =
+                                    extract_text_from_operand(
+                                        element,
+                                        &current_font,
+                                        font_base_names.get(&current_font).map(|s| s.as_str()),
+                                        font_cmaps,
+                                        &font_tounicode_refs,
+                                        &inline_cmaps,
+                                        &font_encodings,
+                                        &encoding_cache,
+                                        &mut cmap_decisions,
+                                        &font_widths,
+                                    )
+                                {
                                     current_text.push_str(&text);
+                                    current_symbol_rewrite |= legacy_symbol_rewrite;
                                 }
                             }
                         }
@@ -1045,6 +1052,7 @@ pub(crate) fn extract_page_text_items(
                                 sub_start_width_ts,
                                 total_width_ts,
                                 current_estimate_ts,
+                                current_symbol_rewrite,
                             ));
                         }
                         // Emit one TextItem per sub-item
@@ -1075,7 +1083,9 @@ pub(crate) fn extract_page_text_items(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w, estimate_ts) in &sub_items {
+                            for (text, start_w, end_w, estimate_ts, legacy_symbol_rewrite) in
+                                &sub_items
+                            {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -1143,6 +1153,7 @@ pub(crate) fn extract_page_text_items(
                                     )
                                     .to_string(),
                                     font_tag: current_font.clone(),
+                                    legacy_symbol_rewrite: *legacy_symbol_rewrite,
                                     font_size: rendered_size,
                                     page: page_num,
                                     is_bold: is_bold_font(base_font)
@@ -1271,7 +1282,7 @@ pub(crate) fn extract_page_text_items(
                     || suppress_glyph_extraction
                     || op.operands.is_empty())
                 {
-                    if let Some(text) = extract_text_from_operand(
+                    if let Some((text, legacy_symbol_rewrite)) = extract_text_from_operand(
                         &op.operands[0],
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -1333,6 +1344,7 @@ pub(crate) fn extract_page_text_items(
                                 )
                                 .to_string(),
                                 font_tag: current_font.clone(),
+                                legacy_symbol_rewrite,
                                 font_size: rendered_size,
                                 page: page_num,
                                 is_bold: is_bold_font(base_font)
@@ -1388,6 +1400,7 @@ pub(crate) fn extract_page_text_items(
                                         height,
                                         font: String::new(),
                                         font_tag: String::new(),
+                                        legacy_symbol_rewrite: false,
                                         font_size: 0.0,
                                         page: page_num,
                                         is_bold: false,
@@ -1584,6 +1597,7 @@ pub(crate) fn extract_page_text_items(
                                     )
                                     .to_string(),
                                     font_tag: current_font.clone(),
+                                    legacy_symbol_rewrite: false,
                                     font_size: rendered_size,
                                     page: page_num,
                                     is_bold: is_bold_font(base_font) || desc_bold,
@@ -3559,6 +3573,7 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             advance_known: true,
             font: "Helvetica".to_string(),
             font_tag: "F1".to_string(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,
@@ -3642,6 +3657,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (   ) Tj ET",
             advance_known: true,
             font: "Helvetica".to_string(),
             font_tag: "F1".to_string(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,

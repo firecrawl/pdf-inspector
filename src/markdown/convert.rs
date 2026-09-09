@@ -1643,6 +1643,7 @@ mod tests {
             height: 12.0,
             font: "Helvetica".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page,
             is_bold: false,

@@ -380,6 +380,7 @@ mod tests {
             height: 12.0,
             font: String::new(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,

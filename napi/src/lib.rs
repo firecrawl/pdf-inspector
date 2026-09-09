@@ -128,6 +128,10 @@ pub struct TextItem {
     pub advance_known: bool,
     pub font: String,
     pub font_tag: String,
+    /// Present only when legacy private-use symbol cleanup changed a source
+    /// character. This is decoding provenance, not a request to run OCR.
+    /// Merged items retain evidence from all contributing runs.
+    pub legacy_symbol_rewrite: Option<bool>,
     pub font_size: f64,
     pub page: u32,
     pub is_bold: bool,
@@ -554,6 +558,7 @@ fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
         height: item.height as f64,
         font: item.font,
         font_tag: item.font_tag,
+        legacy_symbol_rewrite: item.legacy_symbol_rewrite.then_some(true),
         font_size: item.font_size as f64,
         page: item.page,
         is_bold: item.is_bold,

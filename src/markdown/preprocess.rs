@@ -217,6 +217,8 @@ pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextL
                 if let Some(first_item) = result[idx].items.first_mut() {
                     let prev_text = first_item.text.trim().to_string();
                     first_item.text = format!("{}{}", drop_char, prev_text);
+                    first_item.legacy_symbol_rewrite |=
+                        line.items.iter().any(|item| item.legacy_symbol_rewrite);
                 }
             }
             // Don't add the drop cap line itself
@@ -243,6 +245,7 @@ mod tests {
             height: font_size,
             font: "TestFont".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,

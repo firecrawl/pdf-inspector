@@ -406,6 +406,7 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             && fusable_anchor_edge(anchor, run.anchor_on_left)
             && !run_of_glyph.contains_key(&run.anchor);
 
+        let legacy_symbol_rewrite = run.glyphs.iter().any(|&g| items[g].legacy_symbol_rewrite);
         if fuse {
             // Direction from the baseline offset (y-up): raised → superscript
             // digits (footnote refs), lowered → subscript (chemistry). NFKC
@@ -420,6 +421,7 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             let run_left = items[run.glyphs[0]].x;
             let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
             let anchor = &mut items[run.anchor];
+            anchor.legacy_symbol_rewrite |= legacy_symbol_rewrite;
             // The fused item spans the union of word and marker: a kerned
             // marker may end inside the word's advance or start before it.
             let anchor_right = item_right(anchor);
@@ -448,6 +450,7 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             let text: String = run.glyphs.iter().map(|&g| items[g].text.as_str()).collect();
             let head = &mut items[run.glyphs[0]];
             head.text = text;
+            head.legacy_symbol_rewrite = legacy_symbol_rewrite;
             head.width = run_right - head.x;
             head.baseline_shift = head.y - anchor_y;
             for &g in &run.glyphs[1..] {
@@ -493,6 +496,7 @@ mod tests {
             height: font_size,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
@@ -511,6 +515,17 @@ mod tests {
 
     fn texts(items: &[TextItem]) -> Vec<&str> {
         items.iter().map(|i| i.text.as_str()).collect()
+    }
+
+    #[test]
+    fn script_merge_keeps_rewrite_evidence_from_every_contributor() {
+        let clean = make_item_fs("A", 20.0, 100.0, 6.0, 10.0);
+        let mut digit = make_item_fs("1", 26.0, 103.0, 3.0, 5.0);
+        digit.legacy_symbol_rewrite = true;
+        let merged = merge_subscript_items(vec![clean, digit]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "A¹");
+        assert!(merged[0].legacy_symbol_rewrite);
     }
 
     // ---- fusion behaviour carried over from the fusion-only pass ----

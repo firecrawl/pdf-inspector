@@ -545,6 +545,7 @@ fn extract_form_xobject_text_inner(
                                     height,
                                     font: String::new(),
                                     font_tag: String::new(),
+                                    legacy_symbol_rewrite: false,
                                     font_size: 0.0,
                                     page: page_num,
                                     is_bold: false,
@@ -740,7 +741,7 @@ fn extract_form_xobject_text_inner(
                         }
                         continue;
                     }
-                    if let Some(text) = extract_text_from_operand(
+                    if let Some((text, legacy_symbol_rewrite)) = extract_text_from_operand(
                         show_operand,
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -834,6 +835,7 @@ fn extract_form_xobject_text_inner(
                                 )
                                 .to_string(),
                                 font_tag: current_font.clone(),
+                                legacy_symbol_rewrite,
                                 font_size: rendered_size,
                                 page: page_num,
                                 is_bold: is_bold_font(base_font)
@@ -887,8 +889,9 @@ fn extract_form_xobject_text_inner(
                         };
                         let column_gap_threshold = space_threshold * 4.0;
 
-                        let mut sub_items: Vec<(String, f32, f32, f32)> = Vec::new();
+                        let mut sub_items: Vec<(String, f32, f32, f32, bool)> = Vec::new();
                         let mut current_text = String::new();
+                        let mut current_symbol_rewrite = false;
                         let mut current_estimate_ts: f32 = 0.0; // metric-less estimate of `current_text`
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
@@ -919,6 +922,7 @@ fn extract_form_xobject_text_inner(
                                             sub_start_width_ts,
                                             total_width_ts,
                                             std::mem::take(&mut current_estimate_ts),
+                                            std::mem::take(&mut current_symbol_rewrite),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -955,6 +959,7 @@ fn extract_form_xobject_text_inner(
                                             sub_start_width_ts,
                                             total_width_ts,
                                             std::mem::take(&mut current_estimate_ts),
+                                            std::mem::take(&mut current_symbol_rewrite),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -997,19 +1002,22 @@ fn extract_form_xobject_text_inner(
                                 current_estimate_ts += element_estimate_ts;
                             }
                             if !hidden {
-                                if let Some(text) = extract_text_from_operand(
-                                    element,
-                                    &current_font,
-                                    font_base_names.get(&current_font).map(|s| s.as_str()),
-                                    font_cmaps,
-                                    &font_tounicode_refs,
-                                    &inline_cmaps,
-                                    &font_encodings,
-                                    &encoding_cache,
-                                    cmap_decisions,
-                                    &font_widths,
-                                ) {
+                                if let Some((text, legacy_symbol_rewrite)) =
+                                    extract_text_from_operand(
+                                        element,
+                                        &current_font,
+                                        font_base_names.get(&current_font).map(|s| s.as_str()),
+                                        font_cmaps,
+                                        &font_tounicode_refs,
+                                        &inline_cmaps,
+                                        &font_encodings,
+                                        &encoding_cache,
+                                        cmap_decisions,
+                                        &font_widths,
+                                    )
+                                {
                                     current_text.push_str(&text);
+                                    current_symbol_rewrite |= legacy_symbol_rewrite;
                                 }
                             }
                         }
@@ -1019,6 +1027,7 @@ fn extract_form_xobject_text_inner(
                                 sub_start_width_ts,
                                 total_width_ts,
                                 current_estimate_ts,
+                                current_symbol_rewrite,
                             ));
                         }
                         if !sub_items.is_empty() {
@@ -1047,7 +1056,9 @@ fn extract_form_xobject_text_inner(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w, estimate_ts) in &sub_items {
+                            for (text, start_w, end_w, estimate_ts, legacy_symbol_rewrite) in
+                                &sub_items
+                            {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -1115,6 +1126,7 @@ fn extract_form_xobject_text_inner(
                                     )
                                     .to_string(),
                                     font_tag: current_font.clone(),
+                                    legacy_symbol_rewrite: *legacy_symbol_rewrite,
                                     font_size: rendered_size,
                                     page: page_num,
                                     is_bold: is_bold_font(base_font)

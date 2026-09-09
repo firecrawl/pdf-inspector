@@ -255,6 +255,7 @@ fn text_chars_to_items(chars: &[PageChar], page: u32) -> Vec<TextItem> {
             height,
             font: "PDFium native text".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: height.max(1.0),
             page,
             is_bold: false,

@@ -595,6 +595,7 @@ mod tests {
             height: 10.0,
             font: "Test".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page,
             is_bold: false,
