@@ -129,6 +129,8 @@ fn separate_show_operators_preserve_evidence_when_their_items_merge() {
 #[test]
 fn quote_show_operators_record_evidence_without_changing_line_motion() {
     for in_form in [false, true] {
+        // Form streams use xobjects.rs, whose show-operator handler also
+        // supports double quote; the page-stream handler supports single quote.
         let second_show = if in_form { "0 0 (A) \"" } else { "(A) '" };
         let items = extract(
             &format!("BT /F1 10 Tf 20 TL 50 300 Td (W) ' {second_show} ET"),

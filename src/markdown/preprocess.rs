@@ -270,6 +270,24 @@ mod tests {
     }
 
     #[test]
+    fn drop_cap_merge_preserves_evidence_from_either_source() {
+        for (body_marked, cap_marked) in [(false, false), (true, false), (false, true)] {
+            let mut body = make_line("elcome", 12.0, 1, 700.0, None);
+            body.items[0].legacy_symbol_rewrite = body_marked;
+            let mut cap = make_line("W", 36.0, 1, 680.0, None);
+            cap.items[0].legacy_symbol_rewrite = cap_marked;
+
+            let result = merge_drop_caps(vec![body, cap], 12.0);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].text(), "Welcome");
+            assert_eq!(
+                result[0].items[0].legacy_symbol_rewrite,
+                body_marked || cap_marked
+            );
+        }
+    }
+
+    #[test]
     fn test_merge_struct_tree_headings() {
         // Two consecutive lines tagged as H2 via struct tree, same font size as body
         let lines = vec![
