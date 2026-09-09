@@ -1,0 +1,21 @@
+src/tables/financial.rs
+  s_f5ff107f39c26a::t_de0d1c9a28c791 108
+src/tables/mod.rs
+  s_f5ff107f39c26a::t_de0d1c9a28c791 331,358,1607,1631,1646-1661
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b4113c9a23dd298a5cff44422e4237a73d978cdc",
+  "prompts": {},
+  "sessions": {
+    "s_f5ff107f39c26a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07e0d-7783-7e81-b6a9-5492ed984ceb",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
