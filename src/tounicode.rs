@@ -2290,28 +2290,30 @@ impl FontCMaps {
             }
 
             // Try parsing embedded TrueType/OpenType cmap
-            if let Some(ff_ref) = font_file_ref {
-                if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                    let data = match stream.decompressed_content() {
-                        Ok(d) => d,
-                        Err(_) => stream.content.clone(),
-                    };
-                    if let Some(cmap) = build_cmap_from_truetype(&data) {
-                        debug!(
-                            "TrueType CMap obj={:<6} (embedded font) char_map={}",
-                            lookup_key,
-                            cmap.char_map.len()
-                        );
-                        by_obj_num.insert(
-                            lookup_key,
-                            CMapEntry {
-                                primary: cmap,
-                                remapped: None,
-                                fallback: None,
-                            },
-                        );
-                        resolved = true;
-                    }
+            let font_data = font_file_ref.and_then(|ff_ref| {
+                let stream = doc.get_object(ff_ref).and_then(Object::as_stream).ok()?;
+                Some(
+                    stream
+                        .decompressed_content()
+                        .unwrap_or_else(|_| stream.content.clone()),
+                )
+            });
+            if let Some(data) = font_data.as_deref() {
+                if let Some(cmap) = build_cmap_from_truetype(data) {
+                    debug!(
+                        "TrueType CMap obj={:<6} (embedded font) char_map={}",
+                        lookup_key,
+                        cmap.char_map.len()
+                    );
+                    by_obj_num.insert(
+                        lookup_key,
+                        CMapEntry {
+                            primary: cmap,
+                            remapped: None,
+                            fallback: None,
+                        },
+                    );
+                    resolved = true;
                 }
             }
 
@@ -2320,6 +2322,32 @@ impl FontCMaps {
                 if let Some(cmap) = build_cmap_from_cid_system_info(cid_font_dict, doc) {
                     debug!(
                         "Predefined CMap obj={:<6} (CIDSystemInfo) char_map={}",
+                        lookup_key,
+                        cmap.char_map.len()
+                    );
+                    by_obj_num.insert(
+                        lookup_key,
+                        CMapEntry {
+                            primary: cmap,
+                            remapped: None,
+                            fallback: None,
+                        },
+                    );
+                    resolved = true;
+                }
+            }
+
+            // A subset stripped of both its cmap and its glyph names leaves
+            // only the glyph order; fonts that keep the standard Macintosh
+            // ordering still decode, when their metrics corroborate it. A
+            // predefined CID collection above is authoritative and wins.
+            if !resolved && crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc) {
+                if let Some(cmap) = font_data
+                    .as_deref()
+                    .and_then(crate::mac_glyph_order::build_cmap_from_mac_glyph_order)
+                {
+                    debug!(
+                        "Standard Macintosh glyph order obj={:<6} (embedded font without cmap) char_map={}",
                         lookup_key,
                         cmap.char_map.len()
                     );

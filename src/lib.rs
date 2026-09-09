@@ -35,6 +35,7 @@ pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
+mod mac_glyph_order;
 pub mod markdown;
 pub mod process_mode;
 pub mod structure_tree;
