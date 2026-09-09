@@ -95,6 +95,15 @@ pub(crate) struct RunGeometry {
     pub(crate) advance_known: bool,
 }
 
+impl RunGeometry {
+    /// Whether the run reads along +x: the same half-plane as
+    /// `TextItem::is_upright`.
+    pub(crate) fn is_upright(&self) -> bool {
+        let rotation = self.rotation.rem_euclid(360.0);
+        rotation <= 45.0 || rotation >= 315.0
+    }
+}
+
 /// Compute the axis-aligned box a shown run occupies in device space.
 ///
 /// `combined` is the (rise-adjusted) text matrix × CTM at the run's start,

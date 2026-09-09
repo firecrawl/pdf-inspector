@@ -179,6 +179,29 @@ fn horizontal_scale_applies_to_tj_spacing_and_tj_array_cursor() {
 }
 
 #[test]
+fn squeezed_space_runs_keep_their_word_space_under_horizontal_scale() {
+    // Word-per-operator producers paint the space as its own run, squeezed
+    // with a negative `Tc` (600/1000 em space, `-6 Tc` leaves 1.19pt at
+    // 99 Tz: under the 0.13 em word threshold). Forms take the same path.
+    for depth in [0, 1] {
+        for show in [
+            "(for) Tj -6 Tc ( ) Tj 0 Tc (the) Tj",
+            "[(for)] TJ -6 Tc [( )] TJ 0 Tc [(the)] TJ",
+        ] {
+            let bytes = pdf(
+                &format!("BT /F1 12 Tf 99 Tz 1 0 0 1 100 300 Tm {show} ET"),
+                depth,
+                "",
+                false,
+            );
+            let extracted = items(&bytes);
+            let texts: Vec<_> = extracted.iter().map(|item| item.text.as_str()).collect();
+            assert_eq!(texts, ["for the"], "depth {depth}: {show}");
+        }
+    }
+}
+
+#[test]
 fn horizontal_scale_restores_with_graphics_state_and_survives_text_blocks() {
     let content = "50 Tz BT /F1 12 Tf 1 0 0 1 100 300 Tm (BEFORE) Tj ET
         q 200 Tz BT /F1 12 Tf 1 0 0 1 100 250 Tm (INSIDE) Tj ET Q

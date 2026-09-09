@@ -158,6 +158,115 @@ pub(crate) fn estimated_string_advance_ts(
         + spaces as f32 * word_spacing
 }
 
+/// A whitespace-only run painted right after the previous item, waiting for
+/// the run that follows it.
+///
+/// Word-per-`Tj` producers paint the separating space as its own operator,
+/// often squeezed with a negative `Tc` until the gap it leaves falls under
+/// the word-space thresholds, and whitespace runs never become items. Once
+/// the next visible run arrives and both neighbours prove to be same-size
+/// alphanumeric text, the previous item gets the trailing space `(for ) Tj`
+/// would have carried. Its box is left alone, so the gap stays measurable.
+/// Superscripts, signs, joining punctuation and right-to-left runs keep the
+/// items other stages already handle. The state belongs to one content
+/// stream: a run at a Form XObject boundary is dropped, as before.
+pub(crate) struct PendingSpace {
+    /// Index of the item the run follows.
+    after: usize,
+    /// Where the run ends on the baseline, and that baseline.
+    x_end: f32,
+    y: f32,
+    em: f32,
+}
+
+/// Space runs narrower than this many em are invisible to gap detection:
+/// the widest word-space threshold in item merging is 0.13 em for
+/// lowercase junctions, and line assembly uses 0.15–0.18 em. Wider runs
+/// leave gaps that are detected there, and their items stay untouched.
+const SQUEEZED_SPACE_EM: f32 = 0.2;
+
+/// Whether a junction character can take a rescued word space: letters and
+/// digits of a left-to-right script.
+fn takes_word_space(c: char) -> bool {
+    c.is_alphanumeric() && !crate::text_utils::is_rtl_char(c)
+}
+
+impl PendingSpace {
+    /// Note a whitespace-only run painted at `run` on `page`, when it is a
+    /// squeezed space right after the last item. A run continuing a pending
+    /// space extends it: several squeezed runs are still one space.
+    pub(crate) fn note(
+        pending: Option<Self>,
+        items: &[TextItem],
+        run: &RunGeometry,
+        page: u32,
+    ) -> Option<Self> {
+        let after = items.len().checked_sub(1)?;
+        if let Some(mut pending) = pending {
+            if pending.after == after
+                && run.is_upright()
+                && (run.y - pending.y).abs() <= pending.em * 0.2
+                && (run.x - pending.x_end).abs() <= pending.em * 0.1
+            {
+                pending.x_end = pending.x_end.max(run.x + run.width);
+                return Some(pending);
+            }
+        }
+        let last = &items[after];
+        if last.page != page || !matches!(last.item_type, ItemType::Text) || !last.is_upright() {
+            return None;
+        }
+        if !last.text.chars().last().is_some_and(takes_word_space) {
+            return None;
+        }
+        let em = last.font_size.abs();
+        if em <= 0.0 || !run.is_upright() || run.width <= 0.0 {
+            return None;
+        }
+        if run.width >= em * SQUEEZED_SPACE_EM || (run.y - last.y).abs() > em * 0.2 {
+            return None;
+        }
+        // The run must start where the previous item ends: a space painted
+        // a column away is layout, not this item's word space.
+        let gap = run.x - (last.x + last.width);
+        if !(-em * 0.1..=em * 0.5).contains(&gap) {
+            return None;
+        }
+        Some(Self {
+            after,
+            x_end: run.x + run.width,
+            y: run.y,
+            em,
+        })
+    }
+
+    /// The next visible run is about to become an item: give the previous
+    /// item its space when the two runs are same-size alphanumeric text
+    /// with nothing but the space between them.
+    pub(crate) fn resolve(self, items: &mut [TextItem], next: &RunGeometry, text: &str, size: f32) {
+        if self.after + 1 != items.len() || !next.is_upright() {
+            return;
+        }
+        if !text.chars().next().is_some_and(takes_word_space) {
+            return;
+        }
+        let em = self.em;
+        // A smaller run on a shifted baseline is a script, whose fusion
+        // with its body deliberately refuses a spaced edge.
+        let ratio = size.abs() / em;
+        if !(0.85..=1.0 / 0.85).contains(&ratio) || (next.y - self.y).abs() > em * 0.2 {
+            return;
+        }
+        if !(-em * 0.1..=em * 0.3).contains(&(next.x - self.x_end)) {
+            return;
+        }
+        let last = &mut items[self.after];
+        if !last.text.ends_with(char::is_whitespace) {
+            last.text.push(' ');
+        }
+    }
+}
+
 /// Reflections from `Tf` or `Tz` inside ActualText can walk the cursor back
 /// over painted text or flip its glyph-up axis. Keep those run bounds so
 /// cancelled advances cannot hide the replacement item's footprint. Spans
@@ -441,6 +550,7 @@ pub(crate) fn extract_page_text_items(
     let mut char_spacing: f32 = 0.0; // Tc parameter (extra spacing per character, unscaled)
     let mut word_spacing: f32 = 0.0; // Tw parameter (extra spacing per space char, unscaled)
     let mut horizontal_scale: f32 = 1.0; // Tz, stored as a ratio
+    let mut pending_space: Option<PendingSpace> = None; // squeezed space run awaiting its next run
     let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift for super/subscripts, unscaled)
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -754,8 +864,20 @@ pub(crate) fn extract_page_text_items(
                         text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
                         text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
                         // Only create text item for non-whitespace; whitespace
-                        // still advances the text matrix above so gap detection works
-                        if !text.trim().is_empty() {
+                        // still advances the text matrix above so gap detection
+                        // works, and a space run hands its word space to the
+                        // item it follows.
+                        if text.trim().is_empty() {
+                            pending_space = PendingSpace::note(
+                                pending_space.take(),
+                                &items,
+                                &geometry,
+                                page_num,
+                            );
+                        } else {
+                            if let Some(pending) = pending_space.take() {
+                                pending.resolve(&mut items, &geometry, &text, rendered_size);
+                            }
                             rotation_votes.cast_direction(reading_direction(
                                 &combined,
                                 current_font_size * horizontal_scale,
@@ -1046,6 +1168,29 @@ pub(crate) fn extract_page_text_items(
                                 total_width_ts,
                                 current_estimate_ts,
                             ));
+                        } else if !is_invisible && sub_items.is_empty() && !current_text.is_empty()
+                        {
+                            // A whitespace-only array is a space run like a
+                            // whitespace-only `Tj`: it may be the word space
+                            // of the item before it.
+                            let combined =
+                                multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
+                            let geometry = scaled_run_geometry(
+                                &combined,
+                                font_info.map(|_| total_width_ts),
+                                current_estimate_ts,
+                                rendered_size.copysign(current_font_size),
+                                type3_y_flips.contains(&current_font),
+                                horizontal_scale,
+                            );
+                            pending_space = PendingSpace::note(
+                                pending_space.take(),
+                                &items,
+                                &geometry,
+                                page_num,
+                            );
                         }
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
@@ -1130,6 +1275,9 @@ pub(crate) fn extract_page_text_items(
                                     } else {
                                         rtl_visual_candidates.push(items.len());
                                     }
+                                }
+                                if let Some(pending) = pending_space.take() {
+                                    pending.resolve(&mut items, &geometry, text, rendered_size);
                                 }
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
@@ -1283,27 +1431,37 @@ pub(crate) fn extract_page_text_items(
                         &mut cmap_decisions,
                         &font_widths,
                     ) {
-                        if !text.trim().is_empty() {
-                            let combined =
-                                multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                        let combined =
+                            multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                        let rendered_size = effective_font_size(current_font_size, &combined)
+                            * type3_scales.get(&current_font).copied().unwrap_or(1.0);
+                        let geometry = scaled_run_geometry(
+                            &combined,
+                            w_ts_opt,
+                            if glyph_count > 0 {
+                                estimate_ts
+                            } else {
+                                estimated_advance_ts(&text, em_ts)
+                            },
+                            rendered_size.copysign(current_font_size),
+                            type3_y_flips.contains(&current_font),
+                            horizontal_scale,
+                        );
+                        if text.trim().is_empty() {
+                            pending_space = PendingSpace::note(
+                                pending_space.take(),
+                                &items,
+                                &geometry,
+                                page_num,
+                            );
+                        } else {
+                            if let Some(pending) = pending_space.take() {
+                                pending.resolve(&mut items, &geometry, &text, rendered_size);
+                            }
                             rotation_votes.cast_direction(reading_direction(
                                 &combined,
                                 current_font_size * horizontal_scale,
                             ));
-                            let rendered_size = effective_font_size(current_font_size, &combined)
-                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                            let geometry = scaled_run_geometry(
-                                &combined,
-                                w_ts_opt,
-                                if glyph_count > 0 {
-                                    estimate_ts
-                                } else {
-                                    estimated_advance_ts(&text, em_ts)
-                                },
-                                rendered_size.copysign(current_font_size),
-                                type3_y_flips.contains(&current_font),
-                                horizontal_scale,
-                            );
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -3684,5 +3842,112 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
         assert_close(seven.y, -306.0, "y");
         assert_close(seven.width, 10.0, "width");
         assert_close(seven.height, 6.0, "height");
+    }
+
+    /// Word-per-`Tj` producers paint the separating space as its own run,
+    /// squeezed with a negative `Tc` (Helvetica here: 600/1000 em space,
+    /// `-6 Tc` leaves a 1.2pt gap at 12pt, under the 0.13 em word threshold,
+    /// so the merged item would otherwise read "forthe").
+    #[test]
+    fn squeezed_space_run_gives_previous_item_its_word_space() {
+        for (content, expected) in [
+            (
+                "BT /F1 12 Tf 72 700 Td (for) Tj -6 Tc ( ) Tj 0 Tc (the) Tj ET",
+                "for the",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td [(for)] TJ -6 Tc [( )] TJ 0 Tc [(the)] TJ ET",
+                "for the",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td 99 Tz (for) Tj -6 Tc ( ) Tj 0 Tc (the) Tj ET",
+                "for the",
+            ),
+            // Several squeezed runs are one space.
+            (
+                "BT /F1 12 Tf 72 700 Td (for) Tj -6 Tc ( ) Tj ( ) Tj (  ) Tj 0 Tc (the) Tj ET",
+                "for the",
+            ),
+            // Digits are word characters too.
+            (
+                "BT /F1 12 Tf 72 700 Td (900) Tj -6 Tc ( ) Tj 0 Tc (the) Tj ET",
+                "900 the",
+            ),
+        ] {
+            let items = extract_simple_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts, [expected], "{content}");
+        }
+    }
+
+    /// A space run wide enough to be seen as a gap (0.6 em here) is left to
+    /// gap detection, so the items other stages see are unchanged.
+    #[test]
+    fn wide_whitespace_run_is_left_to_gap_detection() {
+        let items = extract_simple_items(b"BT /F1 12 Tf 72 700 Td (for) Tj ( ) Tj (the) Tj ET");
+        let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["for", "the"]);
+        let line = crate::types::TextLine {
+            items,
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(line.text(), "for the");
+    }
+
+    #[test]
+    fn squeezed_space_run_away_from_its_neighbours_is_dropped() {
+        for content in [
+            // Repositioned 0.7 em past the item's end: layout, not a word space.
+            "BT /F1 12 Tf 72 700 Td (for) Tj 30 0 Td -6 Tc ( ) Tj 0 Tc (the) Tj ET",
+            // The following run is repositioned away from the run.
+            "BT /F1 12 Tf 72 700 Td (for) Tj -6 Tc ( ) Tj 0 Tc 30 0 Td (the) Tj ET",
+            // Next line.
+            "BT /F1 12 Tf 72 700 Td (for) Tj 0 -14 Td -6 Tc ( ) Tj 0 Tc (the) Tj ET",
+            // Rotated run: its x extent is not its advance.
+            "BT /F1 12 Tf 0 1 -1 0 72 700 Tm (for) Tj -6 Tc ( ) Tj 0 Tc (the) Tj ET",
+            // No item before the run.
+            "BT /F1 12 Tf 72 700 Td -6 Tc ( ) Tj 0 Tc (the) Tj ET",
+        ] {
+            let items = extract_simple_items(content.as_bytes());
+            assert!(
+                items.iter().all(|i| !i.text.contains("for ")),
+                "{content}: {items:?}"
+            );
+        }
+    }
+
+    /// Script fusion refuses a spaced body edge, sign and punctuation
+    /// junctions have their own joining rules, so those runs keep their
+    /// items as they were.
+    #[test]
+    fn squeezed_space_run_between_non_word_neighbours_is_dropped() {
+        for (content, expected) in [
+            (
+                "BT /F1 12 Tf 72 700 Td (R) Tj -6 Tc ( ) Tj 0 Tc /F1 8 Tf 4 Ts (2) Tj ET",
+                "R",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td (3) Tj -6 Tc ( ) Tj 0 Tc (;200) Tj ET",
+                "3;200",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td (-) Tj -6.9 Tc ( ) Tj 0 Tc (40%) Tj ET",
+                "-40%",
+            ),
+        ] {
+            let items = extract_simple_items(content.as_bytes());
+            assert!(
+                items.iter().any(|i| i.text.starts_with(expected)),
+                "{content}: {items:?}"
+            );
+            assert!(
+                items
+                    .iter()
+                    .all(|i| !i.text.contains(&format!("{} ", &expected[..1]))),
+                "{content}: {items:?}"
+            );
+        }
     }
 }

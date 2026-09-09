@@ -1386,6 +1386,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 if !small_caps_join
                     && (needs_bullet_space || (gap > effective_threshold && !numeric_boundary))
                     && !explicit_bold_space
+                    && !text.ends_with(char::is_whitespace)
                 {
                     text.push(' ');
                 }
@@ -1584,6 +1585,19 @@ mod tests {
             mcid: None,
             baseline_shift: 0.0,
         }
+    }
+
+    #[test]
+    fn explicit_trailing_space_is_not_doubled_across_a_word_gap() {
+        // "for " already carries its space run; the 4pt gap (0.33 em) that
+        // run left clears the word threshold but must not add a second one.
+        let items = vec![
+            make_merge_item("for ", 100.0, 21.6),
+            make_merge_item("the", 125.6, 21.6),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "for the");
     }
 
     fn with_mcid(mut item: TextItem) -> TextItem {

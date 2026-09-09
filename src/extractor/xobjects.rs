@@ -8,7 +8,7 @@ use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
-use super::content_stream::estimated_string_advance_ts;
+use super::content_stream::{estimated_string_advance_ts, PendingSpace};
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, build_type3_y_flips,
     compute_string_width_ts, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
@@ -426,6 +426,7 @@ fn extract_form_xobject_text_inner(
                                      // Ts parameter (baseline shift, unscaled). Text state is graphics state,
                                      // so a form starts with the rise in force where it was invoked.
     let mut horizontal_scale: f32 = inherited_horizontal_scale;
+    let mut pending_space: Option<PendingSpace> = None;
     let mut text_rise: f32 = inherited_text_rise;
     // Tr is graphics state, so a form starts in the mode the invoking stream
     // left it in: `3 Tr` set on the page or in an outer form hides the text
@@ -795,8 +796,20 @@ fn extract_form_xobject_text_inner(
                         text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
                         text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
                         // Only create text item for non-whitespace; whitespace
-                        // still advances the text matrix above so gap detection works
-                        if !text.trim().is_empty() {
+                        // still advances the text matrix above so gap detection
+                        // works, and a space run hands its word space to the
+                        // item it follows.
+                        if text.trim().is_empty() {
+                            pending_space = PendingSpace::note(
+                                pending_space.take(),
+                                items,
+                                &geometry,
+                                page_num,
+                            );
+                        } else {
+                            if let Some(pending) = pending_space.take() {
+                                pending.resolve(items, &geometry, &text, rendered_size);
+                            }
                             let (dir_x, dir_y) =
                                 reading_direction(&combined, current_font_size * horizontal_scale);
                             run_rotations.push(baseline_rotation(dir_x, dir_y));
@@ -1020,6 +1033,28 @@ fn extract_form_xobject_text_inner(
                                 total_width_ts,
                                 current_estimate_ts,
                             ));
+                        } else if !hidden && sub_items.is_empty() && !current_text.is_empty() {
+                            // A whitespace-only array is a space run like a
+                            // whitespace-only `Tj`: it may be the word space
+                            // of the item before it.
+                            let combined =
+                                multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
+                            let geometry = scaled_run_geometry(
+                                &combined,
+                                font_info.map(|_| total_width_ts),
+                                current_estimate_ts,
+                                rendered_size.copysign(current_font_size),
+                                type3_y_flips.contains(&current_font),
+                                horizontal_scale,
+                            );
+                            pending_space = PendingSpace::note(
+                                pending_space.take(),
+                                items,
+                                &geometry,
+                                page_num,
+                            );
                         }
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
@@ -1102,6 +1137,9 @@ fn extract_form_xobject_text_inner(
                                     } else {
                                         rtl_visual_candidates.push(items.len());
                                     }
+                                }
+                                if let Some(pending) = pending_space.take() {
+                                    pending.resolve(items, &geometry, text, rendered_size);
                                 }
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
