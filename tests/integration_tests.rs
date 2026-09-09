@@ -5192,6 +5192,70 @@ fn clipping_provenance_follows_sorted_items_and_supported_show_operators() {
     );
 }
 
+fn clipped_rtl_items(left_clip: &str, right_clip: &str, visual_order: bool) -> Vec<TextItem> {
+    use lopdf::{dictionary, Document, Stream};
+
+    let field = |clip: &str, x: u32, text: &str| {
+        format!("q {clip} BT /F1 12 Tf 10 Tz 1 0 0 1 {x} 100 Tm ({text}) Tj ET Q\n")
+    };
+    let content = if visual_order {
+        field(left_clip, 50, "AB") + &field(right_clip, 52, "CD")
+    } else {
+        field(right_clip, 52, "DC") + &field(left_clip, 50, "BA")
+    };
+    let mut doc = Document::load_mem(&make_text_pdf(&content, "0 0 300 300")).unwrap();
+    let cmap = doc.add_object(Stream::new(
+        dictionary! {},
+        b"begincmap\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+          4 beginbfchar\n<41> <05D0>\n<42> <05D1>\n<43> <05D2>\n<44> <05D3>\n\
+          endbfchar\nendcmap"
+            .to_vec(),
+    ));
+    let font = doc.get_object_mut((5, 0)).unwrap().as_dict_mut().unwrap();
+    font.set("ToUnicode", cmap);
+    font.set("FirstChar", 65);
+    font.set("LastChar", 68);
+    font.set("Widths", vec![lopdf::Object::Integer(500); 4]);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    extract_text_with_positions_mem(&bytes).unwrap()
+}
+
+#[test]
+fn separated_rtl_clips_keep_runs_in_both_text_storage_orders() {
+    for visual_order in [false, true] {
+        let items = clipped_rtl_items("50 98 1.3 15 re W n", "52 98 1.3 15 re W n", visual_order);
+        assert_eq!(
+            items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+            ["\u{05D1}\u{05D0}", "\u{05D3}\u{05D2}"]
+        );
+        assert_eq!(items.iter().map(|i| i.x).collect::<Vec<_>>(), [50.0, 52.0]);
+        assert!(items.iter().all(|i| i.advance_known));
+        // These narrow, measured runs would otherwise merge; their clip
+        // association must survive visual-order character correction too.
+        assert_eq!(clipped_rtl_items("", "", visual_order).len(), 1);
+    }
+}
+
+#[test]
+fn rtl_clips_still_require_separation_and_contained_advances() {
+    for (left, right) in [
+        ("50 98 10 15 re W n", "50 98 10 15 re W n"),
+        ("50 98 2 15 re W n", "52 98 1.3 15 re W n"),
+        ("50 98 2.2 15 re W n", "52 98 1.3 15 re W n"),
+        ("50 98 1.995 15 re W n", "52 98 1.3 15 re W n"),
+        ("50 98 1.1 15 re W n", "52 98 1.3 15 re W n"),
+        ("50 98 1.3 15 re W n", ""),
+        ("50 98 1.3 15 re W n", "52 98 m 54 98 l 54 110 l h W n"),
+    ] {
+        assert_eq!(
+            clipped_rtl_items(left, right, true).len(),
+            1,
+            "{left}; {right}"
+        );
+    }
+}
+
 #[test]
 fn clip_rounding_gaps_and_rotated_page_frames_keep_existing_output() {
     let touching = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")

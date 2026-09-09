@@ -150,10 +150,11 @@ pub(super) fn separated_runs(
     next_clip: Option<&ClipRect>,
 ) -> bool {
     match (previous_clip, next_clip) {
-        (Some(left), Some(right)) => {
-            left.right + TOLERANCE < right.left
-                && left.contains_advance(previous)
-                && right.contains_advance(next)
+        (Some(previous_rect), Some(next_rect)) => {
+            (previous_rect.right + TOLERANCE < next_rect.left
+                || next_rect.right + TOLERANCE < previous_rect.left)
+                && previous_rect.contains_advance(previous)
+                && next_rect.contains_advance(next)
         }
         _ => false,
     }
