@@ -1,0 +1,23 @@
+tests/symbol_rewrite_evidence.rs
+  s_f5ff107f39c26a::t_27964b58414486 132-136
+src/tables/mod.rs
+  s_f5ff107f39c26a::t_de0d1c9a28c791 331,358,1607,1631,1646-1661
+src/tables/financial.rs
+  s_f5ff107f39c26a::t_de0d1c9a28c791 108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d7f12241292b2b30b9df77fb3426ed89097dea40",
+  "prompts": {},
+  "sessions": {
+    "s_f5ff107f39c26a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07e0d-7783-7e81-b6a9-5492ed984ceb",
+        "model": "gpt-6-astra"
+      },
+      "human_author": null
+    }
+  }
+}
