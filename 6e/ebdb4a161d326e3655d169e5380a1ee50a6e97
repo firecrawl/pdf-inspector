@@ -1,0 +1,19 @@
+src/extractor/mod.rs
+  s_f5ff107f39c26a::t_bc050dbd649940 6,1215-1221,1226-1233,1278,1340-1348,1426,1456,1603,1623-1666,2027,2048,2069,2860,2881,2902,2934,2955,2976,3010,3051,3093,3114,3135,3164,3308,3329,3360,3381,3428,3479,3530,3574
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6eebdb4a161d326e3655d169e5380a1ee50a6e97",
+  "prompts": {},
+  "sessions": {
+    "s_f5ff107f39c26a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07e0d-7783-7e81-b6a9-5492ed984ceb",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
