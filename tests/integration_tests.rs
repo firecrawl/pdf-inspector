@@ -5029,3 +5029,205 @@ BT /F1 12 Tf 0 -1 1 0 320 704 Tm (LINE) Tj ET";
         );
     }
 }
+
+fn clipped_run_items(content: &str) -> Vec<TextItem> {
+    extract_text_with_positions_mem(&make_text_pdf(content, "0 0 300 300")).unwrap()
+}
+
+fn clipped_field(clip: &str, x: f32, text: &str) -> String {
+    format!("q {clip} BT /F1 12 Tf 1 0 0 1 {x} 100 Tm ({text}) Tj ET Q\n")
+}
+
+#[test]
+fn separated_rectangular_clips_preserve_independent_measured_runs() {
+    let content = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + &clipped_field("84 98 25 15 re W* n", 84.0, "Beta")
+        + &clipped_field("112 98 45 15 re W n", 112.0, "Gamma");
+    let items = clipped_run_items(&content);
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["Alpha", "Beta", "Gamma"]
+    );
+    assert!(items.iter().all(|i| i.advance_known));
+    assert_eq!(
+        items.iter().map(|i| i.x).collect::<Vec<_>>(),
+        [50.0, 84.0, 112.0]
+    );
+}
+
+#[test]
+fn same_touching_overlapping_and_unknown_clips_keep_existing_merges() {
+    for (left, right) in [
+        ("50 98 100 15 re W n", "50 98 100 15 re W n"),
+        ("50 98 34 15 re W n", "84 98 25 15 re W n"),
+        ("50 98 36 15 re W n", "84 98 25 15 re W n"),
+        ("", ""),
+        ("50 98 31 15 re W n", ""),
+        ("", "84 98 25 15 re W n"),
+        ("50 98 31 15 re W n", "84 98 m 109 98 l 109 113 l h W n"),
+        ("50 98 31 15 re W n", "84 98 25 15 re 200 0 1 1 re W n"),
+    ] {
+        let content = clipped_field(left, 50.0, "Alpha") + &clipped_field(right, 84.0, "Beta");
+        let items = clipped_run_items(&content);
+        assert_eq!(items.len(), 1, "{left} / {right}: {items:?}");
+        assert_eq!(items[0].text, "Alpha Beta");
+    }
+    let currency = clipped_field("50 98 9 15 re W n", 50.0, "$")
+        + &clipped_field("59 98 20 15 re W n", 59.0, "60");
+    assert_eq!(clipped_run_items(&currency)[0].text, "$ 60");
+}
+
+#[test]
+fn clipping_preserves_prose_and_text_operator_fragments_within_one_clip() {
+    let prose = "q 40 90 150 40 re W n BT /F1 12 Tf 50 100 Td [(Al) (pha)] TJ ET \
+        q BT /F1 12 Tf 84 100 Td (Beta) Tj ET Q Q";
+    assert_eq!(clipped_run_items(prose)[0].text, "Alpha Beta");
+    // Each source word belongs to its own separated clip, regardless of whether
+    // downstream layout uses the words as prose or as fields.
+    let fields = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + &clipped_field("84 98 31 15 re W n", 84.0, "Alpha");
+    assert_eq!(
+        clipped_run_items(&fields)
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha", "Alpha"]
+    );
+}
+
+#[test]
+fn clip_sidecar_stays_aligned_across_skipped_text_and_graphics_restore() {
+    let content = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + "BT /F1 12 Tf 3 Tr (Hidden) Tj () TJ ET\n"
+        + &clipped_field("84 98 25 15 re W n", 84.0, "Beta");
+    let items = clipped_run_items(&content);
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["Alpha", "Beta"]
+    );
+}
+
+#[test]
+fn nested_clips_and_transformed_paths_preserve_only_proven_boundaries() {
+    let left = "q 0 0 200 200 re W n 50 98 31 15 re W n \
+        1 0 0 1 10 0 cm BT /F1 12 Tf 40 100 Td (Alpha) Tj ET Q\n";
+    let right = "q 2 0 0 1 0 0 cm 42 98 12.5 15 re W n \
+        0.5 0 0 1 0 0 cm BT /F1 12 Tf 84 100 Td (Beta) Tj ET Q";
+    let items = clipped_run_items(&(left.to_string() + right));
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["Alpha", "Beta"]
+    );
+}
+
+#[test]
+fn partially_clipped_or_unmeasured_advances_do_not_prove_a_boundary() {
+    let content = clipped_field("50 98 15 15 re W n", 50.0, "Alpha")
+        + &clipped_field("84 98 25 15 re W n", 84.0, "Beta");
+    assert_eq!(clipped_run_items(&content)[0].text, "Alpha Beta");
+    let content = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + &clipped_field("84 98 25 15 re W n", 84.0, "Beta");
+    let bytes = make_text_pdf(&content, "0 0 300 300");
+    let unknown_font = String::from_utf8(bytes)
+        .unwrap()
+        .replace("/Helvetica", "/UnknownXX");
+    let items = extract_text_with_positions_mem(unknown_font.as_bytes()).unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(!items[0].advance_known);
+}
+
+#[test]
+fn clip_provenance_does_not_guess_form_or_actual_text_boundaries() {
+    use lopdf::{dictionary, Object, Stream};
+    let content = "q 50 98 31 15 re W n /A Do Q q 84 98 25 15 re W n /B Do Q";
+    let mut doc = lopdf::Document::load_mem(&make_text_pdf(content, "0 0 300 300")).unwrap();
+    let a = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(),0.into(),300.into(),300.into()],
+        },
+        b"BT /F1 12 Tf 50 100 Td (Alpha) Tj ET".to_vec(),
+    ));
+    let b = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(),0.into(),300.into(),300.into()],
+        },
+        b"BT /F1 12 Tf 84 100 Td (Beta) Tj ET".to_vec(),
+    ));
+    let page_id = doc.get_pages()[&1];
+    doc.get_dictionary_mut(page_id)
+        .unwrap()
+        .get_mut(b"Resources")
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set(
+            "XObject",
+            dictionary! {"A"=>Object::Reference(a),"B"=>Object::Reference(b)},
+        );
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let items = extract_text_with_positions_mem(&bytes).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].text, "Alpha Beta");
+    let actual = "q 50 98 31 15 re W n BT /F1 12 Tf 50 100 Td \
+        /Span << /ActualText (Alpha) >> BDC (Alpha) Tj EMC ET Q \
+        q 84 98 25 15 re W n BT /F1 12 Tf 84 100 Td \
+        /Span << /ActualText (Beta) >> BDC (Beta) Tj EMC ET Q";
+    assert_eq!(clipped_run_items(actual)[0].text, "Alpha Beta");
+}
+
+#[test]
+fn clipping_provenance_follows_sorted_items_and_supported_show_operators() {
+    let content = "q 112 98 45 15 re W n BT /F1 12 Tf 112 100 Td (Gamma) Tj ET Q \
+        q 50 98 31 15 re W n BT /F1 12 Tf 50 100 Td [(Al) (pha)] TJ ET Q \
+        q 84 98 25 15 re W n BT /F1 12 Tf 84 112 Td 12 TL (Beta) ' ET Q";
+    assert_eq!(
+        clipped_run_items(content)
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha", "Beta", "Gamma"]
+    );
+}
+
+#[test]
+fn clip_rounding_gaps_and_rotated_page_frames_keep_existing_output() {
+    let touching = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + &clipped_field("81.005 98 28 15 re W n", 84.0, "Beta");
+    assert_eq!(clipped_run_items(&touching)[0].text, "Alpha Beta");
+    let rotated = "q 98 50 15 31 re W n BT /F1 12 Tf 0 1 -1 0 100 50 Tm (Alpha) Tj ET Q \
+        q 98 84 15 25 re W n BT /F1 12 Tf 0 1 -1 0 100 84 Tm (Beta) Tj ET Q";
+    let unclipped = rotated
+        .replace("98 50 15 31 re W n", "")
+        .replace("98 84 15 25 re W n", "");
+    let observed = clipped_run_items(rotated);
+    let control = clipped_run_items(&unclipped);
+    assert_eq!(
+        observed
+            .iter()
+            .map(|i| (&i.text, i.x, i.y, i.width))
+            .collect::<Vec<_>>(),
+        control
+            .iter()
+            .map(|i| (&i.text, i.x, i.y, i.width))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn separated_clipped_word_fragments_keep_text_when_assembled() {
+    let content = clipped_field("50 98 10.8 15 re W n", 50.0, "Al")
+        + &clipped_field("61 98 21 15 re W n", 61.0, "pha");
+    let items = clipped_run_items(&content);
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["Al", "pha"]
+    );
+    let md = process_pdf_mem(&make_text_pdf(&content, "0 0 300 300"))
+        .unwrap()
+        .markdown
+        .unwrap();
+    assert_eq!(md.trim(), "Alpha");
+}

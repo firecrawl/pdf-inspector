@@ -479,7 +479,18 @@ pub(crate) fn extract_page_text_items(
         stack.iter().rev().find_map(|e| e.mcid)
     }
 
+    let mut clips = super::clip_boundaries::ClipTracker::default();
+    let mut item_clips = Vec::new();
+    let mut shown_clip = None;
     for op in &content.operations {
+        // Record all items appended by the preceding operator, including paths
+        // that continue the loop early. Forms and ActualText remain unproven.
+        item_clips.resize(items.len(), shown_clip);
+        clips.observe(&op.operator, &op.operands, ctm);
+        shown_clip = match op.operator.as_str() {
+            "Tj" | "TJ" | "'" => clips.rect(),
+            _ => None,
+        };
         trace!("{} {:?}", op.operator, op.operands);
         text_paint.observe(&op.operator, &op.operands, &paint_resources);
         match op.operator.as_str() {
@@ -1905,6 +1916,8 @@ pub(crate) fn extract_page_text_items(
         }
     }
 
+    item_clips.resize(items.len(), shown_clip);
+
     // Reverse visual-order RTL runs while candidate indexes are still valid
     // (merge_text_items below reshapes the item list).
     crate::text_utils::fix_visual_order_rtl(&mut items, &rtl_visual_candidates, rtl_logical_ops);
@@ -1925,7 +1938,13 @@ pub(crate) fn extract_page_text_items(
         page_num,
     );
 
-    let items = super::merge_text_items(items);
+    let items = if page_rotation == PageRotation::Upright {
+        super::merge_text_items_with_clips(items, &item_clips)
+    } else {
+        // Clips use the original page frame; rotated-page correction is an
+        // intentionally unsupported provenance case.
+        super::merge_text_items(items)
+    };
     let items = super::merge_subscript_items(items);
     Ok((
         (items, rects, lines),

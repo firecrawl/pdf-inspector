@@ -3,6 +3,7 @@
 //! This module extracts text with position information for structure detection.
 
 mod base14;
+mod clip_boundaries;
 mod content_decode;
 pub(crate) mod content_stream;
 mod fonts;
@@ -1211,9 +1212,24 @@ fn trimmed_suffix(next: &TextItem) -> &str {
 }
 
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
+    merge_text_items_with_clips(items, &[])
+}
+
+fn merge_text_items_with_clips(
+    items: Vec<TextItem>,
+    clips: &[Option<clip_boundaries::ClipRect>],
+) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
     }
+
+    // References into `items` remain stable throughout grouping and sorting.
+    // Keep clipping provenance private rather than changing the public item type.
+    let clip_by_item: HashMap<*const TextItem, clip_boundaries::ClipRect> = items
+        .iter()
+        .zip(clips)
+        .filter_map(|(item, clip)| clip.map(|rect| (item as *const TextItem, rect)))
+        .collect();
 
     // Group items by (page, Y position) with 5pt tolerance
     let y_tolerance = 5.0;
@@ -1318,6 +1334,15 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     break;
                 }
                 if gap < -first.font_size * 0.5 && !preserve_stream_order {
+                    break;
+                }
+                let previous = group[j - 1];
+                if clip_boundaries::separated_runs(
+                    previous,
+                    clip_by_item.get(&(previous as *const TextItem)),
+                    next,
+                    clip_by_item.get(&(next as *const TextItem)),
+                ) {
                     break;
                 }
                 // Vertically stacked DIGITS at different baselines — the
