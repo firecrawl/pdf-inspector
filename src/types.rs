@@ -17,8 +17,14 @@ pub(crate) type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
 /// Font encoding map: maps byte codes to Unicode characters
 pub(crate) type FontEncodingMap = HashMap<u8, char>;
 
+/// Explicit glyph encodings and narrowly verified repairs for a stale CMap.
+pub(crate) struct FontEncoding {
+    pub(crate) differences: FontEncodingMap,
+    pub(crate) identity_overrides: FontEncodingMap,
+}
+
 /// All font encodings for a page
-pub(crate) type PageFontEncodings = HashMap<String, FontEncodingMap>;
+pub(crate) type PageFontEncodings = HashMap<String, FontEncoding>;
 
 /// Font width information extracted from PDF font dictionaries
 #[derive(Debug, Clone)]
