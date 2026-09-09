@@ -40,7 +40,7 @@ pub use download::{HttpModelDownloadError, HttpModelDownloader, DEFAULT_MODEL_DO
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use fusion::{
     fuse_ocr_pages, ocr_page_to_markdown, FusedPageMarkdown, FusedPages, OcrFusionError,
-    OcrFusionOptions,
+    OcrFusionOptions, OcrTextSpan,
 };
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 pub use models::{

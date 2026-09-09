@@ -102,6 +102,8 @@ result = pdf_inspector.extract_pages_markdown("document.pdf", pages=[0, 2])
 ocr = pdf_inspector.process_pdf_with_ocr("document.pdf")
 for page in ocr.pages:
     print(page.page_number, page.provenance.source)
+    for span in page.spans:
+        print(span.text, span.x, span.y, span.width, span.height, span.confidence)
 
 # Restrict OCR processing to 1-indexed PDF pages and prohibit downloads.
 ocr = pdf_inspector.process_pdf_with_ocr(
@@ -193,7 +195,16 @@ class OcrPageProvenance:
 class OcrPageResult:
     page_number: int                 # 1-indexed
     markdown: str
+    spans: list[OcrTextSpan]         # empty unless OCR ran for this page
     provenance: OcrPageProvenance
+
+class OcrTextSpan:                   # OCR recognition line, in recognition order
+    text: str
+    x: float                         # PDF points, same visible-page frame as TextItem
+    y: float                         # y grows upward
+    width: float                     # axis-aligned rectangle
+    height: float
+    confidence: float                 # 0.0 - 1.0
 
 class OcrPdfResult:                  # process_pdf_with_ocr / bytes
     markdown: str

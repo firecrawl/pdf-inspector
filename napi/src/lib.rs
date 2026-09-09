@@ -240,12 +240,33 @@ pub struct OcrPageProvenance {
     pub hosted_recommended: bool,
 }
 
+/// Positioned OCR recognition result, same coordinate frame as TextItem
+/// (PDF points, axis-aligned box). For text layers, highlight geometries,
+/// and confidence visualization without re-running OCR.
+#[napi(object)]
+pub struct OcrTextSpan {
+    /// Recognized line text, trimmed.
+    pub text: String,
+    /// Axis-aligned box, same frame as TextItem.
+    pub x: f64,
+    /// Axis-aligned box, same frame as TextItem.
+    pub y: f64,
+    /// Axis-aligned box, same frame as TextItem.
+    pub width: f64,
+    /// Axis-aligned box, same frame as TextItem.
+    pub height: f64,
+    /// Recognition confidence in the inclusive range 0–1.
+    pub confidence: f64,
+}
+
 /// Final Markdown and provenance for one page.
 #[napi(object)]
 pub struct OcrPageResult {
     /// 1-indexed page number.
     pub page_number: u32,
     pub markdown: String,
+    /// Accepted OCR spans with geometry; empty unless OCR ran for the page.
+    pub spans: Vec<OcrTextSpan>,
     pub provenance: OcrPageProvenance,
 }
 
@@ -370,6 +391,18 @@ fn to_napi_ocr_result(result: pdf_inspector::vision::OcrPdfResult) -> OcrPdfResu
                 OcrPageResult {
                     page_number: page.page_number,
                     markdown: page.markdown,
+                    spans: page
+                        .spans
+                        .into_iter()
+                        .map(|span| OcrTextSpan {
+                            text: span.text,
+                            x: f64::from(span.x),
+                            y: f64::from(span.y),
+                            width: f64::from(span.width),
+                            height: f64::from(span.height),
+                            confidence: f64::from(span.confidence),
+                        })
+                        .collect(),
                     provenance: OcrPageProvenance {
                         page_number: provenance.page_number,
                         source: convert_page_content_source(provenance.source),
@@ -1240,4 +1273,78 @@ pub fn extract_pages_markdown_async(
         bytes: buffer.to_vec(),
         pages,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pdf_inspector::vision::{
+        FusedPageMarkdown, OcrPdfResult as CoreOcrPdfResult, OcrTextSpan as CoreOcrTextSpan,
+        PageContentSource, PageProvenance, VisionTimings,
+    };
+
+    fn page(page_number: u32, spans: Vec<CoreOcrTextSpan>) -> FusedPageMarkdown {
+        FusedPageMarkdown {
+            page_number,
+            markdown: format!("page {page_number}"),
+            spans,
+            provenance: PageProvenance {
+                page_number,
+                source: if page_number == 1 {
+                    PageContentSource::Ocr
+                } else {
+                    PageContentSource::Native
+                },
+                ocr_model: None,
+                render_dpi: None,
+                ocr_confidence: None,
+                timings: VisionTimings::default(),
+                warnings: Vec::new(),
+                hosted_recommended: false,
+            },
+        }
+    }
+
+    #[test]
+    fn maps_positioned_ocr_spans_into_napi_result() {
+        let result = CoreOcrPdfResult {
+            markdown: "page 1\npage 2".into(),
+            pages: vec![
+                page(
+                    1,
+                    vec![CoreOcrTextSpan {
+                        text: "Chapter title".into(),
+                        x: 12.5,
+                        y: 56.0,
+                        width: 180.25,
+                        height: 14.0,
+                        confidence: 0.97,
+                    }],
+                ),
+                page(2, Vec::new()),
+            ],
+            page_count: 2,
+            pages_recommended_for_ocr: vec![1],
+            pages_routed_to_ocr: vec![1],
+            pages_recommending_hosted: Vec::new(),
+            ocr_reasons_by_page: Vec::new(),
+            pages_with_tables: Vec::new(),
+            pages_with_columns: Vec::new(),
+            is_complex: false,
+            processing_time_ms: 10,
+            render_time_ms: 4,
+            ocr_time_ms: 5,
+        };
+
+        let mapped = to_napi_ocr_result(result);
+        assert_eq!(mapped.pages[0].spans.len(), 1);
+        let span = &mapped.pages[0].spans[0];
+        assert_eq!(span.text, "Chapter title");
+        assert_eq!(span.x, 12.5);
+        assert_eq!(span.y, 56.0);
+        assert_eq!(span.width, 180.25);
+        assert_eq!(span.height, 14.0);
+        assert!((span.confidence - 0.97).abs() < 1e-6);
+        assert!(mapped.pages[1].spans.is_empty());
+    }
 }

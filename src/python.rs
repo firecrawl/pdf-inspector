@@ -131,6 +131,31 @@ pub struct PyOcrPageProvenance {
     pub hosted_recommended: bool,
 }
 
+/// Positioned OCR recognition result, same coordinate frame as TextItem
+/// (PDF points, axis-aligned box).
+#[pyclass(name = "OcrTextSpan")]
+#[derive(Clone)]
+pub struct PyOcrTextSpan {
+    /// Recognized line text, trimmed.
+    #[pyo3(get)]
+    pub text: String,
+    /// Axis-aligned box, same frame as TextItem.
+    #[pyo3(get)]
+    pub x: f32,
+    /// Axis-aligned box, same frame as TextItem.
+    #[pyo3(get)]
+    pub y: f32,
+    /// Axis-aligned box, same frame as TextItem.
+    #[pyo3(get)]
+    pub width: f32,
+    /// Axis-aligned box, same frame as TextItem.
+    #[pyo3(get)]
+    pub height: f32,
+    /// Recognition confidence in the inclusive range 0–1.
+    #[pyo3(get)]
+    pub confidence: f32,
+}
+
 /// Final Markdown and provenance for one page.
 #[pyclass(name = "OcrPageResult")]
 #[derive(Clone)]
@@ -140,6 +165,9 @@ pub struct PyOcrPageResult {
     pub page_number: u32,
     #[pyo3(get)]
     pub markdown: String,
+    /// Accepted OCR spans with geometry; empty unless OCR ran for the page.
+    #[pyo3(get)]
+    pub spans: Vec<PyOcrTextSpan>,
     #[pyo3(get)]
     pub provenance: PyOcrPageProvenance,
 }
@@ -557,6 +585,18 @@ fn to_py_ocr_result(result: crate::vision::OcrPdfResult) -> PyOcrPdfResult {
                 PyOcrPageResult {
                     page_number: page.page_number,
                     markdown: page.markdown,
+                    spans: page
+                        .spans
+                        .into_iter()
+                        .map(|span| PyOcrTextSpan {
+                            text: span.text,
+                            x: span.x,
+                            y: span.y,
+                            width: span.width,
+                            height: span.height,
+                            confidence: span.confidence,
+                        })
+                        .collect(),
                     provenance: PyOcrPageProvenance {
                         page_number: provenance.page_number,
                         source: page_content_source_str(provenance.source),
@@ -635,6 +675,89 @@ fn convert_structure_elements(elements: Vec<crate::StructureElement>) -> Vec<PyS
             role: e.role,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vision::{
+        FusedPageMarkdown, OcrPdfResult, OcrTextSpan, PageContentSource, PageProvenance,
+        VisionTimings,
+    };
+
+    fn page(page_number: u32, spans: Vec<OcrTextSpan>) -> FusedPageMarkdown {
+        FusedPageMarkdown {
+            page_number,
+            markdown: format!("page {page_number}"),
+            spans,
+            provenance: PageProvenance {
+                page_number,
+                source: if page_number == 1 {
+                    PageContentSource::Ocr
+                } else {
+                    PageContentSource::Native
+                },
+                ocr_model: None,
+                render_dpi: None,
+                ocr_confidence: None,
+                timings: VisionTimings::default(),
+                warnings: Vec::new(),
+                hosted_recommended: false,
+            },
+        }
+    }
+
+    #[test]
+    fn maps_positioned_ocr_spans_into_python_result() {
+        let result = OcrPdfResult {
+            markdown: "page 1\npage 2".into(),
+            pages: vec![
+                page(
+                    1,
+                    vec![OcrTextSpan {
+                        text: "Chapter title".into(),
+                        x: 12.5,
+                        y: 56.0,
+                        width: 180.25,
+                        height: 14.0,
+                        confidence: 0.97,
+                    }],
+                ),
+                page(2, Vec::new()),
+            ],
+            page_count: 2,
+            pages_recommended_for_ocr: vec![1],
+            pages_routed_to_ocr: vec![1],
+            pages_recommending_hosted: Vec::new(),
+            ocr_reasons_by_page: Vec::new(),
+            pages_with_tables: Vec::new(),
+            pages_with_columns: Vec::new(),
+            is_complex: false,
+            processing_time_ms: 10,
+            render_time_ms: 4,
+            ocr_time_ms: 5,
+        };
+
+        let mapped = to_py_ocr_result(result);
+        assert_eq!(mapped.pages[0].spans.len(), 1);
+        let span = &mapped.pages[0].spans[0];
+        assert_eq!(span.text, "Chapter title");
+        assert_eq!(span.x, 12.5);
+        assert_eq!(span.y, 56.0);
+        assert_eq!(span.width, 180.25);
+        assert_eq!(span.height, 14.0);
+        assert_eq!(span.confidence, 0.97);
+        assert!(mapped.pages[1].spans.is_empty());
+    }
+
+    #[test]
+    fn exports_ocr_text_span_type_from_python_module() {
+        Python::with_gil(|py| {
+            let module = PyModule::new(py, "pdf_inspector").expect("create test module");
+            pdf_inspector(&module).expect("initialize Python module");
+            assert!(module.getattr("OcrTextSpan").is_ok());
+        });
+    }
 }
 
 fn parse_page_regions(
@@ -1129,6 +1252,7 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOcrModelIdentity>()?;
     m.add_class::<PyOcrTimings>()?;
     m.add_class::<PyOcrPageProvenance>()?;
+    m.add_class::<PyOcrTextSpan>()?;
     m.add_class::<PyOcrPageResult>()?;
     m.add_class::<PyOcrPdfResult>()?;
     m.add_class::<PyPdfClassification>()?;

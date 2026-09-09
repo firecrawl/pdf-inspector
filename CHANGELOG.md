@@ -7,6 +7,16 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Added
+
+- `FusedPageMarkdown::spans`: accepted OCR spans with PDF-space geometry
+  (same frame as `TextItem`), so consumers can place recognized text
+  themselves — selectable text layers, highlight geometries, confidence
+  visualization. Exposed as `spans` on the Node and Python `OcrPageResult`.
+  Empty unless OCR ran for the page.
+
 ## [1.18.0] - 2026-09-07
 
 Changes since 1.17.0.
