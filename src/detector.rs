@@ -1032,6 +1032,19 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
             if embedded_font_has_cmap(doc, ff_ref) {
                 return true;
             }
+            // Fallback 3: no cmap, but the glyph order is the standard
+            // Macintosh one and the metrics corroborate it (see
+            // `mac_glyph_order`); extraction decodes it.
+            if crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc)
+                && doc
+                    .get_object(ff_ref)
+                    .and_then(Object::as_stream)
+                    .ok()
+                    .and_then(|stream| stream.decompressed_content().ok())
+                    .is_some_and(|data| crate::mac_glyph_order::font_file_follows_mac_order(&data))
+            {
+                return true;
+            }
         }
     }
 

@@ -291,13 +291,21 @@ pub(crate) fn cid_to_gid_is_identity(cid_font_dict: &lopdf::Dictionary, doc: &Do
     }
 }
 
+/// Whether an Identity CIDFont's embedded program decodes through the
+/// standard Macintosh order: the detector's view of the same decision, so
+/// pages this rescues are not routed to OCR.
+pub(crate) fn font_file_follows_mac_order(font_data: &[u8]) -> bool {
+    build_cmap_from_mac_glyph_order(font_data).is_some()
+}
+
 /// Build a GID→Unicode CMap for a TrueType font that has neither a `cmap`
 /// table nor glyph names, assuming the standard Macintosh glyph order.
 ///
 /// The assumption is only accepted when the font's own metrics corroborate
 /// it: at least three glyphs at the digit positions (19–28) exist and share
 /// one advance, as tabular figures do; the glyph at the space position (3)
-/// advances without an outline; `i` and `l` are narrower than `m` and `w`;
+/// advances without an outline; every present `i` and `l` is narrower than
+/// every present `m` and `w`;
 /// and capitals average wider than lowercase. Each check only applies to
 /// glyphs the subset kept. Everything else keeps today's behaviour.
 pub(crate) fn build_cmap_from_mac_glyph_order(font_data: &[u8]) -> Option<ToUnicodeCMap> {
@@ -338,14 +346,12 @@ pub(crate) fn build_cmap_from_mac_glyph_order(font_data: &[u8]) -> Option<ToUnic
     // fails these as often as it passes them.
     // A subset too sparse to run any of them is left alone.
     let mut letter_checks = 0usize;
-    let narrow = [advance(76), advance(79)]; // i l
-    let wide = [advance(80), advance(90)]; // m w
-    for (n, w) in narrow.iter().zip(wide) {
-        if let (Some(n), Some(w)) = (n, w) {
-            letter_checks += 1;
-            if *n >= w {
-                return None;
-            }
+    let narrow: Vec<u16> = [76u16, 79].into_iter().filter_map(advance).collect(); // i l
+    let wide: Vec<u16> = [80u16, 90].into_iter().filter_map(advance).collect(); // m w
+    if let (Some(widest_narrow), Some(narrowest_wide)) = (narrow.iter().max(), wide.iter().min()) {
+        letter_checks += 1;
+        if widest_narrow >= narrowest_wide {
+            return None;
         }
     }
     let mean = |range: std::ops::RangeInclusive<u16>| {

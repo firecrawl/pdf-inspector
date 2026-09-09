@@ -6,6 +6,12 @@ use lopdf::{dictionary, Document, Object, Stream};
 /// `glyf` but no `cmap` and no `post` names. Glyph `i` is `(outlined,
 /// advance)`; a missing glyph is `(false, 0)`.
 fn cmapless_truetype(glyphs: &[(bool, u16)]) -> Vec<u8> {
+    truetype(glyphs, false, false)
+}
+
+/// The same font, optionally with a (3,1) `cmap` mapping `A` to glyph 36,
+/// or a `post` format 2 table naming glyph 36 `A`.
+fn truetype(glyphs: &[(bool, u16)], with_cmap: bool, with_post_names: bool) -> Vec<u8> {
     let square: Vec<u8> = {
         let mut g = Vec::new();
         g.extend(1i16.to_be_bytes());
@@ -54,6 +60,43 @@ fn cmapless_truetype(glyphs: &[(bool, u16)]) -> Vec<u8> {
         (b"loca", loca),
         (b"maxp", maxp),
     ];
+    if with_cmap {
+        // One (3,1) format 4 subtable with a single segment: 'A' → glyph 36.
+        let mut cmap = Vec::new();
+        cmap.extend(0u16.to_be_bytes());
+        cmap.extend(1u16.to_be_bytes());
+        cmap.extend(3u16.to_be_bytes());
+        cmap.extend(1u16.to_be_bytes());
+        cmap.extend(12u32.to_be_bytes());
+        let seg_count_x2 = 4u16; // 'A' segment + 0xFFFF terminator
+        cmap.extend(4u16.to_be_bytes()); // format
+        cmap.extend(32u16.to_be_bytes()); // length
+        cmap.extend(0u16.to_be_bytes()); // language
+        cmap.extend(seg_count_x2.to_be_bytes());
+        cmap.extend([0u8; 6]); // searchRange, entrySelector, rangeShift
+        cmap.extend(0x41u16.to_be_bytes()); // endCode
+        cmap.extend(0xFFFFu16.to_be_bytes());
+        cmap.extend(0u16.to_be_bytes()); // reservedPad
+        cmap.extend(0x41u16.to_be_bytes()); // startCode
+        cmap.extend(0xFFFFu16.to_be_bytes());
+        cmap.extend((36u16.wrapping_sub(0x41)).to_be_bytes()); // idDelta
+        cmap.extend(1u16.to_be_bytes());
+        cmap.extend(0u16.to_be_bytes()); // idRangeOffset
+        cmap.extend(0u16.to_be_bytes());
+        tables.push((b"cmap", cmap));
+    }
+    if with_post_names {
+        // post format 2: glyph 36 carries the custom name "A", the rest .notdef.
+        let mut post = Vec::new();
+        post.extend(0x0002_0000u32.to_be_bytes());
+        post.extend([0u8; 28]);
+        post.extend(num_glyphs.to_be_bytes());
+        for gid in 0..num_glyphs {
+            post.extend(if gid == 36 { 258u16 } else { 0u16 }.to_be_bytes());
+        }
+        post.extend([1u8, b'A']);
+        tables.push((b"post", post));
+    }
     tables.sort_by_key(|(tag, _)| **tag);
     let mut font = Vec::new();
     font.extend(0x0001_0000u32.to_be_bytes());
@@ -135,13 +178,24 @@ fn mac_order_needs_a_blank_advancing_space_glyph() {
 }
 
 #[test]
-fn mac_order_is_not_used_when_the_font_has_a_cmap_or_names() {
-    // The regular cmap path owns fonts with a cmap; a font with names goes
-    // through the post-table path. Both are represented by real fonts in the
-    // wider suite; here the builder must simply decline a font whose glyph
-    // count is too small to hold the digit run.
+fn mac_order_declines_a_font_too_small_for_the_digit_run() {
     let font = cmapless_truetype(&[(true, 750), (false, 0), (false, 0), (false, 278)]);
     assert!(build_cmap_from_mac_glyph_order(&font).is_none());
+}
+
+#[test]
+fn mac_order_is_not_used_when_the_font_has_a_cmap_or_glyph_names() {
+    // A cmap or post names are authoritative; those fonts take the regular
+    // embedded-cmap and glyph-name paths instead.
+    let glyphs = arial_like(&[556; 10], (false, 278));
+    let with_cmap = truetype(&glyphs, true, false);
+    let face = ttf_parser::Face::parse(&with_cmap, 0).unwrap();
+    assert_eq!(face.glyph_index('A').map(|g| g.0), Some(36));
+    assert!(build_cmap_from_mac_glyph_order(&with_cmap).is_none());
+    let with_names = truetype(&glyphs, false, true);
+    let face = ttf_parser::Face::parse(&with_names, 0).unwrap();
+    assert_eq!(face.glyph_name(ttf_parser::GlyphId(36)), Some("A"));
+    assert!(build_cmap_from_mac_glyph_order(&with_names).is_none());
 }
 
 #[test]
@@ -165,7 +219,9 @@ fn cid_to_gid_identity_is_absent_or_named() {
 /// font with a CIDToGIDMap stream does not.
 #[test]
 fn identity_h_font_without_cmap_extracts_through_mac_order() {
-    for (cid_to_gid, expected) in [(None, "How many"), (Some(vec![0u8; 8]), "")] {
+    // With a CIDToGIDMap stream the CIDs are not glyph IDs, so the order is
+    // not applied and today's output stands: the CIDs as Latin-1 characters.
+    for (cid_to_gid, expected) in [(None, "How many"), (Some(vec![0u8; 8]), "+RZPDQ\\")] {
         let mut doc = Document::with_version("1.5");
         let font_file = doc.add_object(Stream::new(
             dictionary! {},
@@ -216,11 +272,7 @@ fn identity_h_font_without_cmap_extracts_through_mac_order() {
             .map(|item| item.text)
             .collect::<Vec<_>>()
             .join("|");
-        if expected.is_empty() {
-            assert!(!text.contains("How many"), "CIDToGIDMap stream: {text:?}");
-        } else {
-            assert_eq!(text, expected);
-        }
+        assert_eq!(text, expected, "CIDToGIDMap stream case");
     }
 }
 
@@ -265,4 +317,15 @@ fn mac_order_maps_only_slots_the_subset_kept() {
         !cmap.char_map.contains_key(&4),
         "exclam is not in the subset"
     );
+}
+
+#[test]
+fn mac_order_compares_every_narrow_letter_with_every_wide_one() {
+    // `i` narrower than `m` but `l` wider than `w`: a cross-pair violation.
+    let mut glyphs = arial_like(&[556; 10], (false, 278));
+    glyphs[76] = (true, 222); // i
+    glyphs[79] = (true, 800); // l
+    glyphs[80] = (true, 833); // m
+    glyphs[90] = (true, 722); // w
+    assert!(build_cmap_from_mac_glyph_order(&cmapless_truetype(&glyphs)).is_none());
 }

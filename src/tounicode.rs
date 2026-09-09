@@ -2340,8 +2340,13 @@ impl FontCMaps {
             // A subset stripped of both its cmap and its glyph names leaves
             // only the glyph order; fonts that keep the standard Macintosh
             // ordering still decode, when their metrics corroborate it. A
-            // predefined CID collection above is authoritative and wins.
-            if !resolved && crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc) {
+            // predefined CID collection above is authoritative and wins, and
+            // so does the CID-as-Unicode passthrough below: CIDs that look
+            // like Unicode are not glyph IDs.
+            if !resolved
+                && !cid_values_look_like_unicode(cid_font_dict)
+                && crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc)
+            {
                 if let Some(cmap) = font_data
                     .as_deref()
                     .and_then(crate::mac_glyph_order::build_cmap_from_mac_glyph_order)
