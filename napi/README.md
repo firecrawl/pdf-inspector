@@ -182,6 +182,22 @@ interface RegionText {
   ocrReason?: string        // "suspected_garbled_text" when known
 }
 
+interface OcrTextSpan {
+  text: string              // recognized OCR line, trimmed
+  x: number
+  y: number
+  width: number
+  height: number
+  confidence: number        // 0.0 - 1.0
+}
+
+interface OcrPageResult {
+  pageNumber: number        // 1-indexed
+  markdown: string
+  spans: OcrTextSpan[]      // empty unless OCR ran for this page
+  provenance: OcrPageProvenance
+}
+
 interface OcrPdfResult {
   markdown: string
   pages: OcrPageResult[]              // 1-indexed pages + provenance
@@ -198,6 +214,11 @@ interface OcrPdfResult {
   ocrTimeMs: number
 }
 ```
+
+`OcrTextSpan` rectangles are axis-aligned PDF-point boxes in the same visible-page
+coordinate frame as `TextItem`. They are OCR recognition lines, in recognition order.
+They remain available when fusion chooses native Markdown, but are empty for pages where
+OCR did not run.
 
 ## Platforms
 

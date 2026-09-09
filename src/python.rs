@@ -677,6 +677,80 @@ fn convert_structure_elements(elements: Vec<crate::StructureElement>) -> Vec<PyS
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vision::{
+        FusedPageMarkdown, OcrPdfResult, OcrTextSpan, PageContentSource, PageProvenance,
+        VisionTimings,
+    };
+
+    fn page(page_number: u32, spans: Vec<OcrTextSpan>) -> FusedPageMarkdown {
+        FusedPageMarkdown {
+            page_number,
+            markdown: format!("page {page_number}"),
+            spans,
+            provenance: PageProvenance {
+                page_number,
+                source: if page_number == 1 {
+                    PageContentSource::Ocr
+                } else {
+                    PageContentSource::Native
+                },
+                ocr_model: None,
+                render_dpi: None,
+                ocr_confidence: None,
+                timings: VisionTimings::default(),
+                warnings: Vec::new(),
+                hosted_recommended: false,
+            },
+        }
+    }
+
+    #[test]
+    fn maps_positioned_ocr_spans_into_python_result() {
+        let result = OcrPdfResult {
+            markdown: "page 1\npage 2".into(),
+            pages: vec![
+                page(
+                    1,
+                    vec![OcrTextSpan {
+                        text: "Chapter title".into(),
+                        x: 12.5,
+                        y: 56.0,
+                        width: 180.25,
+                        height: 14.0,
+                        confidence: 0.97,
+                    }],
+                ),
+                page(2, Vec::new()),
+            ],
+            page_count: 2,
+            pages_recommended_for_ocr: vec![1],
+            pages_routed_to_ocr: vec![1],
+            pages_recommending_hosted: Vec::new(),
+            ocr_reasons_by_page: Vec::new(),
+            pages_with_tables: Vec::new(),
+            pages_with_columns: Vec::new(),
+            is_complex: false,
+            processing_time_ms: 10,
+            render_time_ms: 4,
+            ocr_time_ms: 5,
+        };
+
+        let mapped = to_py_ocr_result(result);
+        assert_eq!(mapped.pages[0].spans.len(), 1);
+        let span = &mapped.pages[0].spans[0];
+        assert_eq!(span.text, "Chapter title");
+        assert_eq!(span.x, 12.5);
+        assert_eq!(span.y, 56.0);
+        assert_eq!(span.width, 180.25);
+        assert_eq!(span.height, 14.0);
+        assert_eq!(span.confidence, 0.97);
+        assert!(mapped.pages[1].spans.is_empty());
+    }
+}
+
 fn parse_page_regions(
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
 ) -> PyResult<Vec<(u32, Vec<[f32; 4]>)>> {
