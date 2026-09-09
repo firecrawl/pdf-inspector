@@ -805,12 +805,23 @@ pub(crate) fn build_font_encodings(
 /// render as.
 fn blank_glyph_reads_as_space(encoding: Option<&FontEncoding>, code: u8, label: &str) -> bool {
     encoding.is_some_and(|map| map.blank_codes.contains(&code))
-        && label.chars().any(|c| {
-            !matches!(
-                c,
-                '\u{00AD}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
-            )
-        })
+        && label.chars().any(|c| !is_invisible_format(c))
+}
+
+/// Characters that render as nothing by design: soft hyphen, zero-width
+/// spaces and joiners, bidi marks, embeddings and isolates, invisible math
+/// operators, byte order mark. A blank glyph labelled with one of these is
+/// the label's own rendering, not a stale space.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// Codes of a symbolic TrueType font whose glyph has no outline but a
@@ -861,7 +872,7 @@ fn blank_glyph_codes(
             let code = u32::from(code);
             for subtable in cmap.subtables {
                 let candidates: &[u32] = match (subtable.platform_id, subtable.encoding_id) {
-                    (PlatformId::Macintosh, _) => &[code],
+                    (PlatformId::Macintosh, 0) => &[code],
                     (PlatformId::Windows, 0) => {
                         &[0xF000 + code, 0xF100 + code, 0xF200 + code, code]
                     }
@@ -879,6 +890,7 @@ fn blank_glyph_codes(
         };
         let mut blank = std::collections::HashSet::new();
         let mut outlined = 0usize;
+        let mut mapped = 0usize;
         // Control codes never carry a word space; Word's subsets start at
         // 0x21 and other producers keep 0x00-0x1F for genuinely blank
         // control glyphs.
@@ -886,6 +898,7 @@ fn blank_glyph_codes(
             let Some(gid) = glyph_for(code) else {
                 continue;
             };
+            mapped += 1;
             if face.glyph_bounding_box(gid).is_some() {
                 outlined += 1;
                 continue;
@@ -901,7 +914,7 @@ fn blank_glyph_codes(
         // blank glyph, with one code mapped. With no outline anywhere, at
         // most two mapped codes still read as such a space subset; more is
         // an invisible text layer, which keeps its text.
-        if blank.is_empty() || (outlined == 0 && blank.len() > 2) {
+        if blank.is_empty() || (outlined == 0 && mapped > 2) {
             return None;
         }
         debug!(

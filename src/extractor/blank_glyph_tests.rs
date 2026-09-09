@@ -1,9 +1,64 @@
 use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 
+/// How the synthetic font's `cmap` addresses its glyphs.
+#[derive(Clone, Copy)]
+enum Cmap {
+    /// (1,0) format 0: byte code → glyph.
+    MacRoman,
+    /// (3,0) format 4: `0xF000 + code` → glyph.
+    SymbolPrivate,
+    /// (3,0) format 4: bare `code` → glyph.
+    SymbolBare,
+    /// (3,0) format 4: both `0xF000 + code` → glyph and bare `code` → the
+    /// glyph after it, to show which one wins.
+    SymbolBoth,
+}
+
 /// A minimal TrueType font: `head`, `hhea`, `maxp`, `hmtx`, `loca`, `glyf`
 /// and a (1,0) format 0 `cmap`. Glyph 0 is `.notdef`; each entry in
 /// `glyphs` is `(outlined, advance)`, mapped from `codes[i]`.
 fn synthetic_truetype(glyphs: &[(bool, u16)], codes: &[u8]) -> Vec<u8> {
+    synthetic_truetype_with(glyphs, codes, Cmap::MacRoman)
+}
+
+/// (3,0) format 4 subtable: one segment per mapping, `code → gid`.
+fn symbol_cmap(mappings: &[(u16, u16)]) -> Vec<u8> {
+    let mut mappings = mappings.to_vec();
+    mappings.sort();
+    let segs = mappings.len() as u16 + 1;
+    let mut sub = Vec::new();
+    sub.extend(4u16.to_be_bytes()); // format
+    sub.extend((16 + 8 * segs).to_be_bytes()); // length
+    sub.extend(0u16.to_be_bytes()); // language
+    sub.extend((segs * 2).to_be_bytes());
+    sub.extend([0u8; 6]);
+    for &(code, _) in &mappings {
+        sub.extend(code.to_be_bytes()); // endCode
+    }
+    sub.extend(0xFFFFu16.to_be_bytes());
+    sub.extend(0u16.to_be_bytes()); // reservedPad
+    for &(code, _) in &mappings {
+        sub.extend(code.to_be_bytes()); // startCode
+    }
+    sub.extend(0xFFFFu16.to_be_bytes());
+    for &(code, gid) in &mappings {
+        sub.extend(gid.wrapping_sub(code).to_be_bytes()); // idDelta
+    }
+    sub.extend(1u16.to_be_bytes());
+    for _ in 0..segs {
+        sub.extend(0u16.to_be_bytes()); // idRangeOffset
+    }
+    let mut cmap = Vec::new();
+    cmap.extend(0u16.to_be_bytes());
+    cmap.extend(1u16.to_be_bytes());
+    cmap.extend(3u16.to_be_bytes()); // platform Windows
+    cmap.extend(0u16.to_be_bytes()); // encoding Symbol
+    cmap.extend(12u32.to_be_bytes());
+    cmap.extend(sub);
+    cmap
+}
+
+fn synthetic_truetype_with(glyphs: &[(bool, u16)], codes: &[u8], kind: Cmap) -> Vec<u8> {
     let num_glyphs = glyphs.len() as u16 + 1;
     let square: Vec<u8> = {
         let mut g = Vec::new();
@@ -48,20 +103,50 @@ fn synthetic_truetype(glyphs: &[(bool, u16)], codes: &[u8]) -> Vec<u8> {
         hmtx.extend(advance.to_be_bytes());
         hmtx.extend(0i16.to_be_bytes());
     }
-    let mut cmap = Vec::new();
-    cmap.extend(0u16.to_be_bytes()); // version
-    cmap.extend(1u16.to_be_bytes()); // one subtable
-    cmap.extend(1u16.to_be_bytes()); // platform Macintosh
-    cmap.extend(0u16.to_be_bytes()); // encoding Roman
-    cmap.extend(12u32.to_be_bytes()); // offset
-    cmap.extend(0u16.to_be_bytes()); // format 0
-    cmap.extend(262u16.to_be_bytes());
-    cmap.extend(0u16.to_be_bytes()); // language
-    let mut glyph_ids = [0u8; 256];
-    for (i, &code) in codes.iter().enumerate() {
-        glyph_ids[code as usize] = i as u8 + 1;
-    }
-    cmap.extend(glyph_ids);
+    let cmap = match kind {
+        Cmap::MacRoman => {
+            let mut cmap = Vec::new();
+            cmap.extend(0u16.to_be_bytes()); // version
+            cmap.extend(1u16.to_be_bytes()); // one subtable
+            cmap.extend(1u16.to_be_bytes()); // platform Macintosh
+            cmap.extend(0u16.to_be_bytes()); // encoding Roman
+            cmap.extend(12u32.to_be_bytes()); // offset
+            cmap.extend(0u16.to_be_bytes()); // format 0
+            cmap.extend(262u16.to_be_bytes());
+            cmap.extend(0u16.to_be_bytes()); // language
+            let mut glyph_ids = [0u8; 256];
+            for (i, &code) in codes.iter().enumerate() {
+                glyph_ids[code as usize] = i as u8 + 1;
+            }
+            cmap.extend(glyph_ids);
+            cmap
+        }
+        Cmap::SymbolPrivate => symbol_cmap(
+            &codes
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| (0xF000 + u16::from(c), i as u16 + 1))
+                .collect::<Vec<_>>(),
+        ),
+        Cmap::SymbolBare => symbol_cmap(
+            &codes
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| (u16::from(c), i as u16 + 1))
+                .collect::<Vec<_>>(),
+        ),
+        Cmap::SymbolBoth => symbol_cmap(
+            &codes
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &c)| {
+                    let gid = i as u16 + 1;
+                    let next = (gid % glyphs.len() as u16) + 1;
+                    [(0xF000 + u16::from(c), gid), (u16::from(c), next)]
+                })
+                .collect::<Vec<_>>(),
+        ),
+    };
     let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
         (b"cmap", cmap),
         (b"glyf", glyf),
@@ -102,10 +187,21 @@ fn doc_with_font(
     encoding: Option<&str>,
     content: &[u8],
 ) -> (Document, ObjectId) {
+    doc_with_font_cmap(glyphs, codes, tounicode, encoding, content, Cmap::MacRoman)
+}
+
+fn doc_with_font_cmap(
+    glyphs: &[(bool, u16)],
+    codes: &[u8],
+    tounicode: Option<&str>,
+    encoding: Option<&str>,
+    content: &[u8],
+    kind: Cmap,
+) -> (Document, ObjectId) {
     let mut doc = Document::with_version("1.4");
     let font_file = doc.add_object(Stream::new(
         dictionary! {},
-        synthetic_truetype(glyphs, codes),
+        synthetic_truetype_with(glyphs, codes, kind),
     ));
     let mut widths = vec![Object::Integer(0); 256];
     for (i, &code) in codes.iter().enumerate() {
@@ -157,8 +253,11 @@ fn text_of(doc: &mut Document) -> String {
 /// Codes `!` `"` `$` map to glyphs 1 (`3`), 2 (`r`) and 3 (the blank space).
 const WORD_FOR_MAC: &[(bool, u16)] = &[(true, 500), (true, 400), (false, 226)];
 const CODES: &[u8] = &[0x21, 0x22, 0x24];
+/// Ten entries: fewer than ten and the CMap loader treats the ToUnicode as
+/// too sparse and prefers the embedded cmap, which is a different subject.
 const STALE_TOUNICODE: &str = "1 begincodespacerange\n<00><FF>\nendcodespacerange\n\
-3 beginbfchar\n<21><0033>\n<22><0072>\n<24><0024>\nendbfchar";
+10 beginbfchar\n<21><0033>\n<22><0072>\n<24><0024>\n<30><0030>\n<31><0031>\n<32><0032>\n\
+<33><0033>\n<34><0034>\n<35><0035>\n<36><0036>\nendbfchar";
 const CONTENT: &[u8] = b"BT /F1 12 Tf 1 0 0 1 40 700 Tm (!\"$\"!) Tj ET";
 
 #[test]
@@ -272,4 +371,48 @@ fn non_symbolic_fonts_are_left_alone() {
         .unwrap()
         .set("FontDescriptor", descriptor);
     assert_eq!(text_of(&mut doc), "3r$r3");
+}
+
+#[test]
+fn symbol_cmaps_are_read_through_the_private_range_first() {
+    // (3,0) tables address symbolic glyphs at F000+code; the bare code is
+    // the last resort. In `SymbolBoth` the bare code points at the glyph
+    // after the intended one, so `$` (blank at F024) stays a space only if
+    // the private range is consulted first, and `!` (outlined at F021, blank
+    // `$` glyph at bare 0x22...) is untouched.
+    for kind in [Cmap::SymbolPrivate, Cmap::SymbolBare, Cmap::SymbolBoth] {
+        let (mut doc, _) = doc_with_font_cmap(
+            WORD_FOR_MAC,
+            CODES,
+            Some(STALE_TOUNICODE),
+            None,
+            CONTENT,
+            kind,
+        );
+        assert_eq!(text_of(&mut doc), "3r r3", "{:?}", kind as u8);
+    }
+}
+
+#[test]
+fn all_blank_font_counts_every_mapped_code() {
+    // Three mapped codes with one zero-advance glyph is still a text layer,
+    // not a single-space subset.
+    let (mut doc, _) = doc_with_font(
+        &[(false, 500), (false, 0), (false, 226)],
+        CODES,
+        Some(STALE_TOUNICODE),
+        None,
+        CONTENT,
+    );
+    assert_eq!(text_of(&mut doc), "3r$r3");
+}
+
+#[test]
+fn bidi_and_math_invisible_labels_keep_their_label() {
+    for label in ["200E", "202A", "2062", "2066"] {
+        let cmap = STALE_TOUNICODE.replace("<24><0024>", &format!("<24><{label}>"));
+        let (mut doc, _) = doc_with_font(WORD_FOR_MAC, CODES, Some(&cmap), None, CONTENT);
+        let text = text_of(&mut doc);
+        assert!(!text.contains(' '), "label {label}: {text:?}");
+    }
 }
