@@ -328,9 +328,7 @@ pub(crate) fn extract_page_text_items(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data = s
-                        .decompressed_content()
-                        .unwrap_or_else(|_| s.content.clone());
+                    let data = crate::safe_decompress::decompressed_or_raw(s);
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                     {
@@ -361,27 +359,25 @@ pub(crate) fn extract_page_text_items(
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
-    // Get content, bounding decompression so a page-content bomb (a tiny
-    // Flate stream inflating to gigabytes) skips the page instead of
-    // exhausting memory — same degradation as the operator cap below. Real
-    // page content runs a few MB at most; the bound is deliberately far
-    // above that.
+    // Get content, bounding decompression via lopdf's own native limit (added
+    // upstream in lopdf 0.44 — see #478) so a page-content bomb (a tiny Flate
+    // stream inflating to gigabytes) can't exhaust memory. Real page content
+    // runs a few MB at most; the bound is deliberately far above that.
+    //
+    // Unlike #478's own call site, a cap hit here fails closed with a typed
+    // `PdfError::ResourceLimit` instead of silently returning empty content:
+    // a caller must not mistake a page that hit the decompression-bomb guard
+    // for one that genuinely, successfully extracted as empty. See #221.
     const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
     let content_data = match doc.get_page_content_with_limit(page_id, MAX_PAGE_CONTENT_BYTES) {
         Ok(data) => data,
-        Err(e) => {
-            log::warn!(
-                "page {}: skipping extraction — content stream exceeds {} decompressed bytes: {}",
-                page_num,
-                MAX_PAGE_CONTENT_BYTES,
-                e
-            );
-            return Ok((
-                (Vec::new(), Vec::new(), Vec::new()),
-                false,
-                PageRotation::Upright,
-                false,
-            ));
+        Err(_) => {
+            return Err(PdfError::ResourceLimit {
+                page: page_num,
+                object_id: page_id,
+                resource: "page content".to_string(),
+                limit_bytes: MAX_PAGE_CONTENT_BYTES,
+            });
         }
     };
 

@@ -20,6 +20,15 @@ def fixture_bytes(name: str) -> bytes:
 # parameter, so these are exercised through `process_pdf_with_ocr`, which does.
 ENCRYPTED_FIXTURE_PASSWORDS = {"encrypted-secret123.pdf": "secret123"}
 
+# Fixtures that are deliberately malicious (a decompression-bomb-shaped
+# content stream) and are expected to make `process_pdf` raise, rather than
+# return a successful result — see #221. Kept as a targeted exception
+# rather than silently swallowing any exception in the generic loop below.
+RESOURCE_LIMIT_FIXTURES = {
+    "oversized_content_stream.pdf",
+    "mixed_oversized_content_stream.pdf",
+}
+
 
 # ---------------------------------------------------------------------------
 # process_pdf
@@ -598,6 +607,11 @@ class TestMultipleFixtures:
             )
             assert result.page_count > 0
             assert result.markdown
+            return
+
+        if filename in RESOURCE_LIMIT_FIXTURES:
+            with pytest.raises(ValueError, match="resource limit exceeded"):
+                pdf_inspector.process_pdf(fixture_path(filename))
             return
 
         result = pdf_inspector.process_pdf(fixture_path(filename))
