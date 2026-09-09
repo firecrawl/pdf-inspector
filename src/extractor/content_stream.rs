@@ -1647,6 +1647,19 @@ pub(crate) fn extract_page_text_items(
                                 Object::String(bytes, _) => Some(decode_text_string(bytes)),
                                 _ => None,
                             };
+                            // An ActualText holding the replacement character
+                            // is not a transcription: InDesign writes tab
+                            // leaders as U+0009 followed by one U+FFFD per
+                            // dot. The painted glyphs decode better than that.
+                            if actual_text
+                                .as_deref()
+                                .is_some_and(|text| text.contains('\u{FFFD}'))
+                            {
+                                log::debug!(
+                                    "ActualText contains U+FFFD; decoding the glyphs instead"
+                                );
+                                actual_text = None;
+                            }
                         }
                         if let Ok(Object::Integer(id)) = d.get(b"MCID") {
                             mcid = Some(*id);
@@ -3984,5 +3997,29 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
                 "{content}: {items:?}"
             );
         }
+    }
+
+    /// InDesign exports tab leaders as a span whose ActualText is U+0009
+    /// followed by one U+FFFD per dot. The replacement character is not a
+    /// transcription, so the painted dots are decoded instead.
+    #[test]
+    fn actual_text_with_replacement_characters_is_ignored() {
+        let items = extract_simple_items(
+            b"BT /F1 10 Tf 72 700 Td (Amy Ganz) Tj /Span <</ActualText <FEFF0009FFFDFFFDFFFD>>> BDC ( . . . ) Tj EMC (Chief) Tj ET",
+        );
+        let text: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(text.join("|"), "Amy Ganz . . . Chief");
+        assert!(
+            items.iter().all(|i| !i.text.contains('\u{FFFD}')),
+            "{items:?}"
+        );
+    }
+
+    #[test]
+    fn actual_text_without_replacement_characters_still_replaces_the_glyphs() {
+        let items = extract_simple_items(
+            b"BT /F1 10 Tf 72 700 Td /Span <</ActualText <FEFF00480069>>> BDC (Hx) Tj EMC ET",
+        );
+        assert_eq!(items[0].text, "Hi");
     }
 }

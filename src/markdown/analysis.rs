@@ -104,11 +104,26 @@ pub(crate) fn bold_heading_level(heading_tiers: &[f32]) -> usize {
 
 /// Detect TOC-style lines that contain dot leaders (e.g., "Section Name .... 42").
 /// These lines should never be joined with adjacent lines into a paragraph.
-/// Handles both consecutive dots ("....") and spaced dots ("...   ...").
+/// Handles consecutive dots ("...."), spaced groups ("...   ...") and single
+/// dots set a space apart (". . . .", as InDesign paints tab leaders).
 pub(crate) fn has_dot_leaders(text: &str) -> bool {
     // Consecutive dots (4+)
     if text.contains("....") {
         return true;
+    }
+    // Single dots separated by one space each: four or more in a row.
+    let mut spaced_run = 0;
+    let mut prev = ' ';
+    for ch in text.chars() {
+        match ch {
+            '.' if spaced_run == 0 || prev == ' ' => spaced_run += 1,
+            ' ' if prev == '.' => {}
+            _ => spaced_run = 0,
+        }
+        if spaced_run >= 4 {
+            return true;
+        }
+        prev = ch;
     }
     // Spaced dot leaders: "..." followed by whitespace and more dots
     // Count occurrences of "..." (3+ dots) — if 2+ groups, it's a dot leader
@@ -970,5 +985,14 @@ mod tests {
         assert!(!is_heading_fragment("Changing objectives:"));
         assert!(!is_heading_fragment("Sales by Region (2024)"));
         assert!(!is_heading_fragment("Results (preliminary)"));
+    }
+
+    #[test]
+    fn has_dot_leaders_recognises_spaced_single_dots() {
+        assert!(has_dot_leaders("Amy Ganz . . . . . . Chief of Staff"));
+        assert!(has_dot_leaders("Name . . . . 12"));
+        assert!(!has_dot_leaders("e.g. i.e. etc. and so on."));
+        assert!(!has_dot_leaders("Wait . . . what?"));
+        assert!(!has_dot_leaders("A. B. C. D."));
     }
 }
