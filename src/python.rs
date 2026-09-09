@@ -749,6 +749,15 @@ mod tests {
         assert_eq!(span.confidence, 0.97);
         assert!(mapped.pages[1].spans.is_empty());
     }
+
+    #[test]
+    fn exports_ocr_text_span_type_from_python_module() {
+        Python::with_gil(|py| {
+            let module = PyModule::new(py, "pdf_inspector").expect("create test module");
+            pdf_inspector(&module).expect("initialize Python module");
+            assert!(module.getattr("OcrTextSpan").is_ok());
+        });
+    }
 }
 
 fn parse_page_regions(
@@ -1243,6 +1252,7 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOcrModelIdentity>()?;
     m.add_class::<PyOcrTimings>()?;
     m.add_class::<PyOcrPageProvenance>()?;
+    m.add_class::<PyOcrTextSpan>()?;
     m.add_class::<PyOcrPageResult>()?;
     m.add_class::<PyOcrPdfResult>()?;
     m.add_class::<PyPdfClassification>()?;

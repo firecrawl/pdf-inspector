@@ -674,9 +674,9 @@ fn ocr_span_rect(span: &OcrSpan, rendered: &RenderedPage) -> Option<PdfRect> {
     ))
 }
 
-/// Accepted OCR spans with PDF-space geometry, in recognition order
-/// (top-to-bottom seed, same order the Markdown assembly consumes).
-/// Unlike the Markdown assembly above, this keeps per-span confidence so
+/// Accepted OCR spans with PDF-space geometry, in the OCR engine's recognition
+/// order. Markdown assembly independently reorders its text items into a
+/// geometry-based reading-order seed. Spans retain per-line confidence so
 /// consumers can threshold or visualize recognition quality themselves.
 fn ocr_text_spans(page: &RoutedOcrPage) -> Vec<OcrTextSpan> {
     page.ocr
