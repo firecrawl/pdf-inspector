@@ -1,0 +1,19 @@
+src/extractor/content_stream.rs
+  s_f5ff107f39c26a::t_ce32a18ca4cdc5 16-19,32,245,254-276,279,524-551,806-808,934,1108-1110,1499-1500,1511,1954-1995,2057-2074
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "881c681e9f1988f71c79d323299b670bd6578bce",
+  "prompts": {},
+  "sessions": {
+    "s_f5ff107f39c26a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07e0d-7783-7e81-b6a9-5492ed984ceb",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
