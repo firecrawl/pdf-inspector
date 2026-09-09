@@ -104,6 +104,13 @@ above the baseline (descenders fall below it); for image, link and form-field
 items `y` is the rect bottom and that box is exact. Pages whose CropBox equals
 the MediaBox at `(0, 0)` are unaffected.
 
+`legacySymbolRewrite: true` marks items whose decoded text includes a character
+changed by legacy symbol cleanup. Merged items retain this evidence from either
+source, and split items conservatively inherit it. The field is omitted when
+that cleanup did not change a character; absence is not a general guarantee of
+decoding accuracy. Consumers correcting other text can use the marker to avoid
+treating a rewritten symbol as an authoritative Unicode value.
+
 ```typescript
 import { extractTextWithPositions } from '@firecrawl/pdf-inspector'
 
