@@ -1,0 +1,19 @@
+napi/README.md
+  s_f5ff107f39c26a::t_567461c2676f6c 107-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d6d42d24e753e5b72b8097bd10836ed4def7f9d8",
+  "prompts": {},
+  "sessions": {
+    "s_f5ff107f39c26a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07e0d-7783-7e81-b6a9-5492ed984ceb",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
