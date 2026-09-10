@@ -169,6 +169,54 @@ fn auto_recovers_credible_native_text_before_loading_ocr_models() {
 
 #[cfg(all(feature = "ocr", feature = "render-pdfium"))]
 #[test]
+fn auto_prefers_recovered_invisible_ocr_layer_over_a_fresh_ocr_pass() {
+    // Regression: a "searchable image" scan with real body text embedded as
+    // an invisible (Tr 3) layer under the page raster, plus a small visible
+    // document-ID stamp. Before this fix the page misclassified as
+    // TextBased (silently returning only the stamp) or ImageBased (never
+    // reaching the Mixed-only invisible-text retry at all). Its OCR reason
+    // is `scanned`, not `suspected_garbled_text`/`vector_text`, so - unlike
+    // `auto_recovers_credible_native_text_before_loading_ocr_models` above -
+    // it doesn't qualify for the short-circuit that skips OCR entirely:
+    // `auto` mode still renders and OCRs the page image (asserted below via
+    // `pages_routed_to_ocr`, so this test can't silently stop exercising
+    // that path). What must hold is that fusion still prefers the
+    // recovered, higher-fidelity native text - originally embedded by
+    // whatever tool produced the scan - over the OCR engine's own weaker
+    // re-derivation of the same rasterized text.
+    let Some(model_directory) = std::env::var_os(MODEL_DIRECTORY_ENV) else {
+        eprintln!("skipping OCR runtime test because {MODEL_DIRECTORY_ENV} is not set");
+        return;
+    };
+    let Some(_renderer) = load_renderer() else {
+        return;
+    };
+
+    let bytes = std::fs::read("tests/fixtures/scan_with_invisible_ocr_layer.pdf").unwrap();
+    let ocr = OcrOptions::new()
+        .mode(OcrMode::Auto)
+        .model_directory(model_directory)
+        .model_downloads(ModelDownloadPolicy::Offline);
+    let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new().ocr(ocr)).unwrap();
+
+    assert_eq!(
+        result.pages_routed_to_ocr,
+        vec![1],
+        "page 1's OCR reason is `scanned`, not `garbled`/`vector_text`, so it \
+         must actually go through OCR - otherwise this test never exercises \
+         the fusion-prefers-native behavior its name claims to check"
+    );
+    assert!(result.markdown.contains("Jane Roe"));
+    assert!(result.markdown.contains("John Smith"));
+    assert!(result
+        .markdown
+        .to_lowercase()
+        .contains("quarterly planning"));
+    assert_eq!(result.pages[0].provenance.source, PageContentSource::Native);
+}
+
+#[cfg(all(feature = "ocr", feature = "render-pdfium"))]
+#[test]
 fn auto_rejects_garbled_native_recovery_and_continues_to_ocr() {
     let Some(_renderer) = load_renderer() else {
         return;
