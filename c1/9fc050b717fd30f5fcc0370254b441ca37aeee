@@ -1,0 +1,11 @@
+src/tounicode_mac_order_tests.rs
+  ai_agent 332-348
+src/tounicode.rs
+  ai_agent 2343-2349
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c19fc050b717fd30f5fcc0370254b441ca37aeee",
+  "prompts": {}
+}
