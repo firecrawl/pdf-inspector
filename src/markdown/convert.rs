@@ -8,8 +8,8 @@ use crate::types::TextLine;
 
 use super::analysis::{
     bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
-    detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment, is_toc_entry_line,
-    is_toc_marker_heading,
+    detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment,
+    is_leader_continuation, is_toc_entry_line, is_toc_marker_heading, trailing_leader_dots,
 };
 use super::classify::{format_list_item, is_caption_line, is_list_item, starts_with_bullet_marker};
 use super::heading::classify_heading_sequences;
@@ -1030,6 +1030,16 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         if trimmed.is_empty() {
             continue;
         }
+        if !in_code_block && is_leader_continuation(plain_trimmed) {
+            // The tail of a leader painted as its own run: extend the leader
+            // line before it, or drop a line of dots that belongs to nothing.
+            // Decided before captions, headings and lists, none of which a
+            // line of dots can be; inside a code block the dots are code.
+            // Paragraph and list state are left as they were, so the next
+            // line is treated exactly as if this one had not been painted.
+            extend_leader(&mut output, plain_trimmed);
+            continue;
+        }
 
         // Detect figure/table captions and source citations
         // These should be on their own line followed by a paragraph break
@@ -1349,6 +1359,48 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 }
 
 /// Convert text lines to markdown
+/// A line made only of dots is the tail of the previous line's leader,
+/// painted as a separate run. When the line emitted just before it (one
+/// newline back: a paragraph or page break means the dots belong to
+/// nothing) is text ending in its leader (`Total assets....`, four or more
+/// dots; a period or an ellipsis does not count), extend that leader with the
+/// dots, inside any closing emphasis or underline markup. Otherwise the dots
+/// carry no information and the caller drops them. This looks at the output
+/// rather than paragraph state because a list item or heading may have
+/// closed the paragraph.
+fn extend_leader(output: &mut String, dots: &str) -> bool {
+    // Paragraph lines are separated lazily, so the previous line may still
+    // lack its newline; more than one newline is a paragraph or page break.
+    let body_len = output.trim_end_matches('\n').len();
+    if output.len() - body_len > 1 {
+        return false;
+    }
+    let line_start = output[..body_len].rfind('\n').map_or(0, |i| i + 1);
+    let last_line = &output[line_start..body_len];
+    // Closing markup after the leader: `**`, `*`, `</u>`, `</s>`.
+    let mut text_end = last_line.len();
+    loop {
+        let head = &last_line[..text_end];
+        let Some(stripped) = ["**", "*", "</u>", "</s>"]
+            .iter()
+            .find_map(|m| head.strip_suffix(m))
+        else {
+            break;
+        };
+        text_end = stripped.len();
+    }
+    // A leader run (four or more dots, solid or spaced), not a sentence or
+    // an ellipsis, after text of its own.
+    let text = &last_line[..text_end];
+    if trailing_leader_dots(text) < 4 || !text.chars().any(char::is_alphabetic) {
+        return false;
+    }
+    let insert_at = line_start + text_end;
+    let run: String = dots.chars().filter(|c| *c == '.').collect();
+    output.insert_str(insert_at, &run);
+    true
+}
+
 pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) -> String {
     if lines.is_empty() {
         return String::new();
@@ -1450,6 +1502,16 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         let plain_trimmed = plain_text.trim();
 
         if trimmed.is_empty() {
+            continue;
+        }
+        if !in_code_block && is_leader_continuation(plain_trimmed) {
+            // The tail of a leader painted as its own run: extend the leader
+            // line before it, or drop a line of dots that belongs to nothing.
+            // Decided before captions, headings and lists, none of which a
+            // line of dots can be; inside a code block the dots are code.
+            // Paragraph and list state are left as they were, so the next
+            // line is treated exactly as if this one had not been painted.
+            extend_leader(&mut output, plain_trimmed);
             continue;
         }
 
@@ -2611,6 +2673,97 @@ mod tests {
         assert!(
             md.contains("1. ") && md.contains("A model has CB-1"),
             "numbered list item should remain intact: {md}"
+        );
+    }
+
+    #[test]
+    fn extend_leader_respects_markup_breaks_and_sentences() {
+        let mut out = String::from("**Total assets....**\n");
+        assert!(extend_leader(&mut out, ". . ."));
+        assert_eq!(out, "**Total assets.......**\n");
+        // A paragraph line still waiting for its separator.
+        let mut out = String::from("Intro\n\nTotal assets....");
+        assert!(extend_leader(&mut out, ".."));
+        assert_eq!(out, "Intro\n\nTotal assets......");
+        // An ellipsis closing a sentence is not a leader.
+        let mut out = String::from("And then...\n");
+        assert!(!extend_leader(&mut out, "...."));
+        assert_eq!(out, "And then...\n");
+        // A spaced leader on the previous line is one too.
+        let mut out = String::from("Total assets . . . .\n");
+        assert!(extend_leader(&mut out, ". . ."));
+        assert_eq!(out, "Total assets . . . ....\n");
+        let mut out = String::from("<u>Deficiency....</u>\n");
+        assert!(extend_leader(&mut out, "...."));
+        assert_eq!(out, "<u>Deficiency........</u>\n");
+        // A paragraph or page break in between: the dots belong to nothing.
+        let mut out = String::from("Total assets....\n\n");
+        assert!(!extend_leader(&mut out, "...."));
+        assert_eq!(out, "Total assets....\n\n");
+        // A sentence's period, a bare number, or dots alone are not leaders.
+        for prev in ["Introduction.\n", "............. 19.2\n", "........\n", ""] {
+            let mut out = String::from(prev);
+            assert!(!extend_leader(&mut out, "...."), "{prev:?}");
+            assert_eq!(out, prev);
+        }
+    }
+
+    #[test]
+    fn leader_continuation_lines_extend_the_line_before_them() {
+        let lines = vec![
+            line_at("Total assets........", 1, 700.0),
+            line_at("......", 1, 688.0),
+            line_at("Deficiency.......", 1, 676.0),
+            line_at("9. Real property as per list \"G\".....", 1, 664.0),
+            line_at("........", 1, 652.0),
+            line_at("10. Furniture.......", 1, 640.0),
+            // A value already closed this row: the dots are dropped.
+            line_at("Amount of subscribed capital....... 0,00", 1, 628.0),
+            line_at("....", 1, 616.0),
+            // Dots after a plain line, a dots-and-number table fragment, or
+            // more dots belong to nothing.
+            line_at("2 849,23", 1, 604.0),
+            line_at(".....................", 1, 592.0),
+            line_at("..........", 1, 580.0),
+            line_at("............. 19.2", 1, 568.0),
+            line_at("..........", 1, 556.0),
+            // A sentence's period is not a leader, and a lone ellipsis is text.
+            line_at("Introduction.", 1, 544.0),
+            line_at("......", 1, 532.0),
+            line_at("...", 1, 520.0),
+            line_at("Closing line", 1, 508.0),
+        ];
+        let md = to_markdown_from_lines(lines, MarkdownOptions::default());
+        assert!(
+            !md.lines().any(|l| {
+                let t = l.trim();
+                t.len() >= 4 && t.chars().all(|c| c == '.')
+            }),
+            "no leader run alone:\n{md}"
+        );
+        assert!(md.contains("..."), "the ellipsis line survives:\n{md}");
+        assert!(md.contains("Total assets.............."), "{md}");
+        assert!(md.contains("as per list \"G\"............."), "{md}");
+        assert!(md.contains("Deficiency......."), "{md}");
+        assert!(md.contains("capital....... 0,00"), "{md}");
+        assert!(
+            !md.contains("0,00."),
+            "a closed row takes no trailing dots:\n{md}"
+        );
+        assert!(md.contains("2 849,23"), "{md}");
+        assert!(
+            !md.contains("2 849,23."),
+            "dots are not glued to a plain line:\n{md}"
+        );
+        assert!(md.contains("............. 19.2"), "{md}");
+        assert!(
+            !md.contains("19.2."),
+            "a dots-and-number fragment takes none:\n{md}"
+        );
+        assert!(md.contains("Introduction."), "{md}");
+        assert!(
+            !md.contains("Introduction.."),
+            "a period is not a leader:\n{md}"
         );
     }
 }
