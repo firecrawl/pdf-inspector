@@ -111,12 +111,13 @@ pub(crate) fn has_dot_leaders(text: &str) -> bool {
     if text.contains("....") {
         return true;
     }
-    // Single dots separated by one space each: four or more in a row.
+    // Single dots separated by one space each: four or more in a row, each
+    // dot standing alone (a period attached to a word does not start one).
     let mut spaced_run = 0;
     let mut prev = ' ';
     for ch in text.chars() {
         match ch {
-            '.' if spaced_run == 0 || prev == ' ' => spaced_run += 1,
+            '.' if prev == ' ' => spaced_run += 1,
             ' ' if prev == '.' => {}
             _ => spaced_run = 0,
         }
@@ -993,6 +994,8 @@ mod tests {
         assert!(has_dot_leaders("Name . . . . 12"));
         assert!(!has_dot_leaders("e.g. i.e. etc. and so on."));
         assert!(!has_dot_leaders("Wait . . . what?"));
+        assert!(!has_dot_leaders("Wait. . . . what?"));
         assert!(!has_dot_leaders("A. B. C. D."));
+        assert!(has_dot_leaders(". . . . 12"));
     }
 }
