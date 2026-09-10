@@ -86,6 +86,16 @@ jobs:
       - name: Run OCR clippy
         run: cargo clippy --features ocr -- -D warnings
 
+      # The intermediate feature sets are what a browser, text-only or
+      # renderer-only consumer actually compiles. Only default and ocr were
+      # ever built here, so a vision-gated module importing an ocr-gated item
+      # broke both of them without failing CI.
+      - name: Run vision clippy
+        run: cargo clippy --features vision -- -D warnings
+
+      - name: Run renderer-only clippy
+        run: cargo clippy --features render-pdfium -- -D warnings
+
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
