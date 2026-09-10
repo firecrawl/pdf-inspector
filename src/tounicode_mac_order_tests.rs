@@ -329,3 +329,20 @@ fn mac_order_compares_every_narrow_letter_with_every_wide_one() {
     glyphs[90] = (true, 722); // w
     assert!(build_cmap_from_mac_glyph_order(&cmapless_truetype(&glyphs)).is_none());
 }
+
+#[test]
+fn mac_order_declines_a_unicode_keyed_font() {
+    // Chromium- and Qt-style fonts index glyphs by code point: digits at
+    // 0x30-0x39, letters at 0x41+, and nothing at the Macintosh digit slots.
+    // The passthrough handles those; the ordering must not claim them.
+    let mut glyphs = vec![(false, 0u16); 0x7B];
+    glyphs[0] = (true, 750);
+    glyphs[0x20] = (false, 278);
+    for code in 0x30..=0x39 {
+        glyphs[code] = (true, 556);
+    }
+    for code in (0x41..=0x5A).chain(0x61..=0x7A) {
+        glyphs[code] = (true, 600);
+    }
+    assert!(build_cmap_from_mac_glyph_order(&cmapless_truetype(&glyphs)).is_none());
+}
