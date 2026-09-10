@@ -2745,7 +2745,10 @@ mod tests {
             })
             .count();
         assert_eq!(orphan_runs, 5, "{md}");
-        assert!(md.contains("\n...\n"), "the ellipsis line survives:\n{md}");
+        assert!(
+            md.contains("\n... Closing line") && !md.contains("Introduction...."),
+            "the ellipsis survives as text and is not folded into the sentence:\n{md}"
+        );
         assert!(md.contains("Total assets.............."), "{md}");
         assert!(md.contains("as per list \"G\"............."), "{md}");
         assert!(md.contains("Deficiency......."), "{md}");
