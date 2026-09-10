@@ -1030,18 +1030,6 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         if trimmed.is_empty() {
             continue;
         }
-        if !in_code_block
-            && is_leader_continuation(plain_trimmed)
-            && extend_leader(&mut output, plain_trimmed)
-        {
-            // The tail of a leader painted as its own run has been folded
-            // into the leader line before it; nothing else about the state
-            // changes, so the next line is treated exactly as if this one
-            // had not been painted. A run with no leader line before it (a
-            // table's "rows omitted" ellipsis, a stray leader) keeps its
-            // usual handling below. Inside a code block the dots are code.
-            continue;
-        }
 
         // Detect figure/table captions and source citations
         // These should be on their own line followed by a paragraph break
@@ -1059,6 +1047,22 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             || (options.detect_code
                 && (in_code_block || !in_paragraph)
                 && super::classify::line_is_monospace(line));
+        if !in_code_block
+            && !is_code_line
+            && !is_para_break
+            && is_leader_continuation(plain_trimmed)
+            && extend_leader(&mut output, plain_trimmed)
+        {
+            // The tail of a leader painted as its own run has been folded
+            // into the leader line before it; nothing else about the state
+            // changes, so the next line is treated exactly as if this one
+            // had not been painted. Only a vertically adjacent run counts
+            // (a paragraph-sized gap means the dots belong to nothing), a
+            // run with no leader line before it (a table's "rows omitted"
+            // ellipsis, a stray leader) keeps its usual handling below, and
+            // a monospace run is code.
+            continue;
+        }
 
         // Close code block when transitioning to non-code
         if in_code_block && !is_code_line {
@@ -1391,10 +1395,14 @@ fn extend_leader(output: &mut String, dots: &str) -> bool {
         };
         text_end = stripped.len();
     }
-    // A leader run (four or more dots, solid or spaced), not a sentence or
-    // an ellipsis, after text of its own.
+    // A leader run (four or more dots, solid or spaced, starting at a
+    // standalone dot), not a sentence, an ellipsis or `Wait. . . .`, after
+    // text of its own.
     let text = &last_line[..text_end];
-    if trailing_leader_dots(text) < 4 || !text.chars().any(char::is_alphabetic) {
+    if trailing_leader_dots(text) < 4
+        || !has_dot_leaders(text)
+        || !text.chars().any(char::is_alphabetic)
+    {
         return false;
     }
     let insert_at = line_start + text_end;
@@ -1506,13 +1514,17 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         if trimmed.is_empty() {
             continue;
         }
-        if is_leader_continuation(plain_trimmed) && extend_leader(&mut output, plain_trimmed) {
+        if !is_para_break
+            && is_leader_continuation(plain_trimmed)
+            && extend_leader(&mut output, plain_trimmed)
+        {
             // The tail of a leader painted as its own run has been folded
             // into the leader line before it; nothing else about the state
             // changes, so the next line is treated exactly as if this one
-            // had not been painted. A run with no leader line before it (a
-            // table's "rows omitted" ellipsis, a stray leader) keeps its
-            // usual handling below.
+            // had not been painted. Only a vertically adjacent run counts
+            // (a paragraph-sized gap means the dots belong to nothing), and
+            // a run with no leader line before it (a table's "rows omitted"
+            // ellipsis, a stray leader) keeps its usual handling below.
             continue;
         }
 
@@ -2690,10 +2702,14 @@ mod tests {
         let mut out = String::from("And then...\n");
         assert!(!extend_leader(&mut out, "...."));
         assert_eq!(out, "And then...\n");
-        // A spaced leader on the previous line is one too.
+        // A spaced leader on the previous line is one too, but a period
+        // glued to the word followed by spaced dots is punctuation.
         let mut out = String::from("Total assets . . . .\n");
         assert!(extend_leader(&mut out, ". . ."));
         assert_eq!(out, "Total assets . . . ....\n");
+        let mut out = String::from("Wait. . . .\n");
+        assert!(!extend_leader(&mut out, "...."));
+        assert_eq!(out, "Wait. . . .\n");
         let mut out = String::from("<u>Deficiency....</u>\n");
         assert!(extend_leader(&mut out, "...."));
         assert_eq!(out, "<u>Deficiency........</u>\n");
@@ -2733,6 +2749,9 @@ mod tests {
             line_at("......", 1, 532.0),
             line_at("...", 1, 520.0),
             line_at("Closing line", 1, 508.0),
+            // A run a paragraph-sized gap below a leader line is not its tail.
+            line_at("Far leader........", 1, 496.0),
+            line_at("......", 1, 296.0),
         ];
         let md = to_markdown_from_lines(lines, MarkdownOptions::default());
         // Runs after a leader line are folded; runs after anything else keep
@@ -2744,7 +2763,12 @@ mod tests {
                 t.len() >= 4 && t.chars().all(|c| c == '.')
             })
             .count();
-        assert_eq!(orphan_runs, 5, "{md}");
+        assert_eq!(orphan_runs, 6, "{md}");
+        assert!(md.contains("Far leader........\n"), "{md}");
+        assert!(
+            !md.contains("Far leader........."),
+            "no fold across a paragraph gap:\n{md}"
+        );
         assert!(
             md.contains("\n... Closing line") && !md.contains("Introduction...."),
             "the ellipsis survives as text and is not folded into the sentence:\n{md}"
