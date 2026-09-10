@@ -990,7 +990,7 @@ mod tests {
 
     #[test]
     fn has_dot_leaders_recognises_spaced_single_dots() {
-        assert!(has_dot_leaders("Amy Ganz . . . . . . Chief of Staff"));
+        assert!(has_dot_leaders("Jane Roe . . . . . . Chief of Staff"));
         assert!(has_dot_leaders("Name . . . . 12"));
         assert!(!has_dot_leaders("e.g. i.e. etc. and so on."));
         assert!(!has_dot_leaders("Wait . . . what?"));

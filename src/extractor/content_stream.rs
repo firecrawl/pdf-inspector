@@ -4006,10 +4006,10 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
     #[test]
     fn actual_text_with_replacement_characters_is_ignored() {
         let items = extract_simple_items(
-            b"BT /F1 10 Tf 72 700 Td (Amy Ganz) Tj /Span <</ActualText <FEFF0009FFFDFFFDFFFD>>> BDC ( . . . ) Tj EMC (Chief) Tj ET",
+            b"BT /F1 10 Tf 72 700 Td (Jane Roe) Tj /Span <</ActualText <FEFF0009FFFDFFFDFFFD>>> BDC ( . . . ) Tj EMC (Chief) Tj ET",
         );
         let text: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
-        assert_eq!(text.join("|"), "Amy Ganz . . . Chief");
+        assert_eq!(text.join("|"), "Jane Roe . . . Chief");
         assert!(
             items.iter().all(|i| !i.text.contains('\u{FFFD}')),
             "{items:?}"
