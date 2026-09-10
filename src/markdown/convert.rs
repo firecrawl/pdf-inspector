@@ -1504,13 +1504,13 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         if trimmed.is_empty() {
             continue;
         }
-        if !in_code_block && is_leader_continuation(plain_trimmed) {
+        if is_leader_continuation(plain_trimmed) {
             // The tail of a leader painted as its own run: extend the leader
             // line before it, or drop a line of dots that belongs to nothing.
             // Decided before captions, headings and lists, none of which a
-            // line of dots can be; inside a code block the dots are code.
-            // Paragraph and list state are left as they were, so the next
-            // line is treated exactly as if this one had not been painted.
+            // line of dots can be (this path has no code blocks). Paragraph
+            // and list state are left as they were, so the next line is
+            // treated exactly as if this one had not been painted.
             extend_leader(&mut output, plain_trimmed);
             continue;
         }
