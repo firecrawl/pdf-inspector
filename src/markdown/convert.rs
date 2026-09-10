@@ -1030,14 +1030,16 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         if trimmed.is_empty() {
             continue;
         }
-        if !in_code_block && is_leader_continuation(plain_trimmed) {
-            // The tail of a leader painted as its own run: extend the leader
-            // line before it, or drop a line of dots that belongs to nothing.
-            // Decided before captions, headings and lists, none of which a
-            // line of dots can be; inside a code block the dots are code.
-            // Paragraph and list state are left as they were, so the next
-            // line is treated exactly as if this one had not been painted.
-            extend_leader(&mut output, plain_trimmed);
+        if !in_code_block
+            && is_leader_continuation(plain_trimmed)
+            && extend_leader(&mut output, plain_trimmed)
+        {
+            // The tail of a leader painted as its own run has been folded
+            // into the leader line before it; nothing else about the state
+            // changes, so the next line is treated exactly as if this one
+            // had not been painted. A run with no leader line before it (a
+            // table's "rows omitted" ellipsis, a stray leader) keeps its
+            // usual handling below. Inside a code block the dots are code.
             continue;
         }
 
@@ -1364,10 +1366,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 /// newline back: a paragraph or page break means the dots belong to
 /// nothing) is text ending in its leader (`Total assets....`, four or more
 /// dots; a period or an ellipsis does not count), extend that leader with the
-/// dots, inside any closing emphasis or underline markup. Otherwise the dots
-/// carry no information and the caller drops them. This looks at the output
-/// rather than paragraph state because a list item or heading may have
-/// closed the paragraph.
+/// dots, inside any closing emphasis or underline markup, and report true.
+/// Otherwise nothing is touched: the caller gives the line its usual
+/// handling. This looks at the output rather than paragraph state because a
+/// list item or heading may have closed the paragraph.
 fn extend_leader(output: &mut String, dots: &str) -> bool {
     // Paragraph lines are separated lazily, so the previous line may still
     // lack its newline; more than one newline is a paragraph or page break.
@@ -1504,14 +1506,13 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         if trimmed.is_empty() {
             continue;
         }
-        if is_leader_continuation(plain_trimmed) {
-            // The tail of a leader painted as its own run: extend the leader
-            // line before it, or drop a line of dots that belongs to nothing.
-            // Decided before captions, headings and lists, none of which a
-            // line of dots can be (this path has no code blocks). Paragraph
-            // and list state are left as they were, so the next line is
-            // treated exactly as if this one had not been painted.
-            extend_leader(&mut output, plain_trimmed);
+        if is_leader_continuation(plain_trimmed) && extend_leader(&mut output, plain_trimmed) {
+            // The tail of a leader painted as its own run has been folded
+            // into the leader line before it; nothing else about the state
+            // changes, so the next line is treated exactly as if this one
+            // had not been painted. A run with no leader line before it (a
+            // table's "rows omitted" ellipsis, a stray leader) keeps its
+            // usual handling below.
             continue;
         }
 
@@ -2734,14 +2735,17 @@ mod tests {
             line_at("Closing line", 1, 508.0),
         ];
         let md = to_markdown_from_lines(lines, MarkdownOptions::default());
-        assert!(
-            !md.lines().any(|l| {
+        // Runs after a leader line are folded; runs after anything else keep
+        // their usual line of their own, as does a lone ellipsis.
+        let orphan_runs = md
+            .lines()
+            .filter(|l| {
                 let t = l.trim();
                 t.len() >= 4 && t.chars().all(|c| c == '.')
-            }),
-            "no leader run alone:\n{md}"
-        );
-        assert!(md.contains("..."), "the ellipsis line survives:\n{md}");
+            })
+            .count();
+        assert_eq!(orphan_runs, 5, "{md}");
+        assert!(md.contains("\n...\n"), "the ellipsis line survives:\n{md}");
         assert!(md.contains("Total assets.............."), "{md}");
         assert!(md.contains("as per list \"G\"............."), "{md}");
         assert!(md.contains("Deficiency......."), "{md}");
