@@ -1,0 +1,9 @@
+src/markdown/analysis.rs
+  ai_agent 114-115,120,997,999
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3c2b5096b965d7bec09b802eb35d5e8f7127ebc7",
+  "prompts": {}
+}
