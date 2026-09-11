@@ -146,10 +146,12 @@ pub(crate) fn has_dot_leaders(text: &str) -> bool {
     dot_groups >= 2
 }
 
-/// A line made of nothing but dots (and spaces), four or more: the tail of
-/// the previous line's leader, painted as its own run when a leader spans
-/// two text objects. It belongs on that line, not on one of its own. A lone
-/// ellipsis (three dots) is text and stays.
+/// A line made of nothing but dots (and spaces), two or more: a candidate
+/// tail of the previous line's leader, painted as its own run when a leader
+/// spans two text objects. Whether it is folded is decided downstream by
+/// `extend_leader`, which requires the line before it to end in a leader of
+/// four or more dots, so a lone ellipsis after ordinary text keeps its own
+/// line.
 pub(crate) fn is_leader_continuation(text: &str) -> bool {
     let mut dots = 0;
     for ch in text.chars() {
