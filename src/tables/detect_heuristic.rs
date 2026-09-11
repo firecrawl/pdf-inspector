@@ -1194,6 +1194,7 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
         .filter_map(|(row, _)| page_number_value(row[page_item(row)?].1.text.trim()))
         .collect();
     let (first_value, last_value) = (*values.first()?, *values.last()?);
+    let raw_values = values.clone();
     values.sort_unstable();
     values.dedup();
     if values.len() < 3 || last_value <= first_value {
@@ -1218,6 +1219,40 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
         );
         return None;
     }
+    // A rank or ID column is a perfectly dense run (1, 2, 3, …); a contents
+    // page can be one too when every entry has its own page. The generic
+    // path tells them apart by the header row a data table carries above its
+    // numbers, and that row is what the block boundary above drops — so a
+    // dense run whose preceding row holds an item over the number column
+    // is the data table it looks like, and stays with the generic path.
+    let dense_consecutive = {
+        let mut sorted = raw_values.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted.len() == raw_values.len()
+            && sorted
+                .last()
+                .is_some_and(|max| (max - sorted[0]) as usize + 1 == sorted.len())
+    };
+    if dense_consecutive && first > 0 {
+        let number_left = row_items[first..=last]
+            .iter()
+            .zip(&numbered[first..=last])
+            .filter(|(_, n)| n.is_some())
+            .filter_map(|(row, _)| page_item(row).map(|at| row[at].1.x))
+            .fold(f32::INFINITY, f32::min);
+        let header_over_numbers = row_items[first - 1]
+            .iter()
+            .any(|(_, i)| i.x <= median_edge + 2.0 && i.x + i.width >= number_left - 2.0);
+        if header_over_numbers {
+            debug!(
+                "  contents list rejected: dense run {:?} under a header row",
+                raw_values
+            );
+            return None;
+        }
+    }
+
     let mut cells = Vec::new();
     let mut item_indices = Vec::new();
     let mut title_x = f32::INFINITY;
@@ -2730,6 +2765,42 @@ mod tests {
         assert_eq!(table.cells[2], vec!["Chapter 3 Methods", "41"]);
         assert_eq!(table.cells[3], vec!["Chapter 4 Results", "58"]);
         assert_eq!(table.cells[4], vec!["Chapter 5 Conclusions.", "77"]);
+    }
+
+    #[test]
+    fn contents_list_leaves_a_headed_rank_table_to_the_generic_path() {
+        let rows = |header: Option<(&str, f32, f32)>| -> Vec<TextItem> {
+            let mut items = Vec::new();
+            if let Some((text, x, width)) = header {
+                items.push(contents_item(text, x, 520.0, width));
+            }
+            for (r, title) in [
+                "Northern region office",
+                "Coastal distribution hub",
+                "Mountain research station",
+                "Central logistics depot",
+                "Southern service centre",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let y = 500.0 - r as f32 * 13.0;
+                items.push(contents_item(title, 68.0, y, 130.0));
+                items.push(contents_item(&format!("{}", r + 1), 356.0, y, 6.0));
+            }
+            items
+        };
+        // "Rank" over the number column: a data table, even though every
+        // label is multi-word and the numbers climb by one.
+        let table = rows(Some(("Rank", 344.0, 24.0)));
+        let indexed: Vec<(usize, &TextItem)> = table.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+        // A title row that stays clear of the numbers is not a header; the
+        // same rows are a one-page-per-entry contents list.
+        let contents = rows(Some(("Where to find us", 68.0, 90.0)));
+        let indexed: Vec<(usize, &TextItem)> = contents.iter().enumerate().collect();
+        let toc = detect_contents_list(&indexed).expect("dense contents list");
+        assert_eq!(toc.cells[0], vec!["Northern region office", "1"]);
     }
 
     #[test]
