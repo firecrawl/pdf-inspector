@@ -1012,6 +1012,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         }
         // Don't immediately end list on paragraph break
         // Let the continuation check below decide if we're still in a list
+        let (prior_y, prior_x) = (prev_y, prev_x);
         prev_y = line.y;
         prev_x = line_x;
 
@@ -1060,7 +1061,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             // (a paragraph-sized gap means the dots belong to nothing), a
             // run with no leader line before it (a table's "rows omitted"
             // ellipsis, a stray leader) keeps its usual handling below, and
-            // a monospace run is code.
+            // a monospace run is code. The next line measures its gap and
+            // band from the text line, not from the tail.
+            prev_y = prior_y;
+            prev_x = prior_x;
             continue;
         }
 
@@ -1365,6 +1369,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 }
 
 /// Convert text lines to markdown
+/// Inline markup the converters emit around a line's text.
+const MARKUP_TOKENS: [&str; 9] = [
+    "**", "*", "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>",
+];
+
 /// A line made only of dots is the tail of the previous line's leader,
 /// painted as a separate run. When the line emitted just before it (one
 /// newline back: a paragraph or page break means the dots belong to
@@ -1395,13 +1404,18 @@ fn extend_leader(output: &mut String, dots: &str) -> bool {
         };
         text_end = stripped.len();
     }
-    // A leader run (four or more dots, solid or spaced, starting at a
-    // standalone dot), not a sentence, an ellipsis or `Wait. . . .`, after
-    // text of its own.
-    let text = &last_line[..text_end];
-    if trailing_leader_dots(text) < 4
-        || !has_dot_leaders(text)
-        || !text.chars().any(char::is_alphabetic)
+    // Judge the leader on the text itself, with any inline markup removed:
+    // a run of four or more dots starting at a standalone dot (not a
+    // sentence, an ellipsis or `Wait. . . .`) after a label of its own,
+    // which may be a number (`12......`) but not more dots (`<u>....</u>`).
+    let plain: String = MARKUP_TOKENS
+        .iter()
+        .fold(last_line[..text_end].to_string(), |acc, m| {
+            acc.replace(m, "")
+        });
+    if trailing_leader_dots(&plain) < 4
+        || !has_dot_leaders(&plain)
+        || !plain.chars().any(char::is_alphanumeric)
     {
         return false;
     }
@@ -1497,6 +1511,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         }
         // Don't immediately end list on paragraph break
         // Let the continuation check below decide if we're still in a list
+        let prior_y = prev_y;
         prev_y = line.y;
 
         // Get text with optional bold/italic formatting
@@ -1527,6 +1542,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             // run with no leader line before it (a table's "rows omitted"
             // ellipsis, a stray leader) keeps its usual handling below, and
             // a monospace run is code for the block detection further down.
+            // The next line measures its gap from the text line, not the tail.
+            prev_y = prior_y;
             continue;
         }
 
@@ -2712,6 +2729,13 @@ mod tests {
         let mut out = String::from("Wait. . . .\n");
         assert!(!extend_leader(&mut out, "...."));
         assert_eq!(out, "Wait. . . .\n");
+        // A numeric label is a label; an underlined run of dots is not.
+        let mut out = String::from("12......\n");
+        assert!(extend_leader(&mut out, "...."));
+        assert_eq!(out, "12..........\n");
+        let mut out = String::from("<u>........</u>\n");
+        assert!(!extend_leader(&mut out, "...."));
+        assert_eq!(out, "<u>........</u>\n");
         let mut out = String::from("<u>Deficiency....</u>\n");
         assert!(extend_leader(&mut out, "...."));
         assert_eq!(out, "<u>Deficiency........</u>\n");
