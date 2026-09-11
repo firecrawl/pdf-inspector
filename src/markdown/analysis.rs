@@ -159,7 +159,7 @@ pub(crate) fn is_leader_continuation(text: &str) -> bool {
             _ => return false,
         }
     }
-    dots >= 4
+    dots >= 2
 }
 
 /// Number of dots in the trailing run of dots and spaces of `text`: the
@@ -1026,11 +1026,12 @@ mod tests {
     }
 
     #[test]
-    fn leader_continuation_is_four_or_more_dots_only() {
+    fn leader_continuation_is_two_or_more_dots_only() {
         assert!(is_leader_continuation("........"));
         assert!(is_leader_continuation(". . . ."));
-        assert!(!is_leader_continuation("..."), "an ellipsis is text");
-        assert!(!is_leader_continuation(".."));
+        assert!(is_leader_continuation("..."));
+        assert!(is_leader_continuation(".."));
+        assert!(!is_leader_continuation("."));
         assert!(!is_leader_continuation("...... 12"));
         assert!(!is_leader_continuation("Total assets........"));
         assert!(!is_leader_continuation(""));

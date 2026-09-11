@@ -1421,9 +1421,18 @@ fn extend_leader(output: &mut String, dots: &str) -> bool {
     {
         return false;
     }
-    let insert_at = line_start + text_end;
-    let run: String = dots.chars().filter(|c| *c == '.').collect();
-    output.insert_str(insert_at, &run);
+    // Match the line's own leader style: a spaced leader (`. . . .`) takes
+    // its tail spaced too, so the punctuation-spacing pass collapses the
+    // whole run at once instead of leaving a seam (`. . . ....`).
+    let tail = plain.trim_end_matches([' ', '.']).len();
+    let spaced = plain[tail..].trim().contains(' ');
+    let count = dots.chars().filter(|c| *c == '.').count();
+    let run = if spaced {
+        " .".repeat(count)
+    } else {
+        ".".repeat(count)
+    };
+    output.insert_str(line_start + text_end, &run);
     true
 }
 
@@ -2727,7 +2736,10 @@ mod tests {
         // glued to the word followed by spaced dots is punctuation.
         let mut out = String::from("Total assets . . . .\n");
         assert!(extend_leader(&mut out, ". . ."));
-        assert_eq!(out, "Total assets . . . ....\n");
+        assert_eq!(out, "Total assets . . . . . . .\n");
+        let mut out = String::from("Total assets . . . .\n");
+        assert!(extend_leader(&mut out, "..."));
+        assert_eq!(out, "Total assets . . . . . . .\n");
         let mut out = String::from("Wait. . . .\n");
         assert!(!extend_leader(&mut out, "...."));
         assert_eq!(out, "Wait. . . .\n");
@@ -2758,6 +2770,32 @@ mod tests {
             assert!(!extend_leader(&mut out, "...."), "{prev:?}");
             assert_eq!(out, prev);
         }
+    }
+
+    #[test]
+    fn spaced_leader_tails_fold_in_the_line_style_and_collapse_cleanly() {
+        let lines = vec![
+            line_at(
+                "Balance of secured claims as per list \"B\" . . . . . .",
+                1,
+                700.0,
+            ),
+            line_at(". . . .", 1, 688.0),
+            line_at("Secured creditors as per list \"B\" . . . . . .", 1, 676.0),
+        ];
+        let md = to_markdown_from_lines(lines, MarkdownOptions::default());
+        assert!(
+            md.contains("Balance of secured claims as per list \"B\"..........\n"),
+            "{md}"
+        );
+        assert!(
+            !md.contains(". ....") && !md.contains(".. ."),
+            "no seam between spaced and solid dots:\n{md}"
+        );
+        assert!(
+            md.contains("Secured creditors as per list \"B\"......"),
+            "{md}"
+        );
     }
 
     #[test]
