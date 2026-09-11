@@ -1515,6 +1515,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             continue;
         }
         if !is_para_break
+            && !(options.detect_code && super::classify::line_is_monospace(line))
             && is_leader_continuation(plain_trimmed)
             && extend_leader(&mut output, plain_trimmed)
         {
@@ -1522,9 +1523,10 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             // into the leader line before it; nothing else about the state
             // changes, so the next line is treated exactly as if this one
             // had not been painted. Only a vertically adjacent run counts
-            // (a paragraph-sized gap means the dots belong to nothing), and
-            // a run with no leader line before it (a table's "rows omitted"
-            // ellipsis, a stray leader) keeps its usual handling below.
+            // (a paragraph-sized gap means the dots belong to nothing), a
+            // run with no leader line before it (a table's "rows omitted"
+            // ellipsis, a stray leader) keeps its usual handling below, and
+            // a monospace run is code for the block detection further down.
             continue;
         }
 
