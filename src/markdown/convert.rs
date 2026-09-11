@@ -1051,15 +1051,16 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         if !in_code_block
             && !is_code_line
             && !is_para_break
+            && !is_band_switch
             && is_leader_continuation(plain_trimmed)
             && extend_leader(&mut output, plain_trimmed)
         {
             // The tail of a leader painted as its own run has been folded
             // into the leader line before it; nothing else about the state
             // changes, so the next line is treated exactly as if this one
-            // had not been painted. Only a vertically adjacent run counts
-            // (a paragraph-sized gap means the dots belong to nothing), a
-            // run with no leader line before it (a table's "rows omitted"
+            // had not been painted. Only a vertically adjacent run in the
+            // same band counts (a paragraph-sized gap or the other column
+            // means the dots belong to nothing), a run with no leader line before it (a table's "rows omitted"
             // ellipsis, a stray leader) keeps its usual handling below, and
             // a monospace run is code. The next line measures its gap and
             // band from the text line, not from the tail.
@@ -1370,8 +1371,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
 /// Convert text lines to markdown
 /// Inline markup the converters emit around a line's text.
-const MARKUP_TOKENS: [&str; 9] = [
-    "**", "*", "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>",
+const MARKUP_TOKENS: [&str; 10] = [
+    "**", "*", "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>", "</sub>",
 ];
 
 /// A line made only of dots is the tail of the previous line's leader,
@@ -1392,11 +1393,12 @@ fn extend_leader(output: &mut String, dots: &str) -> bool {
     }
     let line_start = output[..body_len].rfind('\n').map_or(0, |i| i + 1);
     let last_line = &output[line_start..body_len];
-    // Closing markup after the leader: `**`, `*`, `</u>`, `</s>`.
+    // Closing markup after the leader: `**`, `*`, `</u>`, `</s>`, `</sup>`,
+    // `</sub>`.
     let mut text_end = last_line.len();
     loop {
         let head = &last_line[..text_end];
-        let Some(stripped) = ["**", "*", "</u>", "</s>"]
+        let Some(stripped) = ["**", "*", "</u>", "</s>", "</sup>", "</sub>"]
             .iter()
             .find_map(|m| head.strip_suffix(m))
         else {
@@ -2736,6 +2738,13 @@ mod tests {
         let mut out = String::from("<u>........</u>\n");
         assert!(!extend_leader(&mut out, "...."));
         assert_eq!(out, "<u>........</u>\n");
+        // Script markup is kept around the extended leader too.
+        let mut out = String::from("<sup>Note....</sup>\n");
+        assert!(extend_leader(&mut out, ".."));
+        assert_eq!(out, "<sup>Note......</sup>\n");
+        let mut out = String::from("<sub>Note....</sub>");
+        assert!(extend_leader(&mut out, ".."));
+        assert_eq!(out, "<sub>Note......</sub>");
         let mut out = String::from("<u>Deficiency....</u>\n");
         assert!(extend_leader(&mut out, "...."));
         assert_eq!(out, "<u>Deficiency........</u>\n");
