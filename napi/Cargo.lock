@@ -2043,7 +2043,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pdf-inspector"
-version = "1.17.0"
+version = "1.19.0"
 dependencies = [
  "dirs",
  "env_logger",
@@ -2060,7 +2060,6 @@ dependencies = [
  "regex",
  "sha2",
  "thiserror",
- "tinyvec",
  "ttf-parser",
  "unicode-normalization",
  "ureq",
@@ -2069,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-inspector-napi"
-version = "1.17.0"
+version = "1.19.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -2934,9 +2933,9 @@ dependencies = [
 
 [[package]]
 name = "tinyvec"
-version = "1.12.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb4ebadaa0af04fab11ae01eb5f9fdb5f9c5b875506e210e71c07873528baa7f"
+checksum = "3e61e67053d25a4e82c844e8424039d9745781b3fc4f32b8d55ed50f5f667ef3"
 dependencies = [
  "tinyvec_macros",
 ]

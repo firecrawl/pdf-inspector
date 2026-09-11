@@ -17,8 +17,18 @@ pub(crate) type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
 /// Font encoding map: maps byte codes to Unicode characters
 pub(crate) type FontEncodingMap = HashMap<u8, char>;
 
+/// Explicit glyph encodings and narrowly verified repairs for a stale CMap.
+pub(crate) struct FontEncoding {
+    pub(crate) differences: FontEncodingMap,
+    pub(crate) identity_overrides: FontEncodingMap,
+    /// Codes whose embedded glyph has no outline but a positive advance:
+    /// painted, they leave a gap and nothing else, so they read as spaces
+    /// whatever the font's ToUnicode claims (see `blank_glyph_codes`).
+    pub(crate) blank_codes: std::collections::HashSet<u8>,
+}
+
 /// All font encodings for a page
-pub(crate) type PageFontEncodings = HashMap<String, FontEncodingMap>;
+pub(crate) type PageFontEncodings = HashMap<String, FontEncoding>;
 
 /// Font width information extracted from PDF font dictionaries
 #[derive(Debug, Clone)]
@@ -184,6 +194,12 @@ pub struct TextItem {
     /// that don't originate from a content-stream show operator (images,
     /// links, form fields, OCR).
     pub font_tag: String,
+    /// At least one source character was changed by the legacy private-use
+    /// symbol cleanup. This is decoding provenance, not an OCR verdict:
+    /// the rewritten value must not be assumed to be an authoritative
+    /// Unicode alias. Merged items retain evidence from every contributing run;
+    /// later text splits conservatively retain their source run's evidence.
+    pub legacy_symbol_rewrite: bool,
     /// Font size
     pub font_size: f32,
     /// Page number (1-indexed)
@@ -666,6 +682,7 @@ mod formatting_tests {
             height: 12.0,
             font: "F1".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,

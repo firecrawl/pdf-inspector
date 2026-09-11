@@ -3,6 +3,7 @@
 //! This module extracts text with position information for structure detection.
 
 mod base14;
+mod clip_boundaries;
 mod content_decode;
 pub(crate) mod content_stream;
 mod fonts;
@@ -12,6 +13,7 @@ mod links;
 pub(crate) mod page_box;
 mod reading_order;
 mod scripts;
+mod text_paint;
 pub(crate) mod underline;
 mod xobjects;
 
@@ -1210,9 +1212,24 @@ fn trimmed_suffix(next: &TextItem) -> &str {
 }
 
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
+    merge_text_items_with_clips(items, &[])
+}
+
+fn merge_text_items_with_clips(
+    items: Vec<TextItem>,
+    clips: &[Option<clip_boundaries::ClipRect>],
+) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
     }
+
+    // References into `items` remain stable throughout grouping and sorting.
+    // Keep clipping provenance private rather than changing the public item type.
+    let clip_by_item: HashMap<*const TextItem, clip_boundaries::ClipRect> = items
+        .iter()
+        .zip(clips)
+        .filter_map(|(item, clip)| clip.map(|rect| (item as *const TextItem, rect)))
+        .collect();
 
     // Group items by (page, Y position) with 5pt tolerance
     let y_tolerance = 5.0;
@@ -1258,6 +1275,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         while i < group.len() {
             let first = group[i];
             let mut text = first.text.clone();
+            let mut legacy_symbol_rewrite = first.legacy_symbol_rewrite;
             let mut end_x = first.x + effective_merge_width(first);
             let mut box_right = first.x + first.width;
             let mut box_left = first.x;
@@ -1285,14 +1303,9 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 {
                     break;
                 }
-                // Never merge across style boundaries: the merged item
-                // carries `first`'s flags, so absorbing a styled run into a
-                // plain neighbor (or vice versa) silently erases the styling
-                // that markdown emission and downstream inline-styling need —
-                // and OR-ing underline instead would stretch `<u>` spans over
-                // neighboring plain text.
-                if next.is_bold != first.is_bold
-                    || next.is_italic != first.is_italic
+                // Preserve the existing join behavior at non-bold style
+                // boundaries, including italic fragments within formulas.
+                if next.is_italic != first.is_italic
                     || next.is_underline != first.is_underline
                     || next.is_strikeout != first.is_strikeout
                 {
@@ -1322,6 +1335,15 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     break;
                 }
                 if gap < -first.font_size * 0.5 && !preserve_stream_order {
+                    break;
+                }
+                let previous = group[j - 1];
+                if clip_boundaries::separated_runs(
+                    previous,
+                    clip_by_item.get(&(previous as *const TextItem)),
+                    next,
+                    clip_by_item.get(&(next as *const TextItem)),
+                ) {
                     break;
                 }
                 // Vertically stacked DIGITS at different baselines — the
@@ -1365,10 +1387,44 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     Some((run_end, floor)) if j <= run_end => floor,
                     _ => threshold,
                 };
-                if !small_caps_join && (needs_bullet_space || gap > effective_threshold) {
+                let bold_boundary = next.is_bold != first.is_bold;
+                let explicit_bold_space = bold_boundary
+                    && (text.ends_with(char::is_whitespace)
+                        || next.text.starts_with(char::is_whitespace));
+                // Numeric fragments have their own joining thresholds in
+                // line assembly. Injecting a word space here would split a
+                // number whose decimal point or digits use a bold font.
+                let numeric_boundary = bold_boundary
+                    && match (text.chars().last(), next.text.chars().next()) {
+                        (Some(p), Some(c)) if p.is_ascii_digit() => {
+                            c.is_ascii_digit() || matches!(c, '.' | ',' | '%')
+                        }
+                        (Some('.' | ','), Some(c)) if c.is_ascii_digit() => {
+                            let prefix = &text[..text.len() - 1];
+                            // A separate decimal glyph can start a fractional
+                            // number even without a preceding integer run.
+                            prefix.trim().is_empty()
+                                || prefix.chars().last().is_some_and(|c| c.is_ascii_digit())
+                        }
+                        (Some('+' | '-'), Some(c)) => c.is_ascii_digit(),
+                        _ => false,
+                    };
+                if !small_caps_join
+                    && (needs_bullet_space || (gap > effective_threshold && !numeric_boundary))
+                    && !explicit_bold_space
+                    && !text.ends_with(char::is_whitespace)
+                {
                     text.push(' ');
                 }
+                // Keep bold runs separate, but preserve the same word-space
+                // decision as an unstyled merge. Otherwise the later line
+                // assembler's wider joining threshold can glue words when
+                // newly recovered font flags split a previously merged run.
+                if bold_boundary {
+                    break;
+                }
                 text.push_str(&next.text);
+                legacy_symbol_rewrite |= next.legacy_symbol_rewrite;
                 box_right = box_right.max(next.x + next.width);
                 box_left = box_left.min(next.x);
                 let next_end = next.x + effective_merge_width(next);
@@ -1398,6 +1454,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 height: first.height,
                 font: first.font.clone(),
                 font_tag: first.font_tag.clone(),
+                legacy_symbol_rewrite,
                 font_size: first.font_size,
                 page: first.page,
                 is_bold: first.is_bold,
@@ -1544,6 +1601,7 @@ mod tests {
             height: 12.0,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,
@@ -1556,6 +1614,19 @@ mod tests {
             mcid: None,
             baseline_shift: 0.0,
         }
+    }
+
+    #[test]
+    fn explicit_trailing_space_is_not_doubled_across_a_word_gap() {
+        // "for " already carries its space run; the 4pt gap (0.33 em) that
+        // run left clears the word threshold but must not add a second one.
+        let items = vec![
+            make_merge_item("for ", 100.0, 21.6),
+            make_merge_item("the", 125.6, 21.6),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "for the");
     }
 
     fn with_mcid(mut item: TextItem) -> TextItem {
@@ -1603,6 +1674,146 @@ mod tests {
         assert!(merged[1].is_italic && !merged[1].is_underline);
         assert!(merged[2].is_underline && !merged[2].is_italic);
         assert!(!merged[3].is_underline && !merged[3].is_italic);
+    }
+
+    #[test]
+    fn recovered_bold_preserves_word_spacing_at_style_boundary() {
+        // A 0.1-em gap is a word boundary in merging, but the later line
+        // assembler joins gaps below 0.15 em. Recovering bold must not lose
+        // the space that the original all-plain merge would have emitted.
+        let plain = vec![
+            make_merge_item("KEY", 100.0, 24.0),
+            make_merge_item("Body", 125.2, 24.0),
+        ];
+        let original = merge_text_items(plain.clone());
+        let mut styled = plain;
+        styled[0].is_bold = true;
+        let recovered = merge_text_items(styled);
+        assert_eq!(original[0].text, "KEY Body");
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered[0].is_bold && !recovered[1].is_bold);
+        assert_eq!(recovered[0].text, "KEY ");
+        assert_eq!(recovered[1].text, "Body");
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            original[0].text
+        );
+        let line = TextLine {
+            items: recovered,
+            y: 100.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(line.text(), "KEY Body");
+        assert_eq!(
+            line.text_with_formatting(true, false, false),
+            "**KEY** Body"
+        );
+    }
+
+    #[test]
+    fn recovered_bold_keeps_zero_gap_word_fragments_joined() {
+        let plain = vec![
+            make_merge_item("un", 100.0, 12.0),
+            make_merge_item("known", 112.0, 30.0),
+        ];
+        let original = merge_text_items(plain.clone());
+        let mut styled = plain;
+        styled[0].is_bold = true;
+        let recovered = merge_text_items(styled);
+        assert_eq!(original[0].text, "unknown");
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered[0].is_bold && !recovered[1].is_bold);
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            original[0].text
+        );
+        let line = TextLine {
+            items: recovered,
+            y: 100.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(line.text(), "unknown");
+        assert_eq!(line.text_with_formatting(true, false, false), "**un**known");
+    }
+
+    #[test]
+    fn bold_numeric_fragments_keep_line_assembly_spacing() {
+        for (parts, gap, expected) in [
+            (
+                vec![("0", false), (".", true), ("86", false)],
+                1.2,
+                "0**.**86",
+            ),
+            (vec![("0.", true), ("86", false)], 1.2, "**0.**86"),
+            (vec![(".", true), ("42", false)], 1.2, "**.**42"),
+            (
+                vec![("12 ", false), (".", true), ("55", false)],
+                1.2,
+                "12 **.**55",
+            ),
+            (
+                vec![("12", false), (" .", true), ("55", false)],
+                1.2,
+                "12 **.**55",
+            ),
+            (vec![("1", false), ("23", true)], 1.2, "1**23**"),
+            (vec![("12", true), ("%", false)], 1.2, "**12**%"),
+            (vec![("+", true), ("12", false)], 1.2, "**+**12"),
+            (
+                vec![("1", false), (",", true), ("25", false)],
+                1.2,
+                "1**,**25",
+            ),
+            (vec![("Done.", true), ("2", false)], 1.2, "**Done.** 2"),
+            (vec![("0. ", true), ("86", false)], 1.2, "**0.** 86"),
+            (vec![("0.", true), ("86", false)], 4.8, "**0.** 86"),
+            (vec![("KEY ", true), ("Body", false)], 1.2, "**KEY** Body"),
+            (vec![("KEY", true), (" Body", false)], 1.2, "**KEY** Body"),
+        ] {
+            let mut x = 100.0;
+            let items = parts
+                .into_iter()
+                .map(|(text, bold)| {
+                    let width = text.len() as f32 * 6.0;
+                    let mut item = make_merge_item(text, x, width);
+                    item.is_bold = bold;
+                    x += width + gap;
+                    item
+                })
+                .collect();
+            let line = TextLine {
+                items: merge_text_items(items),
+                y: 100.0,
+                page: 1,
+                adaptive_threshold: 0.1,
+            };
+            assert_eq!(line.text_with_formatting(true, false, false), expected);
+            assert_eq!(line.text(), expected.replace("**", ""));
+        }
+    }
+
+    #[test]
+    fn non_bold_style_boundaries_keep_existing_spacing() {
+        for style in 0..3 {
+            let mut first = make_merge_item("KEY", 100.0, 24.0);
+            match style {
+                0 => first.is_italic = true,
+                1 => first.is_underline = true,
+                _ => first.is_strikeout = true,
+            }
+            let merged = merge_text_items(vec![first, make_merge_item("Body", 125.2, 24.0)]);
+            assert_eq!(merged.len(), 2);
+            assert_eq!(merged[0].text, "KEY");
+            assert_eq!(merged[1].text, "Body");
+        }
     }
 
     #[test]
@@ -1783,6 +1994,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -1803,6 +2015,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -1823,6 +2036,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2613,6 +2827,7 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2633,6 +2848,7 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2653,6 +2869,7 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2684,6 +2901,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2704,6 +2922,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2724,6 +2943,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2757,6 +2977,7 @@ mod tests {
                 height: 13.3,
                 font: "F4".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 13.3,
                 page: 1,
                 is_bold: true,
@@ -2797,6 +3018,7 @@ mod tests {
                 height: 13.3,
                 font: "F5".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 13.3,
                 page: 1,
                 is_bold: false,
@@ -2838,6 +3060,7 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2858,6 +3081,7 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2878,6 +3102,7 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2906,6 +3131,7 @@ mod tests {
             height: 12.0,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,
@@ -3049,6 +3275,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -3069,6 +3296,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -3099,6 +3327,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -3119,6 +3348,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -3165,6 +3395,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page,
                 is_bold: false,
@@ -3215,6 +3446,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page,
                 is_bold: false,
@@ -3265,6 +3497,7 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page,
                 is_bold: false,
@@ -3308,6 +3541,7 @@ mod tests {
             height: font_size,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,

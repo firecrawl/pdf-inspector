@@ -145,6 +145,9 @@ fn merge_adjacent_items_preserving(
                 height: first_item.height,
                 font: first_item.font.clone(),
                 font_tag: first_item.font_tag.clone(),
+                legacy_symbol_rewrite: indices
+                    .iter()
+                    .any(|&index| items[index].legacy_symbol_rewrite),
                 font_size: first_item.font_size,
                 page: first_item.page,
                 is_bold: first_item.is_bold,
@@ -2600,6 +2603,7 @@ mod tests {
             item_type: crate::types::ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            legacy_symbol_rewrite: false,
         }
     }
 
@@ -2883,6 +2887,7 @@ mod tests {
             height: font_size,
             font: "TestFont".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
@@ -3029,6 +3034,7 @@ mod tests {
             height: 12.0,
             font: "F1".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,

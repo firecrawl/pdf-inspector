@@ -279,6 +279,7 @@ mod tests {
             height: 9.876,
             font: "F1".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page: 2,
             is_bold: false,

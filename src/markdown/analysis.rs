@@ -104,11 +104,27 @@ pub(crate) fn bold_heading_level(heading_tiers: &[f32]) -> usize {
 
 /// Detect TOC-style lines that contain dot leaders (e.g., "Section Name .... 42").
 /// These lines should never be joined with adjacent lines into a paragraph.
-/// Handles both consecutive dots ("....") and spaced dots ("...   ...").
+/// Handles consecutive dots ("...."), spaced groups ("...   ...") and single
+/// dots set a space apart (". . . .", as InDesign paints tab leaders).
 pub(crate) fn has_dot_leaders(text: &str) -> bool {
     // Consecutive dots (4+)
     if text.contains("....") {
         return true;
+    }
+    // Single dots separated by one space each: four or more in a row, each
+    // dot standing alone (a period attached to a word does not start one).
+    let mut spaced_run = 0;
+    let mut prev = ' ';
+    for ch in text.chars() {
+        match ch {
+            '.' if prev == ' ' => spaced_run += 1,
+            ' ' if prev == '.' => {}
+            _ => spaced_run = 0,
+        }
+        if spaced_run >= 4 {
+            return true;
+        }
+        prev = ch;
     }
     // Spaced dot leaders: "..." followed by whitespace and more dots
     // Count occurrences of "..." (3+ dots) — if 2+ groups, it's a dot leader
@@ -128,6 +144,34 @@ pub(crate) fn has_dot_leaders(text: &str) -> bool {
         dot_groups += 1;
     }
     dot_groups >= 2
+}
+
+/// A line made of nothing but dots (and spaces), two or more: a candidate
+/// tail of the previous line's leader, painted as its own run when a leader
+/// spans two text objects. Whether it is folded is decided downstream by
+/// `extend_leader`, which requires the line before it to end in a leader of
+/// four or more dots, so a lone ellipsis after ordinary text keeps its own
+/// line.
+pub(crate) fn is_leader_continuation(text: &str) -> bool {
+    let mut dots = 0;
+    for ch in text.chars() {
+        match ch {
+            '.' => dots += 1,
+            ' ' => {}
+            _ => return false,
+        }
+    }
+    dots >= 2
+}
+
+/// Number of dots in the trailing run of dots and spaces of `text`: the
+/// length of a leader that ends the line, whether painted `....` or `. . .`.
+pub(crate) fn trailing_leader_dots(text: &str) -> usize {
+    text.chars()
+        .rev()
+        .take_while(|c| *c == '.' || *c == ' ')
+        .filter(|c| *c == '.')
+        .count()
 }
 
 /// Detect a table-of-contents entry: a line ending in a page number preceded by
@@ -846,6 +890,7 @@ mod tests {
             height: font_size,
             font: "Test".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: bold,
@@ -969,5 +1014,36 @@ mod tests {
         assert!(!is_heading_fragment("Changing objectives:"));
         assert!(!is_heading_fragment("Sales by Region (2024)"));
         assert!(!is_heading_fragment("Results (preliminary)"));
+    }
+
+    #[test]
+    fn has_dot_leaders_recognises_spaced_single_dots() {
+        assert!(has_dot_leaders("Jane Roe . . . . . . Chief of Staff"));
+        assert!(has_dot_leaders("Name . . . . 12"));
+        assert!(!has_dot_leaders("e.g. i.e. etc. and so on."));
+        assert!(!has_dot_leaders("Wait . . . what?"));
+        assert!(!has_dot_leaders("Wait. . . . what?"));
+        assert!(!has_dot_leaders("A. B. C. D."));
+        assert!(has_dot_leaders(". . . . 12"));
+    }
+
+    #[test]
+    fn leader_continuation_is_two_or_more_dots_only() {
+        assert!(is_leader_continuation("........"));
+        assert!(is_leader_continuation(". . . ."));
+        assert!(is_leader_continuation("..."));
+        assert!(is_leader_continuation(".."));
+        assert!(!is_leader_continuation("."));
+        assert!(!is_leader_continuation("...... 12"));
+        assert!(!is_leader_continuation("Total assets........"));
+        assert!(!is_leader_continuation(""));
+    }
+
+    #[test]
+    fn trailing_leader_dots_counts_spaced_and_solid_runs() {
+        assert_eq!(trailing_leader_dots("Total assets........"), 8);
+        assert_eq!(trailing_leader_dots("Total assets . . . . "), 4);
+        assert_eq!(trailing_leader_dots("Capital.... 0,00"), 0);
+        assert_eq!(trailing_leader_dots("And then..."), 3);
     }
 }

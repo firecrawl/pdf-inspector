@@ -328,6 +328,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             height: item.height,
             font: item.font.clone(),
             font_tag: item.font_tag.clone(),
+            legacy_symbol_rewrite: item.legacy_symbol_rewrite,
             font_size: item.font_size,
             page: item.page,
             is_bold: item.is_bold,
@@ -354,6 +355,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             height: item.height,
             font: item.font.clone(),
             font_tag: item.font_tag.clone(),
+            legacy_symbol_rewrite: item.legacy_symbol_rewrite,
             font_size: item.font_size,
             page: item.page,
             is_bold: item.is_bold,
@@ -1602,6 +1604,7 @@ mod tests {
             height: font_size,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
@@ -1625,6 +1628,7 @@ mod tests {
             height: font_size,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
@@ -1636,6 +1640,25 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+        }
+    }
+
+    #[test]
+    fn financial_value_splits_retain_source_rewrite_evidence() {
+        for rewritten in [false, true] {
+            let mut source = make_char("$ 120 230 340", 10.0, 50.0, 10.0, 300.0);
+            source.legacy_symbol_rewrite = rewritten;
+            let parts = financial::try_split_financial_item(&source).unwrap();
+            assert_eq!(
+                parts
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["$ 120", "230", "340"]
+            );
+            assert!(parts
+                .iter()
+                .all(|item| item.legacy_symbol_rewrite == rewritten));
         }
     }
 

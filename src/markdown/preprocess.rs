@@ -217,6 +217,8 @@ pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextL
                 if let Some(first_item) = result[idx].items.first_mut() {
                     let prev_text = first_item.text.trim().to_string();
                     first_item.text = format!("{}{}", drop_char, prev_text);
+                    first_item.legacy_symbol_rewrite |=
+                        line.items.iter().any(|item| item.legacy_symbol_rewrite);
                 }
             }
             // Don't add the drop cap line itself
@@ -243,6 +245,7 @@ mod tests {
             height: font_size,
             font: "TestFont".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
@@ -263,6 +266,24 @@ mod tests {
             y,
             page,
             adaptive_threshold: 0.10,
+        }
+    }
+
+    #[test]
+    fn drop_cap_merge_preserves_evidence_from_either_source() {
+        for (body_marked, cap_marked) in [(false, false), (true, false), (false, true)] {
+            let mut body = make_line("elcome", 12.0, 1, 700.0, None);
+            body.items[0].legacy_symbol_rewrite = body_marked;
+            let mut cap = make_line("W", 36.0, 1, 680.0, None);
+            cap.items[0].legacy_symbol_rewrite = cap_marked;
+
+            let result = merge_drop_caps(vec![body, cap], 12.0);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].text(), "Welcome");
+            assert_eq!(
+                result[0].items[0].legacy_symbol_rewrite,
+                body_marked || cap_marked
+            );
         }
     }
 

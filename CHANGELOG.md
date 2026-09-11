@@ -9,6 +9,50 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Fixed
+
+- A contents page whose entries end in right-aligned page numbers without dot
+  leaders — an edited volume's table of contents with the chapter authors on
+  their own lines — is rendered as a contents list, one entry per line with
+  its page number tab-separated, instead of being read as a two-column page
+  whose titles and numbers interleave into a paragraph.
+
+## [1.19.0] - 2026-09-09
+
+Changes since 1.18.0.
+
+### Added
+
+- Rust `TextItem::legacy_symbol_rewrite` and optional Node `legacySymbolRewrite`
+  identify text changed by legacy symbol cleanup. Merged and split items retain
+  this evidence; a false or absent marker does not guarantee decoding accuracy.
+  ([#519](https://github.com/firecrawl/pdf-inspector/pull/519))
+
+### Fixed
+
+- Preserve bold emphasis simulated by filling and stroking text, including
+  nested forms, and retain inline styling in long quoted prose.
+  ([#511](https://github.com/firecrawl/pdf-inspector/pull/511))
+- Apply horizontal text scaling (`Tz`) to bounds and advances, including
+  reflected text and nested forms, so scaled text lands in the correct region.
+  ([#510](https://github.com/firecrawl/pdf-inspector/pull/510))
+- Recover narrowly verified stale Unicode mappings in embedded subset fonts
+  while preserving valid semantic mappings and ligatures.
+  ([#516](https://github.com/firecrawl/pdf-inspector/pull/516))
+- Keep independently positioned text runs separate when their measured advances
+  lie inside distinct rectangular clipping regions, including visual-order RTL.
+  ([#518](https://github.com/firecrawl/pdf-inspector/pull/518))
+
+### Changed
+
+- Rust `TextItem` literals must include the new `legacy_symbol_rewrite` field
+  (`false` for items without legacy symbol cleanup). The Node field is optional
+  and emitted only when cleanup changed a character.
+
+## [1.18.0] - 2026-09-07
+
+Changes since 1.17.0.
+
 ### Added
 
 - `TextItem::baseline_shift`: signed offset, in points, of a superscript or
@@ -47,12 +91,15 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
-- A contents page whose entries end in right-aligned page numbers without dot
-  leaders — an edited volume's table of contents with the chapter authors on
-  their own lines — is rendered as a contents list, one entry per line with
-  its page number tab-separated, instead of being read as a two-column page
-  whose titles and numbers interleave into a paragraph.
-
+- Object-stream decompression is bounded during loading with lopdf 0.44,
+  preventing excessive memory use. Oversized streams are skipped, and
+  documents with no readable pages fail cleanly.
+- Embedded TrueType fonts recover bold styling from `head.macStyle` when
+  OS/2 metadata is unavailable, while explicit OS/2 styling remains
+  authoritative. Word spacing and numeric continuity survive bold boundaries.
+- PDFs with 19-byte classic cross-reference entries ending in a bare LF or
+  CR now load through a repair pass instead of failing with `invalid file
+  trailer`.
 - Raised and lowered marker glyphs no longer form their own line. Line
   grouping — the Markdown pipeline and `extract_text_in_regions`
   (`extractTextInRegions`) alike — compares baselines through `line_y()`, so
@@ -132,7 +179,7 @@ version and date. Earlier releases are described in their
   still not applied.
 - Rust: `TextItem` gained the required public field `baseline_shift`, so code
   that builds a `TextItem` with a struct literal must add it (`0.0` for normal
-  text). This follows the precedent of `font_tag` in 1.16.0; the Python and
+  text). This follows the precedent of `font_tag` in 1.17.0; the Python and
   Node bindings are unaffected.
 - Snapshot fixtures `thermo-freon12` and `shannon-entropy-p1-2` updated for
   the corrected script handling (`Freon<sup>®</sup>`, `V<sub>f</sub>`,
@@ -147,3 +194,16 @@ version and date. Earlier releases are described in their
   `extract_text_with_positions_and_rotations_mem` to
   `collect_text_in_region_in_frame`, or use `extract_text_in_regions_mem`,
   which handles both turns itself.
+
+### Included pull requests
+
+- [#452](https://github.com/firecrawl/pdf-inspector/pull/452): Faster cross-platform CI.
+- [#453](https://github.com/firecrawl/pdf-inspector/pull/453): Faster release publishing.
+- [#478](https://github.com/firecrawl/pdf-inspector/pull/478): Bounded object-stream decompression.
+- [#488](https://github.com/firecrawl/pdf-inspector/pull/488): Superscript/subscript handling and baseline metadata.
+- [#489](https://github.com/firecrawl/pdf-inspector/pull/489): Password-aware Python fixture tests.
+- [#490](https://github.com/firecrawl/pdf-inspector/pull/490): Python binding tests in CI.
+- [#487](https://github.com/firecrawl/pdf-inspector/pull/487): Positions and regions relative to the visible page box.
+- [#486](https://github.com/firecrawl/pdf-inspector/pull/486): Rotated-text bounds and rotation metadata.
+- [#507](https://github.com/firecrawl/pdf-inspector/pull/507): Embedded bold-font metadata recovery.
+- [#508](https://github.com/firecrawl/pdf-inspector/pull/508): Repair classic cross-reference tables with short entries.
