@@ -15,7 +15,8 @@ use super::fonts::{
     CMapDecisionCache, FontStyleCache,
 };
 use super::geometry::{
-    baseline_rotation, estimated_advance_ts, reading_direction, rise_adjusted, scaled_run_geometry,
+    advanced_tm, baseline_rotation, estimated_advance_ts, reading_direction, rise_adjusted,
+    scaled_run_geometry,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -909,6 +910,12 @@ fn extract_form_xobject_text_inner(
                         let mut current_estimate_ts: f32 = 0.0; // metric-less estimate of `current_text`
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
+                        // A sub-run's box starts at its first painted glyph.
+                        // Positioning ahead of that glyph — `[-2973 (oduction)]
+                        // TJ` rejoining a word whose head was painted first
+                        // from another `Tm` — carries the pen from the `Tm`
+                        // origin, not the box.
+                        let mut sub_run_painted = false;
                         // Positive TJ offsets beyond a space width move the pen
                         // backward past painted glyphs — logical-order RTL
                         // producers position runs right-to-left this way.
@@ -940,6 +947,7 @@ fn extract_form_xobject_text_inner(
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_run_painted = false;
                                     } else {
                                         total_width_ts += displacement;
                                         if !hidden
@@ -977,6 +985,7 @@ fn extract_form_xobject_text_inner(
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_run_painted = false;
                                     } else {
                                         total_width_ts += displacement;
                                         if !hidden
@@ -990,6 +999,12 @@ fn extract_form_xobject_text_inner(
                                     continue;
                                 }
                                 _ => {}
+                            }
+                            if !sub_run_painted
+                                && get_operand_bytes(element).is_some_and(|raw| !raw.is_empty())
+                            {
+                                sub_start_width_ts = total_width_ts;
+                                sub_run_painted = true;
                             }
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
@@ -1047,13 +1062,15 @@ fn extract_form_xobject_text_inner(
                             // A whitespace-only array is a space run like a
                             // whitespace-only `Tj`: it may be the word space
                             // of the item before it.
+                            let offset_tm =
+                                advanced_tm(&text_matrix, sub_start_width_ts, horizontal_scale);
                             let combined =
-                                multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                                multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let geometry = scaled_run_geometry(
                                 &combined,
-                                font_info.map(|_| total_width_ts),
+                                font_info.map(|_| total_width_ts - sub_start_width_ts),
                                 current_estimate_ts,
                                 rendered_size.copysign(current_font_size),
                                 type3_y_flips.contains(&current_font),
@@ -1095,14 +1112,8 @@ fn extract_form_xobject_text_inner(
                             for (text, start_w, end_w, estimate_ts, legacy_symbol_rewrite) in
                                 &sub_items
                             {
-                                let offset_tm = [
-                                    text_matrix[0],
-                                    text_matrix[1],
-                                    text_matrix[2],
-                                    text_matrix[3],
-                                    text_matrix[4] + start_w * horizontal_scale * text_matrix[0],
-                                    text_matrix[5] + start_w * horizontal_scale * text_matrix[1],
-                                ];
+                                let offset_tm =
+                                    advanced_tm(&text_matrix, *start_w, horizontal_scale);
                                 let combined_mat =
                                     multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
                                 let geometry = scaled_run_geometry(
@@ -2213,5 +2224,26 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
             body.width
         );
         assert_eq!(body.height, 12.0);
+    }
+
+    /// The form parser positions `TJ` sub-runs like the page parser: pen
+    /// travel ahead of the first glyph moves the box, not just the pen.
+    #[test]
+    fn tj_positioning_ahead_of_the_first_glyph_inside_form_moves_the_box() {
+        // -5400 at 10pt carries the pen 54pt from x=100 to 154, flush against
+        // "Intr" (130..154), so the merge pass rejoins the word.
+        let items = form_items(
+            b"BT /F1 10 Tf 1 0 0 1 130 700 Tm (Intr) Tj 1 0 0 1 100 700 Tm [-5400 (oduction)] TJ ET",
+        );
+        let word = find(&items, "Introduction");
+        assert!((word.x - 130.0).abs() < 0.05, "{items:?}");
+        assert!((word.width - 72.0).abs() < 0.05, "{items:?}");
+
+        // A squeezed space run positioned the same way is still the word
+        // space of the item before it.
+        let items = form_items(
+            b"BT /F1 12 Tf 72 700 Td (for) Tj -6 Tc 1 0 0 1 60 700 Tm [-2800 ( )] TJ 0 Tc 1 0 0 1 94.8 700 Tm (the) Tj ET",
+        );
+        find(&items, "for the");
     }
 }

@@ -83,6 +83,21 @@ pub(crate) fn rise_adjusted(tm: &[f32; 6], rise: f32) -> [f32; 6] {
     ]
 }
 
+/// `tm` with its origin carried `advance_ts` text-space units along the
+/// baseline (scaled by `Tz`): where a run painted after that much pen travel
+/// begins.
+pub(crate) fn advanced_tm(tm: &[f32; 6], advance_ts: f32, horizontal_scale: f32) -> [f32; 6] {
+    let advance = advance_ts * horizontal_scale;
+    [
+        tm[0],
+        tm[1],
+        tm[2],
+        tm[3],
+        tm[4] + advance * tm[0],
+        tm[5] + advance * tm[1],
+    ]
+}
+
 /// Axis-aligned device-space box of one shown run plus its baseline angle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RunGeometry {
@@ -648,5 +663,21 @@ mod tests {
         assert_eq!(baseline_rotation(1.0, -1e-7), 0.0);
         assert_eq!(normalize_degrees(-90.0), 270.0);
         assert_eq!(normalize_degrees(360.0), 0.0);
+    }
+
+    #[test]
+    fn advanced_tm_carries_the_origin_along_the_scaled_baseline() {
+        // 9.5pt text at (68, 418): 2.973 text-space units of pen travel land
+        // 28.24pt to the right and leave the linear part alone.
+        let tm = [9.5, 0.0, 0.0, 9.5, 68.0, 418.0];
+        let moved = advanced_tm(&tm, 2.973, 1.0);
+        assert!((moved[4] - 96.2435).abs() < 1e-3, "{moved:?}");
+        assert_eq!(&moved[..4], &tm[..4]);
+        assert_eq!(moved[5], 418.0);
+        // `Tz 50` halves the travel; a 90° matrix travels along y.
+        assert!((advanced_tm(&tm, 2.973, 0.5)[4] - 82.12175).abs() < 1e-3);
+        let turned = advanced_tm(&[0.0, 12.0, -12.0, 0.0, 100.0, 200.0], 2.0, 1.0);
+        assert_eq!((turned[4], turned[5]), (100.0, 224.0));
+        assert_eq!(advanced_tm(&tm, 0.0, 1.0), tm);
     }
 }

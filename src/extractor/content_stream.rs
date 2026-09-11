@@ -19,8 +19,8 @@ use super::fonts::{
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
 use super::geometry::{
-    estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees, reading_direction,
-    rise_adjusted, scaled_run_geometry, PageRotation, RunGeometry,
+    advanced_tm, estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees,
+    reading_direction, rise_adjusted, scaled_run_geometry, PageRotation, RunGeometry,
 };
 use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
@@ -972,27 +972,6 @@ pub(crate) fn extract_page_text_items(
                         }
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
-                        // Capture first-glyph position for ActualText
-                        let paints_a_glyph = op
-                            .operands
-                            .first()
-                            .and_then(|o| o.as_array().ok())
-                            .is_some_and(|elements| {
-                                elements.iter().any(|e| {
-                                    get_operand_bytes(e).is_some_and(|raw| !raw.is_empty())
-                                })
-                            });
-                        if suppress_glyph_extraction
-                            && actual_text_glyph_tm.is_none()
-                            && paints_a_glyph
-                        {
-                            actual_text_glyph_tm = Some(text_matrix);
-                            actual_text_glyph_rise = Some(text_rise);
-                            actual_text_glyph_font = Some(current_font.clone());
-                            actual_text_glyph_font_size = Some(current_font_size);
-                            actual_text_glyph_scale = Some(horizontal_scale);
-                        }
-
                         // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(font_info) = font_info {
                             let space_em = font_info.space_width as f32 * font_info.units_scale;
@@ -1011,6 +990,12 @@ pub(crate) fn extract_page_text_items(
                         let mut current_estimate_ts: f32 = 0.0; // metric-less estimate of `current_text`
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
+                        // A sub-run's box starts at its first painted glyph.
+                        // Positioning ahead of that glyph — `[-2973 (oduction)]
+                        // TJ` rejoining a word whose head was painted first
+                        // from another `Tm` — carries the pen from the `Tm`
+                        // origin, not the box.
+                        let mut sub_run_painted = false;
                         // Positive TJ offsets beyond a space width move the pen
                         // backward past painted glyphs — logical-order RTL
                         // producers position runs right-to-left this way.
@@ -1043,6 +1028,7 @@ pub(crate) fn extract_page_text_items(
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_run_painted = false;
                                     } else {
                                         total_width_ts += displacement;
                                         if !is_invisible
@@ -1080,6 +1066,7 @@ pub(crate) fn extract_page_text_items(
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_run_painted = false;
                                     } else {
                                         total_width_ts += displacement;
                                         if !is_invisible
@@ -1093,6 +1080,25 @@ pub(crate) fn extract_page_text_items(
                                     continue;
                                 }
                                 _ => {}
+                            }
+                            if !sub_run_painted
+                                && get_operand_bytes(element).is_some_and(|raw| !raw.is_empty())
+                            {
+                                sub_start_width_ts = total_width_ts;
+                                sub_run_painted = true;
+                                // An ActualText span starts at its first
+                                // painted glyph too.
+                                if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
+                                    actual_text_glyph_tm = Some(advanced_tm(
+                                        &text_matrix,
+                                        total_width_ts,
+                                        horizontal_scale,
+                                    ));
+                                    actual_text_glyph_rise = Some(text_rise);
+                                    actual_text_glyph_font = Some(current_font.clone());
+                                    actual_text_glyph_font_size = Some(current_font_size);
+                                    actual_text_glyph_scale = Some(horizontal_scale);
+                                }
                             }
                             let element_glyphs =
                                 shown_glyph_count(get_operand_bytes(element), font_info);
@@ -1128,11 +1134,11 @@ pub(crate) fn extract_page_text_items(
                                 actual_text_glyphs_measured &= font_info.is_some();
                                 actual_text_estimate_ts += element_estimate_ts * horizontal_scale;
                                 if element_glyphs > 0 {
-                                    let mut offset_tm = text_matrix;
-                                    offset_tm[4] +=
-                                        element_start_width_ts * horizontal_scale * text_matrix[0];
-                                    offset_tm[5] +=
-                                        element_start_width_ts * horizontal_scale * text_matrix[1];
+                                    let offset_tm = advanced_tm(
+                                        &text_matrix,
+                                        element_start_width_ts,
+                                        horizontal_scale,
+                                    );
                                     let combined = multiply_matrices(
                                         &rise_adjusted(&offset_tm, text_rise),
                                         &ctm,
@@ -1193,13 +1199,15 @@ pub(crate) fn extract_page_text_items(
                             // A whitespace-only array is a space run like a
                             // whitespace-only `Tj`: it may be the word space
                             // of the item before it.
+                            let offset_tm =
+                                advanced_tm(&text_matrix, sub_start_width_ts, horizontal_scale);
                             let combined =
-                                multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                                multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let geometry = scaled_run_geometry(
                                 &combined,
-                                font_info.map(|_| total_width_ts),
+                                font_info.map(|_| total_width_ts - sub_start_width_ts),
                                 current_estimate_ts,
                                 rendered_size.copysign(current_font_size),
                                 type3_y_flips.contains(&current_font),
@@ -1243,14 +1251,8 @@ pub(crate) fn extract_page_text_items(
                             for (text, start_w, end_w, estimate_ts, legacy_symbol_rewrite) in
                                 &sub_items
                             {
-                                let offset_tm = [
-                                    text_matrix[0],
-                                    text_matrix[1],
-                                    text_matrix[2],
-                                    text_matrix[3],
-                                    text_matrix[4] + start_w * horizontal_scale * text_matrix[0],
-                                    text_matrix[5] + start_w * horizontal_scale * text_matrix[1],
-                                ];
+                                let offset_tm =
+                                    advanced_tm(&text_matrix, *start_w, horizontal_scale);
                                 let combined =
                                     multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
                                 let geometry = scaled_run_geometry(
@@ -4022,5 +4024,61 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             b"BT /F1 10 Tf 72 700 Td /Span <</ActualText <FEFF00480069>>> BDC (Hx) Tj EMC ET",
         );
         assert_eq!(items[0].text, "Hi");
+    }
+
+    /// Producers that paint a word out of order — its tail, then its head
+    /// from a `Tm` reset — lead the tail's `TJ` array with the pen travel
+    /// that puts it back after the head. That travel moves the pen from the
+    /// `Tm` origin; the sub-run's box starts at its first painted glyph.
+    #[test]
+    fn tj_positioning_ahead_of_the_first_glyph_moves_the_box_not_the_origin() {
+        // 6pt glyphs: -5400 at 10pt carries the pen 54pt from x=100 to 154,
+        // flush against "Intr" (130..154), so the merge pass rejoins the word.
+        let items = extract_simple_items(
+            b"BT /F1 10 Tf 1 0 0 1 130 700 Tm (Intr) Tj 1 0 0 1 100 700 Tm [-5400 (oduction)] TJ ET",
+        );
+        let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["Introduction"], "{items:?}");
+        assert!((items[0].x - 130.0).abs() < 0.05, "{items:?}");
+        assert!((items[0].width - 72.0).abs() < 0.05, "{items:?}");
+
+        // Likewise for a kern between a column gap and the next glyph: "B"
+        // is painted 4pt past the 60pt gap, at 170.
+        let items =
+            extract_simple_items(b"BT /F1 10 Tf 1 0 0 1 100 700 Tm [(A) -6000 -400 (B)] TJ ET");
+        let boxes: Vec<_> = items
+            .iter()
+            .map(|i| (i.text.as_str(), i.x.round(), i.width.round()))
+            .collect();
+        assert_eq!(boxes, [("A", 100.0, 6.0), ("B", 170.0, 6.0)]);
+    }
+
+    /// The same travel ahead of a whitespace-only array puts the space run
+    /// where it is painted, so a squeezed word space still reaches the item
+    /// before it.
+    #[test]
+    fn squeezed_space_run_positioned_by_tj_travel_gives_the_word_space() {
+        // "for" ends at 93.6; from x=60, -2800 at 12pt carries the pen 33.6pt
+        // to it, and the 1.2pt space ends at 94.8 where "the" starts.
+        let items = extract_simple_items(
+            b"BT /F1 12 Tf 72 700 Td (for) Tj -6 Tc 1 0 0 1 60 700 Tm [-2800 ( )] TJ 0 Tc 1 0 0 1 94.8 700 Tm (the) Tj ET",
+        );
+        let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["for the"], "{items:?}");
+    }
+
+    /// An ActualText span whose first array leads with positioning starts
+    /// where its first glyph is painted, like any other sub-run.
+    #[test]
+    fn actual_text_span_starts_at_its_first_painted_glyph() {
+        // -5400 at 10pt carries the pen 54pt from x=100 to 154 before the
+        // 48pt of glyphs the replacement text stands for.
+        let items = extract_simple_items(
+            b"BT /F1 10 Tf 1 0 0 1 100 700 Tm /Span <</ActualText (ODUCTION) >> BDC [-5400 (oduction)] TJ EMC ET",
+        );
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].text, "ODUCTION");
+        assert!((items[0].x - 154.0).abs() < 0.05, "{items:?}");
+        assert!((items[0].width - 48.0).abs() < 0.05, "{items:?}");
     }
 }
