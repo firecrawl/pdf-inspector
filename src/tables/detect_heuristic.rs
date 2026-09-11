@@ -1223,8 +1223,10 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
     // page can be one too when every entry has its own page. The generic
     // path tells them apart by the header row a data table carries above its
     // numbers, and that row is what the block boundary above drops — so a
-    // dense run whose preceding row holds an item over the number column
-    // is the data table it looks like, and stays with the generic path.
+    // dense run whose preceding row holds a text item over the number
+    // column is the data table it looks like, and stays with the generic
+    // path. A script there (a footnote marker on the title above) is not a
+    // header.
     let dense_consecutive = {
         let mut sorted = raw_values.clone();
         sorted.sort_unstable();
@@ -1241,9 +1243,9 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
             .filter(|(_, n)| n.is_some())
             .filter_map(|(row, _)| page_item(row).map(|at| row[at].1.x))
             .fold(f32::INFINITY, f32::min);
-        let header_over_numbers = row_items[first - 1]
-            .iter()
-            .any(|(_, i)| i.x <= median_edge + 2.0 && i.x + i.width >= number_left - 2.0);
+        let header_over_numbers = row_items[first - 1].iter().any(|(_, i)| {
+            !i.is_script() && i.x <= median_edge + 2.0 && i.x + i.width >= number_left - 2.0
+        });
         if header_over_numbers {
             debug!(
                 "  contents list rejected: dense run {:?} under a header row",
@@ -2800,6 +2802,17 @@ mod tests {
         let contents = rows(Some(("Where to find us", 68.0, 90.0)));
         let indexed: Vec<(usize, &TextItem)> = contents.iter().enumerate().collect();
         let toc = detect_contents_list(&indexed).expect("dense contents list");
+        assert_eq!(toc.cells[0], vec!["Northern region office", "1"]);
+        // A footnote marker on that title, raised into the number band, is
+        // not a header either.
+        let mut marked = contents;
+        let mut marker = contents_item("1", 358.0, 524.0, 3.0);
+        marker.font_size = 6.0;
+        marker.height = 6.0;
+        marker.baseline_shift = 4.0;
+        marked.push(marker);
+        let indexed: Vec<(usize, &TextItem)> = marked.iter().enumerate().collect();
+        let toc = detect_contents_list(&indexed).expect("dense contents list under a marked title");
         assert_eq!(toc.cells[0], vec!["Northern region office", "1"]);
     }
 
