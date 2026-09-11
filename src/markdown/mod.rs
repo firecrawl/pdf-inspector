@@ -7,7 +7,7 @@
 //! - Paragraphs
 
 pub(crate) mod analysis;
-mod classify;
+pub(crate) mod classify;
 mod convert;
 mod furniture;
 mod heading;
