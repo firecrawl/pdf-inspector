@@ -17,6 +17,37 @@ The reproducible runtime path uses these builds:
 Use these versions for the reproducible path. Other compatible shared-library
 builds may work, but are not part of the release smoke test.
 
+## Model sets
+
+The recogniser and its character dictionary decide which scripts OCR can
+read; detection is script-agnostic. `OcrModelSet` selects one pinned,
+checksum-verified set. The default is unchanged.
+
+| `OcrModelSet` | Identifier | Files (revision) | Scripts | Download size |
+|---|---|---|---|---|
+| `PpOcrV6Small` (default) | `pp-ocrv6-small` | `pp-ocrv6_small_det.onnx`, `pp-ocrv6_small_rec.onnx`, `ppocrv6_dict.txt` (`oar-ocr-v0.7.0`) | Latin scripts, Simplified and Traditional Chinese, Japanese | about 31 MB |
+| `PpOcrV5Korean` | `pp-ocrv5-korean` | `pp-ocrv5_mobile_det.onnx`, `korean_pp-ocrv5_mobile_rec.onnx`, `ppocrv5_korean_dict.txt` (`oar-ocr-v0.3.0`) | Korean (all 11,172 Hangul syllables), Latin letters, digits | about 18 MB |
+
+```bash
+pdf2md scan-ko.pdf --ocr auto --ocr-model-set pp-ocrv5-korean --json
+```
+
+```rust
+use pdf_inspector::vision::{OcrMode, OcrModelSet, OcrOptions, OcrPdfOptions};
+
+let ocr = OcrOptions::new()
+    .mode(OcrMode::Auto)
+    .model_set(OcrModelSet::PpOcrV5Korean);
+let options = OcrPdfOptions::new().ocr(ocr);
+```
+
+Each set is cached under its own `<id>/<revision>` directory, and the
+in-process engine cache is keyed by the selected set, so switching sets in a
+long-lived worker replaces the loaded sessions instead of mixing artifacts.
+For offline packaging, populate the model directory with the three files of
+the chosen set (`--ocr-offline --ocr-model-dir`); the directory is verified
+against that set's manifest.
+
 ## Install the shared libraries
 
 Download and extract the matching archives:

@@ -55,6 +55,16 @@ Changes since 1.17.0.
 
 ### Added
 
+- `OcrModelSet`: selects which pinned, checksum-verified model set the OCR
+  engine loads. `PpOcrV6Small` is the default and unchanged; the new
+  `PpOcrV5Korean` set pairs the script-agnostic PP-OCRv5 mobile detector with
+  the Korean PP-OCRv5 mobile recogniser and its dictionary (all 11,172 Hangul
+  syllables plus Latin letters and digits, ~18 MB in total). Exposed as
+  `OcrOptions::model_set(...)`, the `PP_OCR_V5_KOREAN` manifest, and
+  `pdf2md --ocr-model-set pp-ocrv5-korean`. Each set resolves, downloads, and
+  caches under its own manifest id and revision, and the in-process engine
+  cache is keyed by the selected set, so switching sets never mixes artifacts.
+
 - `TextItem::baseline_shift`: signed offset, in points, of a superscript or
   subscript glyph run from the baseline of the body text it is attached to
   (positive = raised, negative = lowered, `0` for normal text). Exposed as
@@ -156,6 +166,11 @@ Changes since 1.17.0.
 
 ### Changed
 
+- `OcrOptions` gained the public `model_set` field. Construct it through
+  `OcrOptions::new()`/`Default` and the builder methods, as the docs show;
+  a struct literal that spells out every field needs the new field. This
+  follows the crate's existing practice for public structs (`TextItem`
+  gained `rotation`, `advance_known`, and `baseline_shift` in this cycle).
 - **Coordinate frame of positioned output — consumer action may be required.**
   `extract_text_with_positions*` (Rust), `extractTextWithPositions` (Node),
   `extract_text_with_positions[_bytes]` (Python) and `pdf2md --items-json` now

@@ -32,8 +32,8 @@ mod pdfium;
 
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use contracts::{
-    ImagePoint, ImageQuad, ModelDownloadPolicy, ModelIdentity, OcrEngine, OcrMode, OcrOptions,
-    OcrPage, OcrSpan, PageContentSource, PageProvenance, PageRenderer, VisionTimings,
+    ImagePoint, ImageQuad, ModelDownloadPolicy, ModelIdentity, OcrEngine, OcrMode, OcrModelSet,
+    OcrOptions, OcrPage, OcrSpan, PageContentSource, PageProvenance, PageRenderer, VisionTimings,
 };
 #[cfg(all(feature = "model-download", not(target_arch = "wasm32")))]
 pub use download::{HttpModelDownloadError, HttpModelDownloader, DEFAULT_MODEL_DOWNLOAD_TIMEOUT};
@@ -45,7 +45,7 @@ pub use fusion::{
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 pub use models::{
     ModelAcquireError, ModelArtifact, ModelArtifactKind, ModelDownloader, ModelManifest,
-    ModelPaths, ModelStore, ModelStoreError, PP_OCR_V6_SMALL,
+    ModelPaths, ModelStore, ModelStoreError, PP_OCR_V5_KOREAN, PP_OCR_V6_SMALL,
 };
 #[cfg(all(feature = "ocr-oar", not(target_arch = "wasm32")))]
 pub use oar::{OarOcrEngine, OarOcrError, ONNX_RUNTIME_LIBRARY_ENV};
