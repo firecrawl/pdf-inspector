@@ -2667,11 +2667,42 @@ fn has_chart_bar_signature(
         || bar_family(|r| r.1, |r| r.3, |r| r.2, |r| r.0)
 }
 
+/// Above this many rects in a cluster, `has_chart_bar_signature`'s cost
+/// (an anchor-per-rect scan that rebuilds a same-breadth "family" and runs
+/// a nested any/filter plus a per-member full-page item scan — O(n^3) in
+/// the cluster size in the worst case) becomes prohibitive on dense
+/// forms/checkbox grids. A real fixture (`bits_pilani_feedback.pdf`, a
+/// dense feedback form) clusters into ~2000-2008 rects — essentially the
+/// existing `MAX_CLUSTER_RECTS` ceiling — and took this crate from a
+/// documented ~200ms to 30+ seconds before this cap. 500 is an order of
+/// magnitude below that pathological range (this fixture drops to ~5s at
+/// this cap, verified), while leaving real headroom above plausible
+/// legitimate chart sizes. Clusters above this size are treated as
+/// "not chart-like" instead — the normal table-grid detectors take over,
+/// which is what a genuinely dense table/form cluster this size actually
+/// is anyway.
+///
+/// An earlier attempt bucketed/subsampled oversized clusters instead of
+/// unconditionally excluding them, to still recognize genuinely huge
+/// multi-series bar charts rather than routing them into table detection
+/// as garbage tables. That was reverted after it was shown (against a
+/// real 20-column statistical table) to occasionally misclassify a
+/// legitimate large table's rect cluster as chart-like under the biased
+/// sample, silently dropping table columns — a data-loss failure mode
+/// strictly worse than the "large chart renders as a mediocre table"
+/// failure mode this unconditional cutoff accepts instead. See the
+/// firecrawl/pdf-inspector#221 review discussion.
+const MAX_CHART_CLUSTER_RECTS: usize = 500;
+
 fn is_chart_bar_cluster(
     items: &[TextItem],
     group_rects: &[(f32, f32, f32, f32)],
     page: u32,
 ) -> bool {
+    if group_rects.len() > MAX_CHART_CLUSTER_RECTS {
+        return false;
+    }
+
     let has_bar_signature = has_chart_bar_signature(items, group_rects, page);
 
     // A segmented horizontal chart can share most of its edges across rows.
@@ -3651,6 +3682,99 @@ mod tests {
         let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
         assert!(tables.is_empty(), "chart bars must not become a table");
         assert!(hints.is_empty(), "chart bars must not become a hint region");
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_still_detects_genuine_chart_below_cap() {
+        // Sanity check that the real chart fixture used elsewhere in this
+        // module is still classified chart-like directly through
+        // is_chart_bar_cluster (not just via the higher-level
+        // detect_chart_regions/detect_tables_from_rects path already
+        // covered by chart_bars_produce_region_not_table) — establishes
+        // that the oversized-cluster test below exercises the size
+        // bailout specifically, not a change to has_chart_bar_signature
+        // itself.
+        let items: Vec<TextItem> = [
+            ("38", 228.0, 638.0),
+            ("30", 228.0, 676.0),
+            ("46", 333.0, 643.0),
+            ("17", 333.0, 679.0),
+            ("57", 438.0, 650.0),
+            ("20", 438.0, 694.0),
+        ]
+        .iter()
+        .map(|&(t, x, y)| make_item(t, x, y, 9.0))
+        .collect();
+        let rects: Vec<(f32, f32, f32, f32)> = chart_rects()
+            .iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect();
+        assert!(
+            is_chart_bar_cluster(&items, &rects, 1),
+            "the real chart fixture should be classified chart-like below the cap"
+        );
+        assert!(
+            rects.len() <= MAX_CHART_CLUSTER_RECTS,
+            "this fixture is meant to stay under the cap"
+        );
+    }
+
+    /// Builds `n` vertical bars shaped to satisfy every check in
+    /// `bar_family` (spaced apart past the touching-gap threshold, strictly
+    /// increasing heights so no two bars pair up within tolerance, and one
+    /// numeric data-label item per bar) — a genuinely chart-like cluster,
+    /// not just "many rects". Used to prove the oversized-cluster bailout
+    /// test actually exercises the size cutoff, rather than incidentally
+    /// passing because this shape fails `has_chart_bar_signature` on its
+    /// own merits (touching rects, degenerate geometry, no labels).
+    #[allow(clippy::type_complexity)]
+    fn chart_shaped_cluster(n: usize) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+        let bw = 10.0;
+        let mut rects = Vec::with_capacity(n);
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = i as f32 * (bw * 2.0); // gap = bw, well past the bw*0.5 touching threshold
+            let height = 20.0 + i as f32 * 5.0; // strictly increasing: no two bars match within tolerance 3
+            rects.push((x, 0.0, bw, height));
+            items.push(make_item("5", x + 1.0, 5.0, 6.0)); // numeric data label inside the bar
+        }
+        (items, rects)
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_detects_genuine_chart_below_the_size_cap() {
+        // Sanity check that chart_shaped_cluster actually produces a
+        // chart-shaped cluster per bar_family's own rules, at a size well
+        // under MAX_CHART_CLUSTER_RECTS — establishes that the `false`
+        // result in the oversized test below can only come from the size
+        // bailout, not from this shape failing on its own merits.
+        let (items, rects) = chart_shaped_cluster(10);
+        assert!(
+            is_chart_bar_cluster(&items, &rects, 1),
+            "a spaced, varied-height, labeled bar cluster should be chart-like"
+        );
+    }
+
+    #[test]
+    fn is_chart_bar_cluster_bails_out_above_max_size() {
+        // Regression for the perf fix in #221 (and the reverted
+        // bucket-sampling follow-up that regressed a real 20-column
+        // statistical table — see the constant's doc comment): an
+        // oversized cluster must be treated as "not chart-like"
+        // unconditionally, without running has_chart_bar_signature's
+        // O(n^3) checks at all. Uses the same genuinely chart-shaped
+        // geometry the sibling test proves succeeds below the cap, so the
+        // `false` result here specifically exercises the size bailout.
+        // No wall-clock assertion — that was flagged as CI-flaky in an
+        // earlier review round; the real performance win
+        // (bits_pilani_feedback.pdf: ~30s -> ~3-5s) is verified manually
+        // and documented in the commit message.
+        let (items, oversized) = chart_shaped_cluster(MAX_CHART_CLUSTER_RECTS + 1);
+
+        assert!(
+            !is_chart_bar_cluster(&items, &oversized, 1),
+            "oversized cluster must not be classified as a chart"
+        );
     }
 
     #[test]
