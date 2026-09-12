@@ -64,6 +64,33 @@ pub struct PdfTypeResult {
     /// codes (`scanned`, `no_text`, `vector_text`, `suspected_garbled_text`).
     /// Only contains pages that need OCR.
     pub ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>>,
+    /// The effective `min_text_ops_per_page` used for this detection
+    /// (echoes `DetectionConfig`, so callers don't need to keep their own
+    /// copy of the config alongside the result).
+    pub min_text_ops_per_page_used: u32,
+    /// The effective `text_page_ratio_threshold` used for this detection.
+    pub text_page_ratio_threshold_used: f32,
+    /// Per-page routing detail for pages that were actually sampled/analyzed
+    /// during detection. Pages outside the sample (e.g. under
+    /// `ScanStrategy::Sample`/`EarlyExit`) are not itemized here even if
+    /// they're included in `pages_needing_ocr` via whole-document
+    /// classification (e.g. every page of a `Scanned` PDF).
+    pub page_routing: Vec<PageRoutingInfo>,
+}
+
+/// Per-page routing detail, only populated for pages that were analyzed.
+/// See [`PdfTypeResult::page_routing`].
+#[derive(Debug, Clone)]
+pub struct PageRoutingInfo {
+    /// 1-indexed page number.
+    pub page_number: u32,
+    /// Text operator (Tj/TJ) count found on this page.
+    pub text_ops: u32,
+    /// Whether this page met the text-page criteria (see
+    /// `DetectionConfig::min_text_ops_per_page` and related heuristics).
+    pub has_text: bool,
+    /// Whether this page is present in `pages_needing_ocr`.
+    pub routed_to_ocr: bool,
 }
 
 /// Configuration for PDF type detection
@@ -89,6 +116,54 @@ impl Default for DetectionConfig {
     }
 }
 
+impl DetectionConfig {
+    /// Validate that this config's tunable thresholds are usable.
+    ///
+    /// - `text_page_ratio_threshold` must be finite and within `0.0..=1.0`.
+    /// - `min_text_ops_per_page` has no invalid range: `0` is a legal (if
+    ///   unusual) value, meaning every sampled page counts as text-bearing
+    ///   regardless of operator count (subject to the other, non-configurable
+    ///   heuristics such as image-dominated-page detection).
+    ///
+    /// Called automatically by `detect_pdf_type_with_config` and
+    /// `detect_pdf_type_mem_with_config`; expose it directly if you build a
+    /// `DetectionConfig` ahead of time and want to fail fast.
+    pub fn validate(&self) -> Result<(), PdfError> {
+        if !self.text_page_ratio_threshold.is_finite() {
+            return Err(PdfError::InvalidConfig(format!(
+                "text_page_ratio_threshold must be finite, got {}",
+                self.text_page_ratio_threshold
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.text_page_ratio_threshold) {
+            return Err(PdfError::InvalidConfig(format!(
+                "text_page_ratio_threshold must be within 0.0..=1.0, got {}",
+                self.text_page_ratio_threshold
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Whether a page meets the text-page criteria used both for the
+/// document-level `text_page_ratio_threshold` comparison and for
+/// `PageRoutingInfo::has_text`. Kept as a single function so the two never
+/// drift apart.
+fn page_has_text(analysis: &PageAnalysis, config: &DetectionConfig) -> bool {
+    let is_image_dominated =
+        analysis.image_count > 10 && analysis.image_count > analysis.text_operator_count * 3;
+    let effective_min_ops = if analysis.has_images || analysis.image_count > 0 {
+        config.min_text_ops_per_page.max(10)
+    } else {
+        config.min_text_ops_per_page
+    };
+    analysis.text_operator_count >= effective_min_ops
+        && !is_image_dominated
+        && analysis.unique_text_chars >= 5
+        && !analysis.has_vector_text
+        && !analysis.has_only_type3_fonts
+}
+
 /// Detect PDF type from file path
 pub fn detect_pdf_type<P: AsRef<Path>>(path: P) -> Result<PdfTypeResult, PdfError> {
     detect_pdf_type_with_config(path, DetectionConfig::default())
@@ -99,6 +174,7 @@ pub fn detect_pdf_type_with_config<P: AsRef<Path>>(
     path: P,
     config: DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    config.validate()?;
     crate::validate_pdf_file(&path)?;
 
     let (doc, page_count) = crate::load_document_from_path(&path)?;
@@ -116,6 +192,7 @@ pub fn detect_pdf_type_mem_with_config(
     buffer: &[u8],
     config: DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    config.validate()?;
     crate::validate_pdf_bytes(buffer)?;
 
     let (doc, page_count) = crate::load_document_from_mem(buffer)?;
@@ -234,17 +311,7 @@ pub(crate) fn detect_from_document(
             );
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
-            let effective_min_ops = if analysis.has_images || analysis.image_count > 0 {
-                config.min_text_ops_per_page.max(10)
-            } else {
-                config.min_text_ops_per_page
-            };
-            if analysis.text_operator_count >= effective_min_ops
-                && !is_image_dominated
-                && analysis.unique_text_chars >= 5
-                && !analysis.has_vector_text
-                && !analysis.has_only_type3_fonts
-            {
+            if page_has_text(&analysis, config) {
                 pages_with_text += 1;
             }
             if analysis.has_images {
@@ -471,6 +538,20 @@ pub(crate) fn detect_from_document(
     // Try to get title from metadata
     let title = get_document_title(doc);
 
+    // Per-page routing detail, limited to pages actually analyzed (see
+    // `PdfTypeResult::page_routing` doc comment for why unsampled pages
+    // aren't itemized here).
+    let mut page_routing: Vec<PageRoutingInfo> = analysis_cache
+        .iter()
+        .map(|(&page_number, analysis)| PageRoutingInfo {
+            page_number,
+            text_ops: analysis.text_operator_count,
+            has_text: page_has_text(analysis, config),
+            routed_to_ocr: pages_needing_ocr.contains(&page_number),
+        })
+        .collect();
+    page_routing.sort_by_key(|p| p.page_number);
+
     Ok(PdfTypeResult {
         pdf_type,
         page_count,
@@ -481,6 +562,9 @@ pub(crate) fn detect_from_document(
         ocr_recommended,
         pages_needing_ocr,
         ocr_reasons_by_page,
+        min_text_ops_per_page_used: config.min_text_ops_per_page,
+        text_page_ratio_threshold_used: config.text_page_ratio_threshold,
+        page_routing,
     })
 }
 
@@ -3932,5 +4016,122 @@ mod tests {
             analysis.has_decodable_text_fonts,
             "P3: inherited decodable font should be detected as used"
         );
+    }
+
+    // ========================================================================
+    // DetectionConfig::validate() tests
+    // ========================================================================
+
+    #[test]
+    fn validate_rejects_nan_threshold() {
+        let config = DetectionConfig {
+            text_page_ratio_threshold: f32::NAN,
+            ..Default::default()
+        };
+        assert!(matches!(config.validate(), Err(PdfError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn validate_rejects_above_range_threshold() {
+        let config = DetectionConfig {
+            text_page_ratio_threshold: 1.5,
+            ..Default::default()
+        };
+        assert!(matches!(config.validate(), Err(PdfError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn validate_rejects_below_range_threshold() {
+        let config = DetectionConfig {
+            text_page_ratio_threshold: -0.1,
+            ..Default::default()
+        };
+        assert!(matches!(config.validate(), Err(PdfError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn validate_accepts_range_boundaries() {
+        let low = DetectionConfig {
+            text_page_ratio_threshold: 0.0,
+            ..Default::default()
+        };
+        let high = DetectionConfig {
+            text_page_ratio_threshold: 1.0,
+            ..Default::default()
+        };
+        assert!(low.validate().is_ok());
+        assert!(high.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_default_config() {
+        assert!(DetectionConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_zero_min_text_ops() {
+        // 0 is a legal, if unusual, value: every sampled page counts as
+        // text-bearing regardless of operator count (subject to the other
+        // non-configurable heuristics).
+        let config = DetectionConfig {
+            min_text_ops_per_page: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    // ========================================================================
+    // page_has_text() tests
+    // ========================================================================
+
+    #[test]
+    fn page_has_text_true_for_plain_text_page() {
+        let config = DetectionConfig::default();
+        let analysis = PageAnalysis {
+            text_operator_count: 20,
+            unique_text_chars: 40,
+            ..Default::default()
+        };
+        assert!(page_has_text(&analysis, &config));
+    }
+
+    #[test]
+    fn page_has_text_false_when_below_min_ops() {
+        let config = DetectionConfig::default();
+        let analysis = PageAnalysis {
+            text_operator_count: 2, // below default min_text_ops_per_page: 3
+            unique_text_chars: 40,
+            ..Default::default()
+        };
+        assert!(!page_has_text(&analysis, &config));
+    }
+
+    #[test]
+    fn page_has_text_false_when_image_dominated() {
+        let config = DetectionConfig::default();
+        let analysis = PageAnalysis {
+            text_operator_count: 5,
+            has_images: true,
+            image_count: 20, // > 10 and > text_operator_count * 3
+            unique_text_chars: 40,
+            ..Default::default()
+        };
+        assert!(!page_has_text(&analysis, &config));
+    }
+
+    #[test]
+    fn page_has_text_respects_custom_min_text_ops_per_page() {
+        // Raising the configured minimum should exclude pages that would
+        // have passed under the default of 3.
+        let config = DetectionConfig {
+            min_text_ops_per_page: 10,
+            ..Default::default()
+        };
+        let analysis = PageAnalysis {
+            text_operator_count: 5,
+            unique_text_chars: 40,
+            ..Default::default()
+        };
+        assert!(!page_has_text(&analysis, &config));
     }
 }
