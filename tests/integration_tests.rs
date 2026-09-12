@@ -1531,6 +1531,9 @@ fn test_pages_needing_ocr_field_accessible() {
         ocr_recommended: false,
         pages_needing_ocr: Vec::new(),
         ocr_reasons_by_page: std::collections::BTreeMap::new(),
+        min_text_ops_per_page_used: 3,
+        text_page_ratio_threshold_used: 0.6,
+        page_routing: Vec::new(),
     };
     assert!(detection_result.pages_needing_ocr.is_empty());
 

@@ -4273,6 +4273,7 @@ fn process_document(
     options: PdfOptions,
     start: ProcessingTimer,
 ) -> Result<PdfProcessResult, PdfError> {
+    options.detection.validate()?;
     // Step 1 — Detection (cheap: scans content streams for text operators)
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
     let pdf_type = detection.pdf_type;
@@ -6483,6 +6484,8 @@ pub enum PdfError {
     InvalidStructure,
     #[error("Not a PDF: {0}")]
     NotAPdf(String),
+    #[error("Invalid detection config: {0}")]
+    InvalidConfig(String),
 }
 
 impl From<lopdf::Error> for PdfError {
