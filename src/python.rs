@@ -842,8 +842,10 @@ fn detect_pdf_bytes(data: &[u8]) -> PyResult<PyPdfResult> {
     Ok(to_py_result(result))
 }
 
-/// Lightweight PDF classification — returns type, page count, and OCR pages.
-/// Faster than detect_pdf as it skips building the full PdfProcessResult.
+/// Lightweight structural PDF classification — returns type, page count, and
+/// pages with structural OCR signals. Faster than detect_pdf as it skips
+/// building the full PdfProcessResult. It does not extract text or validate
+/// text encoding quality.
 /// Pages in pages_needing_ocr are 0-indexed.
 #[pyfunction]
 fn classify_pdf(path: &str) -> PyResult<PyPdfClassification> {
@@ -851,7 +853,8 @@ fn classify_pdf(path: &str) -> PyResult<PyPdfClassification> {
     classify_pdf_bytes(&data)
 }
 
-/// Lightweight PDF classification from bytes.
+/// Lightweight structural PDF classification from bytes. This fast path does
+/// not extract text or validate text encoding quality.
 /// Pages in pages_needing_ocr are 0-indexed.
 #[pyfunction]
 fn classify_pdf_bytes(data: &[u8]) -> PyResult<PyPdfClassification> {

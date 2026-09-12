@@ -246,6 +246,12 @@ wasm/                   — Browser bindings (wasm-bindgen)
 
 This detects 300+ page PDFs in milliseconds. The result includes `pages_needing_ocr` — a list of specific page numbers that lack text, enabling per-page OCR routing instead of all-or-nothing.
 
+Fast `detect_pdf*` and `classify_pdf*` calls inspect structural signals only;
+they do not extract text or validate font/character encoding. Therefore,
+`pages_needing_ocr = []` is not a text-quality verdict. Use
+`ProcessMode::Analyze`, `process_pdf*`, or `extract_pages_markdown*` when OCR
+routing must also catch broken or garbled text encodings.
+
 ### Scan strategies
 
 | Strategy | Behavior | Best for |
