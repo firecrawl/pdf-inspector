@@ -1441,12 +1441,201 @@ fn refine_segment_grid_text_rows(
     ))
 }
 
+/// Put a rotated row-group label into the merged cell it belongs to.
+///
+/// A block label ("Grupo WBC (15)", "Q1") is drawn once, rotated, beside the
+/// rows it groups: its column carries no rules between those rows, so the
+/// label fills one tall merged cell. A uniform grid subdivides that cell,
+/// which either strands the label outside the table — it crosses too many
+/// rows to belong to any single one — or drops it into whichever row its
+/// centre happened to meet. Both readings lose the grouping, so recover the
+/// merged span from the rules that actually cross the label's column and put
+/// the label in that span's first row.
+fn place_row_group_labels(
+    items: &[TextItem],
+    page: u32,
+    col_edges: &[f32],
+    row_edges_desc: &[f32],
+    horizontals: &[(f32, f32, f32)],
+    cells: &mut [Vec<String>],
+    item_indices: &mut Vec<usize>,
+) {
+    /// How far a rule may sit from a row edge and still be that edge.
+    const EDGE_TOLERANCE: f32 = 3.0;
+
+    let num_cols = col_edges.len().saturating_sub(1);
+    let num_rows = row_edges_desc.len().saturating_sub(1);
+    if num_cols == 0 || num_rows == 0 || cells.len() < num_rows {
+        return;
+    }
+
+    for (idx, item) in items.iter().enumerate() {
+        if item.page != page || item.is_horizontal() {
+            continue;
+        }
+        let label = item.text.trim();
+        if label.is_empty() {
+            continue;
+        }
+        let centre_x = item.x + item.width / 2.0;
+        let Some(col) = (0..num_cols)
+            .find(|&c| centre_x >= col_edges[c] - 2.0 && centre_x <= col_edges[c + 1] + 2.0)
+        else {
+            continue;
+        };
+        let (foot, head) = (item.y, item.y + item.height);
+
+        // Rows the label stands across, then the merged cell around them:
+        // grow while the row boundary carries no rule over this column.
+        let covered: Vec<usize> = (0..num_rows)
+            .filter(|&r| row_edges_desc[r] > foot && row_edges_desc[r + 1] < head)
+            .collect();
+        let (Some(&first_covered), Some(&last_covered)) = (covered.first(), covered.last()) else {
+            continue;
+        };
+        let column_middle = (col_edges[col] + col_edges[col + 1]) / 2.0;
+        let ruled_across_column = |edge: f32| {
+            horizontals.iter().any(|&(y, x_min, x_max)| {
+                (y - edge).abs() <= EDGE_TOLERANCE
+                    && x_min <= column_middle + EDGE_TOLERANCE
+                    && x_max >= column_middle - EDGE_TOLERANCE
+            })
+        };
+        let mut span_start = first_covered;
+        while span_start > 0 && !ruled_across_column(row_edges_desc[span_start]) {
+            span_start -= 1;
+        }
+        let mut span_end = last_covered;
+        while span_end + 1 < num_rows && !ruled_across_column(row_edges_desc[span_end + 1]) {
+            span_end += 1;
+        }
+        if span_end == span_start {
+            continue; // one row tall: ordinary assignment already fits
+        }
+
+        // Only the label may live in the merged cell. Anything else there is
+        // a sign the span was mis-read, so leave that grid alone.
+        if (span_start..=span_end).any(|r| {
+            cells[r]
+                .get(col)
+                .is_some_and(|cell| !cell.trim().is_empty() && cell.trim() != label)
+        }) {
+            continue;
+        }
+        for r in span_start..=span_end {
+            if let Some(cell) = cells[r].get_mut(col) {
+                cell.clear();
+            }
+        }
+        if let Some(cell) = cells[span_start].get_mut(col) {
+            cell.push_str(label);
+        }
+        if !item_indices.contains(&idx) {
+            item_indices.push(idx);
+        }
+    }
+}
+
 /// Detect tables from line segments on a given page.
 ///
 /// Lines are classified as horizontal or vertical, snapped into grid edges,
 /// and validated before assigning text items to the resulting grid.
 pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32) -> Vec<Table> {
     detect_tables_from_lines_inner(items, lines, page, true, true)
+}
+
+/// Hairline filled rectangles re-expressed as the line segments they draw.
+///
+/// Plenty of generators (office-suite and report-writer exports in
+/// particular) never stroke a table's rules: they fill a very thin `re` box
+/// for every border instead. Such a page arrives at line-based detection with
+/// zero `PdfLine`s and a few hundred slivers that the rect clustering throws
+/// away as too small, so its grid is invisible to every structural detector
+/// and only the heuristic pass is left to guess at the columns.
+///
+/// Each hairline becomes the segment along its long axis. Collinear
+/// neighbours are welded together because these borders are emitted per cell
+/// — one sliver per row for a column rule — and the grid scanner discards
+/// segments shorter than a row height. Thick boxes (cell shading, panels) are
+/// left alone: those are what rect-based detection reads.
+pub(crate) fn synthesize_lines_from_thin_rects(rects: &[PdfRect], page: u32) -> Vec<PdfLine> {
+    /// Widest rect still considered a drawn rule rather than a filled box.
+    const MAX_THICKNESS: f32 = 2.0;
+    /// Shortest sliver worth keeping — below this they are corner dots.
+    const MIN_LENGTH: f32 = 3.0;
+    /// How far two segments' shared coordinate may drift and still weld.
+    const COLLINEAR_TOLERANCE: f32 = 1.0;
+    /// Largest gap bridged when welding, covering hairline corner joints.
+    const JOIN_GAP: f32 = 2.0;
+
+    let mut horizontals: Vec<(f32, f32, f32)> = Vec::new();
+    let mut verticals: Vec<(f32, f32, f32)> = Vec::new();
+
+    for rect in rects.iter().filter(|rect| rect.page == page) {
+        let (mut x, mut y, mut width, mut height) = (rect.x, rect.y, rect.width, rect.height);
+        if width < 0.0 {
+            x += width;
+            width = -width;
+        }
+        if height < 0.0 {
+            y += height;
+            height = -height;
+        }
+        if height <= MAX_THICKNESS && width > height && width >= MIN_LENGTH {
+            horizontals.push((y + height / 2.0, x, x + width));
+        } else if width <= MAX_THICKNESS && height > width && height >= MIN_LENGTH {
+            verticals.push((x + width / 2.0, y, y + height));
+        }
+    }
+
+    let horizontals = weld_collinear_segments(horizontals, COLLINEAR_TOLERANCE, JOIN_GAP);
+    let verticals = weld_collinear_segments(verticals, COLLINEAR_TOLERANCE, JOIN_GAP);
+
+    let mut lines: Vec<PdfLine> = Vec::with_capacity(horizontals.len() + verticals.len());
+    for (y, x_start, x_end) in horizontals {
+        lines.push(PdfLine {
+            x1: x_start,
+            y1: y,
+            x2: x_end,
+            y2: y,
+            page,
+        });
+    }
+    for (x, y_start, y_end) in verticals {
+        lines.push(PdfLine {
+            x1: x,
+            y1: y_start,
+            x2: x,
+            y2: y_end,
+            page,
+        });
+    }
+    lines
+}
+
+/// Weld segments that share a coordinate and touch along their axis.
+///
+/// `segments` are `(shared_coordinate, start, end)`; the result keeps the
+/// same shape with runs of touching segments collapsed into one.
+fn weld_collinear_segments(
+    mut segments: Vec<(f32, f32, f32)>,
+    coordinate_tolerance: f32,
+    join_gap: f32,
+) -> Vec<(f32, f32, f32)> {
+    segments.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let mut welded: Vec<(f32, f32, f32)> = Vec::with_capacity(segments.len());
+    for (coordinate, start, end) in segments {
+        match welded.last_mut() {
+            Some(last)
+                if (last.0 - coordinate).abs() <= coordinate_tolerance
+                    && start <= last.2 + join_gap =>
+            {
+                last.2 = last.2.max(end);
+            }
+            _ => welded.push((coordinate, start, end)),
+        }
+    }
+    welded
 }
 
 /// Bounding boxes of chart panels backed by a very dense vector grid.
@@ -1885,8 +2074,55 @@ fn detect_tables_from_lines_inner(
         }
     );
 
+    // Row edges may only come from rules that touch the ruled region. Page
+    // furniture draws horizontals far from any grid — a header underline, a
+    // footer rule, the box around a note — and taking those as row edges
+    // stretches the table across unrelated prose and swallows the headings
+    // above it. The vertical rules say where the grid actually lives, so once
+    // the page draws at least two of them, rules outside their span are page
+    // decoration rather than row boundaries. Layouts whose columns come from
+    // horizontal-segment endpoints have no verticals to trust and keep every
+    // rule.
+    let grid_horizontals: Vec<(f32, f32, f32)> = if cols_from_segments || verticals.len() < 2 {
+        horizontals.clone()
+    } else {
+        const RULE_SPAN_SLACK: f32 = 3.0;
+        let ruled_bottom = verticals
+            .iter()
+            .map(|&(_, y_min, _)| y_min)
+            .fold(f32::INFINITY, f32::min)
+            - RULE_SPAN_SLACK;
+        let ruled_top = verticals
+            .iter()
+            .map(|&(_, _, y_max)| y_max)
+            .fold(f32::NEG_INFINITY, f32::max)
+            + RULE_SPAN_SLACK;
+        let inside: Vec<(f32, f32, f32)> = horizontals
+            .iter()
+            .copied()
+            .filter(|&(y, _, _)| y >= ruled_bottom && y <= ruled_top)
+            .collect();
+        // Keep the unfiltered set when the span rejects almost everything:
+        // that means the verticals are decoration and the horizontals carry
+        // the structure, which the checks below still have to judge.
+        if inside.len() >= 3 {
+            if inside.len() < horizontals.len() {
+                log::debug!(
+                    "detect_lines p{}: dropped {} H rules outside ruled span {:.0}..{:.0}",
+                    page,
+                    horizontals.len() - inside.len(),
+                    ruled_bottom,
+                    ruled_top
+                );
+            }
+            inside
+        } else {
+            horizontals.clone()
+        }
+    };
+
     // Snap Y-values of horizontal lines → row edges
-    let h_ys: Vec<f32> = horizontals.iter().map(|(y, _, _)| *y).collect();
+    let h_ys: Vec<f32> = grid_horizontals.iter().map(|(y, _, _)| *y).collect();
     let row_edges = snap_edges(&h_ys, 3.0);
 
     // Column edges from drawn verticals when present, else from the
@@ -1942,7 +2178,10 @@ fn detect_tables_from_lines_inner(
     // Letter dimensions but have many internal row/column rules. Only
     // reject when the line set looks like a bare frame, not a grid.
     // Standard pages are ~595×842 (A4) or ~612×792 (Letter).
-    if table_width > 500.0 && table_height > 700.0 && horizontals.len() <= 4 && verticals.len() <= 4
+    if table_width > 500.0
+        && table_height > 700.0
+        && grid_horizontals.len() <= 4
+        && verticals.len() <= 4
     {
         log::debug!(
             "detect_lines p{}: rejected — page-spanning frame ({:.0}×{:.0}, {} h + {} v)",
@@ -1958,11 +2197,11 @@ fn detect_tables_from_lines_inner(
     // Validate horizontal lines: at least 3 should span a meaningful width.
     // Full-width spanning (>50%) is ideal, but tables with partial horizontal
     // rules (column-level separators) are also valid if there are enough.
-    let spanning_h = horizontals
+    let spanning_h = grid_horizontals
         .iter()
         .filter(|(_, x_min, x_max)| (x_max - x_min) > table_width * 0.5)
         .count();
-    let partial_h = horizontals
+    let partial_h = grid_horizontals
         .iter()
         .filter(|(_, x_min, x_max)| (x_max - x_min) > table_width * 0.15)
         .count();
@@ -2018,7 +2257,17 @@ fn detect_tables_from_lines_inner(
     );
 
     // Assign items to grid
-    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges_desc, page);
+    let (mut cells, mut item_indices) =
+        assign_items_to_grid(items, &col_edges, &row_edges_desc, page);
+    place_row_group_labels(
+        items,
+        page,
+        &col_edges,
+        &row_edges_desc,
+        &grid_horizontals,
+        &mut cells,
+        &mut item_indices,
+    );
 
     // Require at least 2 non-empty rows
     let non_empty_rows = cells
