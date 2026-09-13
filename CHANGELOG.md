@@ -34,6 +34,9 @@ version and date. Earlier releases are described in their
   rules the block out.
 - A field list whose first fields sit beside a shaded title band keeps those
   fields in its table.
+- Lines of small type stacked less than an em apart — a column header
+  wrapped onto two lines in a 6pt statement table — are no longer woven
+  together glyph by glyph into one run such as `(0d1e/0fi1c/i2t0)25-`.
 
 ## [1.19.0] - 2026-09-09
 
