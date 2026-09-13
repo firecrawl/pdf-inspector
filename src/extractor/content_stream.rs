@@ -174,6 +174,14 @@ pub(crate) fn estimated_string_advance_ts(
 /// Superscripts, signs, joining punctuation and right-to-left runs keep the
 /// items other stages already handle. The state belongs to one content
 /// stream: a run at a Form XObject boundary is dropped, as before.
+///
+/// Glyph-by-glyph producers (browser print-to-PDF) paint every glyph, space
+/// included, as its own run at a hinted whole-pixel advance. Their spaces
+/// are not squeezed, but the gaps between letters stray as far as a space
+/// does, so geometry alone cannot find the words: a space run between two
+/// items each painted from one character code is kept whatever its width.
+/// The count is of codes, not of the decoded text: a ligature glyph decodes
+/// to two or three letters, and a word shown in one string can spell one.
 pub(crate) struct PendingSpace {
     /// Index of the item the run follows.
     after: usize,
@@ -181,6 +189,11 @@ pub(crate) struct PendingSpace {
     x_end: f32,
     y: f32,
     em: f32,
+    /// The run is too wide to count as squeezed and was kept only because
+    /// it follows a single glyph.
+    between_glyphs: bool,
+    /// The run follows a single glyph, which may be punctuation.
+    after_glyph: bool,
 }
 
 /// Space runs narrower than this many em are invisible to gap detection:
@@ -195,13 +208,22 @@ fn takes_word_space(c: char) -> bool {
     c.is_alphanumeric() && !crate::text_utils::is_rtl_char(c)
 }
 
+/// Between single glyphs a painted space is a word space next to punctuation
+/// too ("STATEMENTS, 2025"): those runs have no other word-boundary evidence.
+fn takes_glyph_space(c: char) -> bool {
+    !c.is_whitespace() && !crate::text_utils::is_rtl_char(c)
+}
+
 impl PendingSpace {
     /// Note a whitespace-only run painted at `run` on `page`, when it is a
     /// squeezed space right after the last item. A run continuing a pending
     /// space extends it: several squeezed runs are still one space.
+    /// `single_glyph_items` holds, ascending, the indexes of the items painted
+    /// from one character code.
     pub(crate) fn note(
         pending: Option<Self>,
         items: &[TextItem],
+        single_glyph_items: &[usize],
         run: &RunGeometry,
         page: u32,
     ) -> Option<Self> {
@@ -220,20 +242,40 @@ impl PendingSpace {
         if last.page != page || !matches!(last.item_type, ItemType::Text) || !last.is_upright() {
             return None;
         }
-        if !last.text.chars().last().is_some_and(takes_word_space) {
-            return None;
-        }
         let em = last.font_size.abs();
         if em <= 0.0 || !run.is_upright() || run.width <= 0.0 {
             return None;
         }
-        if run.width >= em * SQUEEZED_SPACE_EM || (run.y - last.y).abs() > em * 0.2 {
+        let between_glyphs = run.width >= em * SQUEEZED_SPACE_EM;
+        let after_glyph = single_glyph_items.last() == Some(&after);
+        if between_glyphs && !after_glyph {
+            return None;
+        }
+        // A glyph-by-glyph producer paints the space after "," or "." as a
+        // run of its own too, and a font whose space is just under
+        // SQUEEZED_SPACE_EM wide (0.198 em) makes that run a squeezed one.
+        let takes_space = if after_glyph {
+            takes_glyph_space
+        } else {
+            takes_word_space
+        };
+        if !last.text.chars().last().is_some_and(takes_space) {
+            return None;
+        }
+        if (run.y - last.y).abs() > em * 0.2 {
             return None;
         }
         // The run must start where the previous item ends: a space painted
         // a column away is layout, not this item's word space.
         let gap = run.x - (last.x + last.width);
-        if !(-em * 0.1..=em * 0.5).contains(&gap) {
+        // A kerned space ("L" then space) can start well inside the glyph's
+        // declared box; between glyphs it only has to follow the glyph.
+        let follows = if between_glyphs {
+            run.x > last.x
+        } else {
+            gap >= -em * 0.1
+        };
+        if !follows || gap > em * 0.5 {
             return None;
         }
         Some(Self {
@@ -241,17 +283,45 @@ impl PendingSpace {
             x_end: run.x + run.width,
             y: run.y,
             em,
+            between_glyphs,
+            after_glyph,
         })
     }
 
     /// The next visible run is about to become an item: give the previous
     /// item its space when the two runs are same-size alphanumeric text
-    /// with nothing but the space between them.
-    pub(crate) fn resolve(self, items: &mut [TextItem], next: &RunGeometry, text: &str, size: f32) {
+    /// with nothing but the space between them. `next_single_glyph`: the run
+    /// paints one character code.
+    pub(crate) fn resolve(
+        self,
+        items: &mut [TextItem],
+        next: &RunGeometry,
+        text: &str,
+        size: f32,
+        next_single_glyph: bool,
+    ) {
         if self.after + 1 != items.len() || !next.is_upright() {
             return;
         }
-        if !text.chars().next().is_some_and(takes_word_space) {
+        let glyph_pair = self.after_glyph && next_single_glyph;
+        if self.between_glyphs && !glyph_pair {
+            return;
+        }
+        let takes_space = if glyph_pair {
+            takes_glyph_space
+        } else {
+            takes_word_space
+        };
+        if !text.chars().next().is_some_and(takes_space) {
+            return;
+        }
+        if !glyph_pair
+            && !items[self.after]
+                .text
+                .chars()
+                .last()
+                .is_some_and(takes_word_space)
+        {
             return;
         }
         let em = self.em;
@@ -597,6 +667,8 @@ pub(crate) fn extract_page_text_items(
 
     let mut clips = super::clip_boundaries::ClipTracker::default();
     let mut item_clips = Vec::new();
+    // Indexes of the items painted from one character code, ascending.
+    let mut single_glyph_items: Vec<usize> = Vec::new();
     let mut shown_clip = None;
     for op in &content.operations {
         // Record all items appended by the preceding operator, including paths
@@ -899,12 +971,22 @@ pub(crate) fn extract_page_text_items(
                             pending_space = PendingSpace::note(
                                 pending_space.take(),
                                 &items,
+                                &single_glyph_items,
                                 &geometry,
                                 page_num,
                             );
                         } else {
                             if let Some(pending) = pending_space.take() {
-                                pending.resolve(&mut items, &geometry, &text, rendered_size);
+                                pending.resolve(
+                                    &mut items,
+                                    &geometry,
+                                    &text,
+                                    rendered_size,
+                                    glyph_count == 1,
+                                );
+                            }
+                            if glyph_count == 1 {
+                                single_glyph_items.push(items.len());
                             }
                             rotation_votes.cast_direction(reading_direction(
                                 &combined,
@@ -1029,9 +1111,10 @@ pub(crate) fn extract_page_text_items(
 
                         // Track sub-items for column-gap splitting:
                         // (text, start_width_ts, end_width_ts)
-                        let mut sub_items: Vec<(String, f32, f32, f32, bool)> = Vec::new();
+                        let mut sub_items: Vec<(String, f32, f32, f32, bool, usize)> = Vec::new();
                         let mut current_text = String::new();
                         let mut current_symbol_rewrite = false;
+                        let mut current_codes: usize = 0; // character codes painted in `current_text`
                         let mut current_estimate_ts: f32 = 0.0; // metric-less estimate of `current_text`
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
@@ -1078,6 +1161,7 @@ pub(crate) fn extract_page_text_items(
                                             total_width_ts,
                                             std::mem::take(&mut current_estimate_ts),
                                             std::mem::take(&mut current_symbol_rewrite),
+                                            std::mem::take(&mut current_codes),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -1116,6 +1200,7 @@ pub(crate) fn extract_page_text_items(
                                             total_width_ts,
                                             std::mem::take(&mut current_estimate_ts),
                                             std::mem::take(&mut current_symbol_rewrite),
+                                            std::mem::take(&mut current_codes),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -1298,6 +1383,7 @@ pub(crate) fn extract_page_text_items(
                                     };
                                     current_text.push_str(&text);
                                     current_symbol_rewrite |= legacy_symbol_rewrite;
+                                    current_codes += element_glyphs;
                                 }
                             }
                         }
@@ -1309,6 +1395,7 @@ pub(crate) fn extract_page_text_items(
                                 total_width_ts,
                                 current_estimate_ts,
                                 current_symbol_rewrite,
+                                current_codes,
                             ));
                         } else if !is_invisible && sub_items.is_empty() && !current_text.is_empty()
                         {
@@ -1332,6 +1419,7 @@ pub(crate) fn extract_page_text_items(
                             pending_space = PendingSpace::note(
                                 pending_space.take(),
                                 &items,
+                                &single_glyph_items,
                                 &geometry,
                                 page_num,
                             );
@@ -1364,7 +1452,7 @@ pub(crate) fn extract_page_text_items(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w, estimate_ts, legacy_symbol_rewrite) in
+                            for (text, start_w, end_w, estimate_ts, legacy_symbol_rewrite, codes) in
                                 &sub_items
                             {
                                 let offset_tm =
@@ -1417,7 +1505,16 @@ pub(crate) fn extract_page_text_items(
                                     }
                                 }
                                 if let Some(pending) = pending_space.take() {
-                                    pending.resolve(&mut items, &geometry, text, rendered_size);
+                                    pending.resolve(
+                                        &mut items,
+                                        &geometry,
+                                        text,
+                                        rendered_size,
+                                        *codes == 1,
+                                    );
+                                }
+                                if *codes == 1 {
+                                    single_glyph_items.push(items.len());
                                 }
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
@@ -1619,12 +1716,22 @@ pub(crate) fn extract_page_text_items(
                             pending_space = PendingSpace::note(
                                 pending_space.take(),
                                 &items,
+                                &single_glyph_items,
                                 &geometry,
                                 page_num,
                             );
                         } else {
                             if let Some(pending) = pending_space.take() {
-                                pending.resolve(&mut items, &geometry, &text, rendered_size);
+                                pending.resolve(
+                                    &mut items,
+                                    &geometry,
+                                    &text,
+                                    rendered_size,
+                                    glyph_count == 1,
+                                );
+                            }
+                            if glyph_count == 1 {
+                                single_glyph_items.push(items.len());
                             }
                             rotation_votes.cast_direction(reading_direction(
                                 &combined,
@@ -1790,6 +1897,7 @@ pub(crate) fn extract_page_text_items(
                                     )
                                     .append_into(
                                         &mut items,
+                                        &mut single_glyph_items,
                                         &mut rtl_visual_candidates,
                                         &mut rtl_logical_ops,
                                         &mut form_runs,
@@ -2311,11 +2419,12 @@ pub(crate) fn extract_page_text_items(
     );
 
     let items = if page_rotation == PageRotation::Upright {
-        super::merge_text_items_with_clips(items, &item_clips)
+        super::merge_text_items_with_clips(items, &item_clips, &single_glyph_items)
     } else {
         // Clips use the original page frame; rotated-page correction is an
-        // intentionally unsupported provenance case.
-        super::merge_text_items(items)
+        // intentionally unsupported provenance case. It keeps the items in
+        // place, so their glyph counts still apply.
+        super::merge_text_items_with_clips(items, &[], &single_glyph_items)
     };
     let items = super::merge_subscript_items(items);
     Ok((
@@ -4113,6 +4222,97 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
             assert_eq!(texts, [expected], "{content}");
         }
+    }
+
+    /// Glyph-by-glyph layout at hinted advances: every letter sits 0.16 em
+    /// past its declared width, over the word-space thresholds, and the
+    /// 0.3 em space runs between words are the only word boundaries.
+    #[test]
+    fn wide_space_runs_between_single_glyphs_carry_the_word_spaces() {
+        let mut content = String::from("BT /F1 10 Tf 100 700 Td ");
+        for glyph in "Name of the entity".chars() {
+            if glyph == ' ' {
+                content.push_str("-3 Tc ( ) Tj 0 Tc 3 0 Td ");
+            } else {
+                content.push_str(&format!("({glyph}) Tj 7.6 0 Td "));
+            }
+        }
+        content.push_str("ET");
+        let items = extract_simple_items(content.as_bytes());
+        let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["Name of the entity"]);
+    }
+
+    /// A two-letter word shown in one string is two glyphs even when its
+    /// letters spell a ligature: next to glyph-by-glyph prose in its font, the
+    /// gap after it and the space run it paints are word spaces.
+    #[test]
+    fn a_word_shown_as_one_string_spelling_a_ligature_is_not_a_single_glyph() {
+        let mut prose = String::from("BT /F1 10 Tf 100 700 Td ");
+        for glyph in "Name of the entity".chars() {
+            if glyph == ' ' {
+                prose.push_str("-3 Tc ( ) Tj 0 Tc 3 0 Td ");
+            } else {
+                prose.push_str(&format!("({glyph}) Tj 7.6 0 Td "));
+            }
+        }
+        prose.push_str("ET\n");
+        let glyphs =
+            |x: f32| format!("BT /F1 10 Tf {x} 680 Td (t) Tj 7.6 0 Td (h) Tj 7.6 0 Td (e) Tj ET\n");
+        let word = "BT /F1 10 Tf 100 680 Td (fi) Tj ET\n";
+        let squeezed_space = "BT /F1 10 Tf 112 680 Td -4.5 Tc ( ) Tj 0 Tc ET\n";
+        for line in [
+            format!("{word}{}", glyphs(114.0)),
+            format!("{word}{squeezed_space}{}", glyphs(113.5)),
+            format!("{word}{squeezed_space}BT /F1 10 Tf 113.5 680 Td (the) Tj ET\n"),
+        ] {
+            let items = extract_simple_items(format!("{prose}{line}").as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts, ["Name of the entity", "fi the"], "{line}");
+        }
+    }
+
+    /// A ligature is one painted glyph too, though its text is two letters:
+    /// the hinted gap before it stays inside the word, and the wide space run
+    /// after it is the word space it carries.
+    #[test]
+    fn wide_space_run_after_a_single_ligature_glyph_carries_the_word_space() {
+        use crate::tounicode::FontCMaps;
+        use lopdf::{dictionary, Object};
+
+        // "~" stands for code 1, the "ff" ligature.
+        let mut content = String::from("BT /F1 10 Tf 100 700 Td ");
+        for word in ["Sta~", "costs", "of", "the", "entity"] {
+            for glyph in word.chars() {
+                let code = if glyph == '~' {
+                    "\\001".to_string()
+                } else {
+                    glyph.to_string()
+                };
+                content.push_str(&format!("({code}) Tj 7.6 0 Td "));
+            }
+            content.push_str("-3 Tc ( ) Tj 0 Tc 3 0 Td ");
+        }
+        content.push_str("ET");
+        let (mut doc, page_id) = simple_doc_with_content(content.as_bytes());
+        let font = doc.get_object_mut((1, 0)).unwrap().as_dict_mut().unwrap();
+        font.set(
+            "Encoding",
+            dictionary! { "Differences" => vec![1.into(), Object::Name(b"ff".to_vec())] },
+        );
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["Staff costs of the entity"]);
     }
 
     /// A space run wide enough to be seen as a gap (0.6 em here) is left to

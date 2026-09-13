@@ -8,7 +8,7 @@ use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
-use super::content_stream::{estimated_string_advance_ts, PendingSpace};
+use super::content_stream::{estimated_string_advance_ts, shown_glyph_count, PendingSpace};
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, build_type3_y_flips,
     compute_string_width_ts, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
@@ -194,6 +194,8 @@ fn collect_xobjects_from_dict(
 /// `is_visual_rtl_candidate`) and a count of logical-order show ops.
 pub(crate) struct ExtractedText {
     pub(crate) items: Vec<TextItem>,
+    /// Indexes of the items painted from one character code, ascending.
+    pub(crate) single_glyph_items: Vec<usize>,
     pub(crate) rtl_visual_candidates: Vec<usize>,
     pub(crate) rtl_logical_ops: u32,
     /// Baseline angle of every text-producing show operator, in stream
@@ -210,6 +212,7 @@ impl ExtractedText {
     fn new() -> Self {
         Self {
             items: Vec::new(),
+            single_glyph_items: Vec::new(),
             rtl_visual_candidates: Vec::new(),
             rtl_logical_ops: 0,
             run_rotations: Vec::new(),
@@ -224,12 +227,14 @@ impl ExtractedText {
     pub(crate) fn append_into(
         self,
         items: &mut Vec<TextItem>,
+        single_glyph_items: &mut Vec<usize>,
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_ops: &mut u32,
         run_rotations: &mut Vec<f32>,
         skipped_invisible: &mut bool,
     ) {
         let base = items.len();
+        single_glyph_items.extend(self.single_glyph_items.into_iter().map(|i| i + base));
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         *rtl_logical_ops += self.rtl_logical_ops;
         run_rotations.extend(self.run_rotations);
@@ -316,6 +321,7 @@ fn extract_form_xobject_text_inner(
         return extracted;
     };
     let items = &mut extracted.items;
+    let single_glyph_items = &mut extracted.single_glyph_items;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_ops = &mut extracted.rtl_logical_ops;
     let run_rotations = &mut extracted.run_rotations;
@@ -535,6 +541,7 @@ fn extract_form_xobject_text_inner(
                                     )
                                     .append_into(
                                         items,
+                                        single_glyph_items,
                                         rtl_visual_candidates,
                                         rtl_logical_ops,
                                         run_rotations,
@@ -825,12 +832,17 @@ fn extract_form_xobject_text_inner(
                             pending_space = PendingSpace::note(
                                 pending_space.take(),
                                 items,
+                                single_glyph_items,
                                 &geometry,
                                 page_num,
                             );
                         } else {
+                            let codes = shown_glyph_count(raw, font_widths.get(&current_font));
                             if let Some(pending) = pending_space.take() {
-                                pending.resolve(items, &geometry, &text, rendered_size);
+                                pending.resolve(items, &geometry, &text, rendered_size, codes == 1);
+                            }
+                            if codes == 1 {
+                                single_glyph_items.push(items.len());
                             }
                             let (dir_x, dir_y) =
                                 reading_direction(&combined, current_font_size * horizontal_scale);
@@ -950,9 +962,10 @@ fn extract_form_xobject_text_inner(
                         let space_threshold = word_gap_threshold(font_info);
                         let column_gap_threshold = space_threshold * 4.0;
 
-                        let mut sub_items: Vec<(String, f32, f32, f32, bool)> = Vec::new();
+                        let mut sub_items: Vec<(String, f32, f32, f32, bool, usize)> = Vec::new();
                         let mut current_text = String::new();
                         let mut current_symbol_rewrite = false;
+                        let mut current_codes: usize = 0; // character codes painted in `current_text`
                         let mut current_estimate_ts: f32 = 0.0; // metric-less estimate of `current_text`
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
@@ -998,6 +1011,7 @@ fn extract_form_xobject_text_inner(
                                             total_width_ts,
                                             std::mem::take(&mut current_estimate_ts),
                                             std::mem::take(&mut current_symbol_rewrite),
+                                            std::mem::take(&mut current_codes),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -1036,6 +1050,7 @@ fn extract_form_xobject_text_inner(
                                             total_width_ts,
                                             std::mem::take(&mut current_estimate_ts),
                                             std::mem::take(&mut current_symbol_rewrite),
+                                            std::mem::take(&mut current_codes),
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
@@ -1164,6 +1179,8 @@ fn extract_form_xobject_text_inner(
                                     };
                                     current_text.push_str(&text);
                                     current_symbol_rewrite |= legacy_symbol_rewrite;
+                                    current_codes +=
+                                        shown_glyph_count(get_operand_bytes(element), font_info);
                                 }
                             }
                         }
@@ -1174,6 +1191,7 @@ fn extract_form_xobject_text_inner(
                                 total_width_ts,
                                 current_estimate_ts,
                                 current_symbol_rewrite,
+                                current_codes,
                             ));
                         } else if !hidden && sub_items.is_empty() && !current_text.is_empty() {
                             // A whitespace-only array is a space run like a
@@ -1196,6 +1214,7 @@ fn extract_form_xobject_text_inner(
                             pending_space = PendingSpace::note(
                                 pending_space.take(),
                                 items,
+                                single_glyph_items,
                                 &geometry,
                                 page_num,
                             );
@@ -1226,7 +1245,7 @@ fn extract_form_xobject_text_inner(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w, estimate_ts, legacy_symbol_rewrite) in
+                            for (text, start_w, end_w, estimate_ts, legacy_symbol_rewrite, codes) in
                                 &sub_items
                             {
                                 let offset_tm =
@@ -1279,7 +1298,16 @@ fn extract_form_xobject_text_inner(
                                     }
                                 }
                                 if let Some(pending) = pending_space.take() {
-                                    pending.resolve(items, &geometry, text, rendered_size);
+                                    pending.resolve(
+                                        items,
+                                        &geometry,
+                                        text,
+                                        rendered_size,
+                                        *codes == 1,
+                                    );
+                                }
+                                if *codes == 1 {
+                                    single_glyph_items.push(items.len());
                                 }
                                 items.push(TextItem {
                                     text: expand_ligatures(text),

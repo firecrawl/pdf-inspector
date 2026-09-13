@@ -23,6 +23,10 @@ version and date. Earlier releases are described in their
   their own lines — is rendered as a contents list, one entry per line with
   its page number tab-separated, instead of being read as a two-column page
   whose titles and numbers interleave into a paragraph.
+- Text laid out glyph by glyph at hinted whole-pixel advances, as browser
+  print-to-PDF output is, keeps its words whole ("LIABILITIES", not
+  "LIAB ILITIES"): the painted space glyphs mark the word boundaries, so the
+  gaps a wider hinted glyph leaves inside a word no longer do.
 
 ## [1.19.0] - 2026-09-09
 
