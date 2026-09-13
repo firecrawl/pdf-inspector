@@ -7,7 +7,7 @@ use super::cell_text::join_cell_items;
 use super::financial::try_split_financial_item;
 use super::grid::{
     find_column_boundaries, find_column_index, find_row_boundaries, find_row_index,
-    recover_header_row,
+    recover_header_row, recover_wrapped_column_headers,
 };
 use super::{Table, TableDetectionMode};
 
@@ -642,8 +642,10 @@ pub(crate) fn detect_tables_with_page_width(
                     script_flags[i]
                 })
             {
+                let rows_before_header = table.rows.len();
                 // Try to recover body-font header row above the small-font table
                 recover_header_row(&mut table, items, table_font_threshold);
+                let body_font_header = table.rows.len() > rows_before_header;
                 // Try to recover a label column from unclaimed items to the left
                 try_add_label_column(
                     &mut table,
@@ -652,6 +654,9 @@ pub(crate) fn detect_tables_with_page_width(
                     y_min,
                     y_max,
                 );
+                if !body_font_header {
+                    recover_wrapped_column_headers(&mut table, items, &claimed_indices);
+                }
                 for &idx in &table.item_indices {
                     claimed_indices.insert(idx);
                 }
@@ -723,11 +728,12 @@ pub(crate) fn detect_tables_with_page_width(
                     continue;
                 }
 
-                if let Some(table) =
+                if let Some(mut table) =
                     detect_table_in_region(&region_items, TableDetectionMode::BodyFont, &|i| {
                         body_script_flags[i]
                     })
                 {
+                    recover_wrapped_column_headers(&mut table, items, &claimed_indices);
                     tables.push(table);
                 }
             }
@@ -1512,6 +1518,14 @@ fn detect_table_in_region(
             rows.len(),
             multi_col_threshold
         );
+        return None;
+    }
+
+    // Validation 2b: a grid needs two rows across two cells or more. Once
+    // leading form rows are skipped, a line of words over one unsplit line
+    // can remain, and claiming its items takes them out of the text flow.
+    if rows_with_multi_cols < 2 {
+        log::debug!("  validation 2b fail: {rows_with_multi_cols} rows multi-col");
         return None;
     }
 
@@ -2603,16 +2617,14 @@ pub(crate) fn find_first_table_row(
         // Otherwise skip this sparse row
     }
 
-    // Collect item indices from excluded rows
+    // Collect item indices from excluded rows. An item belongs to the row it
+    // was assigned to, not to every skipped row within reach: small type sets
+    // rows closer than any fixed tolerance, and excluding the first kept
+    // row's items prints that row twice.
     if first_table_row > 0 {
-        let y_tolerance = 15.0;
         for (idx, item) in original_items {
-            // Check if this item is in one of the excluded rows
-            for row_y in rows.iter().take(first_table_row) {
-                if (item.y - *row_y).abs() < y_tolerance {
-                    excluded_items.insert(*idx);
-                    break;
-                }
+            if find_row_index(rows, item.line_y()).is_some_and(|row| row < first_table_row) {
+                excluded_items.insert(*idx);
             }
         }
     }
@@ -3196,6 +3208,28 @@ mod tests {
             make_item("Bell System Technical Journal,", 264.2, 82.6, 8.0, 95.0),
             make_item("July 1928, p. 535.", 364.3, 82.6, 8.0, 65.0),
         ]
+    }
+
+    #[test]
+    fn prose_line_left_over_a_skipped_form_row_is_not_a_table() {
+        // Three lines of a prompt in small monospace type, the words of the
+        // first two at shared stops. The first reads as form labels and is
+        // skipped; the second is a line of words and the third one unsplit
+        // line. Two rows of which one fills a single cell are not a grid.
+        let columns = [72.0, 126.0, 180.0, 234.0, 288.0];
+        let mut items = Vec::new();
+        for (y, words) in [
+            (500.0, ["Task:", "pick", "one of:", "the", "kinds:"]),
+            (489.0, ["it fall", "in from", "the set", "{a, b,", "c}?"]),
+        ] {
+            for (x, word) in columns.iter().zip(words) {
+                items.push(make_item(word, *x, y, 8.0, 4.8 * word.len() as f32));
+            }
+        }
+        items.push(make_item("Return only the kind.", 72.0, 478.0, 8.0, 100.8));
+        let indexed: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
+        let table = detect_table_in_region(&indexed, TableDetectionMode::SmallFont, &|_| false);
+        assert!(table.is_none(), "{table:?}");
     }
 
     #[test]

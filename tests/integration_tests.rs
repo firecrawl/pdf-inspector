@@ -5561,3 +5561,208 @@ BT /F1 7 Tf 26 774 Td (General information about the statements) Tj ET\n{}",
     let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
     assert_label_value_rows(&md);
 }
+
+/// A statement of changes in equity set in 6pt type, one glyph per show op,
+/// whose column headers wrap: some titles take two lines, and the periods
+/// under them are either one line or split after the dash. The wrapped lines
+/// of neighbouring header rows sit 4pt apart, so baselines from different
+/// rows and columns crowd into one band above the body rows.
+fn make_wrapped_column_header_statement_pdf() -> Vec<u8> {
+    make_statement_pdf("0", None)
+}
+
+/// The statement above, with `zero` printed for the zero amounts and, when
+/// given, a footnote marker of that size raised after the first "Share
+/// capital" title.
+fn make_statement_pdf(zero: &'static str, marker_size: Option<f32>) -> Vec<u8> {
+    fn run(content: &mut String, x: f32, y: f32, text: &str) {
+        content.push_str(&format!("BT /F1 6 Tf {x:.1} {y:.1} Td"));
+        for ch in text.chars() {
+            let glyph = match ch {
+                '(' | ')' | '\\' => format!("\\{ch}"),
+                _ => ch.to_string(),
+            };
+            content.push_str(&format!(" ({glyph}) Tj"));
+        }
+        content.push_str(" ET\n");
+    }
+    fn right_aligned(content: &mut String, right: f32, y: f32, value: &str) {
+        let width: f32 = value
+            .chars()
+            .map(|c| if c == ',' { 1.668 } else { 3.336 })
+            .sum();
+        run(content, right - width, y, value);
+    }
+
+    struct Column {
+        x: f32,
+        title: &'static [&'static str],
+        period: &'static [&'static str],
+        values: [&'static str; 2],
+    }
+    let columns = [
+        Column {
+            x: 204.8,
+            title: &["Total equity"],
+            period: &["01/01/2025-", "31/12/2025"],
+            values: ["2,848", "3,394"],
+        },
+        Column {
+            x: 269.2,
+            title: &["Share capital"],
+            period: &["01/01/2025-", "31/12/2025"],
+            values: ["2,000", "2,000"],
+        },
+        Column {
+            x: 333.8,
+            title: &["Retained earnings", "(accumulated losses)"],
+            period: &["01/01/2025-31/12/2025"],
+            values: ["848", "1,394"],
+        },
+        Column {
+            x: 442.5,
+            title: &["Revaluation surplus", "(deficit)"],
+            period: &["01/01/2025-", "31/12/2025"],
+            values: [zero, zero],
+        },
+        Column {
+            x: 507.0,
+            title: &["Total equity"],
+            period: &["01/01/2024-", "31/12/2024"],
+            values: ["2,406", "2,848"],
+        },
+        Column {
+            x: 571.5,
+            title: &["Share capital"],
+            period: &["01/01/2024-", "31/12/2024"],
+            values: ["2,000", "2,000"],
+        },
+        Column {
+            x: 636.0,
+            title: &["Retained earnings", "(accumulated losses)"],
+            period: &["01/01/2024-31/12/2024"],
+            values: ["406", "848"],
+        },
+        Column {
+            x: 745.5,
+            title: &["Revaluation surplus", "(deficit)"],
+            period: &["01/01/2024-", "31/12/2024"],
+            values: [zero, zero],
+        },
+    ];
+
+    let mut content = String::new();
+    run(&mut content, 12.0, 574.0, "STATEMENT OF CHANGES IN EQUITY");
+    run(&mut content, 24.8, 553.0, "Statement of changes in equity");
+    for column in &columns {
+        for (lines, centre) in [(column.title, 561.2), (column.period, 544.8)] {
+            let top = centre + 4.15 * (lines.len() - 1) as f32;
+            for (i, line) in lines.iter().enumerate() {
+                run(&mut content, column.x, top - 8.3 * i as f32, line);
+            }
+        }
+    }
+    if let Some(size) = marker_size {
+        content.push_str(&format!("BT /F1 {size} Tf 306.6 563.4 Td (1) Tj ET\n"));
+    }
+    run(&mut content, 22.5, 532.0, "CHANGES IN EQUITY");
+    for (row, (label, y)) in [
+        ("Balance at the start of the period", 523.8),
+        ("Total equity", 515.5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        run(&mut content, 33.8, y, label);
+        for column in &columns {
+            right_aligned(&mut content, column.x + 30.0, y, column.values[row]);
+        }
+    }
+    make_text_pdf(&content, "0 0 842 595")
+}
+
+#[test]
+fn wrapped_column_headers_form_the_table_header_row() {
+    let buf = make_wrapped_column_header_statement_pdf();
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    // Mid-word glyph splits are a separate defect; compare without spaces.
+    let squeezed: Vec<String> = md.lines().map(|l| l.replace(' ', "")).collect();
+
+    assert!(
+        !md.contains("0d1e") && md.contains("(deficit)"),
+        "stacked header lines interleaved glyph by glyph: {md}"
+    );
+
+    let header = squeezed
+        .iter()
+        .position(|l| l.starts_with("|---"))
+        .map(|i| &squeezed[i - 1])
+        .unwrap_or_else(|| panic!("no table: {md}"));
+    for cell in [
+        "|Totalequity01/01/2025-31/12/2025|",
+        "|Sharecapital01/01/2025-31/12/2025|",
+        "|Retainedearnings(accumulatedlosses)01/01/2025-31/12/2025|",
+        "|Revaluationsurplus(deficit)01/01/2025-31/12/2025|",
+        "|Totalequity01/01/2024-31/12/2024|",
+        "|Revaluationsurplus(deficit)01/01/2024-31/12/2024|",
+    ] {
+        assert!(header.contains(cell), "missing header cell {cell}: {md}");
+    }
+    assert!(
+        squeezed
+            .iter()
+            .any(|l| l == "|Balanceatthestartoftheperiod|2,848|2,000|848|0|2,406|2,000|406|0|"),
+        "body row: {md}"
+    );
+    assert_eq!(
+        md.matches("Balance at the start").count(),
+        1,
+        "body row repeated outside the table: {md}"
+    );
+    assert!(
+        !squeezed
+            .iter()
+            .any(|l| !l.starts_with('|') && l.contains("01/01/20")),
+        "header periods left outside the table: {md}"
+    );
+}
+
+/// The header row a statement's table printed, with spaces squeezed out.
+fn squeezed_header_row(md: &str) -> String {
+    let squeezed: Vec<String> = md.lines().map(|l| l.replace(' ', "")).collect();
+    squeezed
+        .iter()
+        .position(|l| l.starts_with("|---"))
+        .map(|i| squeezed[i - 1].clone())
+        .unwrap_or_else(|| panic!("no table: {md}"))
+}
+
+#[test]
+fn wrapped_column_headers_join_a_statement_that_prints_zero_as_a_dash() {
+    for zero in ["-", "nil"] {
+        let buf = make_statement_pdf(zero, None);
+        let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+        let header = squeezed_header_row(&md);
+        assert!(
+            header.contains("|Revaluationsurplus(deficit)01/01/2025-31/12/2025|"),
+            "zero as {zero:?}: {md}"
+        );
+    }
+}
+
+#[test]
+fn footnote_marker_on_a_wrapped_column_header_stays_with_its_title() {
+    for size in [4.5, 3.5] {
+        let buf = make_statement_pdf("0", Some(size));
+        let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+        let header = squeezed_header_row(&md);
+        assert!(
+            header.contains("|Sharecapital101/01/2025-31/12/2025|"),
+            "marker at {size}pt: {md}"
+        );
+        assert!(
+            md.lines().all(|l| l.starts_with('|') || l.trim() != "1"),
+            "marker at {size}pt left outside the table: {md}"
+        );
+    }
+}
