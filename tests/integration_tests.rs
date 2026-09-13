@@ -5342,3 +5342,222 @@ BT /F1 12 Tf 385.6 522 Td (61) Tj ET";
         "entries interleaved into a paragraph: {md}"
     );
 }
+
+/// Two independent columns of short lines at x = 34 and x = 324 in 7pt type,
+/// one pair per baseline, under a 10pt heading: the shape of a field list,
+/// without values keyed to labels.
+fn two_column_short_lines_pdf(heading: &str, left: &[&str], right: &[&str]) -> Vec<u8> {
+    let mut content = format!("BT /F1 10 Tf 24 790 Td ({heading}) Tj ET\n");
+    for (row, (a, b)) in left.iter().zip(right).enumerate() {
+        let y = 766 - 10 * row as i32;
+        content.push_str(&format!(
+            "BT /F1 7 Tf 34 {y} Td ({a}) Tj ET\nBT /F1 7 Tf 324 {y} Td ({b}) Tj ET\n"
+        ));
+    }
+    make_text_pdf(&content, "0 0 595 842")
+}
+
+#[test]
+fn test_two_column_index_page_is_not_a_table() {
+    let left = [
+        "Accruals 12, 44",
+        "Amortisation 18",
+        "Assets held for sale 31",
+        "Borrowings 21, 52",
+        "Cash and cash equivalents 9",
+        "Contingent liabilities 58",
+        "Deferred tax 27, 40",
+        "Dividends 6, 49",
+        "Earnings per share 15",
+        "Employee benefits 36",
+        "Finance costs 19",
+        "Goodwill 24, 25",
+        "Impairment 26",
+        "Inventories 11",
+    ];
+    let right = [
+        "Leases 33, 61",
+        "Lending 47",
+        "Non-controlling interests 8",
+        "Operating segments 54",
+        "Payables 13, 45",
+        "Property and equipment 22",
+        "Provisions 38",
+        "Receivables 10, 42",
+        "Related parties 57",
+        "Reserves 7",
+        "Revenue 16, 17",
+        "Share capital 5",
+        "Taxation 28",
+        "Trade payables 46",
+    ];
+    let buf = two_column_short_lines_pdf("Index", &left, &right);
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(!md.contains('|'), "index columns rendered as a table: {md}");
+    for entry in left.iter().chain(&right) {
+        assert!(md.contains(entry), "missing {entry:?} in {md}");
+    }
+}
+
+#[test]
+fn test_two_column_name_list_is_not_a_table() {
+    let left = [
+        "Alice Brown",
+        "Bernard Clarke",
+        "Chloe Dawson",
+        "Daniel Evans",
+        "Emma Fletcher",
+        "Frank Gibson",
+        "Grace Harper",
+        "Henry Irwin",
+        "Isla Jenkins",
+        "Jack Kerr",
+    ];
+    let right = [
+        "Karen Lowe",
+        "Liam Moss",
+        "Maya Norris",
+        "Noah Owens",
+        "Olivia Price",
+        "Peter Quinn",
+        "Rose Stanley",
+        "Samuel Todd",
+        "Tara Underwood",
+        "Victor Walsh",
+    ];
+    let buf = two_column_short_lines_pdf("Contributors", &left, &right);
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(!md.contains('|'), "name columns rendered as a table: {md}");
+    for name in left.iter().chain(&right) {
+        assert!(md.contains(name), "missing {name:?} in {md}");
+    }
+}
+
+#[test]
+fn test_task_list_beside_a_column_of_tags_is_not_a_table() {
+    let tasks = [
+        "Replace the kitchen tap washer",
+        "Book train tickets for the visit",
+        "Renew the library membership",
+        "Collect the parcel from the depot",
+        "Clear the gutters before winter",
+        "Write up the meeting minutes",
+        "Order printer paper for the office",
+        "Call the plumber about the boiler",
+    ];
+    let tags = [
+        "home", "travel", "errand", "errand", "home", "work", "work", "home",
+    ];
+    let buf = two_column_short_lines_pdf("To do", &tasks, &tags);
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(
+        !md.contains('|'),
+        "task and tag columns rendered as a table: {md}"
+    );
+    for entry in tasks.iter().chain(&tags) {
+        assert!(md.contains(entry), "missing {entry:?} in {md}");
+    }
+}
+
+#[test]
+fn test_task_list_beside_a_column_of_title_cased_tags_is_not_a_table() {
+    let tasks = [
+        "Replace the kitchen tap washer",
+        "Book train tickets for the visit",
+        "Renew the library membership",
+        "Collect the parcel from the depot",
+        "Clear the gutters before winter",
+        "Write up the meeting minutes",
+        "Order printer paper for the office",
+        "Call the plumber about the boiler",
+    ];
+    let tags = [
+        "Done", "Blocked", "Review", "Waiting", "Backlog", "Urgent", "Planned", "Done",
+    ];
+    let buf = two_column_short_lines_pdf("To do", &tasks, &tags);
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(
+        !md.contains('|'),
+        "task and tag columns rendered as a table: {md}"
+    );
+    for entry in tasks.iter().chain(&tags) {
+        assert!(md.contains(entry), "missing {entry:?} in {md}");
+    }
+}
+
+const LABEL_VALUE_FIELDS: [(&str, &str); 14] = [
+    ("Type of entity", "Public company"),
+    ("Registration number", "2019/0442"),
+    ("Name of reporting entity", "ACME HOLDINGS"),
+    ("Listing status", "Listed"),
+    ("Short code", "ACME"),
+    ("Sector", "Industrials"),
+    ("Sub-sector", "Machinery"),
+    ("Reporting period frequency", "Annual"),
+    (
+        "Whether the reporting entity is preparing statements for its first period",
+        "No",
+    ),
+    ("Reporting period start date", "01/01/2025"),
+    ("Reporting period end date", "31/12/2025"),
+    ("Description of reporting currency", "Euro"),
+    ("Level of rounding off for monetary values", "Thousands"),
+    ("Preparation format", "Consolidated"),
+];
+
+/// One field per line from `top` down, label at x = 34 and value at x = 324,
+/// set at 7pt. One label runs most of the way to the value column.
+fn label_value_rows(top: i32) -> String {
+    let mut content = String::new();
+    for (row, (label, value)) in LABEL_VALUE_FIELDS.iter().enumerate() {
+        let y = top - 10 * row as i32;
+        content.push_str(&format!(
+            "BT /F1 7 Tf 34 {y} Td ({label}) Tj ET\nBT /F1 7 Tf 324 {y} Td ({value}) Tj ET\n"
+        ));
+    }
+    content
+}
+
+fn assert_label_value_rows(md: &str) {
+    for (label, value) in LABEL_VALUE_FIELDS {
+        assert!(
+            md.contains(&format!("|{label}|{value}|")),
+            "missing row {label:?} -> {value:?} in {md}"
+        );
+    }
+    assert!(
+        !md.contains("Type of entity Public company"),
+        "fields flowed into a paragraph: {md}"
+    );
+}
+
+#[test]
+fn test_two_column_label_value_page_renders_one_row_per_field() {
+    // A form-style information page: a section heading, then the fields set
+    // smaller than the heading. Each label must stay paired with its value
+    // on one row, not flow into a paragraph of labels and values.
+    let content = format!(
+        "BT /F1 10 Tf 24 790 Td (Report information) Tj ET\n\
+BT /F1 7 Tf 26 776 Td (General information about the statements) Tj ET\n{}",
+        label_value_rows(766)
+    );
+    let buf = make_text_pdf(&content, "0 0 595 842");
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert_label_value_rows(&md);
+}
+
+#[test]
+fn test_label_value_rows_under_a_shaded_title_band_keep_their_first_fields() {
+    // The page title sits in a two-by-two grid of shaded cells whose bottom
+    // edge is within a line or two of the first fields. The grid holds no
+    // table, and the fields next to it must still join the rows below.
+    let content = format!(
+        "0.9 g 25 772 399 11 re f 424 772 126 11 re f 25 783 399 11 re f 424 783 126 11 re f 0 g\n\
+BT /F1 10 Tf 30 785 Td (Report information) Tj ET\n\
+BT /F1 7 Tf 26 774 Td (General information about the statements) Tj ET\n{}",
+        label_value_rows(764)
+    );
+    let buf = make_text_pdf(&content, "0 0 595 842");
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert_label_value_rows(&md);
+}

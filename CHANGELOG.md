@@ -27,6 +27,13 @@ version and date. Earlier releases are described in their
   print-to-PDF output is, keeps its words whole ("LIABILITIES", not
   "LIAB ILITIES"): the painted space glyphs mark the word boundaries, so the
   gaps a wider hinted glyph leaves inside a word no longer do.
+- A two-column field list — one label and one short value per line, as on a
+  form or information page — is rendered as a two-column table instead of
+  being split into a paragraph of labels and a paragraph of values. A single
+  label long enough to run most of the way to the value column no longer
+  rules the block out.
+- A field list whose first fields sit beside a shaded title band keeps those
+  fields in its table.
 
 ## [1.19.0] - 2026-09-09
 

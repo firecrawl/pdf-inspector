@@ -1892,9 +1892,9 @@ fn convert_items_with_rects_lines_and_table_output(
 
             // 3b. Heuristic fallback on unclaimed items
             let mut run_heuristic =
-                |subset_items: &[TextItem], index_map: &[usize], min_items: usize| {
+                |subset_items: &[TextItem], index_map: &[usize], min_items: usize| -> bool {
                     if subset_items.len() < min_items {
-                        return;
+                        return false;
                     }
                     // Reject candidates whose cells prove they are parallel
                     // prose fragments — the shape produced when the body-font
@@ -1906,6 +1906,7 @@ fn convert_items_with_rects_lines_and_table_output(
                     // pass. Band-split retries stay exempt: they exist for
                     // tables that only assemble after recombining bands.
                     let reject_parallel_prose = !was_split;
+                    let mut found = false;
                     let tables = detect_tables_with_page_width(
                         subset_items,
                         base_size,
@@ -1941,7 +1942,9 @@ fn convert_items_with_rects_lines_and_table_output(
                             }
                         }
                         table_output.record(page, &table, chart_prose_order);
+                        found = true;
                     }
+                    found
                 };
 
             // Run heuristic detection on unclaimed items
@@ -1953,6 +1956,7 @@ fn convert_items_with_rects_lines_and_table_output(
                 // No rect tables but hint regions exist — run heuristic separately
                 // on items inside each hint region and on items outside all hints.
                 let padding = 15.0;
+                let mut unmatched_hint_items = HashSet::new();
                 for hint in &hint_regions {
                     let (inside_items, inside_map): (Vec<TextItem>, Vec<usize>) = band_items
                         .iter()
@@ -1962,18 +1966,44 @@ fn convert_items_with_rects_lines_and_table_output(
                         })
                         .map(|(idx, item)| (item.clone(), idx))
                         .unzip();
-                    run_heuristic(&inside_items, &inside_map, 6);
-                    for &band_idx in &inside_map {
-                        rect_claimed.insert(band_idx);
+                    if run_heuristic(&inside_items, &inside_map, 6) {
+                        rect_claimed.extend(inside_map.iter().copied());
+                    } else {
+                        unmatched_hint_items.extend(inside_map.iter().copied());
                     }
                 }
-                let (outside_items, outside_map): (Vec<TextItem>, Vec<usize>) = band_items
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, _)| !rect_claimed.contains(idx))
-                    .map(|(idx, item)| (item.clone(), idx))
-                    .unzip();
-                run_heuristic(&outside_items, &outside_map, 6);
+                // A borderless table can start inside a decorated header band
+                // that holds no table of its own. When the band holds a row,
+                // two items or more on one baseline, its items are first
+                // offered to the outside pass, which runs again without them
+                // if it finds nothing. A band of lone lines, a title over
+                // prose, adds no row to any table and costs no second pass.
+                let band_adds_rows = unmatched_hint_items.iter().any(|&idx| {
+                    let item = &band_items[idx];
+                    unmatched_hint_items.iter().any(|&other| {
+                        let other = &band_items[other];
+                        other.x != item.x && (other.y - item.y).abs() < item.font_size.abs() * 0.2
+                    })
+                });
+                let outside = |with_band: bool| -> (Vec<TextItem>, Vec<usize>) {
+                    band_items
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| {
+                            !rect_claimed.contains(idx)
+                                && (with_band || !unmatched_hint_items.contains(idx))
+                        })
+                        .map(|(idx, item)| (item.clone(), idx))
+                        .unzip()
+                };
+                let found_with_band = band_adds_rows && {
+                    let (outside_items, outside_map) = outside(true);
+                    run_heuristic(&outside_items, &outside_map, 6)
+                };
+                if !found_with_band {
+                    let (outside_items, outside_map) = outside(false);
+                    run_heuristic(&outside_items, &outside_map, 6);
+                }
             } else {
                 // Rect tables found — run heuristic on unclaimed items
                 let (unclaimed_items, unclaimed_map): (Vec<TextItem>, Vec<usize>) = band_items
