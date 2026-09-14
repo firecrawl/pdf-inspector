@@ -81,6 +81,14 @@ include_dir = "0.7"
 [dev-dependencies]
 tempfile = "3.3"
 
+# Matches the release profile already used in napi/ and wasm/: LTO and a
+# single codegen unit trade build time for a smaller, faster binary. Debug
+# builds are untouched, so the local dev loop isn't affected.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+
 [features]
 default = []
 python = ["pyo3", "ocr"]
