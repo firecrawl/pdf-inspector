@@ -1138,6 +1138,11 @@ fn extract_form_xobject_text_inner(
                                             },
                                         )
                                     });
+                                    // Only positioning may follow the array's
+                                    // last string; the next run decides for it.
+                                    let strings_follow = array[index + 1..].iter().any(|el| {
+                                        get_operand_bytes(el).is_some_and(|raw| !raw.is_empty())
+                                    });
                                     let text = match (candidate, array.get(index + 1)) {
                                         (Some(candidate), Some(next))
                                             if offset_takes_spacing_back(
@@ -1148,7 +1153,7 @@ fn extract_form_xobject_text_inner(
                                         {
                                             candidate.spaced_text
                                         }
-                                        (Some(candidate), None) => {
+                                        (Some(candidate), _) if !strings_follow => {
                                             deferred_word_gaps =
                                                 Some((current_text.clone(), candidate));
                                             text
@@ -2388,6 +2393,7 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
             ),
             ("BT /F1 10 Tf 12 TL 72 712 Td 3 Tc (dt) ' 0 Tc 15 0 Td (o) Tj ET", "d to"),
             ("BT /F1 10 Tf 12 TL 72 712 Td 0 3 (dt) \" 0 Tc 15 0 Td (o) Tj ET", "d to"),
+            ("BT /F1 10 Tf 72 700 Td 3 Tc [(dt) 20] TJ 0 Tc 14.8 0 Td (o) Tj ET", "d to"),
             ("BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj 18 0 Td (o) Tj ET", "dto"),
             ("BT /F1 10 Tf 72 700 Td 3 Tc (HEADING) Tj ET", "HEADING"),
         ] {

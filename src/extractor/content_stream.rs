@@ -1272,6 +1272,11 @@ pub(crate) fn extract_page_text_items(
                                             },
                                         )
                                     });
+                                    // Only positioning may follow the array's
+                                    // last string; the next run decides for it.
+                                    let strings_follow = array[index + 1..].iter().any(|el| {
+                                        get_operand_bytes(el).is_some_and(|raw| !raw.is_empty())
+                                    });
                                     let text = match (candidate, array.get(index + 1)) {
                                         (Some(candidate), Some(next))
                                             if offset_takes_spacing_back(
@@ -1282,7 +1287,7 @@ pub(crate) fn extract_page_text_items(
                                         {
                                             candidate.spaced_text
                                         }
-                                        (Some(candidate), None) => {
+                                        (Some(candidate), _) if !strings_follow => {
                                             deferred_word_gaps =
                                                 Some((current_text.clone(), candidate));
                                             text
@@ -4276,6 +4281,12 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             // The next run's `Td` puts it 3pt before the pen.
             (
                 "BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td (dt) Tj 0 Tc 15 0 Td (o) Tj ET",
+                "send to",
+            ),
+            // Trailing positioning after the array's last string leaves the
+            // decision to the next run all the same.
+            (
+                "BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td [(dt) 0 ()] TJ 0 Tc 15 0 Td (o) Tj ET",
                 "send to",
             ),
             // Likewise after the next-line show operator.

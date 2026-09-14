@@ -124,9 +124,10 @@ pub(crate) struct WordGapCandidate {
 
 /// Read `raw`, shown with `char_spacing` and `word_spacing` at `font_size`,
 /// as a word-gap candidate. `text` is the string's own decode and `decode`
-/// decodes one code: the candidate stands only when the codes decode one at
-/// a time to the same text, so a decoder that reads the string as a whole
-/// (UTF-16, a CMap choice still being sampled) keeps its item. Word spacing
+/// decodes one code: the candidate stands only when every code decodes, and
+/// the codes decode one at a time to the same text, so a decoder that reads
+/// the string as a whole (UTF-16, a CMap choice still being sampled) or
+/// drops a code keeps its item. Word spacing
 /// counts only after a space code that paints a glyph: after a space glyph
 /// it merely widens a gap the text already carries.
 #[allow(clippy::too_many_arguments)]
@@ -172,25 +173,21 @@ pub(crate) fn word_gap_candidate(
         return None;
     }
 
-    let labels: Vec<Option<String>> = codes
+    let labels: Vec<String> = codes
         .iter()
         .map(|code| {
             decode(&Object::String(code.to_vec(), StringFormat::Literal)).map(|(label, _)| label)
         })
-        .collect();
-    let joined: String = labels.iter().flatten().map(String::as_str).collect();
-    if joined != text {
+        .collect::<Option<_>>()?;
+    if labels.concat() != text {
         return None;
     }
 
     let mut spaced_text = String::new();
     let mut spaces = 0usize;
     for (index, label) in labels.iter().enumerate() {
-        let Some(label) = label else {
-            continue;
-        };
         spaced_text.push_str(label);
-        let Some(next) = labels.get(index + 1).and_then(|next| next.as_deref()) else {
+        let Some(next) = labels.get(index + 1) else {
             continue;
         };
         let paints = !label.chars().all(char::is_whitespace);
@@ -492,7 +489,25 @@ mod tests {
 
     #[test]
     fn a_decoder_that_reads_the_whole_string_keeps_its_item() {
+        // A code the decoder drops leaves a partial text: no candidate.
+        let dropping = |code: &Object| match code {
+            Object::String(bytes, _) if bytes == b"\x01" => None,
+            other => latin(other),
+        };
         let font = font();
+        assert_eq!(
+            word_gap_candidate(
+                b"\x01dt",
+                "dt",
+                Some(&font),
+                10.0,
+                2.0,
+                0.0,
+                word_gap_threshold(Some(&font)),
+                dropping
+            ),
+            None
+        );
         // The string decodes to a ligature the codes cannot reproduce.
         assert_eq!(
             word_gap_candidate(
