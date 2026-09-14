@@ -1325,7 +1325,16 @@ fn test_snapshot_p1244() {
 
 #[test]
 fn test_snapshot_real_estate_pricing() {
-    assert_snapshot("real-estate-pricing");
+    // Every font in this fixture maps `/space` to code 1 while code 32
+    // carries a wide letter. The contains checks restate the intent
+    // independently of the snapshot file, so a bad refresh can't silently
+    // bless the fused words the old space width produced.
+    let output = assert_snapshot("real-estate-pricing");
+    assert!(
+        output.contains("How Should Commercial Real Estate")
+            && output.contains("pricing is like the weather"),
+        "space width must come from the remapped space glyph, got: {output}"
+    );
 }
 
 #[test]

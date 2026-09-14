@@ -176,3 +176,63 @@ fn indirect_differences_array_is_resolved() {
     font.set("Encoding", encoding);
     assert_eq!(space_width_of(&doc, &font), 288);
 }
+
+#[test]
+fn truetype_subset_with_remapped_space_uses_its_width() {
+    // Same parser path as Type1; the other common simple-font subtype.
+    let (doc, mut font) = simple_font(
+        556,
+        &[(1, 278), (32, 611)],
+        Some(vec![1.into(), Object::Name(b"space".to_vec())]),
+    );
+    font.set("Subtype", Object::Name(b"TrueType".to_vec()));
+    assert_eq!(space_width_of(&doc, &font), 278);
+}
+
+#[test]
+fn type3_remapped_space_keeps_glyph_space_units() {
+    // Type3 widths are in glyph space; the remapped width is taken as-is
+    // and the FontMatrix scale still applies on top of it.
+    let (doc, mut font) = simple_font(
+        50,
+        &[(26, 29), (32, 0)],
+        Some(vec![26.into(), Object::Name(b"space".to_vec())]),
+    );
+    font.set("Subtype", Object::Name(b"Type3".to_vec()));
+    font.set(
+        "FontMatrix",
+        vec![
+            Object::Real(0.01),
+            0.into(),
+            0.into(),
+            Object::Real(0.01),
+            0.into(),
+            0.into(),
+        ],
+    );
+    let info = parse_simple_font_widths(&doc, &font).expect("Type3 font parses");
+    assert_eq!(info.space_width, 29);
+    assert!((info.units_scale - 0.01).abs() < 1e-6);
+}
+
+#[test]
+fn type3_without_remapped_space_keeps_average_estimate() {
+    // Control: no usable space metric on a non-standard scale still falls
+    // back to the 45%-of-average estimate, not to the remap.
+    let (doc, mut font) = simple_font(50, &[(32, 0)], None);
+    font.set("Subtype", Object::Name(b"Type3".to_vec()));
+    font.set(
+        "FontMatrix",
+        vec![
+            Object::Real(0.01),
+            0.into(),
+            0.into(),
+            Object::Real(0.01),
+            0.into(),
+            0.into(),
+        ],
+    );
+    let info = parse_simple_font_widths(&doc, &font).expect("Type3 font parses");
+    // 119 codes at 50 plus one at 0: average 49.58 → 22.
+    assert_eq!(info.space_width, 22);
+}
