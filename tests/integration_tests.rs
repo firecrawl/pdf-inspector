@@ -2493,6 +2493,154 @@ fn poly(x1: f32, y1: f32, x2: f32, y2: f32) -> Vec<f32> {
     vec![x1, y1, x2, y1, x2, y2, x1, y2]
 }
 
+/// A page set in a subset font that numbers its glyphs from 1 in order of
+/// first use, so `/space` sits at code 26 and code 32 is an unused slot with
+/// width 0 — the shape InDesign writes for embedded Type1 subsets. The
+/// content kerns an IP address with the offsets found in such a document
+/// (`-110.9`, `-105.1`): below the 288-unit space's word-gap threshold, but
+/// above the one a 250-unit default would give.
+fn synthetic_remapped_space_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    // Codes 1..=120: 556 for everything, 288 for the space at 26, 278 for
+    // the period, and 0 for the unused code 32.
+    let widths: Vec<Object> = (1u16..=120)
+        .map(|code| match code {
+            26 => 288,
+            32 => 0,
+            46 => 278,
+            _ => 556,
+        })
+        .map(Object::Integer)
+        .collect();
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "ABCDEF+SubsetSans",
+            "FirstChar" => 1,
+            "LastChar" => 120,
+            "Widths" => widths,
+            "Encoding" => dictionary! {
+                "Type" => "Encoding",
+                "BaseEncoding" => "WinAnsiEncoding",
+                "Differences" => vec![26.into(), Object::Name(b"space".to_vec())],
+            },
+        }
+        .into(),
+    );
+
+    let kerned_ip: Vec<Object> = vec![
+        Object::string_literal("17"),
+        Object::Real(-57.1),
+        Object::string_literal("2"),
+        Object::Real(-110.9),
+        Object::string_literal("."),
+        Object::Real(-23.0),
+        Object::string_literal("17"),
+        Object::Real(-12.3),
+        Object::string_literal("."),
+        Object::Real(-23.0),
+        Object::string_literal("1"),
+        Object::Real(-31.8),
+        Object::string_literal("0"),
+        Object::Real(-62.4),
+        Object::string_literal("1"),
+        Object::Real(-41.5),
+        Object::string_literal("."),
+        Object::Real(-105.1),
+        Object::string_literal("2"),
+        Object::Real(-78.5),
+        Object::string_literal("0"),
+    ];
+    // A real word space painted through code 26.
+    let mut labelled = b"Panel".to_vec();
+    labelled.push(26);
+    labelled.extend_from_slice(b"ID");
+
+    let operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 9.into()]),
+        Operation::new("Td", vec![50.into(), 700.into()]),
+        Operation::new("TJ", vec![Object::Array(kerned_ip)]),
+        Operation::new("Td", vec![0.into(), Object::Integer(-14)]),
+        Operation::new(
+            "Tj",
+            vec![Object::String(labelled, lopdf::StringFormat::Literal)],
+        ),
+        Operation::new("ET", vec![]),
+    ];
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 800.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn remapped_space_width_keeps_kerned_ip_address_whole() {
+    let buf = synthetic_remapped_space_pdf();
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+    let markdown = result
+        .pages
+        .iter()
+        .map(|p| p.markdown.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        markdown.contains("172.17.101.20"),
+        "kerning inside the IP must not become spaces:\n{markdown}"
+    );
+    assert!(
+        !markdown.contains("172 .17"),
+        "space width fell back to the 250-unit default:\n{markdown}"
+    );
+    assert!(
+        markdown.contains("Panel ID"),
+        "the space glyph at code 26 still reads as a space:\n{markdown}"
+    );
+}
+
 fn synthetic_dense_table_pdf() -> Vec<u8> {
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Document, Object, Stream};
