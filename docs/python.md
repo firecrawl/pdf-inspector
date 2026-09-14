@@ -111,6 +111,9 @@ ocr = pdf_inspector.process_pdf_with_ocr(
     offline=True,
 )
 
+# Password-protected PDFs
+result = pdf_inspector.extract_pages_markdown("document.pdf", password="secret")
+
 # Structure-tree elements from tagged PDFs (empty list when untagged).
 # Pages are 1-indexed to match TextItem.page, so (page, mcid) joins directly
 # against extract_text_with_positions — e.g. to recover real heading levels:
@@ -143,8 +146,8 @@ headings = [
 | `extract_text_with_positions_and_rotations_bytes(data)` | The same from bytes |
 | `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions (top-left PDF points in the visible page box) |
 | `extract_text_in_regions_bytes(data, page_regions)` | Region extraction from bytes |
-| `extract_pages_markdown(path, pages=None)` | Per-page Markdown + layout metadata (all pages by default) |
-| `extract_pages_markdown_bytes(data, pages=None)` | Per-page Markdown from bytes |
+| `extract_pages_markdown(path, pages=None, password=None)` | Per-page Markdown + layout metadata (all pages by default) |
+| `extract_pages_markdown_bytes(data, pages=None, password=None)` | Per-page Markdown from bytes |
 | `extract_structure_elements(path, pages=None)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_bytes(data, pages=None)` | Structure-tree elements from bytes |
 
