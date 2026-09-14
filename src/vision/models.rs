@@ -12,7 +12,7 @@ use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::{ModelDownloadPolicy, OcrOptions};
+use super::{ModelDownloadPolicy, OcrModelSet, OcrOptions};
 
 /// Environment variable overriding the default local model cache.
 pub const MODEL_CACHE_ENV: &str = "PDF_INSPECTOR_MODEL_CACHE";
@@ -93,6 +93,54 @@ pub const PP_OCR_V6_SMALL: ModelManifest = ModelManifest {
     revision: "oar-ocr-v0.7.0",
     artifacts: PP_OCR_V6_SMALL_ARTIFACTS,
 };
+
+const PP_OCR_V5_KOREAN_ARTIFACTS: &[ModelArtifact] = &[
+    ModelArtifact {
+        kind: ModelArtifactKind::TextDetection,
+        filename: "pp-ocrv5_mobile_det.onnx",
+        url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-ocrv5_mobile_det.onnx",
+        sha256: "1eb7b4f7ab657ebd1c66d5f79bca7497f29768a2e3c15e52daecbba1a8e4a039",
+        size: 4_826_518,
+    },
+    ModelArtifact {
+        kind: ModelArtifactKind::TextRecognition,
+        filename: "korean_pp-ocrv5_mobile_rec.onnx",
+        url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/korean_pp-ocrv5_mobile_rec.onnx",
+        sha256: "2d7ed96308065a86103325d22af07a88c4d06afc009f21602a4882342c0cc054",
+        size: 13_446_374,
+    },
+    ModelArtifact {
+        kind: ModelArtifactKind::CharacterDictionary,
+        filename: "ppocrv5_korean_dict.txt",
+        url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/ppocrv5_korean_dict.txt",
+        sha256: "a88071c68c01707489baa79ebe0405b7beb5cca229f4fc94cc3ef992328802d7",
+        size: 47_451,
+    },
+];
+
+/// Pinned PP-OCRv5 Korean model set.
+///
+/// Pairs the script-agnostic PP-OCRv5 mobile detector with the Korean
+/// PP-OCRv5 mobile recogniser and its dictionary (all 11,172 Hangul
+/// syllables plus Latin letters and digits). The artifacts are the files
+/// published with the `oar-ocr` v0.3.0 release; the revision identifies that
+/// release.
+pub const PP_OCR_V5_KOREAN: ModelManifest = ModelManifest {
+    schema_version: 1,
+    id: "pp-ocrv5-korean",
+    revision: "oar-ocr-v0.3.0",
+    artifacts: PP_OCR_V5_KOREAN_ARTIFACTS,
+};
+
+impl OcrModelSet {
+    /// The pinned manifest this model set resolves to.
+    pub fn manifest(self) -> &'static ModelManifest {
+        match self {
+            OcrModelSet::PpOcrV6Small => &PP_OCR_V6_SMALL,
+            OcrModelSet::PpOcrV5Korean => &PP_OCR_V5_KOREAN,
+        }
+    }
+}
 
 /// Resolved, verified filesystem paths for one model manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -754,6 +802,50 @@ mod tests {
     fn pinned_pp_ocr_manifest_is_well_formed() {
         validate_manifest(&PP_OCR_V6_SMALL).unwrap();
         assert_eq!(PP_OCR_V6_SMALL.artifacts.len(), 3);
+    }
+
+    #[test]
+    fn pinned_korean_manifest_is_well_formed() {
+        validate_manifest(&PP_OCR_V5_KOREAN).unwrap();
+        assert_eq!(PP_OCR_V5_KOREAN.id, "pp-ocrv5-korean");
+        assert_ne!(PP_OCR_V5_KOREAN.id, PP_OCR_V6_SMALL.id);
+        let kinds: Vec<_> = PP_OCR_V5_KOREAN
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ModelArtifactKind::TextDetection,
+                ModelArtifactKind::TextRecognition,
+                ModelArtifactKind::CharacterDictionary,
+            ]
+        );
+    }
+
+    #[test]
+    fn model_sets_resolve_to_manifests_with_matching_ids() {
+        for set in OcrModelSet::ALL {
+            let manifest = set.manifest();
+            validate_manifest(manifest).unwrap();
+            assert_eq!(manifest.id, set.id());
+        }
+        assert_eq!(OcrModelSet::default().manifest().id, PP_OCR_V6_SMALL.id);
+        assert_eq!(
+            OcrModelSet::PpOcrV5Korean.manifest().id,
+            PP_OCR_V5_KOREAN.id
+        );
+    }
+
+    #[test]
+    fn model_sets_use_distinct_cache_roots() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(cache.path());
+        let default_root = store.model_root(OcrModelSet::PpOcrV6Small.manifest());
+        let korean_root = store.model_root(OcrModelSet::PpOcrV5Korean.manifest());
+        assert_ne!(default_root, korean_root);
+        assert!(korean_root.starts_with(cache.path()));
     }
 
     #[test]

@@ -26,7 +26,7 @@ use super::{
     route_ocr_pages, run_ocr_pages, FusedPageMarkdown, FusedPages, HttpModelDownloadError,
     HttpModelDownloader, ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError,
     OcrEngine, OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions, OcrRoutingError, OcrRun,
-    OcrRunError, PageRenderer, PdfiumRenderer, RenderError, RenderOptions, PP_OCR_V6_SMALL,
+    OcrRunError, PageRenderer, PdfiumRenderer, RenderError, RenderOptions,
 };
 
 /// Bounds live rendered-page memory while preserving small OCR batches.
@@ -648,13 +648,14 @@ fn clone_native_page(page: &PageMarkdown) -> PageMarkdown {
 
 fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipelineError> {
     let store = ModelStore::from_options(options)?;
+    let manifest = options.model_set.manifest();
     let key = OcrEngineCacheKey {
-        model_root: normalized_cache_path(store.model_root(&PP_OCR_V6_SMALL)),
+        model_root: normalized_cache_path(store.model_root(manifest)),
         runtime_library: normalized_cache_path(onnx_runtime_library_path()),
-        manifest_schema: PP_OCR_V6_SMALL.schema_version,
-        manifest_id: PP_OCR_V6_SMALL.id,
-        manifest_revision: PP_OCR_V6_SMALL.revision,
-        artifact_digests: PP_OCR_V6_SMALL
+        manifest_schema: manifest.schema_version,
+        manifest_id: manifest.id,
+        manifest_revision: manifest.revision,
+        artifact_digests: manifest
             .artifacts
             .iter()
             .map(|artifact| artifact.sha256)
@@ -674,7 +675,7 @@ fn cached_ocr_engine(options: &OcrOptions) -> Result<Arc<OarOcrEngine>, OcrPipel
     // OCR requests can continue using a warm engine. Concurrent cold misses may
     // build redundantly; the second cache check keeps only one shared session.
     let models = store.resolve_or_download(
-        &PP_OCR_V6_SMALL,
+        manifest,
         options.model_downloads,
         &HttpModelDownloader::default(),
     )?;
