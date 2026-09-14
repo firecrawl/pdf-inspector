@@ -70,17 +70,36 @@ pub(crate) fn is_page_number_line(text: &str) -> bool {
 
     let lowercase = text.trim().to_ascii_lowercase();
     lowercase.strip_prefix("page").is_some_and(|rest| {
-        let mut characters = rest.trim_start().chars().peekable();
-        let mut has_page_number = false;
-        while characters
-            .peek()
-            .is_some_and(|character| character.is_ascii_digit())
-        {
-            has_page_number = true;
-            characters.next();
+        let rest = rest.trim_start();
+        if !rest.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            return false;
         }
-
-        has_page_number && characters.next().is_none_or(char::is_whitespace)
+        let digit_end = rest
+            .char_indices()
+            .find(|(_, character)| !character.is_ascii_digit())
+            .map(|(index, _)| index)
+            .unwrap_or(rest.len());
+        let suffix = rest[digit_end..].trim_start();
+        if suffix.is_empty() || suffix == "." {
+            return true;
+        }
+        if let Some(after_period) = suffix.strip_prefix('.') {
+            let after_period = after_period.trim_start();
+            if after_period.is_empty() {
+                return true;
+            }
+            // A period followed by a sentence-like body is not a running page
+            // header. Short labels such as `Page 1. Introduction` remain
+            // removable as likely headers.
+            return after_period.split_whitespace().count() <= 1;
+        }
+        // Punctuation after the page label usually introduces body text rather
+        // than a running header. Keep it, including Unicode dash/whitespace.
+        if suffix.starts_with(':') || suffix.starts_with('-') || suffix.starts_with('—') {
+            return false;
+        }
+        // `Page N of M` and labels such as `Page N Chapter ...` remain headers.
+        true
     })
 }
 
