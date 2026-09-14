@@ -7,7 +7,7 @@ use super::cell_text::join_cell_items;
 use super::financial::try_split_financial_item;
 use super::grid::{
     find_column_boundaries, find_column_index, find_row_boundaries, find_row_index,
-    recover_header_row,
+    recover_header_row, recover_wrapped_column_headers,
 };
 use super::{Table, TableDetectionMode};
 
@@ -642,8 +642,10 @@ pub(crate) fn detect_tables_with_page_width(
                     script_flags[i]
                 })
             {
+                let rows_before_header = table.rows.len();
                 // Try to recover body-font header row above the small-font table
                 recover_header_row(&mut table, items, table_font_threshold);
+                let body_font_header = table.rows.len() > rows_before_header;
                 // Try to recover a label column from unclaimed items to the left
                 try_add_label_column(
                     &mut table,
@@ -652,6 +654,9 @@ pub(crate) fn detect_tables_with_page_width(
                     y_min,
                     y_max,
                 );
+                if !body_font_header {
+                    recover_wrapped_column_headers(&mut table, items, &claimed_indices);
+                }
                 for &idx in &table.item_indices {
                     claimed_indices.insert(idx);
                 }
@@ -723,11 +728,12 @@ pub(crate) fn detect_tables_with_page_width(
                     continue;
                 }
 
-                if let Some(table) =
+                if let Some(mut table) =
                     detect_table_in_region(&region_items, TableDetectionMode::BodyFont, &|i| {
                         body_script_flags[i]
                     })
                 {
+                    recover_wrapped_column_headers(&mut table, items, &claimed_indices);
                     tables.push(table);
                 }
             }
@@ -1515,6 +1521,14 @@ fn detect_table_in_region(
         return None;
     }
 
+    // Validation 2b: a grid needs two rows across two cells or more. Once
+    // leading form rows are skipped, a line of words over one unsplit line
+    // can remain, and claiming its items takes them out of the text flow.
+    if rows_with_multi_cols < 2 {
+        log::debug!("  validation 2b fail: {rows_with_multi_cols} rows multi-col");
+        return None;
+    }
+
     // Validation 3: tables shouldn't have too many rows (likely misdetected text)
     let max_rows = match mode {
         TableDetectionMode::SmallFont => 200,
@@ -1553,7 +1567,7 @@ fn detect_table_in_region(
     }
 
     // Validation 7: Tables should have some numeric/data content
-    if !has_table_like_content(&cells, mode) {
+    if !has_table_like_content(&cells, mode) && !is_label_value_list(&cells, &cell_items) {
         log::debug!("  validation 7 fail: no table-like content");
         return None;
     }
@@ -1729,6 +1743,116 @@ fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bo
         }
     }
     false
+}
+
+/// Fewest rows holding both a label and a value that make a field list.
+const MIN_LABEL_VALUE_FIELDS: usize = 6;
+/// Share of rows holding both a label and a value: a field list may carry a
+/// section title or an unanswered field, not a column of blanks.
+const MIN_COMPLETE_FIELD_SHARE: f32 = 0.8;
+/// A label is a short phrase and a value a word or two; lines that fill a
+/// column of running text run longer than either.
+const MAX_MEDIAN_LABEL_CHARS: usize = 60;
+const MAX_MEDIAN_VALUE_CHARS: usize = 25;
+/// A label names what its value holds and so runs longer than it: field
+/// lists measure about twice, while two columns of like entries (an index,
+/// a list of names) measure about the same.
+const MIN_LABEL_TO_VALUE_LENGTH: f32 = 1.5;
+
+/// A form-style field list: one label and one short value per line, as on a
+/// report's information page. The cells carry little numeric data, so the
+/// content check would otherwise fail them in either detection mode, and
+/// column flow then separates every label from its value.
+///
+/// Two columns of any short lines have that shape too, so the values must be
+/// keyed to the labels: at least four rows in five hold both, the labels run
+/// clearly longer than the values and do not end in a number (as an index
+/// entry ends in its page), and every value starts at one left edge and
+/// sits on its label's baseline. Lengths are judged by their median so a single long
+/// label, one that runs most of the way to the value column, does not
+/// disqualify the block.
+///
+/// Each field names something else and answers it with its own value, so
+/// four in five labels and four in five values are distinct: a value that
+/// recurs down the column is a category or a tag. A column of one kind
+/// throughout, every value a figure or every value in lower case, is a
+/// parallel list of years or tags; figures are the content check's to judge.
+fn is_label_value_list(cells: &[Vec<String>], cell_items: &[Vec<Vec<&TextItem>>]) -> bool {
+    if cells.first().map(|r| r.len()) != Some(2) {
+        return false;
+    }
+    let mut labels = Vec::new();
+    let mut values = Vec::new();
+    let mut label_texts = std::collections::HashSet::new();
+    let mut value_texts = std::collections::HashSet::new();
+    let mut figure_values = 0;
+    let mut numbered_labels = 0;
+    let mut value_edges = Vec::new();
+    for (row, items) in cells.iter().zip(cell_items) {
+        let (label, value) = (row[0].trim(), row[1].trim());
+        if label.is_empty() || value.is_empty() {
+            continue;
+        }
+        if label.ends_with(['.', ',', ';']) || value.ends_with(['.', ',', ';']) {
+            return false;
+        }
+        let (Some(label_item), Some(value_item)) = (
+            items[0].iter().min_by(|a, b| a.x.total_cmp(&b.x)),
+            items[1].iter().min_by(|a, b| a.x.total_cmp(&b.x)),
+        ) else {
+            return false;
+        };
+        let em = value_item.font_size.abs().max(label_item.font_size.abs());
+        if (label_item.line_y() - value_item.line_y()).abs() > em * 0.2 {
+            return false;
+        }
+        value_edges.push((value_item.x, em));
+        labels.push(label.chars().count());
+        values.push(value.chars().count());
+        label_texts.insert(label);
+        value_texts.insert(value);
+        if value.chars().any(|c| c.is_numeric()) {
+            figure_values += 1;
+        }
+        if label.ends_with(|c: char| c.is_ascii_digit()) {
+            numbered_labels += 1;
+        }
+    }
+    if labels.len() < MIN_LABEL_VALUE_FIELDS
+        || (labels.len() as f32) < cells.len() as f32 * MIN_COMPLETE_FIELD_SHARE
+    {
+        return false;
+    }
+    if numbered_labels * 2 > labels.len() {
+        return false;
+    }
+    let distinct = |count: usize| count as f32 >= labels.len() as f32 * MIN_COMPLETE_FIELD_SHARE;
+    if !distinct(label_texts.len()) || !distinct(value_texts.len()) {
+        return false;
+    }
+    // A field list answers some fields with a date, number or code and
+    // others with a word. A column of one kind throughout, whatever its
+    // case, is a parallel list: years, or tags beside entries.
+    if figure_values == 0 || figure_values == labels.len() {
+        return false;
+    }
+    let mut edges: Vec<f32> = value_edges.iter().map(|(x, _)| *x).collect();
+    edges.sort_by(|a, b| a.total_cmp(b));
+    let edge = edges[edges.len() / 2];
+    if value_edges
+        .iter()
+        .any(|&(x, em)| (x - edge).abs() > em * 0.5)
+    {
+        return false;
+    }
+    let median = |lens: &mut Vec<usize>| {
+        lens.sort_unstable();
+        lens[lens.len() / 2]
+    };
+    let (label_len, value_len) = (median(&mut labels), median(&mut values));
+    label_len <= MAX_MEDIAN_LABEL_CHARS
+        && value_len <= MAX_MEDIAN_VALUE_CHARS
+        && label_len as f32 >= value_len as f32 * MIN_LABEL_TO_VALUE_LENGTH
 }
 
 /// Check if a cell value looks like table data
@@ -2493,16 +2617,14 @@ pub(crate) fn find_first_table_row(
         // Otherwise skip this sparse row
     }
 
-    // Collect item indices from excluded rows
+    // Collect item indices from excluded rows. An item belongs to the row it
+    // was assigned to, not to every skipped row within reach: small type sets
+    // rows closer than any fixed tolerance, and excluding the first kept
+    // row's items prints that row twice.
     if first_table_row > 0 {
-        let y_tolerance = 15.0;
         for (idx, item) in original_items {
-            // Check if this item is in one of the excluded rows
-            for row_y in rows.iter().take(first_table_row) {
-                if (item.y - *row_y).abs() < y_tolerance {
-                    excluded_items.insert(*idx);
-                    break;
-                }
+            if find_row_index(rows, item.line_y()).is_some_and(|row| row < first_table_row) {
+                excluded_items.insert(*idx);
             }
         }
     }
@@ -3086,6 +3208,28 @@ mod tests {
             make_item("Bell System Technical Journal,", 264.2, 82.6, 8.0, 95.0),
             make_item("July 1928, p. 535.", 364.3, 82.6, 8.0, 65.0),
         ]
+    }
+
+    #[test]
+    fn prose_line_left_over_a_skipped_form_row_is_not_a_table() {
+        // Three lines of a prompt in small monospace type, the words of the
+        // first two at shared stops. The first reads as form labels and is
+        // skipped; the second is a line of words and the third one unsplit
+        // line. Two rows of which one fills a single cell are not a grid.
+        let columns = [72.0, 126.0, 180.0, 234.0, 288.0];
+        let mut items = Vec::new();
+        for (y, words) in [
+            (500.0, ["Task:", "pick", "one of:", "the", "kinds:"]),
+            (489.0, ["it fall", "in from", "the set", "{a, b,", "c}?"]),
+        ] {
+            for (x, word) in columns.iter().zip(words) {
+                items.push(make_item(word, *x, y, 8.0, 4.8 * word.len() as f32));
+            }
+        }
+        items.push(make_item("Return only the kind.", 72.0, 478.0, 8.0, 100.8));
+        let indexed: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
+        let table = detect_table_in_region(&indexed, TableDetectionMode::SmallFont, &|_| false);
+        assert!(table.is_none(), "{table:?}");
     }
 
     #[test]
@@ -4026,5 +4170,183 @@ mod tests {
             vec!["Section D".into(), "TBD".into()],
         ];
         assert!(!is_page_number_toc(&cells));
+    }
+
+    /// Judge `pairs` as a field list set one pair per line in 7pt type, the
+    /// label at x = 34 and the value at `value_x(row)`.
+    fn field_list_with(pairs: &[(&str, &str)], value_x: impl Fn(usize) -> f32) -> bool {
+        let cells: Vec<Vec<String>> = pairs
+            .iter()
+            .map(|(a, b)| vec![a.to_string(), b.to_string()])
+            .collect();
+        let items: Vec<[TextItem; 2]> = pairs
+            .iter()
+            .enumerate()
+            .map(|(row, (label, value))| {
+                let y = 700.0 - 10.0 * row as f32;
+                let mut label = contents_item(label, 34.0, y, 3.5 * label.len() as f32);
+                let mut value = contents_item(value, value_x(row), y, 3.5 * value.len() as f32);
+                label.font_size = 7.0;
+                value.font_size = 7.0;
+                [label, value]
+            })
+            .collect();
+        let cell_items: Vec<Vec<Vec<&TextItem>>> = items
+            .iter()
+            .zip(&cells)
+            .map(|(pair, row)| {
+                pair.iter()
+                    .zip(row)
+                    .map(|(item, text)| if text.is_empty() { vec![] } else { vec![item] })
+                    .collect()
+            })
+            .collect();
+        is_label_value_list(&cells, &cell_items)
+    }
+
+    fn field_list(pairs: &[(&str, &str)]) -> bool {
+        field_list_with(pairs, |_| 324.0)
+    }
+
+    const FIELDS: [(&str, &str); 8] = [
+        ("Section information", ""),
+        ("Type of entity", "Public company"),
+        ("Registration number", "2019/0442"),
+        ("Name of reporting entity", "ACME HOLDINGS"),
+        ("Listing status", "Listed"),
+        (
+            "Whether the reporting entity is preparing statements for its first financial period since it was established",
+            "No",
+        ),
+        ("Description of reporting currency", "Euro"),
+        ("Level of rounding off for monetary values", "Thousands"),
+    ];
+
+    #[test]
+    fn label_value_list_is_a_field_list_despite_one_long_label() {
+        assert!(field_list(&FIELDS));
+    }
+
+    #[test]
+    fn values_off_a_common_left_edge_are_not_a_label_value_list() {
+        assert!(!field_list_with(&FIELDS, |row| 300.0 + 12.0 * row as f32));
+    }
+
+    #[test]
+    fn index_entries_are_not_a_label_value_list() {
+        assert!(!field_list(&[
+            ("Accounting policies and estimates 4, 30", "Leases 33"),
+            ("Cash and cash equivalents 9, 41", "Lending 47"),
+            ("Contingent liabilities and commitments 58", "Payables 13"),
+            ("Deferred tax assets and liabilities 27", "Provisions 38"),
+            ("Earnings per share, basic and diluted 15", "Reserves 7"),
+            ("Property, plant and equipment 22, 23", "Revenue 16"),
+        ]));
+    }
+
+    #[test]
+    fn two_columns_of_names_are_not_a_label_value_list() {
+        assert!(!field_list(&[
+            ("Alice Brown", "Karen Lowe"),
+            ("Bernard Clarke", "Liam Moss"),
+            ("Chloe Dawson", "Maya Norris"),
+            ("Daniel Evans", "Noah Owens"),
+            ("Emma Fletcher", "Olivia Price"),
+            ("Frank Gibson", "Peter Quinn"),
+        ]));
+    }
+
+    #[test]
+    fn parallel_prose_columns_are_not_a_label_value_list() {
+        let pairs = [
+            (
+                "The committee met four times during the year",
+                "and reviewed the budget for the coming period",
+            ),
+            (
+                "to consider the proposals put forward by the",
+                "with particular attention to the costs of the",
+            ),
+            (
+                "members, and agreed that further work was",
+                "new building, which had risen since the last",
+            ),
+            (
+                "needed before a decision could be taken on",
+                "estimate was prepared by the finance office",
+            ),
+            (
+                "the question of the annual subscription",
+                "and circulated to members in the spring",
+            ),
+            (
+                "which has not changed for several years",
+                "ahead of the general meeting in June",
+            ),
+        ];
+        assert!(!field_list(&pairs));
+        let cells: Vec<Vec<String>> = pairs
+            .iter()
+            .map(|(a, b)| vec![a.to_string(), b.to_string()])
+            .collect();
+        assert!(!has_table_like_content(
+            &cells,
+            TableDetectionMode::SmallFont
+        ));
+    }
+
+    const TITLES: [&str; 6] = [
+        "A Quiet Morning by the Harbour",
+        "Letters from the Northern Coast",
+        "The Orchard in Late Autumn",
+        "Notes on Winter Gardening",
+        "Seven Walks through the Old Town",
+        "Maps of Forgotten Islands",
+    ];
+
+    fn beside_titles<'a>(values: [&'a str; 6]) -> Vec<(&'a str, &'a str)> {
+        TITLES.into_iter().zip(values).collect()
+    }
+
+    #[test]
+    fn titles_beside_a_column_of_years_are_not_a_label_value_list() {
+        assert!(!field_list(&beside_titles([
+            "2012", "1998", "2019", "2003", "2015", "2007"
+        ])));
+    }
+
+    #[test]
+    fn entries_beside_a_column_of_tags_are_not_a_label_value_list() {
+        assert!(!field_list(&beside_titles([
+            "fiction", "letters", "fiction", "essays", "travel", "poetry"
+        ])));
+        assert!(!field_list(&beside_titles([
+            "novel", "letters", "memoir", "essays", "travel", "poetry"
+        ])));
+        assert!(!field_list(&beside_titles([
+            "Fiction", "Letters", "Fiction", "Essays", "Travel", "Fiction"
+        ])));
+    }
+
+    #[test]
+    fn entries_beside_a_column_of_title_cased_tags_are_not_a_label_value_list() {
+        assert!(!field_list(&beside_titles([
+            "Done", "Blocked", "Review", "Waiting", "Backlog", "Urgent"
+        ])));
+        assert!(!field_list(&beside_titles([
+            "DONE", "BLOCKED", "REVIEW", "WAITING", "BACKLOG", "URGENT"
+        ])));
+    }
+
+    #[test]
+    fn a_short_value_column_beside_sentences_is_not_a_label_value_list() {
+        assert!(!field_list(&[
+            ("The first meeting was held in the spring.", "Note 1"),
+            ("Members agreed the budget for the year.", "Note 2"),
+            ("The finance office prepared the estimate.", "Note 3"),
+            ("A revised plan was circulated in June.", "Note 4"),
+            ("The subscription was left unchanged.", "Note 5"),
+            ("The next meeting is set for the autumn.", "Note 6"),
+        ]));
     }
 }

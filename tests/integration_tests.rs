@@ -5342,3 +5342,427 @@ BT /F1 12 Tf 385.6 522 Td (61) Tj ET";
         "entries interleaved into a paragraph: {md}"
     );
 }
+
+/// Two independent columns of short lines at x = 34 and x = 324 in 7pt type,
+/// one pair per baseline, under a 10pt heading: the shape of a field list,
+/// without values keyed to labels.
+fn two_column_short_lines_pdf(heading: &str, left: &[&str], right: &[&str]) -> Vec<u8> {
+    let mut content = format!("BT /F1 10 Tf 24 790 Td ({heading}) Tj ET\n");
+    for (row, (a, b)) in left.iter().zip(right).enumerate() {
+        let y = 766 - 10 * row as i32;
+        content.push_str(&format!(
+            "BT /F1 7 Tf 34 {y} Td ({a}) Tj ET\nBT /F1 7 Tf 324 {y} Td ({b}) Tj ET\n"
+        ));
+    }
+    make_text_pdf(&content, "0 0 595 842")
+}
+
+#[test]
+fn test_two_column_index_page_is_not_a_table() {
+    let left = [
+        "Accruals 12, 44",
+        "Amortisation 18",
+        "Assets held for sale 31",
+        "Borrowings 21, 52",
+        "Cash and cash equivalents 9",
+        "Contingent liabilities 58",
+        "Deferred tax 27, 40",
+        "Dividends 6, 49",
+        "Earnings per share 15",
+        "Employee benefits 36",
+        "Finance costs 19",
+        "Goodwill 24, 25",
+        "Impairment 26",
+        "Inventories 11",
+    ];
+    let right = [
+        "Leases 33, 61",
+        "Lending 47",
+        "Non-controlling interests 8",
+        "Operating segments 54",
+        "Payables 13, 45",
+        "Property and equipment 22",
+        "Provisions 38",
+        "Receivables 10, 42",
+        "Related parties 57",
+        "Reserves 7",
+        "Revenue 16, 17",
+        "Share capital 5",
+        "Taxation 28",
+        "Trade payables 46",
+    ];
+    let buf = two_column_short_lines_pdf("Index", &left, &right);
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(!md.contains('|'), "index columns rendered as a table: {md}");
+    for entry in left.iter().chain(&right) {
+        assert!(md.contains(entry), "missing {entry:?} in {md}");
+    }
+}
+
+#[test]
+fn test_two_column_name_list_is_not_a_table() {
+    let left = [
+        "Alice Brown",
+        "Bernard Clarke",
+        "Chloe Dawson",
+        "Daniel Evans",
+        "Emma Fletcher",
+        "Frank Gibson",
+        "Grace Harper",
+        "Henry Irwin",
+        "Isla Jenkins",
+        "Jack Kerr",
+    ];
+    let right = [
+        "Karen Lowe",
+        "Liam Moss",
+        "Maya Norris",
+        "Noah Owens",
+        "Olivia Price",
+        "Peter Quinn",
+        "Rose Stanley",
+        "Samuel Todd",
+        "Tara Underwood",
+        "Victor Walsh",
+    ];
+    let buf = two_column_short_lines_pdf("Contributors", &left, &right);
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(!md.contains('|'), "name columns rendered as a table: {md}");
+    for name in left.iter().chain(&right) {
+        assert!(md.contains(name), "missing {name:?} in {md}");
+    }
+}
+
+#[test]
+fn test_task_list_beside_a_column_of_tags_is_not_a_table() {
+    let tasks = [
+        "Replace the kitchen tap washer",
+        "Book train tickets for the visit",
+        "Renew the library membership",
+        "Collect the parcel from the depot",
+        "Clear the gutters before winter",
+        "Write up the meeting minutes",
+        "Order printer paper for the office",
+        "Call the plumber about the boiler",
+    ];
+    let tags = [
+        "home", "travel", "errand", "errand", "home", "work", "work", "home",
+    ];
+    let buf = two_column_short_lines_pdf("To do", &tasks, &tags);
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(
+        !md.contains('|'),
+        "task and tag columns rendered as a table: {md}"
+    );
+    for entry in tasks.iter().chain(&tags) {
+        assert!(md.contains(entry), "missing {entry:?} in {md}");
+    }
+}
+
+#[test]
+fn test_task_list_beside_a_column_of_title_cased_tags_is_not_a_table() {
+    let tasks = [
+        "Replace the kitchen tap washer",
+        "Book train tickets for the visit",
+        "Renew the library membership",
+        "Collect the parcel from the depot",
+        "Clear the gutters before winter",
+        "Write up the meeting minutes",
+        "Order printer paper for the office",
+        "Call the plumber about the boiler",
+    ];
+    let tags = [
+        "Done", "Blocked", "Review", "Waiting", "Backlog", "Urgent", "Planned", "Done",
+    ];
+    let buf = two_column_short_lines_pdf("To do", &tasks, &tags);
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(
+        !md.contains('|'),
+        "task and tag columns rendered as a table: {md}"
+    );
+    for entry in tasks.iter().chain(&tags) {
+        assert!(md.contains(entry), "missing {entry:?} in {md}");
+    }
+}
+
+const LABEL_VALUE_FIELDS: [(&str, &str); 14] = [
+    ("Type of entity", "Public company"),
+    ("Registration number", "2019/0442"),
+    ("Name of reporting entity", "ACME HOLDINGS"),
+    ("Listing status", "Listed"),
+    ("Short code", "ACME"),
+    ("Sector", "Industrials"),
+    ("Sub-sector", "Machinery"),
+    ("Reporting period frequency", "Annual"),
+    (
+        "Whether the reporting entity is preparing statements for its first period",
+        "No",
+    ),
+    ("Reporting period start date", "01/01/2025"),
+    ("Reporting period end date", "31/12/2025"),
+    ("Description of reporting currency", "Euro"),
+    ("Level of rounding off for monetary values", "Thousands"),
+    ("Preparation format", "Consolidated"),
+];
+
+/// One field per line from `top` down, label at x = 34 and value at x = 324,
+/// set at 7pt. One label runs most of the way to the value column.
+fn label_value_rows(top: i32) -> String {
+    let mut content = String::new();
+    for (row, (label, value)) in LABEL_VALUE_FIELDS.iter().enumerate() {
+        let y = top - 10 * row as i32;
+        content.push_str(&format!(
+            "BT /F1 7 Tf 34 {y} Td ({label}) Tj ET\nBT /F1 7 Tf 324 {y} Td ({value}) Tj ET\n"
+        ));
+    }
+    content
+}
+
+fn assert_label_value_rows(md: &str) {
+    for (label, value) in LABEL_VALUE_FIELDS {
+        assert!(
+            md.contains(&format!("|{label}|{value}|")),
+            "missing row {label:?} -> {value:?} in {md}"
+        );
+    }
+    assert!(
+        !md.contains("Type of entity Public company"),
+        "fields flowed into a paragraph: {md}"
+    );
+}
+
+#[test]
+fn test_two_column_label_value_page_renders_one_row_per_field() {
+    // A form-style information page: a section heading, then the fields set
+    // smaller than the heading. Each label must stay paired with its value
+    // on one row, not flow into a paragraph of labels and values.
+    let content = format!(
+        "BT /F1 10 Tf 24 790 Td (Report information) Tj ET\n\
+BT /F1 7 Tf 26 776 Td (General information about the statements) Tj ET\n{}",
+        label_value_rows(766)
+    );
+    let buf = make_text_pdf(&content, "0 0 595 842");
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert_label_value_rows(&md);
+}
+
+#[test]
+fn test_label_value_rows_under_a_shaded_title_band_keep_their_first_fields() {
+    // The page title sits in a two-by-two grid of shaded cells whose bottom
+    // edge is within a line or two of the first fields. The grid holds no
+    // table, and the fields next to it must still join the rows below.
+    let content = format!(
+        "0.9 g 25 772 399 11 re f 424 772 126 11 re f 25 783 399 11 re f 424 783 126 11 re f 0 g\n\
+BT /F1 10 Tf 30 785 Td (Report information) Tj ET\n\
+BT /F1 7 Tf 26 774 Td (General information about the statements) Tj ET\n{}",
+        label_value_rows(764)
+    );
+    let buf = make_text_pdf(&content, "0 0 595 842");
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert_label_value_rows(&md);
+}
+
+/// A statement of changes in equity set in 6pt type, one glyph per show op,
+/// whose column headers wrap: some titles take two lines, and the periods
+/// under them are either one line or split after the dash. The wrapped lines
+/// of neighbouring header rows sit 4pt apart, so baselines from different
+/// rows and columns crowd into one band above the body rows.
+fn make_wrapped_column_header_statement_pdf() -> Vec<u8> {
+    make_statement_pdf("0", None)
+}
+
+/// The statement above, with `zero` printed for the zero amounts and, when
+/// given, a footnote marker of that size raised after the first "Share
+/// capital" title.
+fn make_statement_pdf(zero: &'static str, marker_size: Option<f32>) -> Vec<u8> {
+    fn run(content: &mut String, x: f32, y: f32, text: &str) {
+        content.push_str(&format!("BT /F1 6 Tf {x:.1} {y:.1} Td"));
+        for ch in text.chars() {
+            let glyph = match ch {
+                '(' | ')' | '\\' => format!("\\{ch}"),
+                _ => ch.to_string(),
+            };
+            content.push_str(&format!(" ({glyph}) Tj"));
+        }
+        content.push_str(" ET\n");
+    }
+    fn right_aligned(content: &mut String, right: f32, y: f32, value: &str) {
+        let width: f32 = value
+            .chars()
+            .map(|c| if c == ',' { 1.668 } else { 3.336 })
+            .sum();
+        run(content, right - width, y, value);
+    }
+
+    struct Column {
+        x: f32,
+        title: &'static [&'static str],
+        period: &'static [&'static str],
+        values: [&'static str; 2],
+    }
+    let columns = [
+        Column {
+            x: 204.8,
+            title: &["Total equity"],
+            period: &["01/01/2025-", "31/12/2025"],
+            values: ["2,848", "3,394"],
+        },
+        Column {
+            x: 269.2,
+            title: &["Share capital"],
+            period: &["01/01/2025-", "31/12/2025"],
+            values: ["2,000", "2,000"],
+        },
+        Column {
+            x: 333.8,
+            title: &["Retained earnings", "(accumulated losses)"],
+            period: &["01/01/2025-31/12/2025"],
+            values: ["848", "1,394"],
+        },
+        Column {
+            x: 442.5,
+            title: &["Revaluation surplus", "(deficit)"],
+            period: &["01/01/2025-", "31/12/2025"],
+            values: [zero, zero],
+        },
+        Column {
+            x: 507.0,
+            title: &["Total equity"],
+            period: &["01/01/2024-", "31/12/2024"],
+            values: ["2,406", "2,848"],
+        },
+        Column {
+            x: 571.5,
+            title: &["Share capital"],
+            period: &["01/01/2024-", "31/12/2024"],
+            values: ["2,000", "2,000"],
+        },
+        Column {
+            x: 636.0,
+            title: &["Retained earnings", "(accumulated losses)"],
+            period: &["01/01/2024-31/12/2024"],
+            values: ["406", "848"],
+        },
+        Column {
+            x: 745.5,
+            title: &["Revaluation surplus", "(deficit)"],
+            period: &["01/01/2024-", "31/12/2024"],
+            values: [zero, zero],
+        },
+    ];
+
+    let mut content = String::new();
+    run(&mut content, 12.0, 574.0, "STATEMENT OF CHANGES IN EQUITY");
+    run(&mut content, 24.8, 553.0, "Statement of changes in equity");
+    for column in &columns {
+        for (lines, centre) in [(column.title, 561.2), (column.period, 544.8)] {
+            let top = centre + 4.15 * (lines.len() - 1) as f32;
+            for (i, line) in lines.iter().enumerate() {
+                run(&mut content, column.x, top - 8.3 * i as f32, line);
+            }
+        }
+    }
+    if let Some(size) = marker_size {
+        content.push_str(&format!("BT /F1 {size} Tf 306.6 563.4 Td (1) Tj ET\n"));
+    }
+    run(&mut content, 22.5, 532.0, "CHANGES IN EQUITY");
+    for (row, (label, y)) in [
+        ("Balance at the start of the period", 523.8),
+        ("Total equity", 515.5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        run(&mut content, 33.8, y, label);
+        for column in &columns {
+            right_aligned(&mut content, column.x + 30.0, y, column.values[row]);
+        }
+    }
+    make_text_pdf(&content, "0 0 842 595")
+}
+
+#[test]
+fn wrapped_column_headers_form_the_table_header_row() {
+    let buf = make_wrapped_column_header_statement_pdf();
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    // Mid-word glyph splits are a separate defect; compare without spaces.
+    let squeezed: Vec<String> = md.lines().map(|l| l.replace(' ', "")).collect();
+
+    assert!(
+        !md.contains("0d1e") && md.contains("(deficit)"),
+        "stacked header lines interleaved glyph by glyph: {md}"
+    );
+
+    let header = squeezed
+        .iter()
+        .position(|l| l.starts_with("|---"))
+        .map(|i| &squeezed[i - 1])
+        .unwrap_or_else(|| panic!("no table: {md}"));
+    for cell in [
+        "|Totalequity01/01/2025-31/12/2025|",
+        "|Sharecapital01/01/2025-31/12/2025|",
+        "|Retainedearnings(accumulatedlosses)01/01/2025-31/12/2025|",
+        "|Revaluationsurplus(deficit)01/01/2025-31/12/2025|",
+        "|Totalequity01/01/2024-31/12/2024|",
+        "|Revaluationsurplus(deficit)01/01/2024-31/12/2024|",
+    ] {
+        assert!(header.contains(cell), "missing header cell {cell}: {md}");
+    }
+    assert!(
+        squeezed
+            .iter()
+            .any(|l| l == "|Balanceatthestartoftheperiod|2,848|2,000|848|0|2,406|2,000|406|0|"),
+        "body row: {md}"
+    );
+    assert_eq!(
+        md.matches("Balance at the start").count(),
+        1,
+        "body row repeated outside the table: {md}"
+    );
+    assert!(
+        !squeezed
+            .iter()
+            .any(|l| !l.starts_with('|') && l.contains("01/01/20")),
+        "header periods left outside the table: {md}"
+    );
+}
+
+/// The header row a statement's table printed, with spaces squeezed out.
+fn squeezed_header_row(md: &str) -> String {
+    let squeezed: Vec<String> = md.lines().map(|l| l.replace(' ', "")).collect();
+    squeezed
+        .iter()
+        .position(|l| l.starts_with("|---"))
+        .map(|i| squeezed[i - 1].clone())
+        .unwrap_or_else(|| panic!("no table: {md}"))
+}
+
+#[test]
+fn wrapped_column_headers_join_a_statement_that_prints_zero_as_a_dash() {
+    for zero in ["-", "nil"] {
+        let buf = make_statement_pdf(zero, None);
+        let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+        let header = squeezed_header_row(&md);
+        assert!(
+            header.contains("|Revaluationsurplus(deficit)01/01/2025-31/12/2025|"),
+            "zero as {zero:?}: {md}"
+        );
+    }
+}
+
+#[test]
+fn footnote_marker_on_a_wrapped_column_header_stays_with_its_title() {
+    for size in [4.5, 3.5] {
+        let buf = make_statement_pdf("0", Some(size));
+        let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+        let header = squeezed_header_row(&md);
+        assert!(
+            header.contains("|Sharecapital101/01/2025-31/12/2025|"),
+            "marker at {size}pt: {md}"
+        );
+        assert!(
+            md.lines().all(|l| l.starts_with('|') || l.trim() != "1"),
+            "marker at {size}pt left outside the table: {md}"
+        );
+    }
+}

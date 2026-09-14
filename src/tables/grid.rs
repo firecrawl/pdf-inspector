@@ -449,6 +449,307 @@ pub(crate) fn recover_header_row(
     table.item_indices.extend(header_indices);
 }
 
+/// Most lines a wrapped header block takes above its table: a title wrapped
+/// onto three lines over a period split in two, a unit line, and two section
+/// rows. Text further up belongs to whatever precedes the table.
+const MAX_HEADER_LINES: usize = 8;
+/// Share of a table's values that must be figures before lines above it are
+/// read as its column headers.
+const MIN_FIGURE_SHARE: f32 = 0.8;
+/// Header lines stack no further apart than the table's own rows, with a
+/// little slack for a looser header, and never closer than the leading a
+/// line of the table's type needs.
+const HEADER_LINE_PITCH_SLACK: f32 = 1.25;
+const MIN_HEADER_LINE_GAP_EM: f32 = 1.5;
+/// Header text is set within a size or two of the body: smaller text is a
+/// note marker or caption, larger text a title.
+const HEADER_FONT_BAND: std::ops::RangeInclusive<f32> = 0.75..=1.35;
+/// Baselines closer than this many em are one header line.
+const HEADER_LINE_EM: f32 = 0.3;
+
+/// A table value as statements print it: a number, negative in parentheses,
+/// after a currency sign or code, or a dash or "nil" for zero.
+fn is_figure(text: &str) -> bool {
+    let text = text.trim();
+    if matches!(text, "-" | "\u{2013}" | "\u{2014}") || text.eq_ignore_ascii_case("nil") {
+        return true;
+    }
+    let text = text
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim_start_matches(['$', '\u{20ac}', '\u{a3}', '\u{a5}', '\u{20b9}'])
+        .trim();
+    let text = match text.split_once(' ') {
+        Some((code, amount)) if code.len() == 3 && code.chars().all(|c| c.is_ascii_uppercase()) => {
+            amount
+        }
+        _ => text,
+    };
+    is_numeric_text(text.trim_start_matches('(').trim_end_matches(')'))
+}
+
+/// A cell that stands for a value rather than naming a row: a missing-value
+/// or boolean marker. Dashes and "nil" are already figures.
+fn is_value_marker(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "n/a" | "na" | "yes" | "no" | "none" | "true" | "false"
+    )
+}
+
+/// A footnote marker set after header text: one or two digits or reference
+/// symbols in type smaller than the header's.
+fn is_note_marker(item: &TextItem, font_size: f32) -> bool {
+    let text = item.text.trim();
+    item.font_size.abs() < font_size
+        && (1..=2).contains(&text.chars().count())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '*' | '\u{2020}' | '\u{2021}'))
+}
+
+/// Drop the columns whose `keep` entry is false from `row`.
+fn retain_columns<T>(row: &mut Vec<T>, keep: &[bool]) {
+    let mut column = 0;
+    row.retain(|_| {
+        column += 1;
+        keep[column - 1]
+    });
+}
+
+/// Recover column headers that wrap onto several lines above a table's first
+/// row and were left out of it.
+///
+/// A header set in small type over narrow columns ("Retained earnings" over
+/// "(accumulated losses)" over a period split after its dash) stacks lines
+/// closer together than the table's rows, with the lines of neighbouring
+/// columns on staggered baselines. Row clustering cannot make one row of
+/// that, so the detector drops those rows and they fall back into the text
+/// flow as a paragraph. Here each line above the table is assigned to a
+/// column by where it sits over the body text, and the lines are joined top
+/// to bottom within their column into one header row.
+///
+/// The block is the run of lines directly above the first row, no further
+/// apart than the rows themselves, in which every item lands in exactly one
+/// column. Label-only lines between the header and the first row are section
+/// rows and join the body. Footnote markers take no line of their own: each
+/// joins the header text it follows. Nothing changes unless the table's
+/// values are figures beside a first column holding label text, and the
+/// header reaches at least two data columns and half of them. Columns left with no text in any row, cluster positions
+/// seeded by the header's left edges, are dropped.
+pub(crate) fn recover_wrapped_column_headers(
+    table: &mut Table,
+    items: &[TextItem],
+    claimed: &std::collections::HashSet<usize>,
+) {
+    let column_count = table.columns.len();
+    if column_count < 3 || table.rows.len() < 2 {
+        return;
+    }
+
+    let mut extents: Vec<Option<(f32, f32)>> = vec![None; column_count];
+    let mut font_sizes = Vec::new();
+    for &index in &table.item_indices {
+        let item = &items[index];
+        if let Some(column) = find_column_index(&table.columns, item.x) {
+            let extent = extents[column].get_or_insert((item.x, item.x + item.width));
+            extent.0 = extent.0.min(item.x);
+            extent.1 = extent.1.max(item.x + item.width);
+        }
+        font_sizes.push(item.font_size.abs());
+    }
+    let data_columns = extents.iter().skip(1).filter(|e| e.is_some()).count();
+    if extents[0].is_none() || data_columns < 2 || font_sizes.is_empty() {
+        return;
+    }
+    // A first column of figures is data, not labels: with no label column
+    // there is no body to tell headers from the lines of a grid above. A
+    // missing-value or yes/no marker among the figures is data too.
+    let labelled = table
+        .cells
+        .iter()
+        .filter_map(|row| row.first())
+        .any(|cell| !cell.trim().is_empty() && !is_figure(cell) && !is_value_marker(cell));
+    if !labelled {
+        return;
+    }
+    // Only figures under labels: in a table of wrapped prose the lines above
+    // the first row are as likely the previous rows of another grid.
+    let values: Vec<&str> = table
+        .cells
+        .iter()
+        .flat_map(|row| row.iter().skip(1))
+        .map(|cell| cell.trim())
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    let figures = values.iter().filter(|v| is_figure(v)).count();
+    if values.is_empty() || (figures as f32) < values.len() as f32 * MIN_FIGURE_SHARE {
+        return;
+    }
+    font_sizes.sort_by(|a, b| a.total_cmp(b));
+    let font_size = font_sizes[font_sizes.len() / 2];
+    if font_size <= 0.0 {
+        return;
+    }
+    let mut pitches: Vec<f32> = table.rows.windows(2).map(|w| w[0] - w[1]).collect();
+    pitches.sort_by(|a, b| a.total_cmp(b));
+    let max_gap = (pitches[pitches.len() / 2] * HEADER_LINE_PITCH_SLACK)
+        .max(font_size * MIN_HEADER_LINE_GAP_EM);
+    // Columns split at the middle of the gap between their body texts. A
+    // header is centred on, left-aligned over or right-aligned over its
+    // column's values, so its centre lands in that column's span, but it
+    // must not reach over another column's values: that is a spanning
+    // header, which has no single column.
+    let present: Vec<(usize, f32, f32)> = extents
+        .iter()
+        .enumerate()
+        .filter_map(|(c, e)| e.map(|(a, b)| (c, a, b)))
+        .collect();
+    let column_of = |item: &TextItem| -> Option<usize> {
+        let (left, right) = (item.x, item.x + item.width);
+        let centre = (left + right) / 2.0;
+        let slot = present
+            .windows(2)
+            .position(|w| centre < (w[0].2 + w[1].1) / 2.0);
+        let (column, _, _) = present[slot.unwrap_or(present.len() - 1)];
+        let reaches_other = present
+            .iter()
+            .any(|&(c, a, b)| c != column && right > a && left < b);
+        (!reaches_other).then_some(column)
+    };
+
+    let in_table: std::collections::HashSet<usize> = table.item_indices.iter().copied().collect();
+    let first_row_y = table.rows[0];
+    let (mut markers, mut candidates): (Vec<usize>, Vec<usize>) = (0..items.len())
+        .filter(|i| {
+            let item = &items[*i];
+            !in_table.contains(i)
+                && !claimed.contains(i)
+                && !item.text.trim().is_empty()
+                && item.is_upright()
+                && item.line_y() > first_row_y + font_size * HEADER_LINE_EM
+                && item.font_size.abs() <= font_size * HEADER_FONT_BAND.end()
+        })
+        .partition(|i| is_note_marker(&items[*i], font_size));
+    candidates.retain(|i| items[*i].font_size.abs() >= font_size * HEADER_FONT_BAND.start());
+    candidates.sort_by(|a, b| items[*a].line_y().total_cmp(&items[*b].line_y()));
+
+    // Lines ascending from the table, each a list of (item, column).
+    let mut lines: Vec<(f32, Vec<(usize, usize)>)> = Vec::new();
+    let mut previous_y = first_row_y;
+    let mut rest = candidates.as_slice();
+    while let Some(&first) = rest.first() {
+        let y = items[first].line_y();
+        if y - previous_y > max_gap {
+            break;
+        }
+        let end = rest
+            .iter()
+            .position(|&i| items[i].line_y() - y > font_size * HEADER_LINE_EM)
+            .unwrap_or(rest.len());
+        let Some(line) = rest[..end]
+            .iter()
+            .map(|&i| column_of(&items[i]).map(|c| (i, c)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            break;
+        };
+        lines.push((y, line));
+        previous_y = y;
+        rest = &rest[end..];
+        if lines.len() == MAX_HEADER_LINES {
+            break;
+        }
+    }
+
+    let label_only = |line: &[(usize, usize)]| line.iter().all(|&(_, c)| c == 0);
+    let section_count = lines.iter().take_while(|(_, l)| label_only(l)).count();
+    while lines.len() > section_count && lines.last().is_some_and(|(_, l)| label_only(l)) {
+        lines.pop();
+    }
+    let header_lines = &lines[section_count..];
+    let mut header_parts: Vec<Vec<usize>> = vec![Vec::new(); column_count];
+    for &(index, column) in header_lines.iter().flat_map(|(_, l)| l) {
+        header_parts[column].push(index);
+    }
+    let headed = header_parts
+        .iter()
+        .skip(1)
+        .filter(|p| !p.is_empty())
+        .count();
+    if headed < 2 || headed * 2 < data_columns {
+        return;
+    }
+
+    // A marker follows the text it annotates, at or a little above its
+    // baseline.
+    let mut marked: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+    markers.sort_by(|a, b| items[*a].x.total_cmp(&items[*b].x));
+    markers.retain(|&marker| {
+        let m = &items[marker];
+        let host = header_parts.iter().flatten().copied().find(|&host| {
+            let h = &items[host];
+            let after = m.x - (h.x + h.width);
+            let raised = m.line_y() - h.line_y();
+            (-font_size * HEADER_LINE_EM..=font_size * 0.5).contains(&after)
+                && (-font_size * HEADER_LINE_EM..=font_size).contains(&raised)
+        });
+        if let Some(host) = host {
+            marked.entry(host).or_default().push(marker);
+        }
+        host.is_some()
+    });
+
+    let mut header = Vec::with_capacity(column_count);
+    for parts in &mut header_parts {
+        parts.sort_by(|&a, &b| {
+            let (a, b) = (&items[a], &items[b]);
+            b.line_y().total_cmp(&a.line_y()).then(a.x.total_cmp(&b.x))
+        });
+        let mut text = String::new();
+        for part in parts.iter() {
+            if !text.is_empty() && !text.ends_with('-') {
+                text.push(' ');
+            }
+            text.push_str(items[*part].text.trim());
+            for &marker in marked.get(part).into_iter().flatten() {
+                text.push_str(items[marker].text.trim());
+            }
+        }
+        header.push(text);
+    }
+
+    for (y, line) in lines[..section_count].iter() {
+        let mut parts: Vec<&TextItem> = line.iter().map(|&(i, _)| &items[i]).collect();
+        parts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let mut row = vec![String::new(); column_count];
+        row[0] = parts
+            .iter()
+            .map(|p| p.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        table.rows.insert(0, *y);
+        table.cells.insert(0, row);
+    }
+    let header_y = header_lines.last().map_or(first_row_y, |(y, _)| *y);
+    table.rows.insert(0, header_y);
+    table.cells.insert(0, header);
+    table
+        .item_indices
+        .extend(lines.iter().flat_map(|(_, l)| l.iter().map(|&(i, _)| i)));
+    table.item_indices.extend(markers);
+
+    let keep: Vec<bool> = (0..column_count)
+        .map(|c| table.cells.iter().any(|row| !row[c].trim().is_empty()))
+        .collect();
+    if keep.iter().any(|k| !k) {
+        retain_columns(&mut table.columns, &keep);
+        for row in &mut table.cells {
+            retain_columns(row, &keep);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,5 +1174,137 @@ mod tests {
         let refs: Vec<(usize, &TextItem)> = items.iter().map(|(i, t)| (*i, t)).collect();
         let cols = find_column_boundaries(&refs, TableDetectionMode::BodyFont);
         assert_eq!(cols.len(), 4, "Expected 4 columns, got {}", cols.len());
+    }
+
+    #[test]
+    fn statement_figures_include_dashes_nil_and_currency() {
+        for figure in [
+            "1,200",
+            "(1,200)",
+            "-",
+            "\u{2013}",
+            "\u{2014}",
+            "nil",
+            "Nil",
+            "$1,200",
+            "(\u{20ac}350)",
+            "\u{a3}(42)",
+            "USD 1,200",
+        ] {
+            assert!(is_figure(figure), "{figure:?}");
+        }
+        for text in ["Yes", "n/a", "--x", "Total", "US 1,200", ""] {
+            assert!(!is_figure(text), "{text:?}");
+        }
+    }
+
+    /// A three-column table of `values` in 6pt type under a label column,
+    /// its rows at 500 and 490, with a column header wrapped onto two lines
+    /// above each value column.
+    fn wrapped_header_table(values: [[&str; 3]; 2]) -> (Table, Vec<TextItem>) {
+        wrapped_header_table_labelled(["Opening", "Closing"], values)
+    }
+
+    fn wrapped_header_table_labelled(
+        labels: [&str; 2],
+        values: [[&str; 3]; 2],
+    ) -> (Table, Vec<TextItem>) {
+        let columns = vec![30.0, 200.0, 300.0, 400.0];
+        let rows = vec![500.0, 490.0];
+        let mut items = Vec::new();
+        let mut cells = Vec::new();
+        for (row, (&y, label)) in rows.iter().zip(labels).enumerate() {
+            items.push(make_item(label, 30.0, y, 6.0));
+            let mut cell_row = vec![label.to_string()];
+            for (column, value) in values[row].iter().enumerate() {
+                items.push(make_item(value, columns[column + 1], y, 6.0));
+                cell_row.push(value.to_string());
+            }
+            cells.push(cell_row);
+        }
+        let item_indices = (0..items.len()).collect();
+        for (column, title) in [("Plan", "held"), ("Owner", "named"), ("Status", "given")]
+            .into_iter()
+            .enumerate()
+        {
+            items.push(make_item(title.0, columns[column + 1], 515.0, 6.0));
+            items.push(make_item(title.1, columns[column + 1], 508.0, 6.0));
+        }
+        (Table::new(columns, rows, cells, item_indices), items)
+    }
+
+    #[test]
+    fn wrapped_headers_over_a_table_of_figures_join_its_header_row() {
+        let (mut table, items) = wrapped_header_table([["12", "-", "(3)"], ["14", "nil", "(5)"]]);
+        recover_wrapped_column_headers(&mut table, &items, &Default::default());
+        assert_eq!(
+            table.cells[0],
+            ["", "Plan held", "Owner named", "Status given"]
+        );
+    }
+
+    #[test]
+    fn wrapped_headers_over_a_table_of_words_are_left_alone() {
+        let (mut table, items) =
+            wrapped_header_table([["Draft", "Finance", "Open"], ["Final", "Legal", "Closed"]]);
+        let (rows, cells) = (table.rows.clone(), table.cells.clone());
+        recover_wrapped_column_headers(&mut table, &items, &Default::default());
+        assert_eq!(table.rows, rows);
+        assert_eq!(table.cells, cells);
+        assert_eq!(table.item_indices.len(), 8);
+    }
+
+    #[test]
+    fn lines_over_a_table_of_figures_with_no_label_column_are_left_alone() {
+        let (mut table, items) =
+            wrapped_header_table_labelled(["2", "4"], [["12", "-", "(3)"], ["14", "nil", "(5)"]]);
+        let (rows, cells) = (table.rows.clone(), table.cells.clone());
+        recover_wrapped_column_headers(&mut table, &items, &Default::default());
+        assert_eq!(table.rows, rows);
+        assert_eq!(table.cells, cells);
+    }
+
+    #[test]
+    fn lines_over_a_figures_column_holding_a_value_marker_are_left_alone() {
+        for marker in [
+            "n/a", "N/A", "na", "Yes", "no", "None", "TRUE", "false", "-", "\u{2014}",
+        ] {
+            let (mut table, items) = wrapped_header_table_labelled(
+                ["2", marker],
+                [["12", "-", "(3)"], ["14", "nil", "(5)"]],
+            );
+            let (rows, cells) = (table.rows.clone(), table.cells.clone());
+            recover_wrapped_column_headers(&mut table, &items, &Default::default());
+            assert_eq!(table.rows, rows, "{marker}");
+            assert_eq!(table.cells, cells, "{marker}");
+        }
+    }
+
+    #[test]
+    fn a_label_column_header_on_the_header_baseline_heads_the_label_column() {
+        let (mut table, mut items) =
+            wrapped_header_table([["12", "-", "(3)"], ["14", "nil", "(5)"]]);
+        items.push(make_item("Item", 30.0, 508.0, 6.0));
+        recover_wrapped_column_headers(&mut table, &items, &Default::default());
+        assert_eq!(
+            table.cells[0],
+            ["Item", "Plan held", "Owner named", "Status given"]
+        );
+        assert_eq!(table.rows.len(), 3);
+    }
+
+    /// A label-only line below every header line is where a statement sets
+    /// its first section heading, and it opens the body.
+    #[test]
+    fn a_label_only_line_below_the_header_is_a_section_row() {
+        let (mut table, mut items) =
+            wrapped_header_table([["12", "-", "(3)"], ["14", "nil", "(5)"]]);
+        items.push(make_item("Assets", 30.0, 504.0, 6.0));
+        recover_wrapped_column_headers(&mut table, &items, &Default::default());
+        assert_eq!(
+            table.cells[0],
+            ["", "Plan held", "Owner named", "Status given"]
+        );
+        assert_eq!(table.cells[1], ["Assets", "", "", ""]);
     }
 }

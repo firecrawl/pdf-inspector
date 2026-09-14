@@ -1212,13 +1212,94 @@ fn trimmed_suffix(next: &TextItem) -> &str {
     next.text.trim()
 }
 
+/// Widest gap, in em, that a hinted whole-pixel advance leaves between two
+/// glyphs of one word. Hinting at small pixel sizes widens a glyph by up to
+/// a pixel and more (Times Bold "Q" at 8px: 6.2px declared, 8px laid out, a
+/// 0.22 em gap), as wide as a word space, so these gaps only stay unspaced on
+/// pages whose word spaces are painted and so already carried by the items.
+const HINTED_GLYPH_RESIDUAL_EM: f32 = 0.3;
+
+/// Items painted from one character code each, by address. The count is of
+/// codes, not decoded text: a ligature glyph decodes to its letters, and a
+/// word shown in one string can spell a ligature.
+type SingleGlyphs = HashSet<*const TextItem>;
+
+/// Right-to-left glyphs take no rescued space (see `PendingSpace`), so their
+/// word boundaries are still found from the gaps.
+fn is_single_ltr_glyph(item: &TextItem, single_glyphs: &SingleGlyphs) -> bool {
+    single_glyphs.contains(&(item as *const TextItem))
+        && !item.text.chars().any(crate::text_utils::is_rtl_char)
+}
+
+/// Fonts, per page, laid out glyph by glyph with their word spaces painted:
+/// extraction hands a painted space to the glyph before it (`PendingSpace`),
+/// so such a font shows words ending in a spaced glyph right after a bare
+/// one ("m", "e "), among runs of bare glyphs. Word-per-`Tj` producers emit
+/// "a " and "I " too, but after a word, not after a bare glyph. The evidence
+/// is kept to its font: a page can mix such prose with a grid of single
+/// digits in another font whose gaps are real word gaps. A grid in the same
+/// font is kept apart by the merge, which never widens a gap between digits.
+fn fonts_painting_glyph_spaces<'a>(
+    groups: &[(u32, f32, Vec<&'a TextItem>, bool)],
+    single_glyphs: &SingleGlyphs,
+) -> HashSet<(u32, &'a str)> {
+    const MIN_SPACED_GLYPHS: usize = 3;
+    let mut counts: HashMap<(u32, &str), (usize, usize)> = HashMap::new();
+    for (page, _, group, _) in groups {
+        for pair in group.windows(2) {
+            let single = |item: &TextItem| single_glyphs.contains(&(item as *const TextItem));
+            if !single(pair[0]) || pair[0].text.ends_with(char::is_whitespace) {
+                continue;
+            }
+            let (spaced, bare_pairs) = counts.entry((*page, &pair[1].font)).or_default();
+            if single(pair[1]) {
+                *bare_pairs += 1;
+                if pair[1].text.ends_with(' ') {
+                    *spaced += 1;
+                }
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, (spaced, bare_pairs))| *spaced >= MIN_SPACED_GLYPHS && bare_pairs >= spaced)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Half-height, in points, of the baseline band an item of `size` joins
+/// when the band was started by an item of `band_size`.
+///
+/// Type under 10pt narrows the band to half an em. A script glyph of body
+/// text sits further out than that: a superscript in 9pt math is raised
+/// 0.52 em. So an item well smaller than the other side, next to type of
+/// 8pt or more, keeps a wider band. Scripts of smaller type stay narrow,
+/// where half an em is already most of the gap between two lines.
+fn line_band_tolerance(size: f32, band_size: f32) -> f32 {
+    const MAX_BAND: f32 = 5.0;
+    const LINE_BAND_EM: f32 = 0.5;
+    const SCRIPT_BAND_EM: f32 = 0.55;
+    const SCRIPT_SIZE_RATIO: f32 = 0.8;
+    const SCRIPT_BODY_MIN_SIZE: f32 = 8.0;
+    let (size, band_size) = (size.abs(), band_size.abs());
+    let em = size.max(band_size);
+    if em <= 0.0 {
+        return MAX_BAND;
+    }
+    let script = size.min(band_size) < em * SCRIPT_SIZE_RATIO && em >= SCRIPT_BODY_MIN_SIZE;
+    let band_em = if script { SCRIPT_BAND_EM } else { LINE_BAND_EM };
+    MAX_BAND.min(em * band_em)
+}
+
+#[cfg(test)]
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
-    merge_text_items_with_clips(items, &[])
+    merge_text_items_with_clips(items, &[], &[])
 }
 
 fn merge_text_items_with_clips(
     items: Vec<TextItem>,
     clips: &[Option<clip_boundaries::ClipRect>],
+    single_glyph_items: &[usize],
 ) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
@@ -1231,19 +1312,26 @@ fn merge_text_items_with_clips(
         .zip(clips)
         .filter_map(|(item, clip)| clip.map(|rect| (item as *const TextItem, rect)))
         .collect();
+    let single_glyphs: SingleGlyphs = single_glyph_items
+        .iter()
+        .filter_map(|&index| items.get(index))
+        .map(|item| item as *const TextItem)
+        .collect();
 
-    // Group items by (page, Y position) with 5pt tolerance
-    let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
+    // Group items by (page, Y position) with a 5pt tolerance, narrowed to half
+    // an em for small type: two lines of 6pt text can sit 8pt apart, and a
+    // band that reaches both of them sorts their glyphs into one interleaved
+    // run. Baselines half an em apart are never one line of that size.
+    let mut line_groups: Vec<(u32, f32, f32, Vec<&TextItem>)> = Vec::new();
 
     for item in &items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
+        let found = line_groups.iter_mut().find(|(pg, y, size, _)| {
+            *pg == item.page && (item.y - *y).abs() < line_band_tolerance(item.font_size, *size)
+        });
+        if let Some((_, _, _, group)) = found {
             group.push(item);
         } else {
-            line_groups.push((item.page, item.y, vec![item]));
+            line_groups.push((item.page, item.y, item.font_size, vec![item]));
         }
     }
 
@@ -1251,7 +1339,7 @@ fn merge_text_items_with_clips(
 
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
-    for (page, y, mut group) in line_groups {
+    for (page, y, _, mut group) in line_groups {
         let rtl = is_rtl_text(group.iter().map(|i| &i.text));
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
@@ -1269,9 +1357,11 @@ fn merge_text_items_with_clips(
     // Sort groups by page then Y descending (top of page first)
     ordered_line_groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
 
+    let spaced_glyph_fonts = fonts_painting_glyph_spaces(&ordered_line_groups, &single_glyphs);
+
     let mut merged = Vec::new();
 
-    for (_, _, group, preserve_stream_order) in &ordered_line_groups {
+    for (page, _, group, preserve_stream_order) in &ordered_line_groups {
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
@@ -1384,10 +1474,19 @@ fn merge_text_items_with_clips(
                 let needs_bullet_space = *preserve_stream_order
                     && is_standalone_bullet_text(&text)
                     && !next.text.trim().is_empty();
-                let effective_threshold = match tracked {
+                let mut effective_threshold = match tracked {
                     Some((run_end, floor)) if j <= run_end => floor,
                     _ => threshold,
                 };
+                if spaced_glyph_fonts.contains(&(*page, next.font.as_str()))
+                    && previous.font == next.font
+                    && is_single_ltr_glyph(previous, &single_glyphs)
+                    && is_single_ltr_glyph(next, &single_glyphs)
+                    && !(digits(&previous.text) && digits(next.text.trim_end()))
+                {
+                    effective_threshold =
+                        effective_threshold.max(first.font_size * HINTED_GLYPH_RESIDUAL_EM);
+                }
                 let bold_boundary = next.is_bold != first.is_bold;
                 let explicit_bold_space = bold_boundary
                     && (text.ends_with(char::is_whitespace)
@@ -3557,6 +3656,71 @@ mod tests {
         }
     }
 
+    /// One glyph per item, each advancing by `step`, all at baseline `y`.
+    fn glyphs_at(text: &str, x: f32, y: f32, step: f32, font_size: f32) -> Vec<TextItem> {
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| make_item_fs(&c.to_string(), x + step * i as f32, y, step, font_size))
+            .collect()
+    }
+
+    #[test]
+    fn stacked_small_type_lines_are_not_interleaved() {
+        // A wrapped column header in 6pt type: "(deficit)" over "01/01/2025-",
+        // one glyph per show op, baselines 8.25pt apart. A line drawn earlier
+        // at 553pt sits within 5pt of both, so a fixed 5pt band gathers the
+        // two lines together and the x-sort weaves their glyphs into one run.
+        let mut items = glyphs_at("Statement", 24.8, 553.0, 2.8, 6.0);
+        items.extend(glyphs_at("(deficit)", 442.5, 557.1, 3.0, 6.0));
+        items.extend(glyphs_at("01/01/2025-", 442.5, 548.9, 3.0, 6.0));
+        let merged = merge_text_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert!(texts.contains(&"(deficit)"), "{texts:?}");
+        assert!(texts.contains(&"01/01/2025-"), "{texts:?}");
+    }
+
+    #[test]
+    fn stacked_small_type_lines_with_a_mirrored_size_keep_apart() {
+        // A negative rendered size (a flipped font matrix) is the same type
+        // size: the band narrows as it does for the positive one, so the
+        // lines come out one after the other rather than woven by x.
+        let mut items = glyphs_at("Statement", 24.8, 553.0, 2.8, -6.0);
+        items.extend(glyphs_at("(deficit)", 442.5, 557.1, 3.0, -6.0));
+        items.extend(glyphs_at("01/01/2025-", 442.5, 548.9, 3.0, -6.0));
+        let merged = merge_text_items(items);
+        let ys: Vec<f32> = merged.iter().map(|i| i.y).collect();
+        assert!(ys.windows(2).all(|w| w[0] >= w[1]), "{ys:?}");
+    }
+
+    #[test]
+    fn raised_script_of_nine_point_math_stays_in_its_band() {
+        // "2m²d" in 9pt math: the 6pt superscript is raised 4.7pt, more than
+        // half an em of its base, and drawn after the band's first item. It
+        // must stay between its neighbours rather than open a line above.
+        let items = vec![
+            make_item_fs("QK", 60.0, 449.5, 12.0, 9.0),
+            make_item_fs("2m", 80.0, 449.5, 12.0, 9.0),
+            make_item_fs("2", 92.5, 454.2, 3.0, 6.0),
+            make_item_fs("d", 96.0, 449.5, 5.0, 9.0),
+        ];
+        let merged = merge_text_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["QK", "2m", "2", "d"]);
+    }
+
+    #[test]
+    fn raised_footnote_marker_in_small_type_stays_on_its_line() {
+        // A 4.5pt marker raised 2.5pt after a 6pt label, drawn before the
+        // label, anchors the band: it must still take the label in.
+        let mut items = vec![make_item_fs("1", 52.0, 502.5, 2.5, 4.5)];
+        items.extend(glyphs_at("Revenue", 30.0, 500.0, 3.0, 6.0));
+        let merged = merge_text_items(items);
+        let lines: Vec<(f32, &str)> = merged.iter().map(|i| (i.y, i.text.as_str())).collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0].1, "Revenue", "{lines:?}");
+        assert_eq!(lines[1].1, "1", "{lines:?}");
+    }
+
     #[test]
     fn stacked_fraction_glyphs_are_not_merged_into_one_run() {
         // "1" over "3" (a TeX case fraction): same x, baselines 8pt apart,
@@ -3936,5 +4100,72 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         second.rotation = 90.0;
         let merged = merge_text_items(vec![first, second]);
         assert_eq!(merged.len(), 2, "{merged:?}");
+    }
+
+    #[test]
+    fn painted_spaces_in_word_per_show_prose_leave_a_digit_grid_spaced() {
+        // Prose shown a word at a time carries its spaces ("a ", "I ") on
+        // one page with a grid of single digits 0.15 and 0.28 em apart. The
+        // prose paints no glyph-by-glyph words, so the grid's gaps are still
+        // word gaps: its cells must not run together into "101".
+        let mut items = Vec::new();
+        let mut x = 72.0;
+        for word in ["I ", "saw ", "a ", "cat ", "and ", "a ", "dog"] {
+            let width = 5.0 * word.len() as f32;
+            items.push(make_item_fs(word, x, 700.0, width, 10.0));
+            x += width;
+        }
+        for y in [680.0, 668.0, 656.0] {
+            for (digit, x) in [("1", 72.0), ("0", 79.06), ("1", 87.42)] {
+                items.push(make_item_fs(digit, x, y, 5.56, 10.0));
+            }
+        }
+        // The digits are each painted from one code; the prose words are not.
+        let digits: Vec<usize> = (7..items.len()).collect();
+        let merged = merge_text_items_with_clips(items, &[], &digits);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(
+            texts.iter().filter(|t| **t == "1 0 1").count(),
+            3,
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn painted_glyph_spaces_in_one_font_leave_another_fonts_digit_grid_spaced() {
+        // Glyph-by-glyph prose with painted spaces in one font, and a grid
+        // of single digits 0.15 and 0.28 em apart in another: the hinted
+        // gaps of the prose font say nothing about the grid's.
+        let mut items = Vec::new();
+        let mut x = 72.0;
+        for glyph in "Name of the entity and its parent".chars() {
+            if glyph == ' ' {
+                if let Some(last) = items.last_mut() {
+                    let last: &mut TextItem = last;
+                    last.text.push(' ');
+                    last.width += 2.5;
+                }
+                x += 2.5;
+                continue;
+            }
+            items.push(make_item_fs(&glyph.to_string(), x, 700.0, 5.0, 10.0));
+            x += 5.0;
+        }
+        for y in [680.0, 668.0, 656.0] {
+            for (digit, x) in [("1", 72.0), ("0", 79.06), ("1", 87.42)] {
+                let mut item = make_item_fs(digit, x, y, 5.56, 10.0);
+                item.font = "F2".into();
+                items.push(item);
+            }
+        }
+        let glyphs: Vec<usize> = (0..items.len()).collect();
+        let merged = merge_text_items_with_clips(items, &[], &glyphs);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts[0], "Name of the entity and its parent", "{texts:?}");
+        assert_eq!(
+            texts.iter().filter(|t| **t == "1 0 1").count(),
+            3,
+            "{texts:?}"
+        );
     }
 }

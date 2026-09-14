@@ -23,6 +23,25 @@ version and date. Earlier releases are described in their
   their own lines — is rendered as a contents list, one entry per line with
   its page number tab-separated, instead of being read as a two-column page
   whose titles and numbers interleave into a paragraph.
+- Text laid out glyph by glyph at hinted whole-pixel advances, as browser
+  print-to-PDF output is, keeps its words whole ("LIABILITIES", not
+  "LIAB ILITIES"): the painted space glyphs mark the word boundaries, so the
+  gaps a wider hinted glyph leaves inside a word no longer do.
+- A two-column field list — one label and one short value per line, as on a
+  form or information page — is rendered as a two-column table instead of
+  being split into a paragraph of labels and a paragraph of values. A single
+  label long enough to run most of the way to the value column no longer
+  rules the block out.
+- A field list whose first fields sit beside a shaded title band keeps those
+  fields in its table.
+- Lines of small type stacked less than an em apart — a column header
+  wrapped onto two lines in a 6pt statement table — are no longer woven
+  together glyph by glyph into one run such as `(0d1e/0fi1c/i2t0)25-`.
+- A table of figures whose column headers wrap onto several staggered lines
+  above the first row gets those lines joined per column into its header
+  row, instead of leaving them before the table as a bold paragraph.
+- The first body row after a table's skipped header rows is no longer
+  printed a second time as a paragraph outside the table.
 
 ## [1.19.0] - 2026-09-09
 
