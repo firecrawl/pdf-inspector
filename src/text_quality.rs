@@ -11,8 +11,9 @@
 //!   backstop on the region-extraction and whole-document paths.
 //! - **Item/span-level** ([`analyze_text_quality`],
 //!   [`region_items_have_decoding_issue`]) run on individual `TextItem`s and
-//!   accumulate per-page evidence, so localized garbled spans on an otherwise
-//!   clean page are caught without a single span having to condemn the page.
+//!   accumulate page-wide and per-font evidence, so localized garbled spans on
+//!   an otherwise clean page are caught without a single span having to
+//!   condemn the page.
 //!
 //! Detection classes, roughly by signal:
 //! - **Replacement runs**: U+FFFD clusters ([`has_replacement_text_run`]).
@@ -103,13 +104,47 @@ struct CipherGarbleStats {
     /// lowercase straight to uppercase mid-word.
     letter_bigrams: usize,
     case_shift_bigrams: usize,
+    /// Aggregate character composition and short word-like items/tokens.
+    non_whitespace_chars: usize,
+    explicit_word_tokens: usize,
+    explicit_word_letters: usize,
+    /// Streaming evidence for a syntactically valid Base64 payload. Whitespace
+    /// and PDF item boundaries are ignored so wrapped or fragmented payloads
+    /// are evaluated as a single aggregate sample.
+    base64_chars: usize,
+    base64_symbol_chars: usize,
+    base64_padding: usize,
+    base64_invalid: bool,
+    base64_saw_padding: bool,
+    base64_bit_buffer: u16,
+    base64_bit_count: u8,
+    base64_decoded_bytes: usize,
+    base64_printable_bytes: usize,
 }
 
 impl CipherGarbleStats {
+    const MIN_FONT_SAMPLE_LETTER_KINDS: usize = 15;
+    const MIN_FONT_SAMPLE_WORD_TOKENS: usize = 8;
+    const MIN_FONT_SAMPLE_WORD_LETTERS: usize = 100;
+    const MAX_WORD_TOKEN_CHARS: usize = 32;
+
     fn add_text(&mut self, text: &str) {
         let mut prev: Option<char> = None;
+        let mut token_chars = 0usize;
+        let mut token_letters = 0usize;
         for ch in text.chars() {
+            if ch.is_whitespace() {
+                self.add_explicit_word(token_chars, token_letters);
+                token_chars = 0;
+                token_letters = 0;
+            } else {
+                self.non_whitespace_chars += 1;
+                token_chars += 1;
+                self.add_base64_char(ch);
+            }
+
             if ch.is_ascii_alphabetic() {
+                token_letters += 1;
                 let idx = (ch.to_ascii_lowercase() as u8 - b'a') as usize;
                 self.letter_counts[idx] += 1;
                 self.ascii_letters += 1;
@@ -134,6 +169,103 @@ impl CipherGarbleStats {
                 prev = None;
             }
         }
+
+        // PDF producers commonly emit each visible word as its own Tj/TJ
+        // item without a trailing space. Count a word-like trailing token as
+        // prose evidence; the aggregate Base64 check below prevents encoded
+        // chunks from becoming false word evidence.
+        self.add_explicit_word(token_chars, token_letters);
+    }
+
+    fn add_explicit_word(&mut self, chars: usize, letters: usize) {
+        if (2..=Self::MAX_WORD_TOKEN_CHARS).contains(&chars) && letters * 2 >= chars {
+            self.explicit_word_tokens += 1;
+            self.explicit_word_letters += letters;
+        }
+    }
+
+    fn has_explicit_prose_structure(&self) -> bool {
+        self.explicit_word_tokens >= Self::MIN_FONT_SAMPLE_WORD_TOKENS
+            && self.explicit_word_letters >= Self::MIN_FONT_SAMPLE_WORD_LETTERS
+    }
+
+    fn add_base64_char(&mut self, ch: char) {
+        self.base64_chars += 1;
+
+        if ch == '=' {
+            self.base64_symbol_chars += 1;
+            self.base64_padding += 1;
+            self.base64_saw_padding = true;
+            if self.base64_padding > 2 {
+                self.base64_invalid = true;
+            }
+            return;
+        }
+
+        let value = match ch {
+            'A'..='Z' => (ch as u8 - b'A') as u16,
+            'a'..='z' => (ch as u8 - b'a' + 26) as u16,
+            '0'..='9' => (ch as u8 - b'0' + 52) as u16,
+            '+' => {
+                self.base64_symbol_chars += 1;
+                62
+            }
+            '/' => {
+                self.base64_symbol_chars += 1;
+                63
+            }
+            _ => {
+                self.base64_invalid = true;
+                return;
+            }
+        };
+
+        if self.base64_saw_padding {
+            self.base64_invalid = true;
+            return;
+        }
+
+        self.base64_bit_buffer = (self.base64_bit_buffer << 6) | value;
+        self.base64_bit_count += 6;
+        if self.base64_bit_count >= 8 {
+            self.base64_bit_count -= 8;
+            let byte = (self.base64_bit_buffer >> self.base64_bit_count) as u8;
+            self.base64_decoded_bytes += 1;
+            if byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+                self.base64_printable_bytes += 1;
+            }
+            let mask = (1u16 << self.base64_bit_count) - 1;
+            self.base64_bit_buffer &= mask;
+        }
+    }
+
+    fn looks_like_structured_base64(&self) -> bool {
+        if self.base64_invalid
+            || self.base64_chars < 200
+            || !self.base64_chars.is_multiple_of(4)
+            || self.base64_decoded_bytes == 0
+        {
+            return false;
+        }
+
+        let data_chars = self.base64_chars - self.base64_padding;
+        let padding_is_valid = match self.base64_padding {
+            0 => data_chars.is_multiple_of(4) && self.base64_bit_count == 0,
+            1 => data_chars % 4 == 3 && self.base64_bit_count == 2,
+            2 => data_chars % 4 == 2 && self.base64_bit_count == 4,
+            _ => false,
+        };
+        if !padding_is_valid || self.base64_bit_buffer != 0 {
+            return false;
+        }
+
+        // `+`, `/`, or terminal padding is direct Base64 evidence. A Base64
+        // encoding of plain text may contain none of those, so also accept a
+        // payload that decodes overwhelmingly to printable ASCII. Arbitrary
+        // digit-heavy cipher text can satisfy the alphabet and length rules,
+        // but its decoded bytes do not satisfy either discriminator.
+        self.base64_symbol_chars > 0
+            || self.base64_printable_bytes * 10 >= self.base64_decoded_bytes * 9
     }
 
     /// Cosine similarity between the observed letter histogram and English
@@ -223,6 +355,38 @@ impl CipherGarbleStats {
 
         case_shifts || permuted_language
     }
+
+    /// A per-font slice is more likely than a whole page to contain repeated
+    /// identifiers, acronyms, or other structured ASCII. A small alphabet can
+    /// accidentally resemble the sorted English frequency profile even when
+    /// the text is legitimate (for example, a dedicated code font containing
+    /// repeated `myXMLParser` labels). Require broad alphabet coverage before
+    /// applying the page-calibrated cipher heuristic to an isolated font.
+    /// Structured blobs such as Base64 can also cover the whole alphabet and
+    /// flip case frequently. Exempt only an aggregate that has valid Base64
+    /// framing plus either Base64-specific symbols/padding or a predominantly
+    /// printable decoded payload. For other samples with a meaningful
+    /// digit/symbol share, require multiple short word-like tokens. This keeps
+    /// digit-heavy shifted tables in scope, including PDFs that emit one word
+    /// per item. Letter-only samples retain the original cipher behavior,
+    /// including uninterrupted shifted prose.
+    ///
+    /// This guard is intentionally font-only: page-wide detection keeps its
+    /// existing behavior, including all-lowercase and all-uppercase shifted
+    /// prose, while the reported mixed-font cipher sample covers well over
+    /// half of the ASCII alphabet.
+    fn font_sample_looks_garbled(&self) -> bool {
+        let letter_kinds = self
+            .letter_counts
+            .iter()
+            .filter(|&&count| count > 0)
+            .count();
+        let letter_only = self.non_whitespace_chars == self.ascii_letters;
+        letter_kinds >= Self::MIN_FONT_SAMPLE_LETTER_KINDS
+            && !self.looks_like_structured_base64()
+            && (letter_only || self.has_explicit_prose_structure())
+            && self.looks_garbled()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -239,6 +403,32 @@ struct PageTextQualityEvidence {
     replacement_spans: usize,
     longest_replacement_run: usize,
     cipher_garble: CipherGarbleStats,
+    cipher_garble_by_font: BTreeMap<String, CipherGarbleStats>,
+}
+
+impl PageTextQualityEvidence {
+    fn add_cipher_text(&mut self, font: &str, text: &str) {
+        self.cipher_garble.add_text(text);
+        if font.is_empty() {
+            return;
+        }
+
+        if let Some(stats) = self.cipher_garble_by_font.get_mut(font) {
+            stats.add_text(text);
+        } else {
+            let mut stats = CipherGarbleStats::default();
+            stats.add_text(text);
+            self.cipher_garble_by_font.insert(font.to_string(), stats);
+        }
+    }
+
+    fn cipher_sample_looks_garbled(&self) -> bool {
+        self.cipher_garble.looks_garbled()
+            || self
+                .cipher_garble_by_font
+                .values()
+                .any(CipherGarbleStats::font_sample_looks_garbled)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +448,7 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
 
         let evidence = evidence_by_page.entry(item.page).or_default();
         evidence.chars += item.text.chars().filter(|ch| !ch.is_whitespace()).count();
-        evidence.cipher_garble.add_text(&item.text);
+        evidence.add_cipher_text(&item.font, &item.text);
 
         match text_span_decoding_issue_kind(&item.text) {
             Some(TextSpanIssueKind::Strong) => {
@@ -282,7 +472,7 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         if reasons_by_page.contains_key(&page) {
             continue;
         }
-        if page_replacement_evidence_needs_ocr(&evidence) || evidence.cipher_garble.looks_garbled()
+        if page_replacement_evidence_needs_ocr(&evidence) || evidence.cipher_sample_looks_garbled()
         {
             add_ocr_reason(
                 &mut reasons_by_page,
