@@ -969,6 +969,11 @@ fn extract_form_xobject_text_inner(
                         // The array's last string, when it is a wide-spaced
                         // boundary string, and the sub-run text before it.
                         let mut deferred_word_gaps: Option<(String, WordGapCandidate)> = None;
+                        // Only positioning may follow the array's last string;
+                        // the next run decides for a candidate there.
+                        let last_string_index = array.iter().rposition(|el| {
+                            get_operand_bytes(el).is_some_and(|raw| !raw.is_empty())
+                        });
                         for (index, element) in array.iter().enumerate() {
                             match element {
                                 Object::Integer(n) => {
@@ -1138,11 +1143,8 @@ fn extract_form_xobject_text_inner(
                                             },
                                         )
                                     });
-                                    // Only positioning may follow the array's
-                                    // last string; the next run decides for it.
-                                    let strings_follow = array[index + 1..].iter().any(|el| {
-                                        get_operand_bytes(el).is_some_and(|raw| !raw.is_empty())
-                                    });
+                                    let strings_follow =
+                                        last_string_index.is_some_and(|last| index < last);
                                     let text = match (candidate, array.get(index + 1)) {
                                         (Some(candidate), Some(next))
                                             if offset_takes_spacing_back(
