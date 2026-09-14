@@ -6,7 +6,10 @@ use lopdf::{dictionary, Document, Object};
 
 /// A simple font whose `/Widths` covers codes 1..=120 with `default` for
 /// every code, then the given overrides. `differences` becomes the
-/// `/Encoding /Differences` array when present.
+/// `/Encoding /Differences` array when present, over a WinAnsi base. The
+/// width lookup reads the Differences map only, never the base encoding:
+/// a subset that puts `/space` at 26 and leaves code 32 out of its
+/// Differences (the shape InDesign writes) must still resolve to 26.
 fn simple_font(
     default: i64,
     overrides: &[(u16, i64)],
@@ -235,4 +238,20 @@ fn type3_without_remapped_space_keeps_average_estimate() {
     let info = parse_simple_font_widths(&doc, &font).expect("Type3 font parses");
     // 119 codes at 50 plus one at 0: average 49.58 → 22.
     assert_eq!(info.space_width, 22);
+}
+
+#[test]
+fn zero_width_duplicate_space_code_is_ignored() {
+    // A second `/space` code that never advances is not a word space; the
+    // one positive metric is the painted space and is trusted.
+    let (doc, font) = simple_font(
+        556,
+        &[(26, 288), (27, 0), (32, 0)],
+        Some(vec![
+            26.into(),
+            Object::Name(b"space".to_vec()),
+            Object::Name(b"space".to_vec()),
+        ]),
+    );
+    assert_eq!(space_width_of(&doc, &font), 288);
 }
