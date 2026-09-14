@@ -375,6 +375,63 @@ fn has_replacement_text_run(text: &str) -> bool {
     longest_run >= 2 || replacement >= 3
 }
 
+/// Rebuild [`PageTextQualityEvidence`] from assembled markdown so the
+/// page-level policy can be applied to it.
+///
+/// [`analyze_text_quality`] sees one [`TextItem`] at a time, so it needs
+/// [`has_replacement_text_run`] to decide a span is worth counting at all. By
+/// the time markdown exists the spans are concatenated: a run straddling two
+/// items is visible here and nowhere else, which is why the per-page gate
+/// still inspects markdown after the item analyzer has run.
+///
+/// Field-for-field this mirrors the accumulation in [`analyze_text_quality`],
+/// counting each contiguous U+FFFD run as one span the way that loop counts
+/// one span per issue-bearing item. Markdown also carries syntax characters
+/// (`#`, `|`, `*`) that item text does not, so `chars` runs slightly high and
+/// the density floor is marginally more permissive than the item-level path.
+fn markdown_replacement_evidence(markdown: &str) -> PageTextQualityEvidence {
+    let (replacement_chars, longest_replacement_run) = replacement_text_stats(markdown);
+
+    PageTextQualityEvidence {
+        chars: markdown.chars().filter(|ch| !ch.is_whitespace()).count(),
+        replacement_chars,
+        replacement_spans: markdown
+            .split(|ch| ch != '\u{FFFD}')
+            .filter(|run| !run.is_empty())
+            .count(),
+        longest_replacement_run,
+        // Not read by `page_replacement_evidence_needs_ocr`; the markdown
+        // gate runs the cipher check separately below.
+        ..Default::default()
+    }
+}
+
+/// Markdown-level encoding check for the per-page extraction gate.
+///
+/// Same three heuristics as [`detect_encoding_issues`], except U+FFFD is
+/// weighed by [`page_replacement_evidence_needs_ocr`] instead of tripping on a
+/// single character. A lone unmappable glyph — a `≤`, a diameter sign, a
+/// ballot box drawn from a subset symbol font with no ToUnicode CMap — is
+/// common on otherwise healthy office pages, and blanking the page over it
+/// discarded text that decoded perfectly (issue #202).
+///
+/// [`detect_encoding_issues`] keeps the strict policy for callers that only
+/// set a flag or reject one table candidate, where a false positive costs no
+/// content.
+pub(crate) fn markdown_encoding_issues_with_evidence(markdown: &str) -> bool {
+    if page_replacement_evidence_needs_ocr(&markdown_replacement_evidence(markdown)) {
+        return true;
+    }
+
+    if has_dollar_as_space_pattern(markdown) {
+        return true;
+    }
+
+    let mut stats = CipherGarbleStats::default();
+    stats.add_text(markdown);
+    stats.looks_garbled()
+}
+
 fn has_private_use_text_run(text: &str) -> bool {
     let mut total = 0usize;
     let mut private_use = 0usize;

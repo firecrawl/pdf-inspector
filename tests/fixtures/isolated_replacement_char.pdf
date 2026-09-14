@@ -1,0 +1,79 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 851 >>
+stream
+BT
+/F1 11 Tf
+14 TL
+56 760 Td
+(Section 4 - Storage and handling) Tj
+T*
+() Tj
+T*
+(Samples are kept in the cold room and logged on arrival. The retention) Tj
+T*
+(period is twelve months from the date of receipt unless the method) Tj
+T*
+(states otherwise. Containers must be labelled with the sample number,) Tj
+T*
+(the date, and the name of the person who took the sample.) Tj
+T*
+() Tj
+T*
+(Stock solutions are stable for twelve months when stored at) Tj
+T*
+/F2 11 Tf
+<00A3> Tj
+/F1 11 Tf
+( -18 C. Check the seal before use and discard any container) Tj
+T*
+(whose label is no longer legible. Record the check in the logbook.) Tj
+T*
+() Tj
+T*
+(Filters are supplied in two sizes. Use the larger one for turbid) Tj
+T*
+(samples and the smaller one for everything else. Rinse the funnel) Tj
+T*
+(with deionised water between samples to avoid carry-over.) Tj
+T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type0 /BaseFont /AAAAAA+SymbolMT /Encoding /Identity-H /DescendantFonts [7 0 R] >>
+endobj
+7 0 obj
+<< /Type /Font /Subtype /CIDFontType2 /BaseFont /AAAAAA+SymbolMT /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 8 0 R /DW 1000 >>
+endobj
+8 0 obj
+<< /Type /FontDescriptor /FontName /AAAAAA+SymbolMT /Flags 4 /FontBBox [0 -220 1113 1005] /ItalicAngle 0 /Ascent 1005 /Descent -220 /CapHeight 662 /StemV 86 >>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000251 00000 n 
+0000001153 00000 n 
+0000001250 00000 n 
+0000001373 00000 n 
+0000001561 00000 n 
+trailer
+<< /Size 9 /Root 1 0 R >>
+startxref
+1736
+%%EOF
