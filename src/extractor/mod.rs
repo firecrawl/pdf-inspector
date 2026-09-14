@@ -15,6 +15,7 @@ mod reading_order;
 mod scripts;
 mod text_paint;
 pub(crate) mod underline;
+pub(crate) mod word_gaps;
 mod xobjects;
 
 use crate::text_utils::{is_cjk_char, is_rtl_text};
@@ -1010,7 +1011,7 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
 /// Han/Kana scripts write without inter-word spaces. Hangul (Korean) DOES
 /// space between words and deliberately stays out of this set — a Korean
 /// tracked run keeps normal word-boundary handling.
-fn is_spaceless_cjk(c: char) -> bool {
+pub(crate) fn is_spaceless_cjk(c: char) -> bool {
     matches!(c,
         '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
         | '\u{3040}'..='\u{309F}' // Hiragana

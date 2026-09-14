@@ -11,6 +11,13 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- Word spaces carried by character spacing instead of space glyphs — the two
+  glyphs around a word boundary shown as one string with a `Tc` as wide as a
+  word space, the spacing taken back with a positive `TJ` offset or by
+  positioning the next run — no longer glue their words together
+  ("sendtoMars"). Such a string reads with its spaces once the spacing after
+  it is seen to be taken back; tracked display text, whose spacing never is,
+  keeps its letters together.
 - A contents page whose entries end in right-aligned page numbers without dot
   leaders — an edited volume's table of contents with the chapter authors on
   their own lines — is rendered as a contents list, one entry per line with

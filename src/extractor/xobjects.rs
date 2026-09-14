@@ -18,6 +18,10 @@ use super::geometry::{
     advanced_tm, baseline_rotation, estimated_advance_ts, reading_direction, rise_adjusted,
     scaled_run_geometry,
 };
+use super::word_gaps::{
+    offset_takes_spacing_back, word_gap_candidate, word_gap_threshold, PendingWordGaps,
+    WordGapCandidate,
+};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
@@ -429,6 +433,7 @@ fn extract_form_xobject_text_inner(
                                      // so a form starts with the rise in force where it was invoked.
     let mut horizontal_scale: f32 = inherited_horizontal_scale;
     let mut pending_space: Option<PendingSpace> = None;
+    let mut pending_word_gaps: Option<PendingWordGaps> = None;
     let mut text_rise: f32 = inherited_text_rise;
     // Tr is graphics state, so a form starts in the mode the invoking stream
     // left it in: `3 Tr` set on the page or in an outer form hides the text
@@ -503,6 +508,9 @@ fn extract_form_xobject_text_inner(
                 }
             }
             "Do" => {
+                // A nested form's runs belong to its own stream and never
+                // continue a wide-spaced boundary string of this one.
+                pending_word_gaps = None;
                 if !op.operands.is_empty() {
                     if let Ok(name) = op.operands[0].as_name() {
                         let xobj_name = String::from_utf8_lossy(name).to_string();
@@ -574,6 +582,9 @@ fn extract_form_xobject_text_inner(
             }
             "ET" => {
                 in_text_block = false;
+                // A wide-spaced boundary string is continued within its text
+                // object; a later object's geometry is unrelated to it.
+                pending_word_gaps = None;
             }
             "Tf" => {
                 if op.operands.len() >= 2 {
@@ -709,6 +720,14 @@ fn extract_form_xobject_text_inner(
                     text_matrix = line_matrix;
                 }
                 if let (true, Some(show_operand)) = (in_text_block, op.operands.last()) {
+                    // Where this run starts says whether the run before it, a
+                    // wide-spaced boundary string, had its spacing taken back.
+                    // An empty show paints nothing and decides nothing.
+                    if get_operand_bytes(show_operand).is_some_and(|raw| !raw.is_empty()) {
+                        if let Some(pending) = pending_word_gaps.take() {
+                            pending.resolve(items, &text_matrix, &ctm);
+                        }
+                    }
                     let invisible = text_rendering_mode == 3 && !include_invisible;
                     if invisible
                         && get_operand_bytes(show_operand).is_some_and(|raw| !raw.is_empty())
@@ -871,6 +890,37 @@ fn extract_form_xobject_text_inner(
                                 mcid: None,
                                 baseline_shift: 0.0,
                             });
+                            // A short string with word-gap character spacing
+                            // shows its spaces once the next run proves the
+                            // spacing after it was taken back (see `word_gaps`).
+                            pending_word_gaps = get_operand_bytes(show_operand).and_then(|raw| {
+                                PendingWordGaps::for_shown_string(
+                                    items.len() - 1,
+                                    raw,
+                                    &text,
+                                    font_widths.get(&current_font),
+                                    current_font_size,
+                                    char_spacing,
+                                    word_spacing,
+                                    &text_matrix,
+                                    &ctm,
+                                    horizontal_scale,
+                                    |code| {
+                                        extract_text_from_operand(
+                                            code,
+                                            &current_font,
+                                            font_base_names.get(&current_font).map(|s| s.as_str()),
+                                            font_cmaps,
+                                            &font_tounicode_refs,
+                                            &inline_cmaps,
+                                            &font_encodings,
+                                            &encoding_cache,
+                                            cmap_decisions,
+                                            &font_widths,
+                                        )
+                                    },
+                                )
+                            });
                         }
                     }
                 }
@@ -895,13 +945,9 @@ fn extract_form_xobject_text_inner(
                         let hidden = fill_is_white || invisible;
                         let font_info = font_widths.get(&current_font);
 
-                        let space_threshold = if let Some(fi) = font_info {
-                            let space_em = fi.space_width as f32 * fi.units_scale;
-                            let threshold = space_em * 1000.0 * 0.4;
-                            threshold.max(80.0)
-                        } else {
-                            120.0
-                        };
+                        // Word-space threshold for `TJ` offsets and character
+                        // spacing alike, from the font metrics when available.
+                        let space_threshold = word_gap_threshold(font_info);
                         let column_gap_threshold = space_threshold * 4.0;
 
                         let mut sub_items: Vec<(String, f32, f32, f32, bool)> = Vec::new();
@@ -920,7 +966,10 @@ fn extract_form_xobject_text_inner(
                         // backward past painted glyphs — logical-order RTL
                         // producers position runs right-to-left this way.
                         let mut backward_jump = false;
-                        for element in array {
+                        // The array's last string, when it is a wide-spaced
+                        // boundary string, and the sub-run text before it.
+                        let mut deferred_word_gaps: Option<(String, WordGapCandidate)> = None;
+                        for (index, element) in array.iter().enumerate() {
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
@@ -1005,6 +1054,17 @@ fn extract_form_xobject_text_inner(
                             {
                                 sub_start_width_ts = total_width_ts;
                                 sub_run_painted = true;
+                                if let Some(pending) = pending_word_gaps.take() {
+                                    pending.resolve(
+                                        items,
+                                        &advanced_tm(
+                                            &text_matrix,
+                                            total_width_ts,
+                                            horizontal_scale,
+                                        ),
+                                        &ctm,
+                                    );
+                                }
                             }
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
@@ -1045,6 +1105,56 @@ fn extract_form_xobject_text_inner(
                                         &font_widths,
                                     )
                                 {
+                                    // A short string with word-gap character
+                                    // spacing shows its spaces once the spacing
+                                    // after it is taken back: by the positive
+                                    // offset that follows it here, or — for the
+                                    // array's last string — by where the next
+                                    // run starts (see `word_gaps`).
+                                    let candidate = get_operand_bytes(element).and_then(|raw| {
+                                        word_gap_candidate(
+                                            raw,
+                                            &text,
+                                            font_info,
+                                            current_font_size,
+                                            char_spacing,
+                                            word_spacing,
+                                            space_threshold,
+                                            |code| {
+                                                extract_text_from_operand(
+                                                    code,
+                                                    &current_font,
+                                                    font_base_names
+                                                        .get(&current_font)
+                                                        .map(|s| s.as_str()),
+                                                    font_cmaps,
+                                                    &font_tounicode_refs,
+                                                    &inline_cmaps,
+                                                    &font_encodings,
+                                                    &encoding_cache,
+                                                    cmap_decisions,
+                                                    &font_widths,
+                                                )
+                                            },
+                                        )
+                                    });
+                                    let text = match (candidate, array.get(index + 1)) {
+                                        (Some(candidate), Some(next))
+                                            if offset_takes_spacing_back(
+                                                next,
+                                                candidate.trailing_spacing_ts,
+                                                current_font_size,
+                                            ) =>
+                                        {
+                                            candidate.spaced_text
+                                        }
+                                        (Some(candidate), None) => {
+                                            deferred_word_gaps =
+                                                Some((current_text.clone(), candidate));
+                                            text
+                                        }
+                                        _ => text,
+                                    };
                                     current_text.push_str(&text);
                                     current_symbol_rewrite |= legacy_symbol_rewrite;
                                 }
@@ -1203,6 +1313,21 @@ fn extract_form_xobject_text_inner(
                         // measured, or estimated for a font without metrics.
                         text_matrix[4] += total_width_ts * horizontal_scale * text_matrix[0];
                         text_matrix[5] += total_width_ts * horizontal_scale * text_matrix[1];
+                        // The array's last string was a candidate: the next
+                        // run decides, against the pen it left.
+                        if let Some((prefix, candidate)) = deferred_word_gaps {
+                            if !sub_items.is_empty() {
+                                pending_word_gaps = Some(PendingWordGaps::new(
+                                    items.len() - 1,
+                                    expand_ligatures(&format!("{prefix}{}", candidate.spaced_text)),
+                                    &text_matrix,
+                                    &ctm,
+                                    horizontal_scale,
+                                    candidate.trailing_spacing_ts,
+                                    current_font_size,
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -2245,5 +2370,57 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
             b"BT /F1 12 Tf 72 700 Td (for) Tj -6 Tc 1 0 0 1 60 700 Tm [-2800 ( )] TJ 0 Tc 1 0 0 1 94.8 700 Tm (the) Tj ET",
         );
         find(&items, "for the");
+    }
+
+    /// Word gaps carried by character spacing inside a form read as word
+    /// spaces once the spacing is taken back, for every show operator —
+    /// `"` sets the spacing itself; spacing that stays is tracking.
+    #[test]
+    fn character_spacing_word_gaps_inside_form_read_as_word_spaces() {
+        for (content, expected) in [
+            (
+                "BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td [(dt) 300 (oM)] TJ 0 Tc 30 0 Td (ars) Tj ET",
+                "send to Mars",
+            ),
+            (
+                "BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td (dt) Tj 0 Tc 15 0 Td (o) Tj ET",
+                "send to",
+            ),
+            ("BT /F1 10 Tf 12 TL 72 712 Td 3 Tc (dt) ' 0 Tc 15 0 Td (o) Tj ET", "d to"),
+            ("BT /F1 10 Tf 12 TL 72 712 Td 0 3 (dt) \" 0 Tc 15 0 Td (o) Tj ET", "d to"),
+            ("BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj 18 0 Td (o) Tj ET", "dto"),
+            ("BT /F1 10 Tf 72 700 Td 3 Tc (HEADING) Tj ET", "HEADING"),
+        ] {
+            let items = form_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts, [expected], "{content}: {items:?}");
+        }
+    }
+
+    /// An XObject painted between a candidate and the run that would have
+    /// taken its spacing back belongs to another stream: the candidate is
+    /// dropped, on the page and inside a form alike.
+    #[test]
+    fn an_xobject_in_between_drops_the_word_gap_candidate() {
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj q /X1 Do Q 0 Tc 15 0 Td (o) Tj ET q /X2 Do Q",
+            &[
+                b"",
+                b"BT /F1 10 Tf 72 600 Td 3 Tc (dt) Tj q /X1 Do Q 0 Tc 15 0 Td (o) Tj ET",
+            ],
+        );
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["dto", "dto"], "{items:?}");
     }
 }
