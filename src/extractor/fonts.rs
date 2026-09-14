@@ -427,6 +427,16 @@ pub(crate) fn parse_simple_font_widths(
         widths.insert(code, w);
     }
 
+    // A subset font may place `/space` at a code other than 32 through
+    // `/Encoding /Differences`, leaving code 32 unused (width 0) or holding
+    // some other glyph. The word-gap threshold derives from the space
+    // width, so read it from the code that actually carries the space
+    // glyph. Only an unambiguous positive width is trusted; anything else
+    // keeps the code-32 metric and its fallbacks.
+    if let Some(width) = encoded_space_width(doc, font_dict, &widths) {
+        space_width = width;
+    }
+
     // Determine units_scale: for Type3 fonts, use FontMatrix[0]; for others, use 1/1000
     let units_scale = if let Ok(fm) = font_dict.get(b"FontMatrix") {
         if let Some(arr) = resolve_array(doc, fm) {
@@ -468,6 +478,35 @@ pub(crate) fn parse_simple_font_widths(
         units_scale,
         wmode: 0,
     })
+}
+
+/// Width of the glyph a simple font paints for the word space when its
+/// `/Encoding /Differences` names `/space` at some code. Subset fonts
+/// written by InDesign-style producers number their glyphs from 1 in order
+/// of first use, so the space lands on an arbitrary code (26, 27, ...) while
+/// code 32 is unused and carries width 0. Returns the width only when every
+/// code mapped to the space has one and the same positive width; a missing,
+/// zero or conflicting metric yields `None` so the caller keeps its code-32
+/// reading and the fallbacks built on it.
+fn encoded_space_width(
+    doc: &Document,
+    font_dict: &lopdf::Dictionary,
+    widths: &HashMap<u16, u16>,
+) -> Option<u16> {
+    let encoding = parse_font_encoding(doc, font_dict)?;
+    let mut space_widths: Vec<u16> = encoding
+        .map
+        .iter()
+        .filter(|(_, character)| **character == ' ')
+        .filter_map(|(code, _)| widths.get(&u16::from(*code)).copied())
+        .filter(|width| *width > 0)
+        .collect();
+    space_widths.sort_unstable();
+    space_widths.dedup();
+    match space_widths.as_slice() {
+        [width] => Some(*width),
+        _ => None,
+    }
 }
 
 /// Parse widths for Type0 (composite/CID) fonts
@@ -2861,3 +2900,7 @@ mod stale_cmap_tests;
 #[cfg(test)]
 #[path = "blank_glyph_tests.rs"]
 mod blank_glyph_tests;
+
+#[cfg(test)]
+#[path = "encoded_space_width_tests.rs"]
+mod encoded_space_width_tests;

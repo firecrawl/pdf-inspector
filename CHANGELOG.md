@@ -11,6 +11,16 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- A simple font whose `/Encoding /Differences` places `/space` at a code
+  other than 32 — InDesign-style subsets number glyphs from 1 in order of
+  first use, leaving code 32 with width 0 — now derives the word-gap
+  threshold from the space glyph's real width instead of code 32's. Kerned
+  runs such as an IP address written as `[(17) -57 (2) -111 (.) ...] TJ` no
+  longer split into `172 .17.101. 20` when code 32 is empty, and running
+  text no longer fuses into `pricingisliketheweather` when code 32 holds a
+  wide letter whose advance hid every real word gap (the `real-estate-pricing`
+  snapshot now reads word by word).
+
 - A contents page whose entries end in right-aligned page numbers without dot
   leaders — an edited volume's table of contents with the chapter authors on
   their own lines — is rendered as a contents list, one entry per line with
