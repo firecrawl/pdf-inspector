@@ -359,16 +359,25 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             Some(ys) => ys,
             None => return false,
         };
-        if ys.len() <= n * 2 {
+        // Adaptive edge count for sparse pages: don't let first/last zones
+        // overlap and swallow the entire page (e.g. 9 lines with n=5 covers all).
+        let adaptive_n = if ys.len() <= 6 {
+            1
+        } else if ys.len() <= 12 {
+            2
+        } else {
+            n
+        };
+        if ys.len() <= adaptive_n * 2 {
             // Page has very few lines — everything is near the edge
             return true;
         }
-        // Check if this Y is among the first or last N
+        // Check if this Y is among the first or last adaptive N
         let pos = match ys.iter().position(|&py| (py - y).abs() < 0.1) {
             Some(p) => p,
             None => return false,
         };
-        pos < n || pos >= ys.len() - n
+        pos < adaptive_n || pos >= ys.len() - adaptive_n
     }
 
     // Average page span for normalizing Y variance
