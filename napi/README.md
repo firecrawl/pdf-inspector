@@ -154,9 +154,10 @@ reads left-to-right (`extractTextWithPositionsAndRotations` reports which
 pages were turned), so its sheet-frame bboxes do not match the rendered image
 even with `/Rotate 0`. Pass `{ frame: "display" }` to give bboxes on the
 rendered page (the visible box turned clockwise by the page's inheritable
-`/Rotate`, with any text turn undone), as a layout model working on page
-images reports them, whatever the page's `/Rotate` or text direction.
-`extractTablesInRegions` takes the same option.
+`/Rotate`; the page-level turn of a predominantly rotated page is undone
+first, while individual runs keep their own `rotation`), as a layout model
+working on page images reports them, whatever the page's `/Rotate` or text
+direction. `extractTablesInRegions` takes the same option.
 
 Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues). When the cause is a suspected garbled text layer, `ocrReason` is set to `"suspected_garbled_text"`.
 
