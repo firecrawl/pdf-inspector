@@ -103,6 +103,12 @@ pub struct PdfClassification {
 /// expressed in that turned frame. Use
 /// [`extract_text_with_positions_and_rotations`] (`extractTextWithPositionsAndRotations`
 /// in JavaScript) to learn which pages were turned and which way.
+///
+/// Pass `{ frame: "display" }` (see [`FrameOptions`]) to get every item in
+/// the rendered page's frame instead: the visible page box turned clockwise
+/// by the page's inheritable `/Rotate`, with the turn of a rotated page
+/// undone, so `x`/`y`/`width`/`height` and `rotation` describe the item as
+/// a renderer draws it.
 #[napi(object)]
 pub struct TextItem {
     pub text: String,
@@ -164,9 +170,34 @@ pub struct TextItem {
 pub struct PageRegions {
     pub page: u32,
     /// Each bbox is [x1, y1, x2, y2] in PDF points, top-left origin of the
-    /// visible page box (`CropBox ∩ MediaBox`, else the MediaBox) — the
-    /// frame of a rendered page image.
+    /// visible page box (`CropBox ∩ MediaBox`, else the MediaBox). By
+    /// default the box is read as laid out in the content stream with
+    /// `/Rotate` not applied — the frame `extractTextWithPositions` reports
+    /// items in, flipped to a top-left origin — which matches a rendered
+    /// page image only for pages with `/Rotate 0`. With
+    /// `{ frame: "display" }` (see [`FrameOptions`]) the bbox is read on the
+    /// rendered page: the visible box turned clockwise by the page's
+    /// inheritable `/Rotate`, top-left origin, `y` down.
     pub regions: Vec<Vec<f64>>,
+}
+
+/// Coordinate frame selection shared by `extractTextWithPositions`,
+/// `extractTextWithPositionsAndRotations`, `extractTextInRegions` and
+/// `extractTablesInRegions`.
+#[napi(object)]
+#[derive(Clone, Default)]
+pub struct FrameOptions {
+    /// `"sheet"` (default): the visible page box as laid out in the content
+    /// stream, `/Rotate` not applied; pages whose text is predominantly
+    /// rotated are turned so that text reads left-to-right (see
+    /// [`TextItem`]). `"display"`: the rendered page — the visible page box
+    /// turned clockwise by the page's inheritable `/Rotate`, lower-left
+    /// origin and `y` up for items, top-left origin and `y` down for region
+    /// bboxes — with the turn of a rotated page undone, so items sit where a
+    /// renderer draws them and region bboxes can be taken from a rendered
+    /// page image.
+    #[napi(ts_type = "\"sheet\" | \"display\"")]
+    pub frame: Option<String>,
 }
 
 /// Extracted text for a single region.
@@ -421,6 +452,22 @@ fn to_napi_err(e: impl std::fmt::Display, ctx: &str) -> Error {
     Error::new(Status::GenericFailure, format!("{ctx}: {e}"))
 }
 
+/// The coordinate frame an optional `FrameOptions` asks for; an unknown
+/// value is an argument error rather than a silent fallback to the default.
+fn position_frame(
+    options: Option<&FrameOptions>,
+    ctx: &str,
+) -> Result<pdf_inspector::PositionFrame> {
+    match options.and_then(|options| options.frame.as_deref()) {
+        None | Some("sheet") => Ok(pdf_inspector::PositionFrame::Sheet),
+        Some("display") => Ok(pdf_inspector::PositionFrame::Display),
+        Some(other) => Err(Error::new(
+            Status::InvalidArg,
+            format!("{ctx}: unknown frame {other:?}; expected \"sheet\" or \"display\""),
+        )),
+    }
+}
+
 /// Run a closure, catching any Rust panic and converting it to a NAPI error.
 /// Prevents process abort from unwind panics in the native module.
 fn catch_panic<F, T>(ctx: &str, f: F) -> Result<T>
@@ -523,26 +570,25 @@ pub fn extract_text(buffer: Buffer) -> Result<String> {
 /// Items are reported in PDF points relative to the page's visible page box
 /// (`CropBox ∩ MediaBox`, else the MediaBox) with the box's lower-left
 /// corner as origin — see [`TextItem`]. `pages` is 1-indexed (matching
-/// `TextItem.page`); omit it for the whole document.
+/// `TextItem.page`); omit it for the whole document. `options.frame`
+/// selects the coordinate frame (see [`FrameOptions`]): `"sheet"` by
+/// default, `"display"` for the rendered page's frame.
 #[napi]
 pub fn extract_text_with_positions(
     buffer: Buffer,
     pages: Option<Vec<u32>>,
+    options: Option<FrameOptions>,
 ) -> Result<Vec<TextItem>> {
     let bytes: Vec<u8> = buffer.to_vec();
+    let frame = position_frame(options.as_ref(), "extract_text_with_positions")?;
     catch_panic("extract_text_with_positions", move || {
-        let items = match pages {
-            Some(p) => {
-                let page_set: HashSet<u32> = p.into_iter().collect();
-                pdf_inspector::extractor::extract_text_with_positions_mem_pages(
-                    &bytes,
-                    Some(&page_set),
-                )
-                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?
-            }
-            None => pdf_inspector::extractor::extract_text_with_positions_mem(&bytes)
-                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?,
-        };
+        let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
+        let items = pdf_inspector::extract_text_with_positions_mem_in_frame(
+            &bytes,
+            page_set.as_ref(),
+            frame,
+        )
+        .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?;
 
         Ok(items.into_iter().map(convert_text_item).collect())
     })
@@ -599,13 +645,32 @@ pub struct PositionedText {
 /// Items on such a page are expressed in the turned frame (their dominant
 /// runs read left-to-right there); pages absent from `pageRotations` are
 /// upright.
+///
+/// `pages` is 1-indexed (matching `TextItem.page`); omit it for the whole
+/// document. `options.frame` selects the coordinate frame (see
+/// [`FrameOptions`]); with `"display"` the turn of a rotated page is undone
+/// and every item is in the rendered page's frame, while `pageRotations`
+/// keeps reporting which pages were turned.
 #[napi]
-pub fn extract_text_with_positions_and_rotations(buffer: Buffer) -> Result<PositionedText> {
+pub fn extract_text_with_positions_and_rotations(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+    options: Option<FrameOptions>,
+) -> Result<PositionedText> {
     let bytes: Vec<u8> = buffer.to_vec();
+    let frame = position_frame(
+        options.as_ref(),
+        "extract_text_with_positions_and_rotations",
+    )?;
     catch_panic("extract_text_with_positions_and_rotations", move || {
+        let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
         let (items, rotations) =
-            pdf_inspector::extract_text_with_positions_and_rotations_mem(&bytes)
-                .map_err(|e| to_napi_err(e, "extract_text_with_positions_and_rotations"))?;
+            pdf_inspector::extract_text_with_positions_and_rotations_mem_in_frame(
+                &bytes,
+                page_set.as_ref(),
+                frame,
+            )
+            .map_err(|e| to_napi_err(e, "extract_text_with_positions_and_rotations"))?;
         let mut page_rotations: Vec<PageRotation> = rotations
             .into_iter()
             .filter_map(|(page, rotation)| {
@@ -691,17 +756,21 @@ pub fn extract_structure_elements(
 /// origin: a positioned `y` becomes `boxHeight - y`. For text items `y` is
 /// the baseline, so `[x, boxHeight - y - height, x + width, boxHeight - y]`
 /// covers the glyph band above the baseline; for image, link and form-field
-/// items `y` is the rect bottom and that box is exact.
+/// items `y` is the rect bottom and that box is exact. `/Rotate` is not
+/// applied by default; pass `{ frame: "display" }` (see [`FrameOptions`]) to
+/// give bboxes on the rendered page instead.
 #[napi]
 pub fn extract_text_in_regions(
     buffer: Buffer,
     page_regions: Vec<PageRegions>,
+    options: Option<FrameOptions>,
 ) -> Result<Vec<PageRegionTexts>> {
     let bytes: Vec<u8> = buffer.to_vec();
     let regions = parse_page_regions(&page_regions);
+    let frame = position_frame(options.as_ref(), "extract_text_in_regions")?;
 
     catch_panic("extract_text_in_regions", move || {
-        let results = pdf_inspector::extract_text_in_regions_mem(&bytes, &regions)
+        let results = pdf_inspector::extract_text_in_regions_mem_in_frame(&bytes, &regions, frame)
             .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
         Ok(to_page_region_texts(results))
     })
@@ -717,18 +786,22 @@ pub fn extract_text_in_regions(
 /// `needsOcr` is `true` so the caller can fall back to GPU OCR.
 ///
 /// Coordinates are PDF points with top-left origin, relative to the visible
-/// page box (see `extractTextInRegions`).
+/// page box (see `extractTextInRegions`); `options.frame` selects the frame
+/// the same way.
 #[napi]
 pub fn extract_tables_in_regions(
     buffer: Buffer,
     page_regions: Vec<PageRegions>,
+    options: Option<FrameOptions>,
 ) -> Result<Vec<PageRegionTexts>> {
     let bytes: Vec<u8> = buffer.to_vec();
     let regions = parse_page_regions(&page_regions);
+    let frame = position_frame(options.as_ref(), "extract_tables_in_regions")?;
 
     catch_panic("extract_tables_in_regions", move || {
-        let results = pdf_inspector::extract_tables_in_regions_mem(&bytes, &regions)
-            .map_err(|e| to_napi_err(e, "extract_tables_in_regions"))?;
+        let results =
+            pdf_inspector::extract_tables_in_regions_mem_in_frame(&bytes, &regions, frame)
+                .map_err(|e| to_napi_err(e, "extract_tables_in_regions"))?;
         Ok(to_page_region_texts(results))
     })
 }

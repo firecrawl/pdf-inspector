@@ -62,6 +62,29 @@ impl PageRotation {
         *width = new_width;
         *height = new_height;
     }
+
+    /// Undo [`PageRotation::rotate_box`]: take a box expressed in the turned
+    /// frame back to the page frame it was turned from. Extents are
+    /// normalised the same way, so the result has non-negative extents.
+    pub(crate) fn unrotate_box(self, x: &mut f32, y: &mut f32, width: &mut f32, height: &mut f32) {
+        let (x0, x1) = (x.min(*x + *width), x.max(*x + *width));
+        let (y0, y1) = (y.min(*y + *height), y.max(*y + *height));
+        let (new_x, new_y, new_width, new_height) = match self {
+            PageRotation::Upright => (x0, y0, x1 - x0, y1 - y0),
+            // Forward `(x, y) → (y, -x)`: the turned x range is the page y
+            // range and the turned y range is the negated page x range, so
+            // the page's left edge is the negated turned top edge.
+            PageRotation::Ccw => (-y1, x0, y1 - y0, x1 - x0),
+            // Forward `(x, y) → (-y, x)`: the turned x range is the negated
+            // page y range and the turned y range is the page x range, so
+            // the page's bottom edge is the negated turned right edge.
+            PageRotation::Cw => (y0, -x1, y1 - y0, x1 - x0),
+        };
+        *x = new_x;
+        *y = new_y;
+        *width = new_width;
+        *height = new_height;
+    }
 }
 
 /// Text rise (Ts) displaces the glyph origin by (0, rise) in unscaled text
@@ -328,6 +351,30 @@ pub(crate) fn normalize_degrees(degrees: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrotate_box_undoes_rotate_box() {
+        for rotation in [PageRotation::Upright, PageRotation::Ccw, PageRotation::Cw] {
+            for (x, y, w, h) in [
+                (188.0, 100.0, 12.0, 36.0),
+                (28.0, 420.0, 12.0, 200.0),
+                (-50.0, -20.0, 30.0, 10.0),
+            ] {
+                let (mut tx, mut ty, mut tw, mut th) = (x, y, w, h);
+                rotation.rotate_box(&mut tx, &mut ty, &mut tw, &mut th);
+                rotation.unrotate_box(&mut tx, &mut ty, &mut tw, &mut th);
+                assert_eq!((tx, ty, tw, th), (x, y, w, h), "{rotation:?}");
+            }
+        }
+        // The turned box may arrive with negative extents; the page box
+        // comes back normalised.
+        let (mut x, mut y, mut w, mut h) = (620.0, -28.0, -200.0, -12.0);
+        PageRotation::Ccw.unrotate_box(&mut x, &mut y, &mut w, &mut h);
+        assert_eq!((x, y, w, h), (28.0, 420.0, 12.0, 200.0));
+        let (mut x, mut y, mut w, mut h) = (-500.0, 312.0, -200.0, -12.0);
+        PageRotation::Cw.unrotate_box(&mut x, &mut y, &mut w, &mut h);
+        assert_eq!((x, y, w, h), (300.0, 500.0, 12.0, 200.0));
+    }
 
     #[test]
     fn page_rotation_turns_boxes_and_points_consistently() {

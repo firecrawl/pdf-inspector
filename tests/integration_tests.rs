@@ -15,6 +15,11 @@ use pdf_inspector::{
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
     PdfType, TextItem,
 };
+use pdf_inspector::{
+    extract_tables_in_regions_mem_in_frame, extract_text_in_regions_mem_in_frame,
+    extract_text_with_positions_and_rotations_mem_in_frame,
+    extract_text_with_positions_mem_in_frame, PositionFrame,
+};
 use std::collections::HashSet;
 
 fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
@@ -23,10 +28,28 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
 
 /// Like [`make_text_pdf`], optionally declaring a `/CropBox` on the page.
 fn make_text_pdf_with_boxes(content: &str, media_box: &str, crop_box: Option<&str>) -> Vec<u8> {
+    make_text_pdf_with_rotate(content, media_box, crop_box, None, None)
+}
+
+/// Like [`make_text_pdf_with_boxes`], optionally declaring a `/Rotate` on
+/// the page (`page_rotate`) and on the `/Pages` node (`pages_rotate`).
+fn make_text_pdf_with_rotate(
+    content: &str,
+    media_box: &str,
+    crop_box: Option<&str>,
+    page_rotate: Option<i64>,
+    pages_rotate: Option<i64>,
+) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
     let crop_entry = crop_box
         .map(|b| format!(" /CropBox [{b}]"))
+        .unwrap_or_default();
+    let page_rotate_entry = page_rotate
+        .map(|r| format!(" /Rotate {r}"))
+        .unwrap_or_default();
+    let pages_rotate_entry = pages_rotate
+        .map(|r| format!(" /Rotate {r}"))
         .unwrap_or_default();
 
     fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
@@ -46,14 +69,14 @@ fn make_text_pdf_with_boxes(content: &str, media_box: &str, crop_box: Option<&st
         &mut pdf,
         &mut offsets,
         2,
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< /Type /Pages /Kids [3 0 R] /Count 1{pages_rotate_entry} >>"),
     );
     add_object(
         &mut pdf,
         &mut offsets,
         3,
         &format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}]{crop_entry} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}]{crop_entry}{page_rotate_entry} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
         ),
     );
 
@@ -5341,4 +5364,308 @@ BT /F1 12 Tf 385.6 522 Td (61) Tj ET";
         !md.contains("List of figures vii List of tables"),
         "entries interleaved into a paragraph: {md}"
     );
+}
+
+// =========================================================================
+// Display frame: positions and regions on the rendered page
+// =========================================================================
+
+fn display_items(buf: &[u8]) -> Vec<TextItem> {
+    extract_text_with_positions_mem_in_frame(buf, None, PositionFrame::Display).unwrap()
+}
+
+fn display_region_text(buf: &[u8], region: [f32; 4]) -> String {
+    extract_text_in_regions_mem_in_frame(buf, &[(0, vec![region])], PositionFrame::Display)
+        .unwrap()
+        .remove(0)
+        .regions
+        .remove(0)
+        .text
+}
+
+/// Both extractions report the same items with the same geometry, exactly.
+fn assert_same_geometry(expected: &[TextItem], actual: &[TextItem]) {
+    assert_eq!(expected.len(), actual.len(), "{expected:#?}\n{actual:#?}");
+    for (e, a) in expected.iter().zip(actual) {
+        assert_eq!(e.text, a.text);
+        assert_eq!(e.page, a.page);
+        assert_eq!(
+            (e.x, e.y, e.width, e.height, e.rotation),
+            (a.x, a.y, a.width, a.height, a.rotation),
+            "{:?}",
+            e.text
+        );
+    }
+}
+
+#[test]
+fn test_display_frame_equals_sheet_frame_on_unrotated_pages() {
+    let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET\nBT /F1 12 Tf 72 680 Td (Second) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+
+    // The default frame is unchanged and is what `PositionFrame::Sheet` names.
+    let sheet = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&sheet, "Anchor");
+    assert_eq!(
+        (anchor.x, anchor.y, anchor.height, anchor.rotation),
+        (72.0, 700.0, 12.0, 0.0)
+    );
+    let explicit =
+        extract_text_with_positions_mem_in_frame(&buf, None, PositionFrame::Sheet).unwrap();
+    assert_same_geometry(&sheet, &explicit);
+
+    // Without a /Rotate the rendered page is the sheet, so both frames agree
+    // for items and for regions.
+    assert_same_geometry(&sheet, &display_items(&buf));
+    let region = item_region(anchor, 792.0);
+    assert_eq!(region_text(&buf, region).trim(), "Anchor");
+    assert_eq!(display_region_text(&buf, region).trim(), "Anchor");
+
+    // The rotations variant takes the same page filter as the positions one.
+    let pages: HashSet<u32> = [1].into_iter().collect();
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem_in_frame(
+        &buf,
+        Some(&pages),
+        PositionFrame::Display,
+    )
+    .unwrap();
+    assert_same_geometry(&sheet, &items);
+    assert!(rotations.is_empty());
+    let absent: HashSet<u32> = [2].into_iter().collect();
+    let (items, _) = extract_text_with_positions_and_rotations_mem_in_frame(
+        &buf,
+        Some(&absent),
+        PositionFrame::Sheet,
+    )
+    .unwrap();
+    assert!(items.is_empty());
+}
+
+#[test]
+fn test_positions_and_rotations_honour_the_page_filter() {
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let pages: HashSet<u32> = [2].into_iter().collect();
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem_in_frame(
+        &buf,
+        Some(&pages),
+        PositionFrame::Sheet,
+    )
+    .unwrap();
+    assert!(!items.is_empty());
+    assert!(items.iter().all(|item| item.page == 2));
+    assert!(rotations.is_empty());
+    let filtered =
+        pdf_inspector::extractor::extract_text_with_positions_mem_pages(&buf, Some(&pages))
+            .unwrap();
+    assert_same_geometry(&filtered, &items);
+}
+
+#[test]
+fn test_display_frame_renders_bottom_to_top_text_under_rotate_90() {
+    // Two lines reading bottom-to-top, the second 30pt to the right of the
+    // first: a page laid out sideways that `/Rotate 90` displays upright.
+    let content = "BT /F1 12 Tf 0 1 -1 0 40 420 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 1 -1 0 70 420 Tm (WORLD) Tj ET";
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None);
+
+    // The sheet frame turns the page so the runs read along +x ...
+    let (sheet, rotations) = extract_text_with_positions_and_rotations_mem(&buf).unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Ccw));
+    let hello = find_item(&sheet, "HELLO");
+    assert_close(hello.x, 420.0);
+    assert_close(hello.y, -40.0);
+    assert_eq!(hello.rotation, 0.0);
+
+    // ... and the display frame puts them where a renderer draws them: on
+    // the 792 x 612 rendered page, a horizontal line starting 420pt from the
+    // left edge whose top sits 40 - 12 = 28pt below the top edge.
+    let (display, rotations) =
+        extract_text_with_positions_and_rotations_mem_in_frame(&buf, None, PositionFrame::Display)
+            .unwrap();
+    assert_eq!(
+        rotations.get(&1),
+        Some(&PageRotation::Ccw),
+        "the turn is still reported"
+    );
+    let hello = find_item(&display, "HELLO");
+    assert_close(hello.x, 420.0);
+    assert_close(hello.y, 612.0 - 40.0);
+    assert_close(hello.height, 12.0);
+    assert_eq!(hello.rotation, 0.0);
+    assert!(
+        hello.width > 30.0 && hello.width < 50.0,
+        "width = {}",
+        hello.width
+    );
+    let world = find_item(&display, "WORLD");
+    assert_close(world.x, 420.0);
+    assert_close(world.y, 612.0 - 70.0);
+    assert_eq!(world.rotation, 0.0);
+    assert!(hello.y > world.y, "HELLO renders above WORLD");
+
+    // Region rects on the rendered page (top-left origin) select exactly the
+    // line they cover: HELLO occupies y ∈ [28, 40], WORLD y ∈ [58, 70].
+    let hello_rect = [400.0, 20.0, 700.0, 45.0];
+    let world_rect = [400.0, 55.0, 700.0, 75.0];
+    assert_eq!(display_region_text(&buf, hello_rect).trim(), "HELLO");
+    assert_eq!(display_region_text(&buf, world_rect).trim(), "WORLD");
+    // Read in the sheet frame, the same rects land on empty paper.
+    assert_eq!(region_text(&buf, hello_rect).trim(), "");
+}
+
+#[test]
+fn test_display_frame_renders_top_to_bottom_text_under_rotate_270() {
+    let content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET";
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(270), None);
+    let (display, rotations) =
+        extract_text_with_positions_and_rotations_mem_in_frame(&buf, None, PositionFrame::Display)
+            .unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Cw));
+
+    // Sheet box x ∈ [300, 312], y ∈ [700 - advance, 700]; `/Rotate 270`
+    // renders it as a horizontal line at x = 792 - 700 with its baseline at
+    // y = 300 on the 792 x 612 page.
+    let hello = find_item(&display, "HELLO");
+    assert_close(hello.x, 92.0);
+    assert_close(hello.y, 300.0);
+    assert_close(hello.height, 12.0);
+    assert_eq!(hello.rotation, 0.0);
+    let second = find_item(&display, "SECOND");
+    assert_close(second.x, 92.0);
+    assert_close(second.y, 270.0);
+    assert!(hello.y > second.y, "HELLO renders above SECOND");
+
+    // HELLO's band is y ∈ [300, 312] from the top, SECOND's y ∈ [330, 342].
+    assert_eq!(
+        display_region_text(&buf, [80.0, 295.0, 200.0, 315.0]).trim(),
+        "HELLO"
+    );
+    assert_eq!(
+        display_region_text(&buf, [80.0, 325.0, 200.0, 345.0]).trim(),
+        "SECOND"
+    );
+}
+
+#[test]
+fn test_display_frame_turns_upright_text_by_an_inherited_rotate() {
+    let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET\nBT /F1 12 Tf 72 680 Td (Second) Tj ET";
+    // `/Rotate 180` on the /Pages node only.
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, None, Some(180));
+    let sheet = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor_sheet = find_item(&sheet, "Anchor");
+    assert_eq!((anchor_sheet.x, anchor_sheet.y), (72.0, 700.0));
+
+    let display = display_items(&buf);
+    let anchor = find_item(&display, "Anchor");
+    assert_close(anchor.x, 612.0 - 72.0 - anchor_sheet.width);
+    assert_close(anchor.y, 792.0 - 700.0 - 12.0);
+    assert_close(anchor.width, anchor_sheet.width);
+    assert_close(anchor.height, 12.0);
+    assert_eq!(anchor.rotation, 180.0);
+    let second = find_item(&display, "Second");
+    assert_close(second.y, 792.0 - 680.0 - 12.0);
+    // Anchor's band on the 612 x 792 rendered page is y ∈ [700, 712] from
+    // the top; Second sits above it at y ∈ [680, 692].
+    assert_eq!(
+        display_region_text(&buf, [400.0, 695.0, 560.0, 715.0]).trim(),
+        "Anchor"
+    );
+
+    // The page's own /Rotate wins over the inherited one.
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), Some(180));
+    let anchor = find_item(&display_items(&buf), "Anchor").clone();
+    assert_close(anchor.x, 700.0);
+    assert_close(anchor.y, 612.0 - 72.0 - anchor_sheet.width);
+    assert_close(anchor.width, 12.0);
+    assert_close(anchor.height, anchor_sheet.width);
+    assert_eq!(anchor.rotation, 270.0);
+
+    // A negative angle folds the way renderers fold it: -90 is 270.
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(-90), None);
+    let anchor = find_item(&display_items(&buf), "Anchor").clone();
+    assert_close(anchor.x, 792.0 - 700.0 - 12.0);
+    assert_close(anchor.y, 72.0);
+    assert_eq!(anchor.rotation, 90.0);
+}
+
+#[test]
+fn test_display_frame_with_an_offset_cropbox_under_rotate_90() {
+    // MediaBox 400 x 500 with CropBox [50 60 350 460]: a 300 x 400 visible
+    // box that `/Rotate 90` renders as a 400 x 300 page.
+    let content =
+        "BT /F1 12 Tf 120 300 Td (Visible glyph) Tj ET\nBT /F1 12 Tf 120 280 Td (Second line) Tj ET";
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 400 500",
+        Some("50 60 350 460"),
+        Some(90),
+        None,
+    );
+    let sheet = extract_text_with_positions_mem(&buf).unwrap();
+    let glyph_sheet = find_item(&sheet, "Visible glyph");
+    assert_close(glyph_sheet.x, 70.0);
+    assert_close(glyph_sheet.y, 240.0);
+
+    let display = display_items(&buf);
+    let glyph = find_item(&display, "Visible glyph");
+    assert_close(glyph.x, 240.0);
+    assert_close(glyph.y, 300.0 - 70.0 - glyph_sheet.width);
+    assert_close(glyph.width, 12.0);
+    assert_close(glyph.height, glyph_sheet.width);
+    assert_eq!(glyph.rotation, 270.0);
+
+    // Its own box on the 400 x 300 rendered page selects it alone.
+    let text = display_region_text(&buf, item_region(glyph, 300.0));
+    assert!(text.contains("Visible glyph"), "got {text:?}");
+    assert!(!text.contains("Second line"), "got {text:?}");
+}
+
+#[test]
+fn test_display_frame_region_tables_follow_the_rect_frame() {
+    // A small aligned grid on a page displayed sideways: the table detector
+    // sees the same items whether the region arrives in the sheet frame or,
+    // turned, in the display frame.
+    let content = "BT /F1 12 Tf 72 700 Td (Name) Tj ET\n\
+BT /F1 12 Tf 200 700 Td (Qty) Tj ET\n\
+BT /F1 12 Tf 330 700 Td (Price) Tj ET\n\
+BT /F1 12 Tf 72 680 Td (Apple) Tj ET\n\
+BT /F1 12 Tf 200 680 Td (3) Tj ET\n\
+BT /F1 12 Tf 330 680 Td (1.50) Tj ET\n\
+BT /F1 12 Tf 72 660 Td (Pear) Tj ET\n\
+BT /F1 12 Tf 200 660 Td (5) Tj ET\n\
+BT /F1 12 Tf 330 660 Td (2.25) Tj ET";
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None);
+    let sheet_rect = [60.0, 80.0, 400.0, 137.0];
+    // The same area on the 792 x 612 rendered page.
+    let display_rect = [792.0 - 137.0, 60.0, 792.0 - 80.0, 400.0];
+
+    let from_sheet = extract_tables_in_regions_mem(&buf, &[(0, vec![sheet_rect])])
+        .unwrap()
+        .remove(0)
+        .regions
+        .remove(0);
+    let from_display = extract_tables_in_regions_mem_in_frame(
+        &buf,
+        &[(0, vec![display_rect])],
+        PositionFrame::Display,
+    )
+    .unwrap()
+    .remove(0)
+    .regions
+    .remove(0);
+    assert_eq!(
+        from_display.text,
+        "|Name|Qty|Price|\n|---|---|---|\n|Apple|3|1.50|\n|Pear|5|2.25|\n"
+    );
+    assert_eq!(from_display.text, from_sheet.text);
+    assert!(!from_display.needs_ocr);
+    assert_eq!(from_display.needs_ocr, from_sheet.needs_ocr);
+
+    // Text regions agree too, and the display rect read in the sheet frame
+    // misses the grid entirely.
+    let text_from_sheet = region_text(&buf, sheet_rect);
+    assert!(text_from_sheet.contains("Apple"), "got {text_from_sheet:?}");
+    assert_eq!(display_region_text(&buf, display_rect), text_from_sheet);
+    assert_eq!(region_text(&buf, display_rect).trim(), "");
 }

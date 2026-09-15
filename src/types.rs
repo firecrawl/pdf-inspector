@@ -129,6 +129,13 @@ pub struct PdfRect {
 /// `extract_text_with_positions_and_rotations_mem`) and the shift is turned
 /// the same way; `/Rotate` is not applied. Inside the markdown pipeline
 /// items stay in raw user space.
+///
+/// [`PositionFrame::Display`](crate::PositionFrame) (see
+/// [`extract_text_with_positions_mem_in_frame`](crate::extract_text_with_positions_mem_in_frame))
+/// reports items in the rendered page's frame instead: the visible page box
+/// turned clockwise by the page's inheritable `/Rotate`, with the turn of a
+/// rotated page undone, so the box and `rotation` describe the item as a
+/// renderer draws it.
 #[derive(Debug, Clone)]
 pub struct TextItem {
     /// The text content

@@ -506,6 +506,18 @@ whose CropBox equals the MediaBox with a `(0, 0)` origin are unaffected by this
 convention. Pages whose text is drawn rotated by 90° are normalized into a
 synthetic landscape frame before the shift, and `/Rotate` is not applied.
 
+That is the **sheet** frame (`PositionFrame::Sheet`), the default of every
+position and region API. The `_in_frame` variants also offer the **display**
+frame (`PositionFrame::Display`): the rendered page, i.e. the visible page box
+turned clockwise by the page's inheritable `/Rotate`, with the same origin
+conventions — items from the lower-left corner with `y` up, regions from the
+top-left corner with `y` down — and with the turn of a predominantly rotated
+page undone first. Items then sit where a renderer draws them, `rotation`
+reads `0` for text that renders horizontally, and region rects can be taken
+straight from a rendered page image. `/Rotate` is read inheritably and snapped
+to a right angle (`-90` is `270`, `450` is `90`); pages with `/Rotate 0` whose
+text is not predominantly rotated are identical in both frames.
+
 ## Processing modes
 
 | Mode | What it does | Returns |
@@ -526,7 +538,13 @@ synthetic landscape frame before the shift, and `/Rotate` is not applied.
 | `process_pdf_mem_with_options(bytes, options)` | Process from bytes with custom options |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_with_positions(path)` | Text with its axis-aligned box (visible-page-box frame, see above), `rotation`, and font info |
+| `extract_text_with_positions_mem_in_frame(bytes, pages, frame)` | Positioned text from bytes, limited to 1-indexed `pages`, in the sheet or display frame (`PositionFrame`) |
 | `extract_text_with_positions_and_rotations_mem(bytes)` | Positioned text plus the `PageRotation` of every page whose text was predominantly rotated |
+| `extract_text_with_positions_and_rotations_mem_in_frame(bytes, pages, frame)` | The same with a page filter and a frame choice |
+| `extract_text_in_regions_mem(bytes, page_regions)` | Text inside top-left region rects (sheet frame) |
+| `extract_text_in_regions_mem_in_frame(bytes, page_regions, frame)` | The same with region rects read in the sheet or display frame |
+| `extract_tables_in_regions_mem(bytes, page_regions)` | Markdown tables inside region rects (sheet frame) |
+| `extract_tables_in_regions_mem_in_frame(bytes, page_regions, frame)` | The same with region rects read in the sheet or display frame |
 | `collect_text_in_region_in_frame(items, x1, y1, x2, y2, page_height, rotation)` | Region text with the page's coordinate frame given explicitly (`page_height` is the visible page box height) |
 | `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |

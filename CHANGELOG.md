@@ -9,6 +9,22 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- An optional display frame for the positioned-text and region APIs. Rust
+  `extract_text_with_positions_mem_in_frame`,
+  `extract_text_with_positions_and_rotations_mem_in_frame`,
+  `extract_text_in_regions_mem_in_frame` and
+  `extract_tables_in_regions_mem_in_frame` take a `PositionFrame`; Node
+  `extractTextWithPositions`, `extractTextWithPositionsAndRotations`,
+  `extractTextInRegions` and `extractTablesInRegions` take an optional
+  `{ frame: "sheet" | "display" }`. `"display"` reports items in, and reads
+  region rects from, the rendered page — the visible page box turned clockwise
+  by the page's inheritable `/Rotate`, with the turn of a predominantly rotated
+  page undone — so boxes line up with a rendered page image. `"sheet"`, the
+  default, is unchanged. `extractTextWithPositionsAndRotations` also accepts
+  the same 1-indexed `pages` filter as `extractTextWithPositions`.
+
 ### Fixed
 
 - Word spaces carried by character spacing instead of space glyphs — the two

@@ -90,7 +90,7 @@ console.log(result.pagesNeedingOcr) // [5, 12, 15] (0-indexed)
 console.log(result.confidence)     // 0.875
 ```
 
-### `extractTextWithPositions(buffer: Buffer, pages?: number[]): TextItem[]`
+### `extractTextWithPositions(buffer: Buffer, pages?: number[], options?: FrameOptions): TextItem[]`
 
 Every text item (plus image placeholders, links and form fields) with its font
 and position. `x`/`y` are PDF points relative to the page's **visible page
@@ -103,6 +103,16 @@ the baseline and `height` the font size, so
 above the baseline (descenders fall below it); for image, link and form-field
 items `y` is the rect bottom and that box is exact. Pages whose CropBox equals
 the MediaBox at `(0, 0)` are unaffected.
+
+By default the page `/Rotate` is not applied and a page whose text is
+predominantly rotated is turned so that text reads left-to-right (this is the
+`"sheet"` frame; `extractTextWithPositionsAndRotations` reports which pages
+were turned). Pass `{ frame: "display" }` to get every item in the rendered
+page's frame instead — the visible page box turned clockwise by the page's
+inheritable `/Rotate`, lower-left origin, `y` up, with the turn of a rotated
+page undone — so `x`/`y`/`width`/`height` and `rotation` describe the item as
+a renderer draws it. Pages with `/Rotate 0` whose text is not predominantly
+rotated are identical in both frames.
 
 `legacySymbolRewrite: true` marks items whose decoded text includes a character
 changed by legacy symbol cleanup. Merged items retain this evidence from either
@@ -117,11 +127,31 @@ import { extractTextWithPositions } from '@firecrawl/pdf-inspector'
 for (const item of extractTextWithPositions(pdf, [1])) { // pages are 1-indexed
   console.log(item.page, item.text, item.x, item.y, item.fontSize)
 }
+
+// Boxes as a renderer draws the page (`/Rotate` applied)
+const rendered = extractTextWithPositions(pdf, undefined, { frame: 'display' })
 ```
 
-### `extractTextInRegions(buffer: Buffer, pageRegions: PageRegions[]): PageRegionTexts[]`
+### `extractTextWithPositionsAndRotations(buffer: Buffer, pages?: number[], options?: FrameOptions): PositionedText`
+
+`extractTextWithPositions` plus `pageRotations`, one `{ page, rotation: 'ccw' | 'cw' }`
+entry per page whose text was predominantly rotated and therefore turned in the
+`"sheet"` frame. With `{ frame: "display" }` the items are in the rendered
+page's frame and the entries only report which pages were turned.
+
+### `extractTextInRegions(buffer: Buffer, pageRegions: PageRegions[], options?: FrameOptions): PageRegionTexts[]`
 
 Extract text within bounding-box regions from a PDF. Designed for hybrid OCR pipelines where a layout model detects regions in rendered page images, and this function extracts text from the PDF structure for text-based pages — skipping GPU OCR.
+
+Region bboxes are `[x1, y1, x2, y2]` in PDF points with a top-left origin,
+relative to the visible page box. By default they are read in the `"sheet"`
+frame — the box as laid out in the content stream, `/Rotate` not applied, the
+frame `extractTextWithPositions` reports items in flipped to a top-left origin
+— which matches a rendered page image only for pages with `/Rotate 0`. Pass
+`{ frame: "display" }` to give bboxes on the rendered page (the visible box
+turned clockwise by the page's inheritable `/Rotate`), as a layout model
+working on page images reports them. `extractTablesInRegions` takes the same
+option.
 
 Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues). When the cause is a suspected garbled text layer, `ocrReason` is set to `"suspected_garbled_text"`.
 
@@ -137,6 +167,13 @@ const result = extractTextInRegions(pdf, [
     ]
   }
 ])
+
+// The same call with bboxes taken from a rendered page image
+const onRendered = extractTextInRegions(
+  pdf,
+  [{ page: 0, regions: [[0, 0, 300, 400]] }],
+  { frame: 'display' },
+)
 
 for (const region of result[0].regions) {
   if (region.needsOcr) {

@@ -12,6 +12,7 @@ import {
   extractTextWithPositionsAndRotations,
   extractStructureElements,
   extractTextInRegions,
+  extractTablesInRegions,
   detectVectorGridInRegion,
   extractPagesMarkdown,
   extractPagesMarkdownAsync,
@@ -209,6 +210,113 @@ const glyphText = glyphRegion[0].regions[0].text;
 assert.ok(glyphText.includes('Visible glyph'), `region should hold the glyph, got ${glyphText}`);
 assert.ok(!glyphText.includes('Second line'), `region should not spill, got ${glyphText}`);
 console.log('  visible page box frame: OK');
+
+// --- display frame: positions and regions on the rendered page ---
+console.log('Testing display frame...');
+
+// One-page PDF with Helvetica text; `rotate` becomes the page's /Rotate.
+function syntheticPdf(content, rotate) {
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]${rotate === undefined ? '' : ` /Rotate ${rotate}`} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>`,
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [];
+  objects.forEach((body, index) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf, 'latin1');
+}
+const close = (actual, expected, what) =>
+  assert.ok(Math.abs(actual - expected) < 0.75, `${what}: expected ${actual} to be close to ${expected}`);
+
+// Without a /Rotate both frames agree, and the default is the sheet frame.
+const uprightPdf = syntheticPdf('BT /F1 12 Tf 72 700 Td (Anchor) Tj ET\nBT /F1 12 Tf 72 680 Td (Second) Tj ET');
+const uprightSheet = extractTextWithPositions(uprightPdf);
+const uprightExplicit = extractTextWithPositions(uprightPdf, undefined, { frame: 'sheet' });
+const uprightDisplay = extractTextWithPositions(uprightPdf, undefined, { frame: 'display' });
+assert.deepEqual(uprightExplicit, uprightSheet);
+assert.deepEqual(uprightDisplay, uprightSheet);
+const uprightAnchor = uprightSheet.find(i => i.text.trim() === 'Anchor');
+close(uprightAnchor.x, 72, 'anchor.x');
+close(uprightAnchor.y, 700, 'anchor.y');
+assert.throws(
+  () => extractTextWithPositions(uprightPdf, undefined, { frame: 'rendered' }),
+  /unknown frame "rendered"/,
+);
+assert.throws(() => extractTextInRegions(uprightPdf, [], { frame: 'page' }), /unknown frame "page"/);
+console.log('  display frame defaults and validation: OK');
+
+// Two lines reading bottom-to-top on a page whose /Rotate 90 displays them
+// upright: the sheet frame turns the page (reported as 'ccw'), the display
+// frame puts each line where a renderer draws it on the 792 x 612 page.
+const sidewaysPdf = syntheticPdf(
+  'BT /F1 12 Tf 0 1 -1 0 40 420 Tm (HELLO) Tj ET\nBT /F1 12 Tf 0 1 -1 0 70 420 Tm (WORLD) Tj ET',
+  90,
+);
+const sidewaysSheet = extractTextWithPositionsAndRotations(sidewaysPdf);
+assert.deepEqual(sidewaysSheet.pageRotations, [{ page: 1, rotation: 'ccw' }]);
+const sidewaysDisplay = extractTextWithPositionsAndRotations(sidewaysPdf, [1], { frame: 'display' });
+assert.deepEqual(sidewaysDisplay.pageRotations, [{ page: 1, rotation: 'ccw' }]);
+const hello = sidewaysDisplay.items.find(i => i.text.trim() === 'HELLO');
+const world = sidewaysDisplay.items.find(i => i.text.trim() === 'WORLD');
+assert.ok(hello && world, 'both lines should be extracted');
+close(hello.x, 420, 'hello.x');
+close(hello.y, 612 - 40, 'hello.y');
+close(hello.height, 12, 'hello.height');
+assert.equal(hello.rotation, 0);
+close(world.x, 420, 'world.x');
+close(world.y, 612 - 70, 'world.y');
+assert.ok(hello.y > world.y, 'HELLO renders above WORLD');
+assert.deepEqual(
+  extractTextWithPositionsAndRotations(sidewaysPdf, [2], { frame: 'display' }),
+  { items: [], pageRotations: [] },
+);
+
+// Region bboxes on the rendered page (top-left origin) pick exactly the line
+// they cover: HELLO occupies y ∈ [28, 40], WORLD y ∈ [58, 70].
+const sidewaysRegions = extractTextInRegions(
+  sidewaysPdf,
+  [{ page: 0, regions: [[400, 20, 700, 45], [400, 55, 700, 75]] }],
+  { frame: 'display' },
+);
+assert.equal(sidewaysRegions[0].regions[0].text.trim(), 'HELLO');
+assert.equal(sidewaysRegions[0].regions[1].text.trim(), 'WORLD');
+// The same bboxes read in the default sheet frame land on empty paper.
+const sidewaysSheetRegions = extractTextInRegions(sidewaysPdf, [
+  { page: 0, regions: [[400, 20, 700, 45]] },
+]);
+assert.equal(sidewaysSheetRegions[0].regions[0].text.trim(), '');
+
+// Tables take the same option: a grid on a sideways page reads identically
+// through a sheet-frame bbox and through the matching display-frame bbox.
+const gridPdf = syntheticPdf(
+  [
+    ['Name', 'Qty', 'Price'],
+    ['Apple', '3', '1.50'],
+    ['Pear', '5', '2.25'],
+  ]
+    .flatMap((row, r) => row.map((cell, c) => `BT /F1 12 Tf ${[72, 200, 330][c]} ${700 - 20 * r} Td (${cell}) Tj ET`))
+    .join('\n'),
+  90,
+);
+const gridFromSheet = extractTablesInRegions(gridPdf, [{ page: 0, regions: [[60, 80, 400, 137]] }]);
+const gridFromDisplay = extractTablesInRegions(
+  gridPdf,
+  [{ page: 0, regions: [[792 - 137, 60, 792 - 80, 400]] }],
+  { frame: 'display' },
+);
+assert.equal(gridFromSheet[0].regions[0].text, '|Name|Qty|Price|\n|---|---|---|\n|Apple|3|1.50|\n|Pear|5|2.25|\n');
+assert.deepEqual(gridFromDisplay, gridFromSheet);
+console.log('  display frame positions and regions: OK');
 
 // --- detectVectorGridInRegion ---
 console.log('Testing detectVectorGridInRegion...');
