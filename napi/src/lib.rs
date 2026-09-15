@@ -174,7 +174,9 @@ pub struct PageRegions {
     /// default the box is read as laid out in the content stream with
     /// `/Rotate` not applied — the frame `extractTextWithPositions` reports
     /// items in, flipped to a top-left origin — which matches a rendered
-    /// page image only for pages with `/Rotate 0`. With
+    /// page image only for pages with `/Rotate 0` whose text is not
+    /// predominantly rotated (such a page is turned so its text reads
+    /// left-to-right, see [`TextItem`]). With
     /// `{ frame: "display" }` (see [`FrameOptions`]) the bbox is read on the
     /// rendered page: the visible box turned clockwise by the page's
     /// inheritable `/Rotate`, top-left origin, `y` down.

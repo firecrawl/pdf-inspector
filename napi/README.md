@@ -147,11 +147,14 @@ Region bboxes are `[x1, y1, x2, y2]` in PDF points with a top-left origin,
 relative to the visible page box. By default they are read in the `"sheet"`
 frame — the box as laid out in the content stream, `/Rotate` not applied, the
 frame `extractTextWithPositions` reports items in flipped to a top-left origin
-— which matches a rendered page image only for pages with `/Rotate 0`. Pass
-`{ frame: "display" }` to give bboxes on the rendered page (the visible box
-turned clockwise by the page's inheritable `/Rotate`), as a layout model
-working on page images reports them. `extractTablesInRegions` takes the same
-option.
+— which matches a rendered page image only for pages with `/Rotate 0` whose
+text is not predominantly rotated: such a page is turned in the sheet frame
+so its text reads left-to-right, and `extractTextWithPositionsAndRotations`
+reports which pages were. Pass `{ frame: "display" }` to give bboxes on the
+rendered page (the visible box turned clockwise by the page's inheritable
+`/Rotate`, with that turn undone), as a layout model working on page images
+reports them, whatever the page's `/Rotate` or text direction.
+`extractTablesInRegions` takes the same option.
 
 Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues). When the cause is a suspected garbled text layer, `ocrReason` is set to `"suspected_garbled_text"`.
 
@@ -213,6 +216,21 @@ interface PdfClassification {
 interface PageRegions {
   page: number              // 0-indexed
   regions: number[][]       // [[x1, y1, x2, y2], ...] in PDF points, top-left origin of the visible page box
+                            // (sheet frame by default; the rendered page with { frame: "display" })
+}
+
+interface FrameOptions {
+  frame?: "sheet" | "display" // coordinate frame of items and region bboxes; "sheet" by default
+}
+
+interface PositionedText {
+  items: TextItem[]            // as returned by extractTextWithPositions
+  pageRotations: PageRotation[] // one entry per page whose text was predominantly rotated
+}
+
+interface PageRotation {
+  page: number              // 1-indexed, matching TextItem.page
+  rotation: string          // "ccw" | "cw": how the page was turned in the "sheet" frame
 }
 
 interface PageRegionTexts {

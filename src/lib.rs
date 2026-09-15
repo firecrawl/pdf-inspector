@@ -1032,10 +1032,11 @@ fn non_placeholder_alnum(items: &[TextItem]) -> usize {
 ///   the page's **visible page box** (`CropBox ∩ MediaBox`, else the
 ///   MediaBox) as laid out in the content stream — the frame
 ///   [`extract_text_with_positions_mem`] reports items in (with `y` flipped
-///   by the box height). `/Rotate` is not applied, so this matches a
-///   rendered page image only for pages with `/Rotate 0`; rects taken from
-///   a rendered page go through [`extract_text_in_regions_mem_in_frame`]
-///   with [`PositionFrame::Display`].
+///   by the box height). `/Rotate` is not applied and a page whose text is
+///   predominantly rotated is turned (see [`PageRotation`]), so this matches
+///   a rendered page image only for pages with `/Rotate 0` whose text is not
+///   predominantly rotated; rects taken from a rendered page go through
+///   [`extract_text_in_regions_mem_in_frame`] with [`PositionFrame::Display`].
 ///
 /// # Returns
 ///

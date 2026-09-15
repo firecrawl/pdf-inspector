@@ -570,6 +570,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
 | `TextItem` | Text with its axis-aligned box (PDF points from the visible page box's lower-left corner), baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false when the font has no width metrics or an ActualText span's advance could not be recovered), `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline), font info, page number, and optional structure-tree `mcid` |
 | `PageRotation` | `Upright`, `Ccw`, `Cw`: how a predominantly rotated page's coordinate frame was turned so its text reads left-to-right |
+| `PositionFrame` | `Sheet` (default): the visible page box as laid out in the content stream, `/Rotate` not applied, predominantly rotated pages turned; `Display`: the rendered page, the visible box turned clockwise by the inheritable `/Rotate` with that turn undone (see [Coordinate frame](#coordinate-frame)) |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
