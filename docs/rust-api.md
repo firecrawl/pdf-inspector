@@ -496,9 +496,9 @@ ignored, and a page without a MediaBox is measured against US Letter).
 `TextItem.x`/`y` use the box's lower-left corner as origin with `y` growing
 upward; region and crop bboxes (`extract_text_in_regions_mem`,
 `extract_tables_in_regions_mem`, `detect_vector_grid_in_region_mem`,
-`TsrTableInput`) use its top-left corner with `y` growing downward, exactly
-like a rendered page image. Converting between the two only needs the box
-height `h`: a positioned `y` becomes `h - y`. For text items `y` is the
+`TsrTableInput`) use its top-left corner with `y` growing downward, the axis
+convention of a rendered page image. Converting between the two only needs
+the box height `h`: a positioned `y` becomes `h - y`. For text items `y` is the
 baseline and `height` the font size, so `[x, h - y - height, x + width, h - y]`
 covers the glyph band above the baseline (descenders fall below it); for image,
 link and form-field items `y` is the rect bottom and that box is exact. Pages
@@ -507,16 +507,18 @@ convention. Pages whose text is drawn rotated by 90° are normalized into a
 synthetic landscape frame before the shift, and `/Rotate` is not applied.
 
 That is the **sheet** frame (`PositionFrame::Sheet`), the default of every
-position and region API. The `_in_frame` variants also offer the **display**
-frame (`PositionFrame::Display`): the rendered page, i.e. the visible page box
-turned clockwise by the page's inheritable `/Rotate`, with the same origin
-conventions — items from the lower-left corner with `y` up, regions from the
-top-left corner with `y` down — and with the turn of a predominantly rotated
-page undone first. Items then sit where a renderer draws them, `rotation`
-reads `0` for text that renders horizontally, and region rects can be taken
-straight from a rendered page image. `/Rotate` is read inheritably and snapped
-to a right angle (`-90` is `270`, `450` is `90`); pages with `/Rotate 0` whose
-text is not predominantly rotated are identical in both frames.
+position and region API. Its coordinates coincide with a rendered page image
+only for pages with `/Rotate 0` whose text is not predominantly rotated; for
+any other page, boxes taken from a rendered image belong in the **display**
+frame (`PositionFrame::Display`) that the `_in_frame` variants offer: the
+rendered page, i.e. the visible page box turned clockwise by the page's
+inheritable `/Rotate`, with the same origin conventions — items from the
+lower-left corner with `y` up, regions from the top-left corner with `y` down
+— and with the synthetic turn of a predominantly rotated page undone first
+(individual runs keep their own `rotation`). Items then sit where a renderer
+draws them, `rotation` reads `0` for text that renders horizontally, and
+region rects can be taken straight from a rendered page image. `/Rotate` is
+read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 
 ## Processing modes
 
