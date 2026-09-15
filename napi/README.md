@@ -145,15 +145,17 @@ Extract text within bounding-box regions from a PDF. Designed for hybrid OCR pip
 
 Region bboxes are `[x1, y1, x2, y2]` in PDF points with a top-left origin,
 relative to the visible page box. By default they are read in the `"sheet"`
-frame — the box as laid out in the content stream, `/Rotate` not applied, the
-frame `extractTextWithPositions` reports items in flipped to a top-left origin
-— which matches a rendered page image only for pages with `/Rotate 0` whose
-text is not predominantly rotated: such a page is turned in the sheet frame
-so its text reads left-to-right, and `extractTextWithPositionsAndRotations`
-reports which pages were. Pass `{ frame: "display" }` to give bboxes on the
+frame: the box as laid out in the content stream, `/Rotate` not applied, the
+frame `extractTextWithPositions` reports items in flipped to a top-left
+origin. The sheet frame matches a rendered page image only when both hold:
+the page has `/Rotate 0`, and its text is not predominantly rotated. A page
+whose text is predominantly rotated is turned in the sheet frame so that text
+reads left-to-right (`extractTextWithPositionsAndRotations` reports which
+pages were turned), so its sheet-frame bboxes do not match the rendered image
+even with `/Rotate 0`. Pass `{ frame: "display" }` to give bboxes on the
 rendered page (the visible box turned clockwise by the page's inheritable
-`/Rotate`, with that turn undone), as a layout model working on page images
-reports them, whatever the page's `/Rotate` or text direction.
+`/Rotate`, with any text turn undone), as a layout model working on page
+images reports them, whatever the page's `/Rotate` or text direction.
 `extractTablesInRegions` takes the same option.
 
 Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues). When the cause is a suspected garbled text layer, `ocrReason` is set to `"suspected_garbled_text"`.
