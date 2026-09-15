@@ -2,9 +2,12 @@
 
 use std::path::Path;
 
-use firecrawl_pdfium::{PageChar, Pdfium, PixelFormat, PixelPoint, RenderConfig};
+#[cfg(feature = "ocr")]
+use firecrawl_pdfium::PageChar;
+use firecrawl_pdfium::{Pdfium, PixelFormat, PixelPoint, RenderConfig};
 use thiserror::Error;
 
+#[cfg(feature = "ocr")]
 use crate::types::{ItemType, TextItem};
 
 use super::{
@@ -77,6 +80,7 @@ pub struct PdfiumRenderer {
 }
 
 /// Positioned native text recovered from one selected PDF page.
+#[cfg(feature = "ocr")]
 #[derive(Debug)]
 pub(crate) struct PdfiumTextPage {
     pub(crate) page: u32,
@@ -127,6 +131,7 @@ impl PdfiumRenderer {
     /// suspicious embedded text layer before paying for rasterization and
     /// OCR. A page-level text failure is treated as an unavailable recovery
     /// candidate so the caller can continue to its normal OCR fallback.
+    #[cfg(feature = "ocr")]
     pub(crate) fn extract_text_pages(
         &self,
         pdf_bytes: &[u8],
@@ -216,6 +221,7 @@ impl PdfiumRenderer {
     }
 }
 
+#[cfg(feature = "ocr")]
 fn text_chars_to_items(chars: &[PageChar], page: u32) -> Vec<TextItem> {
     #[derive(Debug, Clone, Copy)]
     struct Bounds {
@@ -413,8 +419,10 @@ fn bgr_to_rgb_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ocr")]
     use firecrawl_pdfium::{PagePoint, PageRect};
 
+    #[cfg(feature = "ocr")]
     fn page_char(value: char, bounds: PageRect) -> PageChar {
         PageChar {
             unicode: Some(value),
@@ -451,6 +459,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn invalid_character_geometry_splits_text_runs() {
         let chars = [
@@ -470,6 +479,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn coordinates_that_overflow_f32_are_discarded() {
         let left = f64::from(f32::MAX) * 2.0;
