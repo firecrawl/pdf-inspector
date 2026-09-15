@@ -9,6 +9,10 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-09-14
+
+Changes since 1.19.0.
+
 ### Added
 
 - An optional display frame for the positioned-text and region APIs. Rust
@@ -24,9 +28,25 @@ version and date. Earlier releases are described in their
   page undone — so boxes line up with a rendered page image. `"sheet"`, the
   default, is unchanged. `extractTextWithPositionsAndRotations` also accepts
   the same 1-indexed `pages` filter as `extractTextWithPositions`.
+  ([#533](https://github.com/firecrawl/pdf-inspector/pull/533))
 
 ### Fixed
 
+- Preserve word spaces painted as separate whitespace runs squeezed by
+  negative character spacing, so adjacent words no longer merge.
+  ([#517](https://github.com/firecrawl/pdf-inspector/pull/517))
+- Read blank, advancing glyphs in symbolic TrueType fonts as word spaces
+  while preserving invisible text layers and formatting characters.
+  ([#521](https://github.com/firecrawl/pdf-inspector/pull/521))
+- Recover text from cmap-less TrueType subsets using standard Macintosh
+  glyph ordering when the embedded font's metrics corroborate the mapping.
+  ([#522](https://github.com/firecrawl/pdf-inspector/pull/522))
+- Decode painted glyphs when `ActualText` contains replacement characters,
+  and keep spaced or separately painted dot leaders with their text line.
+  ([#523](https://github.com/firecrawl/pdf-inspector/pull/523))
+- Start `TJ` sub-runs at their first painted glyph after leading positioning
+  offsets, correcting their bounds and the order of split words.
+  ([#527](https://github.com/firecrawl/pdf-inspector/pull/527))
 - Word spaces carried by character spacing instead of space glyphs — the two
   glyphs around a word boundary shown as one string with a `Tc` as wide as a
   word space, the spacing taken back with a positive `TJ` offset or by
@@ -34,11 +54,19 @@ version and date. Earlier releases are described in their
   ("sendtoMars"). Such a string reads with its spaces once the spacing after
   it is seen to be taken back; tracked display text, whose spacing never is,
   keeps its letters together.
+  ([#530](https://github.com/firecrawl/pdf-inspector/pull/530))
 - A contents page whose entries end in right-aligned page numbers without dot
   leaders — an edited volume's table of contents with the chapter authors on
   their own lines — is rendered as a contents list, one entry per line with
   its page number tab-separated, instead of being read as a two-column page
   whose titles and numbers interleave into a paragraph.
+  ([#493](https://github.com/firecrawl/pdf-inspector/pull/493))
+
+### Changed
+
+- Upgrade `lopdf` to 0.45.0 for improved recovery of malformed cross-reference
+  entries and `startxref` / `/Prev` offsets.
+  ([#534](https://github.com/firecrawl/pdf-inspector/pull/534))
 
 ## [1.19.0] - 2026-09-09
 
