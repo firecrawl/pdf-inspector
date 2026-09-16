@@ -1,6 +1,8 @@
 """Tests for the pdf_inspector Python bindings."""
 
 import os
+from typing import Optional
+
 import pytest
 import pdf_inspector
 
@@ -30,7 +32,7 @@ def three_weights_pdf() -> bytes:
             f" /LastChar 255 /Widths {widths} /FontDescriptor {descriptor} 0 R >>"
         )
 
-    def descriptor(base_font: str, font_weight: int | None = None) -> str:
+    def descriptor(base_font: str, font_weight: Optional[int] = None) -> str:
         weight = f" /FontWeight {font_weight}" if font_weight else ""
         return (
             f"<< /Type /FontDescriptor /FontName /{base_font} /Flags 32"

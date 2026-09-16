@@ -1386,7 +1386,7 @@ pub(crate) fn font_style(
                 descriptor
                     .get(b"FontWeight")
                     .ok()
-                    .and_then(get_number)
+                    .and_then(|obj| resolve_number(doc, obj))
                     .and_then(weight_class)
             })
             .or(name_weight)
@@ -1404,6 +1404,14 @@ fn is_ordinary_text_font(font_dict: &lopdf::Dictionary) -> bool {
         .ok()
         .and_then(|obj| obj.as_name().ok())
         .is_some_and(|subtype| matches!(subtype, b"Type0" | b"Type1" | b"MMType1" | b"TrueType"))
+}
+
+/// A number from an integer or real object, following an indirect reference.
+fn resolve_number(doc: &Document, obj: &Object) -> Option<f32> {
+    match obj {
+        Object::Reference(id) => doc.get_object(*id).ok().and_then(get_number),
+        direct => get_number(direct),
+    }
 }
 
 /// A weight class value from `usWeightClass` or `/FontWeight`, clamped into
@@ -2479,6 +2487,29 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn indirect_font_weight_is_resolved() {
+        let mut doc = Document::with_version("1.4");
+        let weight_id = doc.add_object(lopdf::Object::Integer(600));
+        let desc_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "Flags" => 32,
+            "ItalicAngle" => 0,
+            "FontWeight" => weight_id,
+        });
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "Tc1",
+            "FontDescriptor" => desc_id,
+        };
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).weight,
+            Some(600)
+        );
     }
 
     #[test]
