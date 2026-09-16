@@ -16,6 +16,59 @@ def fixture_bytes(name: str) -> bytes:
         return f.read()
 
 
+def three_weights_pdf() -> bytes:
+    """A one-page PDF whose first line is set in three non-embedded faces that
+    differ only in weight: ``Face-Lt`` and ``Face-Md`` name theirs, the third
+    has an opaque name and ``/FontWeight 700`` in its descriptor. None of them
+    is bold by the flags or name words the default extraction reads. A second
+    line uses the light face twice."""
+    widths = "[" + " ".join(["600"] * 256) + "]"
+
+    def font(base_font: str, descriptor: int) -> str:
+        return (
+            f"<< /Type /Font /Subtype /TrueType /BaseFont /{base_font} /FirstChar 0"
+            f" /LastChar 255 /Widths {widths} /FontDescriptor {descriptor} 0 R >>"
+        )
+
+    def descriptor(base_font: str, font_weight: int | None = None) -> str:
+        weight = f" /FontWeight {font_weight}" if font_weight else ""
+        return (
+            f"<< /Type /FontDescriptor /FontName /{base_font} /Flags 32"
+            f" /ItalicAngle 0{weight} >>"
+        )
+
+    content = (
+        "BT /F1 12 Tf 72 700 Td (Light ) Tj /F2 12 Tf (Medium ) Tj /F3 12 Tf (Heavy) Tj ET\n"
+        "BT /F1 12 Tf 72 680 Td (Same ) Tj (weight) Tj ET"
+    )
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+        " /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >> /Contents 4 0 R >>",
+        f"<< /Length {len(content)} >>\nstream\n{content}\nendstream",
+        font("ABCDEF+Face-Lt", 8),
+        font("ABCDEF+Face-Md", 9),
+        font("ABCDEF+Opaque", 10),
+        descriptor("ABCDEF+Face-Lt"),
+        descriptor("ABCDEF+Face-Md"),
+        descriptor("ABCDEF+Opaque", 700),
+    ]
+    pdf = b"%PDF-1.4\n"
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf += f"{number} 0 obj\n{body}\nendobj\n".encode("latin-1")
+    xref = len(pdf)
+    pdf += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("latin-1")
+    for offset in offsets:
+        pdf += f"{offset:010d} 00000 n \n".encode("latin-1")
+    pdf += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+    ).encode("latin-1")
+    return pdf
+
+
 # Fixtures that need a user password to open. `process_pdf` has no password
 # parameter, so these are exercised through `process_pdf_with_ocr`, which does.
 ENCRYPTED_FIXTURE_PASSWORDS = {"encrypted-secret123.pdf": "secret123"}
@@ -251,16 +304,46 @@ class TestExtractTextWithPositions:
         path = fixture_path("thermo-freon12.pdf")
         plain = pdf_inspector.extract_text_with_positions(path)
         explicit = pdf_inspector.extract_text_with_positions(path, bold_from_weight=False)
-        assert [(i.text, i.is_bold) for i in explicit] == [(i.text, i.is_bold) for i in plain]
-        # Helvetica carries no weight word, so the option changes nothing here
-        # and every weight it reports is on the 100..900 scale.
+        styles = lambda items: [(i.text, i.is_bold, i.font_weight) for i in items]
+        assert styles(explicit) == styles(plain)
+        # The fixture's faces name their weight ("Verdana,Bold" and "Arial,Bold"
+        # read 700, "Verdana" and "Arial" nothing), and the runs of different
+        # weight already differ in is_bold, so the option leaves every item as
+        # it was; every weight it reports is on the 100..900 scale.
         weighted = pdf_inspector.extract_text_with_positions(path, bold_from_weight=True)
-        assert len(weighted) == len(plain)
+        assert styles(weighted) == styles(plain)
+        assert any(i.font_weight == 700 and i.is_bold for i in weighted)
         assert all(i.font_weight is None or 100 <= i.font_weight <= 900 for i in weighted)
         positioned = pdf_inspector.extract_text_with_positions_and_rotations(
             path, bold_from_weight=True
         )
-        assert len(positioned.items) == len(plain)
+        assert styles(positioned.items) == styles(plain)
+
+    def test_bold_from_weight_splits_runs_and_reads_bold_from_600(self):
+        data = three_weights_pdf()
+        styles = lambda items: [(i.text, i.is_bold, i.font_weight) for i in items]
+        # Default: the three runs merge into one item as they always did, none
+        # is bold, and the item carries its first run's weight class.
+        plain = pdf_inspector.extract_text_with_positions_bytes(data)
+        assert styles(plain) == [
+            ("Light Medium Heavy", False, 300),
+            ("Same weight", False, 300),
+        ]
+        # Option on: runs of different weight stay apart, the 700 face is
+        # bold, the 300 and 500 faces are not, same-weight runs still merge.
+        weighted = pdf_inspector.extract_text_with_positions_bytes(
+            data, bold_from_weight=True
+        )
+        assert styles(weighted) == [
+            ("Light ", False, 300),
+            ("Medium ", False, 500),
+            ("Heavy", True, 700),
+            ("Same weight", False, 300),
+        ]
+        positioned = pdf_inspector.extract_text_with_positions_and_rotations_bytes(
+            data, bold_from_weight=True
+        )
+        assert styles(positioned.items) == styles(weighted)
 
     def test_with_pages(self):
         items = pdf_inspector.extract_text_with_positions(
@@ -445,13 +528,18 @@ class TestExtractTextInRegions:
         assert len(results[0].regions) == 1
         assert isinstance(results[0].regions[0].text, str)
 
-    def test_bold_from_weight_option(self):
-        data = fixture_bytes("thermo-freon12.pdf")
-        regions = [(0, [[0.0, 0.0, 600.0, 100.0]])]
+    def test_bold_from_weight_keeps_the_words_of_a_region(self):
+        # The option splits runs of different weight into separate items; a
+        # region's text is the words on the page and reads the same either
+        # way (the item-level effect is covered by
+        # TestExtractTextWithPositions).
+        data = three_weights_pdf()
+        regions = [(0, [[60.0, 80.0, 400.0, 116.0]])]
         plain = pdf_inspector.extract_text_in_regions_bytes(data, regions)
         weighted = pdf_inspector.extract_text_in_regions_bytes(
             data, regions, bold_from_weight=True
         )
+        assert plain[0].regions[0].text.splitlines()[0].strip() == "Light Medium Heavy"
         assert weighted[0].regions[0].text == plain[0].regions[0].text
 
     def test_repr(self):

@@ -84,17 +84,22 @@ assert.ok(item.fontWeight === undefined || typeof item.fontWeight === 'number');
 assert.equal(typeof item.itemType, 'string');
 console.log('  extractTextWithPositions: OK');
 
-// boldFromWeight: off by default and when passed as false; Helvetica names
-// no weight, so the option changes nothing on this fixture either way.
-const plainStyles = items.map(i => [i.text, i.isBold, i.fontWeight]);
+// boldFromWeight: off by default and when passed as false. The fixture's
+// faces name their weight ("Verdana,Bold" and "Arial,Bold" read 700, the
+// regular faces nothing) and its runs of different weight already differ in
+// isBold, so the option leaves every item as it was here; the synthetic
+// three-weight page further down shows what it changes.
+const styleOf = i => [i.text, i.isBold, i.fontWeight];
+const plainStyles = items.map(styleOf);
 assert.deepEqual(
-  extractTextWithPositions(fixture, undefined, { boldFromWeight: false }).map(i => [i.text, i.isBold, i.fontWeight]),
+  extractTextWithPositions(fixture, undefined, { boldFromWeight: false }).map(styleOf),
   plainStyles,
 );
 const weightedItems = extractTextWithPositions(fixture, undefined, { boldFromWeight: true });
-assert.equal(weightedItems.length, items.length);
+assert.deepEqual(weightedItems.map(styleOf), plainStyles);
+assert.ok(weightedItems.some(i => i.fontWeight === 700 && i.isBold));
 assert.ok(weightedItems.every(i => i.fontWeight === undefined || (i.fontWeight >= 100 && i.fontWeight <= 900)));
-console.log('  extractTextWithPositions boldFromWeight: OK');
+console.log('  extractTextWithPositions boldFromWeight defaults: OK');
 
 // with pages filter
 const page1Items = extractTextWithPositions(fixture, [1]);
@@ -456,6 +461,75 @@ assert.equal(c1.pdfType, 'TextBased');
 assert.equal(c2.pdfType, 'TextBased');
 assert.equal(c3.pages.length, 3);
 console.log('  concurrent async calls: OK');
+
+// --- font weight: fontWeight and boldFromWeight on runs that differ only in weight ---
+console.log('Testing boldFromWeight...');
+
+// One page whose first line is set in three non-embedded faces that differ
+// only in weight: `Face-Lt` and `Face-Md` name theirs, the third has an opaque
+// name and `/FontWeight 700` in its descriptor. None of them is bold by the
+// flags or name words the default extraction reads. A second line uses the
+// light face twice.
+function threeWeightsPdf() {
+  const widths = `[${Array(256).fill('600').join(' ')}]`;
+  const font = (baseFont, descriptor) =>
+    `<< /Type /Font /Subtype /TrueType /BaseFont /${baseFont} /FirstChar 0 /LastChar 255 /Widths ${widths} /FontDescriptor ${descriptor} 0 R >>`;
+  const descriptor = (baseFont, fontWeight) =>
+    `<< /Type /FontDescriptor /FontName /${baseFont} /Flags 32 /ItalicAngle 0${fontWeight ? ` /FontWeight ${fontWeight}` : ''} >>`;
+  const content =
+    'BT /F1 12 Tf 72 700 Td (Light ) Tj /F2 12 Tf (Medium ) Tj /F3 12 Tf (Heavy) Tj ET\n' +
+    'BT /F1 12 Tf 72 680 Td (Same ) Tj (weight) Tj ET';
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >> /Contents 4 0 R >>',
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+    font('ABCDEF+Face-Lt', 8),
+    font('ABCDEF+Face-Md', 9),
+    font('ABCDEF+Opaque', 10),
+    descriptor('ABCDEF+Face-Lt'),
+    descriptor('ABCDEF+Face-Md'),
+    descriptor('ABCDEF+Opaque', 700),
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [];
+  objects.forEach((body, index) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf, 'latin1');
+}
+const weightsPdf = threeWeightsPdf();
+
+// Default: the three runs merge into one item as they always did, none is
+// bold, and the item carries its first run's weight class.
+assert.deepEqual(extractTextWithPositions(weightsPdf).map(styleOf), [
+  ['Light Medium Heavy', false, 300],
+  ['Same weight', false, 300],
+]);
+// Option on: runs of different weight stay apart, the 700 face is bold, the
+// 300 and 500 faces are not, and same-weight runs still merge.
+const weightsOn = extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true });
+assert.deepEqual(weightsOn.map(styleOf), [
+  ['Light ', false, 300],
+  ['Medium ', false, 500],
+  ['Heavy', true, 700],
+  ['Same weight', false, 300],
+]);
+const weightsRotations = extractTextWithPositionsAndRotations(weightsPdf, [1], { boldFromWeight: true });
+assert.deepEqual(weightsRotations.items.map(styleOf), weightsOn.map(styleOf));
+assert.deepEqual(weightsRotations.pageRotations, []);
+// A region's text is the words on the page and reads the same either way.
+const weightsRegion = [{ page: 0, regions: [[60, 80, 400, 116]] }];
+const weightsRegionPlain = extractTextInRegions(weightsPdf, weightsRegion)[0].regions[0].text;
+const weightsRegionOn = extractTextInRegions(weightsPdf, weightsRegion, { boldFromWeight: true })[0].regions[0].text;
+assert.equal(weightsRegionPlain.split('\n')[0].trim(), 'Light Medium Heavy');
+assert.equal(weightsRegionOn, weightsRegionPlain);
+console.log('  boldFromWeight: OK');
 
 // --- Error handling ---
 console.log('Testing error handling...');

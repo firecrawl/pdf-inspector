@@ -5813,9 +5813,16 @@ fn test_bold_from_weight_keeps_weights_apart_and_reads_bold_from_600() {
     assert_close(light.x, 72.0);
     assert_close(medium.x, light.x + light.width);
     assert_close(heavy.x, medium.x + medium.width);
-    assert!(weighted
-        .iter()
-        .all(|item| item.y == 700.0 || item.y == 680.0));
+    for item in &weighted {
+        assert_close(
+            item.y,
+            if item.text.starts_with("Same") {
+                680.0
+            } else {
+                700.0
+            },
+        );
+    }
 
     // The rotations variant and the page filter take the same options.
     let pages: HashSet<u32> = [1].into_iter().collect();

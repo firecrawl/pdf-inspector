@@ -343,11 +343,13 @@ pub fn is_bold_font(font_name: &str) -> bool {
 /// space) and at lowercase→uppercase boundaries, and each piece is matched
 /// whole, so the abbreviations of foundry style suffixes read ("-Md",
 /// "-Lt", "-Bd", "-Sb", "-Dm", "-Hv", "-Blk", "-XBd", "-Ult", "-UltLt",
-/// "-W3".."-W9") while "Bookman" is not Book and the "LT" of a Linotype
-/// family is not Light. Abbreviations count only after the family name
-/// (a leading "TH" is a Thai family, not Thin). A piece written in one
-/// case ("BOLDMT") is searched for the full words instead. The last weight
-/// word wins, since style suffixes follow the family ("Bookman-Demi").
+/// "-W3".."-W9") while "Bookman" is not Book. Abbreviations count only
+/// after the family name (a leading "TH" is a Thai family, not Thin) and
+/// only in the mixed case foundries write them in: an all-caps "LT" or
+/// "MT" is the Linotype or Monotype acronym, not Light. A piece written in
+/// one case ("BOLDMT") is searched for the full words instead. The last
+/// weight word wins, since style suffixes follow the family
+/// ("Bookman-Demi").
 pub fn font_weight_from_name(font_name: &str) -> Option<u16> {
     // Subset tags ("ABCDEF+Face-Md") carry no style.
     let name = font_name
@@ -381,7 +383,7 @@ pub fn font_weight_from_name(font_name: &str) -> Option<u16> {
             }
         }
         let found = weight_word(&piece)
-            .or_else(|| (i > 0).then(|| weight_abbreviation(&piece)).flatten())
+            .or_else(|| (i > 0).then(|| weight_abbreviation(pieces[i])).flatten())
             .or_else(|| {
                 let flat_case = pieces[i].chars().all(|c| !c.is_lowercase())
                     || pieces[i].chars().all(|c| !c.is_uppercase());
@@ -434,16 +436,21 @@ fn weight_word(piece: &str) -> Option<u16> {
     })
 }
 
-/// Weight of one whole style abbreviation, lowercased: the short codes of
+/// Weight of one whole style abbreviation, as written: the short codes of
 /// foundry style suffixes and the "W3".."W9" weight digit of Japanese
-/// families.
+/// families. The codes are written in mixed case ("Md", "Lt", "XBd"); an
+/// all-caps piece is a family or foundry acronym ("LT" for Linotype, "MT"
+/// for Monotype, "ITC") and is not read.
 fn weight_abbreviation(piece: &str) -> Option<u16> {
-    if let Some(digit) = piece.strip_prefix('w') {
+    if let Some(digit) = piece.strip_prefix(['W', 'w']) {
         if let Some(n) = digit.parse::<u16>().ok().filter(|n| (1..=9).contains(n)) {
             return Some(n * 100);
         }
     }
-    Some(match piece {
+    if !piece.chars().any(char::is_lowercase) || !piece.chars().any(char::is_uppercase) {
+        return None;
+    }
+    Some(match piece.to_ascii_lowercase().as_str() {
         "th" => 100,
         "ultlt" | "xlt" => 200,
         "lt" => 300,
@@ -473,14 +480,20 @@ fn weight_word_substring(piece: &str) -> Option<u16> {
     if let Some((_, weight)) = COMPOUND.iter().find(|(word, _)| piece.contains(word)) {
         return Some(*weight);
     }
-    const WORDS: [(&str, u16); 7] = [
+    const WORDS: [(&str, u16); 13] = [
         ("black", 900),
         ("heavy", 900),
+        ("ultra", 900),
         ("bold", 700),
+        ("demi", 600),
         ("medium", 500),
         ("light", 300),
         ("regular", 400),
         ("roman", 400),
+        ("book", 400),
+        ("normal", 400),
+        ("thin", 100),
+        ("hairline", 100),
     ];
     WORDS
         .iter()
@@ -1335,6 +1348,11 @@ mod tests {
             ("NimbusRomNo9L-Medi", Some(500)),
             ("ARIALBOLD", Some(700)),
             ("HELVETICA-BOLDOBLIQUE", Some(700)),
+            ("AVANTGARDEDEMI", Some(600)),
+            ("ARIALTHIN", Some(100)),
+            ("helveticaneue-ultra", Some(900)),
+            ("FrutigerLT-Roman", Some(400)),
+            ("Frutiger LT 45 Light", Some(300)),
         ];
         for (name, expected) in cases {
             assert_eq!(font_weight_from_name(name), expected, "{name}");
@@ -1375,9 +1393,9 @@ mod tests {
 
     #[test]
     fn font_weight_ignores_width_style_and_family_words() {
-        // Condensed and script faces, Linotype's "LT", a Thai family's
-        // leading "TH", a family containing a weight word, and the weight
-        // digit only after a "W".
+        // Condensed and script faces, the all-caps "LT" and "MT" acronyms
+        // of Linotype and Monotype, a Thai family's leading "TH", a family
+        // containing a weight word, and the weight digit only after a "W".
         let cases = [
             "HelveticaNeueLTStd-Cn",
             "Roboto-Condensed",
@@ -1385,6 +1403,10 @@ mod tests {
             "SignPainter-HouseScript",
             "FZXXLB--B51-0",
             "FZHTB--B51-0",
+            "Frutiger LT Std",
+            "Helvetica LT Condensed",
+            "Frutiger-LT",
+            "Foo-MT",
             "THSarabunNew",
             "TH-Sarabun",
             "BlackadderITC",

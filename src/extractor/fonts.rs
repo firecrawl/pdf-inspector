@@ -1299,7 +1299,10 @@ impl FontStyleCache {
 /// font program's OS/2 `usWeightClass` (the weight word of the PostScript
 /// name for a bare CFF program, which has no OS/2 table), the descriptor's
 /// `/FontWeight`, then the weight word of the `/BaseFont` name (see
-/// `text_utils::font_weight_from_name`). `None` when none of them says.
+/// `text_utils::font_weight_from_name`). `None` when none of them says, and
+/// for anything but an ordinary text font (Type0, Type1, MMType1,
+/// TrueType): a Type3 font is a set of glyph procedures whose name and
+/// descriptor say nothing about the ink they draw.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FontStyle {
     pub(crate) italic: bool,
@@ -1321,9 +1324,11 @@ pub(crate) fn font_style(
     font_dict: &lopdf::Dictionary,
     style_cache: &mut FontStyleCache,
 ) -> FontStyle {
+    let has_weight_class = is_ordinary_text_font(font_dict);
     let name_weight = font_dict
         .get(b"BaseFont")
         .ok()
+        .filter(|_| has_weight_class)
         .and_then(|obj| obj.as_name().ok())
         .and_then(|name| crate::text_utils::font_weight_from_name(&String::from_utf8_lossy(name)));
     let descriptor = font_dict
@@ -1374,17 +1379,31 @@ pub(crate) fn font_style(
         style.bold |= embedded.bold;
         style.weight = embedded.weight;
     }
-    style.weight = style
-        .weight
-        .or_else(|| {
-            descriptor
-                .get(b"FontWeight")
-                .ok()
-                .and_then(get_number)
-                .and_then(weight_class)
-        })
-        .or(name_weight);
+    style.weight = if has_weight_class {
+        style
+            .weight
+            .or_else(|| {
+                descriptor
+                    .get(b"FontWeight")
+                    .ok()
+                    .and_then(get_number)
+                    .and_then(weight_class)
+            })
+            .or(name_weight)
+    } else {
+        None
+    };
     style
+}
+
+/// Whether a font dictionary is an ordinary text font — Type0, Type1,
+/// MMType1 or TrueType — as opposed to a Type3 font or an unknown subtype.
+fn is_ordinary_text_font(font_dict: &lopdf::Dictionary) -> bool {
+    font_dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|obj| obj.as_name().ok())
+        .is_some_and(|subtype| matches!(subtype, b"Type0" | b"Type1" | b"MMType1" | b"TrueType"))
 }
 
 /// A weight class value from `usWeightClass` or `/FontWeight`, clamped into
@@ -2460,6 +2479,41 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn type3_fonts_carry_no_weight_class() {
+        // A Type3 font's glyph procedures draw whatever they like: neither a
+        // weight word in its name nor a /FontWeight in its descriptor says
+        // how heavy that ink is, while its style flags stay as they were.
+        let mut doc = Document::with_version("1.4");
+        let desc_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Glyphs-Bold",
+            "Flags" => 4 | (1 << 18),
+            "ItalicAngle" => 0,
+            "FontWeight" => 700,
+        });
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "BaseFont" => "Glyphs-Bold",
+            "FontDescriptor" => desc_id,
+        };
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()),
+            FontStyle {
+                italic: false,
+                bold: true,
+                weight: None,
+            }
+        );
+        // The same holds for a font dictionary without a subtype at all.
+        let font_dict = dictionary! { "Type" => "Font", "BaseFont" => "Anything-Bold" };
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).weight,
+            None
+        );
     }
 
     #[test]
