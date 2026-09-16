@@ -306,6 +306,21 @@ fn add_leading_tab(mut pdf: Vec<u8>) -> Vec<u8> {
     pdf
 }
 
+/// Leading bytes before the header, e.g. an echoed multipart envelope: a
+/// boundary line and part headers before `%PDF`, a closing boundary after
+/// `%%EOF`.
+fn wrap_in_multipart_envelope(pdf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pdf.len() + 256);
+    out.extend_from_slice(
+        b"------------------------------123\r\n\
+          Content-Disposition: form-data; name=\"file\"; filename=\"file.pdf\"\r\n\
+          Content-Type: application/pdf\r\n\r\n",
+    );
+    out.extend_from_slice(pdf);
+    out.extend_from_slice(b"\r\n------------------------------123--\r\n");
+    out
+}
+
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
     use pdf_inspector::types::ItemType;
@@ -1211,6 +1226,68 @@ fn test_process_pdf_mem_repairs_leading_tab_and_truncated_eof() {
             .contains("Hello World"),
         "repaired PDF should still extract text"
     );
+}
+
+#[test]
+fn test_process_pdf_mem_tolerates_leading_bytes_before_header() {
+    let original = make_minimal_text_pdf();
+    let wrapped = wrap_in_multipart_envelope(&original);
+    assert!(!wrapped.starts_with(b"%PDF"));
+
+    let expected = process_pdf_mem(&original).expect("clean PDF should load");
+    let result =
+        process_pdf_mem(&wrapped).expect("leading bytes before the header should be tolerated");
+
+    assert_eq!(result.pdf_type, expected.pdf_type);
+    assert_eq!(result.page_count, expected.page_count);
+    assert_eq!(result.markdown, expected.markdown);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Hello World"),
+        "wrapped PDF should still extract text"
+    );
+}
+
+fn page_texts(result: &pdf_inspector::PagesExtractionResult) -> Vec<String> {
+    result.pages.iter().map(|p| p.markdown.clone()).collect()
+}
+
+#[test]
+fn test_detect_and_extract_tolerate_leading_bytes_before_header() {
+    let original = std::fs::read("tests/fixtures/shannon-entropy-p1-2.pdf").unwrap();
+    let wrapped = wrap_in_multipart_envelope(&original);
+
+    let expected = pdf_inspector::detect_pdf_type_mem(&original).unwrap();
+    let detected = pdf_inspector::detect_pdf_type_mem(&wrapped)
+        .expect("detection should tolerate leading bytes before the header");
+    assert_eq!(detected.pdf_type, expected.pdf_type);
+    assert_eq!(detected.page_count, expected.page_count);
+    assert!(detected.page_count > 1);
+
+    let expected_pages = extract_pages_markdown_mem(&original, None).unwrap();
+    let pages = extract_pages_markdown_mem(&wrapped, None)
+        .expect("page extraction should tolerate leading bytes before the header");
+    assert_eq!(page_texts(&pages), page_texts(&expected_pages));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wrapped.pdf");
+    std::fs::write(&path, &wrapped).unwrap();
+    let from_path =
+        detect_pdf_type(&path).expect("path-based detection should tolerate leading bytes");
+    assert_eq!(from_path.page_count, expected.page_count);
+    let from_path_pages = extract_pages_markdown(&path, None)
+        .expect("path-based extraction should tolerate leading bytes");
+    assert_eq!(page_texts(&from_path_pages), page_texts(&expected_pages));
+}
+
+#[test]
+fn test_header_beyond_search_window_is_not_a_pdf() {
+    let mut buf = vec![b'x'; 2048];
+    buf.extend_from_slice(&make_minimal_text_pdf());
+    assert_not_a_pdf(process_pdf_mem(&buf), "plain text");
 }
 
 #[test]
