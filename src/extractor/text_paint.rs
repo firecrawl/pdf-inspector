@@ -44,7 +44,7 @@ fn device_space(name: &[u8]) -> Option<ColorSpace> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct PaintResources {
     spaces: HashMap<Vec<u8>, Option<ColorSpace>>,
     harmless_states: HashMap<Vec<u8>, bool>,
@@ -117,14 +117,12 @@ impl PaintResources {
         result
     }
 
-    pub(crate) fn form(doc: &Document, form: &Dictionary) -> Self {
+    pub(crate) fn form(doc: &Document, form: &Dictionary, parent: &Self) -> Self {
+        let Ok(resource) = form.get(b"Resources") else {
+            return parent.clone();
+        };
         let mut result = Self::default();
-        if let Some(resources) = form
-            .get(b"Resources")
-            .ok()
-            .and_then(|o| resolve(doc, o))
-            .and_then(|o| o.as_dict().ok())
-        {
+        if let Some(resources) = resolve(doc, resource).and_then(|o| o.as_dict().ok()) {
             result.add(doc, resources);
         }
         result
