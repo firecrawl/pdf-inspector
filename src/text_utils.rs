@@ -345,7 +345,7 @@ pub fn is_bold_font(font_name: &str) -> bool {
 /// seam ("ExtraLight", "Extra-Light", "Extra Light" are all 200). The
 /// abbreviations of foundry style suffixes read ("-Md",
 /// "-Lt", "-Bd", "-Sb", "-Dm", "-Hv", "-Blk", "-XBd", "-Ult", "-UltLt",
-/// "-W3".."-W9") while "Bookman" is not Book. Abbreviations count only
+/// "-W1".."-W9") while "Bookman" is not Book. Abbreviations count only
 /// after the family name (a leading "TH" is a Thai family, not Thin) and
 /// only in the mixed case foundries write them in: an all-caps "LT" or
 /// "MT" is the Linotype or Monotype acronym, not Light. Inside the family
@@ -489,8 +489,9 @@ fn weight_word(piece: &str) -> Option<u16> {
 }
 
 /// Weight of one whole style abbreviation, as written: the short codes of
-/// foundry style suffixes and the "W3".."W9" weight digit of Japanese
-/// families. The codes are written in mixed case ("Md", "Lt", "XBd"); an
+/// foundry style suffixes and the "W1".."W9" weight digit of Japanese
+/// families, a hundredth of the weight class (Hiragino's W3 is 300, its W6
+/// 600). The codes are written in mixed case ("Md", "Lt", "XBd"); an
 /// all-caps piece is a family or foundry acronym ("LT" for Linotype, "MT"
 /// for Monotype, "ITC") and is not read.
 fn weight_abbreviation(piece: &str) -> Option<u16> {
@@ -1467,6 +1468,8 @@ mod tests {
             ("Foo-XBdIt", Some(800)),
             ("Foo-Bk", Some(400)),
             ("Foo-Rg", Some(400)),
+            ("HiraginoSans-W1", Some(100)),
+            ("HiraginoSans-W2", Some(200)),
             ("HiraKakuProN-W3", Some(300)),
             ("HiraKakuProN-W6", Some(600)),
             ("KozMinPr6N-W9", Some(900)),
@@ -1506,6 +1509,7 @@ mod tests {
             "LightRail",
             "HeavyMetal",
             "Foo-W95",
+            "HiraginoSans-W0",
             "Wingdings",
             "ABCDEF+Tc1",
         ];
