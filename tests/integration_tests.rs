@@ -20,6 +20,11 @@ use pdf_inspector::{
     extract_text_with_positions_and_rotations_mem_in_frame,
     extract_text_with_positions_mem_in_frame, PositionFrame,
 };
+use pdf_inspector::{
+    extract_text_in_regions_mem_with_options,
+    extract_text_with_positions_and_rotations_mem_with_options,
+    extract_text_with_positions_mem_with_options, PositionOptions,
+};
 use std::collections::HashSet;
 
 fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
@@ -322,6 +327,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         page,
         is_bold: false,
         is_italic: false,
+        font_weight: None,
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
@@ -354,6 +360,7 @@ fn make_text_item_with_font(
         page,
         is_bold: is_bold_font(font),
         is_italic: is_italic_font(font),
+        font_weight: None,
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
@@ -5668,4 +5675,166 @@ BT /F1 12 Tf 330 660 Td (2.25) Tj ET";
     assert!(text_from_sheet.contains("Apple"), "got {text_from_sheet:?}");
     assert_eq!(display_region_text(&buf, display_rect), text_from_sheet);
     assert_eq!(region_text(&buf, display_rect).trim(), "");
+}
+
+// =========================================================================
+// Font weight: the `font_weight` field and the `bold_from_weight` option
+// =========================================================================
+
+/// One page whose single line is set in three non-embedded faces that differ
+/// only in weight: `Face-Lt` and `Face-Md` name theirs, the third has an
+/// opaque name and says `/FontWeight 700` in its descriptor. None of them is
+/// bold by the flags or the name words the default extraction reads.
+fn synthetic_three_weights_pdf() -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+    let mut font = |base_font: &str, font_weight: Option<i64>| {
+        let mut descriptor = dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => base_font,
+            "Flags" => 32,
+            "ItalicAngle" => 0,
+        };
+        if let Some(weight) = font_weight {
+            descriptor.set("FontWeight", weight);
+        }
+        let descriptor_id = doc.add_object(descriptor);
+        doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => base_font,
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths.clone()),
+            "FontDescriptor" => descriptor_id,
+        })
+    };
+    let light = font("ABCDEF+Face-Lt", None);
+    let medium = font("ABCDEF+Face-Md", None);
+    let heavy = font("ABCDEF+Opaque", Some(700));
+
+    let content =
+        b"BT /F1 12 Tf 72 700 Td (Light ) Tj /F2 12 Tf (Medium ) Tj /F3 12 Tf (Heavy) Tj ET\n\
+BT /F1 12 Tf 72 680 Td (Same ) Tj (weight) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! {
+                "F1" => light,
+                "F2" => medium,
+                "F3" => heavy,
+            },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn text_and_style(items: &[TextItem]) -> Vec<(String, bool, Option<u16>)> {
+    items
+        .iter()
+        .map(|item| (item.text.clone(), item.is_bold, item.font_weight))
+        .collect()
+}
+
+#[test]
+fn test_font_weight_is_reported_and_bold_from_weight_is_off_by_default() {
+    let buf = synthetic_three_weights_pdf();
+
+    // Default: the three runs merge into one item as they always did, none
+    // is bold, and the item carries its first run's weight class.
+    let plain = extract_text_with_positions_mem(&buf).unwrap();
+    assert_eq!(
+        text_and_style(&plain),
+        [
+            ("Light Medium Heavy".to_string(), false, Some(300)),
+            ("Same weight".to_string(), false, Some(300)),
+        ]
+    );
+
+    // Default options are the default extraction, item for item.
+    let explicit =
+        extract_text_with_positions_mem_with_options(&buf, None, PositionOptions::new()).unwrap();
+    assert_same_geometry(&plain, &explicit);
+    assert_eq!(text_and_style(&plain), text_and_style(&explicit));
+    let (rotated, rotations) = extract_text_with_positions_and_rotations_mem_with_options(
+        &buf,
+        None,
+        PositionOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(text_and_style(&plain), text_and_style(&rotated));
+    assert!(rotations.is_empty());
+}
+
+#[test]
+fn test_bold_from_weight_keeps_weights_apart_and_reads_bold_from_600() {
+    let buf = synthetic_three_weights_pdf();
+    let options = PositionOptions::new().bold_from_weight(true);
+
+    // Runs of different weight stay separate items; the 700 face is bold,
+    // the 300 and 500 faces are not; same-weight runs still merge.
+    let weighted = extract_text_with_positions_mem_with_options(&buf, None, options).unwrap();
+    assert_eq!(
+        text_and_style(&weighted),
+        [
+            ("Light ".to_string(), false, Some(300)),
+            ("Medium ".to_string(), false, Some(500)),
+            ("Heavy".to_string(), true, Some(700)),
+            ("Same weight".to_string(), false, Some(300)),
+        ]
+    );
+    let light = find_item(&weighted, "Light");
+    let medium = find_item(&weighted, "Medium");
+    let heavy = find_item(&weighted, "Heavy");
+    assert_close(light.x, 72.0);
+    assert_close(medium.x, light.x + light.width);
+    assert_close(heavy.x, medium.x + medium.width);
+    assert!(weighted
+        .iter()
+        .all(|item| item.y == 700.0 || item.y == 680.0));
+
+    // The rotations variant and the page filter take the same options.
+    let pages: HashSet<u32> = [1].into_iter().collect();
+    let (items, _) =
+        extract_text_with_positions_and_rotations_mem_with_options(&buf, Some(&pages), options)
+            .unwrap();
+    assert_eq!(text_and_style(&items), text_and_style(&weighted));
+
+    // A region's text reads the same whether or not the runs were kept
+    // apart: the option changes items, not the words on the page.
+    let region = [60.0, 792.0 - 712.0, 400.0, 792.0 - 676.0];
+    let plain_region = extract_text_in_regions_mem(&buf, &[(0, vec![region])]).unwrap();
+    let weighted_region =
+        extract_text_in_regions_mem_with_options(&buf, &[(0, vec![region])], options).unwrap();
+    assert_eq!(
+        weighted_region[0].regions[0].text,
+        plain_region[0].regions[0].text
+    );
+    assert!(plain_region[0].regions[0]
+        .text
+        .contains("Light Medium Heavy"));
 }

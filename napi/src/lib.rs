@@ -140,8 +140,21 @@ pub struct TextItem {
     pub legacy_symbol_rewrite: Option<bool>,
     pub font_size: f64,
     pub page: u32,
+    /// Bold from the font name, the FontDescriptor's ForceBold flag, the
+    /// embedded program's bold selection, or text filled and stroked to
+    /// look heavier. With `{ boldFromWeight: true }` (see [`FrameOptions`])
+    /// also `true` when `fontWeight` is 600 or more.
     pub is_bold: bool,
     pub is_italic: bool,
+    /// The font's weight class on the 100..900 scale shared by CSS
+    /// `font-weight` and the OS/2 `usWeightClass` field (400 regular, 700
+    /// bold): the embedded font program's OS/2 table, else the
+    /// FontDescriptor's `/FontWeight`, else a weight word in the font name
+    /// ("Light", "Medium", "-Md", "Black", "W6"). Omitted when none of them
+    /// says, and for image, link and form-field items. Independent of
+    /// `isBold`, which is unchanged: a medium face reports `500` with
+    /// `isBold: false`.
+    pub font_weight: Option<u32>,
     /// Underline detected geometrically (drawn rule/thin rect under the
     /// baseline) — PDFs carry no underline font flag.
     pub is_underline: bool,
@@ -183,9 +196,10 @@ pub struct PageRegions {
     pub regions: Vec<Vec<f64>>,
 }
 
-/// Coordinate frame selection shared by `extractTextWithPositions`,
+/// Options shared by `extractTextWithPositions`,
 /// `extractTextWithPositionsAndRotations`, `extractTextInRegions` and
-/// `extractTablesInRegions`.
+/// `extractTablesInRegions`: the coordinate frame, and whether bold is
+/// also read from the font's weight class.
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct FrameOptions {
@@ -200,6 +214,13 @@ pub struct FrameOptions {
     /// page image.
     #[napi(ts_type = "\"sheet\" | \"display\"")]
     pub frame: Option<String>,
+    /// Also read bold from the font's weight class. When `true`,
+    /// `TextItem.isBold` is also `true` for items whose `fontWeight` is 600
+    /// (SemiBold) or more, and adjacent runs whose `fontWeight` differs stay
+    /// separate items instead of merging, so a heavier run inside a lighter
+    /// paragraph keeps its own item. `false` by default: `isBold` and item
+    /// merging are then unchanged, and `fontWeight` is reported either way.
+    pub bold_from_weight: Option<bool>,
 }
 
 /// Extracted text for a single region.
@@ -454,20 +475,26 @@ fn to_napi_err(e: impl std::fmt::Display, ctx: &str) -> Error {
     Error::new(Status::GenericFailure, format!("{ctx}: {e}"))
 }
 
-/// The coordinate frame an optional `FrameOptions` asks for; an unknown
-/// value is an argument error rather than a silent fallback to the default.
-fn position_frame(
+/// The options an optional `FrameOptions` asks for; an unknown frame is an
+/// argument error rather than a silent fallback to the default.
+fn position_options(
     options: Option<&FrameOptions>,
     ctx: &str,
-) -> Result<pdf_inspector::PositionFrame> {
-    match options.and_then(|options| options.frame.as_deref()) {
-        None | Some("sheet") => Ok(pdf_inspector::PositionFrame::Sheet),
-        Some("display") => Ok(pdf_inspector::PositionFrame::Display),
-        Some(other) => Err(Error::new(
-            Status::InvalidArg,
-            format!("{ctx}: unknown frame {other:?}; expected \"sheet\" or \"display\""),
-        )),
-    }
+) -> Result<pdf_inspector::PositionOptions> {
+    let frame = match options.and_then(|options| options.frame.as_deref()) {
+        None | Some("sheet") => pdf_inspector::PositionFrame::Sheet,
+        Some("display") => pdf_inspector::PositionFrame::Display,
+        Some(other) => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("{ctx}: unknown frame {other:?}; expected \"sheet\" or \"display\""),
+            ))
+        }
+    };
+    let bold_from_weight = options.is_some_and(|options| options.bold_from_weight == Some(true));
+    Ok(pdf_inspector::PositionOptions::new()
+        .frame(frame)
+        .bold_from_weight(bold_from_weight))
 }
 
 /// Run a closure, catching any Rust panic and converting it to a NAPI error.
@@ -582,13 +609,13 @@ pub fn extract_text_with_positions(
     options: Option<FrameOptions>,
 ) -> Result<Vec<TextItem>> {
     let bytes: Vec<u8> = buffer.to_vec();
-    let frame = position_frame(options.as_ref(), "extract_text_with_positions")?;
+    let position = position_options(options.as_ref(), "extract_text_with_positions")?;
     catch_panic("extract_text_with_positions", move || {
         let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
-        let items = pdf_inspector::extract_text_with_positions_mem_in_frame(
+        let items = pdf_inspector::extract_text_with_positions_mem_with_options(
             &bytes,
             page_set.as_ref(),
-            frame,
+            position,
         )
         .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?;
 
@@ -611,6 +638,7 @@ fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
         page: item.page,
         is_bold: item.is_bold,
         is_italic: item.is_italic,
+        font_weight: item.font_weight.map(u32::from),
         is_underline: item.is_underline,
         is_strikeout: item.is_strikeout,
         rotation: item.rotation as f64,
@@ -660,17 +688,17 @@ pub fn extract_text_with_positions_and_rotations(
     options: Option<FrameOptions>,
 ) -> Result<PositionedText> {
     let bytes: Vec<u8> = buffer.to_vec();
-    let frame = position_frame(
+    let position = position_options(
         options.as_ref(),
         "extract_text_with_positions_and_rotations",
     )?;
     catch_panic("extract_text_with_positions_and_rotations", move || {
         let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
         let (items, rotations) =
-            pdf_inspector::extract_text_with_positions_and_rotations_mem_in_frame(
+            pdf_inspector::extract_text_with_positions_and_rotations_mem_with_options(
                 &bytes,
                 page_set.as_ref(),
-                frame,
+                position,
             )
             .map_err(|e| to_napi_err(e, "extract_text_with_positions_and_rotations"))?;
         let mut page_rotations: Vec<PageRotation> = rotations
@@ -769,11 +797,12 @@ pub fn extract_text_in_regions(
 ) -> Result<Vec<PageRegionTexts>> {
     let bytes: Vec<u8> = buffer.to_vec();
     let regions = parse_page_regions(&page_regions);
-    let frame = position_frame(options.as_ref(), "extract_text_in_regions")?;
+    let position = position_options(options.as_ref(), "extract_text_in_regions")?;
 
     catch_panic("extract_text_in_regions", move || {
-        let results = pdf_inspector::extract_text_in_regions_mem_in_frame(&bytes, &regions, frame)
-            .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
+        let results =
+            pdf_inspector::extract_text_in_regions_mem_with_options(&bytes, &regions, position)
+                .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
         Ok(to_page_region_texts(results))
     })
 }
@@ -798,11 +827,11 @@ pub fn extract_tables_in_regions(
 ) -> Result<Vec<PageRegionTexts>> {
     let bytes: Vec<u8> = buffer.to_vec();
     let regions = parse_page_regions(&page_regions);
-    let frame = position_frame(options.as_ref(), "extract_tables_in_regions")?;
+    let position = position_options(options.as_ref(), "extract_tables_in_regions")?;
 
     catch_panic("extract_tables_in_regions", move || {
         let results =
-            pdf_inspector::extract_tables_in_regions_mem_in_frame(&bytes, &regions, frame)
+            pdf_inspector::extract_tables_in_regions_mem_with_options(&bytes, &regions, position)
                 .map_err(|e| to_napi_err(e, "extract_tables_in_regions"))?;
         Ok(to_page_region_texts(results))
     })

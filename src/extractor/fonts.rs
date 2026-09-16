@@ -1,5 +1,6 @@
 //! Font width parsing, encoding, and text decoding.
 
+use super::get_number;
 use crate::glyph_names::glyph_to_char;
 use crate::tounicode::FontCMaps;
 use crate::types::{
@@ -1269,12 +1270,12 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
 /// by the FontFile2/FontFile3 stream's object id: style flags, and the
 /// blank-glyph codes of `blank_glyph_codes`. The same font program is
 /// referenced from every page that uses the font, and decompressing +
-/// parsing it dominates `descriptor_style_flags` — without the memo that
+/// parsing it dominates `font_style` — without the memo that
 /// cost repeats per page whenever the descriptor leaves a flag unset
 /// (the common case: regular fonts report neither italic nor bold).
 #[derive(Debug, Default)]
 pub(crate) struct FontStyleCache {
-    by_font_file: HashMap<ObjectId, (bool, bool)>,
+    by_font_file: HashMap<ObjectId, FontStyle>,
     /// Blank-glyph codes per embedded font program (see `blank_glyph_codes`),
     /// so a font shared across pages is scanned once.
     blank_codes_by_font_file: HashMap<ObjectId, std::collections::HashSet<u8>>,
@@ -1286,18 +1287,45 @@ impl FontStyleCache {
     }
 }
 
-/// Style flags from the FontDescriptor, which survive subset fonts whose
-/// BaseFont names are opaque tags ("Tc1", "ABCDEF+F1") that defeat the
-/// name-based bold/italic heuristics.
+/// Style of a font resource: italic and bold, and the weight class.
 ///
+/// The flags survive subset fonts whose BaseFont names are opaque tags
+/// ("Tc1", "ABCDEF+F1") that defeat the name-based bold/italic heuristics.
 /// Italic: `ItalicAngle` beyond a few degrees, or Flags bit 7 (Italic,
 /// value 64). Bold: Flags bit 19 (ForceBold, value 1<<18). The small
 /// ItalicAngle threshold skips fonts that declare a token slant.
-pub(crate) fn descriptor_style_flags(
+///
+/// `weight` is the 100..=900 weight class, read in this order: the embedded
+/// font program's OS/2 `usWeightClass` (the weight word of the PostScript
+/// name for a bare CFF program, which has no OS/2 table), the descriptor's
+/// `/FontWeight`, then the weight word of the `/BaseFont` name (see
+/// `text_utils::font_weight_from_name`). `None` when none of them says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FontStyle {
+    pub(crate) italic: bool,
+    pub(crate) bold: bool,
+    pub(crate) weight: Option<u16>,
+}
+
+impl FontStyle {
+    /// `(italic, bold)`.
+    pub(crate) fn flags(self) -> (bool, bool) {
+        (self.italic, self.bold)
+    }
+}
+
+/// The [`FontStyle`] of a font resource, from its descriptor, its embedded
+/// program and its name.
+pub(crate) fn font_style(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
     style_cache: &mut FontStyleCache,
-) -> (bool, bool) {
+) -> FontStyle {
+    let name_weight = font_dict
+        .get(b"BaseFont")
+        .ok()
+        .and_then(|obj| obj.as_name().ok())
+        .and_then(|name| crate::text_utils::font_weight_from_name(&String::from_utf8_lossy(name)));
     let descriptor = font_dict
         .get(b"FontDescriptor")
         .ok()
@@ -1310,17 +1338,16 @@ pub(crate) fn descriptor_style_flags(
             resolve_dict(doc, cid_font_dict.get(b"FontDescriptor").ok()?)
         });
     let Some(descriptor) = descriptor else {
-        return (false, false);
+        return FontStyle {
+            weight: name_weight,
+            ..FontStyle::default()
+        };
     };
 
     let italic_angle = descriptor
         .get(b"ItalicAngle")
         .ok()
-        .and_then(|obj| match obj {
-            Object::Integer(i) => Some(*i as f32),
-            Object::Real(r) => Some(*r),
-            _ => None,
-        })
+        .and_then(get_number)
         .unwrap_or(0.0);
     let flags = descriptor
         .get(b"Flags")
@@ -1328,56 +1355,82 @@ pub(crate) fn descriptor_style_flags(
         .and_then(|obj| obj.as_i64().ok())
         .unwrap_or(0);
 
-    let mut italic = italic_angle.abs() >= 4.0 || flags & (1 << 6) != 0;
-    let mut bold = flags & (1 << 18) != 0;
+    let mut style = FontStyle {
+        italic: italic_angle.abs() >= 4.0 || flags & (1 << 6) != 0,
+        bold: flags & (1 << 18) != 0,
+        weight: None,
+    };
 
     // Descriptors lie: subset generators write ItalicAngle 0 for genuinely
     // italic faces. The embedded font file keeps the truth — OS/2
-    // fsSelection (via `Face::is_italic`) and the post table's italicAngle.
-    if !italic || !bold {
-        if let Some(ff_ref) = font_file_ref(descriptor) {
-            let (emb_italic, emb_bold) = *style_cache
-                .by_font_file
-                .entry(ff_ref)
-                .or_insert_with(|| embedded_style_flags(doc, ff_ref));
-            italic = italic || emb_italic;
-            bold = bold || emb_bold;
-        }
+    // fsSelection (via `Face::is_italic`) and the post table's italicAngle —
+    // and it alone carries the weight class.
+    if let Some(ff_ref) = font_file_ref(descriptor) {
+        let embedded = *style_cache
+            .by_font_file
+            .entry(ff_ref)
+            .or_insert_with(|| embedded_style(doc, ff_ref));
+        style.italic |= embedded.italic;
+        style.bold |= embedded.bold;
+        style.weight = embedded.weight;
     }
-    (italic, bold)
+    style.weight = style
+        .weight
+        .or_else(|| {
+            descriptor
+                .get(b"FontWeight")
+                .ok()
+                .and_then(get_number)
+                .and_then(weight_class)
+        })
+        .or(name_weight);
+    style
 }
 
-/// Style flags parsed from an embedded font program stream.
-fn embedded_style_flags(doc: &Document, ff_ref: ObjectId) -> (bool, bool) {
+/// A weight class value from `usWeightClass` or `/FontWeight`, clamped into
+/// the 100..=900 scale; `None` for zero, negative or non-numeric values,
+/// which both fields use for "unset".
+fn weight_class(value: f32) -> Option<u16> {
+    if !value.is_finite() || value < 1.0 {
+        return None;
+    }
+    Some(value.round().clamp(100.0, 900.0) as u16)
+}
+
+/// Style parsed from an embedded font program stream.
+fn embedded_style(doc: &Document, ff_ref: ObjectId) -> FontStyle {
     let Some(data) = font_file_data(doc, ff_ref) else {
-        return (false, false);
+        return FontStyle::default();
     };
     if let Ok(face) = ttf_parser::Face::parse(&data, 0) {
         // PDF subsetters can remove OS/2 while retaining the bold bit in
         // head.macStyle. Face::is_bold only reads OS/2; use the legacy flag
         // when that table is unavailable, without overriding an explicit
         // regular OS/2 face. The parsed face has already validated head.
-        let mac_bold = face.tables().os2.is_none()
+        let os2 = face.tables().os2;
+        let mac_bold = os2.is_none()
             && face
                 .raw_face()
                 .table(ttf_parser::Tag::from_bytes(b"head"))
                 .and_then(|head| head.get(44..46))
                 .is_some_and(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]) & 1 != 0);
-        (
-            face.is_italic() || face.italic_angle().abs() >= 4.0,
-            face.is_bold() || mac_bold,
-        )
+        FontStyle {
+            italic: face.is_italic() || face.italic_angle().abs() >= 4.0,
+            bold: face.is_bold() || mac_bold,
+            weight: os2.and_then(|os2| weight_class(f32::from(os2.weight().to_number()))),
+        }
     } else if let Some(name) = cff_font_name(&data) {
         // FontFile3 is bare CFF (no sfnt container) — ttf_parser
         // can't open it, but the CFF Name INDEX keeps the real
         // PostScript name ("XXXXXX+Amplitude-LightItalic") even
         // when the descriptor was rewritten to claim upright.
-        (
-            crate::text_utils::is_italic_font(&name),
-            crate::text_utils::is_bold_font(&name),
-        )
+        FontStyle {
+            italic: crate::text_utils::is_italic_font(&name),
+            bold: crate::text_utils::is_bold_font(&name),
+            weight: crate::text_utils::font_weight_from_name(&name),
+        }
     } else {
-        (false, false)
+        FontStyle::default()
     }
 }
 
@@ -2166,7 +2219,7 @@ mod tests {
             "Flags" => 32,
         });
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).flags(),
             (true, false)
         );
     }
@@ -2180,7 +2233,7 @@ mod tests {
             "Flags" => 64, // bit 7: Italic
         });
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).flags(),
             (true, false)
         );
     }
@@ -2194,7 +2247,7 @@ mod tests {
             "Flags" => 1 << 18, // ForceBold
         });
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).flags(),
             (false, true)
         );
     }
@@ -2209,7 +2262,7 @@ mod tests {
             "Flags" => 32,
         });
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).flags(),
             (false, false)
         );
     }
@@ -2219,7 +2272,7 @@ mod tests {
         let doc = Document::with_version("1.4");
         let font_dict = dictionary! { "Type" => "Font", "BaseFont" => "Tc1" };
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).flags(),
             (false, false)
         );
     }
@@ -2227,6 +2280,11 @@ mod tests {
     /// Synthetic sfnt containing just the tables needed to parse a face.
     /// No source-document font bytes are needed for these style tests.
     fn sfnt_with_style(mac_style: u16, os2_selection: Option<u16>) -> Vec<u8> {
+        sfnt_with_style_and_weight(mac_style, os2_selection.map(|selection| (selection, 0)))
+    }
+
+    /// [`sfnt_with_style`] whose OS/2 table also carries a `usWeightClass`.
+    fn sfnt_with_style_and_weight(mac_style: u16, os2: Option<(u16, u16)>) -> Vec<u8> {
         let mut head = vec![0u8; 54];
         head[18..20].copy_from_slice(&1000u16.to_be_bytes()); // unitsPerEm
         head[44..46].copy_from_slice(&mac_style.to_be_bytes());
@@ -2235,9 +2293,10 @@ mod tests {
         maxp[..4].copy_from_slice(&0x00005000u32.to_be_bytes());
         maxp[4..6].copy_from_slice(&1u16.to_be_bytes()); // numGlyphs
         let mut tables = vec![(*b"head", head), (*b"hhea", hhea), (*b"maxp", maxp)];
-        if let Some(selection) = os2_selection {
+        if let Some((selection, weight_class)) = os2 {
             let mut os2 = vec![0u8; 78]; // version 0
-            os2[62..64].copy_from_slice(&selection.to_be_bytes());
+            os2[4..6].copy_from_slice(&weight_class.to_be_bytes()); // usWeightClass
+            os2[62..64].copy_from_slice(&selection.to_be_bytes()); // fsSelection
             tables.push((*b"OS/2", os2));
         }
         tables.sort_by_key(|(tag, _)| *tag);
@@ -2278,7 +2337,7 @@ mod tests {
             "BaseFont" => "ABCDEF+OpaqueFace",
             "FontDescriptor" => descriptor,
         };
-        descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new())
+        font_style(&doc, &font_dict, &mut FontStyleCache::new()).flags()
     }
 
     #[test]
@@ -2293,6 +2352,132 @@ mod tests {
     fn embedded_os2_bold_remains_authoritative() {
         assert_eq!(descriptor_flags_from_sfnt(0, Some(1 << 5)), (false, true));
         assert_eq!(descriptor_flags_from_sfnt(1, Some(1 << 6)), (false, false));
+    }
+
+    /// A TrueType font dictionary embedding `font_file`, with the given
+    /// BaseFont and descriptor entries on top of the plain flags.
+    fn embedded_font(
+        base_font: &str,
+        font_file: Vec<u8>,
+        descriptor_extra: lopdf::Dictionary,
+    ) -> (Document, lopdf::Dictionary) {
+        let mut doc = Document::with_version("1.4");
+        let font_file = doc.add_object(lopdf::Stream::new(dictionary! {}, font_file));
+        let mut descriptor = dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => base_font,
+            "Flags" => 4,
+            "ItalicAngle" => 0,
+            "FontFile2" => font_file,
+        };
+        for (key, value) in descriptor_extra.into_iter() {
+            descriptor.set(key.clone(), value.clone());
+        }
+        let descriptor = doc.add_object(descriptor);
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => base_font,
+            "FontDescriptor" => descriptor,
+        };
+        (doc, font_dict)
+    }
+
+    #[test]
+    fn weight_class_comes_from_the_embedded_os2_table_first() {
+        // usWeightClass 700 on a face whose fsSelection bold bit is unset,
+        // whose descriptor claims /FontWeight 400 and whose name says
+        // nothing: the embedded table wins, and it does not make the font
+        // bold on its own.
+        let (doc, font_dict) = embedded_font(
+            "ABCDEF+OpaqueFace",
+            sfnt_with_style_and_weight(0, Some((0, 700))),
+            dictionary! { "FontWeight" => 400 },
+        );
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()),
+            FontStyle {
+                italic: false,
+                bold: false,
+                weight: Some(700),
+            }
+        );
+    }
+
+    #[test]
+    fn weight_class_falls_back_to_the_descriptor_then_the_name() {
+        // No OS/2 table: the descriptor's /FontWeight decides ...
+        let (doc, font_dict) = embedded_font(
+            "ABCDEF+Face-Bold",
+            sfnt_with_style_and_weight(0, None),
+            dictionary! { "FontWeight" => 300 },
+        );
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).weight,
+            Some(300)
+        );
+        // ... and without one the weight word of the BaseFont name does.
+        let (doc, font_dict) = embedded_font(
+            "ABCDEF+Face-Bold",
+            sfnt_with_style_and_weight(0, None),
+            dictionary! {},
+        );
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).weight,
+            Some(700)
+        );
+        // An OS/2 table that leaves usWeightClass at 0 says nothing.
+        let (doc, font_dict) = embedded_font(
+            "ABCDEF+Face-Md",
+            sfnt_with_style_and_weight(0, Some((0, 0))),
+            dictionary! {},
+        );
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).weight,
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn descriptor_font_weight_is_clamped_to_the_scale() {
+        for (value, expected) in [
+            (lopdf::Object::Integer(700), Some(700)),
+            (lopdf::Object::Real(500.0), Some(500)),
+            (lopdf::Object::Integer(1000), Some(900)),
+            (lopdf::Object::Integer(0), None),
+            (lopdf::Object::Integer(-1), None),
+            (lopdf::Object::Name(b"Bold".to_vec()), None),
+        ] {
+            let (doc, font_dict) = doc_with_descriptor(dictionary! {
+                "Type" => "FontDescriptor",
+                "FontName" => "Tc1",
+                "Flags" => 32,
+                "FontWeight" => value.clone(),
+            });
+            assert_eq!(
+                font_style(&doc, &font_dict, &mut FontStyleCache::new()).weight,
+                expected,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_weight_needs_no_descriptor() {
+        let doc = Document::with_version("1.4");
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica-Light",
+        };
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()),
+            FontStyle {
+                italic: false,
+                bold: false,
+                weight: Some(300),
+            }
+        );
     }
 
     #[test]
@@ -2315,7 +2500,7 @@ mod tests {
             "DescendantFonts" => vec![lopdf::Object::Reference(cid_id)],
         };
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).flags(),
             (true, false)
         );
     }
@@ -2329,6 +2514,40 @@ mod tests {
         data.push(1 + name.len() as u8); // offset past last name
         data.extend_from_slice(name.as_bytes());
         data
+    }
+
+    #[test]
+    fn bare_cff_name_weight_outranks_the_descriptor() {
+        // A Type1C program's own PostScript name carries the style
+        // abbreviation; the descriptor's /FontWeight and the opaque
+        // BaseFont say nothing useful.
+        let mut doc = Document::with_version("1.4");
+        let ff_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            bare_cff_with_name("ABCDEF+Face-Md"),
+        )));
+        let desc_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "ABCDEF+Face-Md",
+            "ItalicAngle" => 0,
+            "Flags" => 32,
+            "FontWeight" => 400,
+            "FontFile3" => ff_id,
+        });
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Tc1",
+            "FontDescriptor" => desc_id,
+        };
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()),
+            FontStyle {
+                italic: false,
+                bold: false,
+                weight: Some(500),
+            }
+        );
     }
 
     #[test]
@@ -2356,7 +2575,7 @@ mod tests {
 
         let mut cache = FontStyleCache::new();
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut cache),
+            font_style(&doc, &font_dict, &mut cache).flags(),
             (true, true)
         );
         assert_eq!(cache.by_font_file.len(), 1);
@@ -2369,13 +2588,13 @@ mod tests {
             Object::Stream(Stream::new(dictionary! {}, vec![0u8; 4])),
         );
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut cache),
+            font_style(&doc, &font_dict, &mut cache).flags(),
             (true, true)
         );
         // A cold cache parses the (now garbage) stream, proving the warm
         // call above answered from the memo.
         assert_eq!(
-            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).flags(),
             (false, false)
         );
     }

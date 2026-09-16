@@ -114,6 +114,17 @@ page undone — so `x`/`y`/`width`/`height` and `rotation` describe the item as
 a renderer draws it. Pages with `/Rotate 0` whose text is not predominantly
 rotated are identical in both frames.
 
+`fontWeight` is the font's weight class on the 100..900 scale shared by CSS
+`font-weight` and the OS/2 `usWeightClass` field (400 regular, 700 bold), read
+from the embedded font program's OS/2 table, else the FontDescriptor's
+`/FontWeight`, else a weight word in the font name ("Light", "Medium", "-Md",
+"Black", "W6"); it is omitted when none of them says. `isBold` is unchanged
+and independent of it, so a medium face reports `fontWeight: 500` with
+`isBold: false`. Pass `{ boldFromWeight: true }` to also read `isBold` from a
+weight class of 600 (SemiBold) or more and to keep adjacent runs of different
+weight as separate items, so a heavier run inside a lighter paragraph keeps
+its own item instead of merging into it.
+
 `legacySymbolRewrite: true` marks items whose decoded text includes a character
 changed by legacy symbol cleanup. Merged items retain this evidence from either
 source, and split items conservatively inherit it. The field is omitted when
@@ -130,6 +141,9 @@ for (const item of extractTextWithPositions(pdf, [1])) { // pages are 1-indexed
 
 // Boxes as a renderer draws the page (`/Rotate` applied)
 const rendered = extractTextWithPositions(pdf, undefined, { frame: 'display' })
+
+// Bold also from the weight class; runs of different weight stay apart
+const weighted = extractTextWithPositions(pdf, undefined, { boldFromWeight: true })
 ```
 
 ### `extractTextWithPositionsAndRotations(buffer: Buffer, pages?: number[], options?: FrameOptions): PositionedText`
@@ -157,7 +171,8 @@ rendered page (the visible box turned clockwise by the page's inheritable
 `/Rotate`; the page-level turn of a predominantly rotated page is undone
 first, while individual runs keep their own `rotation`), as a layout model
 working on page images reports them, whatever the page's `/Rotate` or text
-direction. `extractTablesInRegions` takes the same option.
+direction. `extractTablesInRegions` takes the same options, `boldFromWeight`
+included (see `extractTextWithPositions`).
 
 Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues). When the cause is a suspected garbled text layer, `ocrReason` is set to `"suspected_garbled_text"`.
 
@@ -224,6 +239,7 @@ interface PageRegions {
 
 interface FrameOptions {
   frame?: "sheet" | "display" // coordinate frame of items and region bboxes; "sheet" by default
+  boldFromWeight?: boolean    // also read isBold from fontWeight >= 600 and keep runs of different weight apart; false by default
 }
 
 interface PositionedText {

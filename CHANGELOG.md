@@ -9,6 +9,34 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- `TextItem::font_weight`: the font's weight class on the 100..=900 scale
+  (400 regular, 700 bold), read from the embedded font program's OS/2
+  `usWeightClass`, else the FontDescriptor's `/FontWeight`, else a weight word
+  in the font name, foundry abbreviations included ("Light", "Medium", "-Md",
+  "-Lt", "-Blk", "W6"); `None` when none of them says. Node `fontWeight`
+  (omitted when unknown), Python `font_weight` and the `pdf2md --items-json`
+  field `font_weight` report the same value. `is_bold` is unchanged.
+- An opt-in `bold_from_weight` on the positioned-text and region APIs, next
+  to the frame option: Rust `PositionOptions` with the `_with_options`
+  variants (`extract_text_with_positions_mem_with_options`,
+  `extract_text_with_positions_and_rotations_mem_with_options`,
+  `extract_text_in_regions_mem_with_options`,
+  `extract_tables_in_regions_mem_with_options`), Node `{ boldFromWeight: true }`
+  in the options of the same four functions, Python `bold_from_weight=True`
+  on `extract_text_with_positions`, `extract_text_with_positions_and_rotations`,
+  `extract_text_in_regions` and their `_bytes` variants. When on, `is_bold` is
+  also `true` for a weight class of 600 or more, and adjacent runs whose
+  weight class differs stay separate items instead of merging, so a heavier
+  run inside a lighter paragraph keeps its own item. Off by default, where
+  `is_bold` and item merging are unchanged.
+
+### Changed
+
+- Rust `TextItem` literals must include the new `font_weight` field (`None`
+  for items whose weight class is unknown).
+
 ## [1.20.0] - 2026-09-14
 
 Changes since 1.19.0.

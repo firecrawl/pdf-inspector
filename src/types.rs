@@ -211,10 +211,23 @@ pub struct TextItem {
     pub font_size: f32,
     /// Page number (1-indexed)
     pub page: u32,
-    /// Whether the font is bold
+    /// Whether the font is bold: a bold word in the font name, the
+    /// FontDescriptor's ForceBold flag or the embedded program's bold
+    /// selection, or text filled and stroked to look heavier. With
+    /// [`PositionOptions::bold_from_weight`](crate::PositionOptions) it is
+    /// also `true` when `font_weight` is 600 or more.
     pub is_bold: bool,
     /// Whether the font is italic
     pub is_italic: bool,
+    /// The font's weight class on the 100..=900 scale shared by CSS
+    /// `font-weight` and the OS/2 `usWeightClass` field (400 regular, 700
+    /// bold), read from the embedded font program's OS/2 table, else the
+    /// FontDescriptor's `/FontWeight`, else a weight word in the font name
+    /// ("Light", "Medium", "-Md", "Black", "W6"). `None` when none of them
+    /// says, and for items that don't come from a font (images, links, form
+    /// fields, OCR). Independent of `is_bold`, which stays as it was: a
+    /// medium face reports `Some(500)` and `is_bold: false`.
+    pub font_weight: Option<u16>,
     /// Whether the text is underlined (drawn rule/thin rect under the
     /// baseline — PDFs have no underline font flag, so this is detected
     /// geometrically after extraction; see `extractor::underline`).
@@ -694,6 +707,7 @@ mod formatting_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: strikeout,
             rotation: 0.0,

@@ -394,6 +394,12 @@ pub struct PyTextItem {
     pub is_bold: bool,
     #[pyo3(get)]
     pub is_italic: bool,
+    /// The font's weight class on the 100..=900 scale (400 regular, 700
+    /// bold), from the embedded font program's OS/2 table, else the
+    /// FontDescriptor's /FontWeight, else a weight word in the font name;
+    /// None when none of them says. Independent of is_bold.
+    #[pyo3(get)]
+    pub font_weight: Option<u16>,
     #[pyo3(get)]
     pub is_underline: bool,
     #[pyo3(get)]
@@ -615,6 +621,7 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             page: item.page,
             is_bold: item.is_bold,
             is_italic: item.is_italic,
+            font_weight: item.font_weight,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
             rotation: item.rotation,
@@ -883,14 +890,27 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 ///     pages: Optional list of 1-indexed pages (matching TextItem.page).
 ///         When None (default), the whole document is returned.
 ///
+///     bold_from_weight: Also read bold from the font's weight class: is_bold
+///         is then True as well when font_weight is 600 or more, and adjacent
+///         runs whose font_weight differs stay separate items. False by
+///         default, where is_bold and item merging are unchanged.
+///
 /// Returns:
 ///     List of TextItem. x/y are PDF points relative to the page's visible
 ///     page box (CropBox ∩ MediaBox, else MediaBox), origin at its lower-left
 ///     corner with y up; extract_text_in_regions reads regions relative to
 ///     the same box from its top-left corner (flip y with the box height).
 #[pyfunction]
-#[pyo3(signature = (path, pages=None))]
-fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<Vec<PyTextItem>> {
+#[pyo3(signature = (path, pages=None, bold_from_weight=false))]
+fn extract_text_with_positions(
+    path: &str,
+    pages: Option<Vec<u32>>,
+    bold_from_weight: bool,
+) -> PyResult<Vec<PyTextItem>> {
+    if bold_from_weight {
+        let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
+        return extract_text_with_positions_bytes(&data, pages, bold_from_weight);
+    }
     let items = match pages {
         Some(p) => {
             let page_set: HashSet<u32> = p.into_iter().collect();
@@ -899,6 +919,11 @@ fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<
         None => crate::extract_text_with_positions(path).map_err(to_py_err)?,
     };
     Ok(convert_text_items(items))
+}
+
+/// The positioned-text options a `bold_from_weight` argument asks for.
+fn position_options(bold_from_weight: bool) -> crate::PositionOptions {
+    crate::PositionOptions::new().bold_from_weight(bold_from_weight)
 }
 
 /// The coordinate frame of a page whose text was predominantly rotated.
@@ -960,18 +985,31 @@ fn convert_page_rotations(
 /// frame of every page whose text was predominantly rotated. Items on such a
 /// page are expressed in the turned frame (their dominant runs read
 /// left-to-right there); pages absent from `page_rotations` are upright.
+/// `bold_from_weight` is the option of extract_text_with_positions.
 #[pyfunction]
-fn extract_text_with_positions_and_rotations(path: &str) -> PyResult<PyPositionedText> {
+#[pyo3(signature = (path, bold_from_weight=false))]
+fn extract_text_with_positions_and_rotations(
+    path: &str,
+    bold_from_weight: bool,
+) -> PyResult<PyPositionedText> {
     let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
-    extract_text_with_positions_and_rotations_bytes(&data)
+    extract_text_with_positions_and_rotations_bytes(&data, bold_from_weight)
 }
 
 /// Extract text with positions from bytes, together with the coordinate frame
 /// of every page whose text was predominantly rotated.
 #[pyfunction]
-fn extract_text_with_positions_and_rotations_bytes(data: &[u8]) -> PyResult<PyPositionedText> {
-    let (items, rotations) =
-        crate::extract_text_with_positions_and_rotations_mem(data).map_err(to_py_err)?;
+#[pyo3(signature = (data, bold_from_weight=false))]
+fn extract_text_with_positions_and_rotations_bytes(
+    data: &[u8],
+    bold_from_weight: bool,
+) -> PyResult<PyPositionedText> {
+    let (items, rotations) = crate::extract_text_with_positions_and_rotations_mem_with_options(
+        data,
+        None,
+        position_options(bold_from_weight),
+    )
+    .map_err(to_py_err)?;
     Ok(PyPositionedText {
         items: convert_text_items(items),
         page_rotations: convert_page_rotations(rotations),
@@ -982,19 +1020,19 @@ fn extract_text_with_positions_and_rotations_bytes(data: &[u8]) -> PyResult<PyPo
 ///
 /// See extract_text_with_positions for the arguments and coordinate frame.
 #[pyfunction]
-#[pyo3(signature = (data, pages=None))]
+#[pyo3(signature = (data, pages=None, bold_from_weight=false))]
 fn extract_text_with_positions_bytes(
     data: &[u8],
     pages: Option<Vec<u32>>,
+    bold_from_weight: bool,
 ) -> PyResult<Vec<PyTextItem>> {
-    let items = match pages {
-        Some(p) => {
-            let page_set: HashSet<u32> = p.into_iter().collect();
-            crate::extractor::extract_text_with_positions_mem_pages(data, Some(&page_set))
-                .map_err(to_py_err)?
-        }
-        None => crate::extractor::extract_text_with_positions_mem(data).map_err(to_py_err)?,
-    };
+    let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
+    let items = crate::extract_text_with_positions_mem_with_options(
+        data,
+        page_set.as_ref(),
+        position_options(bold_from_weight),
+    )
+    .map_err(to_py_err)?;
     Ok(convert_text_items(items))
 }
 
@@ -1008,15 +1046,21 @@ fn extract_text_with_positions_bytes(
 ///         box extract_text_with_positions reports items in, flipped to a
 ///         top-left origin (y_top = box_height - y).
 ///
+///     bold_from_weight: The option of extract_text_with_positions: read bold
+///         from the font's weight class too and keep runs of different weight
+///         apart while a region's lines are assembled. False by default.
+///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
 #[pyfunction]
+#[pyo3(signature = (path, page_regions, bold_from_weight=false))]
 fn extract_text_in_regions(
     path: &str,
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
+    bold_from_weight: bool,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    extract_text_in_regions_bytes(&data, page_regions)
+    extract_text_in_regions_bytes(&data, page_regions, bold_from_weight)
 }
 
 /// Extract text within bounding-box regions from PDF bytes.
@@ -1029,15 +1073,24 @@ fn extract_text_in_regions(
 ///         box extract_text_with_positions reports items in, flipped to a
 ///         top-left origin (y_top = box_height - y).
 ///
+///     bold_from_weight: See extract_text_in_regions.
+///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
 #[pyfunction]
+#[pyo3(signature = (data, page_regions, bold_from_weight=false))]
 fn extract_text_in_regions_bytes(
     data: &[u8],
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
+    bold_from_weight: bool,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let regions = parse_page_regions(page_regions)?;
-    let results = crate::extract_text_in_regions_mem(data, &regions).map_err(to_py_err)?;
+    let results = crate::extract_text_in_regions_mem_with_options(
+        data,
+        &regions,
+        position_options(bold_from_weight),
+    )
+    .map_err(to_py_err)?;
     Ok(convert_region_results(results))
 }
 

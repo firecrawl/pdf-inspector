@@ -501,6 +501,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,

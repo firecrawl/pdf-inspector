@@ -122,6 +122,14 @@ class TextItem:
     page: int
     is_bold: bool
     is_italic: bool
+    font_weight: Optional[int]
+    """The font's weight class on the 100..900 scale shared by CSS
+    ``font-weight`` and the OS/2 ``usWeightClass`` field (400 regular, 700
+    bold): the embedded font program's OS/2 table, else the FontDescriptor's
+    ``/FontWeight``, else a weight word in the font name ("Light", "Medium",
+    "-Md", "Black", "W6"). ``None`` when none of them says, and for image, link
+    and form-field items. Independent of ``is_bold``, which is unchanged: a
+    medium face reports ``500`` with ``is_bold`` ``False``."""
     is_underline: bool
     is_strikeout: bool
     baseline_shift: float
@@ -152,13 +160,17 @@ class PositionedText:
     """One entry per re-based page; pages absent here are upright and their
     items are in plain page coordinates."""
 
-def extract_text_with_positions_and_rotations(path: str) -> PositionedText:
+def extract_text_with_positions_and_rotations(
+    path: str, bold_from_weight: bool = False
+) -> PositionedText:
     """Extract positioned text plus the coordinate frame of every page whose
     text was predominantly rotated (items on such pages are in the turned
     frame)."""
     ...
 
-def extract_text_with_positions_and_rotations_bytes(data: bytes) -> PositionedText:
+def extract_text_with_positions_and_rotations_bytes(
+    data: bytes, bold_from_weight: bool = False
+) -> PositionedText:
     """Bytes variant of extract_text_with_positions_and_rotations."""
     ...
 
@@ -276,7 +288,9 @@ def extract_text_bytes(data: bytes) -> str:
     """Extract plain text from PDF bytes."""
     ...
 
-def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) -> list[TextItem]:
+def extract_text_with_positions(
+    path: str, pages: Optional[list[int]] = None, bold_from_weight: bool = False
+) -> list[TextItem]:
     """Extract text with position information.
 
     ``x``/``y`` are PDF points relative to the page's visible page box
@@ -294,10 +308,19 @@ def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) ->
         path: Path to the PDF file.
         pages: Optional list of 1-indexed pages (matching ``TextItem.page``).
             When ``None`` (default), the whole document is returned.
+        bold_from_weight: Also read bold from the font's weight class:
+            ``TextItem.is_bold`` is then ``True`` as well when
+            ``TextItem.font_weight`` is 600 or more, and adjacent runs whose
+            ``font_weight`` differs stay separate items, so a heavier run
+            inside a lighter paragraph keeps its own item. ``False`` by
+            default, where ``is_bold`` and item merging are unchanged;
+            ``font_weight`` is reported either way.
     """
     ...
 
-def extract_text_with_positions_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[TextItem]:
+def extract_text_with_positions_bytes(
+    data: bytes, pages: Optional[list[int]] = None, bold_from_weight: bool = False
+) -> list[TextItem]:
     """Extract text with position information from bytes.
 
     See :func:`extract_text_with_positions` for the coordinate frame.
@@ -328,6 +351,7 @@ def extract_structure_elements_bytes(data: bytes, pages: Optional[list[int]] = N
 def extract_text_in_regions(
     path: str,
     page_regions: list[tuple[int, list[list[float]]]],
+    bold_from_weight: bool = False,
 ) -> list[PageRegionTexts]:
     """Extract text within bounding-box regions from a PDF file.
 
@@ -338,12 +362,17 @@ def extract_text_in_regions(
             visible page box (``CropBox ∩ MediaBox``, else the MediaBox) — the
             same box :func:`extract_text_with_positions` reports items in,
             flipped to a top-left origin (``y_top = box_height - y``).
+        bold_from_weight: The option of :func:`extract_text_with_positions`:
+            read bold from the font's weight class too and keep runs of
+            different weight apart while a region's lines are assembled.
+            ``False`` by default.
     """
     ...
 
 def extract_text_in_regions_bytes(
     data: bytes,
     page_regions: list[tuple[int, list[list[float]]]],
+    bold_from_weight: bool = False,
 ) -> list[PageRegionTexts]:
     """Extract text within bounding-box regions from PDF bytes.
 

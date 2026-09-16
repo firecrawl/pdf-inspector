@@ -895,6 +895,7 @@ mod tests {
             page: 1,
             is_bold: bold,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,

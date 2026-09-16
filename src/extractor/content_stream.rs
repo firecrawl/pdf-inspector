@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, build_type3_y_flips,
-    compute_string_width_ts, descriptor_style_flags, extract_text_from_operand,
-    get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
+    compute_string_width_ts, extract_text_from_operand, font_style, get_font_file2_obj_num,
+    get_operand_bytes, CMapDecisionCache, FontStyle, FontStyleCache,
 };
 use super::geometry::{
     advanced_tm, estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees,
@@ -342,14 +342,23 @@ impl ActualTextBounds {
     }
 }
 
-/// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible)`
-/// where `has_gid_fonts` indicates the page uses fonts with unresolvable
-/// gid-encoded glyphs, `page_rotation` says whether (and which way) the
-/// coordinate frame was turned so predominantly rotated text reads along +x
-/// — region boxes must follow it (see `PageRotation`) — and
-/// `skipped_invisible` reports that invisible (Tr 3) text was present but
-/// suppressed — callers can use it to decide whether an `include_invisible`
-/// retry could recover anything at all.
+/// Switches of one page's text extraction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TextExtractionOptions {
+    /// Keep invisible (Tr 3) text instead of skipping it.
+    pub(crate) include_invisible: bool,
+    /// Read bold from the weight class too and keep runs of different
+    /// weight apart — see `PositionOptions::bold_from_weight`.
+    pub(crate) bold_from_weight: bool,
+}
+
+/// Weight class from which `bold_from_weight` reads `is_bold`: SemiBold and
+/// heavier.
+pub(crate) const BOLD_WEIGHT_CLASS: u16 = 600;
+
+/// [`extract_page_text_items_with_options`] with only `include_invisible`
+/// set — the shape the extraction tests drive pages through.
+#[cfg(test)]
 pub(crate) fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
@@ -359,6 +368,38 @@ pub(crate) fn extract_page_text_items(
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, PageRotation, bool), PdfError> {
+    extract_page_text_items_with_options(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        TextExtractionOptions {
+            include_invisible,
+            ..TextExtractionOptions::default()
+        },
+        style_cache,
+        form_budget,
+    )
+}
+
+/// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible)`
+/// where `has_gid_fonts` indicates the page uses fonts with unresolvable
+/// gid-encoded glyphs, `page_rotation` says whether (and which way) the
+/// coordinate frame was turned so predominantly rotated text reads along +x
+/// — region boxes must follow it (see `PageRotation`) — and
+/// `skipped_invisible` reports that invisible (Tr 3) text was present but
+/// suppressed — callers can use it to decide whether an `include_invisible`
+/// retry could recover anything at all.
+pub(crate) fn extract_page_text_items_with_options(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    options: TextExtractionOptions,
+    style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
+) -> Result<(PageExtraction, bool, PageRotation, bool), PdfError> {
+    let include_invisible = options.include_invisible;
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
@@ -419,7 +460,7 @@ pub(crate) fn extract_page_text_items(
         std::collections::HashMap::new();
     let mut inline_cmaps: std::collections::HashMap<String, crate::tounicode::CMapEntry> =
         std::collections::HashMap::new();
-    let mut font_style_flags: std::collections::HashMap<String, (bool, bool)> =
+    let mut font_styles: std::collections::HashMap<String, FontStyle> =
         std::collections::HashMap::new();
     for (font_name, font_dict) in &fonts {
         let resource_name = String::from_utf8_lossy(font_name).to_string();
@@ -431,9 +472,9 @@ pub(crate) fn extract_page_text_items(
         }
         // Descriptor style flags rescue subset fonts whose BaseFont names
         // are opaque tags the name heuristics can't read.
-        let style = descriptor_style_flags(doc, font_dict, style_cache);
-        if style != (false, false) {
-            font_style_flags.insert(resource_name.clone(), style);
+        let style = font_style(doc, font_dict, style_cache);
+        if style != FontStyle::default() {
+            font_styles.insert(resource_name.clone(), style);
         }
         // Track ToUnicode object reference, with FontFile2 fallback for Identity-H/V.
         // Also handle inline ToUnicode streams.
@@ -914,10 +955,8 @@ pub(crate) fn extract_page_text_items(
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            let (desc_italic, desc_bold) = font_style_flags
-                                .get(&current_font)
-                                .copied()
-                                .unwrap_or((false, false));
+                            let style = font_styles.get(&current_font).copied().unwrap_or_default();
+                            let (desc_italic, desc_bold) = style.flags();
                             if crate::text_utils::is_visual_rtl_candidate(&text) {
                                 // combined[0] is the device-space advance
                                 // direction: forward paint order means the
@@ -959,6 +998,7 @@ pub(crate) fn extract_page_text_items(
                                             &ctm,
                                         )),
                                 is_italic: is_italic_font(base_font) || desc_italic,
+                                font_weight: style.weight,
                                 is_underline: false,
                                 is_strikeout: false,
                                 rotation: geometry.rotation,
@@ -1349,10 +1389,8 @@ pub(crate) fn extract_page_text_items(
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            let (desc_italic, desc_bold) = font_style_flags
-                                .get(&current_font)
-                                .copied()
-                                .unwrap_or((false, false));
+                            let style = font_styles.get(&current_font).copied().unwrap_or_default();
+                            let (desc_italic, desc_bold) = style.flags();
                             let scale_x = (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])
                                 * horizontal_scale;
                             // Rotated matrices carry no horizontal evidence:
@@ -1444,6 +1482,7 @@ pub(crate) fn extract_page_text_items(
                                                 &ctm,
                                             )),
                                     is_italic: is_italic_font(base_font) || desc_italic,
+                                    font_weight: style.weight,
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: geometry.rotation,
@@ -1634,10 +1673,8 @@ pub(crate) fn extract_page_text_items(
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            let (desc_italic, desc_bold) = font_style_flags
-                                .get(&current_font)
-                                .copied()
-                                .unwrap_or((false, false));
+                            let style = font_styles.get(&current_font).copied().unwrap_or_default();
+                            let (desc_italic, desc_bold) = style.flags();
                             if crate::text_utils::is_visual_rtl_candidate(&text)
                                 && combined[0].abs() > combined[1].abs()
                             {
@@ -1672,6 +1709,7 @@ pub(crate) fn extract_page_text_items(
                                             &ctm,
                                         )),
                                 is_italic: is_italic_font(base_font) || desc_italic,
+                                font_weight: style.weight,
                                 is_underline: false,
                                 is_strikeout: false,
                                 rotation: geometry.rotation,
@@ -1761,6 +1799,7 @@ pub(crate) fn extract_page_text_items(
                                         page: page_num,
                                         is_bold: false,
                                         is_italic: false,
+                                        font_weight: None,
                                         is_underline: false,
                                         is_strikeout: false,
                                         rotation: 0.0,
@@ -1950,10 +1989,9 @@ pub(crate) fn extract_page_text_items(
                                     .get(&current_font)
                                     .map(|s| s.as_str())
                                     .unwrap_or(&current_font);
-                                let (desc_italic, desc_bold) = font_style_flags
-                                    .get(&current_font)
-                                    .copied()
-                                    .unwrap_or((false, false));
+                                let style =
+                                    font_styles.get(&current_font).copied().unwrap_or_default();
+                                let (desc_italic, desc_bold) = style.flags();
                                 items.push(TextItem {
                                     text: expand_ligatures(&at),
                                     x: geometry.x,
@@ -1971,6 +2009,7 @@ pub(crate) fn extract_page_text_items(
                                     page: page_num,
                                     is_bold: is_bold_font(base_font) || desc_bold,
                                     is_italic: is_italic_font(base_font) || desc_italic,
+                                    font_weight: style.weight,
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: geometry.rotation,
@@ -2310,12 +2349,19 @@ pub(crate) fn extract_page_text_items(
         page_num,
     );
 
+    if options.bold_from_weight {
+        for item in &mut items {
+            if item.font_weight.is_some_and(|w| w >= BOLD_WEIGHT_CLASS) {
+                item.is_bold = true;
+            }
+        }
+    }
     let items = if page_rotation == PageRotation::Upright {
-        super::merge_text_items_with_clips(items, &item_clips)
+        super::merge_text_items_with_clips(items, &item_clips, options.bold_from_weight)
     } else {
         // Clips use the original page frame; rotated-page correction is an
         // intentionally unsupported provenance case.
-        super::merge_text_items(items)
+        super::merge_text_items_with_clips(items, &[], options.bold_from_weight)
     };
     let items = super::merge_subscript_items(items);
     Ok((
@@ -3955,6 +4001,7 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,
@@ -4039,6 +4086,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (   ) Tj ET",
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,

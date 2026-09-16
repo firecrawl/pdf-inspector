@@ -54,9 +54,11 @@ pub use detector::{
 pub use extractor::geometry::PageRotation;
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_and_rotations_mem,
-    extract_text_with_positions_and_rotations_mem_in_frame, extract_text_with_positions_mem,
-    extract_text_with_positions_mem_in_frame, extract_text_with_positions_pages,
-    extract_text_with_positions_pages_with_password, PositionFrame,
+    extract_text_with_positions_and_rotations_mem_in_frame,
+    extract_text_with_positions_and_rotations_mem_with_options, extract_text_with_positions_mem,
+    extract_text_with_positions_mem_in_frame, extract_text_with_positions_mem_with_options,
+    extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
+    PositionFrame, PositionOptions,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
@@ -838,6 +840,7 @@ mod ocr_header_footer_tests {
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1060,6 +1063,24 @@ pub fn extract_text_in_regions_mem_in_frame(
     page_regions: &[(u32, Vec<[f32; 4]>)],
     frame: PositionFrame,
 ) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_text_in_regions_mem_with_options(
+        buffer,
+        page_regions,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_text_in_regions_mem_in_frame`] with every option given as a
+/// [`PositionOptions`]: the frame the region rects are read in, and whether
+/// bold is also read from the font's weight class (`bold_from_weight`, which
+/// also keeps runs of different weight apart while the region's lines are
+/// assembled). The default options are [`extract_text_in_regions_mem`].
+pub fn extract_text_in_regions_mem_with_options(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    options: PositionOptions,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    let frame = options.frame;
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
     let pages = doc.get_pages();
@@ -1098,12 +1119,12 @@ pub fn extract_text_in_regions_mem_in_frame(
             skipped_invisible,
             page_box,
             ..
-        } = extractor::extract_page_text_items_in_page_box(
+        } = extractor::extract_page_text_items_in_page_box_with_options(
             &doc,
             page_id,
             *page_num,
             &font_cmaps,
-            false,
+            options.text_extraction(false),
             &mut style_cache,
             &mut form_budget,
         )?;
@@ -1133,12 +1154,12 @@ pub fn extract_text_in_regions_mem_in_frame(
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
         });
         if skipped_invisible && !has_visible_text {
-            if let Ok(invisible) = extractor::extract_page_text_items_in_page_box(
+            if let Ok(invisible) = extractor::extract_page_text_items_in_page_box_with_options(
                 &doc,
                 page_id,
                 *page_num,
                 &font_cmaps,
-                true,
+                options.text_extraction(true),
                 &mut style_cache,
                 &mut form_budget,
             ) {
@@ -1303,6 +1324,21 @@ pub fn extract_tables_in_regions_mem_in_frame(
     page_regions: &[(u32, Vec<[f32; 4]>)],
     frame: PositionFrame,
 ) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_tables_in_regions_mem_with_options(
+        buffer,
+        page_regions,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_tables_in_regions_mem_in_frame`] with every option given as a
+/// [`PositionOptions`] — see [`extract_text_in_regions_mem_with_options`].
+pub fn extract_tables_in_regions_mem_with_options(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    options: PositionOptions,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    let frame = options.frame;
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
     let pages = doc.get_pages();
@@ -1332,12 +1368,12 @@ pub fn extract_tables_in_regions_mem_in_frame(
             coords_rotated,
             page_box,
             ..
-        } = extractor::extract_page_text_items_in_page_box(
+        } = extractor::extract_page_text_items_in_page_box_with_options(
             &doc,
             page_id,
             *page_num,
             &font_cmaps,
-            false,
+            options.text_extraction(false),
             &mut style_cache,
             &mut extractor::FormWalkBudget::new(),
         )?;
@@ -5596,6 +5632,7 @@ mod text_cluster_column_undercount_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -5877,6 +5914,7 @@ mod table_candidate_selection_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -6712,6 +6750,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -7924,6 +7963,7 @@ mod rotated_run_region_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,

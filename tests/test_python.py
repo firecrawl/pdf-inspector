@@ -244,7 +244,23 @@ class TestExtractTextWithPositions:
         assert isinstance(item.page, int)
         assert isinstance(item.is_bold, bool)
         assert isinstance(item.is_italic, bool)
+        assert item.font_weight is None or isinstance(item.font_weight, int)
         assert isinstance(item.item_type, str)
+
+    def test_bold_from_weight_defaults_off(self):
+        path = fixture_path("thermo-freon12.pdf")
+        plain = pdf_inspector.extract_text_with_positions(path)
+        explicit = pdf_inspector.extract_text_with_positions(path, bold_from_weight=False)
+        assert [(i.text, i.is_bold) for i in explicit] == [(i.text, i.is_bold) for i in plain]
+        # Helvetica carries no weight word, so the option changes nothing here
+        # and every weight it reports is on the 100..900 scale.
+        weighted = pdf_inspector.extract_text_with_positions(path, bold_from_weight=True)
+        assert len(weighted) == len(plain)
+        assert all(i.font_weight is None or 100 <= i.font_weight <= 900 for i in weighted)
+        positioned = pdf_inspector.extract_text_with_positions_and_rotations(
+            path, bold_from_weight=True
+        )
+        assert len(positioned.items) == len(plain)
 
     def test_with_pages(self):
         items = pdf_inspector.extract_text_with_positions(
@@ -428,6 +444,15 @@ class TestExtractTextInRegions:
         assert results[0].page == 0
         assert len(results[0].regions) == 1
         assert isinstance(results[0].regions[0].text, str)
+
+    def test_bold_from_weight_option(self):
+        data = fixture_bytes("thermo-freon12.pdf")
+        regions = [(0, [[0.0, 0.0, 600.0, 100.0]])]
+        plain = pdf_inspector.extract_text_in_regions_bytes(data, regions)
+        weighted = pdf_inspector.extract_text_in_regions_bytes(
+            data, regions, bold_from_weight=True
+        )
+        assert weighted[0].regions[0].text == plain[0].regions[0].text
 
     def test_repr(self):
         results = pdf_inspector.extract_text_in_regions(

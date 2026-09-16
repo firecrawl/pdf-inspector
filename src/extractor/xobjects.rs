@@ -1,6 +1,6 @@
 //! Form XObject and image XObject extraction.
 
-use super::fonts::descriptor_style_flags;
+use super::fonts::{font_style, FontStyle};
 use super::text_paint::{PaintResources, TextPaint};
 use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_italic_font};
 use crate::tounicode::FontCMaps;
@@ -351,7 +351,7 @@ fn extract_form_xobject_text_inner(
     let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
     let mut inline_cmaps: HashMap<String, crate::tounicode::CMapEntry> = HashMap::new();
 
-    let mut font_style_flags: HashMap<String, (bool, bool)> = HashMap::new();
+    let mut font_styles: HashMap<String, FontStyle> = HashMap::new();
     for (font_name, font_dict) in &form_fonts {
         let resource_name = String::from_utf8_lossy(font_name).to_string();
         if let Ok(base_font) = font_dict.get(b"BaseFont") {
@@ -360,9 +360,9 @@ fn extract_form_xobject_text_inner(
                 font_base_names.insert(resource_name.clone(), base_name);
             }
         }
-        let style = descriptor_style_flags(doc, font_dict, style_cache);
-        if style != (false, false) {
-            font_style_flags.insert(resource_name.clone(), style);
+        let style = font_style(doc, font_dict, style_cache);
+        if style != FontStyle::default() {
+            font_styles.insert(resource_name.clone(), style);
         }
         match font_dict.get(b"ToUnicode") {
             Ok(tounicode) => {
@@ -561,6 +561,7 @@ fn extract_form_xobject_text_inner(
                                     page: page_num,
                                     is_bold: false,
                                     is_italic: false,
+                                    font_weight: None,
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: 0.0,
@@ -839,10 +840,8 @@ fn extract_form_xobject_text_inner(
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            let (desc_italic, desc_bold) = font_style_flags
-                                .get(&current_font)
-                                .copied()
-                                .unwrap_or((false, false));
+                            let style = font_styles.get(&current_font).copied().unwrap_or_default();
+                            let (desc_italic, desc_bold) = style.flags();
                             // Forward paint order (positive device-space
                             // advance) may be visual storage; a mirrored
                             // matrix already paints right-to-left. Rotated
@@ -882,6 +881,7 @@ fn extract_form_xobject_text_inner(
                                             &ctm,
                                         )),
                                 is_italic: is_italic_font(base_font) || desc_italic,
+                                font_weight: style.weight,
                                 is_underline: false,
                                 is_strikeout: false,
                                 rotation: geometry.rotation,
@@ -1211,10 +1211,8 @@ fn extract_form_xobject_text_inner(
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            let (desc_italic, desc_bold) = font_style_flags
-                                .get(&current_font)
-                                .copied()
-                                .unwrap_or((false, false));
+                            let style = font_styles.get(&current_font).copied().unwrap_or_default();
+                            let (desc_italic, desc_bold) = style.flags();
                             let scale_x = (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])
                                 * horizontal_scale;
                             // Rotated matrices carry no horizontal evidence:
@@ -1306,6 +1304,7 @@ fn extract_form_xobject_text_inner(
                                                 &ctm,
                                             )),
                                     is_italic: is_italic_font(base_font) || desc_italic,
+                                    font_weight: style.weight,
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: geometry.rotation,

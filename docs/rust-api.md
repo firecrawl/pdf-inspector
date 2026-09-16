@@ -541,12 +541,16 @@ read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_with_positions(path)` | Text with its axis-aligned box (visible-page-box frame, see above), `rotation`, and font info |
 | `extract_text_with_positions_mem_in_frame(bytes, pages, frame)` | Positioned text from bytes, limited to 1-indexed `pages`, in the sheet or display frame (`PositionFrame`) |
+| `extract_text_with_positions_mem_with_options(bytes, pages, options)` | The same with every option given as a `PositionOptions` (frame, `bold_from_weight`) |
 | `extract_text_with_positions_and_rotations_mem(bytes)` | Positioned text plus the `PageRotation` of every page whose text was predominantly rotated |
 | `extract_text_with_positions_and_rotations_mem_in_frame(bytes, pages, frame)` | The same with a page filter and a frame choice |
+| `extract_text_with_positions_and_rotations_mem_with_options(bytes, pages, options)` | The same with a `PositionOptions` |
 | `extract_text_in_regions_mem(bytes, page_regions)` | Text inside top-left region rects (sheet frame) |
 | `extract_text_in_regions_mem_in_frame(bytes, page_regions, frame)` | The same with region rects read in the sheet or display frame |
+| `extract_text_in_regions_mem_with_options(bytes, page_regions, options)` | The same with a `PositionOptions` |
 | `extract_tables_in_regions_mem(bytes, page_regions)` | Markdown tables inside region rects (sheet frame) |
 | `extract_tables_in_regions_mem_in_frame(bytes, page_regions, frame)` | The same with region rects read in the sheet or display frame |
+| `extract_tables_in_regions_mem_with_options(bytes, page_regions, options)` | The same with a `PositionOptions` |
 | `collect_text_in_region_in_frame(items, x1, y1, x2, y2, page_height, rotation)` | Region text with the page's coordinate frame given explicitly (`page_height` is the visible page box height) |
 | `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |
@@ -570,9 +574,10 @@ Low-level detection functions are also available via the `detector` module (`det
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
-| `TextItem` | Text with its axis-aligned box (PDF points from the visible page box's lower-left corner), baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false when the font has no width metrics or an ActualText span's advance could not be recovered), `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline), font info, page number, and optional structure-tree `mcid` |
+| `TextItem` | Text with its axis-aligned box (PDF points from the visible page box's lower-left corner), baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false when the font has no width metrics or an ActualText span's advance could not be recovered), `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline), font info including `font_weight` (the 100..=900 weight class from the embedded font's OS/2 table, `/FontWeight` or a weight word in the name; `None` when unknown), page number, and optional structure-tree `mcid` |
 | `PageRotation` | `Upright`, `Ccw`, `Cw`: how a predominantly rotated page's coordinate frame was turned so its text reads left-to-right |
 | `PositionFrame` | `Sheet` (default): the visible page box as laid out in the content stream, `/Rotate` not applied, predominantly rotated pages turned; `Display`: the rendered page, the visible box turned clockwise by the inheritable `/Rotate`, with only the synthetic turn of a predominantly rotated page undone first while individual runs keep their own `rotation` (see [Coordinate frame](#coordinate-frame)) |
+| `PositionOptions` | Options of the `_with_options` position and region functions: `frame` (a `PositionFrame`) and `bold_from_weight`, which also reads `TextItem::is_bold` from a `font_weight` of 600 or more and keeps adjacent runs of different weight as separate items; off by default, where `is_bold` and merging are unchanged |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |

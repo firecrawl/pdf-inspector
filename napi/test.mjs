@@ -80,8 +80,21 @@ assert.equal(typeof item.fontSize, 'number');
 assert.equal(typeof item.page, 'number');
 assert.equal(typeof item.isBold, 'boolean');
 assert.equal(typeof item.isItalic, 'boolean');
+assert.ok(item.fontWeight === undefined || typeof item.fontWeight === 'number');
 assert.equal(typeof item.itemType, 'string');
 console.log('  extractTextWithPositions: OK');
+
+// boldFromWeight: off by default and when passed as false; Helvetica names
+// no weight, so the option changes nothing on this fixture either way.
+const plainStyles = items.map(i => [i.text, i.isBold, i.fontWeight]);
+assert.deepEqual(
+  extractTextWithPositions(fixture, undefined, { boldFromWeight: false }).map(i => [i.text, i.isBold, i.fontWeight]),
+  plainStyles,
+);
+const weightedItems = extractTextWithPositions(fixture, undefined, { boldFromWeight: true });
+assert.equal(weightedItems.length, items.length);
+assert.ok(weightedItems.every(i => i.fontWeight === undefined || (i.fontWeight >= 100 && i.fontWeight <= 900)));
+console.log('  extractTextWithPositions boldFromWeight: OK');
 
 // with pages filter
 const page1Items = extractTextWithPositions(fixture, [1]);
