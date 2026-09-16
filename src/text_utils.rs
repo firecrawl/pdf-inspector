@@ -341,7 +341,9 @@ pub fn is_bold_font(font_name: &str) -> bool {
 ///
 /// The name is split at the separators producers use (`-`, `_`, `,`,
 /// space) and at lowercase→uppercase boundaries, and each piece is matched
-/// whole, so the abbreviations of foundry style suffixes read ("-Md",
+/// whole; a qualifier reaches the word after it across either kind of
+/// seam ("ExtraLight", "Extra-Light", "Extra Light" are all 200). The
+/// abbreviations of foundry style suffixes read ("-Md",
 /// "-Lt", "-Bd", "-Sb", "-Dm", "-Hv", "-Blk", "-XBd", "-Ult", "-UltLt",
 /// "-W3".."-W9") while "Bookman" is not Book. Abbreviations count only
 /// after the family name (a leading "TH" is a Thai family, not Thin) and
@@ -359,61 +361,63 @@ pub fn font_weight_from_name(font_name: &str) -> Option<u16> {
     let name = font_name
         .split_once('+')
         .map_or(font_name, |(_, rest)| rest);
-    let mut weight = None;
-    for (token_index, token) in name
+    // The name's tokens and their pieces, walked as one sequence so a
+    // qualifier reaches its word across a separator ("Foo-Extra-Light").
+    let tokens: Vec<Vec<&str>> = name
         .split(['-', '_', ',', ' ', '.'])
         .filter(|token| !token.is_empty())
+        .map(camel_pieces)
+        .collect();
+    let flat: Vec<(usize, usize)> = tokens
+        .iter()
         .enumerate()
-    {
-        let pieces = camel_pieces(token);
-        let mut i = 0;
-        while i < pieces.len() {
-            let piece = pieces[i].to_ascii_lowercase();
-            let next = pieces
-                .get(i + 1)
-                .map(|p| p.to_ascii_lowercase())
-                .unwrap_or_default();
-            // "Extra"/"Ultra"/"X" and "Semi"/"Demi" qualify the word after
-            // them; on their own only "Ultra" and "Demi" name a weight.
-            let extra = matches!(piece.as_str(), "extra" | "ultra" | "ult" | "x");
-            let semi = matches!(piece.as_str(), "semi" | "demi" | "sm" | "dm");
-            let qualified = match next.as_str() {
-                "light" | "lt" if extra => Some(200),
-                "bold" | "bd" if extra => Some(800),
-                "black" | "blk" if extra => Some(900),
-                "bold" | "bd" if semi => Some(600),
-                _ => None,
-            };
-            let width = if qualified.is_some() { 2 } else { 1 };
-            let whole = qualified.or_else(|| weight_word(&piece)).or_else(|| {
-                (token_index > 0 || i > 0)
-                    .then(|| weight_abbreviation(pieces[i]))
-                    .flatten()
-            });
-            let found = if whole.is_some() {
-                // A weight word inside the family name is a style only at
-                // its end; a family that starts with one, or goes on with
-                // another word after it, merely contains the word.
-                let in_family = token_index == 0
-                    && (i == 0
-                        || !pieces[i + width..]
-                            .iter()
-                            .all(|rest| is_style_or_mark(rest)));
-                (!in_family).then_some(whole).flatten()
-            } else {
-                // A piece written in one case has no seams to split at: look
-                // for the words inside it, at its end when it is the family.
-                let flat_case = pieces[i].chars().all(|c| !c.is_lowercase())
-                    || pieces[i].chars().all(|c| !c.is_uppercase());
-                flat_case
-                    .then(|| weight_word_substring(&piece, token_index == 0))
-                    .flatten()
-            };
-            if found.is_some() {
-                weight = found;
-            }
-            i += width;
+        .flat_map(|(t, pieces)| (0..pieces.len()).map(move |i| (t, i)))
+        .collect();
+    let lower = |&(t, i): &(usize, usize)| tokens[t][i].to_ascii_lowercase();
+    let mut weight = None;
+    let mut k = 0;
+    while k < flat.len() {
+        let (t, i) = flat[k];
+        let piece = lower(&flat[k]);
+        let next = flat.get(k + 1).map(lower).unwrap_or_default();
+        // "Extra"/"Ultra"/"X" and "Semi"/"Demi" qualify the word after
+        // them; on their own only "Ultra" and "Demi" name a weight.
+        let extra = matches!(piece.as_str(), "extra" | "ultra" | "ult" | "x");
+        let semi = matches!(piece.as_str(), "semi" | "demi" | "sm" | "dm");
+        let qualified = match next.as_str() {
+            "light" | "lt" if extra => Some(200),
+            "bold" | "bd" if extra => Some(800),
+            "black" | "blk" if extra => Some(900),
+            "bold" | "bd" if semi => Some(600),
+            _ => None,
+        };
+        let width = if qualified.is_some() { 2 } else { 1 };
+        let whole = qualified.or_else(|| weight_word(&piece)).or_else(|| {
+            (t > 0 || i > 0)
+                .then(|| weight_abbreviation(tokens[t][i]))
+                .flatten()
+        });
+        let found = if whole.is_some() {
+            // A weight word inside the family name is a style only at its
+            // end; a family that starts with one, or goes on with another
+            // word after it, merely contains the word.
+            let (last_t, last_i) = flat[k + width - 1];
+            let rest = &tokens[last_t][last_i + 1..];
+            let in_family = t == 0 && (i == 0 || !rest.iter().all(|rest| is_style_or_mark(rest)));
+            (!in_family).then_some(whole).flatten()
+        } else {
+            // A piece written in one case has no seams to split at: look
+            // for the words inside it, at its end when it is the family.
+            let flat_case = tokens[t][i].chars().all(|c| !c.is_lowercase())
+                || tokens[t][i].chars().all(|c| !c.is_uppercase());
+            flat_case
+                .then(|| weight_word_substring(&piece, t == 0))
+                .flatten()
+        };
+        if found.is_some() {
+            weight = found;
         }
+        k += width;
     }
     weight
 }
@@ -1428,6 +1432,12 @@ mod tests {
             ("ArialBoldMT", Some(700)),
             ("HelveticaNeueLightItalic", Some(300)),
             ("GillSansUltraBold", Some(800)),
+            ("Foo-Extra-Light", Some(200)),
+            ("Foo-Ultra-Light", Some(200)),
+            ("Foo-Semi-Bold", Some(600)),
+            ("Foo-Demi-Bold", Some(600)),
+            ("Open Sans Extra Bold", Some(800)),
+            ("Foo-Extra-Black", Some(900)),
         ];
         for (name, expected) in cases {
             assert_eq!(font_weight_from_name(name), expected, "{name}");

@@ -321,8 +321,10 @@ class TestExtractTextWithPositions:
         )
         assert styles(positioned.items) == styles(plain)
 
-    def test_bold_from_weight_splits_runs_and_reads_bold_from_600(self):
+    def test_bold_from_weight_splits_runs_and_reads_bold_from_600(self, tmp_path):
         data = three_weights_pdf()
+        path = tmp_path / "three_weights.pdf"
+        path.write_bytes(data)
         styles = lambda items: [(i.text, i.is_bold, i.font_weight) for i in items]
         # Default: the three runs merge into one item as they always did, none
         # is bold, and the item carries its first run's weight class.
@@ -346,6 +348,21 @@ class TestExtractTextWithPositions:
             data, bold_from_weight=True
         )
         assert styles(positioned.items) == styles(weighted)
+        # The file-based functions read the same page the same way.
+        assert styles(pdf_inspector.extract_text_with_positions(str(path))) == styles(plain)
+        assert styles(
+            pdf_inspector.extract_text_with_positions(str(path), bold_from_weight=True)
+        ) == styles(weighted)
+        assert styles(
+            pdf_inspector.extract_text_with_positions(
+                str(path), pages=[1], bold_from_weight=True
+            )
+        ) == styles(weighted)
+        assert styles(
+            pdf_inspector.extract_text_with_positions_and_rotations(
+                str(path), bold_from_weight=True
+            ).items
+        ) == styles(weighted)
 
     def test_with_pages(self):
         items = pdf_inspector.extract_text_with_positions(
@@ -530,12 +547,14 @@ class TestExtractTextInRegions:
         assert len(results[0].regions) == 1
         assert isinstance(results[0].regions[0].text, str)
 
-    def test_bold_from_weight_keeps_the_words_of_a_region(self):
+    def test_bold_from_weight_keeps_the_words_of_a_region(self, tmp_path):
         # The option splits runs of different weight into separate items; a
         # region's text is the words on the page and reads the same either
         # way (the item-level effect is covered by
         # TestExtractTextWithPositions).
         data = three_weights_pdf()
+        path = tmp_path / "three_weights.pdf"
+        path.write_bytes(data)
         regions = [(0, [[60.0, 80.0, 400.0, 116.0]])]
         plain = pdf_inspector.extract_text_in_regions_bytes(data, regions)
         weighted = pdf_inspector.extract_text_in_regions_bytes(
@@ -543,6 +562,10 @@ class TestExtractTextInRegions:
         )
         assert plain[0].regions[0].text.splitlines()[0].strip() == "Light Medium Heavy"
         assert weighted[0].regions[0].text == plain[0].regions[0].text
+        from_file = pdf_inspector.extract_text_in_regions(
+            str(path), regions, bold_from_weight=True
+        )
+        assert from_file[0].regions[0].text == plain[0].regions[0].text
 
     def test_repr(self):
         results = pdf_inspector.extract_text_in_regions(
