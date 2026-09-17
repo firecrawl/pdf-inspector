@@ -387,9 +387,10 @@ pub(crate) fn extract_page_text_items(
 /// gid-encoded glyphs, `page_rotation` says whether (and which way) the
 /// coordinate frame was turned so predominantly rotated text reads along +x
 /// — region boxes must follow it (see `PageRotation`) — and
-/// `skipped_invisible` reports that invisible (Tr 3) text was present but
-/// suppressed — callers can use it to decide whether an `include_invisible`
-/// retry could recover anything at all.
+/// `skipped_invisible` reports that invisible text — render mode 3, or
+/// runs painted wholly outside the rectangular clip in force when they were
+/// shown — was present but suppressed; callers can use it to decide whether
+/// an `include_invisible` retry could recover anything at all.
 pub(crate) fn extract_page_text_items_with_options(
     doc: &Document,
     page_id: ObjectId,
@@ -2333,6 +2334,24 @@ pub(crate) fn extract_page_text_items_with_options(
     // (merge_text_items below reshapes the item list).
     crate::text_utils::fix_visual_order_rtl(&mut items, &rtl_visual_candidates, rtl_logical_ops);
 
+    // Runs painted wholly outside the rectangular clip in force when they
+    // were shown are invisible on the rendered page: labels a charting
+    // library parks off its plot area, content the producer cropped away.
+    // Leave them out like invisible (Tr 3) text so they cannot leak into the
+    // surrounding text; `include_invisible` keeps them, and the flag lets
+    // the region API's retry recover them on a page with nothing else.
+    // After the RTL fix, which indexes items; before the rotation
+    // correction, which moves them out of the clip's frame.
+    if !include_invisible {
+        let dropped = super::clip_boundaries::drop_clipped_away_runs(&mut items, &mut item_clips);
+        if dropped > 0 {
+            log::debug!(
+                "page {page_num}: {dropped} text run(s) painted outside their clip left out"
+            );
+            skipped_invisible = true;
+        }
+    }
+
     // Detect dominant text rotation and transform coordinates if needed.
     // Some PDFs embed landscape content in portrait pages using a rotated text
     // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
@@ -2637,6 +2656,45 @@ mod tests {
                 ("Body", false)
             ]
         );
+    }
+
+    #[test]
+    fn runs_painted_outside_their_clip_are_left_out_unless_invisible_text_is_wanted() {
+        use crate::tounicode::FontCMaps;
+
+        let content = b"
+            BT /F1 12 Tf 72 700 Td (Body) Tj ET
+            q 72 400 300 200 re W n
+            BT /F1 12 Tf 80 500 Td (Inside) Tj ET
+            BT /F1 12 Tf 80 300 Td (Below) Tj ET
+            BT /F1 12 Tf 80 395 Td (Straddling) Tj ET
+            Q
+            BT /F1 12 Tf 80 200 Td (After) Tj ET";
+        let (doc, page_id) = simple_doc_with_content(content);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let extract = |include_invisible: bool| {
+            let ((items, _, _), _, _, skipped_invisible) = extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &font_cmaps,
+                include_invisible,
+                &mut FontStyleCache::new(),
+                &mut FormWalkBudget::new(),
+            )
+            .unwrap();
+            let mut texts: Vec<String> = items.into_iter().map(|item| item.text).collect();
+            texts.sort();
+            (texts, skipped_invisible)
+        };
+
+        let (texts, skipped_invisible) = extract(false);
+        assert_eq!(texts, ["After", "Body", "Inside", "Straddling"]);
+        assert!(skipped_invisible, "a left-out run must be reported");
+
+        let (texts, skipped_invisible) = extract(true);
+        assert_eq!(texts, ["After", "Below", "Body", "Inside", "Straddling"]);
+        assert!(!skipped_invisible);
     }
 
     #[test]

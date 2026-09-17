@@ -1149,7 +1149,10 @@ pub fn extract_text_in_regions_mem_with_options(
         // invisible OCR layer transcribes the raster, so any visible glyph
         // has an invisible twin there and adoption would duplicate it
         // (review catches — strict gate, no fuzzy dedupe). Adopt the retry
-        // only when it contributes real, non-garbage text.
+        // only when it contributes real, non-garbage text. Runs painted
+        // wholly outside their clip count as invisible too, so a page whose
+        // every run the producer clipped out of view is recovered the same
+        // way.
         let has_visible_text = items.iter().any(|it| {
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
         });

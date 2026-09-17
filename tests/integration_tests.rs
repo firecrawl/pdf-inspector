@@ -5845,3 +5845,154 @@ fn test_bold_from_weight_keeps_weights_apart_and_reads_bold_from_600() {
         .text
         .contains("Light Medium Heavy"));
 }
+
+// ---------------------------------------------------------------------------
+// Text painted outside its clip
+// ---------------------------------------------------------------------------
+
+/// Body text, a rectangular clip around a plot area with a legend inside it,
+/// three runs the same clip hides (below and to the right of the plot area,
+/// one of them shown with `'`), one run straddling the clip's bottom edge,
+/// and body text after the clip is restored.
+fn make_clipped_text_pdf() -> Vec<u8> {
+    make_text_pdf(
+        "BT /F1 12 Tf 72 720 Td (Body text above the plot) Tj ET\n\
+         q 72 400 300 200 re W n\n\
+         BT /F1 12 Tf 80 500 Td (Legend inside the plot) Tj ET\n\
+         BT /F1 12 Tf 80 300 Td (Hidden below the plot) Tj ET\n\
+         BT /F1 12 Tf 400 500 Td (Hidden right of the plot) Tj ET\n\
+         BT /F1 12 Tf 14 TL 80 300 Td (Hidden below via quote) ' ET\n\
+         BT /F1 12 Tf 80 395 Td (Straddles the bottom edge) Tj ET\n\
+         Q\n\
+         BT /F1 12 Tf 72 200 Td (Body text after the clip ends) Tj ET",
+        "0 0 612 792",
+    )
+}
+
+const CLIPPED_PDF_KEPT: [&str; 4] = [
+    "Body text above the plot",
+    "Legend inside the plot",
+    "Straddles the bottom edge",
+    "Body text after the clip ends",
+];
+const CLIPPED_PDF_HIDDEN: [&str; 3] = [
+    "Hidden below the plot",
+    "Hidden right of the plot",
+    "Hidden below via quote",
+];
+
+fn joined_text(items: &[TextItem]) -> String {
+    items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// A run the active rectangular clip hides entirely is invisible on the
+/// rendered page and must not be extracted; runs inside the clip, runs
+/// straddling its edge and runs shown after the clip is restored stay.
+#[test]
+fn test_text_painted_outside_its_clip_is_not_extracted() {
+    let buf = make_clipped_text_pdf();
+    let text = joined_text(&extract_text_with_positions_mem(&buf).unwrap());
+    for kept in CLIPPED_PDF_KEPT {
+        assert!(text.contains(kept), "{kept:?} missing from {text:?}");
+    }
+    for hidden in CLIPPED_PDF_HIDDEN {
+        assert!(
+            !text.contains(hidden),
+            "{hidden:?} is clipped away and must not be extracted, got {text:?}"
+        );
+    }
+}
+
+/// The region API sees the same page: the hidden runs neither appear in a
+/// full-page region nor in a region drawn around where they were painted,
+/// and the page's visible text keeps the invisible-layer retry from firing.
+#[test]
+fn test_region_text_omits_runs_painted_outside_their_clip() {
+    let buf = make_clipped_text_pdf();
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let page = &regions[0].regions[0];
+    for kept in CLIPPED_PDF_KEPT {
+        assert!(
+            page.text.contains(kept),
+            "{kept:?} missing from {:?}",
+            page.text
+        );
+    }
+    assert!(!page.text.contains("Hidden"), "{:?}", page.text);
+    assert!(!page.needs_ocr);
+
+    // Top-left page coordinates over the band the two hidden runs below the
+    // plot were painted in (y 286..312 from the bottom on a 792 pt page).
+    let band = [60.0, 792.0 - 320.0, 400.0, 792.0 - 280.0];
+    let regions = extract_text_in_regions_mem(&buf, &[(0, vec![band])]).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        region.text.trim().is_empty(),
+        "nothing visible is painted in the band, got {:?}",
+        region.text
+    );
+}
+
+/// Only a single axis-aligned rectangle establishes what a clip hides. A
+/// path clip and a rectangle drawn under a turned CTM say nothing about
+/// their extent, so text under them is kept even when it lies outside the
+/// path's bounds.
+#[test]
+fn test_text_under_an_unknown_clip_is_kept() {
+    let buf = make_text_pdf(
+        "q 72 400 m 372 400 l 222 600 l h W n\n\
+         BT /F1 12 Tf 80 300 Td (Under a path clip) Tj ET Q\n\
+         q 0.7071 0.7071 -0.7071 0.7071 0 0 cm 0 0 100 100 re W n\n\
+         0.7071 -0.7071 0.7071 0.7071 0 0 cm\n\
+         BT /F1 12 Tf 80 300 Td (Under a turned clip) Tj ET Q",
+        "0 0 612 792",
+    );
+    let text = joined_text(&extract_text_with_positions_mem(&buf).unwrap());
+    assert!(text.contains("Under a path clip"), "{text:?}");
+    assert!(text.contains("Under a turned clip"), "{text:?}");
+}
+
+/// Nested rectangles intersect and `Q` restores the outer clip: the same
+/// run is hidden under the inner clip and visible once it is restored.
+#[test]
+fn test_nested_clips_intersect_and_restore() {
+    let buf = make_text_pdf(
+        "q 72 400 300 200 re W n\n\
+         q 100 450 50 50 re W n\n\
+         BT /F1 12 Tf 80 560 Td (Hidden by the inner clip) Tj ET Q\n\
+         BT /F1 12 Tf 80 560 Td (Visible under the outer clip) Tj ET Q",
+        "0 0 612 792",
+    );
+    let text = joined_text(&extract_text_with_positions_mem(&buf).unwrap());
+    assert!(!text.contains("Hidden by the inner clip"), "{text:?}");
+    assert!(text.contains("Visible under the outer clip"), "{text:?}");
+}
+
+/// A page whose every run is clipped out of view is treated like a page
+/// whose only text is an invisible layer: the positioned API reports no
+/// text, and the region API's retry recovers it rather than sending the
+/// page to OCR.
+#[test]
+fn test_page_with_only_clipped_away_text_is_recovered_like_an_invisible_layer() {
+    let buf = make_text_pdf(
+        "q 72 400 300 200 re W n BT /F1 12 Tf 16 TL 80 300 Td \
+         (The quick brown fox jumps over the lazy dog) Tj T* \
+         (Pack my box with five dozen liquor jugs tonight) Tj T* \
+         (Sphinx of black quartz judge my vow carefully) Tj ET Q",
+        "0 0 612 792",
+    );
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    assert!(
+        items.iter().all(|item| !item.text.contains("quick")),
+        "{:?}",
+        joined_text(&items)
+    );
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let page = &regions[0].regions[0];
+    assert!(page.text.contains("quick brown fox"), "{:?}", page.text);
+    assert!(!page.needs_ocr);
+}
