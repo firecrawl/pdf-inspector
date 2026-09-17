@@ -37,6 +37,16 @@ version and date. Earlier releases are described in their
 - Rust `TextItem` literals must include the new `font_weight` field (`None`
   for items whose weight class is unknown).
 
+### Fixed
+
+- OCR (`--ocr auto`/`--ocr force`, and the Rust, Python and Node OCR APIs)
+  no longer risks hanging at 0% CPU on multi-page scans. Page recognition
+  across OCR workers now dispatches through each worker's own dedicated
+  single-thread pool instead of a shared rayon pool, closing a
+  self-deadlock. A worker's dedicated pool failing to start is now reported
+  as `OarOcrError::WorkerThreadPoolInit` from engine construction, instead
+  of being silently discarded.
+
 ## [1.20.0] - 2026-09-14
 
 Changes since 1.19.0.
