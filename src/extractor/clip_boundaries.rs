@@ -189,8 +189,8 @@ pub(super) fn drop_clipped_away_runs(
             let excluded = clip.is_some_and(|rect| rect.excludes_run(item));
             if excluded {
                 log::trace!(
-                    "run painted outside its clip left out: {:?} at ({}, {}) {}x{}",
-                    item.text,
+                    "run painted outside its clip left out: {} chars at ({}, {}) {}x{}",
+                    item.text.chars().count(),
                     item.x,
                     item.y,
                     item.width,

@@ -43,9 +43,10 @@ version and date. Earlier releases are described in their
   included); text under a path, text-mode or turned clip is kept as before,
   as are runs inside Form XObjects, rotated runs and runs whose advance is
   unknown. A run has to lie a quarter of its height clear of the clip on
-  every side, so glyphs straddling an edge stay. Like render-mode-3 text,
-  the left-out runs are recovered by the region API's invisible-layer retry
-  on a page with no visible text at all.
+  every side, so glyphs straddling an edge stay. Unlike render-mode-3 text,
+  the left-out runs are not an invisible layer that transcribes the page:
+  `include_invisible` does not bring them back, and a page whose every run
+  is clipped away reports no text, like an image-only page.
 
 ### Changed
 

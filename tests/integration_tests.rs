@@ -5972,12 +5972,13 @@ fn test_nested_clips_intersect_and_restore() {
     assert!(text.contains("Visible under the outer clip"), "{text:?}");
 }
 
-/// A page whose every run is clipped out of view is treated like a page
-/// whose only text is an invisible layer: the positioned API reports no
-/// text, and the region API's retry recovers it rather than sending the
-/// page to OCR.
+/// A page whose every run is clipped out of view has no text on it. Unlike
+/// an invisible (Tr 3) OCR layer, which transcribes the visible raster, the
+/// runs describe nothing that can be seen, so the region API must not adopt
+/// them through its invisible-layer retry: the region is empty and goes to
+/// OCR like an image-only page.
 #[test]
-fn test_page_with_only_clipped_away_text_is_recovered_like_an_invisible_layer() {
+fn test_page_with_only_clipped_away_text_reports_no_native_text() {
     let buf = make_text_pdf(
         "q 72 400 300 200 re W n BT /F1 12 Tf 16 TL 80 300 Td \
          (The quick brown fox jumps over the lazy dog) Tj T* \
@@ -5993,6 +5994,10 @@ fn test_page_with_only_clipped_away_text_is_recovered_like_an_invisible_layer() 
     );
     let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
     let page = &regions[0].regions[0];
-    assert!(page.text.contains("quick brown fox"), "{:?}", page.text);
-    assert!(!page.needs_ocr);
+    assert!(
+        page.text.trim().is_empty(),
+        "clipped-away runs must not come back through the invisible-layer retry, got {:?}",
+        page.text
+    );
+    assert!(page.needs_ocr);
 }

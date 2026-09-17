@@ -330,8 +330,7 @@ pub(crate) struct PageBoxExtraction {
     /// (see `content_stream::correct_rotated_page`); `Upright` when it was
     /// not.
     pub(crate) coords_rotated: geometry::PageRotation,
-    /// Invisible text (render mode 3, or runs painted wholly outside their
-    /// rectangular clip) was skipped and could be recovered with
+    /// Invisible (Tr 3) text was skipped and could be recovered with
     /// `include_invisible`.
     pub(crate) skipped_invisible: bool,
     /// The visible page box the geometry was shifted into; its height is the
