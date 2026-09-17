@@ -402,6 +402,9 @@ mod tests {
             baseline_shift: 0.0,
             rotation: 0.0,
             advance_known: true,
+
+            image_data: None,
+            image_format: None,
         }
     }
 

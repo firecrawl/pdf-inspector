@@ -8,9 +8,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::types::TextLine;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use crate::types::TextLine;
 
 /// Strip page-edge furniture on documents too short for repetition evidence.
 ///
@@ -674,6 +674,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
@@ -1349,23 +1352,59 @@ mod tests {
     #[test]
     fn navigation_metadata_lines_are_dropped_but_content_survives() {
         let lines = vec![
-            make_line("P1: OTA/XYZ P2: ABC JWBT634-fm JWBT634-Grimes", 8.0, 1, 750.0, None),
-            make_line("JWBT634-fm JWBT634-Grimes May 11, 2012 8:28 Printer: Hamilton Printing", 8.0, 1, 748.0, None),
-            make_line("P1: OTA JWBT634-c03 JWBT634-Grimes May 10, 2012 7:26 Printer: Hamilton Printing", 8.0, 1, 746.0, None),
-            make_line("The Art and Science of Technical Analysis is a textbook", 11.0, 1, 700.0, None),
-            make_line("Traders who recognize this pattern early can establish", 11.0, 1, 685.0, None),
+            make_line(
+                "P1: OTA/XYZ P2: ABC JWBT634-fm JWBT634-Grimes",
+                8.0,
+                1,
+                750.0,
+                None,
+            ),
+            make_line(
+                "JWBT634-fm JWBT634-Grimes May 11, 2012 8:28 Printer: Hamilton Printing",
+                8.0,
+                1,
+                748.0,
+                None,
+            ),
+            make_line(
+                "P1: OTA JWBT634-c03 JWBT634-Grimes May 10, 2012 7:26 Printer: Hamilton Printing",
+                8.0,
+                1,
+                746.0,
+                None,
+            ),
+            make_line(
+                "The Art and Science of Technical Analysis is a textbook",
+                11.0,
+                1,
+                700.0,
+                None,
+            ),
+            make_line(
+                "Traders who recognize this pattern early can establish",
+                11.0,
+                1,
+                685.0,
+                None,
+            ),
         ];
 
         let result = drop_navigation_metadata_lines(lines);
 
         assert!(
-            !result.iter().any(|l| l.text().contains("OTA") || l.text().contains("JWBT") || l.text().contains("Printer:")),
+            !result.iter().any(|l| l.text().contains("OTA")
+                || l.text().contains("JWBT")
+                || l.text().contains("Printer:")),
             "all navigation-metadata fragments must be dropped, got: {:?}",
             result.iter().map(|l| l.text().clone()).collect::<Vec<_>>()
         );
         assert_eq!(result.len(), 2, "only the two content lines should remain");
-        assert!(result.iter().any(|l| l.text().contains("The Art and Science")));
-        assert!(result.iter().any(|l| l.text().contains("Traders who recognize")));
+        assert!(result
+            .iter()
+            .any(|l| l.text().contains("The Art and Science")));
+        assert!(result
+            .iter()
+            .any(|l| l.text().contains("Traders who recognize")));
     }
 
     #[test]

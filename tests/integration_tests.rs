@@ -361,6 +361,8 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         item_type: ItemType::Text,
         mcid: None,
         baseline_shift: 0.0,
+        image_data: None,
+        image_format: None,
     }
 }
 
@@ -399,6 +401,8 @@ fn make_text_item_with_font(
         item_type: ItemType::Text,
         mcid: None,
         baseline_shift: 0.0,
+        image_data: None,
+        image_format: None,
     }
 }
 
@@ -11167,4 +11171,26 @@ fn cli_drop_page_numbers_flag() {
     // Without --pages there are no markers either.
     let plain_md = run(&["--drop-page-numbers"]);
     assert!(!plain_md.contains("<!-- Page"));
+}
+
+#[test]
+fn test_image_extraction_and_markdown_linking() {
+    let binary = env!("CARGO_BIN_EXE_pdf2md");
+    let fixture = "tests/fixtures/upstage_key_functions.pdf";
+    let temp_dir = tempfile::tempdir().unwrap();
+    let md_path = temp_dir.path().join("output.md");
+    let img_dir = temp_dir.path().join("output_images");
+
+    let output = std::process::Command::new(binary)
+        .arg(fixture)
+        .arg(md_path.to_str().unwrap())
+        .arg("--images")
+        .output()
+        .expect("failed to run pdf2md");
+    assert!(output.status.success());
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.contains("![Image: Image143]"));
+    assert!(img_dir.exists(), "image dir should exist: {img_dir:?}");
+    let entries: Vec<_> = std::fs::read_dir(&img_dir).unwrap().collect();
+    assert!(!entries.is_empty(), "should have exported images");
 }

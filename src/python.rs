@@ -758,6 +758,9 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             baseline_shift: item.baseline_shift,
             item_type: item_type_str(&item.item_type),
             mcid: item.mcid,
+
+            image_data: None,
+            image_format: None,
         })
         .collect()
 }

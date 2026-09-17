@@ -29,7 +29,10 @@ use super::word_gaps::{
     is_dependent_sign, offset_takes_spacing_back, tj_gap_thresholds, tj_tracking,
     word_gap_candidate, word_gap_threshold, PenHighWater, PendingWordGaps, WordGapCandidate,
 };
-use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
+use super::xobjects::{
+    extract_form_xobject_text, extract_image_by_id, extract_image_from_xobject, get_page_xobjects,
+    FormWalkBudget, XObjectType,
+};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
@@ -1124,6 +1127,9 @@ pub(crate) fn extract_page_text_items_with_options(
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                                 baseline_shift: 0.0,
+
+                                image_data: None,
+                                image_format: None,
                             });
                             // A short string with word-gap character spacing
                             // shows its spaces once the next run proves the
@@ -1692,6 +1698,9 @@ pub(crate) fn extract_page_text_items_with_options(
                                     item_type: ItemType::Text,
                                     mcid: current_mcid(&marked_content_stack),
                                     baseline_shift: 0.0,
+
+                                    image_data: None,
+                                    image_format: None,
                                 });
                             }
                         }
@@ -1938,6 +1947,9 @@ pub(crate) fn extract_page_text_items_with_options(
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                                 baseline_shift: 0.0,
+
+                                image_data: None,
+                                image_format: None,
                             });
                             // A short string with word-gap character spacing
                             // shows its spaces once the next run proves the
@@ -1999,7 +2011,7 @@ pub(crate) fn extract_page_text_items_with_options(
 
                         if let Some(xobj_type) = xobjects.get(&xobj_name) {
                             match xobj_type {
-                                XObjectType::Image => {
+                                XObjectType::Image(img_id) => {
                                     // Emit a positional placeholder for the image
                                     // so downstream consumers (layout-aware
                                     // pipelines, figure-OCR routers) can locate
@@ -2009,6 +2021,20 @@ pub(crate) fn extract_page_text_items_with_options(
                                     // `[Image: Im0]` format that the markdown
                                     // emitter already recognizes.
                                     let (x, y, width, height) = image_bbox_from_ctm(&ctm);
+                                    // Best-effort: pull the encoded frame out of the
+                                    // XObject so the markdown pipeline can write the
+                                    // figure to disk instead of emitting a bare
+                                    // placeholder.
+                                    let (image_data, image_format) =
+                                        match extract_image_by_id(doc, *img_id) {
+                                            Ok(Some((data, fmt))) => (Some(data), Some(fmt)),
+                                            _ => match extract_image_from_xobject(
+                                                doc, page_id, &xobj_name,
+                                            ) {
+                                                Ok(Some((data, fmt))) => (Some(data), Some(fmt)),
+                                                _ => (None, None),
+                                            },
+                                        };
                                     items.push(TextItem {
                                         text: format!("[Image: {}]", xobj_name),
                                         x,
@@ -2035,6 +2061,8 @@ pub(crate) fn extract_page_text_items_with_options(
                                         item_type: ItemType::Image,
                                         mcid: current_mcid(&marked_content_stack),
                                         baseline_shift: 0.0,
+                                        image_data,
+                                        image_format,
                                     });
                                 }
                                 XObjectType::Form(form_id) => {
@@ -2289,6 +2317,9 @@ pub(crate) fn extract_page_text_items_with_options(
                                         .mcid
                                         .or_else(|| current_mcid(&marked_content_stack)),
                                     baseline_shift: 0.0,
+
+                                    image_data: None,
+                                    image_format: None,
                                 });
                             }
                         }
@@ -5078,6 +5109,9 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+
+            image_data: None,
+            image_format: None,
         };
         let mut image = text(50.0, 50.0);
         image.text = "[Image: Im0]".to_string();
@@ -5168,6 +5202,9 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (   ) Tj ET",
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+
+            image_data: None,
+            image_format: None,
         };
         let mut image = run.clone();
         image.text = "[Image: Im0]".to_string();

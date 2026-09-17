@@ -1285,6 +1285,11 @@ pub struct MarkdownOptions {
     pub detect_underline: bool,
     /// Include image placeholders in output
     pub include_images: bool,
+    /// Target image directory path for exported image files and links in Markdown
+    /// (e.g. "images" or "my_doc_images"). When Some, markdown emits
+    /// `![Image: {name}]({image_dir}/page_{page}_{name}.{fmt})` and writes image
+    /// files to this directory. When None, emits `![Image: {name}](image)`.
+    pub image_dir: Option<String>,
     /// Include extracted hyperlinks
     pub include_links: bool,
     /// Insert page break markers (<!-- Page N -->) between pages
@@ -1295,6 +1300,21 @@ pub struct MarkdownOptions {
     /// AcroForm field values and content-stream destination markers
     /// (`P1: OTA/XYZ`, `P2: DEST/...`). When false these are removed.
     pub include_form_fields: bool,
+}
+
+impl MarkdownOptions {
+    /// Enable or disable image inclusion in Markdown.
+    pub fn with_images(mut self, include: bool) -> Self {
+        self.include_images = include;
+        self
+    }
+
+    /// Enable image inclusion and set the export directory for images.
+    pub fn with_image_dir(mut self, dir: impl Into<String>) -> Self {
+        self.include_images = true;
+        self.image_dir = Some(dir.into());
+        self
+    }
 }
 
 impl Default for MarkdownOptions {
@@ -1321,12 +1341,50 @@ impl Default for MarkdownOptions {
             // `extract_text_with_positions` for callers (e.g. layout-aware
             // pipelines) that want to crop + caption figures themselves.
             include_images: false,
+            image_dir: None,
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,
             include_form_fields: true,
         }
     }
+}
+
+/// Export extracted images from `TextItem`s to the given directory.
+///
+/// Returns the number of images successfully written to disk.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_images(
+    items: &[TextItem],
+    output_dir: impl AsRef<std::path::Path>,
+) -> std::io::Result<usize> {
+    use crate::types::ItemType;
+    let output_dir = output_dir.as_ref();
+    let mut count = 0;
+    for item in items {
+        if matches!(item.item_type, ItemType::Image) {
+            if let Some(ref data) = item.image_data {
+                if !data.is_empty() {
+                    let img_name = item
+                        .text
+                        .strip_prefix("[Image: ")
+                        .and_then(|s| s.strip_suffix(']'))
+                        .unwrap_or(&item.text);
+                    let fmt = item.image_format.as_deref().unwrap_or("jpg");
+                    let safe_img_name = img_name
+                        .replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_");
+                    let filename = format!("page_{}_{}.{}", item.page, safe_img_name, fmt);
+                    if !output_dir.exists() {
+                        std::fs::create_dir_all(output_dir)?;
+                    }
+                    let file_path = output_dir.join(filename);
+                    std::fs::write(&file_path, data)?;
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// Convert plain text to markdown (basic conversion)
@@ -2145,6 +2203,30 @@ fn convert_items_with_rects_lines_and_table_output(
 
     // Images are also removed before line grouping, so give them the same
     // logical chart-page position as tables before reinsertion.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(ref dir) = options.image_dir {
+        for img in &images {
+            if let Some(ref data) = img.image_data {
+                if !data.is_empty() {
+                    let img_name = img
+                        .text
+                        .strip_prefix("[Image: ")
+                        .and_then(|s| s.strip_suffix(']'))
+                        .unwrap_or(&img.text);
+                    let fmt = img.image_format.as_deref().unwrap_or("jpg");
+                    let safe_img_name = img_name
+                        .replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_");
+                    let filename = format!("page_{}_{}.{}", img.page, safe_img_name, fmt);
+                    let path = std::path::Path::new(dir).join(filename);
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(path, data);
+                }
+            }
+        }
+    }
+
     let mut page_images: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
     for img in &images {
         let img_name = img
@@ -2152,7 +2234,20 @@ fn convert_items_with_rects_lines_and_table_output(
             .strip_prefix("[Image: ")
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(&img.text);
-        let img_md = format!("![Image: {}](image)\n", img_name);
+        let fmt = img.image_format.as_deref().unwrap_or("jpg");
+        let safe_img_name =
+            img_name.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_");
+        let link_target = if let Some(ref dir) = options.image_dir {
+            let filename = format!("page_{}_{}.{}", img.page, safe_img_name, fmt);
+            if dir.is_empty() {
+                filename
+            } else {
+                format!("{}/{}", dir.trim_end_matches('/'), filename)
+            }
+        } else {
+            "image".to_string()
+        };
+        let img_md = format!("![Image: {}]({})\n", img_name, link_target);
         page_images
             .entry(img.page)
             .or_default()
@@ -2720,6 +2815,9 @@ mod tests {
             item_type: crate::types::ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
@@ -3522,5 +3620,43 @@ mod tests {
             split.is_empty(),
             "label+number table should not be split side-by-side"
         );
+    }
+
+    #[test]
+    fn markdown_generation_with_image_dir() {
+        let text_item = make_item(50.0, 700.0, 1);
+        let mut img_item = make_item(50.0, 600.0, 1);
+        img_item.text = "[Image: Im0]".to_string();
+        img_item.item_type = crate::types::ItemType::Image;
+        img_item.image_data = Some(vec![0xFF, 0xD8, 0xFF, 0xD9]);
+        img_item.image_format = Some("jpg".to_string());
+
+        let mut opts = MarkdownOptions::default();
+        opts.include_images = true;
+        opts.image_dir = Some("my_images".to_string());
+
+        let md = to_markdown_from_items(vec![text_item, img_item], opts);
+        assert!(
+            md.contains("![Image: Im0](my_images/page_1_Im0.jpg)"),
+            "Markdown should contain image link with image_dir path, got: {md}"
+        );
+    }
+
+    #[test]
+    fn export_images_writes_files() {
+        let mut img_item = make_item(50.0, 600.0, 1);
+        img_item.text = "[Image: Chart1]".to_string();
+        img_item.item_type = crate::types::ItemType::Image;
+        let test_bytes = vec![1, 2, 3, 4];
+        img_item.image_data = Some(test_bytes.clone());
+        img_item.image_format = Some("png".to_string());
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let count = export_images(&[img_item], temp_dir.path()).unwrap();
+        assert_eq!(count, 1);
+
+        let written_file = temp_dir.path().join("page_1_Chart1.png");
+        assert!(written_file.exists());
+        assert_eq!(std::fs::read(written_file).unwrap(), test_bytes);
     }
 }

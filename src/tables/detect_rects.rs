@@ -3595,6 +3595,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
@@ -5333,6 +5336,9 @@ mod tests {
                     item_type: crate::types::ItemType::Text,
                     mcid: None,
                     baseline_shift: 0.0,
+
+                    image_data: None,
+                    image_format: None,
                 });
             }
         }
@@ -5655,6 +5661,9 @@ mod tests {
                 item_type: crate::types::ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+
+                image_data: None,
+                image_format: None,
             });
         }
         let rects: Vec<crate::types::PdfRect> = page_rects

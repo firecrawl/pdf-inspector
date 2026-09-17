@@ -175,6 +175,9 @@ fn merge_adjacent_items_preserving(
                 } else {
                     0.0
                 },
+
+                image_data: None,
+                image_format: None,
             });
             index_map.push(indices);
 
@@ -2648,6 +2651,9 @@ mod tests {
             mcid: None,
             baseline_shift: 0.0,
             legacy_symbol_rewrite: false,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
@@ -2996,6 +3002,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
@@ -3149,6 +3158,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 

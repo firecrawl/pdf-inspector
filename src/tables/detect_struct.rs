@@ -608,6 +608,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 

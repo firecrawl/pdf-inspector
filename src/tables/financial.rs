@@ -123,6 +123,9 @@ pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>>
             item_type: item.item_type.clone(),
             mcid: item.mcid,
             baseline_shift: item.baseline_shift,
+
+            image_data: None,
+            image_format: None,
         });
     }
     Some(sub_items)
