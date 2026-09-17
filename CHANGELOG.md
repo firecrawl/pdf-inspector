@@ -43,9 +43,7 @@ version and date. Earlier releases are described in their
   no longer risks hanging at 0% CPU on multi-page scans. Page recognition
   across OCR workers now dispatches through each worker's own dedicated
   single-thread pool instead of a shared rayon pool, closing a
-  self-deadlock. A worker's dedicated pool failing to start is now reported
-  as `OarOcrError::WorkerThreadPoolInit` from engine construction, instead
-  of being silently discarded.
+  self-deadlock.
 
 ## [1.20.0] - 2026-09-14
 

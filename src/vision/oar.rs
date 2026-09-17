@@ -72,16 +72,6 @@ pub enum OarOcrError {
     /// OAR or ONNX Runtime rejected the models or failed during inference.
     #[error(transparent)]
     Backend(#[from] oar_ocr::core::OCRError),
-    /// A worker's dedicated single-thread pool failed to start. Page
-    /// recognition must run on that worker's own pool: the rayon calls
-    /// oar-ocr makes while holding this worker's session lock must not be
-    /// able to pick up another page's job.
-    #[error("failed to start dedicated OCR worker thread pool: {source}")]
-    WorkerThreadPoolInit {
-        /// Underlying rayon failure.
-        #[source]
-        source: rayon::ThreadPoolBuildError,
-    },
 }
 
 /// Standard detection input cap. PP-OCR detection resizes each page so its
@@ -125,7 +115,26 @@ struct OcrWorker {
     /// internally (`par_iter`/`par_chunks*`) while holding this worker's
     /// session mutex; on a one-thread pool that call only ever finds work
     /// in its own local deque, so it cannot pick up another page's job.
-    pool: rayon::ThreadPool,
+    /// `pool` has no dedicated thread only when this is the single
+    /// fallback worker created after its pool failed to start (see
+    /// [`build_workers`]); with no page parallelism in that case there is
+    /// no other page for one to reenter, matching the prior shared-pool
+    /// fallback's behavior.
+    pool: WorkerPool,
+}
+
+/// A worker's dedicated pool, or `None` when it failed to start. `install`
+/// runs `f` on the pool's own thread when present, or directly on the
+/// calling thread otherwise.
+struct WorkerPool(Option<rayon::ThreadPool>);
+
+impl WorkerPool {
+    fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+        match &self.0 {
+            Some(pool) => pool.install(f),
+            None => f(),
+        }
+    }
 }
 
 /// Runs page work on a worker's dedicated pool. `install` is the only way
@@ -249,18 +258,21 @@ fn build_workers(
     count: usize,
     intra_threads: usize,
 ) -> Result<Vec<OcrWorker>, OarOcrError> {
-    let mut workers = Vec::with_capacity(count);
-    for index in 0..count {
+    // Pools are planned (and any failure resolved) before any model session
+    // is built, so a worker whose pool never starts never wastes a session.
+    let pools = plan_worker_pools(count, |index| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(move |_| format!("pdf-inspector-ocr-{index}"))
+            .build()
+    });
+    let mut workers = Vec::with_capacity(pools.len());
+    for pool in pools {
         let detector = build_detector(detection, DETECTION_LIMIT_STANDARD, intra_threads)?;
         let recognizer = TextRecognitionPredictor::builder()
             .dict_path(dictionary)
             .with_ort_config(ocr_session_config(intra_threads))
             .build(recognition)?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .thread_name(move |_| format!("pdf-inspector-ocr-{index}"))
-            .build()
-            .map_err(|source| OarOcrError::WorkerThreadPoolInit { source })?;
         workers.push(OcrWorker {
             detector,
             recognizer,
@@ -269,6 +281,43 @@ fn build_workers(
         });
     }
     Ok(workers)
+}
+
+/// Builds up to `count` worker pools with `build`, stopping at the first
+/// failure instead of returning it: environments with a thread limit (a
+/// container's pids limit, for example) must still be able to run OCR.
+///
+/// A failure at index 0 falls back to a single worker with no dedicated
+/// pool (`WorkerPool(None)`) — matching the previous shared-pool-failure
+/// fallback of continuing OCR sequentially instead of making it
+/// unavailable. A failure at any later index keeps the workers already
+/// built and drops the rest, rather than falling back further.
+fn plan_worker_pools<E: std::fmt::Display>(
+    count: usize,
+    mut build: impl FnMut(usize) -> Result<rayon::ThreadPool, E>,
+) -> Vec<WorkerPool> {
+    let mut pools = Vec::with_capacity(count);
+    for index in 0..count {
+        match build(index) {
+            Ok(pool) => pools.push(WorkerPool(Some(pool))),
+            Err(error) if index == 0 => {
+                log::warn!(
+                    "OCR worker thread pool unavailable, falling back to a single \
+                     sequential worker: {error}"
+                );
+                pools.push(WorkerPool(None));
+                break;
+            }
+            Err(error) => {
+                log::warn!(
+                    "OCR worker thread pool unavailable after {index} worker(s) started; \
+                     continuing with {index}: {error}"
+                );
+                break;
+            }
+        }
+    }
+    pools
 }
 
 impl OarOcrEngine {
@@ -641,9 +690,11 @@ fn map_pages_on_workers<W: PageWorker, P: Sync, R: Send, E: Send>(
 
 /// Dispatches `pages` across `workers`, choosing the same branch
 /// `OarOcrEngine::recognize` needs: a single worker or a single page runs
-/// pages one at a time on `workers[0]`'s own pool thread (via `install`),
-/// with the caller only waiting for each to finish; more than one of each
-/// dispatches across workers with [`map_pages_on_workers`].
+/// pages one at a time through `workers[0].install` — normally on that
+/// worker's own pool thread, or on the calling thread itself if that
+/// worker's pool failed to start (the fallback in `build_workers`); more
+/// than one of each dispatches across workers with
+/// [`map_pages_on_workers`].
 fn dispatch_pages_on_workers<W: PageWorker, P: Sync, R: Send, E: Send>(
     workers: &[W],
     pages: &[P],
@@ -1002,6 +1053,48 @@ mod tests {
         assert!((1..=3).contains(&concurrency));
         assert!(intra_threads_per_pipeline(2) == 2);
         assert!((1..=4).contains(&intra_threads_per_pipeline(1)));
+    }
+
+    fn tiny_pool() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn plan_worker_pools_builds_every_pool_when_all_succeed() {
+        let pools = plan_worker_pools(3, |_index| Ok::<_, &str>(tiny_pool()));
+        assert_eq!(pools.len(), 3);
+        assert!(pools.iter().all(|pool| pool.0.is_some()));
+    }
+
+    #[test]
+    fn plan_worker_pools_keeps_earlier_pools_when_a_later_one_fails() {
+        let pools = plan_worker_pools(4, |index| {
+            if index == 2 {
+                Err("boom")
+            } else {
+                Ok(tiny_pool())
+            }
+        });
+        assert_eq!(pools.len(), 2);
+        assert!(pools.iter().all(|pool| pool.0.is_some()));
+    }
+
+    #[test]
+    fn plan_worker_pools_falls_back_to_one_poolless_worker_when_the_first_fails() {
+        let pools = plan_worker_pools(4, |_index| Err::<rayon::ThreadPool, _>("boom"));
+        assert_eq!(pools.len(), 1);
+        assert!(pools[0].0.is_none());
+    }
+
+    #[test]
+    fn worker_pool_without_a_pool_runs_install_on_the_calling_thread() {
+        let pool = WorkerPool(None);
+        let caller_thread = std::thread::current().id();
+        let observed = pool.install(|| std::thread::current().id());
+        assert_eq!(observed, caller_thread);
     }
 
     /// A fake worker whose `install` runs `f` directly on the calling
