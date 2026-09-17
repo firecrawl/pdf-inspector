@@ -4022,12 +4022,14 @@ pub(crate) fn load_document_from_mem_with_password(
     buffer: &[u8],
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
-    // Drop anything before the `%PDF` header. Cross-reference offsets are
+    // Drop anything before the `%PDF-` header. Cross-reference offsets are
     // header-relative in every major reader (mupdf, pdfium, poppler, pdf.js;
     // lopdf slices at `%PDF-` internally as well), so this keeps them exact
-    // for lopdf and for the repair candidates below. A file whose offsets
-    // count the leading bytes instead falls through to lopdf's xref
-    // reconstruction, exactly as it would without the prefix.
+    // for lopdf and for the repair candidates below. A file whose offsets are
+    // off by a constant anyway — they count the leading bytes, or a
+    // version-like mention in the leading bytes was taken for the header — is
+    // recovered by lopdf's cross-reference reconstruction, the same path every
+    // reader takes for it.
     let buffer = strip_leading_bytes_before_header(buffer);
 
     // Fix malformed struct element names before parsing. Some PDF generators
@@ -6641,57 +6643,74 @@ fn detect_file_type_hint(bytes: &[u8]) -> String {
 /// UTF-8 BOM); this mirrors that tolerance with a bounded search.
 const PDF_HEADER_SEARCH_WINDOW: usize = 1024;
 
-/// Longest header prefix the locator inspects (`%PDF-` plus one version digit).
-const PDF_HEADER_PROBE_LEN: usize = 6;
+/// Longest header the locator inspects: `%PDF-M.N` plus its line ending.
+const PDF_HEADER_PROBE_LEN: usize = 9;
 
-/// Locate the `%PDF` header within the first [`PDF_HEADER_SEARCH_WINDOW`]
-/// bytes of `buffer` and return its byte offset.
+/// Byte offset of the `%PDF-` header within the first
+/// [`PDF_HEADER_SEARCH_WINDOW`] bytes of `buffer`.
 ///
-/// Prefers `%PDF-` followed by an ASCII version digit, so a stray `%PDF`
-/// inside leading text (a filename in a part header, say) does not win over
-/// the real header. Falls back to the first bare `%PDF` when no versioned
-/// header is present in the window.
+/// Candidates are ranked by how much they look like a real header line, and
+/// by buffer order within a rank: a canonical `%PDF-M.N` line (starting a
+/// line and ending at a line break) first, then `%PDF-` followed by a version
+/// digit, then any other `%PDF-`. A version-like mention inside leading text
+/// (`X-Note: %PDF-1.4`, say) therefore does not outrank the actual header.
+/// lopdf's own header parser requires the literal `%PDF-`, so a bare `%PDF`
+/// is not a candidate.
 fn pdf_header_offset(buffer: &[u8]) -> Option<usize> {
     // Only the start of the marker is bounded by the window; let the marker
     // itself run past it.
     let probe_end = (PDF_HEADER_SEARCH_WINDOW + PDF_HEADER_PROBE_LEN).min(buffer.len());
     let probe = &buffer[..probe_end];
 
-    let mut bare = None;
+    let mut best: Option<(u8, usize)> = None;
     for (offset, window) in probe
-        .windows(b"%PDF".len())
+        .windows(b"%PDF-".len())
         .enumerate()
         .take(PDF_HEADER_SEARCH_WINDOW)
     {
-        if window != b"%PDF" {
+        if window != b"%PDF-" {
             continue;
         }
-        let versioned = probe.get(offset + 4) == Some(&b'-')
-            && probe.get(offset + 5).is_some_and(u8::is_ascii_digit);
-        if versioned {
+        let version = &probe[offset + b"%PDF-".len()..];
+        let at_line_start = offset == 0 || matches!(probe[offset - 1], b'\r' | b'\n');
+        let rank = if at_line_start && is_canonical_pdf_version_line(version) {
             return Some(offset);
+        } else if version.first().is_some_and(u8::is_ascii_digit) {
+            1
+        } else {
+            2
+        };
+        if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+            best = Some((rank, offset));
         }
-        bare.get_or_insert(offset);
     }
-    bare
+    best.map(|(_, offset)| offset)
 }
 
-/// Return `buffer` starting at its `%PDF` header, dropping any leading bytes.
+/// `M.N` immediately followed by a line ending (or the end of the probe),
+/// i.e. the bytes after `%PDF-` on a canonical header line.
+fn is_canonical_pdf_version_line(version: &[u8]) -> bool {
+    matches!(version, [major, b'.', minor, rest @ ..]
+        if major.is_ascii_digit()
+            && minor.is_ascii_digit()
+            && rest.first().is_none_or(|b| matches!(b, b'\r' | b'\n')))
+}
+
+/// Return `buffer` starting at its `%PDF-` header, dropping any leading bytes.
 ///
-/// Cross-reference offsets are relative to the header, so a buffer with bytes
-/// before it must be sliced, not just accepted. Returns `buffer` unchanged when
-/// no header is found so the loader reports its own error.
+/// Returns `buffer` unchanged when no header is found so the loader reports
+/// its own error.
 fn strip_leading_bytes_before_header(buffer: &[u8]) -> &[u8] {
     match pdf_header_offset(buffer) {
         Some(offset) if offset > 0 => {
-            log::debug!("dropping {offset} leading bytes before the %PDF header");
+            log::debug!("dropping {offset} leading bytes before the %PDF- header");
             &buffer[offset..]
         }
         _ => buffer,
     }
 }
 
-/// Validate that a byte buffer looks like a PDF (has `%PDF` magic).
+/// Validate that a byte buffer looks like a PDF (has `%PDF-` magic).
 ///
 /// The header must start within the first [`PDF_HEADER_SEARCH_WINDOW`] bytes;
 /// see [`pdf_header_offset`]. Leading bytes before it are tolerated here and
@@ -6742,15 +6761,16 @@ mod tests {
     }
 
     #[test]
-    fn pdf_header_offset_prefers_versioned_header_over_bare_marker() {
+    fn pdf_header_offset_ignores_bare_marker_in_leading_text() {
         let buf = b"filename=\"%PDF.pdf\"\r\n\r\n%PDF-1.6\n";
         let expected = buf.len() - b"%PDF-1.6\n".len();
         assert_eq!(pdf_header_offset(buf), Some(expected));
+        assert_eq!(pdf_header_offset(b"xx%PDF\n1 0 obj"), None);
     }
 
     #[test]
-    fn pdf_header_offset_falls_back_to_bare_marker() {
-        assert_eq!(pdf_header_offset(b"xx%PDF\n1 0 obj"), Some(2));
+    fn pdf_header_offset_accepts_dash_without_version_digit() {
+        assert_eq!(pdf_header_offset(b"%PDF-\n1 0 obj"), Some(0));
     }
 
     #[test]
@@ -6770,6 +6790,26 @@ mod tests {
     }
 
     #[test]
+    fn pdf_header_offset_ranks_canonical_header_lines_first() {
+        // dashed-only at 0, version digit at 7, canonical lines at 19 and 28.
+        let buf = b"%PDF-x\n%PDF-1 note\n%PDF-1.4\n%PDF-2.0\r\n";
+        assert_eq!(pdf_header_offset(buf), Some(19));
+        // A canonical-looking version mid-line is only a version-digit match.
+        let buf = b"X-Note: %PDF-1.4\n%PDF-1.7\n";
+        assert_eq!(pdf_header_offset(buf), Some(17));
+        assert_eq!(pdf_header_offset(b"%PDF-x\n%PDF-1 note\n"), Some(7));
+        assert_eq!(pdf_header_offset(b"%PDF-x\n"), Some(0));
+
+        // Many version-like mentions never outrank the real header line.
+        let mut buf = b"x: %PDF-1\n".repeat(50);
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        assert_eq!(
+            pdf_header_offset(&buf),
+            Some(buf.len() - b"%PDF-1.4\n".len())
+        );
+    }
+
+    #[test]
     fn strip_leading_bytes_before_header_slices_to_header() {
         let buf = b"junk\r\n%PDF-1.4\n%%EOF";
         assert_eq!(strip_leading_bytes_before_header(buf), b"%PDF-1.4\n%%EOF");
@@ -6782,7 +6822,7 @@ mod tests {
     #[test]
     fn validate_pdf_bytes_accepts_leading_bytes_and_rejects_text() {
         assert!(validate_pdf_bytes(b"--b\r\n\r\n%PDF-1.4\n").is_ok());
-        match validate_pdf_bytes(b"This is plain text, not a PDF.") {
+        match validate_pdf_bytes(b"This is plain text mentioning %PDF, not a PDF.") {
             Err(PdfError::NotAPdf(hint)) => assert!(hint.contains("plain text"), "{hint}"),
             other => panic!("expected NotAPdf, got {other:?}"),
         }

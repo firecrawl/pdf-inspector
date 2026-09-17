@@ -1284,6 +1284,72 @@ fn test_detect_and_extract_tolerate_leading_bytes_before_header() {
 }
 
 #[test]
+fn test_process_pdf_mem_skips_version_like_text_before_header() {
+    // Leading metadata that mentions version-like `%PDF-1` strings, even
+    // several of them, must not shadow the real header (the ranking picks the
+    // canonical line; a mention that did win would still load through xref
+    // reconstruction, as the prefix-counted-offsets test shows).
+    let mut buf =
+        b"X-A: %PDF-1.4 body\r\nX-B: %PDF-1 x\r\nX-C: %PDF-1.7 y\r\nX-D: %PDF-2 z\r\n\r\n".to_vec();
+    buf.extend_from_slice(&make_minimal_text_pdf());
+
+    let result = process_pdf_mem(&buf).expect("real header should still be found");
+
+    assert_eq!(result.page_count, 1);
+    assert!(result
+        .markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Hello World"));
+}
+
+/// Rewrite a classic xref table and `startxref` so every offset counts an
+/// extra `shift` bytes, as if the writer had measured from the start of the
+/// leading bytes rather than from the header.
+fn shift_xref_offsets(pdf: &[u8], shift: usize) -> Vec<u8> {
+    let text = String::from_utf8(pdf.to_vec()).expect("minimal PDF is ASCII");
+    let entry = regex::Regex::new(r"(?m)^(\d{10}) (\d{5}) n").unwrap();
+    let shifted = entry.replace_all(&text, |caps: &regex::Captures| {
+        let off: usize = caps[1].parse().unwrap();
+        format!("{:010} {} n", off + shift, &caps[2])
+    });
+    let start = regex::Regex::new(r"startxref\s*(\d+)").unwrap();
+    let shifted = start.replace(&shifted, |caps: &regex::Captures| {
+        let off: usize = caps[1].parse().unwrap();
+        format!("startxref\n{}", off + shift)
+    });
+    shifted.into_owned().into_bytes()
+}
+
+#[test]
+fn test_process_pdf_mem_tolerates_prefix_counted_xref_offsets() {
+    let original = make_minimal_text_pdf();
+    let wrapped = wrap_in_multipart_envelope(&original);
+    let prefix_len =
+        wrapped.len() - original.len() - b"\r\n------------------------------123--\r\n".len();
+    let mut buf = wrapped[..prefix_len].to_vec();
+    buf.extend_from_slice(&shift_xref_offsets(&original, prefix_len));
+    assert_ne!(buf[prefix_len..], original[..]);
+
+    let result = process_pdf_mem(&buf).expect("prefix-counted offsets should be recovered");
+    assert_eq!(result.page_count, 1);
+    assert!(result
+        .markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Hello World"));
+}
+
+#[test]
+fn test_bare_pdf_marker_without_dash_is_still_not_a_pdf() {
+    // A bare `%PDF` is not a header lopdf can load, so it fails the cheap
+    // magic check exactly as before.
+    let text = b"Notes: the %PDF marker alone is not a document.";
+    assert_not_a_pdf(process_pdf_mem(text), "plain text");
+    assert_not_a_pdf(pdf_inspector::detect_pdf_type_mem(text), "plain text");
+}
+
+#[test]
 fn test_header_beyond_search_window_is_not_a_pdf() {
     let mut buf = vec![b'x'; 2048];
     buf.extend_from_slice(&make_minimal_text_pdf());
