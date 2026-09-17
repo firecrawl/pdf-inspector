@@ -1291,6 +1291,10 @@ pub struct MarkdownOptions {
     pub include_page_numbers: bool,
     /// Strip repeated headers/footers that appear on many pages
     pub strip_headers_footers: bool,
+    /// Drop navigation-metadata lines that are not document content, such as
+    /// AcroForm field values and content-stream destination markers
+    /// (`P1: OTA/XYZ`, `P2: DEST/...`). When false these are removed.
+    pub include_form_fields: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -1320,6 +1324,7 @@ impl Default for MarkdownOptions {
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,
+            include_form_fields: true,
         }
     }
 }
@@ -2388,6 +2393,17 @@ fn convert_items_with_rects_lines_and_table_output(
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
         furniture::strip_header_footer_lines(lines, document_page_count)
+    } else {
+        lines
+    };
+
+    // Drop navigation-metadata lines (AcroForm values, content-stream
+    // destination markers like `P1: OTA/XYZ`) that are not document content.
+    // Unlike `strip_headers_footers`, this matches a text pattern rather than
+    // cross-page repetition, because these lines vary page to page (different
+    // bookmark names/dates) and never reach the repetition threshold.
+    let lines = if !options.include_form_fields {
+        furniture::drop_navigation_metadata_lines(lines)
     } else {
         lines
     };

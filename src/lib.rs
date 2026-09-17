@@ -262,6 +262,11 @@ pub struct PdfOptions {
     /// Password for decrypting an encrypted PDF. `None` falls back to the
     /// empty password (owner-only encryption).
     pub password: Option<String>,
+    /// Include AcroForm form-field values in the extracted text (default:
+    /// `true`). Set to `false` to drop form fields whose values are
+    /// navigation metadata (named destinations, internal bookkeeping) rather
+    /// than document content.
+    pub include_form_fields: bool,
 }
 
 // Manual `Debug` so the password is never leaked through debug logging or a
@@ -274,6 +279,7 @@ impl std::fmt::Debug for PdfOptions {
             .field("markdown", &self.markdown)
             .field("page_filter", &self.page_filter)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("include_form_fields", &self.include_form_fields)
             .finish()
     }
 }
@@ -286,6 +292,7 @@ impl Default for PdfOptions {
             markdown: MarkdownOptions::default(),
             page_filter: None,
             password: None,
+            include_form_fields: true,
         }
     }
 }
@@ -331,6 +338,12 @@ impl PdfOptions {
     /// Set the password used to decrypt an encrypted PDF.
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
+        self
+    }
+
+    /// Include or exclude AcroForm form-field values (default: `true`).
+    pub fn include_form_fields(mut self, include: bool) -> Self {
+        self.include_form_fields = include;
         self
     }
 }
@@ -650,9 +663,10 @@ fn extract_pages_markdown_mem_impl(
                 &doc,
                 &font_cmaps,
                 required_pages,
+                true,
             )?
         } else {
-            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
+            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None, true)?
         };
     let text_quality = analyze_text_quality(&all_items);
 
@@ -4577,7 +4591,7 @@ fn contains_recent_eof_marker(buf: &[u8]) -> bool {
 fn process_document(
     doc: Document,
     page_count: u32,
-    options: PdfOptions,
+    mut options: PdfOptions,
     start: ProcessingTimer,
 ) -> Result<PdfProcessResult, PdfError> {
     // Step 1 — Detection (cheap: scans content streams for text operators)
@@ -4653,6 +4667,7 @@ fn process_document(
             &doc,
             &font_cmaps,
             options.page_filter.as_ref(),
+            options.include_form_fields,
         );
 
         // For Mixed/template PDFs: if normal extraction produces garbage text
@@ -4676,6 +4691,7 @@ fn process_document(
                         &doc,
                         &font_cmaps,
                         options.page_filter.as_ref(),
+                        options.include_form_fields,
                     )
                 } else {
                     result
@@ -4686,6 +4702,7 @@ fn process_document(
                     &doc,
                     &font_cmaps,
                     options.page_filter.as_ref(),
+                    options.include_form_fields,
                 )
             }
         } else {
@@ -4842,6 +4859,9 @@ fn process_document(
             let md = if options.mode == ProcessMode::Analyze {
                 None
             } else {
+                // Mirror the navigation-metadata knob onto the markdown
+                // options so the pipeline can drop `OTA/XYZ`-style lines.
+                options.markdown.include_form_fields = options.include_form_fields;
                 Some(markdown::to_markdown_from_items_with_rects_and_lines(
                     items,
                     options.markdown,

@@ -468,6 +468,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    include_form_fields: bool,
 ) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
@@ -476,6 +477,7 @@ pub(crate) fn extract_positioned_text_from_doc(
         TextExtractionOptions::default(),
         None,
         CoordinateFrame::UserSpace,
+        include_form_fields,
     )
 }
 
@@ -497,6 +499,7 @@ pub(crate) fn extract_positioned_text_from_doc_in_page_box(
         options.text_extraction(false),
         None,
         CoordinateFrame::VisiblePageBox,
+        true,
     )
 }
 
@@ -519,8 +522,15 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    include_form_fields: bool,
 ) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        include_form_fields,
+    )
 }
 
 /// Invisible-text variant of [`extract_positioned_text_with_folio_context`].
@@ -528,8 +538,15 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    include_form_fields: bool,
 ) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        true,
+        include_form_fields,
+    )
 }
 
 fn extract_positioned_text_with_folio_context_impl(
@@ -537,6 +554,7 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
+    include_form_fields: bool,
 ) -> Result<DocumentExtraction, PdfError> {
     // The selected pages report their CMap coverage; the context pages
     // gathered below for their folio evidence do not.
@@ -553,6 +571,7 @@ fn extract_positioned_text_with_folio_context_impl(
             options,
             None,
             CoordinateFrame::UserSpace,
+            include_form_fields,
         );
     };
 
@@ -569,6 +588,7 @@ fn extract_positioned_text_with_folio_context_impl(
         options,
         None,
         CoordinateFrame::UserSpace,
+        include_form_fields,
     )?;
     if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
         return Ok((
@@ -605,6 +625,7 @@ fn extract_positioned_text_with_folio_context_impl(
         },
         Some(required_pages),
         CoordinateFrame::UserSpace,
+        include_form_fields,
     )?;
     selected_items.extend(context_items);
     selected_rects.extend(context_rects);
@@ -627,6 +648,7 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     doc: &Document,
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
+    include_form_fields: bool,
 ) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
@@ -635,6 +657,7 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
         TextExtractionOptions::default(),
         Some(required_pages),
         CoordinateFrame::UserSpace,
+        include_form_fields,
     )
 }
 
@@ -645,6 +668,7 @@ fn extract_positioned_text_impl(
     options: TextExtractionOptions,
     required_pages: Option<&HashSet<u32>>,
     frame: CoordinateFrame,
+    include_form_fields: bool,
 ) -> Result<DocumentExtraction, PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
@@ -868,28 +892,33 @@ fn extract_positioned_text_impl(
     // Extract AcroForm field values. Widgets on a turned page turn with it,
     // like links, so positional consumers keep them on the text they cover;
     // in the visible-box frame they take the page's (turned) shift as well.
-    let form_items: Vec<TextItem> = extract_form_fields(doc, &page_id_to_num)
-        .into_iter()
-        .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)))
-        .map(|mut item| {
-            let rotation = page_rotations
-                .get(&item.page)
-                .copied()
-                .unwrap_or(geometry::PageRotation::Upright);
-            rotation.rotate_box(&mut item.x, &mut item.y, &mut item.width, &mut item.height);
-            if frame == CoordinateFrame::VisiblePageBox {
-                let frame_box = page_boxes.get(&item.page).copied().unwrap_or_else(|| {
-                    pages
-                        .get(&item.page)
-                        .and_then(|&id| visible_page_box(doc, id))
-                        .unwrap_or(PageBox::LETTER)
-                });
-                frame_box.translate_items(std::slice::from_mut(&mut item), rotation);
-            }
-            item
-        })
-        .collect();
-    all_items.extend(form_items);
+    // Some PDFs carry AcroForm fields whose values are navigation metadata
+    // (named destinations, internal bookkeeping) rather than document content;
+    // callers that see this noise can opt out via `include_form_fields`.
+    if include_form_fields {
+        let form_items: Vec<TextItem> = extract_form_fields(doc, &page_id_to_num)
+            .into_iter()
+            .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)))
+            .map(|mut item| {
+                let rotation = page_rotations
+                    .get(&item.page)
+                    .copied()
+                    .unwrap_or(geometry::PageRotation::Upright);
+                rotation.rotate_box(&mut item.x, &mut item.y, &mut item.width, &mut item.height);
+                if frame == CoordinateFrame::VisiblePageBox {
+                    let frame_box = page_boxes.get(&item.page).copied().unwrap_or_else(|| {
+                        pages
+                            .get(&item.page)
+                            .and_then(|&id| visible_page_box(doc, id))
+                            .unwrap_or(PageBox::LETTER)
+                    });
+                    frame_box.translate_items(std::slice::from_mut(&mut item), rotation);
+                }
+                item
+            })
+            .collect();
+        all_items.extend(form_items);
+    }
 
     Ok((
         (all_items, all_rects, all_lines),
@@ -5354,7 +5383,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
 
         let font_cmaps = FontCMaps::from_doc(&doc);
         let ((items, _, _), _, _, page_rotations, _) =
-            extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+            extract_positioned_text_from_doc(&doc, &font_cmaps, None, true).unwrap();
         assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
         let field = items
             .iter()

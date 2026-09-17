@@ -562,6 +562,7 @@ fn print_usage(argv0: &str) {
     eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
     eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
     eprintln!("  --password PW       Password for an encrypted PDF");
+    eprintln!("  --drop-form-fields  Drop AcroForm form-field values that are navigation metadata (e.g. 'P1: OTA/XYZ'), keeping real content");
     eprintln!("  --detect-only       Only detect PDF type (no extraction)");
     eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
     eprintln!("  --ocr MODE          OCR mode: off, auto, or force (requires feature `ocr`)");
@@ -627,6 +628,7 @@ fn main() {
     let items_json_output = args.iter().any(|a| a == "--items-json");
     let raw_output = args.iter().any(|a| a == "--raw");
     let compact_output = args.iter().any(|a| a == "--compact");
+    let drop_form_fields = args.iter().any(|a| a == "--drop-form-fields");
     let page_numbers = args.iter().any(|a| a == "--pages");
     let detect_only = args.iter().any(|a| a == "--detect-only");
     let analyze = args.iter().any(|a| a == "--analyze");
@@ -821,6 +823,9 @@ fn main() {
         options.page_filter = Some(pages);
     }
     options.password = password;
+    if drop_form_fields {
+        options.include_form_fields = false;
+    }
 
     match process_pdf_with_options(pdf_path, options) {
         Ok(result) => {

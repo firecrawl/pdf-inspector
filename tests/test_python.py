@@ -90,6 +90,30 @@ class TestProcessPdf:
         assert result.markdown is not None
         assert len(result.markdown) > 0
 
+    def test_include_form_fields_default_keeps_fields(self):
+        # The repro fixture carries AcroForm fields whose values are named-
+        # destination metadata (P1: OTA/XYZ, P2: DEST/A/1) rather than real
+        # content. Form fields are included by default.
+        path = fixture_path("_repro_formfield.pdf")
+        result = pdf_inspector.process_pdf(path)
+        assert "P1: OTA/XYZ" in result.markdown
+        assert "Real document text" in result.markdown
+
+    def test_include_form_fields_false_drops_field_noise(self):
+        path = fixture_path("_repro_formfield.pdf")
+        result = pdf_inspector.process_pdf(path, include_form_fields=False)
+        assert "P1: OTA/XYZ" not in result.markdown
+        assert "P2: DEST/A/1" not in result.markdown
+        # The real document content is preserved.
+        assert "Real document text" in result.markdown
+
+    def test_include_form_fields_false_bytes(self):
+        path = fixture_path("_repro_formfield.pdf")
+        data = fixture_bytes("_repro_formfield.pdf")
+        result = pdf_inspector.process_pdf_bytes(data, include_form_fields=False)
+        assert "P1: OTA/XYZ" not in result.markdown
+        assert "Real document text" in result.markdown
+
     def test_result_repr(self):
         result = pdf_inspector.process_pdf(fixture_path("thermo-freon12.pdf"))
         r = repr(result)

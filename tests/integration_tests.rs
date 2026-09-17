@@ -11060,3 +11060,75 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
     );
     assert_eq!(read, ["(2)(4)"]);
 }
+
+/// AcroForm fields whose values are named-destination metadata (e.g.
+/// `P1: OTA/XYZ`) are noise for most documents. `include_form_fields` must
+/// let callers drop them while keeping real content.
+#[test]
+fn include_form_fields_option_drops_field_noise_but_keeps_content() {
+    let buf = std::fs::read("tests/fixtures/_repro_formfield.pdf").unwrap();
+
+    // Default: form fields are included.
+    let default_result = process_pdf_mem(&buf).unwrap();
+    let default_md = default_result.markdown.unwrap();
+    assert!(
+        default_md.contains("P1: OTA/XYZ"),
+        "default output should keep form fields, got: {:?}",
+        default_md
+    );
+    assert!(default_md.contains("Real document text"));
+
+    // opt-out: form fields dropped, real content preserved.
+    let no_fields =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().include_form_fields(false)).unwrap();
+    let no_fields_md = no_fields.markdown.unwrap();
+    assert!(
+        !no_fields_md.contains("P1: OTA/XYZ"),
+        "form-field noise should be gone, got: {:?}",
+        no_fields_md
+    );
+    assert!(!no_fields_md.contains("P2: DEST/A/1"));
+    assert!(
+        no_fields_md.contains("Real document text"),
+        "real content must be preserved, got: {:?}",
+        no_fields_md
+    );
+}
+
+/// The `pdf2md` CLI `--drop-form-fields` flag must drop AcroForm navigation-
+/// metadata fields (e.g. `P1: OTA/XYZ`) while keeping real content.
+#[test]
+fn cli_drop_form_fields_flag() {
+    let binary = env!("CARGO_BIN_EXE_pdf2md");
+    let fixture = "tests/fixtures/_repro_formfield.pdf";
+
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(binary)
+            .arg(fixture)
+            .args(args)
+            .arg("--raw")
+            .output()
+            .expect("failed to run pdf2md");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // Default output keeps the form-field noise.
+    let default_md = run(&[]);
+    assert!(
+        default_md.contains("P1: OTA/XYZ"),
+        "default output should keep form fields, got: {default_md:?}"
+    );
+
+    // With the flag, the noise is gone but real content remains.
+    let dropped_md = run(&["--drop-form-fields"]);
+    assert!(
+        !dropped_md.contains("P1: OTA/XYZ"),
+        "form-field noise should be dropped, got: {dropped_md:?}"
+    );
+    assert!(!dropped_md.contains("P2: DEST/A/1"));
+    assert!(
+        dropped_md.contains("Real document text"),
+        "real content must be preserved, got: {dropped_md:?}"
+    );
+}
