@@ -11132,3 +11132,39 @@ fn cli_drop_form_fields_flag() {
         "real content must be preserved, got: {dropped_md:?}"
     );
 }
+
+#[test]
+fn cli_drop_page_numbers_flag() {
+    let binary = env!("CARGO_BIN_EXE_pdf2md");
+    let fixture = "tests/fixtures/firecrawl_docs_tagged.pdf";
+
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(binary)
+            .arg(fixture)
+            .args(args)
+            .arg("--raw")
+            .output()
+            .expect("failed to run pdf2md");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // --pages inserts page-break markers.
+    let marked_md = run(&["--pages"]);
+    assert!(
+        marked_md.contains("<!-- Page"),
+        "--pages should insert page markers, got: {} occurrences",
+        marked_md.matches("<!-- Page").count()
+    );
+
+    // --drop-page-numbers removes them even when --pages is also given.
+    let dropped_md = run(&["--pages", "--drop-page-numbers"]);
+    assert!(
+        !dropped_md.contains("<!-- Page"),
+        "--drop-page-numbers should remove page markers, got: {dropped_md:?}"
+    );
+
+    // Without --pages there are no markers either.
+    let plain_md = run(&["--drop-page-numbers"]);
+    assert!(!plain_md.contains("<!-- Page"));
+}

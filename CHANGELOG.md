@@ -673,6 +673,11 @@ Changes since 1.20.0.
   include_form_fields=False)` and `process_pdf_bytes(..., include_form_fields=False)`;
   and the `pdf2md` CLI `--drop-form-fields` flag.
 
+- A `--drop-page-numbers` `pdf2md` CLI flag removes page-break markers
+  (`<!-- Page N -->`) from the Markdown output. Since a converted document has
+  no meaningful pagination, this keeps the text flowing as one stream even when
+  `--pages` is passed. It overrides `--pages`.
+
 ## [1.20.0] - 2026-09-14
 
 Changes since 1.19.0.
