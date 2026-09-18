@@ -57,8 +57,8 @@ pub use extractor::{
     extract_text_with_positions_and_rotations_mem_in_frame,
     extract_text_with_positions_and_rotations_mem_with_options, extract_text_with_positions_mem,
     extract_text_with_positions_mem_in_frame, extract_text_with_positions_mem_with_options,
-    extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
-    PositionFrame, PositionOptions,
+    extract_text_with_positions_mem_with_password, extract_text_with_positions_pages,
+    extract_text_with_positions_pages_with_password, PositionFrame, PositionOptions,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
@@ -397,8 +397,17 @@ pub struct PdfClassification {
 /// Classify a PDF from a memory buffer without extracting text.
 /// Returns the PDF type and which pages need OCR (~10-50ms).
 pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
+    classify_pdf_mem_with_password(buffer, None)
+}
+
+/// [`classify_pdf_mem`], decrypting with `password` if the document is
+/// encrypted.
+pub fn classify_pdf_mem_with_password(
+    buffer: &[u8],
+    password: Option<&str>,
+) -> Result<PdfClassification, PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
     let detection = detector::detect_from_document(&doc, page_count, &DetectionConfig::default())?;
     Ok(PdfClassification {
         pdf_type: detection.pdf_type,
