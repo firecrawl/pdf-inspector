@@ -272,6 +272,7 @@ The converter handles:
 | Captions | "Figure", "Table", "Source:" prefix detection |
 | Sub/superscript | Font size and Y-offset relative to baseline |
 | URLs | Converted to Markdown links |
+| Link annotations | `[visible text](url)` from PDF link annotations |
 | Hyphenation | Rejoins words broken across lines |
 | Page numbers | Filtered from output |
 | Drop caps | Large initial letters merged with following text |
