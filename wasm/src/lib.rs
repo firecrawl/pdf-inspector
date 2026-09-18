@@ -61,8 +61,8 @@ export interface PdfClassification {
 
 export function processPdf(data: Uint8Array, options?: ProcessOptions): PdfProcessResult;
 export function detectPdf(data: Uint8Array, options?: Pick<ProcessOptions, "password">): PdfProcessResult;
-export function classifyPdf(data: Uint8Array): PdfClassification;
-export function extractText(data: Uint8Array): string;
+export function classifyPdf(data: Uint8Array, options?: Pick<ProcessOptions, "password">): PdfClassification;
+export function extractText(data: Uint8Array, options?: Pick<ProcessOptions, "password">): string;
 export function version(): string;
 "#;
 
@@ -74,6 +74,15 @@ struct WasmProcessOptions {
     profile: Option<WasmMarkdownProfile>,
     include_page_markers: Option<bool>,
     include_images: Option<bool>,
+}
+
+/// Options for the entry points that only need to open the document.
+/// Kept separate from [`WasmProcessOptions`] so `deny_unknown_fields`
+/// rejects exactly what the TypeScript signature already forbids.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct WasmPasswordOptions {
+    password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +192,14 @@ fn deserialize_options(value: JsValue) -> Result<WasmProcessOptions, JsValue> {
     serde_wasm_bindgen::from_value(value).map_err(|error| js_error("invalid options", error))
 }
 
+fn deserialize_password_options(value: JsValue) -> Result<WasmPasswordOptions, JsValue> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(WasmPasswordOptions::default());
+    }
+
+    serde_wasm_bindgen::from_value(value).map_err(|error| js_error("invalid options", error))
+}
+
 fn build_options(value: JsValue, mode: ProcessMode) -> Result<PdfOptions, JsValue> {
     let options = deserialize_options(value)?;
     if options
@@ -252,10 +269,11 @@ pub fn detect_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
 
 /// Return the lightweight classification shape used by the native Node API.
 #[wasm_bindgen(js_name = classifyPdf, skip_typescript)]
-pub fn classify_pdf(data: &[u8]) -> Result<JsValue, JsValue> {
+pub fn classify_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
     initialize();
-    let result =
-        pdf_inspector::classify_pdf_mem(data).map_err(|error| js_error("classify PDF", error))?;
+    let options = deserialize_password_options(options)?;
+    let result = pdf_inspector::classify_pdf_mem_with_password(data, options.password.as_deref())
+        .map_err(|error| js_error("classify PDF", error))?;
     serialize(&WasmPdfClassification {
         pdf_type: pdf_type_name(result.pdf_type),
         page_count: result.page_count,
@@ -266,10 +284,14 @@ pub fn classify_pdf(data: &[u8]) -> Result<JsValue, JsValue> {
 
 /// Extract plain text from PDF bytes without Markdown conversion.
 #[wasm_bindgen(js_name = extractText, skip_typescript)]
-pub fn extract_text(data: &[u8]) -> Result<String, JsValue> {
+pub fn extract_text(data: &[u8], options: JsValue) -> Result<String, JsValue> {
     initialize();
-    let items = pdf_inspector::extractor::extract_text_with_positions_mem(data)
-        .map_err(|error| js_error("extract text", error))?;
+    let options = deserialize_password_options(options)?;
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem_with_password(
+        data,
+        options.password.as_deref(),
+    )
+    .map_err(|error| js_error("extract text", error))?;
     Ok(
         pdf_inspector::extractor::group_into_lines_preserving_all_text(items)
             .into_iter()
@@ -398,14 +420,25 @@ mod tests {
         assert!(process_pdf(b"not a PDF", JsValue::UNDEFINED).is_err());
     }
 
+    fn password_options(password: &str) -> JsValue {
+        let options = js_sys::Object::new();
+        Reflect::set(
+            &options,
+            &JsValue::from_str("password"),
+            &JsValue::from_str(password),
+        )
+        .expect("set password");
+        options.into()
+    }
+
     #[wasm_bindgen_test]
     fn classifies_and_extracts_plain_text() {
-        let classification = classify_pdf(TEXT_PDF).expect("classify PDF");
+        let classification = classify_pdf(TEXT_PDF, JsValue::UNDEFINED).expect("classify PDF");
         let pdf_type = Reflect::get(&classification, &JsValue::from_str("pdfType"))
             .expect("pdfType")
             .as_string()
             .expect("pdfType string");
-        let text = extract_text(TEXT_PDF).expect("extract text");
+        let text = extract_text(TEXT_PDF, JsValue::UNDEFINED).expect("extract text");
 
         assert_eq!(pdf_type, "TextBased");
         assert!(!text.is_empty());
@@ -413,7 +446,8 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn extracts_cjk_and_preserves_numeric_page_footer() {
-        let text = extract_text(&synthetic_korea1_pdf()).expect("extract predefined CMap text");
+        let text = extract_text(&synthetic_korea1_pdf(), JsValue::UNDEFINED)
+            .expect("extract predefined CMap text");
 
         assert_eq!(text, "가\n42");
     }
@@ -436,5 +470,34 @@ mod tests {
             .expect("markdown string");
 
         assert!(!markdown.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn classifies_encrypted_pdf_with_password() {
+        assert!(classify_pdf(ENCRYPTED_PDF, JsValue::UNDEFINED).is_err());
+
+        let classification = classify_pdf(ENCRYPTED_PDF, password_options("secret123"))
+            .expect("classify encrypted PDF");
+        let pdf_type = Reflect::get(&classification, &JsValue::from_str("pdfType"))
+            .expect("pdfType")
+            .as_string()
+            .expect("pdfType string");
+        let page_count = Reflect::get(&classification, &JsValue::from_str("pageCount"))
+            .expect("pageCount")
+            .as_f64()
+            .expect("pageCount number");
+
+        assert_eq!(pdf_type, "TextBased");
+        assert!(page_count > 0.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn extracts_text_from_encrypted_pdf_with_password() {
+        assert!(extract_text(ENCRYPTED_PDF, JsValue::UNDEFINED).is_err());
+
+        let text = extract_text(ENCRYPTED_PDF, password_options("secret123"))
+            .expect("extract encrypted PDF text");
+
+        assert!(text.contains("Procurement"));
     }
 }

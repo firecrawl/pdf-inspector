@@ -212,6 +212,25 @@ pub fn extract_text_with_positions_mem(buffer: &[u8]) -> Result<Vec<TextItem>, P
     extract_text_with_positions_mem_pages(buffer, None)
 }
 
+/// [`extract_text_with_positions_mem`], decrypting with `password` if the
+/// document is encrypted.
+///
+/// The path-based counterpart is
+/// [`extract_text_with_positions_pages_with_password`]; browser and other
+/// filesystem-less callers need this one.
+pub fn extract_text_with_positions_mem_with_password(
+    buffer: &[u8],
+    password: Option<&str>,
+) -> Result<Vec<TextItem>, PdfError> {
+    let (items, _page_rotations) = extract_text_with_positions_and_rotations_mem_with_password(
+        buffer,
+        None,
+        PositionOptions::new(),
+        password,
+    )?;
+    Ok(items)
+}
+
 /// Extract text with positions from a memory buffer, limited to specific
 /// pages. Coordinates: see [`extract_text_with_positions`].
 pub fn extract_text_with_positions_mem_pages(
@@ -302,8 +321,23 @@ pub fn extract_text_with_positions_and_rotations_mem_with_options(
     page_filter: Option<&HashSet<u32>>,
     options: PositionOptions,
 ) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
+    extract_text_with_positions_and_rotations_mem_with_password(buffer, page_filter, options, None)
+}
+
+/// [`extract_text_with_positions_and_rotations_mem_with_options`],
+/// decrypting with `password` if the document is encrypted.
+///
+/// `password` is kept out of [`PositionOptions`] on purpose: that struct is
+/// `Copy` and describes how items are reported, not how the document is
+/// opened.
+pub(crate) fn extract_text_with_positions_and_rotations_mem_with_password(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    options: PositionOptions,
+    password: Option<&str>,
+) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
     crate::validate_pdf_bytes(buffer)?;
-    let (doc, _) = crate::load_document_from_mem(buffer)?;
+    let (doc, _) = crate::load_document_from_mem_with_password(buffer, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let ((mut items, _rects, _lines), _thresholds, _gid_pages, page_rotations) =
         extract_positioned_text_from_doc_in_page_box(
