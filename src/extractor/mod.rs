@@ -2336,6 +2336,7 @@ fn merge_text_items_with_clips(
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
                 baseline_shift: 0.0,
+                link_url: None,
             });
 
             i = j;
@@ -2534,6 +2535,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -2725,7 +2727,7 @@ mod tests {
         };
         assert_eq!(line.text(), "KEY Body");
         assert_eq!(
-            line.text_with_formatting(true, false, false),
+            line.text_with_formatting(true, false, false, false),
             "**KEY** Body"
         );
     }
@@ -2757,7 +2759,10 @@ mod tests {
             adaptive_threshold: 0.1,
         };
         assert_eq!(line.text(), "unknown");
-        assert_eq!(line.text_with_formatting(true, false, false), "**un**known");
+        assert_eq!(
+            line.text_with_formatting(true, false, false, false),
+            "**un**known"
+        );
     }
 
     #[test]
@@ -2811,7 +2816,10 @@ mod tests {
                 page: 1,
                 adaptive_threshold: 0.1,
             };
-            assert_eq!(line.text_with_formatting(true, false, false), expected);
+            assert_eq!(
+                line.text_with_formatting(true, false, false, false),
+                expected
+            );
             assert_eq!(line.text(), expected.replace("**", ""));
         }
     }
@@ -3025,6 +3033,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "World".into(),
@@ -3049,6 +3058,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "Next line".into(),
@@ -3073,6 +3083,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
         ];
 
@@ -3867,6 +3878,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "Prague".into(),
@@ -3891,6 +3903,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "Rules".into(),
@@ -3915,6 +3928,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
         ];
 
@@ -3950,6 +3964,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "A".into(),
@@ -3974,6 +3989,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "V".into(),
@@ -3998,6 +4014,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
         ];
 
@@ -4035,6 +4052,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             }
         }
 
@@ -4079,6 +4097,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             }
         }
 
@@ -4124,6 +4143,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "履行義務".into(),
@@ -4148,6 +4168,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "を識別す".into(),
@@ -4172,6 +4193,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
         ];
 
@@ -4204,6 +4226,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -4351,6 +4374,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "\u{05D1}".into(), // bet at x=200 (rightmost)
@@ -4375,6 +4399,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
         ];
         sort_line_items(&mut items, false);
@@ -4409,6 +4434,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
             TextItem {
                 text: "World".into(),
@@ -4433,6 +4459,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             },
         ];
         sort_line_items(&mut items, false);
@@ -4483,6 +4510,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             }],
         };
 
@@ -4537,6 +4565,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             }],
         };
 
@@ -4591,6 +4620,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             }],
         };
 
@@ -4638,6 +4668,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 

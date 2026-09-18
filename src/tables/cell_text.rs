@@ -14,7 +14,7 @@ use crate::types::TextItem;
 /// that join fragments themselves never flatten a marker into plain digits.
 pub(crate) fn cell_fragment(item: &TextItem, text: &str) -> String {
     let mut fragment = String::new();
-    crate::types::push_item_text(&mut fragment, item, text);
+    crate::types::push_item_text(&mut fragment, item, text, false);
     fragment
 }
 
@@ -72,9 +72,9 @@ pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
             if crate::types::stacked_fraction_slash(prev_item, item) {
                 result.push('/');
             }
-            crate::types::push_item_text(&mut result, item, text);
+            crate::types::push_item_text(&mut result, item, text, false);
         } else {
-            crate::types::push_item_text(&mut result, item, text);
+            crate::types::push_item_text(&mut result, item, text, false);
         }
         last = Some(item);
     }
@@ -228,7 +228,7 @@ pub(crate) fn push_cell_item<'a>(
             cell.push('/');
         }
     }
-    crate::types::push_item_text(cell, item, text);
+    crate::types::push_item_text(cell, item, text, false);
     *last = Some(item);
 }
 
@@ -261,6 +261,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -336,6 +337,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: shift,
+            link_url: None,
         }
     }
 

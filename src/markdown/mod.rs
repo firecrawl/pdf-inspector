@@ -18,7 +18,7 @@ pub use convert::to_markdown_from_lines;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{PdfLine, PdfRect, TextItem};
+use crate::types::{ItemType, PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
 use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
@@ -1584,6 +1584,11 @@ fn convert_items_with_rects_lines_and_table_output(
         }
     }
 
+    // Stamp text items with URLs from overlapping link annotations.
+    if !links.is_empty() {
+        stamp_link_urls(&mut text_items, &links);
+    }
+
     // Calculate base font size for table detection
     let font_stats = calculate_font_stats_from_items(&text_items);
     let base_size = options
@@ -2411,6 +2416,57 @@ fn convert_items_with_rects_lines_and_table_output(
     }
 }
 
+/// Match link annotation items to text items by spatial overlap and stamp
+/// each covered text item with the annotation's URL.
+fn stamp_link_urls(text_items: &mut [TextItem], links: &[TextItem]) {
+    use std::collections::HashMap;
+
+    struct LinkRect {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        url: String,
+    }
+
+    let mut page_links: HashMap<u32, Vec<LinkRect>> = HashMap::new();
+    for link in links {
+        if let ItemType::Link(ref url) = link.item_type {
+            let (x1, x2) = if link.width >= 0.0 {
+                (link.x, link.x + link.width)
+            } else {
+                (link.x + link.width, link.x)
+            };
+            let (y1, y2) = if link.height >= 0.0 {
+                (link.y, link.y + link.height)
+            } else {
+                (link.y + link.height, link.y)
+            };
+            page_links.entry(link.page).or_default().push(LinkRect {
+                x1,
+                y1,
+                x2,
+                y2,
+                url: url.clone(),
+            });
+        }
+    }
+
+    for item in text_items.iter_mut() {
+        if let Some(rects) = page_links.get(&item.page) {
+            let cx = item.x + item.width * 0.5;
+            let cy = item.y + item.height * 0.5;
+            for lr in rects {
+                if cx >= lr.x1 - 1.0 && cx <= lr.x2 + 1.0 && cy >= lr.y1 - 1.0 && cy <= lr.y2 + 1.0
+                {
+                    item.link_url = Some(lr.url.clone());
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2701,6 +2757,7 @@ mod tests {
             item_type: crate::types::ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 

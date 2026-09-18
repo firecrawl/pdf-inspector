@@ -280,6 +280,7 @@ mod tests {
             baseline_shift: 0.0,
             rotation,
             advance_known: true,
+            link_url: None,
         }
     }
 

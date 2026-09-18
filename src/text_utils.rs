@@ -1642,6 +1642,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -1886,6 +1887,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -2015,6 +2017,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+                link_url: None,
             });
             // Alternate between letter-gap and word-gap to create bimodal distribution
             x += w + if wi % 3 == 2 { word_gap } else { letter_gap };
@@ -2101,6 +2104,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -2203,6 +2207,7 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            link_url: None,
         }
     }
 

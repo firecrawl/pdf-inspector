@@ -479,6 +479,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -829,6 +830,7 @@ mod tests {
                         mcid: None,
                         baseline_shift: 0.0,
                         page: 1,
+                        link_url: None,
                     },
                 ));
             }
@@ -875,6 +877,7 @@ mod tests {
                         mcid: None,
                         baseline_shift: 0.0,
                         page: 1,
+                        link_url: None,
                     },
                 ));
             }

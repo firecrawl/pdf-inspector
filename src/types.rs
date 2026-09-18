@@ -490,6 +490,10 @@ pub struct TextItem {
     /// characters ("H₂O", "word²") and never carries a shift. `y` stays the
     /// glyph's own baseline; [`TextItem::line_y`] gives the anchor's.
     pub baseline_shift: f32,
+    /// URL of a hyperlink annotation whose rectangle covers this text item.
+    /// Set by the markdown pipeline after spatial matching of link annotations
+    /// to text items; `None` for items outside any link annotation.
+    pub link_url: Option<String>,
 }
 
 impl TextItem {
@@ -658,40 +662,78 @@ pub(crate) fn stacked_fraction_slash(prev: &TextItem, item: &TextItem) -> bool {
 /// Append an item's text, wrapping a super/subscript run in its tag.
 /// Shared by line rendering and table-cell joining so both emit the same
 /// markup for a run.
-pub(crate) fn push_item_text(result: &mut String, item: &TextItem, text: &str) {
+fn push_link_text(result: &mut String, text: &str) {
+    if text.contains(']') {
+        for ch in text.chars() {
+            if ch == ']' {
+                result.push_str("\\]");
+            } else {
+                result.push(ch);
+            }
+        }
+    } else {
+        result.push_str(text);
+    }
+}
+
+pub(crate) fn push_item_text(result: &mut String, item: &TextItem, text: &str, in_link: bool) {
     let tag = if item.baseline_shift > 0.0 {
         "sup"
     } else if item.baseline_shift < 0.0 {
         "sub"
     } else {
-        result.push_str(text);
+        if in_link {
+            push_link_text(result, text);
+        } else {
+            result.push_str(text);
+        }
         return;
     };
     result.push('<');
     result.push_str(tag);
     result.push('>');
-    result.push_str(text);
+    if in_link {
+        push_link_text(result, text);
+    } else {
+        result.push_str(text);
+    }
     result.push_str("</");
     result.push_str(tag);
     result.push('>');
 }
 
+fn push_escaped_url(result: &mut String, url: &str) {
+    for ch in url.chars() {
+        match ch {
+            '(' => result.push_str("%28"),
+            ')' => result.push_str("%29"),
+            ' ' => result.push_str("%20"),
+            '\n' | '\r' => {}
+            _ => result.push(ch),
+        }
+    }
+}
+
 impl TextLine {
     pub fn text(&self) -> String {
-        self.text_with_formatting(false, false, false)
+        self.text_with_formatting(false, false, false, false)
     }
 
-    /// Get text with optional bold/italic/decorative markdown formatting.
+    /// Get text with optional bold/italic/decorative/link markdown formatting.
     ///
     /// `format_decorations` enables both geometrically detected source
     /// decorations: underline (`<u>`) and strikeout (`<s>`).
+    ///
+    /// `format_links` wraps text items that carry a `link_url` in
+    /// `[text](url)` markdown link syntax.
     pub fn text_with_formatting(
         &self,
         format_bold: bool,
         format_italic: bool,
         format_decorations: bool,
+        format_links: bool,
     ) -> String {
-        if !format_bold && !format_italic && !format_decorations {
+        if !format_bold && !format_italic && !format_decorations && !format_links {
             return self.text_plain();
         }
 
@@ -702,6 +744,7 @@ impl TextLine {
         let mut current_italic = false;
         let mut current_underline = false;
         let mut current_strikeout = false;
+        let mut current_link: Option<&str> = None;
 
         for (i, item) in self.items.iter().enumerate() {
             let text = item.text.as_str();
@@ -773,61 +816,127 @@ impl TextLine {
                 None
             };
 
-            // Close previous styles if they change
-            if current_italic && !item_italic {
-                result.push('*');
-                current_italic = false;
-            }
-            if current_bold && !item_bold {
-                result.push_str("**");
-                current_bold = false;
-            }
-            if current_underline && !item_underline {
-                result.push_str("</u>");
-                current_underline = false;
-            }
-            if current_strikeout && !item_strikeout {
-                result.push_str("</s>");
-                current_strikeout = false;
-            }
+            // Link URL for this item; script runs inherit the surrounding link.
+            let item_link = if format_links {
+                if is_script {
+                    current_link
+                } else {
+                    item.link_url.as_deref()
+                }
+            } else {
+                None
+            };
 
-            // Add space: either from spacing logic or preserved from item text
-            if emit_space {
-                result.push(' ');
-            }
+            let link_changed = item_link != current_link;
 
-            // Open new styles
-            if item_underline && !current_underline {
-                result.push_str("<u>");
-                current_underline = true;
-            }
-            if item_strikeout && !current_strikeout {
-                result.push_str("<s>");
-                current_strikeout = true;
-            }
-            if item_bold && !current_bold {
-                result.push_str("**");
-                current_bold = true;
-            }
-            if item_italic && !current_italic {
-                result.push('*');
-                current_italic = true;
+            if link_changed {
+                // Link transition: close everything, close old link, space,
+                // open new link, re-open formatting.  This produces
+                // `[**text**](url)` — formatting inside brackets.
+                if current_italic {
+                    result.push('*');
+                    current_italic = false;
+                }
+                if current_bold {
+                    result.push_str("**");
+                    current_bold = false;
+                }
+                if current_underline {
+                    result.push_str("</u>");
+                    current_underline = false;
+                }
+                if current_strikeout {
+                    result.push_str("</s>");
+                    current_strikeout = false;
+                }
+                if let Some(url) = current_link {
+                    result.push_str("](");
+                    push_escaped_url(&mut result, url);
+                    result.push(')');
+                }
+
+                if emit_space {
+                    result.push(' ');
+                }
+
+                if let Some(_url) = item_link {
+                    result.push('[');
+                }
+                current_link = item_link;
+
+                // Re-open formatting for the new item
+                if item_underline {
+                    result.push_str("<u>");
+                    current_underline = true;
+                }
+                if item_strikeout {
+                    result.push_str("<s>");
+                    current_strikeout = true;
+                }
+                if item_bold {
+                    result.push_str("**");
+                    current_bold = true;
+                }
+                if item_italic {
+                    result.push('*');
+                    current_italic = true;
+                }
+            } else {
+                // Same link (or both None): normal style transitions.
+                if current_italic && !item_italic {
+                    result.push('*');
+                    current_italic = false;
+                }
+                if current_bold && !item_bold {
+                    result.push_str("**");
+                    current_bold = false;
+                }
+                if current_underline && !item_underline {
+                    result.push_str("</u>");
+                    current_underline = false;
+                }
+                if current_strikeout && !item_strikeout {
+                    result.push_str("</s>");
+                    current_strikeout = false;
+                }
+
+                if emit_space {
+                    result.push(' ');
+                }
+
+                if item_underline && !current_underline {
+                    result.push_str("<u>");
+                    current_underline = true;
+                }
+                if item_strikeout && !current_strikeout {
+                    result.push_str("<s>");
+                    current_strikeout = true;
+                }
+                if item_bold && !current_bold {
+                    result.push_str("**");
+                    current_bold = true;
+                }
+                if item_italic && !current_italic {
+                    result.push('*');
+                    current_italic = true;
+                }
             }
 
             if i > 0 && stacked_fraction_slash(&self.items[i - 1], item) {
                 result.push('/');
             }
+            let in_link = current_link.is_some();
             match own_script_tag {
                 Some(tag) => {
                     result.push('<');
                     result.push_str(tag);
                     result.push('>');
-                    push_item_text(&mut result, item, text_trimmed);
+                    push_item_text(&mut result, item, text_trimmed, in_link);
                     result.push_str("</");
                     result.push_str(tag);
                     result.push('>');
                 }
-                None => push_item_text(&mut result, item, text_trimmed),
+                None => push_item_text(&mut result, item, text_trimmed, in_link),
             }
         }
 
@@ -843,6 +952,11 @@ impl TextLine {
         }
         if current_strikeout {
             result.push_str("</s>");
+        }
+        if let Some(url) = current_link {
+            result.push_str("](");
+            push_escaped_url(&mut result, url);
+            result.push(')');
         }
 
         result
@@ -873,7 +987,7 @@ impl TextLine {
             if i > 0 && stacked_fraction_slash(&self.items[i - 1], item) {
                 result.push('/');
             }
-            push_item_text(&mut result, item, item.text.as_str());
+            push_item_text(&mut result, item, item.text.as_str(), false);
         }
         result
     }
@@ -955,6 +1069,7 @@ mod formatting_tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -997,7 +1112,7 @@ mod formatting_tests {
         ]);
         assert_eq!(line.text(), "Yibo Yan<sup>1,2</sup>, Jiahao Huo");
         assert_eq!(
-            line.text_with_formatting(true, true, true),
+            line.text_with_formatting(true, true, true, false),
             "Yibo Yan<sup>1,2</sup>, Jiahao Huo"
         );
     }
@@ -1051,7 +1166,7 @@ mod formatting_tests {
         rest.is_bold = true;
         let line = line(vec![name, script("1", 58.0, 4.0, 4.3), rest]);
         assert_eq!(
-            line.text_with_formatting(true, false, false),
+            line.text_with_formatting(true, false, false, false),
             "**Yibo Yan<sup>1</sup>, Jiahao Huo**"
         );
         assert_eq!(line.text(), "Yibo Yan<sup>1</sup>, Jiahao Huo");
@@ -1123,7 +1238,7 @@ mod formatting_tests {
         marker.is_underline = true;
         let line = line(vec![body("word", 10.0, 48.0), marker]);
         assert_eq!(
-            line.text_with_formatting(false, false, true),
+            line.text_with_formatting(false, false, true, false),
             "word<u><sup>1</sup></u>"
         );
     }
@@ -1135,7 +1250,7 @@ mod formatting_tests {
         let second = script("2", 80.0, 4.0, 4.3);
         let line = line(vec![body("word", 10.0, 48.0), first, second]);
         assert_eq!(
-            line.text_with_formatting(false, false, true),
+            line.text_with_formatting(false, false, true, false),
             "word<u><sup>1</sup></u> <sup>2</sup>"
         );
     }
@@ -1150,7 +1265,7 @@ mod formatting_tests {
         marker.is_strikeout = true;
         let line = line(vec![word, marker]);
         assert_eq!(
-            line.text_with_formatting(false, false, true),
+            line.text_with_formatting(false, false, true, false),
             "<u>word<s><sup>1</sup></s></u>"
         );
     }
@@ -1180,7 +1295,7 @@ mod formatting_tests {
         let line = line(vec![item("deleted", 10.0, 42.0, true)]);
 
         assert_eq!(
-            line.text_with_formatting(true, true, true),
+            line.text_with_formatting(true, true, true, false),
             "<s>deleted</s>"
         );
     }
@@ -1194,7 +1309,7 @@ mod formatting_tests {
         ]);
 
         assert_eq!(
-            line.text_with_formatting(true, true, true),
+            line.text_with_formatting(true, true, true, false),
             "keep <s>remove</s> keep"
         );
     }
@@ -1207,7 +1322,7 @@ mod formatting_tests {
         ]);
 
         assert_eq!(
-            line.text_with_formatting(true, true, true),
+            line.text_with_formatting(true, true, true, false),
             "<s>deleted words</s>"
         );
     }
@@ -1221,7 +1336,7 @@ mod formatting_tests {
         let line = line(vec![decorated]);
 
         assert_eq!(
-            line.text_with_formatting(true, true, true),
+            line.text_with_formatting(true, true, true, false),
             "<s>deleted</s>"
         );
         assert_eq!(line.text(), "deleted");

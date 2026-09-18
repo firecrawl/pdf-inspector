@@ -628,6 +628,7 @@ fn extract_form_xobject_text_inner(
                                     item_type: ItemType::Image,
                                     mcid: None,
                                     baseline_shift: 0.0,
+                                    link_url: None,
                                 });
                             }
                             None => {}
@@ -956,6 +957,7 @@ fn extract_form_xobject_text_inner(
                                 item_type: ItemType::Text,
                                 mcid: None,
                                 baseline_shift: 0.0,
+                                link_url: None,
                             });
                             // A short string with word-gap character spacing
                             // shows its spaces once the next run proves the
@@ -1447,6 +1449,7 @@ fn extract_form_xobject_text_inner(
                                     item_type: ItemType::Text,
                                     mcid: None,
                                     baseline_shift: 0.0,
+                                    link_url: None,
                                 });
                             }
                         }
