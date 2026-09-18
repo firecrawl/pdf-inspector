@@ -9878,6 +9878,25 @@ fn make_link_annotation_pdf() -> Vec<u8> {
         },
     });
 
+    let link4_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![68.into(), 534.into(), 220.into(), 556.into()],
+        "A" => dictionary! {
+            "S" => "URI",
+            "URI" => Object::string_literal("https://example.com/bracket"),
+        },
+    });
+    let link5_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![68.into(), 494.into(), 200.into(), 516.into()],
+        "A" => dictionary! {
+            "S" => "URI",
+            "URI" => Object::string_literal("https://example.com/path with spaces/doc"),
+        },
+    });
+
     doc.objects.insert(
         page_id,
         dictionary! {
