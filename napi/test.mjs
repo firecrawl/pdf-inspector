@@ -538,6 +538,19 @@ for (const bad of [0, 99, 901, 1000]) {
     /boldWeightThreshold/,
   );
 }
+// Both ends of the scale are valid: at 100 every weight class is bold, at
+// 900 none of this page's.
+assert.deepEqual(
+  extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true, boldWeightThreshold: 100 }).map(styleOf),
+  [
+    ['Light Medium Heavy', true, 300],
+    ['Same weight', true, 300],
+  ],
+);
+assert.deepEqual(
+  extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true, boldWeightThreshold: 900 }).map(styleOf),
+  extractTextWithPositions(weightsPdf).map(styleOf),
+);
 assert.throws(
   () => extractTextWithPositionsAndRotations(weightsPdf, undefined, { boldWeightThreshold: 1000 }),
   /boldWeightThreshold/,

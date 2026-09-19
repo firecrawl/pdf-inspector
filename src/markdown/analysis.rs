@@ -896,7 +896,7 @@ mod tests {
             is_bold: bold,
             is_italic: false,
             font_weight: None,
-            bold_source: None,
+            bold_source: bold.then_some(crate::types::BoldSource::FontName),
             fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,

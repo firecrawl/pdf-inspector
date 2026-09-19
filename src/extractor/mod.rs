@@ -3605,7 +3605,7 @@ mod tests {
                 is_bold: true,
                 is_italic: false,
                 font_weight: None,
-                bold_source: None,
+                bold_source: Some(crate::types::BoldSource::FontName),
                 fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,

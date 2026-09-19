@@ -1,7 +1,9 @@
 # Third-party font licences
 
-Fixtures under `tests/fixtures/` that embed font programs are listed here
-with the licence those programs are redistributed under.
+The fixtures under `tests/fixtures/` whose embedded font programs were cut
+from third-party fonts for the fixture are listed here with the licence those
+programs are redistributed under. Other fixtures embed the fonts of the
+documents they were made from and are not listed.
 
 ## font_metadata_faces.pdf
 
@@ -10,7 +12,10 @@ version 2.37 (<https://github.com/dejavu-fonts/dejavu-fonts/releases/download/ve
 and subset TrueType programs. DejaVu's changes to the fonts are in the public
 domain; the fonts are otherwise covered by the Bitstream Vera Fonts licence and
 the Arev Fonts licence below, reproduced from the release archive's `LICENSE`
-file. As that licence asks, no modified face carries the Bitstream Vera names.
+file. As that licence asks, no modified face carries the Bitstream Vera names,
+and every subset keeps the source font's copyright, licence description and
+licence URL in its name table; the PDF's document information repeats the
+copyright line.
 
 ```text
 Fonts are (c) Bitstream (see below). DejaVu changes are in public domain.

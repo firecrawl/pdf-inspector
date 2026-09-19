@@ -1076,10 +1076,11 @@ pub fn extract_text_in_regions_mem_in_frame(
 
 /// [`extract_text_in_regions_mem_in_frame`] with every option given as a
 /// [`PositionOptions`]: the frame the region rects are read in, and whether
-/// bold is also read from the font's weight class (`bold_from_weight`, from
-/// the class `bold_weight_threshold` names; a run the weight makes bold is
-/// then its own item while the region's lines are assembled). The default
-/// options are [`extract_text_in_regions_mem`].
+/// bold is also read from the font's weight class (`bold_from_weight`: a
+/// weight class of `bold_weight_threshold` or more, 600 by default, is bold,
+/// and a run the weight makes bold is then its own item while the region's
+/// lines are assembled). The default options are
+/// [`extract_text_in_regions_mem`].
 pub fn extract_text_in_regions_mem_with_options(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],

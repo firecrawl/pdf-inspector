@@ -252,8 +252,9 @@ pub struct FrameOptions {
     pub frame: Option<String>,
     /// Also read bold from the font's weight class. When `true`,
     /// `TextItem.isBold` is also `true` for items whose `fontWeight` is
-    /// `boldWeightThreshold` (600, SemiBold, by default) or more, with
-    /// `boldSource: "WeightClass"`, and adjacent runs are merged by that
+    /// `boldWeightThreshold` (600, SemiBold, by default) or more — with
+    /// `boldSource: "WeightClass"` unless the font's name or flags already
+    /// said bold — and adjacent runs are merged by that
     /// verdict: a run the weight makes bold stays apart from its plain
     /// neighbours, so a heavier run inside a lighter paragraph keeps its own
     /// item, while runs whose weights differ but agree on bold merge as

@@ -134,7 +134,7 @@ class TextItem:
     "-Md", "Black", "W6"). ``None`` when none of them says, and for image, link
     and form-field items. Independent of ``is_bold``, which is unchanged: a
     medium face reports ``500`` with ``is_bold`` ``False``."""
-    bold_source: Optional[str]
+    bold_source: Optional[Literal["font_name", "font_flags", "weight_class", "painted"]]
     """Where ``is_bold`` came from — ``"font_name"``, ``"font_flags"``,
     ``"weight_class"`` (with ``bold_from_weight``) or ``"painted"``, the first
     of them in that order when more than one says bold — so a verdict can be

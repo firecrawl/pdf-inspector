@@ -6455,18 +6455,18 @@ fn test_fixed_pitch_is_declared_or_measured() {
     );
     // Ten tabular digits share an advance and are too few to say.
     assert_eq!(face_style(&items, "0123456789").3, None);
-    // The verdict is the font's, not the option's.
+    // The verdict is the font's, not the option's: whatever the option
+    // makes of the runs, every face reports the same fixed pitch.
     let weighted = font_metadata_items(PositionOptions::new().bold_from_weight(true));
-    assert_eq!(
-        weighted
-            .iter()
-            .map(|item| item.fixed_pitch)
-            .collect::<Vec<_>>(),
+    let by_font = |items: &[TextItem]| -> std::collections::BTreeMap<String, Option<bool>> {
         items
             .iter()
-            .map(|item| item.fixed_pitch)
-            .collect::<Vec<_>>()
-    );
+            .map(|item| (item.font.clone(), item.fixed_pitch))
+            .collect()
+    };
+    let faces = by_font(&items);
+    assert_eq!(faces.len(), 10, "{faces:?}");
+    assert_eq!(by_font(&weighted), faces);
 }
 
 // ---------------------------------------------------------------------------

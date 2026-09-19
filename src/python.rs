@@ -934,7 +934,7 @@ fn extract_text_with_positions(
     path: &str,
     pages: Option<Vec<u32>>,
     bold_from_weight: bool,
-    bold_weight_threshold: u16,
+    bold_weight_threshold: i64,
 ) -> PyResult<Vec<PyTextItem>> {
     // The threshold is checked whichever path the call takes.
     position_options(bold_from_weight, bold_weight_threshold)?;
@@ -958,23 +958,28 @@ fn extract_text_with_positions(
 }
 
 /// The weight class `bold_from_weight` reads bold from unless told otherwise.
-const DEFAULT_BOLD_WEIGHT_THRESHOLD: u16 = 600;
+const DEFAULT_BOLD_WEIGHT_THRESHOLD: i64 = 600;
 
 /// The positioned-text options the `bold_from_weight` and
 /// `bold_weight_threshold` arguments ask for; a threshold outside the
-/// 100..=900 scale is a ValueError rather than a silent clamp.
+/// 100..=900 scale is a ValueError rather than a silent clamp. The argument
+/// is taken as a wide integer so that -1 or 65536 reach this check instead
+/// of failing the conversion to the crate's `u16`.
 fn position_options(
     bold_from_weight: bool,
-    bold_weight_threshold: u16,
+    bold_weight_threshold: i64,
 ) -> PyResult<crate::PositionOptions> {
-    if !(100..=900).contains(&bold_weight_threshold) {
-        return Err(PyValueError::new_err(format!(
-            "bold_weight_threshold {bold_weight_threshold} is outside 100..900"
-        )));
-    }
+    let threshold = u16::try_from(bold_weight_threshold)
+        .ok()
+        .filter(|threshold| (100..=900).contains(threshold))
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "bold_weight_threshold {bold_weight_threshold} is outside 100..900"
+            ))
+        })?;
     Ok(crate::PositionOptions::new()
         .bold_from_weight(bold_from_weight)
-        .bold_weight_threshold(bold_weight_threshold))
+        .bold_weight_threshold(threshold))
 }
 
 /// The coordinate frame of a page whose text was predominantly rotated.
@@ -1043,7 +1048,7 @@ fn convert_page_rotations(
 fn extract_text_with_positions_and_rotations(
     path: &str,
     bold_from_weight: bool,
-    bold_weight_threshold: u16,
+    bold_weight_threshold: i64,
 ) -> PyResult<PyPositionedText> {
     let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
     extract_text_with_positions_and_rotations_bytes(&data, bold_from_weight, bold_weight_threshold)
@@ -1056,7 +1061,7 @@ fn extract_text_with_positions_and_rotations(
 fn extract_text_with_positions_and_rotations_bytes(
     data: &[u8],
     bold_from_weight: bool,
-    bold_weight_threshold: u16,
+    bold_weight_threshold: i64,
 ) -> PyResult<PyPositionedText> {
     let (items, rotations) = crate::extract_text_with_positions_and_rotations_mem_with_options(
         data,
@@ -1079,7 +1084,7 @@ fn extract_text_with_positions_bytes(
     data: &[u8],
     pages: Option<Vec<u32>>,
     bold_from_weight: bool,
-    bold_weight_threshold: u16,
+    bold_weight_threshold: i64,
 ) -> PyResult<Vec<PyTextItem>> {
     let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
     let items = crate::extract_text_with_positions_mem_with_options(
@@ -1117,7 +1122,7 @@ fn extract_text_in_regions(
     path: &str,
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
     bold_from_weight: bool,
-    bold_weight_threshold: u16,
+    bold_weight_threshold: i64,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
     extract_text_in_regions_bytes(&data, page_regions, bold_from_weight, bold_weight_threshold)
@@ -1145,7 +1150,7 @@ fn extract_text_in_regions_bytes(
     data: &[u8],
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
     bold_from_weight: bool,
-    bold_weight_threshold: u16,
+    bold_weight_threshold: i64,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let regions = parse_page_regions(page_regions)?;
     let results = crate::extract_text_in_regions_mem_with_options(

@@ -1394,10 +1394,14 @@ pub(crate) fn font_style(
         .ok()
         .and_then(get_number)
         .unwrap_or(0.0);
+    // The flags may be written as an indirect object.
     let flags = descriptor
         .get(b"Flags")
         .ok()
-        .and_then(|obj| obj.as_i64().ok())
+        .and_then(|obj| match obj {
+            Object::Reference(id) => doc.get_object(*id).ok().and_then(|o| o.as_i64().ok()),
+            direct => direct.as_i64().ok(),
+        })
         .unwrap_or(0);
 
     let force_bold = flags & (1 << 18) != 0;
@@ -3257,6 +3261,28 @@ end",
             font_style(&doc, &font_dict, &mut FontStyleCache::new()).fixed_pitch,
             None
         );
+    }
+
+    #[test]
+    fn indirect_flags_are_resolved_before_their_bits_are_read() {
+        let mut doc = Document::with_version("1.4");
+        let flags_id = doc.add_object(Object::Integer(1 | (1 << 18))); // FixedPitch, ForceBold
+        let desc_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "ItalicAngle" => 0,
+            "Flags" => flags_id,
+        });
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "Tc1",
+            "FontDescriptor" => desc_id,
+        };
+        let style = font_style(&doc, &font_dict, &mut FontStyleCache::new());
+        assert!(style.bold);
+        assert_eq!(style.bold_source, Some(BoldSource::FontFlags));
+        assert_eq!(style.fixed_pitch, Some(true));
     }
 
     #[test]

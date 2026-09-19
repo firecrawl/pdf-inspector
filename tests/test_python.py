@@ -300,9 +300,10 @@ class TestExtractTextWithPositions:
         assert isinstance(item.is_bold, bool)
         assert isinstance(item.is_italic, bool)
         assert item.font_weight is None or isinstance(item.font_weight, int)
-        assert item.bold_source in (None, "font_name", "font_flags", "weight_class", "painted")
-        assert item.is_bold == (item.bold_source is not None)
-        assert item.fixed_pitch is None or isinstance(item.fixed_pitch, bool)
+        sources = (None, "font_name", "font_flags", "weight_class", "painted")
+        assert all(i.bold_source in sources for i in items)
+        assert all(i.is_bold == (i.bold_source is not None) for i in items)
+        assert all(i.fixed_pitch is None or isinstance(i.fixed_pitch, bool) for i in items)
         assert isinstance(item.item_type, str)
 
     def test_bold_from_weight_defaults_off(self):
@@ -374,14 +375,26 @@ class TestExtractTextWithPositions:
             pdf_inspector.extract_text_with_positions_bytes(data, bold_weight_threshold=100)
         ) == styles(plain)
         # Outside 100..900 the threshold is a ValueError, on every function
-        # that takes it and whether or not the option is on.
-        for bad in (0, 99, 901, 1000):
+        # that takes it and whether or not the option is on; values that do
+        # not fit the crate's 16-bit class are the same error, not a
+        # conversion failure. Both ends of the scale are valid.
+        for bad in (-1, 0, 99, 901, 1000, 65536):
             with pytest.raises(ValueError, match="bold_weight_threshold"):
                 pdf_inspector.extract_text_with_positions_bytes(
                     data, bold_from_weight=True, bold_weight_threshold=bad
                 )
         with pytest.raises(ValueError, match="bold_weight_threshold"):
             pdf_inspector.extract_text_with_positions(str(path), bold_weight_threshold=50)
+        assert styles(
+            pdf_inspector.extract_text_with_positions_bytes(
+                data, bold_from_weight=True, bold_weight_threshold=100
+            )
+        ) == [("Light Medium Heavy", True, 300), ("Same weight", True, 300)]
+        assert styles(
+            pdf_inspector.extract_text_with_positions_bytes(
+                data, bold_from_weight=True, bold_weight_threshold=900
+            )
+        ) == styles(plain)
         with pytest.raises(ValueError, match="bold_weight_threshold"):
             pdf_inspector.extract_text_with_positions_and_rotations(
                 str(path), bold_weight_threshold=1000

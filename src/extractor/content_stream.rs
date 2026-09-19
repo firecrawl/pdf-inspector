@@ -2025,6 +2025,11 @@ pub(crate) fn extract_page_text_items_with_options(
                                 let style =
                                     font_styles.get(&current_font).copied().unwrap_or_default();
                                 logical_text_items.push(items.len());
+                                // The span's own glyphs were left out as they
+                                // were painted; the paint that made them
+                                // heavier is read now, as for any other run.
+                                let painted_bold = paintable_fonts.contains(&current_font)
+                                    && text_paint.adds_bold(&at, rendered_size, base_font, &ctm);
                                 items.push(TextItem {
                                     text: expand_ligatures(&at),
                                     x: geometry.x,
@@ -2040,10 +2045,12 @@ pub(crate) fn extract_page_text_items_with_options(
                                     legacy_symbol_rewrite: false,
                                     font_size: rendered_size,
                                     page: page_num,
-                                    is_bold: style.bold,
+                                    is_bold: style.bold || painted_bold,
                                     is_italic: style.italic,
                                     font_weight: style.weight,
-                                    bold_source: style.bold_source,
+                                    bold_source: style
+                                        .bold_source
+                                        .or(painted_bold.then_some(BoldSource::Painted)),
                                     fixed_pitch: style.fixed_pitch,
                                     is_underline: false,
                                     is_strikeout: false,
@@ -2740,6 +2747,26 @@ mod tests {
             assert_eq!(items[0].text, "Styled");
             assert!(items[0].is_bold, "{show}: {items:?}");
         }
+    }
+
+    #[test]
+    fn painted_bold_reaches_an_actual_text_span() {
+        // The span's replacement text is emitted at EMC in place of the
+        // glyphs painted inside it; the fill-and-stroke that made those
+        // glyphs heavier makes the item bold, on the paint's account.
+        let items = extract_simple_items(
+            b"0.3 w 2 Tr BT /F1 12 Tf 72 700 Td /Span << /ActualText (Real) >> BDC (Fake) Tj EMC ET",
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "Real");
+        assert!(items[0].is_bold);
+        assert_eq!(items[0].bold_source, Some(BoldSource::Painted));
+        let plain = extract_simple_items(
+            b"BT /F1 12 Tf 72 700 Td /Span << /ActualText (Real) >> BDC (Fake) Tj EMC ET",
+        );
+        assert_eq!(plain.len(), 1);
+        assert!(!plain[0].is_bold);
+        assert_eq!(plain[0].bold_source, None);
     }
 
     #[test]
