@@ -1775,7 +1775,9 @@ fn fixture_line_texts(fixture: &str) -> Vec<String> {
 /// their built-in encodings — Greek letters, angle brackets, an arrow, check
 /// marks — instead of as the Latin letters at the same codes. A Symbol font
 /// with `/Differences` reads the codes it names through them and the rest
-/// through the built-in encoding.
+/// through the built-in encoding. A named encoding replaces the built-in
+/// one, also when the name is an indirect object; the built-in encoding
+/// named outright is the built-in encoding.
 #[test]
 fn symbol_fonts_decode_through_their_builtin_encodings() {
     assert_eq!(
@@ -1784,6 +1786,8 @@ fn symbol_fonts_decode_through_their_builtin_encodings() {
             "\u{03B1}\u{03B2}\u{03B3}\u{03B4} \u{2329}\u{232A} \u{2192}",
             "\u{2713}\u{2714}",
             "\u{03C9}\u{03B2}",
+            "abgd",
+            "\u{03B1}\u{03B2}\u{03B3}\u{03B4}",
         ]
     );
 }

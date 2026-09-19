@@ -331,19 +331,21 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
     let base = encoding
         .as_ref()
         .and_then(|r| r.base)
-        .or_else(|| crate::extractor::base14::builtin_symbol_encoding(&base_font));
+        .or_else(|| builtin_base_encoding(doc, font_dict));
     let enc_map = encoding.map(|r| r.map).unwrap_or_default();
 
     let mut widths = HashMap::new();
     for code in 0u16..=255 {
         // Resolution order: Differences override, then the font's base
         // encoding — the dictionary's `/BaseEncoding`, or the BUILT-IN
-        // encoding of Symbol/ZapfDingbats, whose glyphs live at positions
-        // unrelated to cp1252 (the renderer draws α for Symbol 0x61 no
-        // matter how the text decoder transliterates it, so the advance
-        // must be α's) — then the cp1252-style fallback used by the text
-        // decoder. The same order the decoder follows, so the width of a
-        // code always matches the char extracted for it.
+        // encoding of Symbol/ZapfDingbats when no named encoding replaces
+        // it (`builtin_base_encoding`, the choice `build_font_encodings`
+        // makes), whose glyphs live at positions unrelated to cp1252 (the
+        // renderer draws α for Symbol 0x61 no matter how the text decoder
+        // transliterates it, so the advance must be α's) — then the
+        // cp1252-style fallback used by the text decoder. The same order
+        // the decoder follows, so the width of a code always matches the
+        // char extracted for it.
         let ch = enc_map
             .get(&(code as u8))
             .copied()
@@ -803,17 +805,9 @@ pub(crate) fn build_font_encodings(
             }
         }
         // Symbol and ZapfDingbats read through their built-in encodings
-        // unless the font names a predefined encoding outright.
-        if base.is_none() && !has_named_encoding(font_dict) {
-            base = font_dict
-                .get(b"BaseFont")
-                .ok()
-                .and_then(|o| o.as_name().ok())
-                .and_then(|name| {
-                    crate::extractor::base14::builtin_symbol_encoding(&String::from_utf8_lossy(
-                        name,
-                    ))
-                });
+        // unless the font names another encoding outright.
+        if base.is_none() {
+            base = builtin_base_encoding(doc, font_dict);
         }
         let blank_codes = blank_glyph_codes(doc, font_dict, font_cache);
         if !differences.is_empty() || !blank_codes.is_empty() || base.is_some() {
@@ -833,10 +827,37 @@ pub(crate) fn build_font_encodings(
 }
 
 /// Whether the font's `/Encoding` is the name of a predefined encoding.
-fn has_named_encoding(font_dict: &lopdf::Dictionary) -> bool {
-    font_dict
-        .get(b"Encoding")
-        .is_ok_and(|encoding| encoding.as_name().is_ok())
+/// The encoding a font's `/Encoding` entry names outright — written as a
+/// name, or as a reference to a name object — rather than describing in
+/// a dictionary.
+fn named_encoding(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<Vec<u8>> {
+    let encoding = match font_dict.get(b"Encoding").ok()? {
+        Object::Reference(id) => doc.get_object(*id).ok()?,
+        other => other,
+    };
+    encoding.as_name().ok().map(<[u8]>::to_vec)
+}
+
+/// The built-in encoding a Symbol or ZapfDingbats font reads through: its
+/// own when nothing overrides it. An `/Encoding` that names an encoding
+/// replaces the built-in one, except that `SymbolEncoding` and
+/// `ZapfDingbatsEncoding` — names some producers write, though the
+/// specification predefines neither — name the font's own built-in
+/// encoding. `None` for other fonts. The text decoder and the base-14
+/// width fallback both take this choice, so a code's width is the advance
+/// of the glyph the text reads.
+fn builtin_base_encoding(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<BaseEncoding> {
+    let base_font = font_dict.get(b"BaseFont").ok()?.as_name().ok()?;
+    let builtin =
+        crate::extractor::base14::builtin_symbol_encoding(&String::from_utf8_lossy(base_font))?;
+    let own_name: &[u8] = match builtin {
+        BaseEncoding::Symbol => b"SymbolEncoding",
+        _ => b"ZapfDingbatsEncoding",
+    };
+    match named_encoding(doc, font_dict) {
+        None => Some(builtin),
+        Some(name) => (name == own_name).then_some(builtin),
+    }
 }
 
 /// The characters of the glyphs that `/Differences` names by index, read
@@ -2365,6 +2386,54 @@ mod tests {
         let result = parse_encoding_dictionary(&doc, &both, None).unwrap();
         assert_eq!(result.base, Some(BaseEncoding::MacRoman));
         assert_eq!(result.map.get(&0x41), Some(&'\u{0391}'));
+    }
+
+    #[test]
+    fn builtin_symbol_encoding_yields_to_a_named_encoding_however_it_is_written() {
+        let mut doc = Document::new();
+        let symbol = lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Symbol"
+        };
+        assert_eq!(
+            builtin_base_encoding(&doc, &symbol),
+            Some(BaseEncoding::Symbol)
+        );
+        // A named encoding replaces the built-in one, as a name or as a
+        // reference to one.
+        let mut direct = symbol.clone();
+        direct.set("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
+        assert_eq!(builtin_base_encoding(&doc, &direct), None);
+        let name_id = doc.add_object(Object::Name(b"WinAnsiEncoding".to_vec()));
+        let mut indirect = symbol.clone();
+        indirect.set("Encoding", Object::Reference(name_id));
+        assert_eq!(builtin_base_encoding(&doc, &indirect), None);
+        // The font's own built-in encoding, named outright.
+        let mut own = symbol.clone();
+        own.set("Encoding", Object::Name(b"SymbolEncoding".to_vec()));
+        assert_eq!(
+            builtin_base_encoding(&doc, &own),
+            Some(BaseEncoding::Symbol)
+        );
+        let mut other = symbol.clone();
+        other.set("Encoding", Object::Name(b"ZapfDingbatsEncoding".to_vec()));
+        assert_eq!(builtin_base_encoding(&doc, &other), None);
+        let helvetica = lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica"
+        };
+        assert_eq!(builtin_base_encoding(&doc, &helvetica), None);
+        // The width fallback follows the same choice: code 0x61 is alpha's
+        // advance through the built-in encoding, and has no Symbol glyph
+        // (so no width) under a named Latin encoding.
+        let alpha = crate::extractor::base14::base14_char_width("Symbol", '\u{03B1}');
+        assert!(alpha.is_some());
+        let widths = base14_fallback_widths(&doc, &symbol).expect("Symbol widths");
+        assert_eq!(widths.widths.get(&0x61).copied(), alpha);
+        let widths = base14_fallback_widths(&doc, &indirect).expect("Symbol widths");
+        assert_eq!(widths.widths.get(&0x61), None);
     }
 
     #[test]

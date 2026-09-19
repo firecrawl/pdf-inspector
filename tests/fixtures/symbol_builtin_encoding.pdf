@@ -1,35 +1,41 @@
 %PDF-1.4
 %Л­Ро
 1 0 obj
-<</Length 118>>stream
+/WinAnsiEncoding 
+endobj
+2 0 obj
+<</Length 190>>stream
 BT /F1 14 Tf 72 700 Td (abgd \341\361 \256) Tj ET
 BT /F2 14 Tf 72 670 Td (34) Tj ET
 BT /F3 14 Tf 72 640 Td (ab) Tj ET
+BT /F4 14 Tf 72 610 Td (abgd) Tj ET
+BT /F5 14 Tf 72 580 Td (abgd) Tj ET
 
 endstream 
 endobj
-2 0 obj
-<</Type/Pages/Kids[3 0 R]/Count 1>>
-endobj
 3 0 obj
-<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1<</Type/Font/Subtype/Type1/BaseFont/Symbol>>/F2<</Type/Font/Subtype/Type1/BaseFont/ZapfDingbats>>/F3<</Type/Font/Subtype/Type1/BaseFont/Symbol/Encoding<</Type/Encoding/Differences[97/omega]>>>>>>>>/Contents 1 0 R>>
+<</Type/Pages/Kids[4 0 R]/Count 1>>
 endobj
 4 0 obj
-<</Type/Catalog/Pages 2 0 R>>
+<</Type/Page/Parent 3 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1<</Type/Font/Subtype/Type1/BaseFont/Symbol>>/F2<</Type/Font/Subtype/Type1/BaseFont/ZapfDingbats>>/F3<</Type/Font/Subtype/Type1/BaseFont/Symbol/Encoding<</Type/Encoding/Differences[97/omega]>>>>/F4<</Type/Font/Subtype/Type1/BaseFont/Symbol/Encoding 1 0 R>>/F5<</Type/Font/Subtype/Type1/BaseFont/Symbol/Encoding/SymbolEncoding>>>>>>/Contents 2 0 R>>
 endobj
 5 0 obj
+<</Type/Catalog/Pages 3 0 R>>
+endobj
+6 0 obj
 <</Title(Symbol and ZapfDingbats through their built-in encodings)/Subject(Synthetic test fixture: standard fonts and two TrueType programs built for it.)/Producer(pdf-inspector examples/symbolic_font_fixtures.rs)>>
 endobj
 xref
-0 6
+0 7
 0000000000 65535 f 
 0000000015 00000 n 
-0000000182 00000 n 
-0000000233 00000 n 
-0000000532 00000 n 
-0000000577 00000 n 
+0000000048 00000 n 
+0000000287 00000 n 
+0000000338 00000 n 
+0000000770 00000 n 
+0000000815 00000 n 
 trailer
-<</Root 4 0 R/Info 5 0 R/Size 6>>
+<</Root 5 0 R/Info 6 0 R/Size 7>>
 startxref
-808
+1046
 %%EOF

@@ -74,7 +74,7 @@ fn checksum(data: &[u8]) -> u32 {
 }
 
 fn pad4(v: &mut Vec<u8>) {
-    while v.len() % 4 != 0 {
+    while !v.len().is_multiple_of(4) {
         v.push(0);
     }
 }
@@ -312,11 +312,16 @@ fn literal(bytes: &[u8]) -> Object {
     Object::String(bytes.to_vec(), StringFormat::Literal)
 }
 
-/// A page with the given font resources and content stream, saved to
+/// Add a page with the given font resources and content stream to a
+/// document the fonts' indirect objects are already in, and save it to
 /// `path` as a one-page document.
-fn write_document(path: &Path, title: &str, fonts: lopdf::Dictionary, content: String) {
-    let mut doc = Document::new();
-    doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+fn finish_document(
+    mut doc: Document,
+    path: &Path,
+    title: &str,
+    fonts: lopdf::Dictionary,
+    content: String,
+) {
     let content_id = doc.add_object(plain_stream(dictionary! {}, content.into_bytes()));
     let pages_id = doc.new_object_id();
     let page = doc.add_object(dictionary! {
@@ -363,29 +368,41 @@ fn simple_font(subtype: &str, base_font: &str, encoding: Option<Object>) -> lopd
 }
 
 /// Non-embedded Symbol and ZapfDingbats, read through their built-in
-/// encodings; a Symbol font whose `/Differences` override one code.
+/// encodings; a Symbol font whose `/Differences` override one code; a
+/// Symbol font whose `/Encoding` names a Latin encoding through an
+/// indirect name object, which replaces the built-in one; and a Symbol
+/// font that names its own built-in encoding outright.
 fn symbol_builtin_encoding(dir: &Path) {
-    let mut doc_fonts = dictionary! {
+    let mut doc = Document::new();
+    doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+    let win_ansi = doc.add_object(Object::Name(b"WinAnsiEncoding".to_vec()));
+    let fonts = dictionary! {
         "F1" => simple_font("Type1", "Symbol", None),
         "F2" => simple_font("Type1", "ZapfDingbats", None),
         "F3" => simple_font("Type1", "Symbol", Some(Object::Dictionary(dictionary! {
             "Type" => "Encoding",
             "Differences" => Object::Array(vec![Object::Integer(0x61), Object::Name(b"omega".to_vec())]),
         }))),
+        "F4" => simple_font("Type1", "Symbol", Some(Object::Reference(win_ansi))),
+        "F5" => simple_font("Type1", "Symbol", Some(Object::Name(b"SymbolEncoding".to_vec()))),
     };
-    let _ = &mut doc_fonts;
     // Symbol: "abgd" are alpha, beta, gamma, delta; 0xE1/0xF1 the angle
     // brackets; 0xAE the right arrow. ZapfDingbats: "34" are two check
     // marks. F3 reads "a" through its Differences (omega) and "b" through
-    // the built-in encoding (beta).
+    // the built-in encoding (beta). F4 reads "abgd" as the Latin letters
+    // its named encoding places at those codes; F5 reads them as Greek
+    // through the built-in encoding it names.
     let content = "BT /F1 14 Tf 72 700 Td (abgd \\341\\361 \\256) Tj ET\n\
                    BT /F2 14 Tf 72 670 Td (34) Tj ET\n\
-                   BT /F3 14 Tf 72 640 Td (ab) Tj ET\n"
+                   BT /F3 14 Tf 72 640 Td (ab) Tj ET\n\
+                   BT /F4 14 Tf 72 610 Td (abgd) Tj ET\n\
+                   BT /F5 14 Tf 72 580 Td (abgd) Tj ET\n"
         .to_string();
-    write_document(
+    finish_document(
+        doc,
         &dir.join("symbol_builtin_encoding.pdf"),
         "Symbol and ZapfDingbats through their built-in encodings",
-        doc_fonts,
+        fonts,
         content,
     );
 }
@@ -394,9 +411,8 @@ fn symbol_builtin_encoding(dir: &Path) {
 /// `/BaseEncoding` and carries no `/Differences`: inline, as an indirect
 /// object, MacRoman, and with `/Differences` on top.
 fn base_encoding_without_differences(dir: &Path) {
-    // The indirect encoding dictionary is added to the document by
-    // `write_document`'s caller through a pre-built document: build the
-    // fonts around a shared object instead.
+    // The shared encoding dictionary is an indirect object of the document
+    // the fonts are built for, so the fonts are built around it.
     let mut doc = Document::new();
     doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
     let shared_encoding = doc.add_object(dictionary! {
