@@ -1050,6 +1050,8 @@ fn extract_text_with_positions_and_rotations(
     bold_from_weight: bool,
     bold_weight_threshold: i64,
 ) -> PyResult<PyPositionedText> {
+    // The threshold is checked before the file is read.
+    position_options(bold_from_weight, bold_weight_threshold)?;
     let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
     extract_text_with_positions_and_rotations_bytes(&data, bold_from_weight, bold_weight_threshold)
 }
@@ -1124,6 +1126,8 @@ fn extract_text_in_regions(
     bold_from_weight: bool,
     bold_weight_threshold: i64,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
+    // The threshold is checked before the file is read.
+    position_options(bold_from_weight, bold_weight_threshold)?;
     let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
     extract_text_in_regions_bytes(&data, page_regions, bold_from_weight, bold_weight_threshold)
 }

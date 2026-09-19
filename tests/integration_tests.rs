@@ -6458,14 +6458,14 @@ fn test_fixed_pitch_is_declared_or_measured() {
     // The verdict is the font's, not the option's: whatever the option
     // makes of the runs, every face reports the same fixed pitch.
     let weighted = font_metadata_items(PositionOptions::new().bold_from_weight(true));
-    let by_font = |items: &[TextItem]| -> std::collections::BTreeMap<String, Option<bool>> {
+    let by_font = |items: &[TextItem]| -> std::collections::BTreeSet<(String, Option<bool>)> {
         items
             .iter()
             .map(|item| (item.font.clone(), item.fixed_pitch))
             .collect()
     };
     let faces = by_font(&items);
-    assert_eq!(faces.len(), 10, "{faces:?}");
+    assert_eq!(faces.len(), 10, "a face reports two verdicts: {faces:?}");
     assert_eq!(by_font(&weighted), faces);
 }
 

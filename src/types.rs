@@ -327,7 +327,9 @@ pub struct TextItem {
     /// `font_weight`: the font name, the font's flags, the weight class or
     /// the way the text was painted (see [`BoldSource`]). When more than one
     /// says bold the first of them in that order is reported. `None` when
-    /// `is_bold` is `false`, and for items that don't come from a font.
+    /// `is_bold` is `false`, and for items that don't come from a font. An
+    /// item merged from several runs keeps its first run's, like `font` and
+    /// `font_weight`.
     pub bold_source: Option<BoldSource>,
     /// Whether the font is fixed-pitch (monospaced): `Some(true)` when the
     /// FontDescriptor's FixedPitch flag or the embedded program's `post`
@@ -336,7 +338,9 @@ pub struct TextItem {
     /// when two of them differ. `None` when the font declares nothing and
     /// carries too few glyphs to measure, and for items that don't come from
     /// a font. Many producers write `/Flags 4` whatever the face, so the
-    /// flag is only ever read as a yes.
+    /// flag is only ever read as a yes. Runs are not kept apart by it: an
+    /// item merged from several runs keeps its first run's value, like
+    /// `font` and `font_weight`.
     pub fixed_pitch: Option<bool>,
     /// Whether the text is underlined (drawn rule/thin rect under the
     /// baseline — PDFs have no underline font flag, so this is detected

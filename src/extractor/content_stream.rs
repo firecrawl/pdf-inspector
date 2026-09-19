@@ -2027,9 +2027,24 @@ pub(crate) fn extract_page_text_items_with_options(
                                 logical_text_items.push(items.len());
                                 // The span's own glyphs were left out as they
                                 // were painted; the paint that made them
-                                // heavier is read now, as for any other run.
-                                let painted_bold = paintable_fonts.contains(&current_font)
-                                    && text_paint.adds_bold(&at, rendered_size, base_font, &ctm);
+                                // heavier is read now, for the font that painted
+                                // them and only when some glyph was painted. The
+                                // replacement is the text the item carries, so
+                                // it stands in for the glyphs in the check for
+                                // alphanumeric content; a symbol face is ruled
+                                // out by the painting font's name.
+                                let paint_base_font = font_base_names
+                                    .get(&paint_font)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(&paint_font);
+                                let painted_bold = actual_text_glyph_count > 0
+                                    && paintable_fonts.contains(&paint_font)
+                                    && text_paint.adds_bold(
+                                        &at,
+                                        rendered_size,
+                                        paint_base_font,
+                                        &ctm,
+                                    );
                                 items.push(TextItem {
                                     text: expand_ligatures(&at),
                                     x: geometry.x,
@@ -2617,18 +2632,31 @@ mod tests {
     }
 
     fn simple_doc_with_content(content: &[u8]) -> (lopdf::Document, lopdf::ObjectId) {
+        doc_with_fonts(content, &[("F1", "Helvetica")])
+    }
+
+    /// A one-page document showing `content` with the given `(tag, BaseFont)`
+    /// Type1 faces, every glyph 600 units wide.
+    fn doc_with_fonts(
+        content: &[u8],
+        fonts: &[(&str, &str)],
+    ) -> (lopdf::Document, lopdf::ObjectId) {
         use lopdf::{dictionary, Object, Stream};
 
         let mut doc = lopdf::Document::new();
         let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
-        let font_id = doc.add_object(dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type1",
-            "BaseFont" => "Helvetica",
-            "FirstChar" => 0,
-            "LastChar" => 255,
-            "Widths" => Object::Array(widths),
-        });
+        let mut font_dict = dictionary! {};
+        for (tag, base_font) in fonts {
+            let font_id = doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => *base_font,
+                "FirstChar" => 0,
+                "LastChar" => 255,
+                "Widths" => Object::Array(widths.clone()),
+            });
+            font_dict.set(tag.as_bytes().to_vec(), Object::Reference(font_id));
+        }
         let content_id = doc.add_object(Object::Stream(Stream::new(
             dictionary! {},
             content.to_vec(),
@@ -2637,9 +2665,7 @@ mod tests {
             "Type" => "Page",
             "Contents" => Object::Reference(content_id),
             "Resources" => dictionary! {
-                "Font" => dictionary! {
-                    "F1" => Object::Reference(font_id),
-                },
+                "Font" => font_dict,
             },
             "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
         });
@@ -2658,9 +2684,13 @@ mod tests {
     }
 
     fn extract_simple_items(content: &[u8]) -> Vec<TextItem> {
+        extract_items_with_fonts(content, &[("F1", "Helvetica")])
+    }
+
+    fn extract_items_with_fonts(content: &[u8], fonts: &[(&str, &str)]) -> Vec<TextItem> {
         use crate::tounicode::FontCMaps;
 
-        let (doc, page_id) = simple_doc_with_content(content);
+        let (doc, page_id) = doc_with_fonts(content, fonts);
         let font_cmaps = FontCMaps::from_doc(&doc);
         let ((items, _, _), _, _, _) = extract_page_text_items(
             &doc,
@@ -2767,6 +2797,34 @@ mod tests {
         assert_eq!(plain.len(), 1);
         assert!(!plain[0].is_bold);
         assert_eq!(plain[0].bold_source, None);
+
+        // A span that painted no glyph has no paint to read, whatever the
+        // state in force.
+        let empty = extract_simple_items(
+            b"0.3 w 2 Tr BT /F1 12 Tf 72 700 Td /Span << /ActualText (Real) >> BDC EMC ET",
+        );
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].text, "Real");
+        assert!(!empty[0].is_bold);
+        assert_eq!(empty[0].bold_source, None);
+
+        // The font that painted the glyphs is the one judged: a symbol face
+        // is a glyph drawing, not emphasis, whatever the replacement says,
+        // and the `Tf` in force at EMC does not stand in for it.
+        let fonts = [("F1", "Helvetica"), ("F2", "Wingdings")];
+        let symbols = extract_items_with_fonts(
+            b"0.3 w 2 Tr BT /F2 12 Tf 72 700 Td /Span << /ActualText (Real) >> BDC (n) Tj EMC ET",
+            &fonts,
+        );
+        assert_eq!(symbols.len(), 1);
+        assert!(!symbols[0].is_bold);
+        let switched = extract_items_with_fonts(
+            b"0.3 w 2 Tr BT /F1 12 Tf 72 700 Td /Span << /ActualText (Real) >> BDC (Fake) Tj /F2 12 Tf EMC ET",
+            &fonts,
+        );
+        assert_eq!(switched.len(), 1);
+        assert!(switched[0].is_bold);
+        assert_eq!(switched[0].bold_source, Some(BoldSource::Painted));
     }
 
     #[test]

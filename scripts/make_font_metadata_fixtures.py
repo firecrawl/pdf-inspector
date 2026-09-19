@@ -432,6 +432,11 @@ def main(argv=None) -> int:
     else:
         release = fetch_release(args.cache_dir)
         fonts_dir, license_file = release / "ttf", release / "LICENSE"
+    if not fonts_dir.is_dir():
+        raise SystemExit(f"{fonts_dir} is not a directory")
+    missing = [name for name in DEJAVU_FILES if not (fonts_dir / name).is_file()]
+    if missing:
+        raise SystemExit(f"{fonts_dir} lacks {', '.join(missing)}")
     if license_file is None:
         raise SystemExit(f"no LICENSE file next to or above {fonts_dir}")
 
