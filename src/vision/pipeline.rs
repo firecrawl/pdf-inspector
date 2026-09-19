@@ -253,6 +253,10 @@ pub fn process_pdf_with_ocr_mem(
     let mut native = extraction.result;
     let page_count = extraction.page_count;
     let extracted_supplemental_regions = extraction.supplemental_ocr_regions;
+    // The renderer reads the document as the loader repaired it, when it
+    // had to; otherwise the caller's bytes as they are.
+    let render_bytes = extraction.render_bytes;
+    let render_buffer: &[u8] = render_bytes.as_deref().unwrap_or(buffer);
     if let Some(invalid) = selected_pages
         .as_ref()
         .and_then(|pages| pages.iter().copied().find(|page| *page > page_count))
@@ -314,7 +318,7 @@ pub fn process_pdf_with_ocr_mem(
         if !native_probe_pages.is_empty() {
             let native_renderer = PdfiumRenderer::load()?;
             let recovered = native_renderer.extract_text_pages(
-                buffer,
+                render_buffer,
                 &native_probe_pages.iter().copied().collect::<Vec<_>>(),
                 options.password.as_deref(),
             )?;
@@ -380,7 +384,7 @@ pub fn process_pdf_with_ocr_mem(
         };
         let elapsed = filter_supplemental_routes_by_pixels(
             &native_renderer,
-            buffer,
+            render_buffer,
             options.password.as_deref(),
             &options.render,
             &mut fusion_routes,
@@ -422,7 +426,7 @@ pub fn process_pdf_with_ocr_mem(
         run_and_fuse_ocr_chunks(
             &renderer,
             engine.as_ref(),
-            buffer,
+            render_buffer,
             &routed,
             options.password.as_deref(),
             &options.render,

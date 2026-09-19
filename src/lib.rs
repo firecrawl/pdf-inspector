@@ -36,6 +36,7 @@ mod bidi;
 mod bidi_mirroring;
 pub mod detector;
 pub mod extractor;
+mod form_bbox_repair;
 pub mod glyph_names;
 mod mac_glyph_order;
 pub mod markdown;
@@ -411,6 +412,31 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     })
 }
 
+/// The PDF written back out with the zero-area `/BBox` of its Form XObjects
+/// widened, for callers that render the document with their own renderer.
+///
+/// Some producers write `/BBox [0 0 0 0]` on a form XObject that holds a
+/// page's content. Taken as the clip it declares, the box hides the form
+/// entirely, and a page drawn through it renders blank. pdf-inspector
+/// repairs such forms whenever it loads a document, so its own extraction
+/// and the renderer of its OCR pipeline see the content; a renderer given
+/// the original bytes does not, and can be given these instead.
+///
+/// Returns `Ok(None)` when no form needs the repair, and for an encrypted
+/// document, whose objects would have to be re-encrypted to be written.
+/// Otherwise `Ok(Some(bytes))` holds a plain serialization of the loaded
+/// document: object streams and incremental updates are flattened, and
+/// the file's own repairs — a recovered cross-reference table, a missing
+/// end-of-file marker — are folded in.
+pub fn widen_degenerate_form_bboxes_mem(buffer: &[u8]) -> Result<Option<Vec<u8>>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (mut doc, _page_count, repairs) = load_document_from_mem_with_repairs(buffer, None)?;
+    if repairs.widened_form_bboxes == 0 {
+        return Ok(None);
+    }
+    Ok(form_bbox_repair::serialize_for_rendering(&mut doc))
+}
+
 // =========================================================================
 // Per-page markdown extraction
 // =========================================================================
@@ -452,6 +478,11 @@ pub(crate) struct InternalPagesExtraction {
     pub(crate) page_count: u32,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     pub(crate) supplemental_ocr_regions: BTreeMap<u32, Vec<PdfRect>>,
+    /// The document written back out for the renderer when form XObjects
+    /// were repaired at load (see `form_bbox_repair`); `None` when the
+    /// original bytes render as loaded.
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) render_bytes: Option<Vec<u8>>,
 }
 
 /// Extract formatted markdown for pages of a PDF, with layout
@@ -513,7 +544,11 @@ fn extract_pages_markdown_mem_impl(
     preserve_ocr_candidates: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
+    let (doc, page_count, repairs) = load_document_from_mem_with_repairs(buffer, password)?;
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    let mut doc = doc;
+    #[cfg(not(all(feature = "ocr", not(target_arch = "wasm32"))))]
+    let _ = repairs;
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
@@ -735,6 +770,14 @@ fn extract_pages_markdown_mem_impl(
         page_count,
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         supplemental_ocr_regions,
+        // A renderer reading the original bytes would clip a repaired form
+        // to nothing, so the OCR pipeline renders the repaired document.
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        render_bytes: if preserve_ocr_candidates && repairs.widened_form_bboxes > 0 {
+            form_bbox_repair::serialize_for_rendering(&mut doc)
+        } else {
+            None
+        },
     })
 }
 
@@ -4065,6 +4108,25 @@ pub(crate) fn load_document_from_mem_with_password(
     buffer: &[u8],
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
+    load_document_from_mem_with_repairs(buffer, password)
+        .map(|(doc, page_count, _)| (doc, page_count))
+}
+
+/// Repairs applied to a document's objects once it is loaded, beyond the
+/// container repairs the loader tries when a file does not parse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LoadRepairs {
+    /// Form XObjects whose zero-area `/BBox` was widened
+    /// (see `form_bbox_repair`).
+    pub(crate) widened_form_bboxes: usize,
+}
+
+/// [`load_document_from_mem_with_password`], also reporting the repairs
+/// applied to the loaded objects.
+pub(crate) fn load_document_from_mem_with_repairs(
+    buffer: &[u8],
+    password: Option<&str>,
+) -> Result<(Document, u32, LoadRepairs), PdfError> {
     // Drop anything before the `%PDF-` header. Cross-reference offsets are
     // header-relative in every major reader (mupdf, pdfium, poppler, pdf.js;
     // lopdf slices at `%PDF-` internally as well), so this keeps them exact
@@ -4108,7 +4170,7 @@ pub(crate) fn load_document_from_mem_with_password(
 /// an object stream lopdf skipped for exceeding the bound. Fail the load
 /// either way rather than letting a pageless document masquerade as a
 /// successful parse.
-fn finish_loaded_document(doc: Document) -> Result<(Document, u32), PdfError> {
+fn finish_loaded_document(mut doc: Document) -> Result<(Document, u32, LoadRepairs), PdfError> {
     let page_count = doc.get_pages().len() as u32;
     if page_count == 0 {
         return Err(PdfError::Parse(
@@ -4134,7 +4196,10 @@ fn finish_loaded_document(doc: Document) -> Result<(Document, u32), PdfError> {
              resolve as not-found"
         );
     }
-    Ok((doc, page_count))
+    let repairs = LoadRepairs {
+        widened_form_bboxes: form_bbox_repair::widen_degenerate_form_bboxes(&mut doc),
+    };
+    Ok((doc, page_count, repairs))
 }
 
 /// Per-stream decompression budget applied while loading (object streams and

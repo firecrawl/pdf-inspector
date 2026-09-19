@@ -4,6 +4,7 @@ use pdf_inspector::detector::{estimate_page_count_from_bytes, DetectionConfig, S
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::ItemType;
 use pdf_inspector::types::TextLine;
+use pdf_inspector::widen_degenerate_form_bboxes_mem;
 use pdf_inspector::{
     collect_text_in_region_in_frame, extract_text_with_positions_and_rotations_mem, PageRotation,
 };
@@ -6920,4 +6921,177 @@ fn test_real_reflections_report_the_reflected_glyph_box() {
     assert!((flipped.x - 72.0).abs() < 0.01, "{flipped:?}");
     assert!((flipped.height - 12.0).abs() < 0.01, "{flipped:?}");
     assert_eq!(flipped.rotation, 180.0, "{flipped:?}");
+}
+
+// ============================================================================
+// Form XObjects with a zero-area BBox
+// ============================================================================
+
+/// A page whose content is `page_content`, with a Form XObject `Fm1`
+/// declaring `form_bbox` and holding `form_content`, both with Helvetica as
+/// `F1`.
+fn make_pdf_with_form(page_content: &str, form_bbox: &str, form_content: &str) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Fm1 6 0 R >> >> /Contents 4 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            page_content.len(),
+            page_content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        &format!(
+            "<< /Type /XObject /Subtype /Form /BBox [{form_bbox}] \
+             /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+            form_content.len(),
+            form_content
+        ),
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+const FORM_PAGE_CONTENT: &str = "q Q q 0 0 612 792 re W n /Fm1 Do Q";
+const FORM_TEXT_CONTENT: &str = "BT /F1 24 Tf 72 700 Td (Drawn through the form) Tj ET\n\
+                                 BT /F1 12 Tf 72 670 Td (Second line inside the form) Tj ET";
+
+/// A page drawn entirely through a Form XObject whose `/BBox` has no area
+/// — a re-save pattern — is a text page like any other: its text extracts
+/// where it is painted, and the page is neither empty nor routed to OCR.
+#[test]
+fn test_form_with_zero_area_bbox_is_extracted_as_a_text_page() {
+    let buf = make_pdf_with_form(FORM_PAGE_CONTENT, "0 0 0 0", FORM_TEXT_CONTENT);
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let title = items
+        .iter()
+        .find(|item| item.text == "Drawn through the form")
+        .unwrap_or_else(|| panic!("{}", joined_text(&items)));
+    assert!((title.x - 72.0).abs() < 0.01 && (title.y - 700.0).abs() < 0.01);
+    assert!(items
+        .iter()
+        .any(|item| item.text == "Second line inside the form"));
+
+    let result = process_pdf_mem(&buf).unwrap();
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(result.pages_needing_ocr.is_empty(), "{:?}", result);
+    let markdown = result.markdown.unwrap();
+    assert!(markdown.contains("Drawn through the form"), "{markdown}");
+
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let page = &regions[0].regions[0];
+    assert!(page.text.contains("Second line inside the form"));
+    assert!(!page.needs_ocr);
+}
+
+/// `widen_degenerate_form_bboxes_mem` hands renderers the repaired
+/// document: the zero-area box is widened, the text extracts the same from
+/// the repaired bytes, and a form with a real box is left alone.
+#[test]
+fn test_widen_degenerate_form_bboxes_mem_repairs_only_zero_area_boxes() {
+    let buf = make_pdf_with_form(FORM_PAGE_CONTENT, "0 0 0 0", FORM_TEXT_CONTENT);
+    let repaired = widen_degenerate_form_bboxes_mem(&buf)
+        .unwrap()
+        .expect("a zero-area form box needs the repair");
+    let doc = lopdf::Document::load_mem(&repaired).unwrap();
+    let form = doc
+        .objects
+        .values()
+        .find_map(|object| match object {
+            lopdf::Object::Stream(stream)
+                if stream
+                    .dict
+                    .get(b"Subtype")
+                    .ok()
+                    .and_then(|s| s.as_name().ok())
+                    == Some(b"Form") =>
+            {
+                Some(stream)
+            }
+            _ => None,
+        })
+        .expect("the form survives the round trip");
+    let bbox: Vec<f32> = form
+        .dict
+        .get(b"BBox")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_float().unwrap())
+        .collect();
+    assert!(bbox[0] < -10_000.0 && bbox[1] < -10_000.0, "{bbox:?}");
+    assert!(bbox[2] > 10_000.0 && bbox[3] > 10_000.0, "{bbox:?}");
+
+    let original_items = extract_text_with_positions_mem(&buf).unwrap();
+    let repaired_items = extract_text_with_positions_mem(&repaired).unwrap();
+    assert_eq!(
+        repaired_items
+            .iter()
+            .map(|item| (item.text.clone(), item.x, item.y))
+            .collect::<Vec<_>>(),
+        original_items
+            .iter()
+            .map(|item| (item.text.clone(), item.x, item.y))
+            .collect::<Vec<_>>()
+    );
+
+    let proper = make_pdf_with_form("q /Fm1 Do Q", "0 690 612 792", FORM_TEXT_CONTENT);
+    assert!(widen_degenerate_form_bboxes_mem(&proper).unwrap().is_none());
+    assert!(widen_degenerate_form_bboxes_mem(&make_minimal_text_pdf())
+        .unwrap()
+        .is_none());
 }
