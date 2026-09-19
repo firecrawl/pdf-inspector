@@ -25,8 +25,8 @@ use super::geometry::{
 use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
 use super::word_gaps::{
-    offset_takes_spacing_back, tj_tracking, word_gap_candidate, word_gap_threshold,
-    PendingWordGaps, WordGapCandidate,
+    offset_takes_spacing_back, tj_gap_thresholds, tj_tracking, word_gap_candidate,
+    word_gap_threshold, PendingWordGaps, WordGapCandidate,
 };
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -1068,35 +1068,35 @@ pub(crate) fn extract_page_text_items_with_options(
                         // Word-space threshold for `TJ` offsets and character
                         // spacing alike, from the font metrics when available.
                         let space_threshold = word_gap_threshold(font_info);
-                        let column_gap_threshold = space_threshold * 4.0;
                         // A tracked display run — one glyph per string, the
                         // letter spacing as the offset between them — is
-                        // judged over its own tracking (see `tj_tracking`):
-                        // its letter gaps stay inside the word, and an
-                        // offset wider by a word gap ends the sub-run, so
-                        // each word keeps the box its glyphs span. Elsewhere
-                        // the fixed thresholds apply: a word gap adds a
-                        // space, a column gap ends the sub-run.
-                        let tracking = tj_tracking(array, font_info, space_threshold, |element| {
-                            extract_text_from_operand(
-                                element,
-                                &current_font,
-                                font_base_names.get(&current_font).map(|s| s.as_str()),
-                                font_cmaps,
-                                &font_tounicode_refs,
-                                &inline_cmaps,
-                                &font_encodings,
-                                &encoding_cache,
-                                &mut cmap_decisions,
-                                &font_widths,
-                            )
-                        });
-                        let (word_gap, split_gap) = match tracking {
-                            Some(tracking) => {
-                                (space_threshold + tracking, space_threshold + tracking)
-                            }
-                            None => (space_threshold, column_gap_threshold),
+                        // judged over its own tracking (see `tj_tracking`
+                        // and `tj_gap_thresholds`); a run that shows nothing
+                        // is not read for it.
+                        let tracking = if is_invisible {
+                            None
+                        } else {
+                            tj_tracking(array, font_info, space_threshold, |element| {
+                                extract_text_from_operand(
+                                    element,
+                                    &current_font,
+                                    font_base_names.get(&current_font).map(|s| s.as_str()),
+                                    font_cmaps,
+                                    &font_tounicode_refs,
+                                    &inline_cmaps,
+                                    &font_encodings,
+                                    &encoding_cache,
+                                    &mut cmap_decisions,
+                                    &font_widths,
+                                )
+                            })
                         };
+                        let baseline_horizontal = {
+                            let combined = multiply_matrices(&text_matrix, &ctm);
+                            combined[0].abs() >= combined[1].abs()
+                        };
+                        let (word_gap, split_gap) =
+                            tj_gap_thresholds(space_threshold, tracking, baseline_horizontal);
 
                         // Track sub-items for column-gap splitting:
                         // (text, start_width_ts, end_width_ts)
@@ -4525,7 +4525,7 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
                 "VALLEY ROAD",
             ),
             (
-                "BT /F1 24 Tf 72 700 Td [(V) -150 (a) -170 (l) -130 (l) -150 (e) -160 (y)] TJ ET",
+                "BT /F1 24 Tf 72 700 Td [(V) -125 (a) -135 (l) -120 (l) -125 (e) -130 (y)] TJ ET",
                 "Valley",
             ),
             // A negative `Tf` size reads the offsets the same way.
@@ -4557,9 +4557,27 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
         assert!(valley.advance_known && road.advance_known);
     }
 
+    /// A rotated tracked run — a chart's axis title — keeps its words in
+    /// one item with a space at the word gap: rotated items are not merged
+    /// again, and one run per line is what the line assembly expects.
+    #[test]
+    fn rotated_tracked_tj_run_stays_one_item_with_its_spaces() {
+        let items = upright_page_with(
+            "BT /F1 10 Tf 0 1 -1 0 40 100 Tm [(V) -250 (A) -250 (L) -250 (L) -250 (E) -250 (Y) -560 (R) -250 (O) -250 (A) -250 (D)] TJ ET",
+        );
+        let title = find_item(&items, "VALLEY ROAD");
+        assert_close(title.rotation, 90.0, "rotation");
+        assert_close(title.x, 30.0, "x");
+        assert_close(title.width, 10.0, "width");
+        // Ten 0.6 em glyphs, nine gaps: 8 × 0.25 em of tracking and the
+        // 0.56 em word gap.
+        assert_close(title.height, 60.0 + 8.0 * 2.5 + 5.6, "height");
+    }
+
     /// Offsets that are not tracking are read as before: words positioned
     /// by offsets, kerning between single glyphs with a word gap among
-    /// them, and one-letter words a space width apart.
+    /// them, and lowercase one-letter words half a space width apart or
+    /// more.
     #[test]
     fn tj_offsets_that_are_not_tracking_read_as_before() {
         for (content, expected) in [
@@ -4574,6 +4592,19 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             (
                 "BT /F1 12 Tf 72 700 Td [(a) -600 (b) -600 (c) -600 (d)] TJ ET",
                 "a b c d",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td [(a) -300 (b) -300 (c) -300 (d)] TJ ET",
+                "a b c d",
+            ),
+            // Math spacing between single glyphs, whatever their case.
+            (
+                "BT /F1 12 Tf 72 700 Td [(a) -278 (<) -278 (b)] TJ ET",
+                "a < b",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td [(E) -278 (\\() -278 (N)] TJ ET",
+                "E ( N",
             ),
         ] {
             let items = extract_simple_items(content.as_bytes());

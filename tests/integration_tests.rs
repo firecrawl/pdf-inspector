@@ -6376,7 +6376,7 @@ fn make_tracked_titles_pdf() -> Vec<u8> {
          BT /F1 24 Tf 6 Tc 72 690 Td (VALLEY ROAD) Tj ET\n\
          BT /F1 24 Tf 0 Tc 72 660 Td [(V) -216 (A) -333 (L) -166 (L) -250 (E) -290 (Y)] TJ ET\n\
          BT /F1 24 Tf 72 630 Td [(A) -300 (N) -300 (N) -300 (U) -300 (A) -300 (L) -700 (R) -300 (E) -300 (P) -300 (O) -300 (R) -300 (T)] TJ ET\n\
-         BT /F1 18 Tf 72 600 Td [(V) -120 (a) -140 (l) -100 (l) -120 (e) -130 (y)] TJ ET\n\
+         BT /F1 18 Tf 72 600 Td [(V) -100 (a) -120 (l) -90 (l) -100 (e) -110 (y)] TJ ET\n\
          BT /F1 12 Tf 72 570 Td [(The) -258 (quick) -300 (brown) -280 (f) -20 (ox) -280 (jumps)] TJ ET\n\
          BT /F1 12 Tf 72 550 Td [(T) 20 (h) -5 (e) -278 (l) 10 (a) -3 (z) -8 (y) -278 (d) -5 (o) (g)] TJ ET\n\
          BT /F1 12 Tf 72 530 Td [(a) -333 (b) -333 (c) -333 (d)] TJ ET",

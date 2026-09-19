@@ -19,8 +19,8 @@ use super::geometry::{
     scaled_run_geometry,
 };
 use super::word_gaps::{
-    offset_takes_spacing_back, tj_tracking, word_gap_candidate, word_gap_threshold,
-    PendingWordGaps, WordGapCandidate,
+    offset_takes_spacing_back, tj_gap_thresholds, tj_tracking, word_gap_candidate,
+    word_gap_threshold, PendingWordGaps, WordGapCandidate,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -948,31 +948,34 @@ fn extract_form_xobject_text_inner(
                         // Word-space threshold for `TJ` offsets and character
                         // spacing alike, from the font metrics when available.
                         let space_threshold = word_gap_threshold(font_info);
-                        let column_gap_threshold = space_threshold * 4.0;
                         // A tracked display run is judged over its own
-                        // tracking, as on the page (see `tj_tracking`): a
-                        // word gap ends the sub-run there, so each word keeps
-                        // the box its glyphs span.
-                        let tracking = tj_tracking(array, font_info, space_threshold, |element| {
-                            extract_text_from_operand(
-                                element,
-                                &current_font,
-                                font_base_names.get(&current_font).map(|s| s.as_str()),
-                                font_cmaps,
-                                &font_tounicode_refs,
-                                &inline_cmaps,
-                                &font_encodings,
-                                &encoding_cache,
-                                cmap_decisions,
-                                &font_widths,
-                            )
-                        });
-                        let (word_gap, split_gap) = match tracking {
-                            Some(tracking) => {
-                                (space_threshold + tracking, space_threshold + tracking)
-                            }
-                            None => (space_threshold, column_gap_threshold),
+                        // tracking, as on the page (see `tj_tracking` and
+                        // `tj_gap_thresholds`); a hidden run is not read
+                        // for it.
+                        let tracking = if hidden {
+                            None
+                        } else {
+                            tj_tracking(array, font_info, space_threshold, |element| {
+                                extract_text_from_operand(
+                                    element,
+                                    &current_font,
+                                    font_base_names.get(&current_font).map(|s| s.as_str()),
+                                    font_cmaps,
+                                    &font_tounicode_refs,
+                                    &inline_cmaps,
+                                    &font_encodings,
+                                    &encoding_cache,
+                                    cmap_decisions,
+                                    &font_widths,
+                                )
+                            })
                         };
+                        let baseline_horizontal = {
+                            let combined = multiply_matrices(&text_matrix, &ctm);
+                            combined[0].abs() >= combined[1].abs()
+                        };
+                        let (word_gap, split_gap) =
+                            tj_gap_thresholds(space_threshold, tracking, baseline_horizontal);
 
                         let mut sub_items: Vec<(String, f32, f32, f32, bool)> = Vec::new();
                         let mut current_text = String::new();
