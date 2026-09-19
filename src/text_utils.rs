@@ -261,9 +261,18 @@ pub(crate) fn sort_line_items(items: &mut [TextItem], page_rtl: bool) {
     items.sort_by(|a, b| key(a).total_cmp(&key(b)));
 }
 
-/// Detect if a font name indicates bold style
-/// Common patterns: "Bold", "Bd", "Black", "Heavy", "Demi", "Semi" (semi-bold)
+/// Detect if a font name indicates bold style: a bold word ("Bold",
+/// "Black", "Heavy", "Demi", "Ultra", "SemiBold", "ExtraBold", "Medium"),
+/// or one of the foundry style abbreviations the weight-class parser reads
+/// ("-Bd", "-Sb", "-Dm", "-Hv", "-Blk", "-XBd", "-Ult", "W6".."W9") — any
+/// name [`font_weight_from_name`] puts at 600 or heavier is bold, so this
+/// flag and the weight class agree. The abbreviations are matched as whole
+/// tokens after the family name, in the mixed case foundries write them:
+/// "Bookman" is not Book, "LT" is not Light and "Hvar" is not Heavy.
 pub fn is_bold_font(font_name: &str) -> bool {
+    if font_weight_from_name(font_name).is_some_and(|weight| weight >= 600) {
+        return true;
+    }
     let lower = font_name.to_lowercase();
 
     // Check for common bold indicators
@@ -1383,6 +1392,58 @@ mod tests {
     }
 
     #[test]
+    fn bold_font_reads_the_weight_parsers_style_words_and_abbreviations() {
+        // Every name the weight parser puts at 600 or heavier is bold,
+        // foundry abbreviations and weight digits included.
+        for name in [
+            "Bookman-Demi",
+            "ITCAvantGardeStd-Demi",
+            "ABCDEF+Face-Demi",
+            "helveticaneue-ultra",
+            "FrutigerLTStd-Ult",
+            "Lato-Heavy",
+            "Roboto-Black",
+            "HelveticaNeueLTStd-Hv",
+            "HelveticaNeueLTStd-Blk",
+            "HelveticaNeueLTStd-XBlk",
+            "Foo-XBd",
+            "Foo-XBdIt",
+            "Foo-Sb",
+            "Foo-SBd",
+            "Foo-Smbd",
+            "ITCFranklinGothicStd-Dm",
+            "ITCFranklinGothicStd-DmCd",
+            "HiraKakuProN-W6",
+            "KozMinPr6N-W9",
+            "Open Sans Extra Bold",
+            "Foo-Semi-Bold",
+        ] {
+            assert!(is_bold_font(name), "{name}");
+        }
+        // Lighter faces, and family names that merely contain the letters
+        // of an abbreviation or a weight word, are not.
+        for name in [
+            "Bookman",
+            "BookAntiqua",
+            "Frutiger-LT",
+            "Frutiger LT Std",
+            "HelveticaNeueLTStd-Lt",
+            "HelveticaNeueLTStd-UltLt",
+            "HelveticaNeueLTStd-Md",
+            "Montserrat-ExtraLight",
+            "Foo-Semi",
+            "Hvar",
+            "Foo-Hvar",
+            "THSarabunNew",
+            "HiraKakuProN-W3",
+            "Roboto-Regular",
+            "Wingdings",
+        ] {
+            assert!(!is_bold_font(name), "{name}");
+        }
+    }
+
+    #[test]
     fn bold_font_urw_medi_abbreviation() {
         // URW Type 1 fonts (LaTeX default Times) abbreviate Medium as "Medi"
         assert!(is_bold_font("NROFIU+NimbusRomNo9L-Medi"));
@@ -1515,6 +1576,8 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1723,6 +1786,8 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1850,6 +1915,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -1934,6 +2001,8 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -2037,6 +2106,8 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,

@@ -511,15 +511,37 @@ assert.deepEqual(extractTextWithPositions(weightsPdf).map(styleOf), [
   ['Light Medium Heavy', false, 300],
   ['Same weight', false, 300],
 ]);
-// Option on: runs of different weight stay apart, the 700 face is bold, the
-// 300 and 500 faces are not, and same-weight runs still merge.
+// Option on: the 700 face is bold on the weight class's account, the 300 and
+// 500 faces are not and, agreeing, still merge; the bold run is its own item.
 const weightsOn = extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true });
 assert.deepEqual(weightsOn.map(styleOf), [
-  ['Light ', false, 300],
-  ['Medium ', false, 500],
+  ['Light Medium ', false, 300],
   ['Heavy', true, 700],
   ['Same weight', false, 300],
 ]);
+assert.equal(weightsOn.find(i => i.text === 'Heavy').boldSource, 'WeightClass');
+assert.equal(weightsOn.find(i => i.text === 'Light Medium ').boldSource, undefined);
+// A threshold of 500 reads the medium face as bold too; the runs merge by
+// the verdict. Outside 100..900 the threshold is an argument error, on
+// every function that takes the options.
+assert.deepEqual(
+  extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true, boldWeightThreshold: 500 }).map(styleOf),
+  [
+    ['Light ', false, 300],
+    ['Medium Heavy', true, 500],
+    ['Same weight', false, 300],
+  ],
+);
+for (const bad of [0, 99, 901, 1000]) {
+  assert.throws(
+    () => extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true, boldWeightThreshold: bad }),
+    /boldWeightThreshold/,
+  );
+}
+assert.throws(
+  () => extractTextWithPositionsAndRotations(weightsPdf, undefined, { boldWeightThreshold: 1000 }),
+  /boldWeightThreshold/,
+);
 const weightsRotations = extractTextWithPositionsAndRotations(weightsPdf, [1], { boldFromWeight: true });
 assert.deepEqual(weightsRotations.items.map(styleOf), weightsOn.map(styleOf));
 assert.deepEqual(weightsRotations.pageRotations, []);
@@ -529,7 +551,82 @@ const weightsRegionPlain = extractTextInRegions(weightsPdf, weightsRegion)[0].re
 const weightsRegionOn = extractTextInRegions(weightsPdf, weightsRegion, { boldFromWeight: true })[0].regions[0].text;
 assert.equal(weightsRegionPlain.split('\n')[0].trim(), 'Light Medium Heavy');
 assert.equal(weightsRegionOn, weightsRegionPlain);
+assert.throws(
+  () => extractTextInRegions(weightsPdf, weightsRegion, { boldFromWeight: true, boldWeightThreshold: 50 }),
+  /boldWeightThreshold/,
+);
+assert.throws(
+  () => extractTablesInRegions(weightsPdf, weightsRegion, { boldWeightThreshold: 901 }),
+  /boldWeightThreshold/,
+);
 console.log('  boldFromWeight: OK');
+
+// --- font metadata: boldSource, fixedPitch and boldWeightThreshold on embedded faces ---
+console.log('Testing font metadata...');
+
+// tests/fixtures/font_metadata_faces.pdf: embedded subsets whose names, OS/2
+// tables, descriptor flags and width tables each make one point (see
+// scripts/make_font_metadata_fixtures.py).
+const facesPdf = readFileSync('../tests/fixtures/font_metadata_faces.pdf');
+const faceStyle = (items, text) => {
+  const item = items.find(i => i.text === text);
+  assert.ok(item, `no item reads ${JSON.stringify(text)}`);
+  return [item.isBold, item.boldSource, item.fontWeight, item.fixedPitch];
+};
+const mixedLine = items =>
+  items.filter(i => i.page === 1 && Math.abs(i.y - 580) < 0.5).map(i => [i.text, i.isBold, i.boldSource, i.fontWeight]);
+
+const faces = extractTextWithPositions(facesPdf);
+// Bold by the name (a Demi face, and a Bold name over a regular program,
+// where fontWeight shows the conflict), by the program's bold selection
+// behind an opaque name, and by filling and stroking; a heavy weight class
+// alone is not bold by default.
+assert.deepEqual(faceStyle(faces, 'Demi name, weight class 600'), [true, 'FontName', 600, false]);
+assert.deepEqual(faceStyle(faces, 'Bold name, weight class 400'), [true, 'FontName', 400, false]);
+assert.deepEqual(faceStyle(faces, 'Plain name, weight class 600'), [false, undefined, 600, false]);
+assert.deepEqual(faceStyle(faces, 'Opaque name, bold selection, weight class 700'), [true, 'FontFlags', 700, false]);
+assert.deepEqual(faceStyle(faces, 'Extra light, weight class 200'), [false, undefined, 200, false]);
+assert.deepEqual(faceStyle(faces, 'Painted heavier'), [true, 'Painted', 400, false]);
+assert.deepEqual(mixedLine(faces), [
+  ['Light regular heavier ', false, undefined, 200],
+  ['bold', true, 'FontName', 400],
+]);
+// Fixed pitch: declared by the program's post table or the descriptor's
+// flag, else measured from the advances of the glyphs in use; ten tabular
+// digits are too few to say.
+assert.equal(faceStyle(faces, 'Mono declared by the program')[3], true);
+assert.equal(faceStyle(faces, 'Mono measured from advances')[3], true);
+assert.equal(faceStyle(faces, 'Mo')[3], true);
+assert.equal(faceStyle(faces, 'Proportional by advances')[3], false);
+assert.equal(faceStyle(faces, '0123456789')[3], undefined);
+assert.ok(
+  [...faces, ...items].every(
+    i => i.boldSource === undefined || ['FontName', 'FontFlags', 'WeightClass', 'Painted'].includes(i.boldSource),
+  ),
+);
+assert.ok([...faces, ...items].every(i => i.fixedPitch === undefined || typeof i.fixedPitch === 'boolean'));
+assert.ok(items.every(i => i.isBold === (i.boldSource !== undefined)));
+
+// With boldFromWeight the plain 600 face is bold on the weight class's
+// account, the name and flags keep theirs, and the mixed line merges by the
+// verdict: the 600 run joins its bold-named neighbour.
+const facesOn = extractTextWithPositions(facesPdf, undefined, { boldFromWeight: true });
+assert.deepEqual(faceStyle(facesOn, 'Plain name, weight class 600'), [true, 'WeightClass', 600, false]);
+assert.equal(faceStyle(facesOn, 'Demi name, weight class 600')[1], 'FontName');
+assert.equal(faceStyle(facesOn, 'Bold name, weight class 400')[1], 'FontName');
+assert.equal(faceStyle(facesOn, 'Opaque name, bold selection, weight class 700')[1], 'FontFlags');
+assert.equal(faceStyle(facesOn, 'Painted heavier')[1], 'Painted');
+assert.deepEqual(mixedLine(facesOn), [
+  ['Light regular ', false, undefined, 200],
+  ['heavier bold', true, 'WeightClass', 600],
+]);
+// A threshold of 700 puts the plain 600 face back with the regular ones.
+const facesAt700 = extractTextWithPositions(facesPdf, undefined, { boldFromWeight: true, boldWeightThreshold: 700 });
+assert.deepEqual(faceStyle(facesAt700, 'Plain name, weight class 600'), [false, undefined, 600, false]);
+assert.equal(faceStyle(facesAt700, 'Demi name, weight class 600')[1], 'FontName');
+assert.deepEqual(mixedLine(facesAt700), mixedLine(faces));
+assert.deepEqual(facesOn.map(i => i.fixedPitch), faces.map(i => i.fixedPitch));
+console.log('  font metadata: OK');
 
 // --- Error handling ---
 console.log('Testing error handling...');

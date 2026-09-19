@@ -4,7 +4,7 @@ use super::get_number;
 use crate::glyph_names::glyph_to_char;
 use crate::tounicode::FontCMaps;
 use crate::types::{
-    FontEncoding, FontEncodingMap, FontWidthInfo, PageFontEncodings, PageFontWidths,
+    BoldSource, FontEncoding, FontEncodingMap, FontWidthInfo, PageFontEncodings, PageFontWidths,
 };
 use log::debug;
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -1287,13 +1287,25 @@ impl FontStyleCache {
     }
 }
 
-/// Style of a font resource: italic and bold, and the weight class.
+/// Style of a font resource: italic and bold, the weight class, and what
+/// the descriptor and the embedded program say about fixed pitch.
 ///
 /// The flags survive subset fonts whose BaseFont names are opaque tags
 /// ("Tc1", "ABCDEF+F1") that defeat the name-based bold/italic heuristics.
 /// Italic: `ItalicAngle` beyond a few degrees, or Flags bit 7 (Italic,
 /// value 64). Bold: Flags bit 19 (ForceBold, value 1<<18). The small
 /// ItalicAngle threshold skips fonts that declare a token slant.
+///
+/// `bold_source` is where `bold` came from: the descriptor's flag or the
+/// program's own selection (`FontFlags`), or the PostScript name of a bare
+/// CFF program (`FontName`). The `/BaseFont` name is read afterwards by
+/// [`FontStyle::with_name`], and the width table by
+/// [`FontStyle::with_measured_pitch`], once per page rather than per run.
+///
+/// `fixed_pitch` is `Some(true)` when the descriptor's FixedPitch flag or
+/// the embedded program's `post` table says the face is monospaced, else
+/// `None`: an unset flag is no evidence, since producers write `/Flags 4`
+/// whatever the face, and the width table is measured later.
 ///
 /// `weight` is the 100..=900 weight class, read in this order: the embedded
 /// font program's OS/2 `usWeightClass` (the weight word of the PostScript
@@ -1307,13 +1319,41 @@ impl FontStyleCache {
 pub(crate) struct FontStyle {
     pub(crate) italic: bool,
     pub(crate) bold: bool,
+    pub(crate) bold_source: Option<BoldSource>,
     pub(crate) weight: Option<u16>,
+    pub(crate) fixed_pitch: Option<bool>,
 }
 
 impl FontStyle {
     /// `(italic, bold)`.
+    #[cfg(test)]
     pub(crate) fn flags(self) -> (bool, bool) {
         (self.italic, self.bold)
+    }
+
+    /// The style with what the font's name says folded in: a bold word or
+    /// style abbreviation makes it bold, and is reported as the source
+    /// ahead of the flags; an italic word makes it italic. `name` is the
+    /// `/BaseFont`, or the resource tag of a font dictionary without one.
+    pub(crate) fn with_name(mut self, name: &str) -> Self {
+        if crate::text_utils::is_bold_font(name) {
+            self.bold = true;
+            self.bold_source = BoldSource::first(self.bold_source, Some(BoldSource::FontName));
+        }
+        if crate::text_utils::is_italic_font(name) {
+            self.italic = true;
+        }
+        self
+    }
+
+    /// The style with the width table's verdict on fixed pitch (see
+    /// [`FontWidthInfo::fixed_pitch_by_advance`]) folded in, for a font
+    /// whose descriptor and program say nothing about it.
+    pub(crate) fn with_measured_pitch(mut self, widths: Option<&FontWidthInfo>) -> Self {
+        if self.fixed_pitch.is_none() {
+            self.fixed_pitch = widths.and_then(FontWidthInfo::fixed_pitch_by_advance);
+        }
+        self
     }
 }
 
@@ -1360,10 +1400,14 @@ pub(crate) fn font_style(
         .and_then(|obj| obj.as_i64().ok())
         .unwrap_or(0);
 
+    let force_bold = flags & (1 << 18) != 0;
     let mut style = FontStyle {
         italic: italic_angle.abs() >= 4.0 || flags & (1 << 6) != 0,
-        bold: flags & (1 << 18) != 0,
+        bold: force_bold,
+        bold_source: force_bold.then_some(BoldSource::FontFlags),
         weight: None,
+        // Flags bit 1: FixedPitch. Only a set bit is evidence.
+        fixed_pitch: (flags & 1 != 0).then_some(true),
     };
 
     // Descriptors lie: subset generators write ItalicAngle 0 for genuinely
@@ -1377,7 +1421,9 @@ pub(crate) fn font_style(
             .or_insert_with(|| embedded_style(doc, ff_ref));
         style.italic |= embedded.italic;
         style.bold |= embedded.bold;
+        style.bold_source = BoldSource::first(style.bold_source, embedded.bold_source);
         style.weight = embedded.weight;
+        style.fixed_pitch = style.fixed_pitch.or(embedded.fixed_pitch);
     }
     style.weight = if has_weight_class {
         style
@@ -1441,20 +1487,28 @@ fn embedded_style(doc: &Document, ff_ref: ObjectId) -> FontStyle {
                 .table(ttf_parser::Tag::from_bytes(b"head"))
                 .and_then(|head| head.get(44..46))
                 .is_some_and(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]) & 1 != 0);
+        let bold = face.is_bold() || mac_bold;
         FontStyle {
             italic: face.is_italic() || face.italic_angle().abs() >= 4.0,
-            bold: face.is_bold() || mac_bold,
+            bold,
+            bold_source: bold.then_some(BoldSource::FontFlags),
             weight: os2.and_then(|os2| weight_class(f32::from(os2.weight().to_number()))),
+            // The post table's isFixedPitch, which font tools set for a
+            // monospaced face and subsetters carry over.
+            fixed_pitch: face.is_monospaced().then_some(true),
         }
     } else if let Some(name) = cff_font_name(&data) {
         // FontFile3 is bare CFF (no sfnt container) — ttf_parser
         // can't open it, but the CFF Name INDEX keeps the real
         // PostScript name ("XXXXXX+Amplitude-LightItalic") even
         // when the descriptor was rewritten to claim upright.
+        let bold = crate::text_utils::is_bold_font(&name);
         FontStyle {
             italic: crate::text_utils::is_italic_font(&name),
-            bold: crate::text_utils::is_bold_font(&name),
+            bold,
+            bold_source: bold.then_some(BoldSource::FontName),
             weight: crate::text_utils::font_weight_from_name(&name),
+            fixed_pitch: None,
         }
     } else {
         FontStyle::default()
@@ -2312,6 +2366,16 @@ mod tests {
 
     /// [`sfnt_with_style`] whose OS/2 table also carries a `usWeightClass`.
     fn sfnt_with_style_and_weight(mac_style: u16, os2: Option<(u16, u16)>) -> Vec<u8> {
+        sfnt_with_tables(mac_style, os2, None)
+    }
+
+    /// [`sfnt_with_style_and_weight`] with a `post` table whose
+    /// `isFixedPitch` is `fixed_pitch`, when given.
+    fn sfnt_with_tables(
+        mac_style: u16,
+        os2: Option<(u16, u16)>,
+        fixed_pitch: Option<bool>,
+    ) -> Vec<u8> {
         let mut head = vec![0u8; 54];
         head[18..20].copy_from_slice(&1000u16.to_be_bytes()); // unitsPerEm
         head[44..46].copy_from_slice(&mac_style.to_be_bytes());
@@ -2325,6 +2389,12 @@ mod tests {
             os2[4..6].copy_from_slice(&weight_class.to_be_bytes()); // usWeightClass
             os2[62..64].copy_from_slice(&selection.to_be_bytes()); // fsSelection
             tables.push((*b"OS/2", os2));
+        }
+        if let Some(fixed_pitch) = fixed_pitch {
+            let mut post = vec![0u8; 32]; // version 3.0: header only
+            post[..4].copy_from_slice(&0x00030000u32.to_be_bytes());
+            post[12..16].copy_from_slice(&u32::from(fixed_pitch).to_be_bytes()); // isFixedPitch
+            tables.push((*b"post", post));
         }
         tables.sort_by_key(|(tag, _)| *tag);
         let count = tables.len();
@@ -2426,7 +2496,9 @@ mod tests {
             FontStyle {
                 italic: false,
                 bold: false,
+                bold_source: None,
                 weight: Some(700),
+                fixed_pitch: None,
             }
         );
     }
@@ -2536,7 +2608,9 @@ mod tests {
             FontStyle {
                 italic: false,
                 bold: true,
+                bold_source: Some(BoldSource::FontFlags),
                 weight: None,
+                fixed_pitch: None,
             }
         );
         // The same holds for a font dictionary without a subtype at all.
@@ -2560,7 +2634,9 @@ mod tests {
             FontStyle {
                 italic: false,
                 bold: false,
+                bold_source: None,
                 weight: Some(300),
+                fixed_pitch: None,
             }
         );
     }
@@ -2630,7 +2706,9 @@ mod tests {
             FontStyle {
                 italic: false,
                 bold: false,
+                bold_source: None,
                 weight: Some(500),
+                fixed_pitch: None,
             }
         );
     }
@@ -3155,6 +3233,178 @@ end",
         assert!(widths.len() <= MAX_CID_W_EXPANSION);
         assert_eq!(widths.get(&0), Some(&500));
         assert_eq!(widths.get(&65535), Some(&500));
+    }
+    #[test]
+    fn descriptor_fixed_pitch_flag_is_read_only_as_a_yes() {
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "ItalicAngle" => 0,
+            "Flags" => 1 | 32, // FixedPitch, Nonsymbolic
+        });
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).fixed_pitch,
+            Some(true)
+        );
+        // An unset bit says nothing: producers write /Flags 4 for any face.
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "ItalicAngle" => 0,
+            "Flags" => 4,
+        });
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).fixed_pitch,
+            None
+        );
+    }
+
+    #[test]
+    fn embedded_post_table_declares_fixed_pitch() {
+        let (doc, font_dict) = embedded_font(
+            "ABCDEF+OpaqueFace",
+            sfnt_with_tables(0, Some((1 << 6, 400)), Some(true)),
+            dictionary! {},
+        );
+        let style = font_style(&doc, &font_dict, &mut FontStyleCache::new());
+        assert_eq!(style.fixed_pitch, Some(true));
+        assert!(!style.bold && style.bold_source.is_none());
+        // A program that says it is proportional leaves the question to the
+        // width table.
+        let (doc, font_dict) = embedded_font(
+            "ABCDEF+OpaqueFace",
+            sfnt_with_tables(0, Some((1 << 6, 400)), Some(false)),
+            dictionary! {},
+        );
+        assert_eq!(
+            font_style(&doc, &font_dict, &mut FontStyleCache::new()).fixed_pitch,
+            None
+        );
+    }
+
+    #[test]
+    fn bold_source_names_the_descriptor_flag_or_the_program() {
+        // ForceBold in the descriptor.
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "ItalicAngle" => 0,
+            "Flags" => 1 << 18,
+        });
+        let style = font_style(&doc, &font_dict, &mut FontStyleCache::new());
+        assert!(style.bold);
+        assert_eq!(style.bold_source, Some(BoldSource::FontFlags));
+        // The embedded program's bold selection.
+        let (doc, font_dict) = embedded_font(
+            "ABCDEF+OpaqueFace",
+            sfnt_with_style_and_weight(0, Some((1 << 5, 700))),
+            dictionary! {},
+        );
+        let style = font_style(&doc, &font_dict, &mut FontStyleCache::new());
+        assert!(style.bold);
+        assert_eq!(style.bold_source, Some(BoldSource::FontFlags));
+        assert_eq!(style.weight, Some(700));
+        // A heavy weight class alone is not bold and names no source.
+        let (doc, font_dict) = embedded_font(
+            "ABCDEF+OpaqueFace",
+            sfnt_with_style_and_weight(0, Some((1 << 6, 700))),
+            dictionary! {},
+        );
+        let style = font_style(&doc, &font_dict, &mut FontStyleCache::new());
+        assert!(!style.bold);
+        assert_eq!(style.bold_source, None);
+    }
+
+    #[test]
+    fn name_style_outranks_the_flags_as_the_bold_source() {
+        let flagged = FontStyle {
+            italic: false,
+            bold: true,
+            bold_source: Some(BoldSource::FontFlags),
+            weight: Some(700),
+            fixed_pitch: None,
+        };
+        // A bold word in the name is what a reader sees first.
+        assert_eq!(
+            flagged.with_name("Foo-Bold").bold_source,
+            Some(BoldSource::FontName)
+        );
+        // A plain name leaves the flags' verdict alone.
+        assert_eq!(flagged.with_name("Tc1"), flagged);
+        // A name alone makes a plain style bold, or italic; the resource
+        // tag of a font without a name says nothing.
+        let plain = FontStyle::default();
+        let named = plain.with_name("ABCDEF+Face-Demi");
+        assert!(named.bold);
+        assert_eq!(named.bold_source, Some(BoldSource::FontName));
+        assert!(plain.with_name("Foo-Italic").italic);
+        assert_eq!(plain.with_name("F1"), plain);
+    }
+
+    #[test]
+    fn measured_pitch_fills_only_an_unknown() {
+        let uniform: Vec<(u16, u16)> = (65u16..77).map(|code| (code, 600)).collect();
+        let info = make_font_info(&uniform, 0, false);
+        assert_eq!(
+            FontStyle::default()
+                .with_measured_pitch(Some(&info))
+                .fixed_pitch,
+            Some(true)
+        );
+        assert_eq!(
+            FontStyle::default().with_measured_pitch(None).fixed_pitch,
+            None
+        );
+        // A declared verdict is not second-guessed by the widths.
+        let declared = FontStyle {
+            fixed_pitch: Some(true),
+            ..FontStyle::default()
+        };
+        let varied = make_font_info(&[(65, 600), (66, 300)], 0, false);
+        assert_eq!(
+            declared.with_measured_pitch(Some(&varied)).fixed_pitch,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn fixed_pitch_by_advance_needs_a_dozen_glyphs_for_a_yes_and_two_for_a_no() {
+        // Ten tabular digits of a proportional face share an advance and
+        // are not enough to call it fixed-pitch.
+        let digits: Vec<(u16, u16)> = (48u16..58).map(|code| (code, 556)).collect();
+        assert_eq!(
+            make_font_info(&digits, 0, false).fixed_pitch_by_advance(),
+            None
+        );
+        let mut dozen = digits.clone();
+        dozen.extend([(43, 556), (45, 556)]);
+        assert_eq!(
+            make_font_info(&dozen, 0, false).fixed_pitch_by_advance(),
+            Some(true)
+        );
+        // A unit of rounding is one advance; a real difference is two.
+        let mut rounded = dozen.clone();
+        rounded[0].1 = 555;
+        assert_eq!(
+            make_font_info(&rounded, 0, false).fixed_pitch_by_advance(),
+            Some(true)
+        );
+        assert_eq!(
+            make_font_info(&[(65, 600), (66, 500)], 0, false).fixed_pitch_by_advance(),
+            Some(false)
+        );
+        // Zero widths are codes without a glyph and do not count.
+        let mut with_gaps = dozen.clone();
+        with_gaps.extend([(1, 0), (2, 0)]);
+        assert_eq!(
+            make_font_info(&with_gaps, 0, false).fixed_pitch_by_advance(),
+            Some(true)
+        );
+        // A CID font's default width covers unlisted glyphs and is not read.
+        assert_eq!(
+            make_font_info(&[], 1000, true).fixed_pitch_by_advance(),
+            None
+        );
     }
 }
 

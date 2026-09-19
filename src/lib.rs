@@ -67,7 +67,7 @@ pub use markdown::{
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
-pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
+pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -843,6 +843,8 @@ mod ocr_header_footer_tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1074,9 +1076,10 @@ pub fn extract_text_in_regions_mem_in_frame(
 
 /// [`extract_text_in_regions_mem_in_frame`] with every option given as a
 /// [`PositionOptions`]: the frame the region rects are read in, and whether
-/// bold is also read from the font's weight class (`bold_from_weight`, which
-/// also keeps runs of different weight apart while the region's lines are
-/// assembled). The default options are [`extract_text_in_regions_mem`].
+/// bold is also read from the font's weight class (`bold_from_weight`, from
+/// the class `bold_weight_threshold` names; a run the weight makes bold is
+/// then its own item while the region's lines are assembled). The default
+/// options are [`extract_text_in_regions_mem`].
 pub fn extract_text_in_regions_mem_with_options(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],
@@ -5608,6 +5611,8 @@ mod text_cluster_column_undercount_tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -5890,6 +5895,8 @@ mod table_candidate_selection_tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -6884,6 +6891,8 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -8097,6 +8106,8 @@ mod rotated_run_region_tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,

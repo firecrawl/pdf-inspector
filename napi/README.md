@@ -121,9 +121,26 @@ from the embedded font program's OS/2 table, else the FontDescriptor's
 "Black", "W6"); it is omitted when none of them says. `isBold` is unchanged
 and independent of it, so a medium face reports `fontWeight: 500` with
 `isBold: false`. Pass `{ boldFromWeight: true }` to also read `isBold` from a
-weight class of 600 (SemiBold) or more and to keep adjacent runs of different
-weight as separate items, so a heavier run inside a lighter paragraph keeps
-its own item instead of merging into it.
+weight class of 600 (SemiBold) or more — or of `boldWeightThreshold`, any
+class on the 100..900 scale — and to merge adjacent runs by that verdict, so a
+heavier run inside a lighter paragraph keeps its own item while runs whose
+weights differ but agree on bold merge as usual.
+
+`boldSource` says where `isBold` came from — `"FontName"` (a bold word or
+style abbreviation in the font name), `"FontFlags"` (the FontDescriptor's
+ForceBold flag or the embedded program's bold selection), `"WeightClass"`
+(the weight class, with `boldFromWeight`) or `"Painted"` (text filled and
+stroked to look heavier), the first of them in that order when more than one
+says bold — so a face whose name says Bold over a `fontWeight` of 400 can be
+told from one whose weight class says so. It is omitted when `isBold` is
+`false`.
+
+`fixedPitch` is `true` when the FontDescriptor's FixedPitch flag or the
+embedded program's `post` table says the font is monospaced, else measured
+from the font's width table: `true` when a dozen or more of its glyphs share
+one advance, `false` when two differ. It is omitted when the font declares
+nothing and carries too few glyphs to measure. Many producers write `/Flags 4`
+whatever the face, so the flag is only ever read as a yes.
 
 `legacySymbolRewrite: true` marks items whose decoded text includes a character
 changed by legacy symbol cleanup. Merged items retain this evidence from either
@@ -142,8 +159,11 @@ for (const item of extractTextWithPositions(pdf, [1])) { // pages are 1-indexed
 // Boxes as a renderer draws the page (`/Rotate` applied)
 const rendered = extractTextWithPositions(pdf, undefined, { frame: 'display' })
 
-// Bold also from the weight class; runs of different weight stay apart
+// Bold also from the weight class, SemiBold (600) and heavier
 const weighted = extractTextWithPositions(pdf, undefined, { boldFromWeight: true })
+
+// ... or from Bold (700) and heavier
+const heavier = extractTextWithPositions(pdf, undefined, { boldFromWeight: true, boldWeightThreshold: 700 })
 ```
 
 ### `extractTextWithPositionsAndRotations(buffer: Buffer, pages?: number[], options?: FrameOptions): PositionedText`
@@ -239,7 +259,8 @@ interface PageRegions {
 
 interface FrameOptions {
   frame?: "sheet" | "display" // coordinate frame of items and region bboxes; "sheet" by default
-  boldFromWeight?: boolean    // also read isBold from fontWeight >= 600 and keep runs of different weight apart; false by default
+  boldFromWeight?: boolean    // also read isBold from fontWeight >= boldWeightThreshold and merge runs by that verdict; false by default
+  boldWeightThreshold?: number // the weight class boldFromWeight reads bold from, 100..900; 600 by default
 }
 
 interface PositionedText {

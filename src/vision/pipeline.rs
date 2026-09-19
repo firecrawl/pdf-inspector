@@ -1147,6 +1147,8 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,

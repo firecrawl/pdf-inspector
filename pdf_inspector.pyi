@@ -121,6 +121,10 @@ class TextItem:
     font_size: float
     page: int
     is_bold: bool
+    """Bold from the font name, the FontDescriptor's ForceBold flag, the
+    embedded program's bold selection, or text filled and stroked to look
+    heavier; with ``bold_from_weight`` also from the weight class.
+    ``bold_source`` says which."""
     is_italic: bool
     font_weight: Optional[int]
     """The font's weight class on the 100..900 scale shared by CSS
@@ -130,6 +134,21 @@ class TextItem:
     "-Md", "Black", "W6"). ``None`` when none of them says, and for image, link
     and form-field items. Independent of ``is_bold``, which is unchanged: a
     medium face reports ``500`` with ``is_bold`` ``False``."""
+    bold_source: Optional[str]
+    """Where ``is_bold`` came from — ``"font_name"``, ``"font_flags"``,
+    ``"weight_class"`` (with ``bold_from_weight``) or ``"painted"``, the first
+    of them in that order when more than one says bold — so a verdict can be
+    weighed against ``font_weight``: a face whose name says Bold over a weight
+    class of 400 reports ``"font_name"``. ``None`` when ``is_bold`` is
+    ``False``, and for image, link and form-field items."""
+    fixed_pitch: Optional[bool]
+    """Whether the font is fixed-pitch (monospaced): ``True`` when the
+    FontDescriptor's FixedPitch flag or the embedded program's ``post`` table
+    says so, else measured from the font's width table — ``True`` when a dozen
+    or more of its glyphs share one advance, ``False`` when two differ.
+    ``None`` when the font declares nothing and carries too few glyphs to
+    measure, and for image, link and form-field items. Many producers write
+    ``/Flags 4`` whatever the face, so the flag is only ever read as a yes."""
     is_underline: bool
     is_strikeout: bool
     baseline_shift: float
@@ -161,15 +180,16 @@ class PositionedText:
     items are in plain page coordinates."""
 
 def extract_text_with_positions_and_rotations(
-    path: str, bold_from_weight: bool = False
+    path: str, bold_from_weight: bool = False, bold_weight_threshold: int = 600
 ) -> PositionedText:
     """Extract positioned text plus the coordinate frame of every page whose
     text was predominantly rotated (items on such pages are in the turned
-    frame)."""
+    frame). ``bold_from_weight`` and ``bold_weight_threshold`` are the options
+    of :func:`extract_text_with_positions`."""
     ...
 
 def extract_text_with_positions_and_rotations_bytes(
-    data: bytes, bold_from_weight: bool = False
+    data: bytes, bold_from_weight: bool = False, bold_weight_threshold: int = 600
 ) -> PositionedText:
     """Bytes variant of extract_text_with_positions_and_rotations."""
     ...
@@ -289,7 +309,10 @@ def extract_text_bytes(data: bytes) -> str:
     ...
 
 def extract_text_with_positions(
-    path: str, pages: Optional[list[int]] = None, bold_from_weight: bool = False
+    path: str,
+    pages: Optional[list[int]] = None,
+    bold_from_weight: bool = False,
+    bold_weight_threshold: int = 600,
 ) -> list[TextItem]:
     """Extract text with position information.
 
@@ -310,16 +333,26 @@ def extract_text_with_positions(
             When ``None`` (default), the whole document is returned.
         bold_from_weight: Also read bold from the font's weight class:
             ``TextItem.is_bold`` is then ``True`` as well when
-            ``TextItem.font_weight`` is 600 or more, and adjacent runs whose
-            ``font_weight`` differs stay separate items, so a heavier run
-            inside a lighter paragraph keeps its own item. ``False`` by
-            default, where ``is_bold`` and item merging are unchanged;
-            ``font_weight`` is reported either way.
+            ``TextItem.font_weight`` is ``bold_weight_threshold`` or more
+            (``bold_source`` ``"weight_class"``), and adjacent runs are merged
+            by that verdict: a run the weight makes bold stays apart from its
+            plain neighbours, so a heavier run inside a lighter paragraph
+            keeps its own item, while runs whose weights differ but agree on
+            bold merge as usual. ``False`` by default, where ``is_bold`` and
+            item merging are unchanged; ``font_weight`` is reported either
+            way.
+        bold_weight_threshold: The weight class from which
+            ``bold_from_weight`` reads bold, on the 100..900 scale; 600
+            (SemiBold) by default. Read only when ``bold_from_weight`` is
+            ``True``; a value outside 100..900 raises ``ValueError``.
     """
     ...
 
 def extract_text_with_positions_bytes(
-    data: bytes, pages: Optional[list[int]] = None, bold_from_weight: bool = False
+    data: bytes,
+    pages: Optional[list[int]] = None,
+    bold_from_weight: bool = False,
+    bold_weight_threshold: int = 600,
 ) -> list[TextItem]:
     """Extract text with position information from bytes.
 
@@ -352,6 +385,7 @@ def extract_text_in_regions(
     path: str,
     page_regions: list[tuple[int, list[list[float]]]],
     bold_from_weight: bool = False,
+    bold_weight_threshold: int = 600,
 ) -> list[PageRegionTexts]:
     """Extract text within bounding-box regions from a PDF file.
 
@@ -363,9 +397,11 @@ def extract_text_in_regions(
             same box :func:`extract_text_with_positions` reports items in,
             flipped to a top-left origin (``y_top = box_height - y``).
         bold_from_weight: The option of :func:`extract_text_with_positions`:
-            read bold from the font's weight class too and keep runs of
-            different weight apart while a region's lines are assembled.
+            read bold from the font's weight class too, so a run the weight
+            makes bold is its own item while a region's lines are assembled.
             ``False`` by default.
+        bold_weight_threshold: The weight class ``bold_from_weight`` reads
+            bold from, 100..900; 600 by default.
     """
     ...
 
@@ -373,6 +409,7 @@ def extract_text_in_regions_bytes(
     data: bytes,
     page_regions: list[tuple[int, list[list[float]]]],
     bold_from_weight: bool = False,
+    bold_weight_threshold: int = 600,
 ) -> list[PageRegionTexts]:
     """Extract text within bounding-box regions from PDF bytes.
 

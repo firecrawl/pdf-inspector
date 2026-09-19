@@ -23,7 +23,7 @@ use pdf_inspector::{
 use pdf_inspector::{
     extract_text_in_regions_mem_with_options,
     extract_text_with_positions_and_rotations_mem_with_options,
-    extract_text_with_positions_mem_with_options, PositionOptions,
+    extract_text_with_positions_mem_with_options, BoldSource, PositionOptions,
 };
 use std::collections::HashSet;
 
@@ -343,6 +343,8 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         is_bold: false,
         is_italic: false,
         font_weight: None,
+        bold_source: None,
+        fixed_pitch: None,
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
@@ -376,6 +378,8 @@ fn make_text_item_with_font(
         is_bold: is_bold_font(font),
         is_italic: is_italic_font(font),
         font_weight: None,
+        bold_source: None,
+        fixed_pitch: None,
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
@@ -6153,28 +6157,28 @@ fn test_font_weight_is_reported_and_bold_from_weight_is_off_by_default() {
 }
 
 #[test]
-fn test_bold_from_weight_keeps_weights_apart_and_reads_bold_from_600() {
+fn test_bold_from_weight_reads_bold_from_600_and_merges_by_the_verdict() {
     let buf = synthetic_three_weights_pdf();
     let options = PositionOptions::new().bold_from_weight(true);
 
-    // Runs of different weight stay separate items; the 700 face is bold,
-    // the 300 and 500 faces are not; same-weight runs still merge.
+    // The 700 face is bold, on the weight class's account; the 300 and 500
+    // faces are not, and agreeing, their runs merge as they do by default,
+    // while the bold run is its own item.
     let weighted = extract_text_with_positions_mem_with_options(&buf, None, options).unwrap();
     assert_eq!(
         text_and_style(&weighted),
         [
-            ("Light ".to_string(), false, Some(300)),
-            ("Medium ".to_string(), false, Some(500)),
+            ("Light Medium ".to_string(), false, Some(300)),
             ("Heavy".to_string(), true, Some(700)),
             ("Same weight".to_string(), false, Some(300)),
         ]
     );
-    let light = find_item(&weighted, "Light");
-    let medium = find_item(&weighted, "Medium");
+    let light = find_item(&weighted, "Light Medium");
     let heavy = find_item(&weighted, "Heavy");
+    assert_eq!(light.bold_source, None);
+    assert_eq!(heavy.bold_source, Some(BoldSource::WeightClass));
     assert_close(light.x, 72.0);
-    assert_close(medium.x, light.x + light.width);
-    assert_close(heavy.x, medium.x + medium.width);
+    assert_close(heavy.x, light.x + light.width);
     for item in &weighted {
         assert_close(
             item.y,
@@ -6185,6 +6189,68 @@ fn test_bold_from_weight_keeps_weights_apart_and_reads_bold_from_600() {
             },
         );
     }
+
+    // A threshold of 500 makes the medium face bold too: the light run is
+    // then alone and the two heavier runs, agreeing, merge. A threshold of
+    // 800 makes nothing bold and the line is one item again.
+    let at_500 = extract_text_with_positions_mem_with_options(
+        &buf,
+        None,
+        options.bold_weight_threshold(500),
+    )
+    .unwrap();
+    assert_eq!(
+        text_and_style(&at_500),
+        [
+            ("Light ".to_string(), false, Some(300)),
+            ("Medium Heavy".to_string(), true, Some(500)),
+            ("Same weight".to_string(), false, Some(300)),
+        ]
+    );
+    assert_eq!(
+        find_item(&at_500, "Medium Heavy").bold_source,
+        Some(BoldSource::WeightClass)
+    );
+    let at_800 = extract_text_with_positions_mem_with_options(
+        &buf,
+        None,
+        options.bold_weight_threshold(800),
+    )
+    .unwrap();
+    assert_eq!(
+        text_and_style(&at_800),
+        text_and_style(&extract_text_with_positions_mem(&buf).unwrap())
+    );
+    assert!(at_800.iter().all(|item| item.bold_source.is_none()));
+
+    // A threshold outside the scale is clamped into it: 0 reads as 100,
+    // which every weight class reaches, and 1000 as 900, which none does.
+    let at_0 =
+        extract_text_with_positions_mem_with_options(&buf, None, options.bold_weight_threshold(0))
+            .unwrap();
+    assert_eq!(
+        text_and_style(&at_0),
+        [
+            ("Light Medium Heavy".to_string(), true, Some(300)),
+            ("Same weight".to_string(), true, Some(300)),
+        ]
+    );
+    let at_1000 = extract_text_with_positions_mem_with_options(
+        &buf,
+        None,
+        options.bold_weight_threshold(1000),
+    )
+    .unwrap();
+    assert_eq!(text_and_style(&at_1000), text_and_style(&at_800));
+
+    // The threshold is read only with the option on.
+    let threshold_alone = extract_text_with_positions_mem_with_options(
+        &buf,
+        None,
+        PositionOptions::new().bold_weight_threshold(100),
+    )
+    .unwrap();
+    assert_eq!(text_and_style(&threshold_alone), text_and_style(&at_800));
 
     // The rotations variant and the page filter take the same options.
     let pages: HashSet<u32> = [1].into_iter().collect();
@@ -6206,6 +6272,201 @@ fn test_bold_from_weight_keeps_weights_apart_and_reads_bold_from_600() {
     assert!(plain_region[0].regions[0]
         .text
         .contains("Light Medium Heavy"));
+}
+
+// =========================================================================
+// Font metadata faces: bold provenance, weight class and fixed pitch
+// =========================================================================
+
+/// The items of `tests/fixtures/font_metadata_faces.pdf`, two pages of text
+/// set in embedded subsets whose names, OS/2 tables, descriptor flags and
+/// width tables each make one point; see
+/// `scripts/make_font_metadata_fixtures.py` for the faces.
+fn font_metadata_items(options: PositionOptions) -> Vec<TextItem> {
+    let buf = std::fs::read("tests/fixtures/font_metadata_faces.pdf").unwrap();
+    extract_text_with_positions_mem_with_options(&buf, None, options).unwrap()
+}
+
+/// `(is_bold, bold_source, font_weight, fixed_pitch)` of the item whose
+/// text is exactly `text`.
+fn face_style(
+    items: &[TextItem],
+    text: &str,
+) -> (bool, Option<BoldSource>, Option<u16>, Option<bool>) {
+    let item = items
+        .iter()
+        .find(|item| item.text == text)
+        .unwrap_or_else(|| panic!("no item reads {text:?}"));
+    (
+        item.is_bold,
+        item.bold_source,
+        item.font_weight,
+        item.fixed_pitch,
+    )
+}
+
+/// The first page's line set in several faces, item by item.
+fn mixed_line(items: &[TextItem]) -> Vec<(String, bool, Option<BoldSource>, Option<u16>)> {
+    items
+        .iter()
+        .filter(|item| item.page == 1 && (item.y - 580.0).abs() < 0.5)
+        .map(|item| {
+            (
+                item.text.clone(),
+                item.is_bold,
+                item.bold_source,
+                item.font_weight,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn test_bold_source_names_where_the_default_verdict_came_from() {
+    let items = font_metadata_items(PositionOptions::new());
+    // A Demi face is bold by its name, whatever its weight class.
+    assert_eq!(
+        face_style(&items, "Demi name, weight class 600"),
+        (true, Some(BoldSource::FontName), Some(600), Some(false))
+    );
+    // Bold in the name of a regular program: the name wins, and the weight
+    // class shows the conflict.
+    assert_eq!(
+        face_style(&items, "Bold name, weight class 400"),
+        (true, Some(BoldSource::FontName), Some(400), Some(false))
+    );
+    // A heavy weight class alone is not bold by default.
+    assert_eq!(
+        face_style(&items, "Plain name, weight class 600"),
+        (false, None, Some(600), Some(false))
+    );
+    // The program's bold selection, behind a name that says nothing.
+    assert_eq!(
+        face_style(&items, "Opaque name, bold selection, weight class 700"),
+        (true, Some(BoldSource::FontFlags), Some(700), Some(false))
+    );
+    assert_eq!(
+        face_style(&items, "Extra light, weight class 200"),
+        (false, None, Some(200), Some(false))
+    );
+    // Filled and stroked text in a regular face.
+    assert_eq!(
+        face_style(&items, "Painted heavier"),
+        (true, Some(BoldSource::Painted), Some(400), Some(false))
+    );
+    // The runs that are not bold merge whatever their weight classes; the
+    // bold-named run is its own item.
+    assert_eq!(
+        mixed_line(&items),
+        [
+            ("Light regular heavier ".to_string(), false, None, Some(200)),
+            (
+                "bold".to_string(),
+                true,
+                Some(BoldSource::FontName),
+                Some(400)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_bold_from_weight_credits_the_weight_class_after_the_name_and_flags() {
+    let options = PositionOptions::new().bold_from_weight(true);
+    let items = font_metadata_items(options);
+    assert_eq!(
+        face_style(&items, "Demi name, weight class 600").1,
+        Some(BoldSource::FontName)
+    );
+    assert_eq!(
+        face_style(&items, "Bold name, weight class 400"),
+        (true, Some(BoldSource::FontName), Some(400), Some(false))
+    );
+    // The plain-named 600 face is now bold, on the weight class's account.
+    assert_eq!(
+        face_style(&items, "Plain name, weight class 600"),
+        (true, Some(BoldSource::WeightClass), Some(600), Some(false))
+    );
+    assert_eq!(
+        face_style(&items, "Opaque name, bold selection, weight class 700").1,
+        Some(BoldSource::FontFlags)
+    );
+    assert_eq!(
+        face_style(&items, "Painted heavier").1,
+        Some(BoldSource::Painted)
+    );
+    // The 600 run is bold like its bold-named neighbour, so the two merge
+    // into an item that keeps the first run's weight and source; the two
+    // lighter runs stay one item.
+    assert_eq!(
+        mixed_line(&items),
+        [
+            ("Light regular ".to_string(), false, None, Some(200)),
+            (
+                "heavier bold".to_string(),
+                true,
+                Some(BoldSource::WeightClass),
+                Some(600)
+            ),
+        ]
+    );
+
+    // A threshold of 700 puts the 600 faces back with the plain ones,
+    // except the one whose name says Demi.
+    let items = font_metadata_items(options.bold_weight_threshold(700));
+    assert_eq!(
+        face_style(&items, "Plain name, weight class 600"),
+        (false, None, Some(600), Some(false))
+    );
+    assert_eq!(
+        face_style(&items, "Demi name, weight class 600").1,
+        Some(BoldSource::FontName)
+    );
+    assert_eq!(
+        face_style(&items, "Opaque name, bold selection, weight class 700").1,
+        Some(BoldSource::FontFlags)
+    );
+    assert_eq!(
+        mixed_line(&items),
+        mixed_line(&font_metadata_items(PositionOptions::new()))
+    );
+}
+
+#[test]
+fn test_fixed_pitch_is_declared_or_measured() {
+    let items = font_metadata_items(PositionOptions::new());
+    // The program's post table says so, whatever the descriptor's Flags 4.
+    assert_eq!(
+        face_style(&items, "Mono declared by the program").3,
+        Some(true)
+    );
+    // Nothing declares it: the uniform advances of the glyphs in use do.
+    assert_eq!(
+        face_style(&items, "Mono measured from advances").3,
+        Some(true)
+    );
+    // The descriptor's FixedPitch flag, on a face with too few glyphs to
+    // measure.
+    assert_eq!(face_style(&items, "Mo").3, Some(true));
+    // A proportional face measures as such.
+    assert_eq!(
+        face_style(&items, "Proportional by advances").3,
+        Some(false)
+    );
+    // Ten tabular digits share an advance and are too few to say.
+    assert_eq!(face_style(&items, "0123456789").3, None);
+    // The verdict is the font's, not the option's.
+    let weighted = font_metadata_items(PositionOptions::new().bold_from_weight(true));
+    assert_eq!(
+        weighted
+            .iter()
+            .map(|item| item.fixed_pitch)
+            .collect::<Vec<_>>(),
+        items
+            .iter()
+            .map(|item| item.fixed_pitch)
+            .collect::<Vec<_>>()
+    );
 }
 
 // ---------------------------------------------------------------------------

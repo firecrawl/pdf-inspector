@@ -390,6 +390,10 @@ pub struct PyTextItem {
     pub font_size: f32,
     #[pyo3(get)]
     pub page: u32,
+    /// Bold from the font name, the FontDescriptor's ForceBold flag, the
+    /// embedded program's bold selection, or text filled and stroked to look
+    /// heavier; with bold_from_weight also from the weight class.
+    /// bold_source says which.
     #[pyo3(get)]
     pub is_bold: bool,
     #[pyo3(get)]
@@ -400,6 +404,20 @@ pub struct PyTextItem {
     /// None when none of them says. Independent of is_bold.
     #[pyo3(get)]
     pub font_weight: Option<u16>,
+    /// Where is_bold came from: "font_name", "font_flags", "weight_class"
+    /// (with bold_from_weight) or "painted", the first of them in that order
+    /// when more than one says bold. None when is_bold is False, and for
+    /// image, link and form-field items.
+    #[pyo3(get)]
+    pub bold_source: Option<String>,
+    /// Whether the font is fixed-pitch: True when the FontDescriptor's
+    /// FixedPitch flag or the embedded program's post table says so, else
+    /// measured from the width table (True when a dozen or more glyphs share
+    /// one advance, False when two differ). None when the font declares
+    /// nothing and carries too few glyphs to measure, and for image, link
+    /// and form-field items.
+    #[pyo3(get)]
+    pub fixed_pitch: Option<bool>,
     #[pyo3(get)]
     pub is_underline: bool,
     #[pyo3(get)]
@@ -622,6 +640,8 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             is_bold: item.is_bold,
             is_italic: item.is_italic,
             font_weight: item.font_weight,
+            bold_source: item.bold_source.map(|source| source.as_str().to_string()),
+            fixed_pitch: item.fixed_pitch,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
             rotation: item.rotation,
@@ -891,9 +911,17 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 ///         When None (default), the whole document is returned.
 ///
 ///     bold_from_weight: Also read bold from the font's weight class: is_bold
-///         is then True as well when font_weight is 600 or more, and adjacent
-///         runs whose font_weight differs stay separate items. False by
-///         default, where is_bold and item merging are unchanged.
+///         is then True as well when font_weight is bold_weight_threshold or
+///         more (bold_source "weight_class"), and adjacent runs are merged by
+///         that verdict, so a run the weight makes bold stays apart from its
+///         plain neighbours while runs of different weight that agree on bold
+///         merge as usual. False by default, where is_bold and item merging
+///         are unchanged.
+///
+///     bold_weight_threshold: The weight class from which bold_from_weight
+///         reads bold, 100..900; 600 (SemiBold) by default. Read only when
+///         bold_from_weight is True; a value outside 100..900 raises
+///         ValueError.
 ///
 /// Returns:
 ///     List of TextItem. x/y are PDF points relative to the page's visible
@@ -901,15 +929,23 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 ///     corner with y up; extract_text_in_regions reads regions relative to
 ///     the same box from its top-left corner (flip y with the box height).
 #[pyfunction]
-#[pyo3(signature = (path, pages=None, bold_from_weight=false))]
+#[pyo3(signature = (path, pages=None, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
 fn extract_text_with_positions(
     path: &str,
     pages: Option<Vec<u32>>,
     bold_from_weight: bool,
+    bold_weight_threshold: u16,
 ) -> PyResult<Vec<PyTextItem>> {
+    // The threshold is checked whichever path the call takes.
+    position_options(bold_from_weight, bold_weight_threshold)?;
     if bold_from_weight {
         let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
-        return extract_text_with_positions_bytes(&data, pages, bold_from_weight);
+        return extract_text_with_positions_bytes(
+            &data,
+            pages,
+            bold_from_weight,
+            bold_weight_threshold,
+        );
     }
     let items = match pages {
         Some(p) => {
@@ -921,9 +957,24 @@ fn extract_text_with_positions(
     Ok(convert_text_items(items))
 }
 
-/// The positioned-text options a `bold_from_weight` argument asks for.
-fn position_options(bold_from_weight: bool) -> crate::PositionOptions {
-    crate::PositionOptions::new().bold_from_weight(bold_from_weight)
+/// The weight class `bold_from_weight` reads bold from unless told otherwise.
+const DEFAULT_BOLD_WEIGHT_THRESHOLD: u16 = 600;
+
+/// The positioned-text options the `bold_from_weight` and
+/// `bold_weight_threshold` arguments ask for; a threshold outside the
+/// 100..=900 scale is a ValueError rather than a silent clamp.
+fn position_options(
+    bold_from_weight: bool,
+    bold_weight_threshold: u16,
+) -> PyResult<crate::PositionOptions> {
+    if !(100..=900).contains(&bold_weight_threshold) {
+        return Err(PyValueError::new_err(format!(
+            "bold_weight_threshold {bold_weight_threshold} is outside 100..900"
+        )));
+    }
+    Ok(crate::PositionOptions::new()
+        .bold_from_weight(bold_from_weight)
+        .bold_weight_threshold(bold_weight_threshold))
 }
 
 /// The coordinate frame of a page whose text was predominantly rotated.
@@ -985,29 +1036,32 @@ fn convert_page_rotations(
 /// frame of every page whose text was predominantly rotated. Items on such a
 /// page are expressed in the turned frame (their dominant runs read
 /// left-to-right there); pages absent from `page_rotations` are upright.
-/// `bold_from_weight` is the option of extract_text_with_positions.
+/// `bold_from_weight` and `bold_weight_threshold` are the options of
+/// extract_text_with_positions.
 #[pyfunction]
-#[pyo3(signature = (path, bold_from_weight=false))]
+#[pyo3(signature = (path, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
 fn extract_text_with_positions_and_rotations(
     path: &str,
     bold_from_weight: bool,
+    bold_weight_threshold: u16,
 ) -> PyResult<PyPositionedText> {
     let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
-    extract_text_with_positions_and_rotations_bytes(&data, bold_from_weight)
+    extract_text_with_positions_and_rotations_bytes(&data, bold_from_weight, bold_weight_threshold)
 }
 
 /// Extract text with positions from bytes, together with the coordinate frame
 /// of every page whose text was predominantly rotated.
 #[pyfunction]
-#[pyo3(signature = (data, bold_from_weight=false))]
+#[pyo3(signature = (data, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
 fn extract_text_with_positions_and_rotations_bytes(
     data: &[u8],
     bold_from_weight: bool,
+    bold_weight_threshold: u16,
 ) -> PyResult<PyPositionedText> {
     let (items, rotations) = crate::extract_text_with_positions_and_rotations_mem_with_options(
         data,
         None,
-        position_options(bold_from_weight),
+        position_options(bold_from_weight, bold_weight_threshold)?,
     )
     .map_err(to_py_err)?;
     Ok(PyPositionedText {
@@ -1020,17 +1074,18 @@ fn extract_text_with_positions_and_rotations_bytes(
 ///
 /// See extract_text_with_positions for the arguments and coordinate frame.
 #[pyfunction]
-#[pyo3(signature = (data, pages=None, bold_from_weight=false))]
+#[pyo3(signature = (data, pages=None, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
 fn extract_text_with_positions_bytes(
     data: &[u8],
     pages: Option<Vec<u32>>,
     bold_from_weight: bool,
+    bold_weight_threshold: u16,
 ) -> PyResult<Vec<PyTextItem>> {
     let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
     let items = crate::extract_text_with_positions_mem_with_options(
         data,
         page_set.as_ref(),
-        position_options(bold_from_weight),
+        position_options(bold_from_weight, bold_weight_threshold)?,
     )
     .map_err(to_py_err)?;
     Ok(convert_text_items(items))
@@ -1047,20 +1102,25 @@ fn extract_text_with_positions_bytes(
 ///         top-left origin (y_top = box_height - y).
 ///
 ///     bold_from_weight: The option of extract_text_with_positions: read bold
-///         from the font's weight class too and keep runs of different weight
-///         apart while a region's lines are assembled. False by default.
+///         from the font's weight class too, so a run the weight makes bold
+///         is its own item while a region's lines are assembled. False by
+///         default.
+///
+///     bold_weight_threshold: The weight class bold_from_weight reads bold
+///         from, 100..900; 600 by default.
 ///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
 #[pyfunction]
-#[pyo3(signature = (path, page_regions, bold_from_weight=false))]
+#[pyo3(signature = (path, page_regions, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
 fn extract_text_in_regions(
     path: &str,
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
     bold_from_weight: bool,
+    bold_weight_threshold: u16,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    extract_text_in_regions_bytes(&data, page_regions, bold_from_weight)
+    extract_text_in_regions_bytes(&data, page_regions, bold_from_weight, bold_weight_threshold)
 }
 
 /// Extract text within bounding-box regions from PDF bytes.
@@ -1075,20 +1135,23 @@ fn extract_text_in_regions(
 ///
 ///     bold_from_weight: See extract_text_in_regions.
 ///
+///     bold_weight_threshold: See extract_text_in_regions.
+///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
 #[pyfunction]
-#[pyo3(signature = (data, page_regions, bold_from_weight=false))]
+#[pyo3(signature = (data, page_regions, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
 fn extract_text_in_regions_bytes(
     data: &[u8],
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
     bold_from_weight: bool,
+    bold_weight_threshold: u16,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let regions = parse_page_regions(page_regions)?;
     let results = crate::extract_text_in_regions_mem_with_options(
         data,
         &regions,
-        position_options(bold_from_weight),
+        position_options(bold_from_weight, bold_weight_threshold)?,
     )
     .map_err(to_py_err)?;
     Ok(convert_region_results(results))

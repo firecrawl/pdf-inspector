@@ -78,12 +78,20 @@ fn format_items_json(items: &[TextItem]) -> String {
                 .font_weight
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string());
+            let bold_source = item
+                .bold_source
+                .map(|source| format!(r#""{}""#, source.as_str()))
+                .unwrap_or_else(|| "null".to_string());
+            let fixed_pitch = item
+                .fixed_pitch
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string());
             let link_url = match &item.item_type {
                 ItemType::Link(url) => format!(r#","url":"{}""#, json_escape(url)),
                 _ => String::new(),
             };
             format!(
-                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"rotation":{:.2},"advance_known":{},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"font_weight":{},"is_underline":{},"is_strikeout":{},"baseline_shift":{:.2},"item_type":"{}","mcid":{}{}}}"#,
+                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"rotation":{:.2},"advance_known":{},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"font_weight":{},"bold_source":{},"fixed_pitch":{},"is_underline":{},"is_strikeout":{},"baseline_shift":{:.2},"item_type":"{}","mcid":{}{}}}"#,
                 json_escape(&item.text),
                 item.page,
                 item.x,
@@ -98,6 +106,8 @@ fn format_items_json(items: &[TextItem]) -> String {
                 item.is_bold,
                 item.is_italic,
                 font_weight,
+                bold_source,
+                fixed_pitch,
                 item.is_underline,
                 item.is_strikeout,
                 item.baseline_shift,
@@ -272,7 +282,7 @@ mod tests {
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     use super::{format_ocr_json, process_pdf_with_ocr, OcrPdfOptions};
     use pdf_inspector::extractor::ItemType;
-    use pdf_inspector::TextItem;
+    use pdf_inspector::{BoldSource, TextItem};
 
     #[test]
     fn items_json_includes_position_and_underline_metadata() {
@@ -290,6 +300,8 @@ mod tests {
             is_bold: false,
             is_italic: true,
             font_weight: Some(300),
+            bold_source: Some(BoldSource::FontName),
+            fixed_pitch: Some(true),
             is_underline: true,
             is_strikeout: true,
             rotation: 90.0,
@@ -308,6 +320,8 @@ mod tests {
         assert!(json.contains(r#""advance_known":true"#));
         assert!(json.contains(r#""is_underline":true"#));
         assert!(json.contains(r#""font_weight":300"#));
+        assert!(json.contains(r#""bold_source":"font_name""#));
+        assert!(json.contains(r#""fixed_pitch":true"#));
         assert!(json.contains(r#""baseline_shift":3.50"#));
         assert!(json.contains(r#""item_type":"text""#));
         assert!(json.contains(r#""mcid":7"#));

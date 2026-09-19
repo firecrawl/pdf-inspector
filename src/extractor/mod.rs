@@ -46,9 +46,10 @@ pub use display_frame::PositionFrame;
 ///
 /// let options = PositionOptions::new()
 ///     .frame(PositionFrame::Display)
-///     .bold_from_weight(true);
+///     .bold_from_weight(true)
+///     .bold_weight_threshold(700);
 /// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PositionOptions {
     /// Coordinate frame items are reported in and region rects are read
@@ -56,17 +57,36 @@ pub struct PositionOptions {
     pub frame: PositionFrame,
     /// Read bold from the font's weight class as well. When set,
     /// `TextItem::is_bold` is also `true` for items whose
-    /// `TextItem::font_weight` is 600 (SemiBold) or more, and adjacent runs
-    /// whose `font_weight` differs stay separate items instead of merging,
-    /// so a heavier run inside a lighter paragraph keeps its own item. Off
-    /// by default: `is_bold` and item merging are then exactly what they
-    /// were before the option existed, and `font_weight` is reported
-    /// either way.
+    /// `TextItem::font_weight` is `bold_weight_threshold` (600, SemiBold,
+    /// by default) or more, `TextItem::bold_source` says so, and adjacent
+    /// runs are merged by that verdict: a run the weight makes bold stays
+    /// apart from its plain neighbours, so a heavier run inside a lighter
+    /// paragraph keeps its own item, while runs whose weights differ but
+    /// agree on bold — both below the threshold, or both at or above it —
+    /// merge as usual. Off by default: `is_bold` and item merging are then
+    /// exactly what they were before the option existed, and `font_weight`
+    /// is reported either way.
     pub bold_from_weight: bool,
+    /// The weight class from which `bold_from_weight` reads bold, on the
+    /// 100..=900 scale: 600 by default, so SemiBold and heavier faces are
+    /// bold. Read only when `bold_from_weight` is set; a value outside the
+    /// scale is clamped into it.
+    pub bold_weight_threshold: u16,
+}
+
+impl Default for PositionOptions {
+    fn default() -> Self {
+        Self {
+            frame: PositionFrame::default(),
+            bold_from_weight: false,
+            bold_weight_threshold: content_stream::DEFAULT_BOLD_WEIGHT_THRESHOLD,
+        }
+    }
 }
 
 impl PositionOptions {
-    /// The defaults: sheet frame, bold not read from the weight class.
+    /// The defaults: sheet frame, bold not read from the weight class, a
+    /// threshold of 600 for when it is.
     pub fn new() -> Self {
         Self::default()
     }
@@ -83,11 +103,19 @@ impl PositionOptions {
         self
     }
 
+    /// Set the weight class from which bold is read when `bold_from_weight`
+    /// is on: 600 by default, valid values 100..=900.
+    pub fn bold_weight_threshold(mut self, threshold: u16) -> Self {
+        self.bold_weight_threshold = threshold;
+        self
+    }
+
     /// The content-stream switches these options ask for.
     pub(crate) fn text_extraction(self, include_invisible: bool) -> TextExtractionOptions {
         TextExtractionOptions {
             include_invisible,
             bold_from_weight: self.bold_from_weight,
+            bold_weight_threshold: self.bold_weight_threshold.clamp(100, 900),
         }
     }
 }
@@ -203,7 +231,12 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let (extraction, _thresholds, _gid_pages, _page_rotations) =
-        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, false)?;
+        extract_positioned_text_from_doc_in_page_box(
+            &doc,
+            &font_cmaps,
+            page_filter,
+            PositionOptions::default(),
+        )?;
     Ok(extraction)
 }
 
@@ -307,12 +340,7 @@ pub fn extract_text_with_positions_and_rotations_mem_with_options(
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let ((mut items, _rects, _lines), _thresholds, _gid_pages, page_rotations) =
-        extract_positioned_text_from_doc_in_page_box(
-            &doc,
-            &font_cmaps,
-            page_filter,
-            options.bold_from_weight,
-        )?;
+        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, options)?;
     if options.frame == PositionFrame::Display {
         display_frame::document_items_to_display_frame(&doc, &mut items, &page_rotations);
     }
@@ -439,16 +467,13 @@ pub(crate) fn extract_positioned_text_from_doc_in_page_box(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-    bold_from_weight: bool,
+    options: PositionOptions,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
         page_filter,
-        TextExtractionOptions {
-            include_invisible: false,
-            bold_from_weight,
-        },
+        options.text_extraction(false),
         None,
         CoordinateFrame::VisiblePageBox,
     )
@@ -1373,7 +1398,7 @@ fn trimmed_suffix(next: &TextItem) -> &str {
 
 #[cfg(test)]
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
-    merge_text_items_with_clips(items, &[], false, false)
+    merge_text_items_with_clips(items, &[], false)
 }
 
 /// The separators a number is written with: point, comma, colon, slash
@@ -1456,16 +1481,16 @@ fn glyph_run_word_gap_floor(gaps: &[f32]) -> Option<f32> {
     }
 }
 
-/// `keep_weights_apart` refuses to merge runs whose `font_weight` differs
-/// (`PositionOptions::bold_from_weight`), the way bold and plain runs are
-/// already kept apart. `visual_rtl` says the page's right-to-left runs are
-/// stored in visual order (see `text_utils::fix_visual_order_rtl`): the
-/// lines holding them are then read back into logical order here, as they
-/// merge.
+/// Bold and plain runs are kept apart whatever said they were bold: with
+/// `PositionOptions::bold_from_weight` the weight class has already had its
+/// say in `is_bold` (see `content_stream::read_bold_from_weight`), so runs
+/// of different weight split only where the bold verdict changes.
+/// `visual_rtl` says the page's right-to-left runs are stored in visual
+/// order (see `text_utils::fix_visual_order_rtl`): the lines holding them
+/// are then read back into logical order here, as they merge.
 fn merge_text_items_with_clips(
     items: Vec<TextItem>,
     clips: &[Option<clip_boundaries::ClipRect>],
-    keep_weights_apart: bool,
     visual_rtl: bool,
 ) -> Vec<TextItem> {
     if items.is_empty() {
@@ -1804,8 +1829,7 @@ fn merge_text_items_with_clips(
                     }
                     _ => threshold,
                 };
-                let bold_boundary = next.is_bold != first.is_bold
-                    || (keep_weights_apart && next.font_weight != first.font_weight);
+                let bold_boundary = next.is_bold != first.is_bold;
                 let explicit_bold_space = bold_boundary
                     && (text.ends_with(char::is_whitespace)
                         || next_text.starts_with(char::is_whitespace));
@@ -1885,6 +1909,8 @@ fn merge_text_items_with_clips(
                 is_bold: first.is_bold,
                 is_italic: first.is_italic,
                 font_weight: first.font_weight,
+                bold_source: first.bold_source,
+                fixed_pitch: first.fixed_pitch,
                 is_underline: first.is_underline,
                 is_strikeout: first.is_strikeout,
                 rotation: first.rotation,
@@ -2081,6 +2107,8 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -2152,50 +2180,95 @@ mod tests {
     }
 
     #[test]
-    fn weight_boundary_splits_runs_only_when_asked() {
-        // A medium-weight label leading a light paragraph: by default the
-        // runs merge into one item as they always did; with the weights
-        // kept apart the label stays its own item, and the merge still
-        // decides the word space the way an unstyled merge would, so the
-        // later line assembler does not glue "Label:" onto "body".
+    fn merge_follows_the_bold_verdict_not_the_weight_class() {
+        use crate::types::BoldSource;
+
+        // A medium-weight label leading a light paragraph: neither is bold,
+        // so the runs merge into one item whatever their weight classes,
+        // and the item carries its first run's weight.
         let mut label = make_merge_item("Label:", 100.0, 36.0);
         label.font_weight = Some(500);
         let mut body = make_merge_item("body", 137.2, 24.0);
         body.font_weight = Some(300);
         let mut more = make_merge_item("text", 163.6, 24.0);
         more.font_weight = Some(300);
-        let items = vec![label, body, more];
-
-        let merged = merge_text_items_with_clips(items.clone(), &[], false, false);
+        let items = vec![label.clone(), body.clone(), more.clone()];
+        let merged = merge_text_items_with_clips(items, &[], false);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "Label: body text");
         assert_eq!(merged[0].font_weight, Some(500));
 
-        let apart = merge_text_items_with_clips(items, &[], true, false);
+        // Once the weight class has made the label bold (the option's pass,
+        // `read_bold_from_weight`), the label stays its own item, and the
+        // merge still decides the word space the way an unstyled merge
+        // would, so the later line assembler does not glue "Label:" onto
+        // "body".
+        let mut items = vec![label, body, more];
+        super::content_stream::read_bold_from_weight(&mut items, 500);
+        let apart = merge_text_items_with_clips(items, &[], false);
         assert_eq!(apart.len(), 2);
         assert_eq!(apart[0].text, "Label: ");
-        assert_eq!(apart[0].font_weight, Some(500));
+        assert!(apart[0].is_bold);
+        assert_eq!(apart[0].bold_source, Some(BoldSource::WeightClass));
         assert_eq!(apart[1].text, "body text");
-        assert_eq!(apart[1].font_weight, Some(300));
-        assert!(!apart[0].is_bold, "the merge reads weights, not bold");
+        assert!(!apart[1].is_bold);
+        assert_eq!(apart[1].bold_source, None);
 
-        // Runs that agree on their weight, or know none, merge as before.
-        let mut a = make_merge_item("same", 100.0, 24.0);
-        a.font_weight = Some(400);
-        let mut b = make_merge_item("weight", 125.2, 36.0);
-        b.font_weight = Some(400);
+        // Runs of different weight that agree on bold merge: a 700 face
+        // beside a 400 face whose name says bold are one item, which keeps
+        // the first run's weight class and bold source.
+        let mut heavy = make_merge_item("Heavy", 100.0, 30.0);
+        heavy.font_weight = Some(700);
+        let mut named = make_merge_item("named", 132.0, 30.0);
+        named.font_weight = Some(400);
+        named.is_bold = true;
+        named.bold_source = Some(BoldSource::FontName);
+        let mut items = vec![heavy, named];
+        super::content_stream::read_bold_from_weight(&mut items, 600);
+        let merged = merge_text_items_with_clips(items, &[], false);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Heavy named");
+        assert_eq!(merged[0].font_weight, Some(700));
+        assert_eq!(merged[0].bold_source, Some(BoldSource::WeightClass));
+
+        // Runs that know no weight merge as before.
         let unknown = vec![
             make_merge_item("no", 100.0, 12.0),
             make_merge_item("weight", 113.2, 36.0),
         ];
-        assert_eq!(
-            merge_text_items_with_clips(vec![a, b], &[], true, false).len(),
-            1
-        );
-        assert_eq!(
-            merge_text_items_with_clips(unknown, &[], true, false).len(),
-            1
-        );
+        assert_eq!(merge_text_items_with_clips(unknown, &[], false).len(), 1);
+    }
+
+    #[test]
+    fn read_bold_from_weight_credits_the_weight_class_after_name_and_flags() {
+        use crate::types::BoldSource;
+
+        let mut named = make_merge_item("named", 0.0, 10.0);
+        named.font_weight = Some(700);
+        named.is_bold = true;
+        named.bold_source = Some(BoldSource::FontName);
+        let mut painted = make_merge_item("painted", 20.0, 10.0);
+        painted.font_weight = Some(650);
+        painted.is_bold = true;
+        painted.bold_source = Some(BoldSource::Painted);
+        let mut light = make_merge_item("light", 40.0, 10.0);
+        light.font_weight = Some(300);
+        let unknown = make_merge_item("unknown", 60.0, 10.0);
+        let mut items = vec![named, painted, light, unknown];
+        super::content_stream::read_bold_from_weight(&mut items, 600);
+        // The name outranks the weight class; the weight class outranks the
+        // paint, since the face itself is heavy.
+        assert_eq!(items[0].bold_source, Some(BoldSource::FontName));
+        assert_eq!(items[1].bold_source, Some(BoldSource::WeightClass));
+        assert!(!items[2].is_bold && items[2].bold_source.is_none());
+        assert!(!items[3].is_bold && items[3].bold_source.is_none());
+
+        // The threshold is inclusive and honoured as given.
+        let mut items = vec![make_merge_item("x", 0.0, 10.0)];
+        items[0].font_weight = Some(500);
+        super::content_stream::read_bold_from_weight(&mut items, 500);
+        assert!(items[0].is_bold);
+        assert_eq!(items[0].bold_source, Some(BoldSource::WeightClass));
     }
 
     #[test]
@@ -2522,6 +2595,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -2544,6 +2619,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -2566,6 +2643,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3358,6 +3437,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3380,6 +3461,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3402,6 +3485,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3435,6 +3520,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3457,6 +3544,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3479,6 +3568,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3514,6 +3605,8 @@ mod tests {
                 is_bold: true,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3556,6 +3649,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3599,6 +3694,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3621,6 +3718,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3643,6 +3742,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3673,6 +3774,8 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -3818,6 +3921,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3840,6 +3945,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3872,6 +3979,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3894,6 +4003,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3942,6 +4053,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -3994,6 +4107,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -4046,6 +4161,8 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -4091,6 +4208,8 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,

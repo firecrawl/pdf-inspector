@@ -2,9 +2,9 @@
 
 use super::fonts::{font_style, FontStyle};
 use super::text_paint::{PaintResources, TextPaint};
-use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_italic_font};
+use crate::text_utils::{effective_font_size, expand_ligatures};
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, TextItem};
+use crate::types::{BoldSource, ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -360,7 +360,15 @@ fn extract_form_xobject_text_inner(
                 font_base_names.insert(resource_name.clone(), base_name);
             }
         }
-        let style = font_style(doc, font_dict, style_cache);
+        // The name (the resource tag for a font without one) and the width
+        // table are read once here rather than for every run.
+        let style = font_style(doc, font_dict, style_cache)
+            .with_name(
+                font_base_names
+                    .get(&resource_name)
+                    .map_or(resource_name.as_str(), String::as_str),
+            )
+            .with_measured_pitch(font_widths.get(&resource_name));
         if style != FontStyle::default() {
             font_styles.insert(resource_name.clone(), style);
         }
@@ -562,6 +570,8 @@ fn extract_form_xobject_text_inner(
                                     is_bold: false,
                                     is_italic: false,
                                     font_weight: None,
+                                    bold_source: None,
+                                    fixed_pitch: None,
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: 0.0,
@@ -841,7 +851,6 @@ fn extract_form_xobject_text_inner(
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
                             let style = font_styles.get(&current_font).copied().unwrap_or_default();
-                            let (desc_italic, desc_bold) = style.flags();
                             // Forward paint order (positive device-space
                             // advance) may be visual storage; a mirrored
                             // matrix already paints right-to-left. Rotated
@@ -856,6 +865,8 @@ fn extract_form_xobject_text_inner(
                                     *rtl_logical_ops += 1;
                                 }
                             }
+                            let painted_bold = paintable_fonts.contains(&current_font)
+                                && text_paint.adds_bold(&text, rendered_size, base_font, &ctm);
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x: geometry.x,
@@ -871,17 +882,13 @@ fn extract_form_xobject_text_inner(
                                 legacy_symbol_rewrite,
                                 font_size: rendered_size,
                                 page: page_num,
-                                is_bold: is_bold_font(base_font)
-                                    || desc_bold
-                                    || (paintable_fonts.contains(&current_font)
-                                        && text_paint.adds_bold(
-                                            &text,
-                                            rendered_size,
-                                            base_font,
-                                            &ctm,
-                                        )),
-                                is_italic: is_italic_font(base_font) || desc_italic,
+                                is_bold: style.bold || painted_bold,
+                                is_italic: style.italic,
                                 font_weight: style.weight,
+                                bold_source: style
+                                    .bold_source
+                                    .or(painted_bold.then_some(BoldSource::Painted)),
+                                fixed_pitch: style.fixed_pitch,
                                 is_underline: false,
                                 is_strikeout: false,
                                 rotation: geometry.rotation,
@@ -1212,7 +1219,6 @@ fn extract_form_xobject_text_inner(
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
                             let style = font_styles.get(&current_font).copied().unwrap_or_default();
-                            let (desc_italic, desc_bold) = style.flags();
                             let scale_x = (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])
                                 * horizontal_scale;
                             // Rotated matrices carry no horizontal evidence:
@@ -1279,6 +1285,8 @@ fn extract_form_xobject_text_inner(
                                 if let Some(pending) = pending_space.take() {
                                     pending.resolve(items, &geometry, text, rendered_size);
                                 }
+                                let painted_bold = paintable_fonts.contains(&current_font)
+                                    && text_paint.adds_bold(text, rendered_size, base_font, &ctm);
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
                                     x: geometry.x,
@@ -1294,17 +1302,13 @@ fn extract_form_xobject_text_inner(
                                     legacy_symbol_rewrite: *legacy_symbol_rewrite,
                                     font_size: rendered_size,
                                     page: page_num,
-                                    is_bold: is_bold_font(base_font)
-                                        || desc_bold
-                                        || (paintable_fonts.contains(&current_font)
-                                            && text_paint.adds_bold(
-                                                text,
-                                                rendered_size,
-                                                base_font,
-                                                &ctm,
-                                            )),
-                                    is_italic: is_italic_font(base_font) || desc_italic,
+                                    is_bold: style.bold || painted_bold,
+                                    is_italic: style.italic,
                                     font_weight: style.weight,
+                                    bold_source: style
+                                        .bold_source
+                                        .or(painted_bold.then_some(BoldSource::Painted)),
+                                    fixed_pitch: style.fixed_pitch,
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: geometry.rotation,

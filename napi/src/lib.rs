@@ -27,6 +27,25 @@ pub enum ItemType {
     FormField,
 }
 
+/// Where `TextItem.isBold` came from. When more than one of them says bold
+/// the first in this order is reported.
+#[napi(string_enum)]
+#[derive(Clone, Copy)]
+pub enum BoldSource {
+    /// A bold word or foundry style abbreviation in the font name ("Bold",
+    /// "-Bd", "Black", "Demi", "-Hv", "W7").
+    FontName,
+    /// The FontDescriptor's ForceBold flag, or the embedded font program's
+    /// own bold selection.
+    FontFlags,
+    /// The weight class: `fontWeight` at or above `boldWeightThreshold`
+    /// (only with `boldFromWeight`).
+    WeightClass,
+    /// Text filled and stroked to look heavier, in a face that is not bold
+    /// itself.
+    Painted,
+}
+
 /// Selects when OCR runs.
 #[napi(string_enum)]
 #[derive(Clone, Copy)]
@@ -143,7 +162,8 @@ pub struct TextItem {
     /// Bold from the font name, the FontDescriptor's ForceBold flag, the
     /// embedded program's bold selection, or text filled and stroked to
     /// look heavier. With `{ boldFromWeight: true }` (see [`FrameOptions`])
-    /// also `true` when `fontWeight` is 600 or more.
+    /// also `true` when `fontWeight` is `boldWeightThreshold` (600 by
+    /// default) or more. `boldSource` says which.
     pub is_bold: bool,
     pub is_italic: bool,
     /// The font's weight class on the 100..900 scale shared by CSS
@@ -155,6 +175,22 @@ pub struct TextItem {
     /// `isBold`, which is unchanged: a medium face reports `500` with
     /// `isBold: false`.
     pub font_weight: Option<u32>,
+    /// Where `isBold` came from — `"FontName"`, `"FontFlags"`,
+    /// `"WeightClass"` (with `boldFromWeight`) or `"Painted"`, the first of
+    /// them in that order when more than one says bold — so a verdict can be
+    /// weighed against `fontWeight`: a face whose name says Bold over a
+    /// weight class of 400 reports `"FontName"`. Omitted when `isBold` is
+    /// `false`, and for image, link and form-field items.
+    pub bold_source: Option<BoldSource>,
+    /// Whether the font is fixed-pitch (monospaced): `true` when the
+    /// FontDescriptor's FixedPitch flag or the embedded program's `post`
+    /// table says so, else measured from the font's width table — `true`
+    /// when a dozen or more of its glyphs share one advance, `false` when
+    /// two differ. Omitted when the font declares nothing and carries too
+    /// few glyphs to measure, and for image, link and form-field items.
+    /// Many producers write `/Flags 4` whatever the face, so the flag is
+    /// only ever read as a yes.
+    pub fixed_pitch: Option<bool>,
     /// Underline detected geometrically (drawn rule/thin rect under the
     /// baseline) — PDFs carry no underline font flag.
     pub is_underline: bool,
@@ -198,8 +234,8 @@ pub struct PageRegions {
 
 /// Options shared by `extractTextWithPositions`,
 /// `extractTextWithPositionsAndRotations`, `extractTextInRegions` and
-/// `extractTablesInRegions`: the coordinate frame, and whether bold is
-/// also read from the font's weight class.
+/// `extractTablesInRegions`: the coordinate frame, and whether (and from
+/// which weight class) bold is also read from the font's weight class.
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct FrameOptions {
@@ -215,12 +251,20 @@ pub struct FrameOptions {
     #[napi(ts_type = "\"sheet\" | \"display\"")]
     pub frame: Option<String>,
     /// Also read bold from the font's weight class. When `true`,
-    /// `TextItem.isBold` is also `true` for items whose `fontWeight` is 600
-    /// (SemiBold) or more, and adjacent runs whose `fontWeight` differs stay
-    /// separate items instead of merging, so a heavier run inside a lighter
-    /// paragraph keeps its own item. `false` by default: `isBold` and item
-    /// merging are then unchanged, and `fontWeight` is reported either way.
+    /// `TextItem.isBold` is also `true` for items whose `fontWeight` is
+    /// `boldWeightThreshold` (600, SemiBold, by default) or more, with
+    /// `boldSource: "WeightClass"`, and adjacent runs are merged by that
+    /// verdict: a run the weight makes bold stays apart from its plain
+    /// neighbours, so a heavier run inside a lighter paragraph keeps its own
+    /// item, while runs whose weights differ but agree on bold merge as
+    /// usual. `false` by default: `isBold` and item merging are then
+    /// unchanged, and `fontWeight` is reported either way.
     pub bold_from_weight: Option<bool>,
+    /// The weight class from which `boldFromWeight` reads bold, on the
+    /// 100..900 scale: 600 by default, so SemiBold and heavier faces are
+    /// bold. Read only when `boldFromWeight` is `true`; a value outside
+    /// 100..900 is an argument error.
+    pub bold_weight_threshold: Option<u32>,
 }
 
 /// Extracted text for a single region.
@@ -462,6 +506,15 @@ fn to_napi_ocr_result(result: pdf_inspector::vision::OcrPdfResult) -> OcrPdfResu
     }
 }
 
+fn convert_bold_source(source: pdf_inspector::BoldSource) -> BoldSource {
+    match source {
+        pdf_inspector::BoldSource::FontName => BoldSource::FontName,
+        pdf_inspector::BoldSource::FontFlags => BoldSource::FontFlags,
+        pdf_inspector::BoldSource::WeightClass => BoldSource::WeightClass,
+        pdf_inspector::BoldSource::Painted => BoldSource::Painted,
+    }
+}
+
 fn convert_item_type(t: &pdf_inspector::types::ItemType) -> (ItemType, Option<String>) {
     match t {
         pdf_inspector::types::ItemType::Text => (ItemType::Text, None),
@@ -492,9 +545,19 @@ fn position_options(
         }
     };
     let bold_from_weight = options.is_some_and(|options| options.bold_from_weight == Some(true));
-    Ok(pdf_inspector::PositionOptions::new()
+    let mut position = pdf_inspector::PositionOptions::new()
         .frame(frame)
-        .bold_from_weight(bold_from_weight))
+        .bold_from_weight(bold_from_weight);
+    if let Some(threshold) = options.and_then(|options| options.bold_weight_threshold) {
+        if !(100..=900).contains(&threshold) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("{ctx}: boldWeightThreshold {threshold} is outside 100..900"),
+            ));
+        }
+        position = position.bold_weight_threshold(threshold as u16);
+    }
+    Ok(position)
 }
 
 /// Run a closure, catching any Rust panic and converting it to a NAPI error.
@@ -639,6 +702,8 @@ fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
         is_bold: item.is_bold,
         is_italic: item.is_italic,
         font_weight: item.font_weight.map(u32::from),
+        bold_source: item.bold_source.map(convert_bold_source),
+        fixed_pitch: item.fixed_pitch,
         is_underline: item.is_underline,
         is_strikeout: item.is_strikeout,
         rotation: item.rotation as f64,

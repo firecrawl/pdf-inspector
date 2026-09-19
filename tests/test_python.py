@@ -300,6 +300,9 @@ class TestExtractTextWithPositions:
         assert isinstance(item.is_bold, bool)
         assert isinstance(item.is_italic, bool)
         assert item.font_weight is None or isinstance(item.font_weight, int)
+        assert item.bold_source in (None, "font_name", "font_flags", "weight_class", "painted")
+        assert item.is_bold == (item.bold_source is not None)
+        assert item.fixed_pitch is None or isinstance(item.fixed_pitch, bool)
         assert isinstance(item.item_type, str)
 
     def test_bold_from_weight_defaults_off(self):
@@ -333,21 +336,68 @@ class TestExtractTextWithPositions:
             ("Light Medium Heavy", False, 300),
             ("Same weight", False, 300),
         ]
-        # Option on: runs of different weight stay apart, the 700 face is
-        # bold, the 300 and 500 faces are not, same-weight runs still merge.
+        # Option on: the 700 face is bold on the weight class's account, the
+        # 300 and 500 faces are not and, agreeing, still merge; the bold run
+        # is its own item.
         weighted = pdf_inspector.extract_text_with_positions_bytes(
             data, bold_from_weight=True
         )
         assert styles(weighted) == [
-            ("Light ", False, 300),
-            ("Medium ", False, 500),
+            ("Light Medium ", False, 300),
             ("Heavy", True, 700),
             ("Same weight", False, 300),
         ]
+        assert next(i for i in weighted if i.text == "Heavy").bold_source == "weight_class"
+        assert next(i for i in weighted if i.text.startswith("Light")).bold_source is None
         positioned = pdf_inspector.extract_text_with_positions_and_rotations_bytes(
             data, bold_from_weight=True
         )
         assert styles(positioned.items) == styles(weighted)
+        # A threshold of 500 reads the medium face as bold too, and the runs
+        # merge by the verdict; 800 makes nothing bold; the threshold alone,
+        # without the option, changes nothing.
+        assert styles(
+            pdf_inspector.extract_text_with_positions_bytes(
+                data, bold_from_weight=True, bold_weight_threshold=500
+            )
+        ) == [
+            ("Light ", False, 300),
+            ("Medium Heavy", True, 500),
+            ("Same weight", False, 300),
+        ]
+        assert styles(
+            pdf_inspector.extract_text_with_positions_bytes(
+                data, bold_from_weight=True, bold_weight_threshold=800
+            )
+        ) == styles(plain)
+        assert styles(
+            pdf_inspector.extract_text_with_positions_bytes(data, bold_weight_threshold=100)
+        ) == styles(plain)
+        # Outside 100..900 the threshold is a ValueError, on every function
+        # that takes it and whether or not the option is on.
+        for bad in (0, 99, 901, 1000):
+            with pytest.raises(ValueError, match="bold_weight_threshold"):
+                pdf_inspector.extract_text_with_positions_bytes(
+                    data, bold_from_weight=True, bold_weight_threshold=bad
+                )
+        with pytest.raises(ValueError, match="bold_weight_threshold"):
+            pdf_inspector.extract_text_with_positions(str(path), bold_weight_threshold=50)
+        with pytest.raises(ValueError, match="bold_weight_threshold"):
+            pdf_inspector.extract_text_with_positions_and_rotations(
+                str(path), bold_weight_threshold=1000
+            )
+        with pytest.raises(ValueError, match="bold_weight_threshold"):
+            pdf_inspector.extract_text_with_positions_and_rotations_bytes(
+                data, bold_from_weight=True, bold_weight_threshold=901
+            )
+        with pytest.raises(ValueError, match="bold_weight_threshold"):
+            pdf_inspector.extract_text_in_regions(
+                str(path), [(0, [[0.0, 0.0, 612.0, 792.0]])], bold_weight_threshold=99
+            )
+        with pytest.raises(ValueError, match="bold_weight_threshold"):
+            pdf_inspector.extract_text_in_regions_bytes(
+                data, [(0, [[0.0, 0.0, 612.0, 792.0]])], bold_weight_threshold=0
+            )
         # The file-based functions read the same page the same way.
         assert styles(pdf_inspector.extract_text_with_positions(str(path))) == styles(plain)
         assert styles(
@@ -406,6 +456,100 @@ class TestExtractTextWithPositions:
 # ---------------------------------------------------------------------------
 # extract_structure_elements / extract_structure_elements_bytes
 # ---------------------------------------------------------------------------
+
+
+class TestFontMetadata:
+    """tests/fixtures/font_metadata_faces.pdf: embedded subsets whose names,
+    OS/2 tables, descriptor flags and width tables each make one point (see
+    scripts/make_font_metadata_fixtures.py)."""
+
+    @staticmethod
+    def face_style(items, text):
+        item = next(i for i in items if i.text == text)
+        return (item.is_bold, item.bold_source, item.font_weight, item.fixed_pitch)
+
+    @staticmethod
+    def mixed_line(items):
+        return [
+            (i.text, i.is_bold, i.bold_source, i.font_weight)
+            for i in items
+            if i.page == 1 and abs(i.y - 580) < 0.5
+        ]
+
+    def test_bold_source_names_where_the_default_verdict_came_from(self):
+        items = pdf_inspector.extract_text_with_positions(
+            fixture_path("font_metadata_faces.pdf")
+        )
+        # A Demi face is bold by its name, whatever its weight class; a Bold
+        # name over a regular program too, with font_weight showing the
+        # conflict; a heavy weight class alone is not bold by default.
+        assert self.face_style(items, "Demi name, weight class 600") == (
+            True, "font_name", 600, False,
+        )
+        assert self.face_style(items, "Bold name, weight class 400") == (
+            True, "font_name", 400, False,
+        )
+        assert self.face_style(items, "Plain name, weight class 600") == (
+            False, None, 600, False,
+        )
+        # The program's bold selection behind an opaque name, and text
+        # filled and stroked to look heavier.
+        assert self.face_style(
+            items, "Opaque name, bold selection, weight class 700"
+        ) == (True, "font_flags", 700, False)
+        assert self.face_style(items, "Painted heavier") == (True, "painted", 400, False)
+        # The runs that are not bold merge whatever their weight classes.
+        assert self.mixed_line(items) == [
+            ("Light regular heavier ", False, None, 200),
+            ("bold", True, "font_name", 400),
+        ]
+
+    def test_fixed_pitch_is_declared_or_measured(self):
+        items = pdf_inspector.extract_text_with_positions_bytes(
+            fixture_bytes("font_metadata_faces.pdf")
+        )
+        # Declared by the program's post table or the descriptor's flag,
+        # else measured from the advances of the glyphs in use; ten tabular
+        # digits are too few to say.
+        assert self.face_style(items, "Mono declared by the program")[3] is True
+        assert self.face_style(items, "Mono measured from advances")[3] is True
+        assert self.face_style(items, "Mo")[3] is True
+        assert self.face_style(items, "Proportional by advances")[3] is False
+        assert self.face_style(items, "0123456789")[3] is None
+
+    def test_bold_from_weight_credits_the_weight_class_and_takes_a_threshold(self):
+        path = fixture_path("font_metadata_faces.pdf")
+        plain = pdf_inspector.extract_text_with_positions(path)
+        weighted = pdf_inspector.extract_text_with_positions(path, bold_from_weight=True)
+        # The plain-named 600 face is bold on the weight class's account;
+        # the name and flags keep theirs.
+        assert self.face_style(weighted, "Plain name, weight class 600") == (
+            True, "weight_class", 600, False,
+        )
+        assert self.face_style(weighted, "Demi name, weight class 600")[1] == "font_name"
+        assert self.face_style(weighted, "Bold name, weight class 400")[1] == "font_name"
+        assert (
+            self.face_style(weighted, "Opaque name, bold selection, weight class 700")[1]
+            == "font_flags"
+        )
+        assert self.face_style(weighted, "Painted heavier")[1] == "painted"
+        # The mixed line merges by the verdict: the 600 run joins its
+        # bold-named neighbour, the two lighter runs stay one item.
+        assert self.mixed_line(weighted) == [
+            ("Light regular ", False, None, 200),
+            ("heavier bold", True, "weight_class", 600),
+        ]
+        # A threshold of 700 puts the plain 600 face back with the regular
+        # ones; the fixed-pitch verdict is the font's, not the option's.
+        at_700 = pdf_inspector.extract_text_with_positions(
+            path, bold_from_weight=True, bold_weight_threshold=700
+        )
+        assert self.face_style(at_700, "Plain name, weight class 600") == (
+            False, None, 600, False,
+        )
+        assert self.face_style(at_700, "Demi name, weight class 600")[1] == "font_name"
+        assert self.mixed_line(at_700) == self.mixed_line(plain)
+        assert [i.fixed_pitch for i in weighted] == [i.fixed_pitch for i in plain]
 
 
 class TestExtractStructureElements:

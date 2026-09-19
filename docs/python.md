@@ -137,12 +137,12 @@ headings = [
 | `classify_pdf_bytes(data)` | Lightweight classification from bytes |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_bytes(data)` | Plain text extraction from bytes |
-| `extract_text_with_positions(path, pages=None, bold_from_weight=False)` | Text with X/Y coords (visible-page-box frame) and font info; `bold_from_weight=True` also reads `is_bold` from a weight class of 600 or more and keeps runs of different weight apart |
-| `extract_text_with_positions_bytes(data, pages=None, bold_from_weight=False)` | Text with positions from bytes |
-| `extract_text_with_positions_and_rotations(path, bold_from_weight=False)` | Positioned text plus the frame of every page whose text was turned (`PositionedText`) |
-| `extract_text_with_positions_and_rotations_bytes(data, bold_from_weight=False)` | The same from bytes |
-| `extract_text_in_regions(path, page_regions, bold_from_weight=False)` | Extract text in bounding-box regions (top-left PDF points in the visible page box) |
-| `extract_text_in_regions_bytes(data, page_regions, bold_from_weight=False)` | Region extraction from bytes |
+| `extract_text_with_positions(path, pages=None, bold_from_weight=False, bold_weight_threshold=600)` | Text with X/Y coords (visible-page-box frame) and font info; `bold_from_weight=True` also reads `is_bold` from a weight class of `bold_weight_threshold` (100..900) or more and merges runs by that verdict |
+| `extract_text_with_positions_bytes(data, pages=None, bold_from_weight=False, bold_weight_threshold=600)` | Text with positions from bytes |
+| `extract_text_with_positions_and_rotations(path, bold_from_weight=False, bold_weight_threshold=600)` | Positioned text plus the frame of every page whose text was turned (`PositionedText`) |
+| `extract_text_with_positions_and_rotations_bytes(data, bold_from_weight=False, bold_weight_threshold=600)` | The same from bytes |
+| `extract_text_in_regions(path, page_regions, bold_from_weight=False, bold_weight_threshold=600)` | Extract text in bounding-box regions (top-left PDF points in the visible page box) |
+| `extract_text_in_regions_bytes(data, page_regions, bold_from_weight=False, bold_weight_threshold=600)` | Region extraction from bytes |
 | `extract_pages_markdown(path, pages=None)` | Per-page Markdown + layout metadata (all pages by default) |
 | `extract_pages_markdown_bytes(data, pages=None)` | Per-page Markdown from bytes |
 | `extract_structure_elements(path, pages=None)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
@@ -230,6 +230,8 @@ class TextItem:                      # extract_text_with_positions
     is_bold: bool
     is_italic: bool
     font_weight: int | None          # weight class 100..900 (400 regular, 700 bold) from the embedded font's OS/2 table, /FontWeight or a weight word in the name; None when unknown
+    bold_source: str | None          # where is_bold came from: "font_name", "font_flags", "weight_class" (with bold_from_weight) or "painted"; None when not bold
+    fixed_pitch: bool | None         # True when the FixedPitch flag or the embedded program says so, else measured from the width table; None when it cannot say
     is_underline: bool
     is_strikeout: bool
     baseline_shift: float            # super/subscript offset from the body baseline (0.0 = normal text; >0 raised, <0 lowered)
