@@ -556,12 +556,10 @@ pub(crate) fn extract_page_text_items_with_options(
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
-    // Get content, bounding decompression so a page-content bomb (a tiny
-    // Flate stream inflating to gigabytes) skips the page instead of
-    // exhausting memory — same degradation as the operator cap below. Real
-    // page content runs a few MB at most; the bound is deliberately far
-    // above that.
-    const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+    // Get content, bounding decompression so a page-content bomb skips the
+    // page instead of exhausting memory — same degradation as the operator
+    // cap below.
+    use crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
     let content_data = match doc.get_page_content_with_limit(page_id, MAX_PAGE_CONTENT_BYTES) {
         Ok(data) => data,
         Err(e) => {
