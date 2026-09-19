@@ -859,14 +859,19 @@ fn builtin_base_encoding(doc: &Document, font_dict: &lopdf::Dictionary) -> Optio
     }
 }
 
-/// The characters of the glyphs that `/Differences` names by index, read
-/// from the embedded font program: through its cmap and glyph names for a
-/// TrueType or OpenType program, through the glyph names of a bare CFF
-/// program. Codes whose glyph the program does not identify are left out.
+/// The characters of the glyphs that `/Differences` names by number, read
+/// from the embedded font program. A name the program itself gives one of
+/// its glyphs wins — subsetters name glyphs `g431` with no regard to their
+/// index — then a `cidNN` name is the CID a CID-keyed CFF program maps to
+/// a glyph, and otherwise the number is the glyph's index, which is what
+/// producers without names for their glyphs mean by it. The glyph's
+/// character comes from the program's cmap and glyph names (TrueType or
+/// OpenType) or from its glyph names (bare CFF). Codes whose glyph the
+/// program does not identify are left out.
 fn glyph_index_chars(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
-    names: &[(u8, u16)],
+    names: &[(u8, String)],
 ) -> FontEncodingMap {
     if names.is_empty() {
         return FontEncodingMap::new();
@@ -884,21 +889,48 @@ fn glyph_index_chars(
     let Some(data) = program() else {
         return FontEncodingMap::new();
     };
-    let by_glyph: HashMap<u16, char> = if let Ok(face) = ttf_parser::Face::parse(&data, 0) {
-        crate::tounicode::build_gid_to_unicode(&face).unwrap_or_default()
-    } else if let Some(cff) = ttf_parser::cff::Table::parse(&data) {
-        (0..cff.number_of_glyphs())
+    let face = ttf_parser::Face::parse(&data, 0).ok();
+    let bare_cff = if face.is_none() {
+        ttf_parser::cff::Table::parse(&data)
+    } else {
+        None
+    };
+    let by_glyph: HashMap<u16, char> = match (&face, &bare_cff) {
+        (Some(face), _) => crate::tounicode::build_gid_to_unicode(face).unwrap_or_default(),
+        (None, Some(cff)) => (0..cff.number_of_glyphs())
             .filter_map(|gid| {
                 let name = cff.glyph_name(ttf_parser::GlyphId(gid))?;
                 glyph_to_char(name).map(|ch| (gid, ch))
             })
-            .collect()
-    } else {
-        return FontEncodingMap::new();
+            .collect(),
+        (None, None) => return FontEncodingMap::new(),
+    };
+    let cff: Option<&ttf_parser::cff::Table> = face
+        .as_ref()
+        .and_then(|face| face.tables().cff.as_ref())
+        .or(bare_cff.as_ref());
+    let glyph_of = |name: &str| -> Option<u16> {
+        let named = match (&face, cff) {
+            (Some(face), _) => face.glyph_index_by_name(name),
+            (None, Some(cff)) => cff.glyph_index_by_name(name),
+            (None, None) => None,
+        };
+        if let Some(gid) = named {
+            return Some(gid.0);
+        }
+        match numbered_glyph_name(name)? {
+            NumberedGlyph::Index(index) => Some(index),
+            NumberedGlyph::Cid(cid) => cff
+                .and_then(|cff| {
+                    (0..cff.number_of_glyphs())
+                        .find(|&gid| cff.glyph_cid(ttf_parser::GlyphId(gid)) == Some(cid))
+                })
+                .or(Some(cid)),
+        }
     };
     names
         .iter()
-        .filter_map(|&(code, gid)| by_glyph.get(&gid).map(|&ch| (code, ch)))
+        .filter_map(|(code, name)| by_glyph.get(&glyph_of(name)?).map(|&ch| (*code, ch)))
         .collect()
 }
 
@@ -1260,23 +1292,37 @@ pub(crate) struct EncodingResult {
     /// program's glyph table and are decodable only through it or through
     /// the font's ToUnicode CMap.
     pub gid_codes: Vec<u8>,
-    /// The glyph index each of `gid_codes` names.
-    pub gid_names: Vec<(u8, u16)>,
+    /// The name each of `gid_codes` carries.
+    pub gid_names: Vec<(u8, String)>,
     /// The `/BaseEncoding`, when the dictionary names one.
     pub base: Option<BaseEncoding>,
 }
 
-/// The glyph index a `/Differences` name spells out, for the name forms
-/// producers write for glyphs they have no name for: `g53`, `gid53`,
-/// `glyph53`, `index53`, `G53`, `cid53`.
-fn glyph_index_from_name(name: &str) -> Option<u16> {
-    let digits = ["glyph", "index", "gid", "cid", "g", "G"]
+/// A `/Differences` name that spells a number instead of naming a glyph,
+/// the forms producers write for glyphs they have no name for: `g53`,
+/// `G53`, `glyph53`, `index53` and `gid53` give a glyph index; `cid53`
+/// gives a CID, which a CID-keyed program maps to its glyph. Whether such
+/// a name is read as a number at all is the font program's to say (see
+/// [`glyph_index_chars`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumberedGlyph {
+    Index(u16),
+    Cid(u16),
+}
+
+fn numbered_glyph_name(name: &str) -> Option<NumberedGlyph> {
+    let (prefix, digits) = ["glyph", "index", "gid", "cid", "g", "G"]
         .iter()
-        .find_map(|prefix| name.strip_prefix(prefix))?;
+        .find_map(|prefix| name.strip_prefix(prefix).map(|digits| (*prefix, digits)))?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    digits.parse().ok()
+    let number = digits.parse().ok()?;
+    Some(if prefix == "cid" {
+        NumberedGlyph::Cid(number)
+    } else {
+        NumberedGlyph::Index(number)
+    })
 }
 
 /// Parse an encoding dictionary: `/BaseEncoding`, `/Differences`, or both.
@@ -1289,7 +1335,10 @@ pub(crate) fn parse_encoding_dictionary(
     let base = enc_dict
         .get(b"BaseEncoding")
         .ok()
-        .and_then(|o| o.as_name().ok())
+        .and_then(|o| match o {
+            Object::Reference(id) => doc.get_object(*id).ok()?.as_name().ok(),
+            other => other.as_name().ok(),
+        })
         .and_then(BaseEncoding::from_name);
 
     let diff_array = match enc_dict.get(b"Differences") {
@@ -1309,7 +1358,7 @@ pub(crate) fn parse_encoding_dictionary(
     let mut current_code: u8 = 0;
     let mut ligature_count = 0u32;
     let mut gid_codes: Vec<u8> = Vec::new();
-    let mut gid_names: Vec<(u8, u16)> = Vec::new();
+    let mut gid_names: Vec<(u8, String)> = Vec::new();
 
     for item in diff_array {
         match item {
@@ -1329,13 +1378,11 @@ pub(crate) fn parse_encoding_dictionary(
                     );
                     ligature_count += 1;
                 }
-                // Glyph-index names (e.g. "gid00053", "g53") say nothing
-                // without the font program's glyph table.
-                if mapped_char.is_none() {
-                    if let Some(gid) = glyph_index_from_name(&glyph_name) {
-                        gid_codes.push(current_code);
-                        gid_names.push((current_code, gid));
-                    }
+                // Numbered names (e.g. "gid00053", "g53", "cid53") say
+                // nothing without the font program's glyph table.
+                if mapped_char.is_none() && numbered_glyph_name(&glyph_name).is_some() {
+                    gid_codes.push(current_code);
+                    gid_names.push((current_code, glyph_name.clone()));
                 }
                 if let Some(ch) = mapped_char {
                     encoding_map.insert(current_code, ch);
@@ -2385,6 +2432,16 @@ mod tests {
         let result = parse_encoding_dictionary(&doc, &both, None).unwrap();
         assert_eq!(result.base, Some(BaseEncoding::MacRoman));
         assert_eq!(result.map.get(&0x41), Some(&'\u{0391}'));
+        // The name written as an indirect object reads the same.
+        let mut doc = Document::new();
+        let name_id = doc.add_object(Object::Name(b"WinAnsiEncoding".to_vec()));
+        let indirect = lopdf::dictionary! {
+            "Type" => "Encoding",
+            "BaseEncoding" => Object::Reference(name_id)
+        };
+        let result =
+            parse_encoding_dictionary(&doc, &indirect, None).expect("base encoding parsed");
+        assert_eq!(result.base, Some(BaseEncoding::WinAnsi));
     }
 
     #[test]
@@ -2455,15 +2512,17 @@ mod tests {
     }
 
     #[test]
-    fn glyph_index_names_are_recognized() {
-        assert_eq!(glyph_index_from_name("g12"), Some(12));
-        assert_eq!(glyph_index_from_name("gid00053"), Some(53));
-        assert_eq!(glyph_index_from_name("glyph3"), Some(3));
-        assert_eq!(glyph_index_from_name("index7"), Some(7));
-        assert_eq!(glyph_index_from_name("G5"), Some(5));
-        assert_eq!(glyph_index_from_name("gamma"), None);
-        assert_eq!(glyph_index_from_name("g"), None);
-        assert_eq!(glyph_index_from_name("g12a"), None);
+    fn numbered_glyph_names_are_recognized() {
+        use NumberedGlyph::{Cid, Index};
+        assert_eq!(numbered_glyph_name("g12"), Some(Index(12)));
+        assert_eq!(numbered_glyph_name("gid00053"), Some(Index(53)));
+        assert_eq!(numbered_glyph_name("glyph3"), Some(Index(3)));
+        assert_eq!(numbered_glyph_name("index7"), Some(Index(7)));
+        assert_eq!(numbered_glyph_name("G5"), Some(Index(5)));
+        assert_eq!(numbered_glyph_name("cid00012"), Some(Cid(12)));
+        assert_eq!(numbered_glyph_name("gamma"), None);
+        assert_eq!(numbered_glyph_name("g"), None);
+        assert_eq!(numbered_glyph_name("g12a"), None);
     }
 
     #[test]

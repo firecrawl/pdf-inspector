@@ -471,7 +471,7 @@ fn base_encoding_without_differences(dir: &Path) {
     );
 }
 
-/// Two embedded TrueType programs without ToUnicode: a symbolic one whose
+/// Three embedded TrueType programs without ToUnicode: a symbolic one whose
 /// (3,0) cmap maps the codes to glyphs named `uniXXXX` and by Adobe Glyph
 /// List names, and one addressed by glyph index through `/Differences`
 /// names of the `gNN` form, resolved through its (3,1) cmap.
@@ -602,9 +602,57 @@ fn glyph_names_in_embedded_fonts(dir: &Path) {
             ]),
         })),
     );
-    let fonts = dictionary! { "F1" => f1, "F2" => f2 };
-    let content =
-        "BT /F1 14 Tf 72 700 Td (ABCD) Tj ET\nBT /F2 14 Tf 72 670 Td (ABC) Tj ET\n".to_string();
+    // F3: glyphs 1..=3 are δ ε ζ by the (3,1) cmap, and the program names
+    // them — glyph 3 is named "g1", the way a subsetter names glyphs with
+    // no regard to their index. The font's /Differences say "g1" and "g2":
+    // the program's own name wins for the first (ζ), the second reads as
+    // an index (ε).
+    let named_by_program = build_truetype(
+        &[
+            Glyph {
+                name: Some(".notdef"),
+                advance: 500,
+                outlined: false,
+                code: None,
+            },
+            Glyph {
+                name: Some("uni03B4"),
+                advance: 600,
+                outlined: true,
+                code: Some(0x03B4),
+            },
+            Glyph {
+                name: Some("uni03B5"),
+                advance: 600,
+                outlined: true,
+                code: Some(0x03B5),
+            },
+            Glyph {
+                name: Some("g1"),
+                advance: 600,
+                outlined: true,
+                code: Some(0x03B6),
+            },
+        ],
+        CmapKind::Unicode,
+    );
+    let f3 = embed(
+        named_by_program,
+        "SyntheticNamedByProgram",
+        32,
+        Some(Object::Dictionary(dictionary! {
+            "Type" => "Encoding",
+            "Differences" => Object::Array(vec![
+                Object::Integer(0x41),
+                Object::Name(b"g1".to_vec()),
+                Object::Name(b"g2".to_vec()),
+            ]),
+        })),
+    );
+    let fonts = dictionary! { "F1" => f1, "F2" => f2, "F3" => f3 };
+    let content = "BT /F1 14 Tf 72 700 Td (ABCD) Tj ET\nBT /F2 14 Tf 72 670 Td (ABC) Tj ET\n\
+                   BT /F3 14 Tf 72 640 Td (AB) Tj ET\n"
+        .to_string();
     finish_document(
         doc,
         &dir.join("glyph_names_in_embedded_fonts.pdf"),

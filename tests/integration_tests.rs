@@ -1832,14 +1832,16 @@ fn test_snapshot_base_encoding_without_differences() {
 /// through its glyph names (`uniXXXX` and Adobe Glyph List forms) rather
 /// than the private-use code points of its (3,0) cmap, and `/Differences`
 /// names of the `gNN`/`glyphNN` form resolve to the glyphs they index
-/// through the font's (3,1) cmap.
+/// through the font's (3,1) cmap — unless the program itself names a glyph
+/// that way, in which case that glyph is meant.
 #[test]
 fn embedded_fonts_decode_through_glyph_names_and_indexes() {
     assert_eq!(
         fixture_line_texts("glyph_names_in_embedded_fonts"),
         [
             "\u{03B1}\u{03B2}\u{03B3}\u{03C9}",
-            "\u{03B4}\u{03B5}\u{03B6}"
+            "\u{03B4}\u{03B5}\u{03B6}",
+            "\u{03B6}\u{03B5}"
         ]
     );
 }
