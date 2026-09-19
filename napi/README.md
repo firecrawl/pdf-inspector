@@ -139,7 +139,8 @@ told from one whose weight class says so. It is omitted when `isBold` is
 embedded program's `post` table says the font is monospaced, else measured
 from the font's width table: `true` when a dozen or more of its glyphs share
 one advance, `false` when two differ. It is omitted when the font declares
-nothing and carries too few glyphs to measure. Many producers write `/Flags 4`
+nothing and no two advances differ but fewer than a dozen share one. Many
+producers write `/Flags 4`
 whatever the face, so the flag is only ever read as a yes.
 
 `legacySymbolRewrite: true` marks items whose decoded text includes a character

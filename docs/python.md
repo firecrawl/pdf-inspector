@@ -231,7 +231,7 @@ class TextItem:                      # extract_text_with_positions
     is_italic: bool
     font_weight: int | None          # weight class 100..900 (400 regular, 700 bold) from the embedded font's OS/2 table, /FontWeight or a weight word in the name; None when unknown
     bold_source: str | None          # where is_bold came from: "font_name", "font_flags", "weight_class" (with bold_from_weight) or "painted"; None when not bold
-    fixed_pitch: bool | None         # True when the FixedPitch flag or the embedded program says so, else measured from the width table; None when it cannot say
+    fixed_pitch: bool | None         # True when the FixedPitch flag or the embedded program says so, else measured from the width table (a dozen glyphs sharing one advance: True; two differing: False; neither: None)
     is_underline: bool
     is_strikeout: bool
     baseline_shift: float            # super/subscript offset from the body baseline (0.0 = normal text; >0 raised, <0 lowered)

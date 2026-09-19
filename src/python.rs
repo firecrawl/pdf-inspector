@@ -414,8 +414,8 @@ pub struct PyTextItem {
     /// FixedPitch flag or the embedded program's post table says so, else
     /// measured from the width table (True when a dozen or more glyphs share
     /// one advance, False when two differ). None when the font declares
-    /// nothing and carries too few glyphs to measure, and for image, link
-    /// and form-field items.
+    /// nothing and no two advances differ but fewer than a dozen share one,
+    /// and for image, link and form-field items.
     #[pyo3(get)]
     pub fixed_pitch: Option<bool>,
     #[pyo3(get)]

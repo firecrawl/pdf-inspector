@@ -6243,14 +6243,25 @@ fn test_bold_from_weight_reads_bold_from_600_and_merges_by_the_verdict() {
     .unwrap();
     assert_eq!(text_and_style(&at_1000), text_and_style(&at_800));
 
-    // The threshold is read only with the option on.
-    let threshold_alone = extract_text_with_positions_mem_with_options(
-        &buf,
-        None,
-        PositionOptions::new().bold_weight_threshold(100),
-    )
-    .unwrap();
-    assert_eq!(text_and_style(&threshold_alone), text_and_style(&at_800));
+    // The threshold is read only with the option on, and clamped whether
+    // or not it is: without the option, any threshold is the default
+    // extraction.
+    for threshold in [100, 0, 1000] {
+        let threshold_alone = extract_text_with_positions_mem_with_options(
+            &buf,
+            None,
+            PositionOptions::new().bold_weight_threshold(threshold),
+        )
+        .unwrap();
+        assert_eq!(
+            text_and_style(&threshold_alone),
+            text_and_style(&at_800),
+            "threshold {threshold} without the option"
+        );
+        assert!(threshold_alone
+            .iter()
+            .all(|item| item.bold_source.is_none()));
+    }
 
     // The rotations variant and the page filter take the same options.
     let pages: HashSet<u32> = [1].into_iter().collect();

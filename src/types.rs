@@ -335,9 +335,10 @@ pub struct TextItem {
     /// FontDescriptor's FixedPitch flag or the embedded program's `post`
     /// table says so, else measured from the font's width table — `Some(true)`
     /// when at least a dozen of its glyphs share one advance, `Some(false)`
-    /// when two of them differ. `None` when the font declares nothing and
-    /// carries too few glyphs to measure, and for items that don't come from
-    /// a font. Many producers write `/Flags 4` whatever the face, so the
+    /// when two of them differ. `None` when the font declares nothing and no
+    /// two advances differ but fewer than a dozen share one, and for items
+    /// that don't come from a font. Many producers write `/Flags 4` whatever
+    /// the face, so the
     /// flag is only ever read as a yes. Runs are not kept apart by it: an
     /// item merged from several runs keeps its first run's value, like
     /// `font` and `font_weight`.

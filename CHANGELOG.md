@@ -31,9 +31,9 @@ Changes since 1.21.0.
   the FontDescriptor's FixedPitch flag or the embedded program's `post`
   table says so; else measured from the font's width table, `Some(true)`
   when a dozen or more of its glyphs share one advance and `Some(false)`
-  when two differ; `None` when the font declares nothing and carries too
-  few glyphs to measure (ten tabular digits are too few), and for image,
-  link and form-field items. Many producers write `/Flags 4` whatever the
+  when two differ; `None` when the font declares nothing and no two
+  advances differ but fewer than a dozen share one (ten tabular digits are
+  too few), and for image, link and form-field items. Many producers write `/Flags 4` whatever the
   face, so the flag is only ever read as a yes. Node `fixedPitch` (omitted
   when unknown), Python `fixed_pitch` and the items JSON field
   `fixed_pitch` report the same value.

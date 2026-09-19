@@ -186,8 +186,9 @@ pub struct TextItem {
     /// FontDescriptor's FixedPitch flag or the embedded program's `post`
     /// table says so, else measured from the font's width table — `true`
     /// when a dozen or more of its glyphs share one advance, `false` when
-    /// two differ. Omitted when the font declares nothing and carries too
-    /// few glyphs to measure, and for image, link and form-field items.
+    /// two differ. Omitted when the font declares nothing and no two
+    /// advances differ but fewer than a dozen share one, and for image,
+    /// link and form-field items.
     /// Many producers write `/Flags 4` whatever the face, so the flag is
     /// only ever read as a yes.
     pub fixed_pitch: Option<bool>,

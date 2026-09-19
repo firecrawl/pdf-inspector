@@ -146,8 +146,9 @@ class TextItem:
     FontDescriptor's FixedPitch flag or the embedded program's ``post`` table
     says so, else measured from the font's width table — ``True`` when a dozen
     or more of its glyphs share one advance, ``False`` when two differ.
-    ``None`` when the font declares nothing and carries too few glyphs to
-    measure, and for image, link and form-field items. Many producers write
+    ``None`` when the font declares nothing and no two advances differ but
+    fewer than a dozen share one, and for image, link and form-field items.
+    Many producers write
     ``/Flags 4`` whatever the face, so the flag is only ever read as a yes."""
     is_underline: bool
     is_strikeout: bool
