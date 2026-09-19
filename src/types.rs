@@ -17,6 +17,21 @@ pub(crate) type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
 /// Font encoding map: maps byte codes to Unicode characters
 pub(crate) type FontEncodingMap = HashMap<u8, char>;
 
+/// A single-byte encoding a simple font's codes read through where its
+/// `/Differences` say nothing: one of the predefined encodings named by an
+/// encoding dictionary's `/BaseEncoding`, or the built-in encoding of the
+/// standard Symbol and ZapfDingbats fonts, whose glyphs sit at positions
+/// that have nothing to do with the Latin encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaseEncoding {
+    Standard,
+    WinAnsi,
+    MacRoman,
+    MacExpert,
+    Symbol,
+    ZapfDingbats,
+}
+
 /// Explicit glyph encodings and narrowly verified repairs for a stale CMap.
 pub(crate) struct FontEncoding {
     pub(crate) differences: FontEncodingMap,
@@ -25,6 +40,9 @@ pub(crate) struct FontEncoding {
     /// painted, they leave a gap and nothing else, so they read as spaces
     /// whatever the font's ToUnicode claims (see `blank_glyph_codes`).
     pub(crate) blank_codes: std::collections::HashSet<u8>,
+    /// The encoding the codes read through where `differences` say nothing
+    /// (see [`BaseEncoding`]); `None` leaves them to the standard decode.
+    pub(crate) base: Option<BaseEncoding>,
 }
 
 /// All font encodings for a page

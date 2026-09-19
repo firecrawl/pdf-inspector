@@ -1133,33 +1133,12 @@ fn glyph_name_to_string(name: &str) -> Option<String> {
     None
 }
 
-/// Build a ToUnicodeCMap from a font's glyph names (post table).
-/// Uses Adobe Glyph List to map glyph names to Unicode.
-fn build_cmap_from_glyph_names(face: &ttf_parser::Face<'_>) -> Option<ToUnicodeCMap> {
-    let mut cmap = ToUnicodeCMap::new();
-
-    for gid in 0..face.number_of_glyphs() {
-        let gid = ttf_parser::GlyphId(gid);
-        if let Some(name) = face.glyph_name(gid) {
-            if let Some(ch) = glyph_to_char(name) {
-                cmap.char_map.insert(gid.0, ch.to_string());
-            }
-        }
-    }
-
-    if cmap.char_map.is_empty() {
-        return None;
-    }
-
-    debug!(
-        "TrueType post glyph names: {} GID→Unicode entries",
-        cmap.char_map.len()
-    );
-    cmap.code_byte_length = 2;
-    Some(cmap)
-}
-
-fn build_gid_to_unicode(face: &ttf_parser::Face<'_>) -> Option<HashMap<u16, char>> {
+/// Glyph index → character for an embedded TrueType or OpenType font:
+/// from its Unicode and Windows Symbol cmap subtables, then from its glyph
+/// names. A name from the Adobe Glyph List or a `uniXXXX`/`uXXXX` form says
+/// what a glyph is more reliably than the private-use code point a symbol
+/// cmap gives it, and names the glyphs the cmap leaves out.
+pub(crate) fn build_gid_to_unicode(face: &ttf_parser::Face<'_>) -> Option<HashMap<u16, char>> {
     let mut gid_to_unicode: HashMap<u16, char> = HashMap::new();
 
     // Iterate all Unicode codepoints that have a glyph mapping.
@@ -1181,16 +1160,28 @@ fn build_gid_to_unicode(face: &ttf_parser::Face<'_>) -> Option<HashMap<u16, char
         });
     }
 
-    if gid_to_unicode.is_empty() {
-        return build_cmap_from_glyph_names(face).map(|cmap| {
-            let mut map = HashMap::new();
-            for (gid, s) in cmap.char_map {
-                if let Some(ch) = s.chars().next() {
-                    map.insert(gid, ch);
-                }
+    let private_use = |c: char| matches!(c, '\u{E000}'..='\u{F8FF}');
+    for gid in 0..face.number_of_glyphs() {
+        let Some(name) = face.glyph_name(ttf_parser::GlyphId(gid)) else {
+            continue;
+        };
+        let Some(text) = glyph_name_to_string(name) else {
+            continue;
+        };
+        let mut chars = text.chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else {
+            continue;
+        };
+        match gid_to_unicode.get(&gid) {
+            Some(&mapped) if !private_use(mapped) => {}
+            _ => {
+                gid_to_unicode.insert(gid, ch);
             }
-            map
-        });
+        }
+    }
+
+    if gid_to_unicode.is_empty() {
+        return None;
     }
 
     Some(gid_to_unicode)

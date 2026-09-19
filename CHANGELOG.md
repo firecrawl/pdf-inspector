@@ -113,6 +113,19 @@ Changes since 1.21.0.
   full before the operator cap could apply; a ToUnicode CMap the detector
   reads is bounded the same way as the loader's own streams.
 
+- Simple fonts decode through their base encoding where their
+  `/Differences` say nothing: an encoding dictionary's `/BaseEncoding` now
+  applies whether or not the dictionary also carries `/Differences` (a
+  `/WinAnsiEncoding` or `/MacRomanEncoding` base without them decoded as
+  StandardEncoding, dropping or mistranslating accented letters), and the
+  standard Symbol and ZapfDingbats fonts read through their built-in
+  encodings instead of as the Latin letters at the same codes.
+- Embedded fonts without a ToUnicode CMap decode through their glyph names
+  where a symbol cmap only offers private-use code points, so a glyph named
+  `uni03B1` or `alpha` reads as α rather than as the byte it was shown
+  with; `/Differences` names that are glyph indexes (`g12`, `glyph12`,
+  `index12`) resolve through the embedded font program.
+
 ### Changed
 
 - With `bold_from_weight`, adjacent runs are merged by the bold verdict
