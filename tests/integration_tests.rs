@@ -6717,3 +6717,207 @@ fn test_tracked_titles_stay_whole_words() {
     }
     assert!(!markdown.contains("V A L L E Y"), "{markdown}");
 }
+
+// ============================================================================
+// Positioned boxes of text drawn with a reflected matrix
+// ============================================================================
+
+/// One string drawn in every reflected way a producer writes it, each on
+/// its own baseline, plus an upright reference line at 12 pt. The first
+/// group renders upright and left to right from x = 72 — a negative `Tf`
+/// size cancelled by a turned text matrix, by a negative horizontal scale
+/// under a y-flipping page matrix, or by the turning `/Matrix` of the form
+/// that draws it, a negative scale cancelled by a mirrored matrix, and a
+/// `TJ` array under the turned matrix. The second group renders reflected
+/// for real: turned around by the size alone or by the matrix alone,
+/// mirrored in x only, and flipped in y only.
+fn make_reflected_text_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    let page_content = "BT /F1 12 Tf 1 0 0 1 72 720 Tm (Reflected run) Tj ET\n\
+         BT /F1 -12 Tf -1 0 0 -1 72 690 Tm (Reflected run) Tj ET\n\
+         q 1 0 0 -1 0 792 cm BT /F1 -12 Tf -100 Tz 72 132 Td (Reflected run) Tj ET Q\n\
+         BT /F1 12 Tf -100 Tz -1 0 0 1 72 630 Tm (Reflected run) Tj 100 Tz ET\n\
+         q /Fm1 Do Q\n\
+         BT /F1 -12 Tf -1 0 0 -1 72 570 Tm [(Reflected) -278 (run)] TJ ET\n\
+         BT /F1 -12 Tf 1 0 0 1 300 540 Tm (Reflected run) Tj ET\n\
+         BT /F1 12 Tf -1 0 0 -1 300 510 Tm (Reflected run) Tj ET\n\
+         BT /F1 12 Tf -1 0 0 1 300 480 Tm (Mirrored) Tj ET\n\
+         BT /F1 12 Tf 1 0 0 -1 72 450 Tm (Flipped) Tj ET";
+    // The form's matrix turns the page around: its text is drawn at a
+    // negative size from the far corner and comes out upright at (72, 600).
+    let form_content = "BT /F1 -12 Tf 540 192 Td (Reflected run) Tj ET";
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Fm1 6 0 R >> >> /Contents 4 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            page_content.len(),
+            page_content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        &format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Matrix [-1 0 0 -1 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+            form_content.len(),
+            form_content
+        ),
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// The item showing `text` whose box bottom is `y`.
+fn item_with_box_bottom<'a>(items: &'a [TextItem], text: &str, y: f32) -> &'a TextItem {
+    items
+        .iter()
+        .find(|item| item.text == text && (item.y - y).abs() < 0.01)
+        .unwrap_or_else(|| {
+            let found: Vec<(&str, f32, f32)> = items
+                .iter()
+                .map(|item| (item.text.as_str(), item.x, item.y))
+                .collect();
+            panic!("no {text:?} with box bottom {y} in {found:?}")
+        })
+}
+
+/// A run whose reflections cancel — a negative `Tf` size against a turned
+/// text matrix, a negative `Tz` scale under a y-flipping `cm`, a turning
+/// form `/Matrix`, a `TJ` array — renders upright from its origin, and its
+/// box is the box of the same string drawn upright: it starts at the
+/// origin, not one text width to its left.
+#[test]
+fn test_reflections_that_cancel_report_the_upright_glyph_box() {
+    let buf = make_reflected_text_pdf();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let reference = item_with_box_bottom(&items, "Reflected run", 720.0);
+    assert!((reference.x - 72.0).abs() < 0.01 && reference.rotation == 0.0);
+    assert!(
+        reference.width > 60.0 && reference.advance_known,
+        "{reference:?}"
+    );
+
+    for baseline in [690.0, 660.0, 630.0, 600.0, 570.0] {
+        let item = item_with_box_bottom(&items, "Reflected run", baseline);
+        assert!((item.x - 72.0).abs() < 0.01, "{item:?}");
+        assert!((item.width - reference.width).abs() < 0.01, "{item:?}");
+        assert!((item.height - 12.0).abs() < 0.01, "{item:?}");
+        assert_eq!(item.rotation, 0.0, "{item:?}");
+        assert!((item.font_size - 12.0).abs() < 0.01, "{item:?}");
+    }
+
+    // The positions-and-rotations API reports the same items and no page turn.
+    let (items_with_rotations, page_rotations) =
+        extract_text_with_positions_and_rotations_mem(&buf).unwrap();
+    assert!(page_rotations.is_empty());
+    assert_eq!(
+        items_with_rotations
+            .iter()
+            .map(|item| (item.text.clone(), item.x, item.y, item.width))
+            .collect::<Vec<_>>(),
+        items
+            .iter()
+            .map(|item| (item.text.clone(), item.x, item.y, item.width))
+            .collect::<Vec<_>>()
+    );
+
+    // A region drawn over the upright lines finds them; the band left of the
+    // margin, where a box shifted by a text width would have landed, is empty.
+    let band = [60.0, 792.0 - 735.0, 320.0, 792.0 - 555.0];
+    let regions = extract_text_in_regions_mem(&buf, &[(0, vec![band])]).unwrap();
+    let text = &regions[0].regions[0].text;
+    assert_eq!(text.matches("Reflected run").count(), 6, "{text:?}");
+    let left_of_margin = [0.0, 792.0 - 735.0, 70.0, 792.0 - 555.0];
+    let regions = extract_text_in_regions_mem(&buf, &[(0, vec![left_of_margin])]).unwrap();
+    assert!(
+        regions[0].regions[0].text.trim().is_empty(),
+        "{:?}",
+        regions[0].regions[0].text
+    );
+}
+
+/// A run reflected for real reports the box its glyphs occupy: turned
+/// around, by the size or by the matrix, it reads towards -x from its
+/// origin with its glyphs hanging below the baseline (rotation 180);
+/// mirrored in x it stands upright but extends to the left of its origin;
+/// flipped in y it hangs below the baseline to the right of it.
+#[test]
+fn test_real_reflections_report_the_reflected_glyph_box() {
+    let buf = make_reflected_text_pdf();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let reference = item_with_box_bottom(&items, "Reflected run", 720.0);
+
+    for baseline in [540.0, 510.0] {
+        let turned = item_with_box_bottom(&items, "Reflected run", baseline - 12.0);
+        assert!(
+            (turned.x - (300.0 - reference.width)).abs() < 0.01,
+            "{turned:?}"
+        );
+        assert!((turned.width - reference.width).abs() < 0.01, "{turned:?}");
+        assert!((turned.height - 12.0).abs() < 0.01, "{turned:?}");
+        assert_eq!(turned.rotation, 180.0, "{turned:?}");
+        assert!((turned.font_size - 12.0).abs() < 0.01, "{turned:?}");
+    }
+
+    let mirrored = item_with_box_bottom(&items, "Mirrored", 480.0);
+    assert!(mirrored.x < 300.0 && (mirrored.x + mirrored.width - 300.0).abs() < 0.01);
+    assert_eq!(mirrored.rotation, 0.0, "{mirrored:?}");
+
+    let flipped = item_with_box_bottom(&items, "Flipped", 450.0 - 12.0);
+    assert!((flipped.x - 72.0).abs() < 0.01, "{flipped:?}");
+    assert!((flipped.height - 12.0).abs() < 0.01, "{flipped:?}");
+    assert_eq!(flipped.rotation, 180.0, "{flipped:?}");
+}
