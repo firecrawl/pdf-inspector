@@ -345,12 +345,16 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
         // transliterates it, so the advance must be α's) — then the
         // cp1252-style fallback used by the text decoder. The same order
         // the decoder follows, so the width of a code always matches the
-        // char extracted for it.
-        let ch = enc_map
-            .get(&(code as u8))
-            .copied()
-            .or_else(|| base.and_then(|base| base.char_for(code as u8)))
-            .unwrap_or_else(|| decode_single_byte_fallback_char(code as u8, true));
+        // char extracted for it — and, like the decoder, a control byte
+        // reads through the Differences alone.
+        let Some(ch) = enc_map.get(&(code as u8)).copied().or_else(|| {
+            (code >= 0x20).then(|| {
+                base.and_then(|base| base.char_for(code as u8))
+                    .unwrap_or_else(|| decode_single_byte_fallback_char(code as u8, true))
+            })
+        }) else {
+            continue;
+        };
         if let Some(w) = crate::extractor::base14::base14_char_width(&base_font, ch) {
             widths.insert(code, w);
         }
@@ -2575,6 +2579,21 @@ mod tests {
         assert_eq!(widths.widths.get(&0x61).copied(), alpha);
         let widths = base14_fallback_widths(&doc, &indirect).expect("Symbol widths");
         assert_eq!(widths.widths.get(&0x61), None);
+        // A control byte gets a width only through the Differences, the
+        // one way the decoder reads it.
+        let mut remapped = symbol.clone();
+        remapped.set(
+            "Encoding",
+            Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Encoding",
+                "Differences" => Object::Array(vec![Object::Integer(0x01), Object::Name(b"alpha".to_vec())])
+            }),
+        );
+        let widths = base14_fallback_widths(&doc, &remapped).expect("Symbol widths");
+        assert_eq!(widths.widths.get(&0x01).copied(), alpha);
+        assert_eq!(widths.widths.get(&0x09), None);
+        let widths = base14_fallback_widths(&doc, &symbol).expect("Symbol widths");
+        assert_eq!(widths.widths.get(&0x01), None);
     }
 
     #[test]
