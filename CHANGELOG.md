@@ -97,6 +97,17 @@ Changes since 1.21.0.
   comes out blank. The OCR pipeline renders the repaired document — a
   decrypted copy, in memory, when the document is encrypted — so such a
   page is no longer a blank render. A box with an area is left as written.
+- A page of vector drawings whose text is shown through a CID-keyed font
+  with a ToUnicode CMap was reported as vector-outlined text (`vector_text`)
+  and routed to OCR: the rule counted the distinct letters and digits among
+  the bytes of the string operands, and the two-byte codes of such a font
+  are glyph indices. On those pages the text is now judged decoded: it is
+  the page's text when it shows as many distinct letters and digits as the
+  byte count asks of a simple font and the drawing stays under a hundred
+  path operators per character, so a paragraph beside a chart or a title
+  over an illustration is a text page, while a page of paths with a
+  caption's worth of text, a title and address line over outlined body
+  text, or a CMap that maps every code alike, still goes to OCR.
 
 ### Changed
 

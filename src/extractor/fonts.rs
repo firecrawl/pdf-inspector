@@ -3440,4 +3440,4 @@ mod stale_cmap_tests;
 
 #[cfg(test)]
 #[path = "blank_glyph_tests.rs"]
-mod blank_glyph_tests;
+pub(crate) mod blank_glyph_tests;

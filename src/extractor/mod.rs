@@ -4,10 +4,10 @@
 
 mod base14;
 mod clip_boundaries;
-mod content_decode;
+pub(crate) mod content_decode;
 pub(crate) mod content_stream;
 pub(crate) mod display_frame;
-mod fonts;
+pub(crate) mod fonts;
 pub(crate) mod geometry;
 mod layout;
 mod links;

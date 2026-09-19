@@ -7095,3 +7095,264 @@ fn test_widen_degenerate_form_bboxes_mem_repairs_only_zero_area_boxes() {
         .unwrap()
         .is_none());
 }
+
+/// A minimal TrueType font program — `head`, `hhea`, `maxp`, `hmtx`, `loca`
+/// and `glyf`, no `cmap` — with `glyph_count` glyphs of one square outline
+/// after `.notdef`, as a CID-keyed subset embeds it.
+fn minimal_truetype_subset(glyph_count: usize) -> Vec<u8> {
+    let square: Vec<u8> = {
+        let mut g = Vec::new();
+        g.extend(1i16.to_be_bytes()); // one contour
+        for v in [0i16, 0, 500, 700] {
+            g.extend(v.to_be_bytes()); // bbox
+        }
+        g.extend(2u16.to_be_bytes()); // endPtsOfContours
+        g.extend(0u16.to_be_bytes()); // no instructions
+        g.extend([1u8, 1, 1]); // on-curve, i16 coordinates
+        for v in [0i16, 500, 0, 0, 0, 700] {
+            g.extend(v.to_be_bytes());
+        }
+        g
+    };
+    let num_glyphs = glyph_count as u16 + 1;
+    let mut glyf = Vec::new();
+    let mut loca = Vec::new();
+    for _ in 0..num_glyphs {
+        loca.extend((glyf.len() as u32).to_be_bytes());
+        glyf.extend(&square);
+    }
+    loca.extend((glyf.len() as u32).to_be_bytes());
+    let mut head = vec![0u8; 54];
+    head[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    head[12..16].copy_from_slice(&0x5F0F_3CF5u32.to_be_bytes());
+    head[18..20].copy_from_slice(&1000u16.to_be_bytes()); // unitsPerEm
+    head[50..52].copy_from_slice(&1i16.to_be_bytes()); // long loca offsets
+    let mut hhea = vec![0u8; 36];
+    hhea[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    hhea[34..36].copy_from_slice(&num_glyphs.to_be_bytes());
+    let mut maxp = vec![0u8; 32];
+    maxp[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    maxp[4..6].copy_from_slice(&num_glyphs.to_be_bytes());
+    let mut hmtx = Vec::new();
+    for _ in 0..num_glyphs {
+        hmtx.extend(600u16.to_be_bytes());
+        hmtx.extend(0i16.to_be_bytes());
+    }
+    let tables: [(&[u8; 4], Vec<u8>); 6] = [
+        (b"glyf", glyf),
+        (b"head", head),
+        (b"hhea", hhea),
+        (b"hmtx", hmtx),
+        (b"loca", loca),
+        (b"maxp", maxp),
+    ];
+    let mut font = Vec::new();
+    font.extend(0x0001_0000u32.to_be_bytes());
+    font.extend((tables.len() as u16).to_be_bytes());
+    font.extend([0u8; 6]); // searchRange, entrySelector, rangeShift
+    let mut offset = 12 + 16 * tables.len();
+    let mut body = Vec::new();
+    for (tag, data) in &tables {
+        font.extend(*tag);
+        font.extend(0u32.to_be_bytes()); // checksum, unchecked
+        font.extend((offset as u32).to_be_bytes());
+        font.extend((data.len() as u32).to_be_bytes());
+        let padded = data.len().div_ceil(4) * 4;
+        body.extend(data);
+        body.extend(std::iter::repeat_n(0u8, padded - data.len()));
+        offset += padded;
+    }
+    font.extend(body);
+    font
+}
+
+/// Three lines that together show forty distinct letters, digits and
+/// spaces.
+const CID_TEXT_LINES: [&str; 3] = [
+    "The quick brown fox jumps over the lazy dog",
+    "Pack my box with five dozen liquor jugs 0123456789",
+    "Sphinx of black quartz judge my vow",
+];
+
+/// A page of `paths` small filled triangles — the operator count of a
+/// vector illustration — and `lines` of text shown as two-byte codes
+/// through a Type0 font: an embedded TrueType subset under Identity-H whose
+/// glyph `i` is the `i`th distinct character of the lines, with a ToUnicode
+/// CMap saying so. None of the codes' bytes is an ASCII letter or digit.
+fn make_cid_text_over_vector_art_pdf(lines: &[&str], paths: usize) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut alphabet: Vec<char> = lines.iter().flat_map(|line| line.chars()).collect();
+    alphabet.sort_unstable();
+    alphabet.dedup();
+    let code_of = |c: char| alphabet.iter().position(|&a| a == c).unwrap() as u16 + 1;
+
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    cmap.push_str(&format!("{} beginbfchar\n", alphabet.len()));
+    for &c in &alphabet {
+        cmap.push_str(&format!("<{:04X}> <{:04X}>\n", code_of(c), c as u32));
+    }
+    cmap.push_str("endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+
+    let mut doc = Document::with_version("1.5");
+    let font_file = minimal_truetype_subset(alphabet.len());
+    let font_file_id = doc.add_object(Stream::new(
+        dictionary! { "Length1" => font_file.len() as i64 },
+        font_file,
+    ));
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "AAAAAA+Subset",
+        "Flags" => 4,
+        "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 700,
+        "Descent" => 0,
+        "CapHeight" => 700,
+        "StemV" => 80,
+        "FontFile2" => font_file_id,
+    });
+    let cid_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "AAAAAA+Subset",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "DW" => 600,
+        "CIDToGIDMap" => "Identity",
+    });
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "AAAAAA+Subset",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![cid_font_id.into()],
+        "ToUnicode" => cmap_id,
+    });
+
+    let mut content = String::new();
+    for i in 0..paths {
+        let (x, y) = (50 + (i % 40) * 12, 100 + (i / 40) * 20);
+        content.push_str(&format!(
+            "{x} {y} m {} {} l {} {y} l h f\n",
+            x + 5,
+            y + 8,
+            x + 10
+        ));
+    }
+    for (index, line) in lines.iter().enumerate() {
+        let hex: String = line
+            .chars()
+            .map(|c| format!("{:04X}", code_of(c)))
+            .collect();
+        content.push_str(&format!(
+            "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
+            700 - 20 * index
+        ));
+    }
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// A page of paths whose only text is one short caption in a simple font:
+/// vector-outlined text with a stray label, which goes to OCR.
+fn make_vector_art_with_caption_pdf() -> Vec<u8> {
+    let mut content = String::new();
+    for i in 0..400 {
+        let (x, y) = (50 + (i % 40) * 12, 100 + (i / 40) * 20);
+        content.push_str(&format!(
+            "{x} {y} m {} {} l {} {y} l h f\n",
+            x + 5,
+            y + 8,
+            x + 10
+        ));
+    }
+    content.push_str("BT /F1 10 Tf 72 40 Td (7) Tj ET");
+    make_text_pdf(&content, "0 0 612 792")
+}
+
+fn vector_text_reasons(result: &pdf_inspector::PdfProcessResult) -> Vec<u32> {
+    result
+        .ocr_reasons_by_page
+        .iter()
+        .filter(|page| page.reasons.iter().any(|reason| reason == "vector_text"))
+        .map(|page| page.page)
+        .collect()
+}
+
+/// Text shown through a CID-keyed font with a ToUnicode CMap next to a
+/// vector illustration is text: the page extracts, and is neither flagged
+/// as vector text nor routed to OCR. A page of paths with a caption's worth
+/// of text still is, whatever the font, and so is a page whose diverse text
+/// is a header over a mass of outlined text.
+#[test]
+fn test_cid_text_next_to_vector_art_is_extracted_not_routed_to_ocr() {
+    let buf = make_cid_text_over_vector_art_pdf(&CID_TEXT_LINES, 400);
+    let result = process_pdf_mem(&buf).unwrap();
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(
+        result.pages_needing_ocr.is_empty(),
+        "{:?}",
+        result.ocr_reasons_by_page
+    );
+    assert!(vector_text_reasons(&result).is_empty());
+    let markdown = result.markdown.unwrap();
+    assert!(markdown.contains("quick brown fox"), "{markdown}");
+    assert!(markdown.contains("liquor jugs 0123456789"), "{markdown}");
+
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr, "{:?}", pages.pages[0]);
+    assert!(pages.pages[0].markdown.contains("Sphinx of black quartz"));
+    assert!(pages.pages_needing_ocr.is_empty());
+
+    let caption = process_pdf_mem(&make_cid_text_over_vector_art_pdf(&["Fig 3"], 400)).unwrap();
+    assert_eq!(caption.pages_needing_ocr, vec![1]);
+    assert_eq!(vector_text_reasons(&caption), vec![1]);
+
+    // The same three lines are a header next to forty thousand path
+    // operators of outlined text.
+    let header =
+        process_pdf_mem(&make_cid_text_over_vector_art_pdf(&CID_TEXT_LINES, 8_000)).unwrap();
+    assert_eq!(header.pages_needing_ocr, vec![1]);
+    assert_eq!(vector_text_reasons(&header), vec![1]);
+
+    let soup = process_pdf_mem(&make_vector_art_with_caption_pdf()).unwrap();
+    assert_eq!(soup.pages_needing_ocr, vec![1]);
+    assert_eq!(vector_text_reasons(&soup), vec![1]);
+}

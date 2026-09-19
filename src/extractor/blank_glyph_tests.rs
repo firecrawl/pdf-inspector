@@ -17,7 +17,7 @@ enum Cmap {
 /// A minimal TrueType font: `head`, `hhea`, `maxp`, `hmtx`, `loca`, `glyf`
 /// and a (1,0) format 0 `cmap`. Glyph 0 is `.notdef`; each entry in
 /// `glyphs` is `(outlined, advance)`, mapped from `codes[i]`.
-fn synthetic_truetype(glyphs: &[(bool, u16)], codes: &[u8]) -> Vec<u8> {
+pub(crate) fn synthetic_truetype(glyphs: &[(bool, u16)], codes: &[u8]) -> Vec<u8> {
     synthetic_truetype_with(glyphs, codes, Cmap::MacRoman)
 }
 
