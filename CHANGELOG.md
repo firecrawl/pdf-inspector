@@ -7,8 +7,6 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## [Unreleased]
-
 ## [1.21.0] - 2026-09-18
 
 Changes since 1.20.0.
