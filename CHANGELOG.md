@@ -9,6 +9,10 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-09-18
+
+Changes since 1.20.0.
+
 ### Added
 
 - `TextItem::font_weight`: the font's weight class on the 100..=900 scale
@@ -18,6 +22,7 @@ version and date. Earlier releases are described in their
   "-Lt", "-Blk", "W6"); `None` when none of them says. Node `fontWeight`
   (omitted when unknown), Python `font_weight` and the `pdf2md --items-json`
   field `font_weight` report the same value. `is_bold` is unchanged.
+  ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
 - An opt-in `bold_from_weight` on the positioned-text and region APIs, next
   to the frame option: Rust `PositionOptions` with the `_with_options`
   variants (`extract_text_with_positions_mem_with_options`,
@@ -31,6 +36,7 @@ version and date. Earlier releases are described in their
   weight class differs stay separate items instead of merging, so a heavier
   run inside a lighter paragraph keeps its own item. Off by default, where
   `is_bold` and item merging are unchanged.
+  ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
 
 ### Fixed
 
@@ -47,11 +53,22 @@ version and date. Earlier releases are described in their
   the left-out runs are not an invisible layer that transcribes the page:
   `include_invisible` does not bring them back, and a page whose every run
   is clipped away reports no text, like an image-only page.
+  ([#539](https://github.com/firecrawl/pdf-inspector/pull/539))
+- A file whose `%PDF-` header is preceded by other bytes — an echoed
+  multipart envelope, a line of text — is no longer rejected as not a PDF,
+  on every API. The header is located within the first 1024 bytes, as
+  mupdf, pdfium and poppler do, and the file is read from there so its
+  cross-reference offsets stay exact; a canonical `%PDF-M.N` header line
+  outranks a version-like mention in the leading bytes. A byte order mark
+  or whitespace before the header was already tolerated, and a bare `%PDF`
+  without the dash is still not a header.
+  ([#538](https://github.com/firecrawl/pdf-inspector/pull/538))
 
 ### Changed
 
 - Rust `TextItem` literals must include the new `font_weight` field (`None`
   for items whose weight class is unknown).
+  ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
 
 ## [1.20.0] - 2026-09-14
 
