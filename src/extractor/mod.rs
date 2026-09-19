@@ -1376,14 +1376,36 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     merge_text_items_with_clips(items, &[], false, false)
 }
 
-/// A fragment of a number: digits of any script with the separators that
-/// join them, and nothing else.
+/// The separators a number is written with: point, comma, colon, slash
+/// and the Arabic decimal and thousands separators.
+fn is_number_separator(c: char) -> bool {
+    matches!(c, '.' | ',' | ':' | '/' | '\u{066B}' | '\u{066C}')
+}
+
+/// A fragment of a number: digits of any script, at least one, with the
+/// separators that join them and nothing else.
 fn numeric_fragment(text: &str) -> bool {
     let text = text.trim();
-    !text.is_empty()
+    text.chars().any(char::is_numeric)
         && text
             .chars()
-            .all(|c| c.is_numeric() || matches!(c, '.' | ',' | ':' | '/' | '\u{066B}' | '\u{066C}'))
+            .all(|c| c.is_numeric() || is_number_separator(c))
+}
+
+/// A fragment of nothing but number separators: a comma or point shown
+/// apart from its digits.
+fn separator_fragment(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && text.chars().all(is_number_separator)
+}
+
+/// Whether the junction of two neighbouring fragments lies inside a
+/// number: both are number material and at least one holds a digit — a
+/// separator shown apart from its digits belongs to the number beside it,
+/// while two lone separators make no number.
+fn inside_number(a: &str, b: &str) -> bool {
+    let material = |text: &str| numeric_fragment(text) || separator_fragment(text);
+    material(a) && material(b) && (numeric_fragment(a) || numeric_fragment(b))
 }
 
 /// Word-gap floor for a line of right-to-left text shown one glyph per
@@ -1559,9 +1581,7 @@ fn merge_text_items_with_clips(
                 let gaps: Vec<f32> = group
                     .windows(2)
                     .zip(&display_gaps)
-                    .filter(|(pair, _)| {
-                        !(numeric_fragment(&pair[0].text) && numeric_fragment(&pair[1].text))
-                    })
+                    .filter(|(pair, _)| !inside_number(&pair[0].text, &pair[1].text))
                     .map(|(pair, gap)| gap / pair[0].font_size.min(pair[1].font_size).max(1.0))
                     .collect();
                 glyph_floor = glyph_run_word_gap_floor(&gaps);
@@ -1908,6 +1928,16 @@ mod tests {
         assert!(!numeric_fragment("a1"));
         assert!(!numeric_fragment("\u{05D0}"));
         assert!(!numeric_fragment("-"));
+        // A separator on its own is no number, but belongs to the number
+        // beside it.
+        assert!(!numeric_fragment(","));
+        assert!(separator_fragment(","));
+        assert!(inside_number("21", ","));
+        assert!(inside_number(",", "847"));
+        assert!(inside_number("1", "2"));
+        assert!(!inside_number(".", "."));
+        assert!(!inside_number("a", "1"));
+        assert!(!inside_number("1", "\u{05D0}"));
     }
 
     #[test]
