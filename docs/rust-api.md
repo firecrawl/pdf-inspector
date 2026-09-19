@@ -559,7 +559,7 @@ read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 | `extract_pages_markdown_mem(bytes, pages)` | Per-page Markdown from bytes |
 | `extract_structure_elements(path, pages)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_mem(bytes, pages)` | Structure-tree elements from bytes |
-| `widen_degenerate_form_bboxes_mem(bytes)` | The document re-serialized with the zero-area `/BBox` of its Form XObjects widened, for rendering elsewhere; `None` when no form needs it |
+| `widen_degenerate_form_bboxes_mem(bytes)` | The document re-serialized with the zero-area `/BBox` of its Form XObjects widened, for rendering elsewhere; `None` when no form needs it and for an encrypted document, whose protection a plain serialization would drop |
 
 Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
 

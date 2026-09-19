@@ -35,20 +35,19 @@ fn unclipped_bbox() -> Object {
 }
 
 /// Whether `object` is a Form XObject whose `/BBox` — direct or an indirect
-/// reference — is four finite numbers spanning no width or no height.
-/// Anything else, a box with an area, a malformed box or a stream of
-/// another kind, is not repaired.
+/// reference, its numbers direct or indirect — is four finite numbers
+/// spanning no width or no height. Anything else, a box with an area, a
+/// malformed box or a stream of another kind, is not repaired.
 fn is_form_with_degenerate_bbox(doc: &Document, object: &Object) -> bool {
     let Object::Stream(stream) = object else {
         return false;
     };
-    if stream
-        .dict
-        .get(b"Subtype")
-        .ok()
-        .and_then(|subtype| subtype.as_name().ok())
-        != Some(b"Form")
-    {
+    let subtype = match stream.dict.get(b"Subtype") {
+        Ok(Object::Reference(id)) => doc.get_object(*id).ok(),
+        Ok(direct) => Some(direct),
+        Err(_) => None,
+    };
+    if subtype.and_then(|subtype| subtype.as_name().ok()) != Some(b"Form") {
         return false;
     }
     let Ok(bbox) = stream.dict.get(b"BBox") else {
@@ -69,6 +68,13 @@ fn is_form_with_degenerate_bbox(doc: &Document, object: &Object) -> bool {
     }
     let mut edges = [0f32; 4];
     for (edge, value) in edges.iter_mut().zip(values) {
+        let value = match value {
+            Object::Reference(id) => match doc.get_object(*id) {
+                Ok(resolved) => resolved,
+                Err(_) => return false,
+            },
+            direct => direct,
+        };
         match value.as_float() {
             Ok(number) if number.is_finite() => *edge = number,
             _ => return false,
@@ -102,12 +108,17 @@ pub(crate) fn widen_degenerate_form_bboxes(doc: &mut Document) -> usize {
 }
 
 /// The document written back out for a renderer, once its forms have been
-/// repaired: a plain serialization of the loaded objects. `None` for an
-/// encrypted document, whose objects would have to be re-encrypted, and
-/// when writing fails.
+/// repaired: a plain serialization of the loaded objects. A document that
+/// was loaded encrypted is written decrypted — the loader decrypted its
+/// objects, and a renderer given these bytes reads them without the
+/// password — so they are for a renderer in the same process, not for
+/// keeping. `None` when the document is encrypted but its objects were not
+/// decrypted, and when writing fails.
 pub(crate) fn serialize_for_rendering(doc: &mut Document) -> Option<Vec<u8>> {
     if doc.is_encrypted() || doc.trailer.get(b"Encrypt").is_ok() {
-        return None;
+        doc.encryption_state.as_ref()?;
+        doc.trailer.remove(b"Encrypt");
+        doc.encryption_state = None;
     }
     let mut bytes = Vec::new();
     doc.save_to(&mut bytes).ok()?;
@@ -197,8 +208,30 @@ mod tests {
         let mut doc = Document::new();
         let bbox_id = doc.add_object(numbers(&[0, 0, 0, 0]));
         let form = form_with_bbox(&mut doc, Object::Reference(bbox_id));
-        assert_eq!(widen_degenerate_form_bboxes(&mut doc), 1);
-        assert_eq!(bbox_of(&doc, form)[2], UNCLIPPED_FORM_BBOX_EXTENT as f32);
+        // Indirect numbers inside the box, and an indirect `/Subtype`.
+        let zero_id = doc.add_object(Object::Integer(0));
+        let indirect_numbers = form_with_bbox(
+            &mut doc,
+            Object::Array(vec![
+                Object::Reference(zero_id),
+                Object::Integer(0),
+                Object::Reference(zero_id),
+                Object::Integer(792),
+            ]),
+        );
+        let subtype_id = doc.add_object(Object::Name(b"Form".to_vec()));
+        let indirect_subtype = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Reference(subtype_id),
+                "BBox" => numbers(&[0, 0, 0, 0]),
+            },
+            Vec::new(),
+        )));
+        assert_eq!(widen_degenerate_form_bboxes(&mut doc), 3);
+        for id in [form, indirect_numbers, indirect_subtype] {
+            assert_eq!(bbox_of(&doc, id)[2], UNCLIPPED_FORM_BBOX_EXTENT as f32);
+        }
         // The shared array itself is left as it was.
         assert_eq!(
             doc.get_object(bbox_id).unwrap().as_array().unwrap().len(),
@@ -273,12 +306,108 @@ mod tests {
         assert!(stream.dict.get(b"BBox").is_err());
     }
 
+    /// A one-page document drawn through a form with a zero-area box.
+    fn page_through_degenerate_form() -> Document {
+        let mut doc = Document::with_version("1.5");
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let form_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => numbers(&[0, 0, 0, 0]),
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => Object::Reference(font_id) } },
+            },
+            b"BT /F1 24 Tf 72 700 Td (Drawn through the form) Tj ET".to_vec(),
+        )));
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"q 0 0 612 792 re W n /Fm1 Do Q".to_vec(),
+        )));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => numbers(&[0, 0, 612, 792]),
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                "XObject" => dictionary! { "Fm1" => Object::Reference(form_id) },
+            },
+            "Contents" => Object::Reference(content_id),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let file_id = Object::string_literal(vec![0x42u8; 16]);
+        doc.trailer
+            .set("ID", Object::Array(vec![file_id.clone(), file_id]));
+        doc
+    }
+
+    fn widened_form_count(doc: &Document) -> usize {
+        doc.objects
+            .values()
+            .filter(|object| match object {
+                Object::Stream(stream) => stream
+                    .dict
+                    .get(b"BBox")
+                    .ok()
+                    .and_then(|bbox| bbox.as_array().ok())
+                    .is_some_and(|values| {
+                        values[2].as_float().ok() == Some(UNCLIPPED_FORM_BBOX_EXTENT as f32)
+                    }),
+                _ => false,
+            })
+            .count()
+    }
+
+    /// A document loaded encrypted is written decrypted for the renderer;
+    /// one whose objects were never decrypted is not written at all.
     #[test]
-    fn serialization_skips_encrypted_documents() {
-        let mut doc = Document::new();
-        form_with_bbox(&mut doc, numbers(&[0, 0, 0, 0]));
-        assert!(serialize_for_rendering(&mut doc).is_some());
-        doc.trailer.set("Encrypt", Object::Reference((7, 0)));
-        assert!(serialize_for_rendering(&mut doc).is_none());
+    fn serialization_writes_a_decrypted_document_and_skips_an_undecrypted_one() {
+        let mut doc = page_through_degenerate_form();
+        let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+            document: &doc,
+            owner_password: "owner",
+            user_password: "",
+            key_length: 128,
+            permissions: lopdf::Permissions::all(),
+        })
+        .unwrap();
+        doc.encrypt(&state).unwrap();
+        let mut encrypted = Vec::new();
+        doc.save_to(&mut encrypted).unwrap();
+
+        let (mut loaded, _, repairs) =
+            crate::load_document_from_mem_with_repairs(&encrypted, None).unwrap();
+        assert_eq!(repairs.widened_form_bboxes, 1);
+        assert!(loaded.encryption_state.is_some());
+        let plain = serialize_for_rendering(&mut loaded).expect("a decrypted copy");
+        let reloaded = Document::load_mem(&plain).unwrap();
+        assert!(!reloaded.is_encrypted());
+        assert_eq!(widened_form_count(&reloaded), 1);
+        assert_eq!(
+            crate::extract_text_with_positions_mem(&plain).unwrap()[0].text,
+            "Drawn through the form"
+        );
+
+        let mut undecrypted = page_through_degenerate_form();
+        undecrypted
+            .trailer
+            .set("Encrypt", Object::Reference((7, 0)));
+        assert!(serialize_for_rendering(&mut undecrypted).is_none());
     }
 }

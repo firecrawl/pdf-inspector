@@ -54,9 +54,11 @@ Changes since 1.21.0.
   point about the metadata above, exercised by the Rust, Node and Python
   tests.
   ([#547](https://github.com/firecrawl/pdf-inspector/pull/547))
-- `widen_degenerate_form_bboxes_mem(bytes)`: the document re-serialized with
-  the zero-area `/BBox` of its Form XObjects widened, or `None` when no form
-  needs it, for callers that render the document with their own renderer.
+- Rust `widen_degenerate_form_bboxes_mem(bytes)`: the document re-serialized
+  with the zero-area `/BBox` of its Form XObjects widened, or `None` when no
+  form needs it and for an encrypted document, for callers that render the
+  document with their own renderer. The Python, Node and WebAssembly
+  bindings do not expose it.
 
 ### Fixed
 
@@ -92,8 +94,9 @@ Changes since 1.21.0.
   holding a page's content, a re-save pattern — is repaired when the
   document is loaded: the box is widened to one that clips nothing, since
   taken as written it hides the form entirely and a page drawn through it
-  comes out blank. The OCR pipeline renders the repaired document, so such
-  a page is no longer a blank render. A box with an area is left as written.
+  comes out blank. The OCR pipeline renders the repaired document — a
+  decrypted copy, in memory, when the document is encrypted — so such a
+  page is no longer a blank render. A box with an area is left as written.
 
 ### Changed
 

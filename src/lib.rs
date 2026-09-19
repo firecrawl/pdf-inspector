@@ -423,15 +423,21 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
 /// the original bytes does not, and can be given these instead.
 ///
 /// Returns `Ok(None)` when no form needs the repair, and for an encrypted
-/// document, whose objects would have to be re-encrypted to be written.
-/// Otherwise `Ok(Some(bytes))` holds a plain serialization of the loaded
-/// document: object streams and incremental updates are flattened, and
-/// the file's own repairs — a recovered cross-reference table, a missing
-/// end-of-file marker — are folded in.
+/// document — whether or not it opens without a password — since a plain
+/// serialization would drop its protection; the OCR pipeline renders a
+/// decrypted copy of such a document in memory instead. Otherwise
+/// `Ok(Some(bytes))` holds a plain serialization of the loaded document:
+/// object streams and incremental updates are flattened, and the file's
+/// own repairs — a recovered cross-reference table, a missing end-of-file
+/// marker — are folded in.
 pub fn widen_degenerate_form_bboxes_mem(buffer: &[u8]) -> Result<Option<Vec<u8>>, PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (mut doc, _page_count, repairs) = load_document_from_mem_with_repairs(buffer, None)?;
-    if repairs.widened_form_bboxes == 0 {
+    let (mut doc, _page_count, repairs) = match load_document_from_mem_with_repairs(buffer, None) {
+        Ok(loaded) => loaded,
+        Err(PdfError::Encrypted) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if repairs.widened_form_bboxes == 0 || doc.is_encrypted() || doc.encryption_state.is_some() {
         return Ok(None);
     }
     Ok(form_bbox_repair::serialize_for_rendering(&mut doc))
@@ -514,16 +520,21 @@ pub fn extract_pages_markdown_mem(
         &MarkdownOptions::default(),
         false,
         false,
+        false,
     )
     .map(|extraction| extraction.result)
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+/// `render_repairs` asks for the repaired document to be written back out
+/// for the renderer when the loader changed it (see `form_bbox_repair`);
+/// a caller that will not render leaves it off.
 pub(crate) fn extract_pages_markdown_mem_for_ocr(
     buffer: &[u8],
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
+    render_repairs: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
     extract_pages_markdown_mem_impl(
         buffer,
@@ -532,6 +543,7 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
         markdown_options,
         markdown_options.strip_headers_footers,
         true,
+        render_repairs,
     )
 }
 
@@ -542,13 +554,14 @@ fn extract_pages_markdown_mem_impl(
     markdown_options: &MarkdownOptions,
     strip_repeated_headers_footers: bool,
     preserve_ocr_candidates: bool,
+    render_repairs: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count, repairs) = load_document_from_mem_with_repairs(buffer, password)?;
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut doc = doc;
     #[cfg(not(all(feature = "ocr", not(target_arch = "wasm32"))))]
-    let _ = repairs;
+    let _ = (repairs, render_repairs);
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
@@ -773,7 +786,7 @@ fn extract_pages_markdown_mem_impl(
         // A renderer reading the original bytes would clip a repaired form
         // to nothing, so the OCR pipeline renders the repaired document.
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
-        render_bytes: if preserve_ocr_candidates && repairs.widened_form_bboxes > 0 {
+        render_bytes: if render_repairs && repairs.widened_form_bboxes > 0 {
             form_bbox_repair::serialize_for_rendering(&mut doc)
         } else {
             None
