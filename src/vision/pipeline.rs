@@ -255,8 +255,9 @@ pub fn process_pdf_with_ocr_mem(
     let page_count = extraction.page_count;
     let extracted_supplemental_regions = extraction.supplemental_ocr_regions;
     // The renderer reads the document as the loader repaired it, when it
-    // had to (a decrypted copy, when the document is encrypted); otherwise
-    // the caller's bytes as they are.
+    // had to (a decrypted copy, when the document is encrypted; a copy that
+    // cannot be written fails the extraction above); otherwise the caller's
+    // bytes as they are.
     let render_bytes = extraction.render_bytes;
     let render_buffer: &[u8] = render_bytes.as_deref().unwrap_or(buffer);
     if let Some(invalid) = selected_pages

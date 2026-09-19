@@ -66,7 +66,9 @@ fn is_form_with_degenerate_bbox(doc: &Document, object: &Object) -> bool {
     if values.len() != 4 {
         return false;
     }
-    let mut edges = [0f32; 4];
+    // Compared as `f64`, which holds every PDF integer exactly: an `f32`
+    // would round large neighbouring coordinates together.
+    let mut edges = [0f64; 4];
     for (edge, value) in edges.iter_mut().zip(values) {
         let value = match value {
             Object::Reference(id) => match doc.get_object(*id) {
@@ -75,8 +77,9 @@ fn is_form_with_degenerate_bbox(doc: &Document, object: &Object) -> bool {
             },
             direct => direct,
         };
-        match value.as_float() {
-            Ok(number) if number.is_finite() => *edge = number,
+        match value {
+            Object::Integer(number) => *edge = *number as f64,
+            Object::Real(number) if number.is_finite() => *edge = f64::from(*number),
             _ => return false,
         }
     }
@@ -185,6 +188,8 @@ mod tests {
             ]),
         );
         let negative = form_with_bbox(&mut doc, numbers(&[612, 792, 0, 0]));
+        // One unit wide at coordinates an `f32` would round together.
+        let far = form_with_bbox(&mut doc, numbers(&[16_777_216, 0, 16_777_217, 792]));
 
         assert_eq!(widen_degenerate_form_bboxes(&mut doc), 3);
         let wide = [
@@ -199,6 +204,13 @@ mod tests {
         assert_eq!(bbox_of(&doc, page_box), [0.0, 0.0, 612.0, 792.0]);
         assert_eq!(bbox_of(&doc, thin), [0.0, 0.0, 0.01, 792.0]);
         assert_eq!(bbox_of(&doc, negative), [612.0, 792.0, 0.0, 0.0]);
+        let Ok(Object::Stream(stream)) = doc.get_object(far) else {
+            unreachable!()
+        };
+        assert_eq!(
+            stream.dict.get(b"BBox").unwrap().as_array().unwrap()[2],
+            Object::Integer(16_777_217)
+        );
         // A second pass finds nothing left to repair.
         assert_eq!(widen_degenerate_form_bboxes(&mut doc), 0);
     }

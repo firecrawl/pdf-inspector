@@ -414,6 +414,7 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
 
 /// The PDF written back out with the zero-area `/BBox` of its Form XObjects
 /// widened, for callers that render the document with their own renderer.
+/// Rust only: the Python, Node.js and WebAssembly bindings do not expose it.
 ///
 /// Some producers write `/BBox [0 0 0 0]` on a form XObject that holds a
 /// page's content. Taken as the clip it declares, the box hides the form
@@ -787,7 +788,16 @@ fn extract_pages_markdown_mem_impl(
         // to nothing, so the OCR pipeline renders the repaired document.
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         render_bytes: if render_repairs && repairs.widened_form_bboxes > 0 {
-            form_bbox_repair::serialize_for_rendering(&mut doc)
+            // A renderer given the original bytes would clip the repaired
+            // forms to nothing again, so a copy that cannot be written is
+            // an error, not a fallback.
+            Some(
+                form_bbox_repair::serialize_for_rendering(&mut doc).ok_or_else(|| {
+                    PdfError::Parse(
+                        "the repaired document could not be written for rendering".to_string(),
+                    )
+                })?,
+            )
         } else {
             None
         },
