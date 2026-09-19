@@ -922,8 +922,9 @@ const VECTOR_TEXT_MIN_ALPHANUMERICS: usize = 30;
 /// stays well under.
 const VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER: u32 = 100;
 
-/// Form XObject nesting followed when counting a page's decoded text.
-const DECODED_TEXT_MAX_FORM_DEPTH: usize = 8;
+/// Form XObjects read at most when counting a page's decoded text; a page
+/// invoking more is counted as far as that.
+const DECODED_TEXT_MAX_FORMS: usize = 1_000;
 
 /// What a page's text amounts to once every string is decoded.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1015,74 +1016,38 @@ fn lookup_font<'a>(
     }
 }
 
-/// The content of every Form XObject reachable from `resources`, each with
-/// the resource dictionaries its font names resolve against: its own first,
-/// then `inherited`.
-fn collect_form_streams<'a>(
-    doc: &'a Document,
-    resources: &'a lopdf::Dictionary,
-    inherited: &[&'a lopdf::Dictionary],
-    visited: &mut HashSet<ObjectId>,
-    depth: usize,
-    out: &mut Vec<(Vec<u8>, Vec<&'a lopdf::Dictionary>)>,
-) {
-    if depth > DECODED_TEXT_MAX_FORM_DEPTH {
-        return;
-    }
-    let xobjects = match resources.get(b"XObject") {
-        Ok(Object::Dictionary(dict)) => Some(dict),
-        Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
-        _ => None,
+/// The Form XObject `name` resolves to in `resources`, when it is one.
+fn lookup_form(doc: &Document, resources: &lopdf::Dictionary, name: &[u8]) -> Option<ObjectId> {
+    let xobjects = match resources.get(b"XObject").ok()? {
+        Object::Dictionary(dict) => dict,
+        Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+        _ => return None,
     };
-    let Some(xobjects) = xobjects else {
-        return;
+    let id = xobjects.get(name).ok()?.as_reference().ok()?;
+    let Ok(Object::Stream(stream)) = doc.get_object(id) else {
+        return None;
     };
-    for (_, value) in xobjects.iter() {
-        let Ok(id) = value.as_reference() else {
-            continue;
-        };
-        if !visited.insert(id) {
-            continue;
-        }
-        let Ok(Object::Stream(stream)) = doc.get_object(id) else {
-            continue;
-        };
-        if stream
-            .dict
-            .get(b"Subtype")
-            .ok()
-            .and_then(|s| s.as_name().ok())
-            != Some(b"Form")
-        {
-            continue;
-        }
-        let own = match stream.dict.get(b"Resources") {
-            Ok(Object::Dictionary(dict)) => Some(dict),
-            Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
-            _ => None,
-        };
-        let mut scope: Vec<&'a lopdf::Dictionary> = own.into_iter().collect();
-        scope.extend_from_slice(inherited);
-        let content = stream
-            .decompressed_content()
-            .unwrap_or_else(|_| stream.content.clone());
-        if let Some(own) = own {
-            collect_form_streams(doc, own, &scope, visited, depth + 1, out);
-        }
-        out.push((content, scope));
-    }
+    (stream
+        .dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|s| s.as_name().ok())
+        == Some(b"Form"))
+    .then_some(id)
 }
 
 /// The alphanumeric characters in the text the page shows — in its own
-/// content and in its Form XObjects — once every string is decoded through
-/// the font in force: its ToUnicode CMap where it has one, the bytes
-/// themselves for a simple font without one, nothing for a font that cannot
-/// be decoded here. Font names resolve against the stream's own resources,
-/// then the page's and its ancestors', and the font in force follows
-/// `q`/`Q` like the rest of the graphics state. Replacement characters,
-/// which a CMap that does not cover its codes produces, are not
-/// alphanumeric and do not count. A stream over the page operation bound
-/// is skipped, as the extractor skips it.
+/// content and in the Form XObjects its content invokes with `Do`, each
+/// once — once every string is decoded through the font in force: its
+/// ToUnicode CMap where it has one, the bytes themselves for a simple font
+/// without one, nothing for a font that cannot be decoded here. Font names
+/// resolve against the stream's own resources, then those of the stream
+/// that invoked it, up to the page's and its ancestors'; the font in force
+/// follows `q`/`Q` like the rest of the graphics state. A form is
+/// decompressed when its turn comes, so one form's content is held at a
+/// time. Replacement characters, which a CMap that does not cover its
+/// codes produces, are not alphanumeric and do not count. A stream over
+/// the page operation bound is skipped, as the extractor skips it.
 fn decoded_text_counts(doc: &Document, page_id: ObjectId) -> DecodedTextCounts {
     use std::rc::Rc;
 
@@ -1106,18 +1071,40 @@ fn decoded_text_counts(doc: &Document, page_id: ObjectId) -> DecodedTextCounts {
             page_content.push(b'\n');
         }
     }
-    let mut streams = vec![(page_content, page_scope.clone())];
-    let mut visited = HashSet::new();
-    for resources in &page_scope {
-        collect_form_streams(doc, resources, &page_scope, &mut visited, 0, &mut streams);
-    }
 
+    enum Pending {
+        Page(Vec<u8>),
+        Form(ObjectId),
+    }
+    let mut pending: Vec<(Pending, Vec<&lopdf::Dictionary>)> =
+        vec![(Pending::Page(page_content), page_scope)];
+    let mut visited: HashSet<ObjectId> = HashSet::new();
     let mut counts = DecodedTextCounts::default();
     let mut seen: HashSet<char> = HashSet::new();
     let mut decoders: HashMap<ObjectId, Option<Rc<FontDecoder>>> = HashMap::new();
-    for (content, scope) in &streams {
+    while let Some((source, invoking_scope)) = pending.pop() {
+        let (content, scope) = match source {
+            Pending::Page(content) => (content, invoking_scope),
+            Pending::Form(id) => {
+                let Ok(Object::Stream(stream)) = doc.get_object(id) else {
+                    continue;
+                };
+                let mut scope: Vec<&lopdf::Dictionary> = match stream.dict.get(b"Resources") {
+                    Ok(Object::Dictionary(dict)) => vec![dict],
+                    Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok().into_iter().collect(),
+                    _ => Vec::new(),
+                };
+                scope.extend(invoking_scope);
+                (
+                    stream
+                        .decompressed_content()
+                        .unwrap_or_else(|_| stream.content.clone()),
+                    scope,
+                )
+            }
+        };
         let Ok(Some(ops)) = crate::extractor::content_decode::decode_content_bounded(
-            content,
+            &content,
             crate::extractor::content_decode::MAX_PAGE_OPERATIONS,
         ) else {
             continue;
@@ -1128,6 +1115,25 @@ fn decoded_text_counts(doc: &Document, page_id: ObjectId) -> DecodedTextCounts {
             match op.operator.as_str() {
                 "q" => saved.push(current.clone()),
                 "Q" => current = saved.pop().flatten(),
+                "Do" => {
+                    if visited.len() >= DECODED_TEXT_MAX_FORMS {
+                        continue;
+                    }
+                    let form = op
+                        .operands
+                        .first()
+                        .and_then(|name| name.as_name().ok())
+                        .and_then(|name| {
+                            scope
+                                .iter()
+                                .find_map(|resources| lookup_form(doc, resources, name))
+                        });
+                    if let Some(id) = form {
+                        if visited.insert(id) {
+                            pending.push((Pending::Form(id), scope.clone()));
+                        }
+                    }
+                }
                 "Tf" => {
                     current = op
                         .operands
@@ -4251,6 +4257,9 @@ mod tests {
         /// In the page content after a `q`/`Q` that selected another font
         /// inside the saved state.
         AfterRestoredFont,
+        /// In a Form XObject the page's resources name but its content
+        /// never invokes.
+        UninvokedForm,
     }
 
     /// A page of `paths` filled triangles and `lines` of text shown as
@@ -4381,7 +4390,9 @@ mod tests {
                 ),
                 dictionary! { "Font" => fonts },
             ),
-            CidTextLayout::Form | CidTextLayout::FormInheritingFonts => {
+            CidTextLayout::Form
+            | CidTextLayout::FormInheritingFonts
+            | CidTextLayout::UninvokedForm => {
                 let mut form_dict = dictionary! {
                     "Type" => "XObject",
                     "Subtype" => "Form",
@@ -4392,8 +4403,13 @@ mod tests {
                 }
                 let form_id =
                     doc.add_object(Object::Stream(Stream::new(form_dict, text.into_bytes())));
+                let invoke = if layout == CidTextLayout::UninvokedForm {
+                    ""
+                } else {
+                    "q /Fm1 Do Q\n"
+                };
                 (
-                    format!("{art}q /Fm1 Do Q\n"),
+                    format!("{art}{invoke}"),
                     dictionary! {
                         "Font" => fonts,
                         "XObject" => dictionary! { "Fm1" => Object::Reference(form_id) },
@@ -4454,7 +4470,8 @@ mod tests {
     /// A caption's worth of decoded text does not make a page of paths a
     /// text page; neither does a CMap that maps every code alike, nor a
     /// title and address line, diverse as they are, over forty thousand
-    /// path operators of outlined body text.
+    /// path operators of outlined body text, nor text in a form the page
+    /// never invokes.
     #[test]
     fn little_or_undecodable_cid_text_over_vector_art_stays_vector_text() {
         let (doc, page_id) = cid_text_over_vector_art(&["Fig 3"], 400, false, CidTextLayout::Page);
@@ -4471,6 +4488,11 @@ mod tests {
             analysis.path_op_count
         );
         assert!(analysis.has_vector_text);
+        // Text in a form the page never invokes is not shown.
+        let (doc, page_id) =
+            cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, CidTextLayout::UninvokedForm);
+        assert!(analyze_page_content(&doc, page_id).has_vector_text);
+        assert!(!decoded_text_counts(&doc, page_id).through_cid_cmap);
     }
 
     /// The decoded counts cover the whole text: the three lines show
