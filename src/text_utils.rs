@@ -589,20 +589,6 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
     result
 }
 
-/// Digits that fall inside the Arabic codepoint block but are stored and
-/// displayed left-to-right like ASCII digits (bidi class AN): Arabic-Indic
-/// (٠-٩) and Extended Arabic-Indic (۰-۹). They carry no evidence of a run's
-/// storage order.
-fn is_arabic_indic_digit(c: char) -> bool {
-    matches!(c, '\u{0660}'..='\u{0669}' | '\u{06F0}'..='\u{06F9}')
-}
-
-/// Arabic decimal (U+066B) and thousands (U+066C) separators — punctuation
-/// that lives inside numbers.
-fn is_arabic_numeric_separator(c: char) -> bool {
-    matches!(c, '\u{066B}' | '\u{066C}')
-}
-
 /// A decoded show-op string qualifies as evidence in the geometric
 /// visual-order vote when it holds an RTL letter. The vote reads the way
 /// show operators walk along the line, which tells the two conventions
@@ -610,12 +596,16 @@ fn is_arabic_numeric_separator(c: char) -> bool {
 /// either storage order, and a string that is mostly Latin — a whole line
 /// shown by one operator, with a right-to-left word inside it — is the
 /// typical output of a visual-order producer, whose pages would otherwise
-/// cast no vote at all and keep that word reversed. Arabic-Indic digits
-/// don't count: they're stored left-to-right in both conventions, so a
-/// bare number carries no evidence.
+/// cast no vote at all and keep that word reversed. Only letters count:
+/// Arabic-Indic digits are stored left-to-right in both conventions, so a
+/// bare number carries no evidence, and a string of nothing but combining
+/// marks (vowel points shown apart from their letters) or a byte order
+/// mark — code points the RTL blocks also hold — says nothing about the
+/// order letters are stored in.
 pub(crate) fn is_visual_rtl_candidate(text: &str) -> bool {
-    text.chars()
-        .any(|c| is_rtl_char(c) && !is_arabic_indic_digit(c) && !is_arabic_numeric_separator(c))
+    text.chars().any(|c| {
+        c.is_alphabetic() && !unicode_normalization::char::is_combining_mark(c) && is_rtl_char(c)
+    })
 }
 
 /// Whether a page's right-to-left runs are stored in visual (screen
@@ -1483,6 +1473,11 @@ mod tests {
         assert!(!is_visual_rtl_candidate("\u{0662}\u{0664}"));
         assert!(!is_visual_rtl_candidate("\u{0663}\u{0665},\u{0660}"));
         assert!(!is_visual_rtl_candidate("\u{0663}\u{0665}\u{066B}\u{0660}"));
+        // Nor do marks shown apart from their letters, or a byte order mark
+        // (both lie in the RTL blocks)
+        assert!(!is_visual_rtl_candidate("\u{05B4}"));
+        assert!(!is_visual_rtl_candidate("\u{064E}\u{0651}"));
+        assert!(!is_visual_rtl_candidate("\u{FEFF}"));
     }
 
     #[test]

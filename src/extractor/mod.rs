@@ -1376,6 +1376,16 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     merge_text_items_with_clips(items, &[], false, false)
 }
 
+/// A fragment of a number: digits of any script with the separators that
+/// join them, and nothing else.
+fn numeric_fragment(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_numeric() || matches!(c, '.' | ',' | ':' | '/' | '\u{066B}' | '\u{066C}'))
+}
+
 /// Word-gap floor for a line of right-to-left text shown one glyph per
 /// item, from its own gaps: the letter gaps of such a line cluster below
 /// its word gaps. Declared advance widths are often off for these fonts,
@@ -1546,16 +1556,12 @@ fn merge_text_items_with_clips(
                 .filter(|i| i.text.trim().chars().count() == 1)
                 .count();
             if group.len() >= 4 && single_glyphs * 10 >= group.len() * 7 {
-                let numeric = |t: &str| {
-                    let t = t.trim();
-                    !t.is_empty()
-                        && t.chars()
-                            .all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | ':' | '/'))
-                };
                 let gaps: Vec<f32> = group
                     .windows(2)
                     .zip(&display_gaps)
-                    .filter(|(pair, _)| !(numeric(&pair[0].text) && numeric(&pair[1].text)))
+                    .filter(|(pair, _)| {
+                        !(numeric_fragment(&pair[0].text) && numeric_fragment(&pair[1].text))
+                    })
                     .map(|(pair, gap)| gap / pair[0].font_size.min(pair[1].font_size).max(1.0))
                     .collect();
                 glyph_floor = glyph_run_word_gap_floor(&gaps);
@@ -1892,6 +1898,18 @@ mod tests {
     use layout::{detect_columns, is_newspaper_layout, ColumnRegion};
 
     /// Glyph-per-item run at `fs`=12 with the given inter-glyph gap (pt).
+    #[test]
+    fn numeric_fragments_are_digits_of_any_script_with_their_separators() {
+        assert!(numeric_fragment("12"));
+        assert!(numeric_fragment(" 1,234.5 "));
+        assert!(numeric_fragment("\u{0662}\u{0664}"));
+        assert!(numeric_fragment("\u{0663}\u{066B}\u{0665}"));
+        assert!(!numeric_fragment(""));
+        assert!(!numeric_fragment("a1"));
+        assert!(!numeric_fragment("\u{05D0}"));
+        assert!(!numeric_fragment("-"));
+    }
+
     #[test]
     fn glyph_run_word_gap_floor_splits_letter_gaps_from_word_gaps() {
         // Letter gaps under a tenth of an em and two word gaps of a third:
