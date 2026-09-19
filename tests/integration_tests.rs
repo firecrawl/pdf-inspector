@@ -7179,7 +7179,8 @@ const CID_TEXT_LINES: [&str; 3] = [
 /// through a Type0 font: an embedded TrueType subset under Identity-H whose
 /// glyph `i` is the `i`th distinct character of the lines, with a ToUnicode
 /// CMap saying so. None of the codes' bytes is an ASCII letter or digit.
-fn make_cid_text_over_vector_art_pdf(lines: &[&str], paths: usize) -> Vec<u8> {
+/// With `in_form` the text is drawn by a Form XObject the page invokes.
+fn make_cid_text_over_vector_art_pdf(lines: &[&str], paths: usize, in_form: bool) -> Vec<u8> {
     use lopdf::{dictionary, Document, Object, Stream};
 
     let mut alphabet: Vec<char> = lines.iter().flat_map(|line| line.chars()).collect();
@@ -7240,35 +7241,52 @@ fn make_cid_text_over_vector_art_pdf(lines: &[&str], paths: usize) -> Vec<u8> {
         "ToUnicode" => cmap_id,
     });
 
-    let mut content = String::new();
+    let mut art = String::new();
     for i in 0..paths {
         let (x, y) = (50 + (i % 40) * 12, 100 + (i / 40) * 20);
-        content.push_str(&format!(
+        art.push_str(&format!(
             "{x} {y} m {} {} l {} {y} l h f\n",
             x + 5,
             y + 8,
             x + 10
         ));
     }
+    let mut text = String::new();
     for (index, line) in lines.iter().enumerate() {
         let hex: String = line
             .chars()
             .map(|c| format!("{:04X}", code_of(c)))
             .collect();
-        content.push_str(&format!(
+        text.push_str(&format!(
             "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
             700 - 20 * index
         ));
     }
+    let mut resources = dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    };
+    let content = if in_form {
+        let form_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            },
+            text.into_bytes(),
+        ));
+        resources.set("XObject", dictionary! { "Fm1" => form_id });
+        format!("{art}q /Fm1 Do Q\n")
+    } else {
+        format!("{art}{text}")
+    };
     let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
     let pages_id = doc.new_object_id();
     let page_id = doc.add_object(dictionary! {
         "Type" => "Page",
         "Parent" => pages_id,
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-        "Resources" => dictionary! {
-            "Font" => dictionary! { "F1" => font_id },
-        },
+        "Resources" => resources,
         "Contents" => content_id,
     });
     doc.objects.insert(
@@ -7323,32 +7341,39 @@ fn vector_text_reasons(result: &pdf_inspector::PdfProcessResult) -> Vec<u32> {
 /// is a header over a mass of outlined text.
 #[test]
 fn test_cid_text_next_to_vector_art_is_extracted_not_routed_to_ocr() {
-    let buf = make_cid_text_over_vector_art_pdf(&CID_TEXT_LINES, 400);
-    let result = process_pdf_mem(&buf).unwrap();
-    assert_eq!(result.pdf_type, PdfType::TextBased);
-    assert!(
-        result.pages_needing_ocr.is_empty(),
-        "{:?}",
-        result.ocr_reasons_by_page
-    );
-    assert!(vector_text_reasons(&result).is_empty());
-    let markdown = result.markdown.unwrap();
-    assert!(markdown.contains("quick brown fox"), "{markdown}");
-    assert!(markdown.contains("liquor jugs 0123456789"), "{markdown}");
+    for in_form in [false, true] {
+        let buf = make_cid_text_over_vector_art_pdf(&CID_TEXT_LINES, 400, in_form);
+        let result = process_pdf_mem(&buf).unwrap();
+        assert_eq!(result.pdf_type, PdfType::TextBased, "in_form={in_form}");
+        assert!(
+            result.pages_needing_ocr.is_empty(),
+            "in_form={in_form}: {:?}",
+            result.ocr_reasons_by_page
+        );
+        assert!(vector_text_reasons(&result).is_empty());
+        let markdown = result.markdown.unwrap();
+        assert!(markdown.contains("quick brown fox"), "{markdown}");
+        assert!(markdown.contains("liquor jugs 0123456789"), "{markdown}");
 
-    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
-    assert!(!pages.pages[0].needs_ocr, "{:?}", pages.pages[0]);
-    assert!(pages.pages[0].markdown.contains("Sphinx of black quartz"));
-    assert!(pages.pages_needing_ocr.is_empty());
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert!(!pages.pages[0].needs_ocr, "{:?}", pages.pages[0]);
+        assert!(pages.pages[0].markdown.contains("Sphinx of black quartz"));
+        assert!(pages.pages_needing_ocr.is_empty());
+    }
 
-    let caption = process_pdf_mem(&make_cid_text_over_vector_art_pdf(&["Fig 3"], 400)).unwrap();
+    let caption =
+        process_pdf_mem(&make_cid_text_over_vector_art_pdf(&["Fig 3"], 400, false)).unwrap();
     assert_eq!(caption.pages_needing_ocr, vec![1]);
     assert_eq!(vector_text_reasons(&caption), vec![1]);
 
     // The same three lines are a header next to forty thousand path
     // operators of outlined text.
-    let header =
-        process_pdf_mem(&make_cid_text_over_vector_art_pdf(&CID_TEXT_LINES, 8_000)).unwrap();
+    let header = process_pdf_mem(&make_cid_text_over_vector_art_pdf(
+        &CID_TEXT_LINES,
+        8_000,
+        true,
+    ))
+    .unwrap();
     assert_eq!(header.pages_needing_ocr, vec![1]);
     assert_eq!(vector_text_reasons(&header), vec![1]);
 

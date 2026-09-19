@@ -861,16 +861,17 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     //
     // The byte count says nothing about text shown through a CID-keyed
     // font: its two-byte codes are glyph indices whose bytes are rarely
-    // ASCII letters or digits, however much text they carry. When such a
-    // font maps its codes through a ToUnicode CMap, the page is judged on
-    // its decoded text instead (see `DecodedTextCounts::is_page_text`) —
-    // only on the pages the byte count would flag, since decoding walks
-    // the content streams again.
+    // ASCII letters or digits, however much text they carry. A page the
+    // byte count would flag is therefore judged on its decoded text when
+    // any of it came through such a font's ToUnicode CMap (see
+    // `DecodedTextCounts::is_page_text`); decoding walks the content
+    // streams again, so it is not done for the other pages.
     let mut has_vector_text = path_ops >= 1000
         && path_ops > text_ops.saturating_mul(200)
         && (unique_alphanum_chars as usize) < VECTOR_TEXT_MIN_ALPHANUMERICS;
-    if has_vector_text && used_fonts_include_cid_with_tounicode(&used_font_ids, &font_map) {
-        has_vector_text = !decoded_text_counts(doc, page_id, &font_map).is_page_text(path_ops);
+    if has_vector_text {
+        let decoded = decoded_text_counts(doc, page_id);
+        has_vector_text = !(decoded.through_cid_cmap && decoded.is_page_text(path_ops));
     }
 
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.
@@ -921,11 +922,6 @@ const VECTOR_TEXT_MIN_ALPHANUMERICS: usize = 30;
 /// stays well under.
 const VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER: u32 = 100;
 
-/// Content-stream operators decoded per stream when counting a page's
-/// decoded text. A stream beyond it is skipped, and the page stays as the
-/// byte count judged it.
-const DECODED_TEXT_MAX_OPERATIONS: usize = 200_000;
-
 /// Form XObject nesting followed when counting a page's decoded text.
 const DECODED_TEXT_MAX_FORM_DEPTH: usize = 8;
 
@@ -936,6 +932,10 @@ struct DecodedTextCounts {
     distinct_alphanumerics: usize,
     /// Alphanumeric characters, repeats included.
     alphanumerics: usize,
+    /// Whether any string was decoded through the ToUnicode CMap of a
+    /// CID-keyed (Type0) font — the strings whose bytes the byte count
+    /// cannot read.
+    through_cid_cmap: bool,
 }
 
 impl DecodedTextCounts {
@@ -952,45 +952,65 @@ impl DecodedTextCounts {
     }
 }
 
-/// Whether the fonts shown on the page include a CID-keyed (Type0) font
-/// with a ToUnicode CMap — the fonts whose string bytes say nothing about
-/// their text.
-fn used_fonts_include_cid_with_tounicode(
-    used_font_ids: &HashSet<ObjectId>,
-    font_map: &HashMap<ObjectId, FontInfo>,
-) -> bool {
-    used_font_ids.iter().any(|id| {
-        font_map
-            .get(id)
-            .is_some_and(|info| info.subtype.as_deref() == Some(b"Type0") && info.has_tounicode)
-    })
-}
-
-/// How a font's string operands are read for the decoded text diversity.
+/// How a font's string operands are read for the decoded text counts.
 enum FontDecoder {
-    /// Codes mapped through the font's ToUnicode CMap.
-    CMap(crate::tounicode::ToUnicodeCMap),
+    /// Codes mapped through the font's ToUnicode CMap; `cid` when the font
+    /// is CID-keyed.
+    CMap {
+        cmap: crate::tounicode::ToUnicodeCMap,
+        cid: bool,
+    },
     /// A simple font without a usable CMap: one character per byte.
     Bytes,
 }
 
-/// The decoder for `info`: its ToUnicode CMap when it has one that parses;
-/// the bytes themselves for a simple font without one; `None` for a font
-/// whose text cannot be decoded here (a CID-keyed font without a CMap, a
-/// Type3 font), whose strings count for nothing.
-fn font_decoder(doc: &Document, info: &FontInfo) -> Option<FontDecoder> {
-    if let Ok(Object::Reference(id)) = info.dict.get(b"ToUnicode") {
-        if let Ok(Object::Stream(stream)) = doc.get_object(*id) {
-            let data = stream
-                .decompressed_content()
-                .unwrap_or_else(|_| stream.content.clone());
-            if let Some(cmap) = crate::tounicode::ToUnicodeCMap::parse(&data) {
-                return Some(FontDecoder::CMap(cmap));
-            }
+/// The decoder for the font dictionary `font`: its ToUnicode CMap when it
+/// has one that parses, direct or referenced; the bytes themselves for a
+/// simple font without one; `None` for a font whose text cannot be decoded
+/// here (a CID-keyed font without a CMap, a Type3 font), whose strings
+/// count for nothing.
+fn font_decoder(doc: &Document, font: &lopdf::Dictionary) -> Option<FontDecoder> {
+    let subtype = font.get(b"Subtype").ok().and_then(|s| s.as_name().ok());
+    let to_unicode = match font.get(b"ToUnicode") {
+        Ok(Object::Stream(stream)) => Some(stream),
+        Ok(Object::Reference(id)) => match doc.get_object(*id) {
+            Ok(Object::Stream(stream)) => Some(stream),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(stream) = to_unicode {
+        let data = stream
+            .decompressed_content()
+            .unwrap_or_else(|_| stream.content.clone());
+        if let Some(cmap) = crate::tounicode::ToUnicodeCMap::parse(&data) {
+            return Some(FontDecoder::CMap {
+                cmap,
+                cid: subtype == Some(b"Type0"),
+            });
         }
     }
-    match info.subtype.as_deref() {
+    match subtype {
         Some(b"Type1") | Some(b"TrueType") | Some(b"MMType1") => Some(FontDecoder::Bytes),
+        _ => None,
+    }
+}
+
+/// The font dictionary `name` resolves to in `resources`, with its object
+/// id when it is an indirect object; an inline dictionary has none.
+fn lookup_font<'a>(
+    doc: &'a Document,
+    resources: &'a lopdf::Dictionary,
+    name: &[u8],
+) -> Option<(Option<ObjectId>, &'a lopdf::Dictionary)> {
+    let fonts = match resources.get(b"Font").ok()? {
+        Object::Dictionary(dict) => dict,
+        Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+        _ => return None,
+    };
+    match fonts.get(name).ok()? {
+        Object::Reference(id) => Some((Some(*id), doc.get_dictionary(*id).ok()?)),
+        Object::Dictionary(dict) => Some((None, dict)),
         _ => None,
     }
 }
@@ -1057,13 +1077,15 @@ fn collect_form_streams<'a>(
 /// content and in its Form XObjects — once every string is decoded through
 /// the font in force: its ToUnicode CMap where it has one, the bytes
 /// themselves for a simple font without one, nothing for a font that cannot
-/// be decoded here. Replacement characters, which a CMap that does not
-/// cover its codes produces, are not alphanumeric and do not count.
-fn decoded_text_counts(
-    doc: &Document,
-    page_id: ObjectId,
-    font_map: &HashMap<ObjectId, FontInfo>,
-) -> DecodedTextCounts {
+/// be decoded here. Font names resolve against the stream's own resources,
+/// then the page's and its ancestors', and the font in force follows
+/// `q`/`Q` like the rest of the graphics state. Replacement characters,
+/// which a CMap that does not cover its codes produces, are not
+/// alphanumeric and do not count. A stream over the page operation bound
+/// is skipped, as the extractor skips it.
+fn decoded_text_counts(doc: &Document, page_id: ObjectId) -> DecodedTextCounts {
+    use std::rc::Rc;
+
     let mut page_scope: Vec<&lopdf::Dictionary> = Vec::new();
     if let Ok((own, ancestors)) = doc.get_page_resources(page_id) {
         page_scope.extend(own);
@@ -1090,19 +1112,22 @@ fn decoded_text_counts(
         collect_form_streams(doc, resources, &page_scope, &mut visited, 0, &mut streams);
     }
 
+    let mut counts = DecodedTextCounts::default();
     let mut seen: HashSet<char> = HashSet::new();
-    let mut alphanumerics = 0usize;
-    let mut decoders: HashMap<ObjectId, Option<FontDecoder>> = HashMap::new();
+    let mut decoders: HashMap<ObjectId, Option<Rc<FontDecoder>>> = HashMap::new();
     for (content, scope) in &streams {
         let Ok(Some(ops)) = crate::extractor::content_decode::decode_content_bounded(
             content,
-            DECODED_TEXT_MAX_OPERATIONS,
+            crate::extractor::content_decode::MAX_PAGE_OPERATIONS,
         ) else {
             continue;
         };
-        let mut current: Option<ObjectId> = None;
+        let mut current: Option<Rc<FontDecoder>> = None;
+        let mut saved: Vec<Option<Rc<FontDecoder>>> = Vec::new();
         for op in &ops.operations {
             match op.operator.as_str() {
+                "q" => saved.push(current.clone()),
+                "Q" => current = saved.pop().flatten(),
                 "Tf" => {
                     current = op
                         .operands
@@ -1111,19 +1136,18 @@ fn decoded_text_counts(
                         .and_then(|name| {
                             scope
                                 .iter()
-                                .find_map(|resources| lookup_font_id(doc, resources, name))
+                                .find_map(|resources| lookup_font(doc, resources, name))
+                        })
+                        .and_then(|(id, font)| match id {
+                            Some(id) => decoders
+                                .entry(id)
+                                .or_insert_with(|| font_decoder(doc, font).map(Rc::new))
+                                .clone(),
+                            None => font_decoder(doc, font).map(Rc::new),
                         });
                 }
                 "Tj" | "'" | "\"" | "TJ" => {
-                    let Some(font_id) = current else {
-                        continue;
-                    };
-                    let decoder = decoders.entry(font_id).or_insert_with(|| {
-                        font_map
-                            .get(&font_id)
-                            .and_then(|info| font_decoder(doc, info))
-                    });
-                    let Some(decoder) = decoder else {
+                    let Some(decoder) = current.as_deref() else {
                         continue;
                     };
                     let mut shown: Vec<&[u8]> = Vec::new();
@@ -1139,18 +1163,20 @@ fn decoded_text_counts(
                     }
                     for bytes in shown {
                         let decoded: Vec<char> = match decoder {
-                            FontDecoder::CMap(cmap) => cmap
-                                .decode_cids(bytes)
-                                .chars()
-                                .filter(|c| c.is_alphanumeric())
-                                .collect(),
+                            FontDecoder::CMap { cmap, cid } => {
+                                counts.through_cid_cmap |= *cid && !bytes.is_empty();
+                                cmap.decode_cids(bytes)
+                                    .chars()
+                                    .filter(|c| c.is_alphanumeric())
+                                    .collect()
+                            }
                             FontDecoder::Bytes => bytes
                                 .iter()
                                 .map(|&b| b as char)
                                 .filter(|c| c.is_alphanumeric())
                                 .collect(),
                         };
-                        alphanumerics += decoded.len();
+                        counts.alphanumerics += decoded.len();
                         seen.extend(decoded);
                     }
                 }
@@ -1158,10 +1184,8 @@ fn decoded_text_counts(
             }
         }
     }
-    DecodedTextCounts {
-        distinct_alphanumerics: seen.len(),
-        alphanumerics,
-    }
+    counts.distinct_alphanumerics = seen.len();
+    counts
 }
 
 /// Check if a page has Type0 fonts with Identity-H/V encoding and no ToUnicode CMap.
@@ -4211,17 +4235,35 @@ mod tests {
         "Sphinx of black quartz judge my vow",
     ];
 
+    /// Where a page's CID text is shown and how its font is written.
+    #[derive(Clone, Copy, PartialEq)]
+    enum CidTextLayout {
+        /// In the page content, the font an indirect object with a
+        /// referenced ToUnicode stream.
+        Page,
+        /// In the page content, the font dictionary and its ToUnicode
+        /// stream written inline in the resources.
+        InlineFont,
+        /// In a Form XObject with its own font resources.
+        Form,
+        /// In a Form XObject without resources, using the page's font.
+        FormInheritingFonts,
+        /// In the page content after a `q`/`Q` that selected another font
+        /// inside the saved state.
+        AfterRestoredFont,
+    }
+
     /// A page of `paths` filled triangles and `lines` of text shown as
     /// two-byte codes through a Type0 font: an embedded TrueType subset
     /// under Identity-H whose glyph `i` is the `i`th distinct character of
     /// the lines, with a ToUnicode CMap saying so — or, when `broken_cmap`,
-    /// mapping every code to the same letter. With `in_form` the text is
-    /// shown by a Form XObject the page invokes, with its own resources.
+    /// mapping every code to the same letter. `layout` says where the text
+    /// is shown and how the font is written.
     fn cid_text_over_vector_art(
         lines: &[&str],
         paths: usize,
         broken_cmap: bool,
-        in_form: bool,
+        layout: CidTextLayout,
     ) -> (Document, ObjectId) {
         use lopdf::{dictionary, Stream};
 
@@ -4280,17 +4322,27 @@ mod tests {
             "DW" => 600,
             "CIDToGIDMap" => "Identity",
         });
-        let cmap_id = doc.add_object(Object::Stream(Stream::new(
-            dictionary! {},
-            cmap.into_bytes(),
-        )));
-        let font_id = doc.add_object(dictionary! {
+        let cmap_stream = Stream::new(dictionary! {}, cmap.into_bytes());
+        let font = |to_unicode: Object| {
+            dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type0",
+                "BaseFont" => "AAAAAA+Subset",
+                "Encoding" => "Identity-H",
+                "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+                "ToUnicode" => to_unicode,
+            }
+        };
+        let font_entry = if layout == CidTextLayout::InlineFont {
+            Object::Dictionary(font(Object::Stream(cmap_stream)))
+        } else {
+            let cmap_id = doc.add_object(Object::Stream(cmap_stream));
+            Object::Reference(doc.add_object(font(Object::Reference(cmap_id))))
+        };
+        let helvetica_id = doc.add_object(dictionary! {
             "Type" => "Font",
-            "Subtype" => "Type0",
-            "BaseFont" => "AAAAAA+Subset",
-            "Encoding" => "Identity-H",
-            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
-            "ToUnicode" => Object::Reference(cmap_id),
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
         });
 
         let mut art = String::new();
@@ -4314,25 +4366,40 @@ mod tests {
                 700 - 20 * index
             ));
         }
-        let font_resources = dictionary! {
-            "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+        let fonts = dictionary! {
+            "F1" => font_entry,
+            "F2" => Object::Reference(helvetica_id),
         };
-        let (page_content, page_resources) = if in_form {
-            let form_id = doc.add_object(Object::Stream(Stream::new(
-                dictionary! {
+        let (page_content, page_resources) = match layout {
+            CidTextLayout::Page | CidTextLayout::InlineFont => {
+                (format!("{art}{text}"), dictionary! { "Font" => fonts })
+            }
+            CidTextLayout::AfterRestoredFont => (
+                format!(
+                    "{art}BT /F1 12 Tf ET q BT /F2 12 Tf 72 40 Td (x) Tj ET Q\n{}",
+                    text.replace("/F1 12 Tf ", "")
+                ),
+                dictionary! { "Font" => fonts },
+            ),
+            CidTextLayout::Form | CidTextLayout::FormInheritingFonts => {
+                let mut form_dict = dictionary! {
                     "Type" => "XObject",
                     "Subtype" => "Form",
                     "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-                    "Resources" => font_resources,
-                },
-                text.into_bytes(),
-            )));
-            (
-                format!("{art}q /Fm1 Do Q\n"),
-                dictionary! { "XObject" => dictionary! { "Fm1" => Object::Reference(form_id) } },
-            )
-        } else {
-            (format!("{art}{text}"), font_resources)
+                };
+                if layout == CidTextLayout::Form {
+                    form_dict.set("Resources", dictionary! { "Font" => fonts.clone() });
+                }
+                let form_id =
+                    doc.add_object(Object::Stream(Stream::new(form_dict, text.into_bytes())));
+                (
+                    format!("{art}q /Fm1 Do Q\n"),
+                    dictionary! {
+                        "Font" => fonts,
+                        "XObject" => dictionary! { "Fm1" => Object::Reference(form_id) },
+                    },
+                )
+            }
         };
         let content_id = doc.add_object(Object::Stream(Stream::new(
             dictionary! {},
@@ -4364,17 +4431,22 @@ mod tests {
     /// letter or digit.
     #[test]
     fn cid_text_with_a_working_tounicode_is_not_vector_text() {
-        for in_form in [false, true] {
-            let (doc, page_id) = cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, in_form);
+        for layout in [
+            CidTextLayout::Page,
+            CidTextLayout::InlineFont,
+            CidTextLayout::Form,
+            CidTextLayout::FormInheritingFonts,
+            CidTextLayout::AfterRestoredFont,
+        ] {
+            let (doc, page_id) = cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, layout);
             let analysis = analyze_page_content(&doc, page_id);
             assert!(analysis.path_op_count >= 1000, "{}", analysis.path_op_count);
-            assert_eq!(analysis.text_operator_count, 3);
             assert!(
                 (analysis.unique_alphanum_chars as usize) < VECTOR_TEXT_MIN_ALPHANUMERICS,
                 "the byte count is blind to the codes: {}",
                 analysis.unique_alphanum_chars
             );
-            assert!(!analysis.has_vector_text, "in_form={in_form}");
+            assert!(!analysis.has_vector_text, "layout {}", layout as u8);
             assert_eq!(page_ocr_signals(&doc, page_id), (false, false));
         }
     }
@@ -4385,11 +4457,13 @@ mod tests {
     /// path operators of outlined body text.
     #[test]
     fn little_or_undecodable_cid_text_over_vector_art_stays_vector_text() {
-        let (doc, page_id) = cid_text_over_vector_art(&["Fig 3"], 400, false, false);
+        let (doc, page_id) = cid_text_over_vector_art(&["Fig 3"], 400, false, CidTextLayout::Page);
         assert!(analyze_page_content(&doc, page_id).has_vector_text);
-        let (doc, page_id) = cid_text_over_vector_art(&CID_TEXT_LINES, 400, true, false);
+        let (doc, page_id) =
+            cid_text_over_vector_art(&CID_TEXT_LINES, 400, true, CidTextLayout::Page);
         assert!(analyze_page_content(&doc, page_id).has_vector_text);
-        let (doc, page_id) = cid_text_over_vector_art(&CID_TEXT_LINES, 8_000, false, false);
+        let (doc, page_id) =
+            cid_text_over_vector_art(&CID_TEXT_LINES, 8_000, false, CidTextLayout::Page);
         let analysis = analyze_page_content(&doc, page_id);
         assert!(
             analysis.path_op_count >= 40_000,
@@ -4400,28 +4474,38 @@ mod tests {
     }
 
     /// The decoded counts cover the whole text: the three lines show
-    /// thirty-nine distinct letters and digits, one hundred and six in
-    /// all. They are the page's text next to a drawing of up to a hundred
-    /// path operators per character, and a header next to a larger one.
+    /// thirty-nine distinct letters and digits, one hundred and six in all,
+    /// through the CID font's CMap. They are the page's text next to a
+    /// drawing of up to a hundred path operators per character, and a
+    /// header next to a larger one.
     #[test]
     fn decoded_text_counts_cover_the_whole_text() {
-        let (doc, page_id) = cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, false);
-        let mut font_map = HashMap::new();
-        let resources = doc.get_page_resources(page_id).unwrap().0.unwrap();
-        collect_fonts_from_resource_dict(&doc, resources, &mut font_map);
-        let counts = decoded_text_counts(&doc, page_id, &font_map);
-        assert_eq!(
-            counts,
-            DecodedTextCounts {
-                distinct_alphanumerics: 39,
-                alphanumerics: 106,
-            }
-        );
-        assert!(counts.is_page_text(10_600));
-        assert!(!counts.is_page_text(10_601));
+        for layout in [
+            CidTextLayout::Page,
+            CidTextLayout::InlineFont,
+            CidTextLayout::FormInheritingFonts,
+            CidTextLayout::AfterRestoredFont,
+        ] {
+            let (doc, page_id) = cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, layout);
+            let counts = decoded_text_counts(&doc, page_id);
+            assert_eq!(
+                (counts.distinct_alphanumerics, counts.through_cid_cmap),
+                (39, true),
+                "layout {}",
+                layout as u8
+            );
+            // The restored-font layout paints one more glyph in the
+            // simple font before the CID text.
+            let extra = usize::from(layout == CidTextLayout::AfterRestoredFont);
+            assert_eq!(counts.alphanumerics, 106 + extra);
+            let at_the_bar = counts.alphanumerics as u32 * VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER;
+            assert!(counts.is_page_text(at_the_bar));
+            assert!(!counts.is_page_text(at_the_bar + 1));
+        }
         let sparse = DecodedTextCounts {
             distinct_alphanumerics: 29,
             alphanumerics: 1_000,
+            through_cid_cmap: true,
         };
         assert!(!sparse.is_page_text(1_000));
     }
