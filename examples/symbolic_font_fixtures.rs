@@ -2,7 +2,7 @@
 //! `tests/fixtures/`.
 //!
 //! Every fixture is synthetic. The pages use the non-embedded standard
-//! fonts (Symbol, ZapfDingbats, Courier, Helvetica, Times) and two tiny
+//! fonts (Symbol, ZapfDingbats, Courier, Helvetica, Times) and three tiny
 //! TrueType programs built here from scratch — a handful of square glyphs
 //! with the tables a reader needs — so nothing in them comes from any
 //! existing font or document.

@@ -786,7 +786,7 @@ pub(crate) fn build_font_encodings(
             // Names that are glyph indexes (`g12`, `glyph12`, `index12`)
             // say nothing by themselves; the embedded font program says
             // what those glyphs are.
-            let by_index = glyph_index_chars(doc, font_dict, &result.gid_names);
+            let by_index = glyph_index_chars(doc, font_dict, &result.gid_names, font_cache);
             let unresolved: Vec<u8> = result
                 .gid_codes
                 .iter()
@@ -867,31 +867,60 @@ fn builtin_base_encoding(doc: &Document, font_dict: &lopdf::Dictionary) -> Optio
 /// producers without names for their glyphs mean by it. The glyph's
 /// character comes from the program's cmap and glyph names (TrueType or
 /// OpenType) or from its glyph names (bare CFF). Codes whose glyph the
-/// program does not identify are left out.
+/// program does not identify are left out. What each name resolves to is
+/// kept in `font_cache` per program, so a font shared across pages is
+/// parsed once.
 fn glyph_index_chars(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
     names: &[(u8, String)],
+    font_cache: &mut FontStyleCache,
 ) -> FontEncodingMap {
     if names.is_empty() {
         return FontEncodingMap::new();
     }
-    let program = || -> Option<Vec<u8>> {
+    let font_file = || -> Option<ObjectId> {
         let descriptor = resolve_dict(doc, font_dict.get(b"FontDescriptor").ok()?)?;
-        let file = descriptor
+        descriptor
             .get(b"FontFile2")
             .or_else(|_| descriptor.get(b"FontFile3"))
             .ok()?
             .as_reference()
-            .ok()?;
-        font_file_data(doc, file)
+            .ok()
     };
-    let Some(data) = program() else {
+    let Some(ff_ref) = font_file() else {
         return FontEncodingMap::new();
     };
-    let face = ttf_parser::Face::parse(&data, 0).ok();
+    let cached = font_cache
+        .numbered_glyphs_by_font_file
+        .entry(ff_ref)
+        .or_default();
+    let unresolved: Vec<&str> = names
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .filter(|name| !cached.contains_key(*name))
+        .collect();
+    if !unresolved.is_empty() {
+        let resolved = font_file_data(doc, ff_ref)
+            .map(|data| resolve_numbered_glyph_names(&data, &unresolved))
+            .unwrap_or_default();
+        for name in unresolved {
+            cached.insert(name.to_string(), resolved.get(name).copied().flatten());
+        }
+    }
+    names
+        .iter()
+        .filter_map(|(code, name)| Some((*code, (*cached.get(name)?)?)))
+        .collect()
+}
+
+/// Resolve numbered names against one font program (see
+/// [`glyph_index_chars`]): the character of each name's glyph, `None` for
+/// a glyph the program does not identify.
+fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, Option<char>> {
+    let face = ttf_parser::Face::parse(data, 0).ok();
     let bare_cff = if face.is_none() {
-        ttf_parser::cff::Table::parse(&data)
+        ttf_parser::cff::Table::parse(data)
     } else {
         None
     };
@@ -903,7 +932,7 @@ fn glyph_index_chars(
                 glyph_to_char(name).map(|ch| (gid, ch))
             })
             .collect(),
-        (None, None) => return FontEncodingMap::new(),
+        (None, None) => return HashMap::new(),
     };
     let cff: Option<&ttf_parser::cff::Table> = face
         .as_ref()
@@ -930,7 +959,10 @@ fn glyph_index_chars(
     };
     names
         .iter()
-        .filter_map(|(code, name)| by_glyph.get(&glyph_of(name)?).map(|&ch| (*code, ch)))
+        .map(|&name| {
+            let ch = glyph_of(name).and_then(|gid| by_glyph.get(&gid).copied());
+            (name.to_string(), ch)
+        })
         .collect()
 }
 
@@ -1524,6 +1556,11 @@ pub(crate) struct FontStyleCache {
     /// Blank-glyph codes per embedded font program (see `blank_glyph_codes`),
     /// so a font shared across pages is scanned once.
     blank_codes_by_font_file: HashMap<ObjectId, std::collections::HashSet<u8>>,
+    /// The character each numbered `/Differences` name resolves to per
+    /// embedded font program (see `glyph_index_chars`), `None` when the
+    /// program does not identify it, so a font shared across pages is
+    /// parsed once.
+    numbered_glyphs_by_font_file: HashMap<ObjectId, HashMap<String, Option<char>>>,
 }
 
 impl FontStyleCache {
@@ -1881,12 +1918,17 @@ pub(crate) fn extract_text_from_operand(
                                 return Some(ch.to_string());
                             }
                         }
-                        // 4. The font's base encoding
-                        if let Some(ch) = encoding_map
-                            .and_then(|map| map.base)
-                            .and_then(|base| base.char_for(b))
-                        {
-                            return Some(ch.to_string());
+                        // 4. The font's base encoding, for printable bytes
+                        // (the predefined tables spell out the control
+                        // codes too, and those are dropped like they are
+                        // by the fallback below)
+                        if b >= 0x20 {
+                            if let Some(ch) = encoding_map
+                                .and_then(|map| map.base)
+                                .and_then(|base| base.char_for(b))
+                            {
+                                return Some(ch.to_string());
+                            }
                         }
                         // 5. Printable single-byte fallback
                         if b >= 0x20 {
@@ -2031,7 +2073,10 @@ pub(crate) fn extract_text_from_operand(
                         .filter_map(|&b| {
                             let label = if let Some(&ch) = encoding_map.get(&b) {
                                 Some(ch)
-                            } else if let Some(ch) = encoding.base.and_then(|base| base.char_for(b))
+                            } else if let Some(ch) = encoding
+                                .base
+                                .filter(|_| b >= 0x20)
+                                .and_then(|base| base.char_for(b))
                             {
                                 Some(ch)
                             } else if b >= 0x20 {
@@ -2442,6 +2487,46 @@ mod tests {
         let result =
             parse_encoding_dictionary(&doc, &indirect, None).expect("base encoding parsed");
         assert_eq!(result.base, Some(BaseEncoding::WinAnsi));
+    }
+
+    #[test]
+    fn base_encoding_leaves_control_bytes_out() {
+        // A font reading through a base encoding drops the control bytes
+        // its text strings carry, as the printable fallback does; the
+        // predefined tables spell those codes out, so the guard is needed.
+        let bytes = vec![0x41_u8, 0x0D, 0x09, 0x42];
+        let obj = Object::String(bytes, lopdf::StringFormat::Literal);
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let inline_cmaps = HashMap::new();
+        let mut font_encodings: PageFontEncodings = HashMap::new();
+        font_encodings.insert(
+            "F0".to_string(),
+            FontEncoding {
+                differences: FontEncodingMap::new(),
+                identity_overrides: FontEncodingMap::new(),
+                blank_codes: Default::default(),
+                base: Some(BaseEncoding::WinAnsi),
+            },
+        );
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F0".to_string(), make_font_info(&[], 1000, false));
+        let (text, _) = extract_text_from_operand(
+            &obj,
+            "F0",
+            Some("Helvetica"),
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("text decoded");
+        assert_eq!(text, "AB");
     }
 
     #[test]
