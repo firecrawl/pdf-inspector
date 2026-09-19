@@ -343,8 +343,9 @@ def extract_text_with_positions(
             way.
         bold_weight_threshold: The weight class from which
             ``bold_from_weight`` reads bold, on the 100..900 scale; 600
-            (SemiBold) by default. Read only when ``bold_from_weight`` is
-            ``True``; a value outside 100..900 raises ``ValueError``.
+            (SemiBold) by default. It matters only when ``bold_from_weight``
+            is ``True``, but a value outside 100..900 raises ``ValueError``
+            either way.
     """
     ...
 

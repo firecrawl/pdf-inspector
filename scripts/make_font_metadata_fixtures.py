@@ -393,10 +393,10 @@ def license_note(license_text: str) -> str:
 
 
 def fetch_release(cache_dir: Path) -> Path:
-    """The extracted release directory, downloaded and checked once."""
+    """The extracted release directory: the archive is downloaded once, but
+    checked against the pinned digest and extracted afresh on every run, so
+    nothing left in the cache by an earlier run is trusted on its own."""
     extracted = cache_dir / DEJAVU_DIR
-    if all((extracted / "ttf" / name).is_file() for name in DEJAVU_FILES) and (extracted / "LICENSE").is_file():
-        return extracted
     cache_dir.mkdir(parents=True, exist_ok=True)
     archive = cache_dir / Path(DEJAVU_URL).name
     if not archive.is_file():
@@ -436,8 +436,12 @@ def main(argv=None) -> int:
         raise SystemExit(f"no LICENSE file next to or above {fonts_dir}")
 
     programs = {face.tag: subset_face(face, fonts_dir / face.source) for face in FACES}
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(build_pdf(programs))
-    args.license_note.write_text(license_note(license_file.read_text()))
+    args.license_note.parent.mkdir(parents=True, exist_ok=True)
+    args.license_note.write_text(
+        license_note(license_file.read_text(encoding="utf-8")), encoding="utf-8"
+    )
     print(f"wrote {args.output} ({args.output.stat().st_size} bytes) and {args.license_note}")
     return 0
 

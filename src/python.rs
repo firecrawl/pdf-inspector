@@ -919,9 +919,9 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 ///         are unchanged.
 ///
 ///     bold_weight_threshold: The weight class from which bold_from_weight
-///         reads bold, 100..900; 600 (SemiBold) by default. Read only when
-///         bold_from_weight is True; a value outside 100..900 raises
-///         ValueError.
+///         reads bold, 100..900; 600 (SemiBold) by default. It matters only
+///         when bold_from_weight is True, but a value outside 100..900 raises
+///         ValueError either way.
 ///
 /// Returns:
 ///     List of TextItem. x/y are PDF points relative to the page's visible

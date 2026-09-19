@@ -263,8 +263,8 @@ pub struct FrameOptions {
     pub bold_from_weight: Option<bool>,
     /// The weight class from which `boldFromWeight` reads bold, on the
     /// 100..900 scale: 600 by default, so SemiBold and heavier faces are
-    /// bold. Read only when `boldFromWeight` is `true`; a value outside
-    /// 100..900 is an argument error.
+    /// bold. It matters only when `boldFromWeight` is `true`, but a value
+    /// outside 100..900 is an argument error either way.
     pub bold_weight_threshold: Option<u32>,
 }
 

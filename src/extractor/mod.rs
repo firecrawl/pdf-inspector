@@ -69,8 +69,8 @@ pub struct PositionOptions {
     pub bold_from_weight: bool,
     /// The weight class from which `bold_from_weight` reads bold, on the
     /// 100..=900 scale: 600 by default, so SemiBold and heavier faces are
-    /// bold. Read only when `bold_from_weight` is set; a value outside the
-    /// scale is clamped into it.
+    /// bold. It matters only when `bold_from_weight` is set; a value outside
+    /// the scale is clamped into it either way.
     pub bold_weight_threshold: u16,
 }
 
