@@ -232,7 +232,8 @@ fn display_order(text: &str, rtl_base: bool) -> Vec<char> {
 fn shape_arabic(text: &str) -> String {
     // (letter, isolated, final, initial, medial); a letter without initial
     // and medial forms (`None`) joins only to the letter before it.
-    const FORMS: &[(char, u32, u32, Option<(u32, u32)>)] = &[
+    type Forms = (char, u32, u32, Option<(u32, u32)>);
+    const FORMS: &[Forms] = &[
         ('\u{0622}', 0xFE81, 0xFE82, None),
         ('\u{0623}', 0xFE83, 0xFE84, None),
         ('\u{0624}', 0xFE85, 0xFE86, None),
@@ -677,7 +678,7 @@ fn write_fixture(fixture: &Fixture, hebrew: &EmbeddedFont, arabic: &EmbeddedFont
     let info = doc.add_object(dictionary! {
         "Title" => Object::String(fixture.title.as_bytes().to_vec(), StringFormat::Literal),
         "Subject" => Object::String(
-            b"Synthetic test fixture. Embedded glyphs: Noto Sans Hebrew / Noto Sans Arabic subsets, SIL Open Font License 1.1.".to_vec(),
+            b"Synthetic test fixture. Embedded glyphs: Noto Sans Hebrew / Noto Sans Arabic subsets, Copyright 2022 The Noto Project Authors, SIL Open Font License 1.1.".to_vec(),
             StringFormat::Literal,
         ),
         "Producer" => Object::String(b"pdf-inspector examples/rtl_fixtures.rs".to_vec(), StringFormat::Literal),

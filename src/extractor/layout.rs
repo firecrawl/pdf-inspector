@@ -2203,6 +2203,10 @@ fn group_into_lines_with_thresholds_and_regions_impl(
 
     for page in pages {
         let page_items: Vec<TextItem> = items.iter().filter(|i| i.page == page).cloned().collect();
+        // The page's direction settles how a line with right-to-left letters
+        // reads when its own letters do not (see `rtl_line_base`); every
+        // column and band of the page shares it.
+        let page_rtl = crate::text_utils::is_rtl_text(page_items.iter().map(|i| &i.text));
         // Page-edge numeric runs are weak evidence for column geometry. Keep
         // contextual values for line assembly, but prevent their preservation
         // from changing the page's inferred layout.
@@ -2244,7 +2248,11 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                         node.kind,
                         node.items.len()
                     );
-                    all_lines.extend(group_single_column(node.items, adaptive_threshold));
+                    all_lines.extend(group_single_column(
+                        node.items,
+                        adaptive_threshold,
+                        page_rtl,
+                    ));
                 }
                 continue;
             }
@@ -2307,13 +2315,18 @@ fn group_into_lines_with_thresholds_and_regions_impl(
         if let Some(lines) = banded {
             all_lines.extend(lines);
         } else if columns.len() <= 1 {
-            all_lines.extend(group_single_column(page_items, adaptive_threshold));
+            all_lines.extend(group_single_column(
+                page_items,
+                adaptive_threshold,
+                page_rtl,
+            ));
         } else {
             all_lines.extend(order_multi_column_region(
                 page_items,
                 &columns,
                 adaptive_threshold,
                 page,
+                page_rtl,
             ));
         }
     }
@@ -2334,8 +2347,16 @@ fn order_multi_column_region(
     columns: &[ColumnRegion],
     adaptive_threshold: f32,
     page: u32,
+    page_rtl: bool,
 ) -> Vec<TextLine> {
-    order_columns_with_policy(page_items, columns, adaptive_threshold, page, false)
+    order_columns_with_policy(
+        page_items,
+        columns,
+        adaptive_threshold,
+        page,
+        false,
+        page_rtl,
+    )
 }
 
 /// Banded-planner entry: the columns already passed the planner's prose
@@ -2350,8 +2371,16 @@ fn order_validated_band(
     columns: &[ColumnRegion],
     adaptive_threshold: f32,
     page: u32,
+    page_rtl: bool,
 ) -> Vec<TextLine> {
-    order_columns_with_policy(page_items, columns, adaptive_threshold, page, true)
+    order_columns_with_policy(
+        page_items,
+        columns,
+        adaptive_threshold,
+        page,
+        true,
+        page_rtl,
+    )
 }
 
 fn order_columns_with_policy(
@@ -2360,6 +2389,7 @@ fn order_columns_with_policy(
     adaptive_threshold: f32,
     page: u32,
     band_validated: bool,
+    page_rtl: bool,
 ) -> Vec<TextLine> {
     let mut all_lines = Vec::new();
     {
@@ -2439,12 +2469,12 @@ fn order_columns_with_policy(
 
             let mut per_column_lines: Vec<Vec<TextLine>> = Vec::new();
             for col_items in col_buckets {
-                let lines = group_single_column(col_items, adaptive_threshold);
+                let lines = group_single_column(col_items, adaptive_threshold, page_rtl);
                 per_column_lines.push(lines);
             }
 
             // Process spanning items as their own group
-            let spanning_lines = group_single_column(spanning_items, adaptive_threshold);
+            let spanning_lines = group_single_column(spanning_items, adaptive_threshold, page_rtl);
 
             let is_newspaper = band_validated
                 || is_newspaper_layout(&per_column_lines, columns)
@@ -2550,9 +2580,7 @@ fn order_columns_with_policy(
                     if let Some(last) = merged.last_mut() {
                         if last.page == line.page && (last.y - line.y).abs() < y_tol {
                             last.items.extend(line.items);
-                            let rtl =
-                                crate::text_utils::is_rtl_text(last.items.iter().map(|i| &i.text));
-                            sort_line_items(&mut last.items, rtl);
+                            sort_line_items(&mut last.items, page_rtl);
                             continue;
                         }
                     }
@@ -2757,6 +2785,9 @@ fn try_banded_layout(
     if page_items.iter().any(|i| !i.y.is_finite()) {
         return None;
     }
+    // Lines with right-to-left letters read by the whole page's direction,
+    // not the band's (see `rtl_line_base`).
+    let page_rtl = crate::text_utils::is_rtl_text(page_items.iter().map(|i| &i.text));
     let (bands, gaps) = split_into_y_bands(detection_items);
     if bands.len() < 2 {
         return None;
@@ -2865,6 +2896,7 @@ fn try_banded_layout(
                 &plan.columns,
                 adaptive_threshold,
                 page,
+                page_rtl,
             ));
         } else if page_count > 1 {
             // No validated band structure of its own: order with the
@@ -2876,9 +2908,10 @@ fn try_banded_layout(
                 page_columns,
                 adaptive_threshold,
                 page,
+                page_rtl,
             ));
         } else {
-            out.extend(group_single_column(items, adaptive_threshold));
+            out.extend(group_single_column(items, adaptive_threshold, page_rtl));
         }
     }
     Some(out)
@@ -2923,13 +2956,17 @@ fn should_use_y_sorting(items: &[TextItem]) -> bool {
 
 /// Group items from a single column into lines
 /// Uses heuristics to decide between PDF stream order and Y-position sorting.
-fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<TextLine> {
+/// `page_rtl` is the direction of the page the column belongs to, which
+/// settles how its lines with right-to-left letters read when their own
+/// letters do not (see `rtl_line_base`).
+fn group_single_column(
+    items: Vec<TextItem>,
+    adaptive_threshold: f32,
+    page_rtl: bool,
+) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
     }
-    // The column's own direction decides how its lines with right-to-left
-    // letters read (see `rtl_line_base`).
-    let page_rtl = crate::text_utils::is_rtl_text(items.iter().map(|i| &i.text));
 
     // Decide whether to use stream order or Y-sorting
     let use_y_sorting = should_use_y_sorting(&items);
@@ -3504,7 +3541,7 @@ mod tests {
             make_item(1, 94.0, 242.0, "6.2. Expectations for Re-Hiring Staff"),
             make_item(1, 380.0, 242.0, "they had no plans to re-hire and more"),
         ];
-        let lines = group_single_column(items, 0.10);
+        let lines = group_single_column(items, 0.10, false);
         assert_eq!(lines.len(), 2, "independent column runs must not fuse");
     }
 
@@ -3515,7 +3552,7 @@ mod tests {
             make_item(1, 94.0, 242.0, "2. Embracing complexity in"),
             make_item(1, 380.0, 242.0, "2.1 Systems thinking and practice"),
         ];
-        let lines = group_single_column(items, 0.10);
+        let lines = group_single_column(items, 0.10, false);
         assert_eq!(lines.len(), 1, "numbered table cells stay on one line");
     }
 

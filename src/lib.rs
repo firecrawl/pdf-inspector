@@ -33,6 +33,7 @@ pub mod python;
 
 pub mod adobe_korea1;
 mod bidi;
+mod bidi_mirroring;
 pub mod detector;
 pub mod extractor;
 pub mod glyph_names;

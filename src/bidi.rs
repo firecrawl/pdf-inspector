@@ -30,7 +30,7 @@
 
 use std::borrow::Cow;
 
-use unicode_bidi::{bidi_class, BidiClass, BidiInfo, Level};
+use unicode_bidi::{bidi_class, BidiClass, BidiDataSource, BidiInfo, HardcodedBidiData, Level};
 use unicode_normalization::UnicodeNormalization;
 
 /// One character of a line in screen order, tagged with the item it belongs
@@ -42,62 +42,21 @@ pub(crate) struct VisualChar {
     pub item: Option<usize>,
 }
 
-/// Bracket pairs that mirror each other when displayed at an odd level
-/// (`Bidi_Mirrored`), as (opening, closing) glyphs. The first entries are
-/// also the paired brackets matched by rule N0.
-const MIRRORED_PAIRS: &[(char, char)] = &[
-    ('(', ')'),
-    ('[', ']'),
-    ('{', '}'),
-    ('\u{2329}', '\u{232A}'), // angle brackets
-    ('\u{27E8}', '\u{27E9}'), // mathematical angle brackets
-    ('\u{3008}', '\u{3009}'), // CJK angle brackets
-    ('\u{300A}', '\u{300B}'), // CJK double angle brackets
-    ('\u{300C}', '\u{300D}'), // CJK corner brackets
-    ('\u{300E}', '\u{300F}'), // CJK white corner brackets
-    ('\u{3010}', '\u{3011}'), // CJK black lenticular brackets
-    ('\u{FF08}', '\u{FF09}'), // fullwidth parentheses
-    ('\u{FF3B}', '\u{FF3D}'), // fullwidth square brackets
-    ('\u{FF5B}', '\u{FF5D}'), // fullwidth curly brackets
-    ('<', '>'),
-    ('\u{00AB}', '\u{00BB}'), // guillemets
-    ('\u{2039}', '\u{203A}'), // single guillemets
-    ('\u{2264}', '\u{2265}'), // less/greater than or equal
-    ('\u{2308}', '\u{2309}'), // ceiling
-    ('\u{230A}', '\u{230B}'), // floor
-];
-
-/// Number of leading `MIRRORED_PAIRS` entries that are paired brackets in
-/// the sense of rule N0 (`Bidi_Paired_Bracket`); the rest only mirror.
-const PAIRED_BRACKETS: usize = 13;
-
-/// The mirror image of `c`, or `c` itself when it has none.
+/// The mirror image of `c` (`Bidi_Mirroring_Glyph`), or `c` itself when
+/// it has none. Rule L4 displays a mirrored character at an odd level by
+/// its mirror image; a bracket painted in a right-to-left word is turned
+/// back into the character that was written with the same data.
 pub(crate) fn mirror_char(c: char) -> char {
-    for &(open, close) in MIRRORED_PAIRS {
-        if c == open {
-            return close;
-        }
-        if c == close {
-            return open;
-        }
-    }
-    c
+    crate::bidi_mirroring::mirrored(c).unwrap_or(c)
 }
 
-/// For a paired bracket, its pair's opening glyph and whether `c` is that
-/// opening glyph.
+/// For a paired bracket (`Bidi_Paired_Bracket_Type`), its pair's opening
+/// glyph — canonical equivalents such as the two angle brackets share one
+/// — and whether `c` is that opening glyph.
 fn paired_bracket(c: char) -> Option<(char, bool)> {
-    MIRRORED_PAIRS[..PAIRED_BRACKETS]
-        .iter()
-        .find_map(|&(open, close)| {
-            if c == open {
-                Some((open, true))
-            } else if c == close {
-                Some((open, false))
-            } else {
-                None
-            }
-        })
+    HardcodedBidiData
+        .bidi_matched_opening_bracket(c)
+        .map(|pair| (pair.opening, pair.is_open))
 }
 
 /// Combining marks by general category (Mn) or nonzero canonical combining
@@ -719,6 +678,16 @@ fn joins_number(c: char) -> bool {
 /// handed back to the items: the result lists `(item index, logical text)`
 /// in reading order.
 ///
+/// A word gap between two items in screen order puts a space into the
+/// display line for the analysis: `word_gap` is the line's own floor for
+/// one, in em of the smaller font beside the gap, when its gaps yield one
+/// (a line shown one glyph per item, see `glyph_run_word_gap_floor`);
+/// otherwise a gap is a word gap from a tenth of an em. Between the two halves of a number it takes
+/// three tenths whatever the floor — digits keep their own widths where a
+/// font's letters are off, and a kerned or split number is still one
+/// token, which a space would break into two numbers the paragraph
+/// direction then orders.
+///
 /// Items holding a letter or a digit are ordered by where those characters
 /// land in the logical line. An item of punctuation alone keeps the
 /// neighbours it has on the page — a bracket glyph may be either of the
@@ -736,12 +705,14 @@ pub(crate) fn logical_line_order<T>(
     span_of: impl Fn(&T) -> (f32, f32),
     em_of: impl Fn(&T) -> f32,
     text_is_visual: impl Fn(usize) -> bool,
+    word_gap: Option<f32>,
     rtl_base: bool,
 ) -> Vec<(usize, String)> {
     let mut visual: Vec<VisualChar> = Vec::new();
     let mut counts: Vec<usize> = vec![0; items.len()];
     let mut prev_right: Option<f32> = None;
     let mut prev_last: Option<char> = None;
+    let mut prev_em = f32::INFINITY;
     for (index, item) in items.iter().enumerate() {
         let (x, width) = span_of(item);
         let display: Cow<'_, str> = if text_is_visual(index) {
@@ -752,12 +723,12 @@ pub(crate) fn logical_line_order<T>(
         if let Some(right) = prev_right {
             let numeric_junction = prev_last.is_some_and(joins_number)
                 && display.chars().next().is_some_and(joins_number);
-            let gap_em = if numeric_junction {
-                NUMBER_GAP_EM
-            } else {
-                WORD_GAP_EM
+            let floor = match word_gap {
+                _ if numeric_junction => em_of(item).max(1.0) * NUMBER_GAP_EM,
+                Some(floor_em) => floor_em * em_of(item).min(prev_em).max(1.0),
+                None => em_of(item).max(1.0) * WORD_GAP_EM,
             };
-            if x - right > em_of(item).max(1.0) * gap_em {
+            if x - right > floor {
                 visual.push(VisualChar {
                     ch: ' ',
                     item: None,
@@ -766,6 +737,7 @@ pub(crate) fn logical_line_order<T>(
         }
         prev_right = Some(prev_right.unwrap_or(f32::MIN).max(x + width.max(0.0)));
         prev_last = display.chars().last().or(prev_last);
+        prev_em = em_of(item);
         counts[index] = display.chars().count();
         visual.extend(display.chars().map(|ch| VisualChar {
             ch,
@@ -876,6 +848,29 @@ mod tests {
 
     // שלום עולם
     const HELLO_WORLD: &str = "\u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{05E2}\u{05D5}\u{05DC}\u{05DD}";
+
+    #[test]
+    fn mirrored_characters_come_from_the_unicode_data() {
+        // Mathematical white square brackets around a Hebrew word: the
+        // display shows the opening glyph at the left, and the pair reads
+        // back as it was written.
+        assert_eq!(
+            logical_text("\u{27E6}\u{05D1}\u{05D0}\u{27E7}", true),
+            "\u{27E6}\u{05D0}\u{05D1}\u{27E7}"
+        );
+        // A mirrored character that pairs with nothing (less-than or
+        // equal to) is un-mirrored by the same data.
+        assert_eq!(
+            logical_text("\u{05D1} \u{2265} \u{05D0}", true),
+            "\u{05D0} \u{2264} \u{05D1}"
+        );
+        assert_eq!(mirror_char('\u{00AB}'), '\u{00BB}');
+        assert_eq!(mirror_char('a'), 'a');
+        // Canonically equivalent angle brackets pair with each other.
+        assert_eq!(paired_bracket('\u{2329}'), Some(('\u{3008}', true)));
+        assert_eq!(paired_bracket('\u{3009}'), Some(('\u{3008}', false)));
+        assert_eq!(paired_bracket('\u{00AB}'), None);
+    }
 
     #[test]
     fn pure_rtl_line_is_reversed() {
@@ -1011,7 +1006,15 @@ mod tests {
             ("\u{05DD}\u{05DC}\u{05D5}\u{05E2}", 100.0f32, 30.0f32), // עולם reversed
             ("\u{05DD}\u{05D5}\u{05DC}\u{05E9}", 140.0, 30.0),       // שלום reversed
         ];
-        let order = logical_line_order(&items, |i| i.0, |i| (i.1, i.2), |_| 12.0, |_| true, true);
+        let order = logical_line_order(
+            &items,
+            |i| i.0,
+            |i| (i.1, i.2),
+            |_| 12.0,
+            |_| true,
+            None,
+            true,
+        );
         assert_eq!(
             order,
             vec![
@@ -1031,7 +1034,15 @@ mod tests {
             ("16)", 133.0, 16.0),
             ("\u{05DF}\u{05E7}\u{05EA}\u{05D4}", 160.0, 28.0),
         ];
-        let order = logical_line_order(&items, |i| i.0, |i| (i.1, i.2), |_| 12.0, |_| true, true);
+        let order = logical_line_order(
+            &items,
+            |i| i.0,
+            |i| (i.1, i.2),
+            |_| 12.0,
+            |_| true,
+            None,
+            true,
+        );
         assert_eq!(
             order,
             vec![
@@ -1060,7 +1071,15 @@ mod tests {
                 39.0,
             ),
         ];
-        let order = logical_line_order(&items, |i| i.0, |i| (i.1, i.2), |_| 10.0, |_| true, true);
+        let order = logical_line_order(
+            &items,
+            |i| i.0,
+            |i| (i.1, i.2),
+            |_| 10.0,
+            |_| true,
+            None,
+            true,
+        );
         assert_eq!(
             order,
             vec![
@@ -1089,7 +1108,15 @@ mod tests {
             ("42", 140.0, 12.0),
             ("\u{05E9}\u{05DC}", 160.0, 20.0),
         ];
-        let order = logical_line_order(&items, |i| i.0, |i| (i.1, i.2), |_| 12.0, |_| false, true);
+        let order = logical_line_order(
+            &items,
+            |i| i.0,
+            |i| (i.1, i.2),
+            |_| 12.0,
+            |_| false,
+            None,
+            true,
+        );
         let indexes: Vec<usize> = order.iter().map(|(i, _)| *i).collect();
         assert_eq!(indexes, vec![3, 1, 2, 0]);
         assert_eq!(order[2].1, "42");

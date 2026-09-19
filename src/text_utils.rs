@@ -202,6 +202,7 @@ pub(crate) fn reorder_bidi_line<T: Clone>(
         },
         |item| item_of(item).font_size,
         |_| false,
+        None,
         rtl_base,
     );
     let source: Vec<T> = items.to_vec();
@@ -603,15 +604,18 @@ fn is_arabic_numeric_separator(c: char) -> bool {
 }
 
 /// A decoded show-op string qualifies as evidence in the geometric
-/// visual-order vote when RTL letters dominate it. A single letter reads
-/// the same in either storage order, but the way one-glyph show operators
-/// walk along the line tells the two conventions apart just as well.
-/// Arabic-Indic digits don't count: they're stored left-to-right in both
-/// conventions, so a bare number carries no evidence.
+/// visual-order vote when it holds an RTL letter. The vote reads the way
+/// show operators walk along the line, which tells the two conventions
+/// apart whatever else a string holds: a single letter reads the same in
+/// either storage order, and a string that is mostly Latin — a whole line
+/// shown by one operator, with a right-to-left word inside it — is the
+/// typical output of a visual-order producer, whose pages would otherwise
+/// cast no vote at all and keep that word reversed. Arabic-Indic digits
+/// don't count: they're stored left-to-right in both conventions, so a
+/// bare number carries no evidence.
 pub(crate) fn is_visual_rtl_candidate(text: &str) -> bool {
     text.chars()
         .any(|c| is_rtl_char(c) && !is_arabic_indic_digit(c) && !is_arabic_numeric_separator(c))
-        && is_rtl_text(std::iter::once(text))
 }
 
 /// Whether a page's right-to-left runs are stored in visual (screen
@@ -1469,8 +1473,9 @@ mod tests {
         assert!(is_visual_rtl_candidate("\u{FEDF}\u{FEE0}"));
         // A single RTL letter votes with its position like a longer run
         assert!(is_visual_rtl_candidate("\u{05E9}"));
-        // Latin-dominant with embedded RTL: internal order is Latin's
-        assert!(!is_visual_rtl_candidate("the word \u{05E9}\u{05DC} here"));
+        // Latin-dominant with an embedded RTL word: the operator's walk
+        // along the line is evidence all the same
+        assert!(is_visual_rtl_candidate("the word \u{05E9}\u{05DC} here"));
         // Pure Latin
         assert!(!is_visual_rtl_candidate("Hello"));
         // Arabic-Indic digits are stored left-to-right in both conventions:

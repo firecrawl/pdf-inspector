@@ -1380,17 +1380,24 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
 /// item, from its own gaps: the letter gaps of such a line cluster below
 /// its word gaps. Declared advance widths are often off for these fonts,
 /// so the fixed em fractions that serve word-by-word runs would put a space
-/// after every narrow letter. The gaps (in em) are split into two classes
-/// where the variance between them is largest (Otsu's threshold), and the
-/// floor sits between the classes when the upper one is a space's worth
-/// apart from the lower — glyphs of a second font with true widths, digits
-/// at zero gap beside letters at a small one, form no such class. `None`
-/// when the gaps do not tell; infinite when they are all letter gaps.
-fn glyph_run_word_gap_floor(gaps: &[f32], font_size: f32) -> Option<f32> {
-    if gaps.len() < 3 || font_size <= 0.0 {
+/// after every narrow letter. The gaps are given and the floor returned in
+/// em — of the smaller font beside each gap, so a word gap next to a
+/// footnote mark or a run of a smaller font is measured by the glyphs it
+/// separates. They are split into two classes where the variance between
+/// them is largest (Otsu's threshold), and the floor sits between the
+/// classes when the upper one is a space's worth apart from the lower —
+/// glyphs of a second font with true widths, digits at zero gap beside
+/// letters at a small one, form no such class. With one class of gaps the
+/// floor is infinite when even the wide ones are mid-word gaps (under the
+/// 0.13 em a junction inside a word may open to), so a line of one word
+/// holds together; gaps of one class that are wider than that could as
+/// well be the word gaps of one-letter words, and the fixed thresholds
+/// decide them: `None`.
+fn glyph_run_word_gap_floor(gaps: &[f32]) -> Option<f32> {
+    if gaps.len() < 3 {
         return None;
     }
-    let mut sorted: Vec<f32> = gaps.iter().map(|g| g / font_size).collect();
+    let mut sorted: Vec<f32> = gaps.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let total: f32 = sorted.iter().sum();
     let n = sorted.len() as f32;
@@ -1407,12 +1414,12 @@ fn glyph_run_word_gap_floor(gaps: &[f32], font_size: f32) -> Option<f32> {
             best = Some((variance, low_mean, high_mean));
         }
     }
-    let median = sorted[sorted.len() / 2];
+    let upper_quartile = sorted[sorted.len() * 3 / 4];
     match best {
         Some((_, low_mean, high_mean)) if high_mean - low_mean >= 0.12 && high_mean >= 0.2 => {
-            Some((low_mean + high_mean) / 2.0 * font_size)
+            Some((low_mean + high_mean) / 2.0)
         }
-        _ if median <= 0.35 => Some(f32::INFINITY),
+        _ if upper_quartile <= 0.13 => Some(f32::INFINITY),
         _ => None,
     }
 }
@@ -1483,6 +1490,13 @@ fn merge_text_items_with_clips(
         bidi: bool,
         /// For a `bidi` line, each fragment's position in screen order.
         display_index: Vec<usize>,
+        /// For a `bidi` line, the gap between each pair of screen
+        /// neighbours, in points, by screen position.
+        display_gaps: Vec<f32>,
+        /// For a `bidi` line shown one glyph per fragment, the word-gap
+        /// floor its own gaps give (`glyph_run_word_gap_floor`), in em of
+        /// the smaller font at a junction.
+        glyph_floor: Option<f32>,
     }
     let mut ordered_line_groups: Vec<LineGroup<'_>> = Vec::new();
 
@@ -1497,6 +1511,8 @@ fn merge_text_items_with_clips(
         let preserve_stream_order = !bidi && should_preserve_overlapping_stream_order(&group);
         let texts: Vec<Cow<'_, str>>;
         let mut display_index: Vec<usize> = Vec::new();
+        let mut display_gaps: Vec<f32> = Vec::new();
+        let mut glyph_floor: Option<f32> = None;
         if bidi {
             // Screen order first; the fragments are then taken in the reading
             // order the Unicode Bidirectional Algorithm gives the line, so an
@@ -1510,12 +1526,47 @@ fn merge_text_items_with_clips(
                 page_rtl.get(&page).copied().unwrap_or(false),
             );
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
+            // The gaps between screen neighbours, taken once here: two
+            // glyphs at one x (a mark over its letter) sort either way, and
+            // the reading order below must index the same sequence.
+            display_gaps = group
+                .windows(2)
+                .map(|pair| pair[1].x - (pair[0].x + effective_merge_width(pair[0])))
+                .collect();
+            // Glyph-by-glyph positioned RTL text clusters into words by the
+            // line's own gaps: adjacent glyphs abut, word gaps do not, with
+            // the floor below where declared widths are off. Junctions
+            // inside a number are never word gaps and say nothing about the
+            // letters' gaps either (digits of another font keep true
+            // widths), so they stay out of the sample. The same floor
+            // separates the words for the bidi analysis and, below, for the
+            // merge.
+            let single_glyphs = group
+                .iter()
+                .filter(|i| i.text.trim().chars().count() == 1)
+                .count();
+            if group.len() >= 4 && single_glyphs * 10 >= group.len() * 7 {
+                let numeric = |t: &str| {
+                    let t = t.trim();
+                    !t.is_empty()
+                        && t.chars()
+                            .all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | ':' | '/'))
+                };
+                let gaps: Vec<f32> = group
+                    .windows(2)
+                    .zip(&display_gaps)
+                    .filter(|(pair, _)| !(numeric(&pair[0].text) && numeric(&pair[1].text)))
+                    .map(|(pair, gap)| gap / pair[0].font_size.min(pair[1].font_size).max(1.0))
+                    .collect();
+                glyph_floor = glyph_run_word_gap_floor(&gaps);
+            }
             let order = crate::bidi::logical_line_order(
                 &group,
                 |i| i.text.as_str(),
                 |i| (i.x, i.width),
                 |i| i.font_size,
                 |_| visual_rtl,
+                glyph_floor,
                 rtl_base,
             );
             let reordered: Vec<&TextItem> = order.iter().map(|&(index, _)| group[index]).collect();
@@ -1548,6 +1599,8 @@ fn merge_text_items_with_clips(
             preserve_stream_order,
             bidi,
             display_index,
+            display_gaps,
+            glyph_floor,
         });
     }
 
@@ -1563,6 +1616,8 @@ fn merge_text_items_with_clips(
             preserve_stream_order,
             bidi,
             display_index,
+            display_gaps,
+            glyph_floor,
             ..
         } = line;
         // A line of right-to-left text is walked in reading order, which
@@ -1573,19 +1628,7 @@ fn merge_text_items_with_clips(
         // order; where the walk jumps into or out of an embedded run, it is
         // the gap between that run's near end and the fragment it turned
         // from — the wider of the two screen gaps that flank the jump, the
-        // other being inside a run. Glyph-by-glyph positioned RTL text
-        // clusters into words this way: adjacent glyphs abut, word gaps do
-        // not, with the floor below where declared widths are off.
-        let display_gaps: Vec<f32> = if *bidi {
-            let mut by_display: Vec<&TextItem> = group.clone();
-            by_display.sort_by(|a, b| a.x.total_cmp(&b.x));
-            by_display
-                .windows(2)
-                .map(|pair| pair[1].x - (pair[0].x + effective_merge_width(pair[0])))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // other being inside a run.
         let junction_gap = |from: usize, to: usize| -> f32 {
             let (a, b) = (display_index[from], display_index[to]);
             if a.abs_diff(b) == 1 {
@@ -1604,33 +1647,7 @@ fn merge_text_items_with_clips(
                 (None, None) => 0.0,
             }
         };
-        let glyph_floor = if *bidi
-            && group.len() >= 4
-            && group
-                .iter()
-                .zip(texts)
-                .filter(|(_, t)| t.trim().chars().count() == 1)
-                .count()
-                * 10
-                >= group.len() * 7
-        {
-            // Junctions inside a number are never word gaps and say nothing
-            // about the letters' gaps either (digits of another font keep
-            // true widths); they stay out of the sample.
-            let numeric = |t: &str| {
-                let t = t.trim();
-                !t.is_empty()
-                    && t.chars()
-                        .all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | ':' | '/'))
-            };
-            let gaps: Vec<f32> = (1..group.len())
-                .filter(|&j| !(numeric(&texts[j - 1]) && numeric(&texts[j])))
-                .map(|j| junction_gap(j - 1, j))
-                .collect();
-            glyph_run_word_gap_floor(&gaps, group[0].font_size)
-        } else {
-            None
-        };
+        let glyph_floor = *glyph_floor;
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
@@ -1756,7 +1773,9 @@ fn merge_text_items_with_clips(
                     && !next_text.trim().is_empty();
                 let effective_threshold = match (tracked, glyph_floor) {
                     (Some((run_end, floor)), _) if j <= run_end => floor,
-                    (_, Some(floor)) => floor,
+                    (_, Some(floor_em)) => {
+                        floor_em * group[j - 1].font_size.min(next.font_size).max(1.0)
+                    }
                     _ => threshold,
                 };
                 let bold_boundary = next.is_bold != first.is_bold
@@ -1873,6 +1892,32 @@ mod tests {
     use layout::{detect_columns, is_newspaper_layout, ColumnRegion};
 
     /// Glyph-per-item run at `fs`=12 with the given inter-glyph gap (pt).
+    #[test]
+    fn glyph_run_word_gap_floor_splits_letter_gaps_from_word_gaps() {
+        // Letter gaps under a tenth of an em and two word gaps of a third:
+        // the floor sits between the classes.
+        let gaps = [0.06, 0.08, 0.07, 0.34, 0.09, 0.06, 0.32, 0.08];
+        let floor = glyph_run_word_gap_floor(&gaps).expect("two classes");
+        assert!(floor > 0.09 && floor < 0.32, "{floor}");
+    }
+
+    #[test]
+    fn glyph_run_word_gap_floor_holds_one_word_together() {
+        // One class of gaps, all mid-word sized: the line is one word.
+        let gaps = [0.06, 0.09, 0.11, 0.07, 0.10];
+        assert_eq!(glyph_run_word_gap_floor(&gaps), Some(f32::INFINITY));
+    }
+
+    #[test]
+    fn glyph_run_word_gap_floor_leaves_uniform_wide_gaps_to_the_thresholds() {
+        // One class of gaps as wide as word spaces (one-letter words, or a
+        // short run whose gaps do not tell): no floor of its own.
+        let gaps = [0.24, 0.26, 0.25, 0.25];
+        assert_eq!(glyph_run_word_gap_floor(&gaps), None);
+        // Too few gaps to read a distribution from.
+        assert_eq!(glyph_run_word_gap_floor(&[0.05, 0.3]), None);
+    }
+
     fn glyph_run(chars: &str, start_x: f32, glyph_w: f32, gap: f32) -> Vec<TextItem> {
         let mut x = start_x;
         let mut out = Vec::new();

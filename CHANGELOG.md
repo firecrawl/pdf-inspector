@@ -14,21 +14,22 @@ Changes since 1.21.0.
 ### Fixed
 
 - Right-to-left text stored in visual order now reads back through the
-  Unicode Bidirectional Algorithm, line by line: a Hebrew or Arabic word
+  Unicode Bidirectional Algorithm, line by line. A Hebrew or Arabic word
   came out with its letters mirrored when the line also held a number, a
-  Latin phrase or punctuation, and a colon, a period or a percent sign next
-  to a number landed on the wrong side of it. Embedded Latin phrases and
+  Latin phrase or punctuation. A colon, a period or a percent sign next to
+  a number landed on the wrong side of it. Embedded Latin phrases and
   numbers keep their own order, mirrored brackets turn back into the
-  characters that were written, and a line of a Latin paragraph that quotes
-  a right-to-left word keeps reading left to right.
+  characters that were written (by the Unicode mirroring data), and a line
+  of a Latin paragraph that quotes a right-to-left word keeps reading left
+  to right.
 - Hebrew and Arabic text positioned one glyph per show operator merges into
   words by the line's own gaps instead of taking a word space after every
   glyph whose declared width falls short of its advance, so a word no
   longer comes out as scattered letters.
 - Arabic (and Hebrew) presentation forms — the positional and ligature
-  code points a font subset by glyph maps its glyphs to — are normalized to
-  the letters they stand for once the text is in reading order, so a
-  ligature's letters come out in order too.
+  code points that a font subsetted by glyph maps its glyphs to — are
+  normalized to the letters they stand for once the text is in reading
+  order, so a ligature's letters come out in order too.
 
 ## [1.21.0] - 2026-09-18
 
