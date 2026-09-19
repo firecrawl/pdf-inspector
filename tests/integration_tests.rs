@@ -6363,3 +6363,85 @@ fn test_page_with_only_clipped_away_text_reports_no_native_text() {
     );
     assert!(page.needs_ocr);
 }
+
+/// Display titles set with tracking — as a `Tc` character spacing, and as
+/// the offsets of a glyph-per-string `TJ` array, with kerning on top and a
+/// word gap a space width above the letter gaps — over a justified body
+/// line whose word gaps are `TJ` offsets between whole words, a kerned
+/// glyph-per-string body line, and a line of one-letter words a space
+/// apart.
+fn make_tracked_titles_pdf() -> Vec<u8> {
+    make_text_pdf(
+        "BT /F1 24 Tf 6 Tc 72 720 Td (VALLEY) Tj ET\n\
+         BT /F1 24 Tf 6 Tc 72 690 Td (VALLEY ROAD) Tj ET\n\
+         BT /F1 24 Tf 0 Tc 72 660 Td [(V) -216 (A) -333 (L) -166 (L) -250 (E) -290 (Y)] TJ ET\n\
+         BT /F1 24 Tf 72 630 Td [(A) -300 (N) -300 (N) -300 (U) -300 (A) -300 (L) -700 (R) -300 (E) -300 (P) -300 (O) -300 (R) -300 (T)] TJ ET\n\
+         BT /F1 18 Tf 72 600 Td [(V) -120 (a) -140 (l) -100 (l) -120 (e) -130 (y)] TJ ET\n\
+         BT /F1 12 Tf 72 570 Td [(The) -258 (quick) -300 (brown) -280 (f) -20 (ox) -280 (jumps)] TJ ET\n\
+         BT /F1 12 Tf 72 550 Td [(T) 20 (h) -5 (e) -278 (l) 10 (a) -3 (z) -8 (y) -278 (d) -5 (o) (g)] TJ ET\n\
+         BT /F1 12 Tf 72 530 Td [(a) -333 (b) -333 (c) -333 (d)] TJ ET",
+        "0 0 612 792",
+    )
+}
+
+/// Tracked titles come out as whole words on every API, each word with the
+/// box its glyphs span, while the word gaps of ordinary text — positioned
+/// words, kerned glyphs, one-letter words — are kept.
+#[test]
+fn test_tracked_titles_stay_whole_words() {
+    let buf = make_tracked_titles_pdf();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+    for expected in [
+        "VALLEY",
+        "VALLEY ROAD",
+        "ANNUAL",
+        "REPORT",
+        "Valley",
+        "The quick brown fox jumps",
+        "The lazy dog",
+        "a b c d",
+    ] {
+        assert!(
+            texts.contains(&expected),
+            "{expected:?} missing from {texts:?}"
+        );
+    }
+    assert!(
+        !texts.iter().any(|text| text.contains("V A L")),
+        "letter-spaced title in {texts:?}"
+    );
+    // Each word of the tracked two-word title keeps its glyph box: the
+    // letters of "ANNUAL" advance 4.056 em plus five 0.3 em letter gaps at
+    // 24 pt, and "REPORT" starts a 0.7 em word gap after the last letter.
+    let annual = items.iter().find(|item| item.text == "ANNUAL").unwrap();
+    let report = items.iter().find(|item| item.text == "REPORT").unwrap();
+    assert!((annual.x - 72.0).abs() < 0.01, "{annual:?}");
+    assert!(
+        (annual.width - (4.056 + 1.5) * 24.0).abs() < 0.1,
+        "{annual:?}"
+    );
+    assert!(
+        (report.x - (annual.x + annual.width + 0.7 * 24.0)).abs() < 0.1,
+        "{report:?}"
+    );
+    assert!(
+        (report.width - (4.167 + 1.5) * 24.0).abs() < 0.1,
+        "{report:?}"
+    );
+    assert!(annual.advance_known && report.advance_known);
+
+    let markdown = process_pdf_mem(&buf).unwrap().markdown.unwrap();
+    for expected in [
+        "VALLEY ROAD",
+        "ANNUAL REPORT",
+        "Valley",
+        "The quick brown fox jumps",
+    ] {
+        assert!(
+            markdown.contains(expected),
+            "{expected:?} missing from {markdown}"
+        );
+    }
+    assert!(!markdown.contains("V A L L E Y"), "{markdown}");
+}

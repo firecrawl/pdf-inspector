@@ -25,8 +25,8 @@ use super::geometry::{
 use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
 use super::word_gaps::{
-    offset_takes_spacing_back, word_gap_candidate, word_gap_threshold, PendingWordGaps,
-    WordGapCandidate,
+    offset_takes_spacing_back, tj_tracking, word_gap_candidate, word_gap_threshold,
+    PendingWordGaps, WordGapCandidate,
 };
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -1069,6 +1069,34 @@ pub(crate) fn extract_page_text_items_with_options(
                         // spacing alike, from the font metrics when available.
                         let space_threshold = word_gap_threshold(font_info);
                         let column_gap_threshold = space_threshold * 4.0;
+                        // A tracked display run — one glyph per string, the
+                        // letter spacing as the offset between them — is
+                        // judged over its own tracking (see `tj_tracking`):
+                        // its letter gaps stay inside the word, and an
+                        // offset wider by a word gap ends the sub-run, so
+                        // each word keeps the box its glyphs span. Elsewhere
+                        // the fixed thresholds apply: a word gap adds a
+                        // space, a column gap ends the sub-run.
+                        let tracking = tj_tracking(array, font_info, space_threshold, |element| {
+                            extract_text_from_operand(
+                                element,
+                                &current_font,
+                                font_base_names.get(&current_font).map(|s| s.as_str()),
+                                font_cmaps,
+                                &font_tounicode_refs,
+                                &inline_cmaps,
+                                &font_encodings,
+                                &encoding_cache,
+                                &mut cmap_decisions,
+                                &font_widths,
+                            )
+                        });
+                        let (word_gap, split_gap) = match tracking {
+                            Some(tracking) => {
+                                (space_threshold + tracking, space_threshold + tracking)
+                            }
+                            None => (space_threshold, column_gap_threshold),
+                        };
 
                         // Track sub-items for column-gap splitting:
                         // (text, start_width_ts, end_width_ts)
@@ -1111,7 +1139,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         backward_jump = true;
                                     }
                                     if !is_invisible
-                                        && n_val < -column_gap_threshold
+                                        && n_val < -split_gap
                                         && !current_text.is_empty()
                                     {
                                         // Column gap: flush current segment
@@ -1128,7 +1156,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     } else {
                                         total_width_ts += displacement;
                                         if !is_invisible
-                                            && n_val < -space_threshold
+                                            && n_val < -word_gap
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
@@ -1150,7 +1178,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         backward_jump = true;
                                     }
                                     if !is_invisible
-                                        && n_val < -column_gap_threshold
+                                        && n_val < -split_gap
                                         && !current_text.is_empty()
                                     {
                                         sub_items.push((
@@ -1166,7 +1194,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     } else {
                                         total_width_ts += displacement;
                                         if !is_invisible
-                                            && n_val < -space_threshold
+                                            && n_val < -word_gap
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
@@ -4469,6 +4497,83 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             (
                 "BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj ET BT /F1 10 Tf 0 Tc 87 700 Td (o) Tj ET",
                 "dto",
+            ),
+        ] {
+            let items = extract_simple_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts, [expected], "{content}: {items:?}");
+        }
+    }
+
+    /// Tracked display text set as a glyph-per-string `TJ` array is judged
+    /// over its own tracking: letter gaps, kerning included, stay inside
+    /// the word and a gap wider by a word space ends the word. The test
+    /// font's space is 0.6 em, so its word-gap threshold is 240 thousandths.
+    #[test]
+    fn tracked_tj_titles_stay_whole_words() {
+        for (content, expected) in [
+            (
+                "BT /F1 24 Tf 72 700 Td [(V) -250 (A) -250 (L) -250 (L) -250 (E) -250 (Y)] TJ ET",
+                "VALLEY",
+            ),
+            (
+                "BT /F1 24 Tf 72 700 Td [(V) -216 (A) -333 (L) -166 (L) -250 (E) -290 (Y)] TJ ET",
+                "VALLEY",
+            ),
+            (
+                "BT /F1 24 Tf 72 700 Td [(V) -216 (A) -333 (L) -166 (L) -250 (E) -290 (Y) -560 (R) -240 (O) -260 (A) -250 (D)] TJ ET",
+                "VALLEY ROAD",
+            ),
+            (
+                "BT /F1 24 Tf 72 700 Td [(V) -150 (a) -170 (l) -130 (l) -150 (e) -160 (y)] TJ ET",
+                "Valley",
+            ),
+            // A negative `Tf` size reads the offsets the same way.
+            (
+                "BT /F1 -24 Tf -1 0 0 -1 72 700 Tm [(V) -250 (A) -250 (L) -250 (L) -250 (E) -250 (Y)] TJ ET",
+                "VALLEY",
+            ),
+        ] {
+            let items = extract_simple_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts.join(" "), expected, "{content}: {items:?}");
+        }
+    }
+
+    /// Each word of a tracked run keeps the box its glyphs span: the
+    /// letters of "VALLEY" advance 0.6 em each plus 0.25 em of tracking at
+    /// 24 pt, and "ROAD" starts a 0.56 em word gap after the last letter.
+    #[test]
+    fn tracked_tj_words_keep_their_glyph_boxes() {
+        let items = extract_simple_items(
+            b"BT /F1 24 Tf 72 700 Td [(V) -250 (A) -250 (L) -250 (L) -250 (E) -250 (Y) -560 (R) -250 (O) -250 (A) -250 (D)] TJ ET",
+        );
+        let valley = find_item(&items, "VALLEY");
+        assert_close(valley.x, 72.0, "x");
+        assert_close(valley.width, 6.0 * 14.4 + 5.0 * 6.0, "width");
+        let road = find_item(&items, "ROAD");
+        assert_close(road.x, 72.0 + valley.width + 0.56 * 24.0, "x");
+        assert_close(road.width, 4.0 * 14.4 + 3.0 * 6.0, "width");
+        assert!(valley.advance_known && road.advance_known);
+    }
+
+    /// Offsets that are not tracking are read as before: words positioned
+    /// by offsets, kerning between single glyphs with a word gap among
+    /// them, and one-letter words a space width apart.
+    #[test]
+    fn tj_offsets_that_are_not_tracking_read_as_before() {
+        for (content, expected) in [
+            (
+                "BT /F1 12 Tf 72 700 Td [(The) -258 (quick) -300 (brown) -280 (f) -20 (ox)] TJ ET",
+                "The quick brown fox",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td [(T) 20 (h) -5 (e) -278 (q) 10 (u) -3 (i) -8 (c) (k)] TJ ET",
+                "The quick",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td [(a) -600 (b) -600 (c) -600 (d)] TJ ET",
+                "a b c d",
             ),
         ] {
             let items = extract_simple_items(content.as_bytes());
