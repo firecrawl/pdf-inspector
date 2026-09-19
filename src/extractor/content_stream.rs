@@ -1072,10 +1072,14 @@ pub(crate) fn extract_page_text_items_with_options(
                         // letter spacing as the offset between them — is
                         // judged over its own tracking (see `tj_tracking`
                         // and `tj_gap_thresholds`); a run that shows nothing
-                        // is not read for it.
+                        // is not read for it. The reader decodes only to
+                        // check the case of a widely spaced run, on a copy
+                        // of the CMap decisions, so the glyphs it samples do
+                        // not count twice when the loop below decodes them.
                         let tracking = if is_invisible {
                             None
                         } else {
+                            let mut probe_decisions: Option<CMapDecisionCache> = None;
                             tj_tracking(array, font_info, space_threshold, |element| {
                                 extract_text_from_operand(
                                     element,
@@ -1086,7 +1090,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     &inline_cmaps,
                                     &font_encodings,
                                     &encoding_cache,
-                                    &mut cmap_decisions,
+                                    probe_decisions.get_or_insert_with(|| cmap_decisions.clone()),
                                     &font_widths,
                                 )
                             })

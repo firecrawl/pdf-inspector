@@ -951,10 +951,12 @@ fn extract_form_xobject_text_inner(
                         // A tracked display run is judged over its own
                         // tracking, as on the page (see `tj_tracking` and
                         // `tj_gap_thresholds`); a hidden run is not read
-                        // for it.
+                        // for it, and the reader decodes on a copy of the
+                        // CMap decisions.
                         let tracking = if hidden {
                             None
                         } else {
+                            let mut probe_decisions: Option<CMapDecisionCache> = None;
                             tj_tracking(array, font_info, space_threshold, |element| {
                                 extract_text_from_operand(
                                     element,
@@ -965,7 +967,7 @@ fn extract_form_xobject_text_inner(
                                     &inline_cmaps,
                                     &font_encodings,
                                     &encoding_cache,
-                                    cmap_decisions,
+                                    probe_decisions.get_or_insert_with(|| cmap_decisions.clone()),
                                     &font_widths,
                                 )
                             })
