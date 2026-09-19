@@ -468,12 +468,7 @@ pub fn detect_tables_from_struct_tree(
                 // cell split across items must not have its number reversed.
                 let rtl = crate::text_utils::is_rtl_text(cell_items.iter().map(|(_, i)| &i.text));
                 if rtl {
-                    crate::text_utils::sort_rtl_cell_items(
-                        &mut cell_items,
-                        |(_, i)| i.x,
-                        |(_, i)| i.line_y(),
-                        |(_, i)| i.text.as_str(),
-                    );
+                    crate::text_utils::sort_rtl_cell_items(&mut cell_items, |(_, i)| *i);
                 } else {
                     cell_items.sort_by(|a, b| {
                         b.1.line_y()

@@ -25,6 +25,7 @@ use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -1372,16 +1373,61 @@ fn trimmed_suffix(next: &TextItem) -> &str {
 
 #[cfg(test)]
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
-    merge_text_items_with_clips(items, &[], false)
+    merge_text_items_with_clips(items, &[], false, false)
+}
+
+/// Word-gap floor for a line of right-to-left text shown one glyph per
+/// item, from its own gaps: the letter gaps of such a line cluster below
+/// its word gaps. Declared advance widths are often off for these fonts,
+/// so the fixed em fractions that serve word-by-word runs would put a space
+/// after every narrow letter. The gaps (in em) are split into two classes
+/// where the variance between them is largest (Otsu's threshold), and the
+/// floor sits between the classes when the upper one is a space's worth
+/// apart from the lower — glyphs of a second font with true widths, digits
+/// at zero gap beside letters at a small one, form no such class. `None`
+/// when the gaps do not tell; infinite when they are all letter gaps.
+fn glyph_run_word_gap_floor(gaps: &[f32], font_size: f32) -> Option<f32> {
+    if gaps.len() < 3 || font_size <= 0.0 {
+        return None;
+    }
+    let mut sorted: Vec<f32> = gaps.iter().map(|g| g / font_size).collect();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let total: f32 = sorted.iter().sum();
+    let n = sorted.len() as f32;
+    let mut best: Option<(f32, f32, f32)> = None; // (between-class variance, low mean, high mean)
+    let mut low_sum = 0.0f32;
+    for (k, &value) in sorted.iter().enumerate().take(sorted.len() - 1) {
+        low_sum += value;
+        let low_n = (k + 1) as f32;
+        let high_n = n - low_n;
+        let low_mean = low_sum / low_n;
+        let high_mean = (total - low_sum) / high_n;
+        let variance = low_n * high_n * (high_mean - low_mean).powi(2);
+        if best.is_none_or(|(v, _, _)| variance > v) {
+            best = Some((variance, low_mean, high_mean));
+        }
+    }
+    let median = sorted[sorted.len() / 2];
+    match best {
+        Some((_, low_mean, high_mean)) if high_mean - low_mean >= 0.12 && high_mean >= 0.2 => {
+            Some((low_mean + high_mean) / 2.0 * font_size)
+        }
+        _ if median <= 0.35 => Some(f32::INFINITY),
+        _ => None,
+    }
 }
 
 /// `keep_weights_apart` refuses to merge runs whose `font_weight` differs
 /// (`PositionOptions::bold_from_weight`), the way bold and plain runs are
-/// already kept apart.
+/// already kept apart. `visual_rtl` says the page's right-to-left runs are
+/// stored in visual order (see `text_utils::fix_visual_order_rtl`): the
+/// lines holding them are then read back into logical order here, as they
+/// merge.
 fn merge_text_items_with_clips(
     items: Vec<TextItem>,
     clips: &[Option<clip_boundaries::ClipRect>],
     keep_weights_apart: bool,
+    visual_rtl: bool,
 ) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
@@ -1410,35 +1456,185 @@ fn merge_text_items_with_clips(
         }
     }
 
-    let mut ordered_line_groups: Vec<(u32, f32, Vec<&TextItem>, bool)> = Vec::new();
+    // Each page's own direction: a line with right-to-left letters on a
+    // right-to-left page reads right to left even when its Latin letters
+    // outnumber them.
+    let page_rtl: HashMap<u32, bool> = items
+        .iter()
+        .map(|item| item.page)
+        .collect::<std::collections::HashSet<u32>>()
+        .into_iter()
+        .map(|page| {
+            let rtl = is_rtl_text(items.iter().filter(|i| i.page == page).map(|i| &i.text));
+            (page, rtl)
+        })
+        .collect();
+
+    /// One line's fragments, in the order they are walked.
+    struct LineGroup<'a> {
+        page: u32,
+        y: f32,
+        group: Vec<&'a TextItem>,
+        /// Each fragment's text as it reads: its own, or on a visual-order
+        /// page the stretch of the line's logical text that is its.
+        texts: Vec<Cow<'a, str>>,
+        preserve_stream_order: bool,
+        /// Holds right-to-left letters: walked in reading order, not along +x.
+        bidi: bool,
+        /// For a `bidi` line, each fragment's position in screen order.
+        display_index: Vec<usize>,
+    }
+    let mut ordered_line_groups: Vec<LineGroup<'_>> = Vec::new();
 
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
     for (page, y, mut group) in line_groups {
-        let rtl = is_rtl_text(group.iter().map(|i| &i.text));
-        let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
-        if rtl {
-            group.sort_by(|a, b| b.x.total_cmp(&a.x));
-            // Embedded LTR phrases must recover screen order before merging
-            // bakes the concatenation in — later sort_line_items passes can
-            // no longer separate a merged item.
-            crate::text_utils::restore_embedded_ltr_runs(&mut group, |i| i.text.as_str());
-        } else if !preserve_stream_order {
+        // A line with right-to-left letters, whichever direction dominates
+        // it, is walked in reading order below.
+        let bidi = group
+            .iter()
+            .any(|i| i.text.chars().any(crate::text_utils::is_rtl_char));
+        let preserve_stream_order = !bidi && should_preserve_overlapping_stream_order(&group);
+        let texts: Vec<Cow<'_, str>>;
+        let mut display_index: Vec<usize> = Vec::new();
+        if bidi {
+            // Screen order first; the fragments are then taken in the reading
+            // order the Unicode Bidirectional Algorithm gives the line, so an
+            // embedded Latin phrase or number keeps its own order when the
+            // concatenation below bakes the order in. On a visual-order page
+            // the fragments' glyphs are the display line itself, and each
+            // fragment gets its stretch of the logical text back.
+            let rtl_base = crate::text_utils::rtl_line_base(
+                &group,
+                |i| *i,
+                page_rtl.get(&page).copied().unwrap_or(false),
+            );
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
+            let order = crate::bidi::logical_line_order(
+                &group,
+                |i| i.text.as_str(),
+                |i| (i.x, i.width),
+                |i| i.font_size,
+                |_| visual_rtl,
+                rtl_base,
+            );
+            let reordered: Vec<&TextItem> = order.iter().map(|&(index, _)| group[index]).collect();
+            display_index = order.iter().map(|&(index, _)| index).collect();
+            texts = order
+                .into_iter()
+                .map(|(index, logical)| {
+                    if visual_rtl {
+                        Cow::Owned(logical)
+                    } else {
+                        Cow::Borrowed(group[index].text.as_str())
+                    }
+                })
+                .collect();
+            group = reordered;
+        } else {
+            if !preserve_stream_order {
+                group.sort_by(|a, b| a.x.total_cmp(&b.x));
+            }
+            texts = group
+                .iter()
+                .map(|i| Cow::Borrowed(i.text.as_str()))
+                .collect();
         }
-        ordered_line_groups.push((page, y, group, preserve_stream_order));
+        ordered_line_groups.push(LineGroup {
+            page,
+            y,
+            group,
+            texts,
+            preserve_stream_order,
+            bidi,
+            display_index,
+        });
     }
 
     // Sort groups by page then Y descending (top of page first)
-    ordered_line_groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
+    ordered_line_groups.sort_by(|a, b| a.page.cmp(&b.page).then_with(|| b.y.total_cmp(&a.y)));
 
     let mut merged = Vec::new();
 
-    for (_, _, group, preserve_stream_order) in &ordered_line_groups {
+    for line in &ordered_line_groups {
+        let LineGroup {
+            group,
+            texts,
+            preserve_stream_order,
+            bidi,
+            display_index,
+            ..
+        } = line;
+        // A line of right-to-left text is walked in reading order, which
+        // runs leftwards through its RTL words and rightwards through an
+        // embedded Latin phrase or number, but its word gaps are gaps between
+        // neighbours on the page. The gap at a junction of the walk is the
+        // gap between the two fragments when they are neighbours in screen
+        // order; where the walk jumps into or out of an embedded run, it is
+        // the gap between that run's near end and the fragment it turned
+        // from — the wider of the two screen gaps that flank the jump, the
+        // other being inside a run. Glyph-by-glyph positioned RTL text
+        // clusters into words this way: adjacent glyphs abut, word gaps do
+        // not, with the floor below where declared widths are off.
+        let display_gaps: Vec<f32> = if *bidi {
+            let mut by_display: Vec<&TextItem> = group.clone();
+            by_display.sort_by(|a, b| a.x.total_cmp(&b.x));
+            by_display
+                .windows(2)
+                .map(|pair| pair[1].x - (pair[0].x + effective_merge_width(pair[0])))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let junction_gap = |from: usize, to: usize| -> f32 {
+            let (a, b) = (display_index[from], display_index[to]);
+            if a.abs_diff(b) == 1 {
+                return display_gaps[a.min(b)];
+            }
+            let towards = |at: usize, other: usize| {
+                if other > at {
+                    display_gaps.get(at).copied()
+                } else {
+                    at.checked_sub(1).and_then(|k| display_gaps.get(k).copied())
+                }
+            };
+            match (towards(a, b), towards(b, a)) {
+                (Some(x), Some(y)) => x.max(y),
+                (Some(x), None) | (None, Some(x)) => x,
+                (None, None) => 0.0,
+            }
+        };
+        let glyph_floor = if *bidi
+            && group.len() >= 4
+            && group
+                .iter()
+                .zip(texts)
+                .filter(|(_, t)| t.trim().chars().count() == 1)
+                .count()
+                * 10
+                >= group.len() * 7
+        {
+            // Junctions inside a number are never word gaps and say nothing
+            // about the letters' gaps either (digits of another font keep
+            // true widths); they stay out of the sample.
+            let numeric = |t: &str| {
+                let t = t.trim();
+                !t.is_empty()
+                    && t.chars()
+                        .all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | ':' | '/'))
+            };
+            let gaps: Vec<f32> = (1..group.len())
+                .filter(|&j| !(numeric(&texts[j - 1]) && numeric(&texts[j])))
+                .map(|j| junction_gap(j - 1, j))
+                .collect();
+            glyph_run_word_gap_floor(&gaps, group[0].font_size)
+        } else {
+            None
+        };
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
-            let mut text = first.text.clone();
+            let mut text = texts[i].to_string();
             let mut legacy_symbol_rewrite = first.legacy_symbol_rewrite;
             let mut end_x = first.x + effective_merge_width(first);
             let mut box_right = first.x + first.width;
@@ -1446,7 +1642,7 @@ fn merge_text_items_with_clips(
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
-            let tracked = if *preserve_stream_order {
+            let tracked = if *preserve_stream_order || *bidi {
                 None
             } else {
                 tracked_run_space_floor(group, i)
@@ -1455,10 +1651,15 @@ fn merge_text_items_with_clips(
             let mut j = i + 1;
             while j < group.len() {
                 let next = group[j];
+                let next_text: &str = &texts[j];
+                let gap = if *bidi {
+                    junction_gap(j - 1, j)
+                } else {
+                    next.x - end_x
+                };
                 // A small-caps junction is mid-word: it both survives the
                 // font-size band below and must never take a space.
-                let small_caps_join =
-                    is_small_caps_continuation(&text, first, next, next.x - end_x);
+                let small_caps_join = is_small_caps_continuation(&text, first, next, gap);
                 // Must be similar font size, except for genuine small-caps
                 // runs, where the shrunken capitals are the same word as the
                 // full-size initial (see helper).
@@ -1489,7 +1690,6 @@ fn merge_text_items_with_clips(
                 if next.advance_known != first.advance_known {
                     break;
                 }
-                let gap = next.x - end_x;
                 let x_gap_max = if *preserve_stream_order && is_standalone_bullet_text(&text) {
                     first.font_size * 1.2
                 } else {
@@ -1521,7 +1721,7 @@ fn merge_text_items_with_clips(
                     && (next.y - first.y).abs() > first.font_size * 0.3
                     && gap < -effective_merge_width(next) * 0.5
                     && digits(text.trim())
-                    && digits(next.text.trim())
+                    && digits(next_text.trim())
                 {
                     break;
                 }
@@ -1531,7 +1731,7 @@ fn merge_text_items_with_clips(
                 // that shift advance widths relative to Td positioning.
                 let threshold = {
                     let prev_last = text.trim_end().chars().last();
-                    let next_first = next.text.trim_start().chars().next();
+                    let next_first = next_text.trim_start().chars().next();
                     // Never insert space before joining punctuation
                     if next_first.is_some_and(|c| matches!(c, '.' | ',' | ';' | ')' | ']' | '}')) {
                         first.font_size * 0.25
@@ -1540,27 +1740,35 @@ fn merge_text_items_with_clips(
                     {
                         // Lowercase→lowercase: likely mid-word, use wider threshold
                         first.font_size * 0.13
+                    } else if prev_last.is_some_and(crate::text_utils::is_rtl_char)
+                        && next_first.is_some_and(crate::text_utils::is_rtl_char)
+                    {
+                        // Two pieces of one Hebrew or Arabic word, split where
+                        // the producer kerned or rejoined a glyph run: as
+                        // mid-word as a lowercase junction.
+                        first.font_size * 0.13
                     } else {
                         first.font_size * 0.08
                     }
                 };
                 let needs_bullet_space = *preserve_stream_order
                     && is_standalone_bullet_text(&text)
-                    && !next.text.trim().is_empty();
-                let effective_threshold = match tracked {
-                    Some((run_end, floor)) if j <= run_end => floor,
+                    && !next_text.trim().is_empty();
+                let effective_threshold = match (tracked, glyph_floor) {
+                    (Some((run_end, floor)), _) if j <= run_end => floor,
+                    (_, Some(floor)) => floor,
                     _ => threshold,
                 };
                 let bold_boundary = next.is_bold != first.is_bold
                     || (keep_weights_apart && next.font_weight != first.font_weight);
                 let explicit_bold_space = bold_boundary
                     && (text.ends_with(char::is_whitespace)
-                        || next.text.starts_with(char::is_whitespace));
+                        || next_text.starts_with(char::is_whitespace));
                 // Numeric fragments have their own joining thresholds in
                 // line assembly. Injecting a word space here would split a
                 // number whose decimal point or digits use a bold font.
                 let numeric_boundary = bold_boundary
-                    && match (text.chars().last(), next.text.chars().next()) {
+                    && match (text.chars().last(), next_text.chars().next()) {
                         (Some(p), Some(c)) if p.is_ascii_digit() => {
                             c.is_ascii_digit() || matches!(c, '.' | ',' | '%')
                         }
@@ -1588,7 +1796,7 @@ fn merge_text_items_with_clips(
                 if bold_boundary {
                     break;
                 }
-                text.push_str(&next.text);
+                text.push_str(next_text);
                 legacy_symbol_rewrite |= next.legacy_symbol_rewrite;
                 box_right = box_right.max(next.x + next.width);
                 box_left = box_left.min(next.x);
@@ -1601,17 +1809,24 @@ fn merge_text_items_with_clips(
                 j += 1;
             }
 
+            // Hebrew and Arabic presentation forms stand for letters; now
+            // that the text reads in logical order, a ligature's letters
+            // come out in reading order.
+            let text = crate::bidi::normalize_presentation_forms(&text).into_owned();
+
             merged.push(TextItem {
                 text,
                 // An estimated run's item is the union of the estimated boxes
-                // it merged, including any fragment that backtracked in x.
-                x: if first.advance_known {
+                // it merged, including any fragment that backtracked in x; so
+                // is a run with right-to-left text, whose fragments were
+                // walked in reading order rather than along +x.
+                x: if first.advance_known && !*bidi {
                     first.x
                 } else {
                     box_left
                 },
                 y: first.y,
-                width: if first.advance_known {
+                width: if first.advance_known && !*bidi {
                     end_x - first.x
                 } else {
                     box_right - box_left
@@ -1858,12 +2073,12 @@ mod tests {
         more.font_weight = Some(300);
         let items = vec![label, body, more];
 
-        let merged = merge_text_items_with_clips(items.clone(), &[], false);
+        let merged = merge_text_items_with_clips(items.clone(), &[], false, false);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "Label: body text");
         assert_eq!(merged[0].font_weight, Some(500));
 
-        let apart = merge_text_items_with_clips(items, &[], true);
+        let apart = merge_text_items_with_clips(items, &[], true, false);
         assert_eq!(apart.len(), 2);
         assert_eq!(apart[0].text, "Label: ");
         assert_eq!(apart[0].font_weight, Some(500));
@@ -1880,8 +2095,14 @@ mod tests {
             make_merge_item("no", 100.0, 12.0),
             make_merge_item("weight", 113.2, 36.0),
         ];
-        assert_eq!(merge_text_items_with_clips(vec![a, b], &[], true).len(), 1);
-        assert_eq!(merge_text_items_with_clips(unknown, &[], true).len(), 1);
+        assert_eq!(
+            merge_text_items_with_clips(vec![a, b], &[], true, false).len(),
+            1
+        );
+        assert_eq!(
+            merge_text_items_with_clips(unknown, &[], true, false).len(),
+            1
+        );
     }
 
     #[test]
@@ -3535,7 +3756,7 @@ mod tests {
                 baseline_shift: 0.0,
             },
         ];
-        sort_line_items(&mut items);
+        sort_line_items(&mut items, false);
         // RTL: rightmost (higher X) comes first
         assert_eq!(items[0].x, 200.0);
         assert_eq!(items[1].x, 100.0);
@@ -3589,7 +3810,7 @@ mod tests {
                 baseline_shift: 0.0,
             },
         ];
-        sort_line_items(&mut items);
+        sort_line_items(&mut items, false);
         // LTR: leftmost comes first
         assert_eq!(items[0].x, 100.0);
         assert_eq!(items[1].x, 200.0);

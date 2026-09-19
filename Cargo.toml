@@ -42,6 +42,9 @@ log = "0.4"
 regex = "1.10"
 once_cell = "1.19"
 unicode-normalization = "0.1"
+# Unicode Bidirectional Algorithm: resolved levels for reading right-to-left
+# lines back out of their display order.
+unicode-bidi = "0.3"
 
 # TrueType font parsing (for Identity-H CID font cmap extraction)
 ttf-parser = "0.25"

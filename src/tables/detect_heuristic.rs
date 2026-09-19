@@ -1438,12 +1438,7 @@ fn detect_table_in_region(
             // restoration (matching the rect and structure-tree detectors).
             let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|i| &i.text));
             if rtl {
-                crate::text_utils::sort_rtl_cell_items(
-                    col_items,
-                    |i| i.x,
-                    |i| i.line_y(),
-                    |i| i.text.as_str(),
-                );
+                crate::text_utils::sort_rtl_cell_items(col_items, |i| *i);
             } else {
                 col_items.sort_by(|a, b| a.x.total_cmp(&b.x));
             }

@@ -731,6 +731,7 @@ dependencies = [
  "regex",
  "thiserror",
  "ttf-parser",
+ "unicode-bidi",
  "unicode-normalization",
 ]
 

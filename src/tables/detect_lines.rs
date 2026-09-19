@@ -1397,12 +1397,7 @@ fn refine_segment_grid_text_rows(
             row.iter_mut()
                 .map(|items| {
                     if crate::text_utils::is_rtl_text(items.iter().map(|item| &item.text)) {
-                        crate::text_utils::sort_rtl_cell_items(
-                            items,
-                            |item| item.x,
-                            |item| item.line_y(),
-                            |item| item.text.as_str(),
-                        );
+                        crate::text_utils::sort_rtl_cell_items(items, |item| *item);
                     } else {
                         items.sort_by(|left, right| left.x.total_cmp(&right.x));
                     }

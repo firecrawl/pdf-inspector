@@ -2550,7 +2550,9 @@ fn order_columns_with_policy(
                     if let Some(last) = merged.last_mut() {
                         if last.page == line.page && (last.y - line.y).abs() < y_tol {
                             last.items.extend(line.items);
-                            sort_line_items(&mut last.items);
+                            let rtl =
+                                crate::text_utils::is_rtl_text(last.items.iter().map(|i| &i.text));
+                            sort_line_items(&mut last.items, rtl);
                             continue;
                         }
                     }
@@ -2925,6 +2927,9 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
     if items.is_empty() {
         return Vec::new();
     }
+    // The column's own direction decides how its lines with right-to-left
+    // letters read (see `rtl_line_base`).
+    let page_rtl = crate::text_utils::is_rtl_text(items.iter().map(|i| &i.text));
 
     // Decide whether to use stream order or Y-sorting
     let use_y_sorting = should_use_y_sorting(&items);
@@ -3048,7 +3053,7 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
 
     // Sort items within each line by X position (direction-aware)
     for line in &mut lines {
-        sort_line_items(&mut line.items);
+        sort_line_items(&mut line.items, page_rtl);
     }
 
     debug!("group_single_column: {} lines", lines.len());

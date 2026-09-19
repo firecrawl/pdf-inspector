@@ -411,6 +411,9 @@ pub(crate) fn extract_page_text_items_with_options(
     // evidence of logical-order storage.
     let mut rtl_visual_candidates: Vec<usize> = Vec::new();
     let mut rtl_logical_ops: u32 = 0;
+    // Items whose text is logical whatever the page's storage order:
+    // ActualText replacements.
+    let mut logical_text_items: Vec<usize> = Vec::new();
 
     // Path construction state for m/l/h → S/s line extraction
     let mut path_subpath_start: Option<(f32, f32)> = None;
@@ -1992,6 +1995,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                 let style =
                                     font_styles.get(&current_font).copied().unwrap_or_default();
                                 let (desc_italic, desc_bold) = style.flags();
+                                logical_text_items.push(items.len());
                                 items.push(TextItem {
                                     text: expand_ligatures(&at),
                                     x: geometry.x,
@@ -2329,9 +2333,15 @@ pub(crate) fn extract_page_text_items_with_options(
 
     item_clips.resize(items.len(), shown_clip);
 
-    // Reverse visual-order RTL runs while candidate indexes are still valid
-    // (merge_text_items below reshapes the item list).
-    crate::text_utils::fix_visual_order_rtl(&mut items, &rtl_visual_candidates, rtl_logical_ops);
+    // Decide the storage order of the page's RTL runs while candidate
+    // indexes are still valid; merge_text_items below reads visual-order
+    // lines back into logical order as it merges them.
+    let visual_rtl = crate::text_utils::fix_visual_order_rtl(
+        &mut items,
+        &rtl_visual_candidates,
+        rtl_logical_ops,
+        &logical_text_items,
+    );
 
     // Runs painted wholly outside the rectangular clip in force when they
     // were shown are invisible on the rendered page: labels a charting
@@ -2372,11 +2382,11 @@ pub(crate) fn extract_page_text_items_with_options(
         }
     }
     let items = if page_rotation == PageRotation::Upright {
-        super::merge_text_items_with_clips(items, &item_clips, options.bold_from_weight)
+        super::merge_text_items_with_clips(items, &item_clips, options.bold_from_weight, visual_rtl)
     } else {
         // Clips use the original page frame; rotated-page correction is an
         // intentionally unsupported provenance case.
-        super::merge_text_items_with_clips(items, &[], options.bold_from_weight)
+        super::merge_text_items_with_clips(items, &[], options.bold_from_weight, visual_rtl)
     };
     let items = super::merge_subscript_items(items);
     Ok((
@@ -3368,15 +3378,15 @@ end"#;
     fn width_less_runs_lay_out_along_their_estimates() {
         // Without width metrics the cursor moves by the estimate the box
         // carries, so the next show operator starts where this one's estimate
-        // ends instead of on top of it — for `Tj` and `TJ` alike.
+        // ends instead of on top of it — for `Tj` and `TJ` alike. The runs
+        // abut, so they merge into one word whose box spans both estimates
+        // (overlapping runs would have stayed apart).
         let items = extract_hebrew_items(b"BT /F1 12 Tf 100 700 Td <4142> Tj <4344> Tj ET");
-        assert_eq!(items.len(), 2, "{items:?}");
-        assert_eq!((items[0].x, items[0].width), (100.0, 12.0));
-        assert_eq!((items[1].x, items[1].width), (112.0, 12.0));
-        let items = extract_hebrew_items(b"BT /F1 12 Tf 100 700 Td [<4142> <4344>] TJ <41> Tj ET");
-        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!((items[0].x, items[0].width), (100.0, 24.0));
-        assert_eq!((items[1].x, items[1].width), (124.0, 6.0));
+        let items = extract_hebrew_items(b"BT /F1 12 Tf 100 700 Td [<4142> <4344>] TJ <41> Tj ET");
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!((items[0].x, items[0].width), (100.0, 30.0));
     }
 
     #[test]

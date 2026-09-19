@@ -32,6 +32,7 @@
 pub mod python;
 
 pub mod adobe_korea1;
+mod bidi;
 pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
@@ -3835,6 +3836,7 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
     // window then emitted them as an orphan ",2,3,2,4,*" line.
     let mut sorted = matched;
     sorted.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()).then(a.x.total_cmp(&b.x)));
+    let region_rtl = text_utils::is_rtl_text(sorted.iter().map(|i| &i.text));
 
     let y_tolerance = 3.0;
     let mut lines: Vec<extractor::TextLine> = Vec::new();
@@ -3859,7 +3861,7 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 
     // Sort items within each line by X position
     for line in &mut lines {
-        text_utils::sort_line_items(&mut line.items);
+        text_utils::sort_line_items(&mut line.items, region_rtl);
     }
 
     lines
