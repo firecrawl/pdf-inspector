@@ -12,11 +12,11 @@ use lopdf::content::Content;
 /// XObject. Matches the previous post-decode skip threshold.
 pub(crate) const MAX_PAGE_OPERATIONS: usize = 1_000_000;
 
-/// Maximum decompressed bytes read for a page's content, so a page-content
-/// bomb (a tiny Flate stream inflating to gigabytes) skips the page instead
-/// of exhausting memory — the same degradation as the operator cap. Real
-/// page content runs a few MB at most; the bound is deliberately far above
-/// that.
+/// Maximum decompressed bytes read for a page's content, and for each Form
+/// XObject read on its own, so a content bomb (a tiny Flate stream
+/// inflating to gigabytes) skips the page or the form instead of exhausting
+/// memory — the same degradation as the operator cap. Real page content
+/// runs a few MB at most; the bound is deliberately far above that.
 pub(crate) const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Decode `data` unless it contains more than `max_operations` operators.

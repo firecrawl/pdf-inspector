@@ -4233,7 +4233,7 @@ fn finish_loaded_document(mut doc: Document) -> Result<(Document, u32, LoadRepai
 /// object stream that would exceed the bound (its objects resolve as
 /// not-found), which the zero-page check in `load_document_from_mem_with_password`
 /// turns into a load error instead of a silently wrong answer.
-const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 
 fn bounded_load_options() -> lopdf::LoadOptions {
     lopdf::LoadOptions {

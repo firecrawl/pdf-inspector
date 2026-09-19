@@ -108,6 +108,10 @@ Changes since 1.21.0.
   over an illustration is a text page, while a page of paths with a
   caption's worth of text, a title and address line over outlined body
   text, or a CMap that maps every code alike, still goes to OCR.
+- A Form XObject whose content inflates past the page-content bound is now
+  skipped, as a page over it already was, instead of being decompressed in
+  full before the operator cap could apply; a ToUnicode CMap the detector
+  reads is bounded the same way as the loader's own streams.
 
 ### Changed
 

@@ -301,9 +301,30 @@ fn extract_form_xobject_text_inner(
         return extracted;
     };
 
-    // Decompress the content stream (fall back to raw bytes for uncompressed streams)
-    let content_data = match stream.decompressed_content() {
+    // Decompress the content stream within the page-content bound: a form
+    // inflating past it is skipped, as a page over it is, before anything
+    // is allocated for it. A stream that fails to decode for another
+    // reason is read raw, if that fits the bound too.
+    let content_data = match stream
+        .decompressed_content_with_limit(super::content_decode::MAX_PAGE_CONTENT_BYTES)
+    {
         Ok(data) => data,
+        Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => {
+            log::warn!(
+                "form xobject {:?}: skipping — content stream exceeds {} decompressed bytes",
+                form_id,
+                super::content_decode::MAX_PAGE_CONTENT_BYTES
+            );
+            return extracted;
+        }
+        Err(_) if stream.content.len() > super::content_decode::MAX_PAGE_CONTENT_BYTES => {
+            log::warn!(
+                "form xobject {:?}: skipping — raw content stream exceeds {} bytes",
+                form_id,
+                super::content_decode::MAX_PAGE_CONTENT_BYTES
+            );
+            return extracted;
+        }
         Err(_) => stream.content.clone(),
     };
 
@@ -1769,6 +1790,34 @@ mod tests {
                 let found: Vec<&String> = items.iter().map(|i| &i.text).collect();
                 panic!("no item {text:?} in {found:?}")
             })
+    }
+
+    /// A form whose content is over the page-content bound is skipped, as
+    /// a page over it is; the forms invoked beside it are still read.
+    #[test]
+    fn form_content_over_the_byte_bound_is_skipped() {
+        let mut oversized = b"BT /F1 12 Tf 72 700 Td (lost) Tj ET".to_vec();
+        oversized.resize(
+            crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES + 1,
+            b' ',
+        );
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"q /X1 Do Q q /X2 Do Q",
+            &[&oversized, b"BT /F1 12 Tf 72 600 Td (kept) Tj ET"],
+        );
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["kept"]);
     }
 
     #[test]
