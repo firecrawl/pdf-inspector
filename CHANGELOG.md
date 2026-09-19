@@ -68,6 +68,14 @@ Changes since 1.20.0.
   for items whose weight class is unknown).
   ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
 
+### Fixed
+
+- OCR (`--ocr auto`/`--ocr force`, and the Rust, Python and Node OCR APIs)
+  no longer risks hanging at 0% CPU on multi-page scans. Page recognition
+  across OCR workers now dispatches through each worker's own dedicated
+  single-thread pool instead of a shared rayon pool, closing a
+  self-deadlock.
+
 ## [1.20.0] - 2026-09-14
 
 Changes since 1.19.0.
