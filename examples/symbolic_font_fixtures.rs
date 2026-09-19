@@ -314,11 +314,12 @@ fn literal(bytes: &[u8]) -> Object {
 
 /// Add a page with the given font resources and content stream to a
 /// document the fonts' indirect objects are already in, and save it to
-/// `path` as a one-page document.
+/// `path` as a one-page document with the given title and subject.
 fn finish_document(
     mut doc: Document,
     path: &Path,
     title: &str,
+    subject: &[u8],
     fonts: lopdf::Dictionary,
     content: String,
 ) {
@@ -345,7 +346,7 @@ fn finish_document(
     });
     let info = doc.add_object(dictionary! {
         "Title" => literal(title.as_bytes()),
-        "Subject" => literal(b"Synthetic test fixture: standard fonts and two TrueType programs built for it."),
+        "Subject" => literal(subject),
         "Producer" => literal(b"pdf-inspector examples/symbolic_font_fixtures.rs"),
     });
     doc.trailer.set("Root", Object::Reference(catalog));
@@ -402,6 +403,7 @@ fn symbol_builtin_encoding(dir: &Path) {
         doc,
         &dir.join("symbol_builtin_encoding.pdf"),
         "Symbol and ZapfDingbats through their built-in encodings",
+        b"Synthetic test fixture: standard fonts only.",
         fonts,
         content,
     );
@@ -459,38 +461,14 @@ fn base_encoding_without_differences(dir: &Path) {
         escape(mac_roman),
         escape(cp1252)
     );
-    let content_id = doc.add_object(plain_stream(dictionary! {}, content.into_bytes()));
-    let pages_id = doc.new_object_id();
-    let page = doc.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => Object::Reference(pages_id),
-        "MediaBox" => Object::Array(vec![0.into(), 0.into(), PAGE_WIDTH.into(), PAGE_HEIGHT.into()]),
-        "Resources" => dictionary! { "Font" => fonts },
-        "Contents" => Object::Reference(content_id),
-    });
-    doc.objects.insert(
-        pages_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Pages",
-            "Kids" => Object::Array(vec![Object::Reference(page)]),
-            "Count" => Object::Integer(1),
-        }),
+    finish_document(
+        doc,
+        &dir.join("base_encoding_without_differences.pdf"),
+        "Encoding dictionaries with a BaseEncoding and no Differences",
+        b"Synthetic test fixture: standard fonts only.",
+        fonts,
+        content,
     );
-    let catalog = doc.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => Object::Reference(pages_id),
-    });
-    let info = doc.add_object(dictionary! {
-        "Title" => literal(b"Encoding dictionaries with a BaseEncoding and no Differences"),
-        "Subject" => literal(b"Synthetic test fixture: standard fonts only."),
-        "Producer" => literal(b"pdf-inspector examples/symbolic_font_fixtures.rs"),
-    });
-    doc.trailer.set("Root", Object::Reference(catalog));
-    doc.trailer.set("Info", Object::Reference(info));
-    let path = dir.join("base_encoding_without_differences.pdf");
-    doc.save(&path)
-        .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-    println!("{}", path.display());
 }
 
 /// Two embedded TrueType programs without ToUnicode: a symbolic one whose
@@ -627,38 +605,14 @@ fn glyph_names_in_embedded_fonts(dir: &Path) {
     let fonts = dictionary! { "F1" => f1, "F2" => f2 };
     let content =
         "BT /F1 14 Tf 72 700 Td (ABCD) Tj ET\nBT /F2 14 Tf 72 670 Td (ABC) Tj ET\n".to_string();
-    let content_id = doc.add_object(plain_stream(dictionary! {}, content.into_bytes()));
-    let pages_id = doc.new_object_id();
-    let page = doc.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => Object::Reference(pages_id),
-        "MediaBox" => Object::Array(vec![0.into(), 0.into(), PAGE_WIDTH.into(), PAGE_HEIGHT.into()]),
-        "Resources" => dictionary! { "Font" => fonts },
-        "Contents" => Object::Reference(content_id),
-    });
-    doc.objects.insert(
-        pages_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Pages",
-            "Kids" => Object::Array(vec![Object::Reference(page)]),
-            "Count" => Object::Integer(1),
-        }),
+    finish_document(
+        doc,
+        &dir.join("glyph_names_in_embedded_fonts.pdf"),
+        "Embedded fonts decoded through their glyph names",
+        b"Synthetic test fixture: TrueType programs built for it, no ToUnicode.",
+        fonts,
+        content,
     );
-    let catalog = doc.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => Object::Reference(pages_id),
-    });
-    let info = doc.add_object(dictionary! {
-        "Title" => literal(b"Embedded fonts decoded through their glyph names"),
-        "Subject" => literal(b"Synthetic test fixture: TrueType programs built for it, no ToUnicode."),
-        "Producer" => literal(b"pdf-inspector examples/symbolic_font_fixtures.rs"),
-    });
-    doc.trailer.set("Root", Object::Reference(catalog));
-    doc.trailer.set("Info", Object::Reference(info));
-    let path = dir.join("glyph_names_in_embedded_fonts.pdf");
-    doc.save(&path)
-        .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-    println!("{}", path.display());
 }
 
 fn main() {

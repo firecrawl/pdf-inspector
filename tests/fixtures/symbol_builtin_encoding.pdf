@@ -23,7 +23,7 @@ endobj
 <</Type/Catalog/Pages 3 0 R>>
 endobj
 6 0 obj
-<</Title(Symbol and ZapfDingbats through their built-in encodings)/Subject(Synthetic test fixture: standard fonts and two TrueType programs built for it.)/Producer(pdf-inspector examples/symbolic_font_fixtures.rs)>>
+<</Title(Symbol and ZapfDingbats through their built-in encodings)/Subject(Synthetic test fixture: standard fonts only.)/Producer(pdf-inspector examples/symbolic_font_fixtures.rs)>>
 endobj
 xref
 0 7
@@ -37,5 +37,5 @@ xref
 trailer
 <</Root 5 0 R/Info 6 0 R/Size 7>>
 startxref
-1046
+1012
 %%EOF

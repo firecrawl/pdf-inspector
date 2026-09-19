@@ -826,7 +826,6 @@ pub(crate) fn build_font_encodings(
     (encodings, has_gid_fonts)
 }
 
-/// Whether the font's `/Encoding` is the name of a predefined encoding.
 /// The encoding a font's `/Encoding` entry names outright — written as a
 /// name, or as a reference to a name object — rather than describing in
 /// a dictionary.
