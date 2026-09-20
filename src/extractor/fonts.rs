@@ -2602,10 +2602,12 @@ mod tests {
         assert_eq!(BaseEncoding::WinAnsi.char_for(0x41), Some('A'));
         assert_eq!(BaseEncoding::MacRoman.char_for(0x8E), Some('\u{00E9}'));
         assert_eq!(BaseEncoding::Standard.char_for(0xE1), Some('\u{00C6}'));
-        // StandardEncoding has no glyph at 0x80; WinAnsi shows its unused
-        // codes above 0x40 as bullets.
+        // StandardEncoding has no glyph at 0x80. WinAnsi shows its unused
+        // codes above 0x40 (0x81 among them) as bullets, the glyph its
+        // code 0x95 names outright.
         assert_eq!(BaseEncoding::Standard.char_for(0x80), None);
         assert_eq!(BaseEncoding::WinAnsi.char_for(0x81), Some('\u{2022}'));
+        assert_eq!(BaseEncoding::WinAnsi.char_for(0x95), Some('\u{2022}'));
         assert_eq!(BaseEncoding::Symbol.char_for(0x61), Some('\u{03B1}'));
         assert_eq!(BaseEncoding::ZapfDingbats.char_for(0x33), Some('\u{2713}'));
         assert_eq!(
