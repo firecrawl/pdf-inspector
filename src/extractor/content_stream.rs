@@ -480,7 +480,7 @@ pub(crate) fn extract_page_text_items_with_options(
         build_font_encodings(doc, &fonts, font_cmaps, style_cache);
 
     // Build font width info for accurate text positioning
-    let font_widths = build_font_widths(doc, &fonts);
+    let font_widths = build_font_widths(doc, &fonts, style_cache);
     let type3_scales = build_type3_scales(doc, &fonts);
     let type3_y_flips = build_type3_y_flips(doc, &fonts);
 

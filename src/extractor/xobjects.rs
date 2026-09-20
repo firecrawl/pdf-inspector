@@ -363,7 +363,7 @@ fn extract_form_xobject_text_inner(
         build_font_encodings(doc, &form_fonts, font_cmaps, style_cache);
 
     // Build font width info for the form
-    let font_widths = build_font_widths(doc, &form_fonts);
+    let font_widths = build_font_widths(doc, &form_fonts, style_cache);
     let type3_scales = build_type3_scales(doc, &form_fonts);
     let type3_y_flips = build_type3_y_flips(doc, &form_fonts);
 

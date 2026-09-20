@@ -98,6 +98,7 @@ pub(crate) fn resolve_dict<'a>(
 pub(crate) fn build_font_widths(
     doc: &Document,
     fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    font_cache: &mut FontStyleCache,
 ) -> PageFontWidths {
     let mut widths = PageFontWidths::new();
 
@@ -134,7 +135,7 @@ pub(crate) fn build_font_widths(
             resource_name, subtype, base_font, has_tounicode, encoding_str, has_descendants
         );
 
-        if let Some(info) = parse_font_widths(doc, font_dict) {
+        if let Some(info) = parse_font_widths(doc, font_dict, font_cache) {
             widths.insert(resource_name, info);
         }
     }
@@ -293,6 +294,7 @@ pub(crate) fn item_font_name<'a>(resource_name: &'a str, base_font: &'a str) -> 
 pub(crate) fn parse_font_widths(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
+    font_cache: &mut FontStyleCache,
 ) -> Option<FontWidthInfo> {
     // Get the font subtype
     let subtype = font_dict.get(b"Subtype").ok()?;
@@ -301,7 +303,7 @@ pub(crate) fn parse_font_widths(
     match subtype_name {
         b"Type0" => parse_type0_widths(doc, font_dict),
         b"Type1" | b"TrueType" | b"MMType1" => parse_simple_font_widths(doc, font_dict)
-            .or_else(|| base14_fallback_widths(doc, font_dict)),
+            .or_else(|| base14_fallback_widths(doc, font_dict, font_cache)),
         b"Type3" => parse_simple_font_widths(doc, font_dict),
         _ => None,
     }
@@ -316,8 +318,13 @@ pub(crate) fn parse_font_widths(
 /// Widths are resolved per code through the font's Differences encoding when
 /// present, falling back to the same single-byte decode the text extractor
 /// uses (cp1252-style smart punctuation for 0x80..=0x9F, Latin-1 elsewhere) —
-/// so the width of a code always matches the char we extract for it.
-fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<FontWidthInfo> {
+/// so the width of a code always matches the char we extract for it. The
+/// cache keeps an embedded program shared across pages parsed once.
+fn base14_fallback_widths(
+    doc: &Document,
+    font_dict: &lopdf::Dictionary,
+    font_cache: &mut FontStyleCache,
+) -> Option<FontWidthInfo> {
     let base_font = font_dict
         .get(b"BaseFont")
         .ok()
@@ -344,12 +351,7 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
     // A numbered name (`g12`) reads through the embedded program for the
     // decoder (`build_font_encodings`); its code is as wide as that reading.
     if let Some(result) = &encoding {
-        let by_index = glyph_index_chars(
-            doc,
-            font_dict,
-            &result.gid_names,
-            &mut FontStyleCache::new(),
-        );
+        let by_index = glyph_index_chars(doc, font_dict, &result.gid_names, font_cache);
         merge_program_readings(by_index, &mut enc_map, &mut sequences);
     }
 
@@ -2907,7 +2909,8 @@ mod tests {
         let result = parse_font_encoding(&doc, &last_letter).expect("parsed");
         assert_eq!(result.map.get(&0x40), Some(&'a'));
         assert!(!result.sequences.contains_key(&0x40));
-        let widths = base14_fallback_widths(&doc, &last_letter).expect("widths");
+        let widths =
+            base14_fallback_widths(&doc, &last_letter, &mut FontStyleCache::new()).expect("widths");
         assert_eq!(
             widths.widths.get(&0x40).copied(),
             crate::extractor::base14::base14_char_width("Helvetica", 'a')
@@ -2916,7 +2919,8 @@ mod tests {
         let result = parse_font_encoding(&doc, &last_ligature).expect("parsed");
         assert_eq!(result.sequences.get(&0x40).map(String::as_str), Some("fi"));
         assert!(!result.map.contains_key(&0x40));
-        let widths = base14_fallback_widths(&doc, &last_ligature).expect("widths");
+        let widths = base14_fallback_widths(&doc, &last_ligature, &mut FontStyleCache::new())
+            .expect("widths");
         let fi: u16 = ['f', 'i']
             .into_iter()
             .map(|ch| crate::extractor::base14::base14_char_width("Helvetica", ch).unwrap())
@@ -2945,7 +2949,8 @@ mod tests {
         };
         let result = parse_font_encoding(&doc, &font).expect("parsed");
         assert_eq!(result.sequences.get(&0x40).map(String::len), Some(100));
-        let widths = base14_fallback_widths(&doc, &font).expect("widths");
+        let widths =
+            base14_fallback_widths(&doc, &font, &mut FontStyleCache::new()).expect("widths");
         assert_eq!(widths.widths.get(&0x40).copied(), Some(u16::MAX));
     }
 
@@ -3044,7 +3049,8 @@ mod tests {
         );
         assert!(!encoding.differences.contains_key(&0x41));
         assert!(!has_gid_fonts);
-        let widths = base14_fallback_widths(&doc, &numbered_last).expect("widths");
+        let widths = base14_fallback_widths(&doc, &numbered_last, &mut FontStyleCache::new())
+            .expect("widths");
         assert_eq!(
             widths.widths.get(&0x41).copied(),
             Some(width('f') + width('t'))
@@ -3054,7 +3060,8 @@ mod tests {
         let (encoding, _) = encoding_of(&letter_last);
         assert_eq!(encoding.differences.get(&0x41), Some(&'a'));
         assert!(!encoding.sequences.contains_key(&0x41));
-        let widths = base14_fallback_widths(&doc, &letter_last).expect("widths");
+        let widths =
+            base14_fallback_widths(&doc, &letter_last, &mut FontStyleCache::new()).expect("widths");
         assert_eq!(widths.widths.get(&0x41).copied(), Some(width('a')));
     }
 
@@ -3160,9 +3167,11 @@ mod tests {
         // (so no width) under a named Latin encoding.
         let alpha = crate::extractor::base14::base14_char_width("Symbol", '\u{03B1}');
         assert!(alpha.is_some());
-        let widths = base14_fallback_widths(&doc, &symbol).expect("Symbol widths");
+        let widths = base14_fallback_widths(&doc, &symbol, &mut FontStyleCache::new())
+            .expect("Symbol widths");
         assert_eq!(widths.widths.get(&0x61).copied(), alpha);
-        let widths = base14_fallback_widths(&doc, &indirect).expect("Symbol widths");
+        let widths = base14_fallback_widths(&doc, &indirect, &mut FontStyleCache::new())
+            .expect("Symbol widths");
         assert_eq!(widths.widths.get(&0x61), None);
         // A control byte gets a width only through the Differences, the
         // one way the decoder reads it.
@@ -3174,10 +3183,12 @@ mod tests {
                 "Differences" => Object::Array(vec![Object::Integer(0x01), Object::Name(b"alpha".to_vec())])
             }),
         );
-        let widths = base14_fallback_widths(&doc, &remapped).expect("Symbol widths");
+        let widths = base14_fallback_widths(&doc, &remapped, &mut FontStyleCache::new())
+            .expect("Symbol widths");
         assert_eq!(widths.widths.get(&0x01).copied(), alpha);
         assert_eq!(widths.widths.get(&0x09), None);
-        let widths = base14_fallback_widths(&doc, &symbol).expect("Symbol widths");
+        let widths = base14_fallback_widths(&doc, &symbol, &mut FontStyleCache::new())
+            .expect("Symbol widths");
         assert_eq!(widths.widths.get(&0x01), None);
     }
 
