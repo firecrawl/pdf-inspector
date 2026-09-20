@@ -120,11 +120,13 @@ Changes since 1.21.0.
   StandardEncoding, dropping or mistranslating accented letters), and the
   standard Symbol and ZapfDingbats fonts read through their built-in
   encodings instead of as the Latin letters at the same codes.
+  ([#553](https://github.com/firecrawl/pdf-inspector/pull/553))
 - Embedded fonts without a ToUnicode CMap decode through their glyph names
   where a symbol cmap only offers private-use code points, so a glyph named
   `uni03B1` or `alpha` reads as α rather than as the byte it was shown
   with; `/Differences` names that are glyph indexes (`g12`, `glyph12`,
   `index12`) resolve through the embedded font program.
+  ([#553](https://github.com/firecrawl/pdf-inspector/pull/553))
 
 ### Changed
 

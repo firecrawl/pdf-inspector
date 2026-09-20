@@ -909,12 +909,9 @@ fn glyph_index_chars(
     }
     let font_file = || -> Option<ObjectId> {
         let descriptor = resolve_dict(doc, font_dict.get(b"FontDescriptor").ok()?)?;
-        descriptor
-            .get(b"FontFile2")
-            .or_else(|_| descriptor.get(b"FontFile3"))
-            .ok()?
-            .as_reference()
-            .ok()
+        [b"FontFile2".as_slice(), b"FontFile3".as_slice()]
+            .into_iter()
+            .find_map(|key| descriptor.get(key).ok()?.as_reference().ok())
     };
     let Some(ff_ref) = font_file() else {
         return FontEncodingMap::new();
@@ -2136,10 +2133,17 @@ pub(crate) fn extract_text_from_operand(
             // encoding of Symbol and ZapfDingbats — reads every code through it.
             if let Some(encoding) = font_encodings.get(current_font) {
                 let encoding_map = &encoding.differences;
+                // A string is read code by code when the Differences, the
+                // blank glyphs or the base encoding have a say on any of its
+                // bytes — a named code the Differences could not map among
+                // them, so that it reads as nothing rather than falling to
+                // the single-byte fallback below.
                 let has_diff_match = encoding.base.is_some()
-                    || bytes
-                        .iter()
-                        .any(|b| encoding_map.contains_key(b) || encoding.blank_codes.contains(b));
+                    || bytes.iter().any(|b| {
+                        encoding_map.contains_key(b)
+                            || encoding.blank_codes.contains(b)
+                            || encoding.named_codes.contains(b)
+                    });
                 if has_diff_match {
                     let decoded: String = bytes
                         .iter()
@@ -2174,6 +2178,15 @@ pub(crate) fn extract_text_from_operand(
                         .collect();
                     if !decoded.is_empty() {
                         return Some(decoded);
+                    }
+                    // Every byte was a named glyph the program could not
+                    // identify, or a control code: the string reads as
+                    // nothing, and the fallbacks below have no more to say.
+                    if bytes
+                        .iter()
+                        .all(|b| encoding.named_codes.contains(b) || *b < 0x20)
+                    {
+                        return Some(String::new());
                     }
                 }
             }
@@ -2605,6 +2618,92 @@ mod tests {
         )
         .expect("text decoded");
         assert_eq!(text, "AB");
+    }
+
+    #[test]
+    fn numbered_names_resolve_through_fontfile3_when_fontfile2_is_not_a_reference() {
+        // The glyph-names fixture's second font names glyphs by index and
+        // embeds its program as FontFile2. A descriptor whose FontFile2 is
+        // not a reference must not stop the lookup: the program under
+        // FontFile3 still resolves the names.
+        let doc = Document::load("tests/fixtures/glyph_names_in_embedded_fonts.pdf").unwrap();
+        let mut doc = doc;
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let fonts = doc.get_page_fonts(page_id).unwrap();
+        let font = (*fonts.get(&b"F2".to_vec()).expect("F2")).clone();
+        let names = vec![
+            (0x41_u8, "g1".to_string()),
+            (0x42, "g2".to_string()),
+            (0x43, "glyph3".to_string()),
+        ];
+        let expected: FontEncodingMap =
+            [(0x41, '\u{03B4}'), (0x42, '\u{03B5}'), (0x43, '\u{03B6}')]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            glyph_index_chars(&doc, &font, &names, &mut FontStyleCache::new()),
+            expected
+        );
+        // Move the program to FontFile3 and leave a non-reference FontFile2.
+        let descriptor_ref = font.get(b"FontDescriptor").unwrap().as_reference().unwrap();
+        let mut descriptor = doc.get_dictionary(descriptor_ref).unwrap().clone();
+        let program = descriptor.get(b"FontFile2").unwrap().clone();
+        descriptor.set("FontFile3", program);
+        descriptor.set("FontFile2", Object::Integer(0));
+        let new_descriptor = doc.add_object(descriptor);
+        let mut moved = font.clone();
+        moved.set("FontDescriptor", Object::Reference(new_descriptor));
+        assert_eq!(
+            glyph_index_chars(&doc, &moved, &names, &mut FontStyleCache::new()),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_string_of_named_but_unmapped_codes_reads_as_nothing_without_a_base() {
+        // A subset whose Differences name every code it uses (`gid00016`…)
+        // without a program that resolves them, no base encoding and no
+        // ToUnicode: the string holds nothing the decoder can read, and it
+        // must not fall to the single-byte fallback and print Latin-1
+        // characters for the codes.
+        let bytes = vec![0x81_u8, 0x82, 0x9B];
+        let obj = Object::String(bytes, lopdf::StringFormat::Literal);
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let inline_cmaps = HashMap::new();
+        let mut font_encodings: PageFontEncodings = HashMap::new();
+        font_encodings.insert(
+            "F0".to_string(),
+            FontEncoding {
+                differences: FontEncodingMap::new(),
+                identity_overrides: FontEncodingMap::new(),
+                blank_codes: Default::default(),
+                base: None,
+                named_codes: [0x81, 0x82, 0x9B].into_iter().collect(),
+            },
+        );
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F0".to_string(), make_font_info(&[], 1000, false));
+        let decoded = extract_text_from_operand(
+            &obj,
+            "F0",
+            Some("SyntheticSubset"),
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        );
+        let text = decoded.map(|(text, _)| text).unwrap_or_default();
+        assert!(
+            !text.contains('\u{201A}') && !text.contains('\u{203A}') && !text.contains('\u{0081}'),
+            "{text:?}"
+        );
+        assert!(text.trim().is_empty(), "{text:?}");
     }
 
     #[test]
