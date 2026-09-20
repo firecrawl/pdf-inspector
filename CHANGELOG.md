@@ -93,7 +93,9 @@ Changes since 1.21.0.
   mixed case foundries write them, so "Bookman" is still not Book and "LT"
   not Light. Faces such as a Franklin Gothic Demi or a Helvetica Neue Heavy
   are bold by default, in the positioned items and in the Markdown output,
-  where the default flag and the weight option now agree.
+  so every face the weight option calls bold the default flag calls bold
+  too; the flag's older reading of a Medium face as bold (weight class 500)
+  stays.
   ([#547](https://github.com/firecrawl/pdf-inspector/pull/547))
 - Rust `TextItem` literals must include the new `bold_source` and
   `fixed_pitch` fields (`None` when unknown).

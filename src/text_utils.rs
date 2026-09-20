@@ -262,13 +262,17 @@ pub(crate) fn sort_line_items(items: &mut [TextItem], page_rtl: bool) {
 }
 
 /// Detect if a font name indicates bold style: a bold word ("Bold",
-/// "Black", "Heavy", "Demi", "Ultra", "SemiBold", "ExtraBold", "Medium"),
-/// or one of the foundry style abbreviations the weight-class parser reads
-/// ("-Bd", "-Sb", "-Dm", "-Hv", "-Blk", "-XBd", "-Ult", "W6".."W9") — any
-/// name [`font_weight_from_name`] puts at 600 or heavier is bold, so this
-/// flag and the weight class agree. The abbreviations are matched as whole
-/// tokens after the family name, in the mixed case foundries write them:
-/// "Bookman" is not Book, "LT" is not Light and "Hvar" is not Heavy.
+/// "Black", "Heavy", "Demi", "Ultra", "SemiBold", "ExtraBold"), or one of
+/// the foundry style abbreviations the weight-class parser reads ("-Bd",
+/// "-Sb", "-Dm", "-Hv", "-Blk", "-XBd", "-Ult", "W6".."W9") — any name
+/// [`font_weight_from_name`] puts at 600 or heavier is bold, so every face
+/// the weight class calls bold this flag calls bold too. The abbreviations
+/// are matched as whole tokens after the family name, in the mixed case
+/// foundries write them: "Bookman" is not Book, "LT" is not Light and
+/// "Hvar" is not Heavy. On top of that the flag keeps its older readings,
+/// which the weight class does not share: a Medium face ("Arial-Medium",
+/// URW's "-Medi") is bold here and 500 there, since some families use
+/// Medium as their heavier weight.
 pub fn is_bold_font(font_name: &str) -> bool {
     if font_weight_from_name(font_name).is_some_and(|weight| weight >= 600) {
         return true;
@@ -1445,6 +1449,10 @@ mod tests {
 
     #[test]
     fn bold_font_urw_medi_abbreviation() {
+        // A Medium face keeps its older bold reading, which the weight class
+        // (500) does not share.
+        assert!(is_bold_font("Arial-Medium"));
+        assert_eq!(font_weight_from_name("Arial-Medium"), Some(500));
         // URW Type 1 fonts (LaTeX default Times) abbreviate Medium as "Medi"
         assert!(is_bold_font("NROFIU+NimbusRomNo9L-Medi"));
         assert!(is_bold_font("NimbusRomNo9L-MediItal"));
