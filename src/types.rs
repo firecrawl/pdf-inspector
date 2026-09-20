@@ -43,6 +43,9 @@ pub(crate) struct FontEncoding {
     /// The encoding the codes read through where `differences` say nothing
     /// (see [`BaseEncoding`]); `None` leaves them to the standard decode.
     pub(crate) base: Option<BaseEncoding>,
+    /// Every code the `/Differences` array names, mapped or not: a code
+    /// named there is that glyph, whatever the base encoding puts at it.
+    pub(crate) named_codes: std::collections::HashSet<u8>,
 }
 
 /// All font encodings for a page

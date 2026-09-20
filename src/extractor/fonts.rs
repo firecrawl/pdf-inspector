@@ -332,6 +332,10 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
         .as_ref()
         .and_then(|r| r.base)
         .or_else(|| builtin_base_encoding(doc, font_dict));
+    let named_codes = encoding
+        .as_ref()
+        .map(|r| r.named_codes.clone())
+        .unwrap_or_default();
     let enc_map = encoding.map(|r| r.map).unwrap_or_default();
 
     let mut widths = HashMap::new();
@@ -346,9 +350,10 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
         // cp1252-style fallback used by the text decoder. The same order
         // the decoder follows, so the width of a code always matches the
         // char extracted for it — and, like the decoder, a control byte
-        // reads through the Differences alone.
+        // reads through the Differences alone, and a code the Differences
+        // name but cannot map reads as nothing.
         let Some(ch) = enc_map.get(&(code as u8)).copied().or_else(|| {
-            (code >= 0x20).then(|| {
+            (code >= 0x20 && !named_codes.contains(&(code as u8))).then(|| {
                 base.and_then(|base| base.char_for(code as u8))
                     .unwrap_or_else(|| decode_single_byte_fallback_char(code as u8, true))
             })
@@ -785,6 +790,7 @@ pub(crate) fn build_font_encodings(
         let mut differences = FontEncodingMap::new();
         let mut identity_overrides = FontEncodingMap::new();
         let mut base: Option<BaseEncoding> = None;
+        let mut named_codes = std::collections::HashSet::new();
         // A Type3 font's Differences name its glyph procedures: a numbered
         // name there (`g10`) labels a procedure and indexes nothing, so the
         // glyph-index reading below is for fonts with a glyph table only.
@@ -795,6 +801,7 @@ pub(crate) fn build_font_encodings(
             .is_some_and(|n| n == b"Type3");
         if let Some(result) = parse_font_encoding(doc, font_dict) {
             base = result.base;
+            named_codes = result.named_codes.clone();
             // Names that are glyph indexes (`g12`, `glyph12`, `index12`)
             // say nothing by themselves; the embedded font program says
             // what those glyphs are.
@@ -838,6 +845,7 @@ pub(crate) fn build_font_encodings(
                     identity_overrides,
                     blank_codes,
                     base,
+                    named_codes,
                 },
             );
         }
@@ -1380,6 +1388,8 @@ pub(crate) struct EncodingResult {
     pub gid_codes: Vec<u8>,
     /// The name each of `gid_codes` carries.
     pub gid_names: Vec<(u8, String)>,
+    /// Every code the `/Differences` array names, mapped or not.
+    pub named_codes: std::collections::HashSet<u8>,
     /// The `/BaseEncoding`, when the dictionary names one.
     pub base: Option<BaseEncoding>,
 }
@@ -1445,6 +1455,7 @@ pub(crate) fn parse_encoding_dictionary(
     let mut ligature_count = 0u32;
     let mut gid_codes: Vec<u8> = Vec::new();
     let mut gid_names: Vec<(u8, String)> = Vec::new();
+    let mut named_codes = std::collections::HashSet::new();
 
     for item in diff_array {
         match item {
@@ -1455,6 +1466,7 @@ pub(crate) fn parse_encoding_dictionary(
             Object::Name(name) => {
                 // Map current code to glyph name -> Unicode
                 let glyph_name = String::from_utf8_lossy(&name).to_string();
+                named_codes.insert(current_code);
                 let mapped_char = glyph_to_char(&glyph_name)
                     .or_else(|| private_glyph_to_char(&glyph_name, base_font_name));
                 if mapped_char.is_some_and(is_ligature_char) {
@@ -1505,6 +1517,7 @@ pub(crate) fn parse_encoding_dictionary(
         glyph_names,
         gid_codes,
         gid_names,
+        named_codes,
         base,
     })
 }
@@ -1972,6 +1985,12 @@ pub(crate) fn extract_text_from_operand(
                                 return Some(ch.to_string());
                             }
                         }
+                        // A code the Differences name but could not map is
+                        // that glyph and no other: neither the base
+                        // encoding nor the fallback below has a say.
+                        if encoding_map.is_some_and(|map| map.named_codes.contains(&b)) {
+                            return None;
+                        }
                         // 4. The font's base encoding, for printable bytes
                         // (the predefined tables spell out the control
                         // codes too, and those are dropped like they are
@@ -2127,6 +2146,10 @@ pub(crate) fn extract_text_from_operand(
                         .filter_map(|&b| {
                             let label = if let Some(&ch) = encoding_map.get(&b) {
                                 Some(ch)
+                            } else if encoding.named_codes.contains(&b) {
+                                // A named glyph that could not be mapped:
+                                // nothing else stands in for it.
+                                None
                             } else if let Some(ch) = encoding
                                 .base
                                 .filter(|_| b >= 0x20)
@@ -2561,6 +2584,7 @@ mod tests {
                 identity_overrides: FontEncodingMap::new(),
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
+                named_codes: Default::default(),
             },
         );
         let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
@@ -2581,6 +2605,65 @@ mod tests {
         )
         .expect("text decoded");
         assert_eq!(text, "AB");
+    }
+
+    #[test]
+    fn a_named_but_unmapped_code_reads_as_nothing() {
+        // A subset names code 0x81 `gid00136` over a WinAnsi base: the
+        // name could not be mapped, and neither WinAnsi's bullet at 0x81
+        // nor the cp1252 fallback is that glyph — the code reads as
+        // nothing.
+        let bytes = vec![0x41_u8, 0x81, 0x42];
+        let obj = Object::String(bytes, lopdf::StringFormat::Literal);
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let inline_cmaps = HashMap::new();
+        let mut font_encodings: PageFontEncodings = HashMap::new();
+        font_encodings.insert(
+            "F0".to_string(),
+            FontEncoding {
+                differences: FontEncodingMap::new(),
+                identity_overrides: FontEncodingMap::new(),
+                blank_codes: Default::default(),
+                base: Some(BaseEncoding::WinAnsi),
+                named_codes: [0x81].into_iter().collect(),
+            },
+        );
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F0".to_string(), make_font_info(&[], 1000, false));
+        let (text, _) = extract_text_from_operand(
+            &obj,
+            "F0",
+            Some("Helvetica"),
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("text decoded");
+        assert_eq!(text, "AB");
+        // The same string with the code unnamed reads the bullet WinAnsi
+        // shows at an unused code.
+        font_encodings.get_mut("F0").unwrap().named_codes.clear();
+        let (text, _) = extract_text_from_operand(
+            &obj,
+            "F0",
+            Some("Helvetica"),
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("text decoded");
+        assert_eq!(text, "A\u{2022}B");
     }
 
     #[test]
