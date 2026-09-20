@@ -1846,6 +1846,27 @@ fn embedded_fonts_decode_through_glyph_names_and_indexes() {
     );
 }
 
+/// `/Differences` names that spell a ligature by its components (`f_t`,
+/// `f_f_i`, `T_h`, `t_z`), with a suffix (`a.sc`, `f_i.liga`) or as a `uni`
+/// sequence (`uni00660069`) read as the letters they join instead of being
+/// dropped as unknown names.
+#[test]
+fn component_ligature_names_read_as_their_letters() {
+    assert_eq!(
+        fixture_line_texts("ligature_glyph_names"),
+        ["ft ffi Th a fi fi tz"]
+    );
+}
+
+#[test]
+fn test_snapshot_ligature_glyph_names() {
+    let output = assert_snapshot("ligature_glyph_names");
+    assert!(
+        output.contains("ft ffi Th a fi fi tz"),
+        "component ligature names must read as their letters, got: {output}"
+    );
+}
+
 #[test]
 fn test_snapshot_glyph_names_in_embedded_fonts() {
     let output = assert_snapshot("glyph_names_in_embedded_fonts");

@@ -4593,8 +4593,91 @@ pub fn glyph_to_char(name: &str) -> Option<char> {
     None
 }
 
+/// The text a glyph name stands for, by the Adobe Glyph List Specification:
+/// a suffix from the first period is dropped (`a.sc`, `f_t.liga`); a `uni`
+/// name of several four-digit groups (`uni00660069`) or a `uXXXX` name is
+/// the code points it spells; a name of components joined by underscores
+/// (`f_t`, `f_f_i`, `T_h`) is the concatenation of what its components
+/// stand for, each resolved the same way; and the common ligature names the
+/// list itself lacks (`ft`, `st`, …) are their letters. `None` when any part
+/// is unknown, so a name that cannot be read stays unread rather than
+/// half-read.
+pub fn glyph_name_to_string(name: &str) -> Option<String> {
+    let base = name.split('.').next().filter(|base| !base.is_empty())?;
+    if let Some(hex) = base.strip_prefix("uni") {
+        if hex.len() >= 8 && hex.len() % 4 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return hex
+                .as_bytes()
+                .chunks(4)
+                .map(|group| {
+                    let code = u32::from_str_radix(std::str::from_utf8(group).ok()?, 16).ok()?;
+                    char::from_u32(code)
+                })
+                .collect();
+        }
+    }
+    // Components first: `f_i` is the letters f and i even where the list
+    // also knows the joined name as a ligature code point.
+    if base.contains('_') {
+        let joined: Option<String> = base
+            .split('_')
+            .map(|part| match part.chars().count() {
+                0 => None,
+                1 if glyph_to_char(part).is_none() => Some(part.to_string()),
+                _ => glyph_name_to_string(part),
+            })
+            .collect();
+        if joined.is_some() {
+            return joined;
+        }
+    }
+    if let Some(ch) = glyph_to_char(base) {
+        return Some(ch.to_string());
+    }
+    match base {
+        "ft" | "st" | "ct" | "tt" | "ti" | "tz" | "fj" | "fb" | "fh" | "fk" => {
+            Some(base.to_string())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::glyph_name_to_string;
+
+    #[test]
+    fn component_names_spell_their_letters() {
+        assert_eq!(glyph_name_to_string("f_t").as_deref(), Some("ft"));
+        assert_eq!(glyph_name_to_string("f_f_i").as_deref(), Some("ffi"));
+        assert_eq!(glyph_name_to_string("T_h").as_deref(), Some("Th"));
+        assert_eq!(
+            glyph_name_to_string("uni0066_uni0069").as_deref(),
+            Some("fi")
+        );
+        // A component the list does not know leaves the whole name unread.
+        assert_eq!(glyph_name_to_string("f_zzz"), None);
+        assert_eq!(glyph_name_to_string("f__t"), None);
+    }
+
+    #[test]
+    fn suffixes_are_dropped_before_the_lookup() {
+        assert_eq!(glyph_name_to_string("a.sc").as_deref(), Some("a"));
+        assert_eq!(glyph_name_to_string("f_i.liga").as_deref(), Some("fi"));
+        assert_eq!(glyph_name_to_string("zero.tf").as_deref(), Some("0"));
+        assert_eq!(glyph_name_to_string(".notdef"), None);
+    }
+
+    #[test]
+    fn uni_sequences_and_plain_ligature_names_are_read() {
+        assert_eq!(glyph_name_to_string("uni00660069").as_deref(), Some("fi"));
+        assert_eq!(glyph_name_to_string("uni03B1").as_deref(), Some("\u{03B1}"));
+        assert_eq!(glyph_name_to_string("u1F600").as_deref(), Some("\u{1F600}"));
+        assert_eq!(glyph_name_to_string("fi").as_deref(), Some("\u{FB01}"));
+        assert_eq!(glyph_name_to_string("ft").as_deref(), Some("ft"));
+        assert_eq!(glyph_name_to_string("st").as_deref(), Some("st"));
+        assert_eq!(glyph_name_to_string("gid00136"), None);
+    }
     use super::*;
 
     #[test]

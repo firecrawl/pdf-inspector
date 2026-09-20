@@ -1,8 +1,8 @@
-//! Generates the symbolic-font and base-encoding fixtures under
-//! `tests/fixtures/`.
+//! Generates the symbolic-font, base-encoding and ligature-name fixtures
+//! under `tests/fixtures/`.
 //!
 //! Every fixture is synthetic. The pages use the non-embedded standard
-//! fonts (Symbol, ZapfDingbats, Courier, Helvetica, Times) and three tiny
+//! fonts (Symbol, ZapfDingbats, Courier, Helvetica, Times) and four tiny
 //! TrueType programs built here from scratch — a handful of square glyphs
 //! with the tables a reader needs — so nothing in them comes from any
 //! existing font or document.
@@ -663,9 +663,98 @@ fn glyph_names_in_embedded_fonts(dir: &Path) {
     );
 }
 
+/// An embedded TrueType program whose `/Differences` name ligature glyphs
+/// the way the Adobe Glyph List Specification allows: by their components
+/// joined with underscores (`f_t`, `f_f_i`, `T_h`, `t_z`), with a suffix
+/// (`a.sc`, `f_i.liga`) and as a `uni` sequence (`uni00660069`). The
+/// glyphs are squares; only the names carry meaning.
+fn ligature_glyph_names(dir: &Path) {
+    let mut doc = Document::new();
+    doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+    let names = [
+        "f_t",
+        "f_f_i",
+        "T_h",
+        "a.sc",
+        "uni00660069",
+        "f_i.liga",
+        "t_z",
+    ];
+    let mut glyphs = vec![Glyph {
+        name: Some(".notdef"),
+        advance: 500,
+        outlined: false,
+        code: None,
+    }];
+    glyphs.push(Glyph {
+        name: Some("space"),
+        advance: 300,
+        outlined: false,
+        code: Some(0x20),
+    });
+    for name in names {
+        glyphs.push(Glyph {
+            name: Some(name),
+            advance: 900,
+            outlined: true,
+            code: None,
+        });
+    }
+    let program = build_truetype(&glyphs, CmapKind::Unicode);
+    let file = doc.add_object(plain_stream(
+        dictionary! { "Length1" => Object::Integer(program.len() as i64) },
+        program,
+    ));
+    let descriptor = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => Object::Name(b"SyntheticLigatures".to_vec()),
+        "Flags" => Object::Integer(32),
+        "FontBBox" => Object::Array(vec![0.into(), 0.into(), 550.into(), 700.into()]),
+        "ItalicAngle" => Object::Integer(0),
+        "Ascent" => Object::Integer(800),
+        "Descent" => Object::Integer(-200),
+        "CapHeight" => Object::Integer(700),
+        "StemV" => Object::Integer(80),
+        "FontFile2" => Object::Reference(file),
+    });
+    // Codes 0x41.. name the ligature glyphs; 0x20 is the space.
+    let mut differences = vec![Object::Integer(0x41)];
+    differences.extend(
+        names
+            .iter()
+            .map(|name| Object::Name(name.as_bytes().to_vec())),
+    );
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "TrueType",
+        "BaseFont" => Object::Name(b"SyntheticLigatures".to_vec()),
+        "FirstChar" => Object::Integer(0x20),
+        "LastChar" => Object::Integer(0x47),
+        "Widths" => Object::Array(
+            (0x20..=0x47).map(|c| Object::Integer(if c == 0x20 { 300 } else if c >= 0x41 { 900 } else { 0 })).collect()
+        ),
+        "FontDescriptor" => Object::Reference(descriptor),
+        "Encoding" => Object::Dictionary(dictionary! {
+            "Type" => "Encoding",
+            "Differences" => Object::Array(differences),
+        }),
+    });
+    let fonts = dictionary! { "F1" => Object::Reference(font) };
+    let content = "BT /F1 14 Tf 72 700 Td (A B C D E F G) Tj ET\n".to_string();
+    finish_document(
+        doc,
+        &dir.join("ligature_glyph_names.pdf"),
+        "Ligature glyphs named by their components",
+        b"Synthetic test fixture: one TrueType program built for it, no ToUnicode.",
+        fonts,
+        content,
+    );
+}
+
 fn main() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     symbol_builtin_encoding(&dir);
     base_encoding_without_differences(&dir);
     glyph_names_in_embedded_fonts(&dir);
+    ligature_glyph_names(&dir);
 }

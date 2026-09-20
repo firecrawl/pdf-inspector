@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
-use crate::glyph_names::glyph_to_char;
+use crate::glyph_names::glyph_name_to_string;
 
 #[cfg(target_arch = "wasm32")]
 static BUILTIN_CMAPS: include_dir::Dir<'_> =
@@ -1102,35 +1102,6 @@ fn strip_pua_char(ch: char) -> char {
     } else {
         ch
     }
-}
-
-fn glyph_name_to_string(name: &str) -> Option<String> {
-    let base = name.split('.').next().unwrap_or(name);
-    if let Some(ch) = glyph_to_char(base) {
-        return Some(ch.to_string());
-    }
-    if base.contains('_') {
-        let mut out = String::new();
-        for part in base.split('_') {
-            if part.is_empty() {
-                return None;
-            }
-            if let Some(ch) = glyph_to_char(part) {
-                out.push(ch);
-            } else if part.len() == 1 {
-                out.push(part.chars().next().unwrap());
-            } else {
-                return None;
-            }
-        }
-        if !out.is_empty() {
-            return Some(out);
-        }
-    }
-    if matches!(base, "ti" | "tt" | "tz") {
-        return Some(base.to_string());
-    }
-    None
 }
 
 /// Glyph index → character for an embedded TrueType or OpenType font:

@@ -46,6 +46,10 @@ pub(crate) struct FontEncoding {
     /// Every code the `/Differences` array names, mapped or not: a code
     /// named there is that glyph, whatever the base encoding puts at it.
     pub(crate) named_codes: std::collections::HashSet<u8>,
+    /// Codes whose `/Differences` glyph stands for several characters: a
+    /// ligature named by its components (`f_t`, `f_f_i`) or by a `uni`
+    /// sequence, read as the letters it joins.
+    pub(crate) sequences: HashMap<u8, String>,
 }
 
 /// All font encodings for a page

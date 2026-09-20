@@ -1,7 +1,7 @@
 //! Font width parsing, encoding, and text decoding.
 
 use super::get_number;
-use crate::glyph_names::glyph_to_char;
+use crate::glyph_names::{glyph_name_to_string, glyph_to_char};
 use crate::tounicode::FontCMaps;
 use crate::types::{
     BaseEncoding, BoldSource, FontEncoding, FontEncodingMap, FontWidthInfo, PageFontEncodings,
@@ -336,10 +336,25 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
         .as_ref()
         .map(|r| r.named_codes.clone())
         .unwrap_or_default();
+    let sequences = encoding
+        .as_ref()
+        .map(|r| r.sequences.clone())
+        .unwrap_or_default();
     let enc_map = encoding.map(|r| r.map).unwrap_or_default();
 
     let mut widths = HashMap::new();
     for code in 0u16..=255 {
+        // A ligature named by its components is as wide as its letters.
+        if let Some(text) = sequences.get(&(code as u8)) {
+            if let Some(total) = text
+                .chars()
+                .map(|ch| crate::extractor::base14::base14_char_width(&base_font, ch))
+                .sum::<Option<u16>>()
+            {
+                widths.insert(code, total);
+            }
+            continue;
+        }
         // Resolution order: Differences override, then the font's base
         // encoding — the dictionary's `/BaseEncoding`, or the BUILT-IN
         // encoding of Symbol/ZapfDingbats when no named encoding replaces
@@ -791,6 +806,7 @@ pub(crate) fn build_font_encodings(
         let mut identity_overrides = FontEncodingMap::new();
         let mut base: Option<BaseEncoding> = None;
         let mut named_codes = std::collections::HashSet::new();
+        let mut sequences: HashMap<u8, String> = HashMap::new();
         // A Type3 font's Differences name its glyph procedures: a numbered
         // name there (`g10`) labels a procedure and indexes nothing, so the
         // glyph-index reading below is for fonts with a glyph table only.
@@ -802,6 +818,7 @@ pub(crate) fn build_font_encodings(
         if let Some(result) = parse_font_encoding(doc, font_dict) {
             base = result.base;
             named_codes = result.named_codes.clone();
+            sequences = result.sequences.clone();
             // Names that are glyph indexes (`g12`, `glyph12`, `index12`)
             // say nothing by themselves; the embedded font program says
             // what those glyphs are.
@@ -837,7 +854,11 @@ pub(crate) fn build_font_encodings(
             base = builtin_base_encoding(doc, font_dict);
         }
         let blank_codes = blank_glyph_codes(doc, font_dict, font_cache);
-        if !differences.is_empty() || !blank_codes.is_empty() || base.is_some() {
+        if !differences.is_empty()
+            || !sequences.is_empty()
+            || !blank_codes.is_empty()
+            || base.is_some()
+        {
             encodings.insert(
                 resource_name,
                 FontEncoding {
@@ -846,6 +867,7 @@ pub(crate) fn build_font_encodings(
                     blank_codes,
                     base,
                     named_codes,
+                    sequences,
                 },
             );
         }
@@ -1387,6 +1409,9 @@ pub(crate) struct EncodingResult {
     pub gid_names: Vec<(u8, String)>,
     /// Every code the `/Differences` array names, mapped or not.
     pub named_codes: std::collections::HashSet<u8>,
+    /// Codes whose glyph stands for several characters (see
+    /// [`FontEncoding::sequences`]).
+    pub sequences: HashMap<u8, String>,
     /// The `/BaseEncoding`, when the dictionary names one.
     pub base: Option<BaseEncoding>,
 }
@@ -1453,6 +1478,7 @@ pub(crate) fn parse_encoding_dictionary(
     let mut gid_codes: Vec<u8> = Vec::new();
     let mut gid_names: Vec<(u8, String)> = Vec::new();
     let mut named_codes = std::collections::HashSet::new();
+    let mut sequences: HashMap<u8, String> = HashMap::new();
 
     for item in diff_array {
         match item {
@@ -1464,9 +1490,20 @@ pub(crate) fn parse_encoding_dictionary(
                 // Map current code to glyph name -> Unicode
                 let glyph_name = String::from_utf8_lossy(&name).to_string();
                 named_codes.insert(current_code);
-                let mapped_char = glyph_to_char(&glyph_name)
-                    .or_else(|| private_glyph_to_char(&glyph_name, base_font_name));
-                if mapped_char.is_some_and(is_ligature_char) {
+                // What the name stands for: one character, or the letters
+                // of a ligature named by its components (`f_t`) or by a
+                // `uni` sequence.
+                let mapped = glyph_name_to_string(&glyph_name).or_else(|| {
+                    private_glyph_to_char(&glyph_name, base_font_name).map(String::from)
+                });
+                let mut chars = mapped.as_deref().unwrap_or_default().chars();
+                let mapped_char = match (chars.next(), chars.next()) {
+                    (Some(ch), None) => Some(ch),
+                    _ => None,
+                };
+                if mapped_char.is_some_and(is_ligature_char)
+                    || mapped.as_ref().is_some_and(|text| text.chars().count() > 1)
+                {
                     debug!(
                         "  Differences: code=0x{:02X} glyph={:?} (ligature)",
                         current_code, glyph_name
@@ -1475,12 +1512,15 @@ pub(crate) fn parse_encoding_dictionary(
                 }
                 // Numbered names (e.g. "gid00053", "g53", "cid53") say
                 // nothing without the font program's glyph table.
-                if mapped_char.is_none() && numbered_glyph_name(&glyph_name).is_some() {
+                if mapped.is_none() && numbered_glyph_name(&glyph_name).is_some() {
                     gid_codes.push(current_code);
                     gid_names.push((current_code, glyph_name.clone()));
                 }
                 if let Some(ch) = mapped_char {
                     encoding_map.insert(current_code, ch);
+                    glyph_names.insert(current_code, glyph_name);
+                } else if let Some(text) = mapped {
+                    sequences.insert(current_code, text);
                     glyph_names.insert(current_code, glyph_name);
                 } else {
                     debug!(
@@ -1515,6 +1555,7 @@ pub(crate) fn parse_encoding_dictionary(
         gid_codes,
         gid_names,
         named_codes,
+        sequences,
         base,
     })
 }
@@ -1981,6 +2022,9 @@ pub(crate) fn extract_text_from_operand(
                             if let Some(&ch) = map.differences.get(&b) {
                                 return Some(ch.to_string());
                             }
+                            if let Some(text) = map.sequences.get(&b) {
+                                return Some(text.clone());
+                            }
                         }
                         // A code the Differences name but could not map is
                         // that glyph and no other: neither the base
@@ -2141,6 +2185,7 @@ pub(crate) fn extract_text_from_operand(
                 let has_diff_match = encoding.base.is_some()
                     || bytes.iter().any(|b| {
                         encoding_map.contains_key(b)
+                            || encoding.sequences.contains_key(b)
                             || encoding.blank_codes.contains(b)
                             || encoding.named_codes.contains(b)
                     });
@@ -2148,30 +2193,32 @@ pub(crate) fn extract_text_from_operand(
                     let decoded: String = bytes
                         .iter()
                         .filter_map(|&b| {
-                            let label = if let Some(&ch) = encoding_map.get(&b) {
-                                Some(ch)
+                            let label: String = if let Some(&ch) = encoding_map.get(&b) {
+                                ch.to_string()
+                            } else if let Some(text) = encoding.sequences.get(&b) {
+                                text.clone()
                             } else if encoding.named_codes.contains(&b) {
                                 // A named glyph that could not be mapped:
                                 // nothing else stands in for it.
-                                None
+                                return None;
                             } else if let Some(ch) = encoding
                                 .base
                                 .filter(|_| b >= 0x20)
                                 .and_then(|base| base.char_for(b))
                             {
-                                Some(ch)
+                                ch.to_string()
                             } else if b >= 0x20 {
                                 // Base encoding fallback for printable bytes.
                                 // Most PDFs with simple fonts use WinAnsi/PDFDocEncoding
                                 // semantics, not ISO-8859-1 C1 controls.
-                                Some(decode_single_byte_fallback_char(b, use_cp1252_fallback))
+                                decode_single_byte_fallback_char(b, use_cp1252_fallback).to_string()
                             } else {
-                                None // Skip unmapped control characters
-                            }?;
+                                return None; // Skip unmapped control characters
+                            };
                             // A glyph with no outline paints a gap, whatever
                             // its label says.
-                            if blank_glyph_reads_as_space(Some(encoding), b, &label.to_string()) {
-                                return Some(' ');
+                            if blank_glyph_reads_as_space(Some(encoding), b, &label) {
+                                return Some(" ".to_string());
                             }
                             Some(label)
                         })
@@ -2598,6 +2645,7 @@ mod tests {
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
                 named_codes: Default::default(),
+                sequences: Default::default(),
             },
         );
         let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
@@ -2680,6 +2728,7 @@ mod tests {
                 blank_codes: Default::default(),
                 base: None,
                 named_codes: [0x81, 0x82, 0x9B].into_iter().collect(),
+                sequences: Default::default(),
             },
         );
         let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
@@ -2707,6 +2756,73 @@ mod tests {
     }
 
     #[test]
+    fn component_ligature_names_read_as_their_letters() {
+        // /Differences naming glyphs by their components — `f_t`, `f_f_i`,
+        // with a suffix, as a uni sequence — read as the letters they join,
+        // in the Differences map's sequences and in the decoded text.
+        let doc = Document::new();
+        let enc = lopdf::dictionary! {
+            "Type" => "Encoding",
+            "Differences" => Object::Array(vec![
+                Object::Integer(0x41),
+                Object::Name(b"f_t".to_vec()),
+                Object::Name(b"f_f_i".to_vec()),
+                Object::Name(b"f_i.liga".to_vec()),
+                Object::Name(b"uni00660069".to_vec()),
+                Object::Name(b"a.sc".to_vec()),
+                Object::Name(b"f_zzz".to_vec()),
+            ])
+        };
+        let result = parse_encoding_dictionary(&doc, &enc, None).expect("parsed");
+        assert_eq!(result.sequences.get(&0x41).map(String::as_str), Some("ft"));
+        assert_eq!(result.sequences.get(&0x42).map(String::as_str), Some("ffi"));
+        assert_eq!(result.sequences.get(&0x43).map(String::as_str), Some("fi"));
+        assert_eq!(result.sequences.get(&0x44).map(String::as_str), Some("fi"));
+        assert_eq!(result.map.get(&0x45), Some(&'a'));
+        assert!(!result.map.contains_key(&0x46) && !result.sequences.contains_key(&0x46));
+        assert!(result.named_codes.contains(&0x46));
+
+        let obj = Object::String(
+            vec![0x41, 0x20, 0x42, 0x45, 0x46],
+            lopdf::StringFormat::Literal,
+        );
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let inline_cmaps = HashMap::new();
+        let mut font_encodings: PageFontEncodings = HashMap::new();
+        font_encodings.insert(
+            "F0".to_string(),
+            FontEncoding {
+                differences: result.map.clone(),
+                identity_overrides: FontEncodingMap::new(),
+                blank_codes: Default::default(),
+                base: Some(BaseEncoding::WinAnsi),
+                named_codes: result.named_codes.clone(),
+                sequences: result.sequences.clone(),
+            },
+        );
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F0".to_string(), make_font_info(&[], 1000, false));
+        let (text, _) = extract_text_from_operand(
+            &obj,
+            "F0",
+            Some("Helvetica"),
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("text decoded");
+        // "ft", a space, "ffi", "a"; the unreadable `f_zzz` code reads as nothing.
+        assert_eq!(text, "ft ffia");
+    }
+
+    #[test]
     fn a_named_but_unmapped_code_reads_as_nothing() {
         // A subset names code 0x81 `gid00136` over a WinAnsi base: the
         // name could not be mapped, and neither WinAnsi's bullet at 0x81
@@ -2726,6 +2842,7 @@ mod tests {
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
                 named_codes: [0x81].into_iter().collect(),
+                sequences: Default::default(),
             },
         );
         let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
