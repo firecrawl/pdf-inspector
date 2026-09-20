@@ -7,6 +7,21 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+Changes since 1.22.0.
+
+### Fixed
+
+- Glyph names that spell a ligature by its components (`f_t`, `f_f_i`,
+  `T_h`), as a `uni` sequence of several code points (`uni00660069`) or
+  with a suffix (`a.sc`, `f_i.liga`) decode to the letters they stand for,
+  per the Adobe Glyph List Specification, in a font's `/Differences` and in
+  an embedded program's own glyph names; they came out as nothing, so a word
+  set with such a ligature lost its letters. A name that still cannot be
+  read keeps reading as nothing.
+  ([#558](https://github.com/firecrawl/pdf-inspector/pull/558))
+
 ## [1.22.0] - 2026-09-20
 
 Changes since 1.21.0.
