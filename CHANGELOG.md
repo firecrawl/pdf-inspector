@@ -7,7 +7,7 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## [Unreleased]
+## [1.22.0] - 2026-09-20
 
 Changes since 1.21.0.
 
@@ -59,6 +59,7 @@ Changes since 1.21.0.
   form needs it and for an encrypted document, for callers that render the
   document with their own renderer. The Python, Node and WebAssembly
   bindings do not expose it.
+  ([#550](https://github.com/firecrawl/pdf-inspector/pull/550))
 
 ### Fixed
 
@@ -71,14 +72,17 @@ Changes since 1.21.0.
   characters that were written (by the Unicode mirroring data), and a line
   of a Latin paragraph that quotes a right-to-left word keeps reading left
   to right.
+  ([#552](https://github.com/firecrawl/pdf-inspector/pull/552))
 - Hebrew and Arabic text positioned one glyph per show operator merges into
   words by the line's own gaps instead of taking a word space after every
   glyph whose declared width falls short of its advance, so a word no
   longer comes out as scattered letters.
+  ([#552](https://github.com/firecrawl/pdf-inspector/pull/552))
 - Arabic (and Hebrew) presentation forms — the positional and ligature
   code points that a font subsetted by glyph maps its glyphs to — are
   normalized to the letters they stand for once the text is in reading
   order, so a ligature's letters come out in order too.
+  ([#552](https://github.com/firecrawl/pdf-inspector/pull/552))
 - Tracked display text set as a `TJ` array with one glyph per string and
   the letter spacing as the offset between them (`[(V) -250 (A) -250 (L) …]
   TJ`) came out with a space between every letter. The offsets of such a
@@ -97,6 +101,7 @@ Changes since 1.21.0.
   comes out blank. The OCR pipeline renders the repaired document — a
   decrypted copy, in memory, when the document is encrypted — so such a
   page is no longer a blank render. A box with an area is left as written.
+  ([#550](https://github.com/firecrawl/pdf-inspector/pull/550))
 - A page of vector drawings whose text is shown through a CID-keyed font
   with a ToUnicode CMap was reported as vector-outlined text (`vector_text`)
   and routed to OCR: the rule counted the distinct letters and digits among
@@ -108,10 +113,12 @@ Changes since 1.21.0.
   over an illustration is a text page, while a page of paths with a
   caption's worth of text, a title and address line over outlined body
   text, or a CMap that maps every code alike, still goes to OCR.
+  ([#551](https://github.com/firecrawl/pdf-inspector/pull/551))
 - A Form XObject whose content inflates past the page-content bound is now
   skipped, as a page over it already was, instead of being decompressed in
   full before the operator cap could apply; a ToUnicode CMap the detector
   reads is bounded the same way as the loader's own streams.
+  ([#551](https://github.com/firecrawl/pdf-inspector/pull/551))
 
 - Simple fonts decode through their base encoding where their
   `/Differences` say nothing: an encoding dictionary's `/BaseEncoding` now
