@@ -1017,13 +1017,24 @@ fn glyph_index_chars(
 /// collection is read face by face: a glyph the program names, or a CID
 /// it maps, may sit in any member, while a bare index reads in the first.
 fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, Option<String>> {
-    /// One face of the stream with its glyph → text map.
+    /// One face of the stream with its cmap's characters; what a glyph
+    /// reads as is looked up for the glyph a name asks for, not for every
+    /// glyph of the font.
     struct Program<'a> {
         face: Option<ttf_parser::Face<'a>>,
         bare_cff: Option<ttf_parser::cff::Table<'a>>,
-        by_glyph: HashMap<u16, String>,
+        cmap_chars: HashMap<u16, char>,
     }
     impl Program<'_> {
+        fn text(&self, gid: u16) -> Option<String> {
+            match (&self.face, &self.bare_cff) {
+                (Some(face), _) => crate::tounicode::glyph_text(face, &self.cmap_chars, gid),
+                (None, Some(cff)) => {
+                    glyph_name_to_string(cff.glyph_name(ttf_parser::GlyphId(gid))?)
+                }
+                (None, None) => None,
+            }
+        }
         fn cff(&self) -> Option<&ttf_parser::cff::Table<'_>> {
             self.face
                 .as_ref()
@@ -1047,7 +1058,7 @@ fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, 
     let mut programs: Vec<Program> = (0..ttf_parser::fonts_in_collection(data).unwrap_or(1))
         .filter_map(|index| ttf_parser::Face::parse(data, index).ok())
         .map(|face| Program {
-            by_glyph: crate::tounicode::build_gid_to_unicode(&face).unwrap_or_default(),
+            cmap_chars: crate::tounicode::cmap_glyph_chars(&face),
             face: Some(face),
             bare_cff: None,
         })
@@ -1055,12 +1066,7 @@ fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, 
     if programs.is_empty() {
         if let Some(cff) = ttf_parser::cff::Table::parse(data) {
             programs.push(Program {
-                by_glyph: (0..cff.number_of_glyphs())
-                    .filter_map(|gid| {
-                        let name = cff.glyph_name(ttf_parser::GlyphId(gid))?;
-                        glyph_name_to_string(name).map(|text| (gid, text))
-                    })
-                    .collect(),
+                cmap_chars: HashMap::new(),
                 face: None,
                 bare_cff: Some(cff),
             });
@@ -1076,18 +1082,18 @@ fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, 
             .iter()
             .find_map(|program| program.glyph_by_name(name).map(|gid| (program, gid)))
         {
-            return program.by_glyph.get(&gid).cloned();
+            return program.text(gid);
         }
         match numbered_glyph_name(name)? {
-            NumberedGlyph::Index(index) => first.by_glyph.get(&index).cloned(),
+            NumberedGlyph::Index(index) => first.text(index),
             NumberedGlyph::Cid(cid) => {
                 if let Some((program, gid)) = programs
                     .iter()
                     .find_map(|program| program.glyph_by_cid(cid).map(|gid| (program, gid)))
                 {
-                    return program.by_glyph.get(&gid).cloned();
+                    return program.text(gid);
                 }
-                first.by_glyph.get(&cid).cloned()
+                first.text(cid)
             }
         }
     };

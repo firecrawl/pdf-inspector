@@ -1123,11 +1123,29 @@ fn strip_pua_char(ch: char) -> char {
 /// what a glyph is more reliably than the private-use code point a symbol
 /// cmap gives it, and names the glyphs the cmap leaves out.
 pub(crate) fn build_gid_to_unicode(face: &ttf_parser::Face<'_>) -> Option<HashMap<u16, String>> {
+    let cmap_chars = cmap_glyph_chars(face);
     let mut gid_to_unicode: HashMap<u16, String> = HashMap::new();
+    for gid in (0..face.number_of_glyphs()).chain(cmap_chars.keys().copied()) {
+        if gid_to_unicode.contains_key(&gid) {
+            continue;
+        }
+        if let Some(text) = glyph_text(face, &cmap_chars, gid) {
+            gid_to_unicode.insert(gid, text);
+        }
+    }
 
-    // Iterate all Unicode codepoints that have a glyph mapping.
-    // For each codepoint, the face gives us a GlyphId; reverse that to GID→Unicode.
-    // We prefer the first (lowest) codepoint for each GID to handle duplicates.
+    if gid_to_unicode.is_empty() {
+        return None;
+    }
+
+    Some(gid_to_unicode)
+}
+
+/// Glyph index → the character the font's Unicode and Windows Symbol cmap
+/// subtables give it, the first (lowest) code point of each glyph: the
+/// part of [`build_gid_to_unicode`] that has to read the whole font.
+pub(crate) fn cmap_glyph_chars(face: &ttf_parser::Face<'_>) -> HashMap<u16, char> {
+    let mut chars: HashMap<u16, char> = HashMap::new();
     for subtable in face.tables().cmap.iter().flat_map(|cmap| cmap.subtables) {
         let is_symbol =
             subtable.platform_id == ttf_parser::PlatformId::Windows && subtable.encoding_id == 0;
@@ -1137,42 +1155,32 @@ pub(crate) fn build_gid_to_unicode(face: &ttf_parser::Face<'_>) -> Option<HashMa
         subtable.codepoints(|cp| {
             if let Some(ch) = char::from_u32(cp) {
                 if let Some(gid) = subtable.glyph_index(cp) {
-                    let gid_val = gid.0;
-                    gid_to_unicode
-                        .entry(gid_val)
-                        .or_insert_with(|| ch.to_string());
+                    chars.entry(gid.0).or_insert(ch);
                 }
             }
         });
     }
+    chars
+}
 
+/// What one glyph reads as, given the cmap's characters
+/// ([`cmap_glyph_chars`]): the glyph's name wins over a private-use code
+/// point from the cmap, and a name of several letters (a ligature) reads
+/// as all of them; a glyph with neither reads as nothing. Read per glyph,
+/// so a caller after a few glyphs of a large font pays for those alone.
+pub(crate) fn glyph_text(
+    face: &ttf_parser::Face<'_>,
+    cmap_chars: &HashMap<u16, char>,
+    gid: u16,
+) -> Option<String> {
     let private_use = |c: char| matches!(c, '\u{E000}'..='\u{F8FF}');
-    for gid in 0..face.number_of_glyphs() {
-        let Some(name) = face.glyph_name(ttf_parser::GlyphId(gid)) else {
-            continue;
-        };
-        let Some(text) = glyph_name_to_string(name) else {
-            continue;
-        };
-        // The glyph's name wins over a private-use code point from the
-        // cmap; a name of several letters (a ligature) maps to all of them.
-        let mapped_private = |mapped: &String| {
-            let mut chars = mapped.chars();
-            matches!((chars.next(), chars.next()), (Some(ch), None) if private_use(ch))
-        };
-        match gid_to_unicode.get(&gid) {
-            Some(mapped) if !mapped_private(mapped) => {}
-            _ => {
-                gid_to_unicode.insert(gid, text);
-            }
-        }
+    let from_cmap = cmap_chars.get(&gid).copied();
+    if let Some(ch) = from_cmap.filter(|ch| !private_use(*ch)) {
+        return Some(ch.to_string());
     }
-
-    if gid_to_unicode.is_empty() {
-        return None;
-    }
-
-    Some(gid_to_unicode)
+    face.glyph_name(ttf_parser::GlyphId(gid))
+        .and_then(glyph_name_to_string)
+        .or_else(|| from_cmap.map(|ch| ch.to_string()))
 }
 
 /// Build a ToUnicodeCMap from pdf.js built-in binary CMaps (bcmaps).
