@@ -785,18 +785,34 @@ pub(crate) fn build_font_encodings(
         let mut differences = FontEncodingMap::new();
         let mut identity_overrides = FontEncodingMap::new();
         let mut base: Option<BaseEncoding> = None;
+        // A Type3 font's Differences name its glyph procedures: a numbered
+        // name there (`g10`) labels a procedure and indexes nothing, so the
+        // glyph-index reading below is for fonts with a glyph table only.
+        let type3 = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .is_some_and(|n| n == b"Type3");
         if let Some(result) = parse_font_encoding(doc, font_dict) {
             base = result.base;
             // Names that are glyph indexes (`g12`, `glyph12`, `index12`)
             // say nothing by themselves; the embedded font program says
             // what those glyphs are.
-            let by_index = glyph_index_chars(doc, font_dict, &result.gid_names, font_cache);
-            let unresolved: Vec<u8> = result
-                .gid_codes
-                .iter()
-                .copied()
-                .filter(|code| !by_index.contains_key(code))
-                .collect();
+            let by_index = if type3 {
+                FontEncodingMap::new()
+            } else {
+                glyph_index_chars(doc, font_dict, &result.gid_names, font_cache)
+            };
+            let unresolved: Vec<u8> = if type3 {
+                Vec::new()
+            } else {
+                result
+                    .gid_codes
+                    .iter()
+                    .copied()
+                    .filter(|code| !by_index.contains_key(code))
+                    .collect()
+            };
             if !unresolved.is_empty() && !tounicode_maps_codes(font_dict, cmaps, &unresolved) {
                 has_gid_fonts = true;
             }
@@ -3666,6 +3682,46 @@ end",
         let (_, has_gid_fonts) =
             build_font_encodings(&doc, &fonts, &cmaps, &mut FontStyleCache::new());
         has_gid_fonts
+    }
+
+    #[test]
+    fn type3_procedure_names_never_flag_the_page() {
+        // A Type3 font names its glyph procedures in /Differences — `g2`,
+        // `g10` — and has no glyph table those numbers could index; the
+        // same names on a font with a program and no ToUnicode do flag.
+        let mut doc = Document::with_version("1.4");
+        let differences = || {
+            Object::Array(vec![
+                2.into(),
+                Object::Name(b"g2".to_vec()),
+                Object::Name(b"g10".to_vec()),
+            ])
+        };
+        let type3 = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontBBox" => vec![0.into(), 0.into(), 1000.into(), 1000.into()],
+            "FontMatrix" => vec![0.001.into(), 0.into(), 0.into(), 0.001.into(), 0.into(), 0.into()],
+            "CharProcs" => dictionary! {},
+            "Encoding" => dictionary! { "Type" => "Encoding", "Differences" => differences() },
+            "FirstChar" => 2,
+            "LastChar" => 3,
+            "Widths" => vec![500.into(), 500.into()],
+        });
+        let truetype = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "SyntheticSubset",
+            "Encoding" => dictionary! { "Type" => "Encoding", "Differences" => differences() },
+        });
+        let cmaps = FontCMaps::from_doc(&doc);
+        for (font_id, expected) in [(type3, false), (truetype, true)] {
+            let font_dict = doc.get_dictionary(font_id).unwrap().clone();
+            let fonts = std::collections::BTreeMap::from([(b"F1".to_vec(), &font_dict)]);
+            let (_, has_gid_fonts) =
+                build_font_encodings(&doc, &fonts, &cmaps, &mut FontStyleCache::new());
+            assert_eq!(has_gid_fonts, expected);
+        }
     }
 
     #[test]
