@@ -264,7 +264,8 @@ pub(crate) fn sort_line_items(items: &mut [TextItem], page_rtl: bool) {
 /// Detect if a font name indicates bold style: a bold word ("Bold",
 /// "Black", "Heavy", "Demi", "Ultra", "SemiBold", "ExtraBold"), or one of
 /// the foundry style abbreviations the weight-class parser reads ("-Bd",
-/// "-Sb", "-Dm", "-Hv", "-Blk", "-XBd", "-Ult", "W6".."W9") — any name
+/// "-Sb", "-SBd", "-Smbd", "-Dm", "-DmBd", "-Hv", "-Blk", "-XBd", "-XBlk",
+/// "-Ult", "W6".."W9") — any name
 /// [`font_weight_from_name`] puts at 600 or heavier is bold, so every face
 /// the weight class calls bold this flag calls bold too. The abbreviations
 /// are matched as whole tokens after the family name, in the mixed case
