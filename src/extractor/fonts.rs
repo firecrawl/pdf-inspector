@@ -346,17 +346,18 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
     for code in 0u16..=255 {
         // A ligature named by its components is as wide as its letters —
         // where a Differences character does not take the code first, as
-        // in the decoder; a letter without a width counts the default.
+        // in the decoder; a letter without a width counts the default, and
+        // the sum of an absurdly long name saturates instead of wrapping.
         if let Some(text) = sequences
             .get(&(code as u8))
             .filter(|_| !enc_map.contains_key(&(code as u8)))
         {
-            let total: u16 = text
+            let total = text
                 .chars()
                 .map(|ch| {
                     crate::extractor::base14::base14_char_width(&base_font, ch).unwrap_or(500)
                 })
-                .sum();
+                .fold(0u16, u16::saturating_add);
             widths.insert(code, total);
             continue;
         }
@@ -2888,6 +2889,31 @@ mod tests {
             .map(|ch| crate::extractor::base14::base14_char_width("Helvetica", ch).unwrap())
             .sum();
         assert_eq!(widths.widths.get(&0x40).copied(), Some(fi));
+    }
+
+    #[test]
+    fn a_sequence_of_many_letters_saturates_its_width() {
+        // A `uni` name strings together any number of code points; the
+        // base-14 width of such a code saturates instead of wrapping (or,
+        // in a debug build, overflowing) when its letters outgrow a width.
+        let doc = Document::new();
+        let name = format!("uni{}", "0041".repeat(100));
+        let font = lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Encoding",
+                "Differences" => Object::Array(vec![
+                    Object::Integer(0x40),
+                    Object::Name(name.into_bytes()),
+                ])
+            })
+        };
+        let result = parse_font_encoding(&doc, &font).expect("parsed");
+        assert_eq!(result.sequences.get(&0x40).map(String::len), Some(100));
+        let widths = base14_fallback_widths(&doc, &font).expect("widths");
+        assert_eq!(widths.widths.get(&0x40).copied(), Some(u16::MAX));
     }
 
     #[test]
