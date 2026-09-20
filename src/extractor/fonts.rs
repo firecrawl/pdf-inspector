@@ -344,15 +344,20 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
 
     let mut widths = HashMap::new();
     for code in 0u16..=255 {
-        // A ligature named by its components is as wide as its letters.
-        if let Some(text) = sequences.get(&(code as u8)) {
-            if let Some(total) = text
+        // A ligature named by its components is as wide as its letters —
+        // where a Differences character does not take the code first, as
+        // in the decoder; a letter without a width counts the default.
+        if let Some(text) = sequences
+            .get(&(code as u8))
+            .filter(|_| !enc_map.contains_key(&(code as u8)))
+        {
+            let total: u16 = text
                 .chars()
-                .map(|ch| crate::extractor::base14::base14_char_width(&base_font, ch))
-                .sum::<Option<u16>>()
-            {
-                widths.insert(code, total);
-            }
+                .map(|ch| {
+                    crate::extractor::base14::base14_char_width(&base_font, ch).unwrap_or(500)
+                })
+                .sum();
+            widths.insert(code, total);
             continue;
         }
         // Resolution order: Differences override, then the font's base
@@ -1524,10 +1529,13 @@ pub(crate) fn parse_encoding_dictionary(
                     gid_codes.push(current_code);
                     gid_names.push((current_code, glyph_name.clone()));
                 }
+                // A code named twice keeps its last name, in one map only.
                 if let Some(ch) = mapped_char {
+                    sequences.remove(&current_code);
                     encoding_map.insert(current_code, ch);
                     glyph_names.insert(current_code, glyph_name);
                 } else if let Some(text) = mapped {
+                    encoding_map.remove(&current_code);
                     sequences.insert(current_code, text);
                     glyph_names.insert(current_code, glyph_name);
                 } else {
@@ -1545,7 +1553,7 @@ pub(crate) fn parse_encoding_dictionary(
     if ligature_count > 0 {
         debug!(
             "  Differences: {} total entries, {} ligatures",
-            encoding_map.len(),
+            encoding_map.len() + sequences.len(),
             ligature_count
         );
     }
@@ -2837,6 +2845,49 @@ mod tests {
         .expect("text decoded");
         // "ft", a space, "ffi", "a"; the unreadable `f_zzz` code reads as nothing.
         assert_eq!(text, "ft ffia");
+    }
+
+    #[test]
+    fn a_code_named_twice_keeps_its_last_name_in_text_and_width() {
+        // `[0x40 /f_i 0x40 /a]`: the later single-character name wins, in
+        // the Differences map and in the base-14 width fallback alike; the
+        // reverse order leaves the ligature.
+        let doc = Document::new();
+        let font = |names: Vec<&[u8]>| {
+            let mut differences = Vec::new();
+            for name in names {
+                differences.push(Object::Integer(0x40));
+                differences.push(Object::Name(name.to_vec()));
+            }
+            lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "Helvetica",
+                "Encoding" => Object::Dictionary(lopdf::dictionary! {
+                    "Type" => "Encoding",
+                    "Differences" => Object::Array(differences)
+                })
+            }
+        };
+        let last_letter = font(vec![b"f_i", b"a"]);
+        let result = parse_font_encoding(&doc, &last_letter).expect("parsed");
+        assert_eq!(result.map.get(&0x40), Some(&'a'));
+        assert!(!result.sequences.contains_key(&0x40));
+        let widths = base14_fallback_widths(&doc, &last_letter).expect("widths");
+        assert_eq!(
+            widths.widths.get(&0x40).copied(),
+            crate::extractor::base14::base14_char_width("Helvetica", 'a')
+        );
+        let last_ligature = font(vec![b"a", b"f_i"]);
+        let result = parse_font_encoding(&doc, &last_ligature).expect("parsed");
+        assert_eq!(result.sequences.get(&0x40).map(String::as_str), Some("fi"));
+        assert!(!result.map.contains_key(&0x40));
+        let widths = base14_fallback_widths(&doc, &last_ligature).expect("widths");
+        let fi: u16 = ['f', 'i']
+            .into_iter()
+            .map(|ch| crate::extractor::base14::base14_char_width("Helvetica", ch).unwrap())
+            .sum();
+        assert_eq!(widths.widths.get(&0x40).copied(), Some(fi));
     }
 
     #[test]

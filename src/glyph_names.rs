@@ -4604,35 +4604,44 @@ pub fn glyph_to_char(name: &str) -> Option<char> {
 /// half-read.
 pub fn glyph_name_to_string(name: &str) -> Option<String> {
     let base = name.split('.').next().filter(|base| !base.is_empty())?;
-    if let Some(hex) = base.strip_prefix("uni") {
-        if hex.len() >= 8 && hex.len() % 4 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return hex
-                .as_bytes()
-                .chunks(4)
-                .map(|group| {
-                    let code = u32::from_str_radix(std::str::from_utf8(group).ok()?, 16).ok()?;
-                    char::from_u32(code)
-                })
-                .collect();
-        }
-    }
     // Components first: `f_i` is the letters f and i even where the list
-    // also knows the joined name as a ligature code point.
+    // also knows the joined name as a ligature code point. Every component
+    // must read, or the name does not.
     if base.contains('_') {
-        let joined: Option<String> = base
-            .split('_')
-            .map(|part| match part.chars().count() {
-                0 => None,
-                1 if glyph_to_char(part).is_none() => Some(part.to_string()),
-                _ => glyph_name_to_string(part),
+        return base.split('_').map(glyph_name_to_string).collect();
+    }
+    if let Some(&ch) = GLYPH_TO_UNICODE.get(base) {
+        return Some(ch.to_string());
+    }
+    // `uni` takes groups of exactly four hex digits, `u` four to six: a
+    // name with anything else after the prefix is not one of them.
+    if let Some(hex) = base.strip_prefix("uni") {
+        if hex.is_empty() || hex.len() % 4 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        return hex
+            .as_bytes()
+            .chunks(4)
+            .map(|group| {
+                let code = u32::from_str_radix(std::str::from_utf8(group).ok()?, 16).ok()?;
+                // Windows Symbol convention: uniF0XX stands for code XX.
+                let code = if (0xF000..=0xF0FF).contains(&code) {
+                    code - 0xF000
+                } else {
+                    code
+                };
+                char::from_u32(code)
             })
             .collect();
-        if joined.is_some() {
-            return joined;
-        }
     }
-    if let Some(ch) = glyph_to_char(base) {
-        return Some(ch.to_string());
+    if let Some(hex) = base.strip_prefix('u') {
+        if !(4..=6).contains(&hex.len()) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        return u32::from_str_radix(hex, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .map(|ch| ch.to_string());
     }
     match base {
         "ft" | "st" | "ct" | "tt" | "ti" | "tz" | "fj" | "fb" | "fh" | "fk" => {
@@ -4655,9 +4664,11 @@ mod tests {
             glyph_name_to_string("uni0066_uni0069").as_deref(),
             Some("fi")
         );
-        // A component the list does not know leaves the whole name unread.
+        // A component the list does not know leaves the whole name unread,
+        // a one-character one included.
         assert_eq!(glyph_name_to_string("f_zzz"), None);
         assert_eq!(glyph_name_to_string("f__t"), None);
+        assert_eq!(glyph_name_to_string("f_!"), None);
     }
 
     #[test]
@@ -4672,11 +4683,21 @@ mod tests {
     fn uni_sequences_and_plain_ligature_names_are_read() {
         assert_eq!(glyph_name_to_string("uni00660069").as_deref(), Some("fi"));
         assert_eq!(glyph_name_to_string("uni03B1").as_deref(), Some("\u{03B1}"));
+        assert_eq!(glyph_name_to_string("uniF041").as_deref(), Some("A"));
+        assert_eq!(glyph_name_to_string("uniF041F042").as_deref(), Some("AB"));
         assert_eq!(glyph_name_to_string("u1F600").as_deref(), Some("\u{1F600}"));
         assert_eq!(glyph_name_to_string("fi").as_deref(), Some("\u{FB01}"));
         assert_eq!(glyph_name_to_string("ft").as_deref(), Some("ft"));
         assert_eq!(glyph_name_to_string("st").as_deref(), Some("st"));
         assert_eq!(glyph_name_to_string("gid00136"), None);
+        // Malformed encoded names are not half-read.
+        assert_eq!(glyph_name_to_string("uni0066X"), None);
+        assert_eq!(glyph_name_to_string("uni006"), None);
+        assert_eq!(glyph_name_to_string("u12"), None);
+        assert_eq!(glyph_name_to_string("u1234567"), None);
+        // Names that merely start with those letters are looked up as names.
+        assert_eq!(glyph_name_to_string("union").as_deref(), Some("\u{222A}"));
+        assert_eq!(glyph_name_to_string("uacute").as_deref(), Some("\u{00FA}"));
     }
     use super::*;
 
