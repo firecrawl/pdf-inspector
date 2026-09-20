@@ -43,6 +43,13 @@ The complete parser configuration, per-document predictions, evaluator output, a
 
 Use the [paired benchmark harness](docs/benchmarking.md) to compare two local builds against the exact same corpus and evaluator revision.
 
+## Demo
+
+[Jev Information Extraction](https://github.com/abhishekmamdapure/jev-information-extraction) uses **pdf-inspector** alongside the **Jev model** for faster document parsing.
+
+- **Demo:** https://jev-information-extraction-fibby-prod-telegram.up.railway.app/
+- **Repo:** https://github.com/abhishekmamdapure/jev-information-extraction
+
 ## Quick start
 
 ### Python
