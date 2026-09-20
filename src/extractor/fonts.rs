@@ -336,11 +336,22 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
         .as_ref()
         .map(|r| r.named_codes.clone())
         .unwrap_or_default();
-    let sequences = encoding
+    let mut sequences = encoding
         .as_ref()
         .map(|r| r.sequences.clone())
         .unwrap_or_default();
-    let enc_map = encoding.map(|r| r.map).unwrap_or_default();
+    let mut enc_map = encoding.as_ref().map(|r| r.map.clone()).unwrap_or_default();
+    // A numbered name (`g12`) reads through the embedded program for the
+    // decoder (`build_font_encodings`); its code is as wide as that reading.
+    if let Some(result) = &encoding {
+        let by_index = glyph_index_chars(
+            doc,
+            font_dict,
+            &result.gid_names,
+            &mut FontStyleCache::new(),
+        );
+        merge_program_readings(by_index, &mut enc_map, &mut sequences);
+    }
 
     let mut widths = HashMap::new();
     for code in 0u16..=255 {
@@ -850,17 +861,7 @@ pub(crate) fn build_font_encodings(
                 identity_overrides = stale_identity_cmap_overrides(doc, font_dict, cmaps, &result);
                 differences = result.map;
             }
-            for (code, text) in by_index {
-                let mut chars = text.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(ch), None) => {
-                        differences.entry(code).or_insert(ch);
-                    }
-                    _ => {
-                        sequences.entry(code).or_insert(text);
-                    }
-                }
-            }
+            merge_program_readings(by_index, &mut differences, &mut sequences);
         }
         // Symbol and ZapfDingbats read through their built-in encodings
         // unless the font names another encoding outright.
@@ -934,6 +935,32 @@ fn builtin_base_encoding(doc: &Document, font_dict: &lopdf::Dictionary) -> Optio
 /// program does not identify are left out. What each name resolves to is
 /// kept in `font_cache` per program, so a font shared across pages is
 /// parsed once.
+/// File what the font program says a font's numbered glyph names stand
+/// for ([`glyph_index_chars`]) the way `parse_encoding_dictionary` files a
+/// name's own reading: one character joins the Differences, the letters
+/// of a ligature the sequences, each taking the code from the other map.
+/// The names are the last names of their codes, so their readings stand.
+fn merge_program_readings(
+    by_index: HashMap<u8, String>,
+    differences: &mut FontEncodingMap,
+    sequences: &mut HashMap<u8, String>,
+) {
+    for (code, text) in by_index {
+        let mut chars = text.chars();
+        match (chars.next(), chars.next()) {
+            (Some(ch), None) => {
+                sequences.remove(&code);
+                differences.insert(code, ch);
+            }
+            (Some(_), Some(_)) => {
+                differences.remove(&code);
+                sequences.insert(code, text);
+            }
+            (None, _) => {}
+        }
+    }
+}
+
 fn glyph_index_chars(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
@@ -1524,19 +1551,25 @@ pub(crate) fn parse_encoding_dictionary(
                     );
                     ligature_count += 1;
                 }
+                // A code named twice keeps its last name, in one map only:
+                // whatever an earlier name gave the code — a character, the
+                // letters of a ligature, or a numbered name awaiting the
+                // font program — goes when a later name takes the code.
+                encoding_map.remove(&current_code);
+                sequences.remove(&current_code);
+                glyph_names.remove(&current_code);
+                gid_codes.retain(|code| *code != current_code);
+                gid_names.retain(|(code, _)| *code != current_code);
                 // Numbered names (e.g. "gid00053", "g53", "cid53") say
                 // nothing without the font program's glyph table.
                 if mapped.is_none() && numbered_glyph_name(&glyph_name).is_some() {
                     gid_codes.push(current_code);
                     gid_names.push((current_code, glyph_name.clone()));
                 }
-                // A code named twice keeps its last name, in one map only.
                 if let Some(ch) = mapped_char {
-                    sequences.remove(&current_code);
                     encoding_map.insert(current_code, ch);
                     glyph_names.insert(current_code, glyph_name);
                 } else if let Some(text) = mapped {
-                    encoding_map.remove(&current_code);
                     sequences.insert(current_code, text);
                     glyph_names.insert(current_code, glyph_name);
                 } else {
@@ -2914,6 +2947,115 @@ mod tests {
         assert_eq!(result.sequences.get(&0x40).map(String::len), Some(100));
         let widths = base14_fallback_widths(&doc, &font).expect("widths");
         assert_eq!(widths.widths.get(&0x40).copied(), Some(u16::MAX));
+    }
+
+    #[test]
+    fn a_later_numbered_name_takes_a_code_from_an_earlier_character() {
+        // `[0x40 /a 0x40 /g5]`: the numbered name is the code's last name,
+        // so `a` no longer names it and the code awaits the font program;
+        // `[0x40 /g5 0x40 /a]` leaves the program nothing to resolve.
+        let doc = Document::new();
+        let font = |names: Vec<&[u8]>| {
+            let mut differences = Vec::new();
+            for name in names {
+                differences.push(Object::Integer(0x40));
+                differences.push(Object::Name(name.to_vec()));
+            }
+            lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "Helvetica",
+                "Encoding" => Object::Dictionary(lopdf::dictionary! {
+                    "Type" => "Encoding",
+                    "Differences" => Object::Array(differences)
+                })
+            }
+        };
+        let numbered_last = parse_font_encoding(&doc, &font(vec![b"a", b"g5"])).expect("parsed");
+        assert!(!numbered_last.map.contains_key(&0x40));
+        assert!(!numbered_last.glyph_names.contains_key(&0x40));
+        assert_eq!(numbered_last.gid_codes, vec![0x40]);
+        assert_eq!(numbered_last.gid_names, vec![(0x40, "g5".to_string())]);
+        let letter_last = parse_font_encoding(&doc, &font(vec![b"g5", b"a"])).expect("parsed");
+        assert_eq!(letter_last.map.get(&0x40), Some(&'a'));
+        assert!(letter_last.gid_codes.is_empty());
+        assert!(letter_last.gid_names.is_empty());
+    }
+
+    #[test]
+    fn a_numbered_name_the_program_reads_as_letters_decodes_and_measures_so() {
+        // The ligature fixture's program names a glyph `f_t`. A font that
+        // reaches that glyph by number after naming the code `a` reads the
+        // code as "ft" — the program's reading of its last name — in its
+        // encoding and, for a standard-14 face without widths, in the
+        // width fallback; named `a` last, the code is `a` in both.
+        let doc = Document::load("tests/fixtures/ligature_glyph_names.pdf").unwrap();
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let fonts = doc.get_page_fonts(page_id).unwrap();
+        let fixture = (*fonts.get(&b"F1".to_vec()).expect("F1")).clone();
+        let descriptor = resolve_dict(&doc, fixture.get(b"FontDescriptor").unwrap()).unwrap();
+        let program_ref = descriptor
+            .get(b"FontFile2")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let program = font_file_data(&doc, program_ref).expect("program");
+        let face = ttf_parser::Face::parse(&program, 0).unwrap();
+        let ft = format!("g{}", face.glyph_index_by_name("f_t").unwrap().0);
+        let font = |names: Vec<&[u8]>| {
+            let mut differences = Vec::new();
+            for name in names {
+                differences.push(Object::Integer(0x41));
+                differences.push(Object::Name(name.to_vec()));
+            }
+            let mut dict = fixture.clone();
+            dict.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+            dict.remove(b"Widths");
+            dict.remove(b"FirstChar");
+            dict.remove(b"LastChar");
+            dict.set(
+                "Encoding",
+                Object::Dictionary(lopdf::dictionary! {
+                    "Type" => "Encoding",
+                    "Differences" => Object::Array(differences)
+                }),
+            );
+            dict
+        };
+        let width =
+            |ch: char| crate::extractor::base14::base14_char_width("Helvetica", ch).unwrap();
+        let encoding_of = |dict: &lopdf::Dictionary| {
+            let mut resources = std::collections::BTreeMap::new();
+            resources.insert(b"F1".to_vec(), dict);
+            let (mut encodings, has_gid_fonts) = build_font_encodings(
+                &doc,
+                &resources,
+                &FontCMaps::default(),
+                &mut FontStyleCache::new(),
+            );
+            (encodings.remove("F1").expect("encoding"), has_gid_fonts)
+        };
+
+        let numbered_last = font(vec![b"a", ft.as_bytes()]);
+        let (encoding, has_gid_fonts) = encoding_of(&numbered_last);
+        assert_eq!(
+            encoding.sequences.get(&0x41).map(String::as_str),
+            Some("ft")
+        );
+        assert!(!encoding.differences.contains_key(&0x41));
+        assert!(!has_gid_fonts);
+        let widths = base14_fallback_widths(&doc, &numbered_last).expect("widths");
+        assert_eq!(
+            widths.widths.get(&0x41).copied(),
+            Some(width('f') + width('t'))
+        );
+
+        let letter_last = font(vec![ft.as_bytes(), b"a"]);
+        let (encoding, _) = encoding_of(&letter_last);
+        assert_eq!(encoding.differences.get(&0x41), Some(&'a'));
+        assert!(!encoding.sequences.contains_key(&0x41));
+        let widths = base14_fallback_widths(&doc, &letter_last).expect("widths");
+        assert_eq!(widths.widths.get(&0x41).copied(), Some(width('a')));
     }
 
     #[test]
