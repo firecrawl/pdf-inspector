@@ -435,8 +435,11 @@ fn lower_median(sorted: &[f32]) -> f32 {
 /// being sampled — is not vouched for, so the run keeps the fixed
 /// thresholds. Both bands are capped in absolute terms, since a font
 /// without a space glyph reports another glyph's width for its space.
-/// Offsets are read the same way at a negative `Tf` size, as the
-/// thresholds are.
+/// Whatever the tracking, the run must be display text: an array with more
+/// punctuation than letters, digits and Han/Kana — math punctuation set
+/// off by thin spaces, a row of leader dots — is spaced by kerns that only
+/// look like tracking, and keeps the fixed thresholds. Offsets are read
+/// the same way at a negative `Tf` size, as the thresholds are.
 pub(crate) fn tj_tracking(
     array: &[Object],
     font_info: Option<&FontWidthInfo>,
@@ -490,15 +493,35 @@ pub(crate) fn tj_tracking(
     if tracking < space_threshold * TRACKING_MIN || tracking > tracking_max {
         return None;
     }
-    let needs_capitals =
-        (space_threshold * TRACKING_NEEDS_CAPITALS).min(TRACKING_NEEDS_CAPITALS_MAX);
-    if tracking >= needs_capitals {
-        for element in strings {
-            let (text, _) = decode(element)?;
-            if !text.chars().all(is_tracked_display_glyph) {
-                return None;
+    // Tracked display text is letters, digits or Han/Kana with the odd
+    // punctuation mark among them. An array with more punctuation than
+    // that — math punctuation set off by thin spaces, a row of leader dots
+    // — is spaced by kerns that only look like tracking, and keeps the
+    // fixed thresholds.
+    let mut texts: Vec<String> = Vec::with_capacity(strings.len());
+    let (mut letters, mut punctuation) = (0usize, 0usize);
+    for element in strings {
+        let (text, _) = decode(element)?;
+        for c in text.chars() {
+            if c.is_alphanumeric() {
+                letters += 1;
+            } else if !c.is_whitespace() {
+                punctuation += 1;
             }
         }
+        texts.push(text);
+    }
+    if letters < punctuation {
+        return None;
+    }
+    let needs_capitals =
+        (space_threshold * TRACKING_NEEDS_CAPITALS).min(TRACKING_NEEDS_CAPITALS_MAX);
+    if tracking >= needs_capitals
+        && !texts
+            .iter()
+            .all(|text| text.chars().all(is_tracked_display_glyph))
+    {
+        return None;
     }
     Some(tracking)
 }
@@ -825,6 +848,26 @@ mod tests {
             word_gap_threshold(Some(&font)),
             latin,
         )
+    }
+
+    /// A math-italic array of commas and ellipsis dots kerned by thin
+    /// spaces, with one letter at its end, is not tracked display text and
+    /// keeps the fixed thresholds, whatever its typical gap; a title whose
+    /// letters carry a period each still reads its tracking.
+    #[test]
+    fn punctuation_led_arrays_are_not_tracking() {
+        assert_eq!(
+            tracking("(,) -167 (.) -167 (.) -167 (.) -167 (,) -167 (D)"),
+            None
+        );
+        assert_eq!(
+            tracking("(,) -100 (.) -100 (.) -100 (.) -100 (,) -100 (D)"),
+            None
+        );
+        assert_eq!(
+            tracking("(R) -300 (.) -300 (E) -300 (.) -300 (V)"),
+            Some(300.0)
+        );
     }
 
     #[test]
