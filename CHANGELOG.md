@@ -19,7 +19,8 @@ Changes since 1.22.0.
   per the Adobe Glyph List Specification, in a font's `/Differences` and in
   an embedded program's own glyph names; they came out as nothing, so a word
   set with such a ligature lost its letters. A name that still cannot be
-  read keeps reading as nothing.
+  read keeps reading as nothing. The width fallback for the standard 14
+  fonts gives such a code the width of the letters it spells.
   ([#558](https://github.com/firecrawl/pdf-inspector/pull/558))
 
 ## [1.22.0] - 2026-09-20

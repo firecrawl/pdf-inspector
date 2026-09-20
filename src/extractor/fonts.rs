@@ -1,7 +1,7 @@
 //! Font width parsing, encoding, and text decoding.
 
 use super::get_number;
-use crate::glyph_names::{glyph_name_to_string, glyph_to_char};
+use crate::glyph_names::glyph_name_to_string;
 use crate::tounicode::FontCMaps;
 use crate::types::{
     BaseEncoding, BoldSource, FontEncoding, FontEncodingMap, FontWidthInfo, PageFontEncodings,
@@ -823,7 +823,7 @@ pub(crate) fn build_font_encodings(
             // say nothing by themselves; the embedded font program says
             // what those glyphs are.
             let by_index = if type3 {
-                FontEncodingMap::new()
+                HashMap::new()
             } else {
                 glyph_index_chars(doc, font_dict, &result.gid_names, font_cache)
             };
@@ -844,8 +844,16 @@ pub(crate) fn build_font_encodings(
                 identity_overrides = stale_identity_cmap_overrides(doc, font_dict, cmaps, &result);
                 differences = result.map;
             }
-            for (code, ch) in by_index {
-                differences.entry(code).or_insert(ch);
+            for (code, text) in by_index {
+                let mut chars = text.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(ch), None) => {
+                        differences.entry(code).or_insert(ch);
+                    }
+                    _ => {
+                        sequences.entry(code).or_insert(text);
+                    }
+                }
             }
         }
         // Symbol and ZapfDingbats read through their built-in encodings
@@ -925,9 +933,9 @@ fn glyph_index_chars(
     font_dict: &lopdf::Dictionary,
     names: &[(u8, String)],
     font_cache: &mut FontStyleCache,
-) -> FontEncodingMap {
+) -> HashMap<u8, String> {
     if names.is_empty() {
-        return FontEncodingMap::new();
+        return HashMap::new();
     }
     let font_file = || -> Option<ObjectId> {
         let descriptor = resolve_dict(doc, font_dict.get(b"FontDescriptor").ok()?)?;
@@ -936,7 +944,7 @@ fn glyph_index_chars(
             .find_map(|key| descriptor.get(key).ok()?.as_reference().ok())
     };
     let Some(ff_ref) = font_file() else {
-        return FontEncodingMap::new();
+        return HashMap::new();
     };
     let cached = font_cache
         .numbered_glyphs_by_font_file
@@ -952,12 +960,12 @@ fn glyph_index_chars(
             .map(|data| resolve_numbered_glyph_names(&data, &unresolved))
             .unwrap_or_default();
         for name in unresolved {
-            cached.insert(name.to_string(), resolved.get(name).copied().flatten());
+            cached.insert(name.to_string(), resolved.get(name).cloned().flatten());
         }
     }
     names
         .iter()
-        .filter_map(|(code, name)| Some((*code, (*cached.get(name)?)?)))
+        .filter_map(|(code, name)| Some((*code, cached.get(name)?.clone()?)))
         .collect()
 }
 
@@ -966,12 +974,12 @@ fn glyph_index_chars(
 /// a glyph the program does not identify. A stream holding a TrueType
 /// collection is read face by face: a glyph the program names, or a CID
 /// it maps, may sit in any member, while a bare index reads in the first.
-fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, Option<char>> {
-    /// One face of the stream with its glyph → character map.
+fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, Option<String>> {
+    /// One face of the stream with its glyph → text map.
     struct Program<'a> {
         face: Option<ttf_parser::Face<'a>>,
         bare_cff: Option<ttf_parser::cff::Table<'a>>,
-        by_glyph: HashMap<u16, char>,
+        by_glyph: HashMap<u16, String>,
     }
     impl Program<'_> {
         fn cff(&self) -> Option<&ttf_parser::cff::Table<'_>> {
@@ -1008,7 +1016,7 @@ fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, 
                 by_glyph: (0..cff.number_of_glyphs())
                     .filter_map(|gid| {
                         let name = cff.glyph_name(ttf_parser::GlyphId(gid))?;
-                        glyph_to_char(name).map(|ch| (gid, ch))
+                        glyph_name_to_string(name).map(|text| (gid, text))
                     })
                     .collect(),
                 face: None,
@@ -1019,25 +1027,25 @@ fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, 
     let Some(first) = programs.first() else {
         return HashMap::new();
     };
-    let resolve = |name: &str| -> Option<char> {
+    let resolve = |name: &str| -> Option<String> {
         // A glyph the program names that way is the glyph meant, whatever
         // character it has.
         if let Some((program, gid)) = programs
             .iter()
             .find_map(|program| program.glyph_by_name(name).map(|gid| (program, gid)))
         {
-            return program.by_glyph.get(&gid).copied();
+            return program.by_glyph.get(&gid).cloned();
         }
         match numbered_glyph_name(name)? {
-            NumberedGlyph::Index(index) => first.by_glyph.get(&index).copied(),
+            NumberedGlyph::Index(index) => first.by_glyph.get(&index).cloned(),
             NumberedGlyph::Cid(cid) => {
                 if let Some((program, gid)) = programs
                     .iter()
                     .find_map(|program| program.glyph_by_cid(cid).map(|gid| (program, gid)))
                 {
-                    return program.by_glyph.get(&gid).copied();
+                    return program.by_glyph.get(&gid).cloned();
                 }
-                first.by_glyph.get(&cid).copied()
+                first.by_glyph.get(&cid).cloned()
             }
         }
     };
@@ -1665,7 +1673,7 @@ pub(crate) struct FontStyleCache {
     /// embedded font program (see `glyph_index_chars`), `None` when the
     /// program does not identify it, so a font shared across pages is
     /// parsed once.
-    numbered_glyphs_by_font_file: HashMap<ObjectId, HashMap<String, Option<char>>>,
+    numbered_glyphs_by_font_file: HashMap<ObjectId, HashMap<String, Option<String>>>,
 }
 
 impl FontStyleCache {
@@ -2006,6 +2014,14 @@ pub(crate) fn extract_text_from_operand(
                                         encoding_map.and_then(|map| map.identity_overrides.get(&b))
                                     {
                                         return Some(ch.to_string());
+                                    }
+                                    // A CMap that maps a code to itself says
+                                    // nothing a Differences ligature name at
+                                    // that code does not say better.
+                                    if let Some(text) =
+                                        encoding_map.and_then(|map| map.sequences.get(&b))
+                                    {
+                                        return Some(text.clone());
                                     }
                                 }
                                 return Some(s);
@@ -2684,9 +2700,10 @@ mod tests {
             (0x42, "g2".to_string()),
             (0x43, "glyph3".to_string()),
         ];
-        let expected: FontEncodingMap =
-            [(0x41, '\u{03B4}'), (0x42, '\u{03B5}'), (0x43, '\u{03B6}')]
+        let expected: HashMap<u8, String> =
+            [(0x41, "\u{03B4}"), (0x42, "\u{03B5}"), (0x43, "\u{03B6}")]
                 .into_iter()
+                .map(|(code, text)| (code, text.to_string()))
                 .collect();
         assert_eq!(
             glyph_index_chars(&doc, &font, &names, &mut FontStyleCache::new()),
