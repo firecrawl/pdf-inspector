@@ -871,6 +871,12 @@ pub(crate) fn build_font_encodings(
             base = builtin_base_encoding(doc, font_dict);
         }
         let blank_codes = blank_glyph_codes(doc, font_dict, font_cache);
+        // A font whose Differences name only codes nothing here can read
+        // gets no encoding, on purpose: the fallback then reads its codes
+        // as the single-byte characters they are, which such producers
+        // tend to keep meaningful (a glyph named by the character itself,
+        // `=` or `;`), where an encoding would read them as nothing. Only
+        // a font some of whose names do read treats the rest as nothing.
         if !differences.is_empty()
             || !sequences.is_empty()
             || !blank_codes.is_empty()
@@ -3064,6 +3070,65 @@ mod tests {
         let widths =
             base14_fallback_widths(&doc, &letter_last, &mut FontStyleCache::new()).expect("widths");
         assert_eq!(widths.widths.get(&0x41).copied(), Some(width('a')));
+    }
+
+    #[test]
+    fn a_font_whose_names_all_read_as_nothing_keeps_the_single_byte_fallback() {
+        // `/Differences [0x3D /= 0x3B /;]`: glyphs named by the character
+        // itself, names the glyph list does not know. Such a font gets no
+        // encoding, so its codes read through the single-byte fallback as
+        // the characters they are; with an encoding they would read as
+        // nothing and the text would lose its punctuation.
+        let doc = Document::new();
+        let font = lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Times-Roman",
+            "Encoding" => Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Encoding",
+                "Differences" => Object::Array(vec![
+                    Object::Integer(0x3D),
+                    Object::Name(b"=".to_vec()),
+                    Object::Integer(0x3B),
+                    Object::Name(b";".to_vec()),
+                ])
+            })
+        };
+        let mut resources = std::collections::BTreeMap::new();
+        resources.insert(b"F0".to_vec(), &font);
+        let (font_encodings, _) = build_font_encodings(
+            &doc,
+            &resources,
+            &FontCMaps::default(),
+            &mut FontStyleCache::new(),
+        );
+        assert!(!font_encodings.contains_key("F0"));
+
+        let obj = Object::String(
+            vec![0x61_u8, 0x3D, 0x62, 0x3B],
+            lopdf::StringFormat::Literal,
+        );
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let inline_cmaps = HashMap::new();
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F0".to_string(), make_font_info(&[], 1000, false));
+        let (text, _) = extract_text_from_operand(
+            &obj,
+            "F0",
+            Some("Times-Roman"),
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("text decoded");
+        assert_eq!(text, "a=b;");
     }
 
     #[test]
