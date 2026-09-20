@@ -1072,10 +1072,12 @@ pub(crate) fn extract_page_text_items_with_options(
                         // letter spacing as the offset between them — is
                         // judged over its own tracking (see `tj_tracking`
                         // and `tj_gap_thresholds`); a run that shows nothing
-                        // is not read for it. The reader decodes only to
-                        // check the case of a widely spaced run, on a copy
-                        // of the CMap decisions, so the glyphs it samples do
-                        // not count twice when the loop below decodes them.
+                        // is not read for it. The reader decodes the glyphs
+                        // of a run in the tracking band — to weigh its
+                        // letters against its punctuation, and to check the
+                        // case of a widely spaced one — on a copy of the
+                        // CMap decisions, so the glyphs it samples do not
+                        // count twice when the loop below decodes them.
                         let tracking = if is_invisible {
                             None
                         } else {

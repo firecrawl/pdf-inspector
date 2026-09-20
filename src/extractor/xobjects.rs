@@ -951,8 +951,9 @@ fn extract_form_xobject_text_inner(
                         // A tracked display run is judged over its own
                         // tracking, as on the page (see `tj_tracking` and
                         // `tj_gap_thresholds`); a hidden run is not read
-                        // for it, and the reader decodes on a copy of the
-                        // CMap decisions.
+                        // for it, and the reader decodes the glyphs of a run
+                        // in the tracking band on a copy of the CMap
+                        // decisions.
                         let tracking = if hidden {
                             None
                         } else {

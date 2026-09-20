@@ -426,20 +426,22 @@ fn lower_median(sorted: &[f32]) -> f32 {
 /// judge one at a time), a junction the offset closes up (a kern, which
 /// formulas and kerned words carry and tracking never does), or a typical
 /// gap under [`TRACKING_MIN`] (kerning) or over [`TRACKING_MAX`] (word and
-/// column spacing) thresholds. A typical gap of [`TRACKING_NEEDS_CAPITALS`]
-/// thresholds or more is ambiguous with a run of one-letter words and
-/// counts as tracking only when every glyph is a capital, a digit, title
-/// punctuation or Han/Kana (see [`is_tracked_display_glyph`]); `decode`
-/// decodes one string element and is consulted only then, and an element
-/// it cannot decode — a code the font does not map, a CMap choice still
-/// being sampled — is not vouched for, so the run keeps the fixed
-/// thresholds. Both bands are capped in absolute terms, since a font
-/// without a space glyph reports another glyph's width for its space.
-/// Whatever the tracking, the run must be display text: an array with more
+/// column spacing) thresholds. `decode` decodes one string element, and
+/// the glyphs of every run in that band are decoded — one call per string
+/// of an array already found to be such a run; an element it cannot
+/// decode — a code the font does not map, a CMap choice still being
+/// sampled — is not vouched for, so the run keeps the fixed thresholds.
+/// The run must be display text whatever its tracking: an array with more
 /// punctuation than letters, digits and Han/Kana — math punctuation set
 /// off by thin spaces, a row of leader dots — is spaced by kerns that only
-/// look like tracking, and keeps the fixed thresholds. Offsets are read
-/// the same way at a negative `Tf` size, as the thresholds are.
+/// look like tracking, and keeps the fixed thresholds. A typical gap of
+/// [`TRACKING_NEEDS_CAPITALS`] thresholds or more is ambiguous with a run
+/// of one-letter words besides, and counts as tracking only when every
+/// glyph is a capital, a digit, title punctuation or Han/Kana (see
+/// [`is_tracked_display_glyph`]). Both bands are capped in absolute terms,
+/// since a font without a space glyph reports another glyph's width for
+/// its space. Offsets are read the same way at a negative `Tf` size, as
+/// the thresholds are.
 pub(crate) fn tj_tracking(
     array: &[Object],
     font_info: Option<&FontWidthInfo>,
