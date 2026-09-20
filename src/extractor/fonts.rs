@@ -937,11 +937,12 @@ fn builtin_base_encoding(doc: &Document, font_dict: &lopdf::Dictionary) -> Optio
 /// program does not identify are left out. What each name resolves to is
 /// kept in `font_cache` per program, so a font shared across pages is
 /// parsed once.
-/// File what the font program says a font's numbered glyph names stand
-/// for ([`glyph_index_chars`]) the way `parse_encoding_dictionary` files a
-/// name's own reading: one character joins the Differences, the letters
-/// of a ligature the sequences, each taking the code from the other map.
-/// The names are the last names of their codes, so their readings stand.
+/// Merge the font program's readings of a font's numbered glyph names
+/// ([`glyph_index_chars`]) into its encoding the way
+/// `parse_encoding_dictionary` records a name's own reading: a reading of
+/// one character joins the Differences and a longer one the sequences,
+/// each removing the code from the other map first. The names are the
+/// last names of their codes, so their readings stand.
 fn merge_program_readings(
     by_index: HashMap<u8, String>,
     differences: &mut FontEncodingMap,
