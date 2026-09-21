@@ -191,11 +191,11 @@ fn collect_xobjects_from_dict(
 /// Text items extracted from a content stream together with the visual-order
 /// RTL evidence gathered while parsing them, for the page-level
 /// `fix_visual_order_rtl` pass: indexes of candidate items (see
-/// `is_visual_rtl_candidate`) and a count of logical-order show ops.
+/// `is_visual_rtl_candidate`) and of the items shown by logical-order ops.
 pub(crate) struct ExtractedText {
     pub(crate) items: Vec<TextItem>,
     pub(crate) rtl_visual_candidates: Vec<usize>,
-    pub(crate) rtl_logical_ops: u32,
+    pub(crate) rtl_logical_runs: Vec<usize>,
     /// Indexes of the items shown by visible ops of several RTL letters
     /// painted forwards (see `is_visual_rtl_run`): visual-storage votes.
     pub(crate) rtl_visual_runs: Vec<usize>,
@@ -214,7 +214,7 @@ impl ExtractedText {
         Self {
             items: Vec::new(),
             rtl_visual_candidates: Vec::new(),
-            rtl_logical_ops: 0,
+            rtl_logical_runs: Vec::new(),
             rtl_visual_runs: Vec::new(),
             run_rotations: Vec::new(),
             skipped_invisible: false,
@@ -229,14 +229,14 @@ impl ExtractedText {
         self,
         items: &mut Vec<TextItem>,
         rtl_visual_candidates: &mut Vec<usize>,
-        rtl_logical_ops: &mut u32,
+        rtl_logical_runs: &mut Vec<usize>,
         rtl_visual_runs: &mut Vec<usize>,
         run_rotations: &mut Vec<f32>,
         skipped_invisible: &mut bool,
     ) {
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
-        *rtl_logical_ops += self.rtl_logical_ops;
+        rtl_logical_runs.extend(self.rtl_logical_runs.into_iter().map(|c| c + base));
         rtl_visual_runs.extend(self.rtl_visual_runs.into_iter().map(|c| c + base));
         run_rotations.extend(self.run_rotations);
         *skipped_invisible |= self.skipped_invisible;
@@ -347,7 +347,7 @@ fn extract_form_xobject_text_inner(
     };
     let items = &mut extracted.items;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
-    let rtl_logical_ops = &mut extracted.rtl_logical_ops;
+    let rtl_logical_runs = &mut extracted.rtl_logical_runs;
     let rtl_visual_runs = &mut extracted.rtl_visual_runs;
     let run_rotations = &mut extracted.run_rotations;
     let skipped_invisible = &mut extracted.skipped_invisible;
@@ -578,7 +578,7 @@ fn extract_form_xobject_text_inner(
                                     .append_into(
                                         items,
                                         rtl_visual_candidates,
-                                        rtl_logical_ops,
+                                        rtl_logical_runs,
                                         rtl_visual_runs,
                                         run_rotations,
                                         skipped_invisible,
@@ -905,7 +905,7 @@ fn extract_form_xobject_text_inner(
                                         rtl_visual_runs.push(items.len());
                                     }
                                 } else {
-                                    *rtl_logical_ops += 1;
+                                    rtl_logical_runs.push(items.len());
                                 }
                             }
                             let painted_bold = paintable_fonts.contains(&current_font)
@@ -1339,10 +1339,10 @@ fn extract_form_xobject_text_inner(
                                     && crate::text_utils::is_visual_rtl_candidate(text)
                                 {
                                     if scale_x < 0.0 {
-                                        *rtl_logical_ops += 1;
+                                        rtl_logical_runs.push(items.len());
                                     } else if backward_jump {
                                         if !op_backtrack_voted {
-                                            *rtl_logical_ops += 1;
+                                            rtl_logical_runs.push(items.len());
                                             op_backtrack_voted = true;
                                         }
                                     } else {

@@ -438,7 +438,7 @@ pub(crate) fn extract_page_text_items_with_options(
     // count of show ops whose glyph progression walked right-to-left —
     // evidence of logical-order storage.
     let mut rtl_visual_candidates: Vec<usize> = Vec::new();
-    let mut rtl_logical_ops: u32 = 0;
+    let mut rtl_logical_runs: Vec<usize> = Vec::new();
     let mut rtl_visual_runs: Vec<usize> = Vec::new();
     // Items whose text is logical whatever the page's storage order:
     // ActualText replacements.
@@ -1056,7 +1056,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                             rtl_visual_runs.push(items.len());
                                         }
                                     } else {
-                                        rtl_logical_ops += 1;
+                                        rtl_logical_runs.push(items.len());
                                     }
                                 }
                             }
@@ -1562,10 +1562,10 @@ pub(crate) fn extract_page_text_items_with_options(
                                     && crate::text_utils::is_visual_rtl_candidate(text)
                                 {
                                     if scale_x < 0.0 {
-                                        rtl_logical_ops += 1;
+                                        rtl_logical_runs.push(items.len());
                                     } else if backward_jump {
                                         if !op_backtrack_voted {
-                                            rtl_logical_ops += 1;
+                                            rtl_logical_runs.push(items.len());
                                             op_backtrack_voted = true;
                                         }
                                     } else {
@@ -1812,7 +1812,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         rtl_visual_runs.push(items.len());
                                     }
                                 } else {
-                                    rtl_logical_ops += 1;
+                                    rtl_logical_runs.push(items.len());
                                 }
                             }
                             let painted_bold = paintable_fonts.contains(&current_font)
@@ -1962,7 +1962,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     .append_into(
                                         &mut items,
                                         &mut rtl_visual_candidates,
-                                        &mut rtl_logical_ops,
+                                        &mut rtl_logical_runs,
                                         &mut rtl_visual_runs,
                                         &mut form_runs,
                                         &mut skipped_invisible,
@@ -2491,8 +2491,9 @@ pub(crate) fn extract_page_text_items_with_options(
     // lines back into logical order as it merges them.
     // Runs painted wholly outside their clip are left out below; they are
     // not on the page, so they do not say how its right-to-left runs are
-    // stored either.
-    let (rtl_visual_candidates, rtl_visual_ops) = {
+    // stored either — neither as walk candidates nor as logical- or
+    // visual-storage votes.
+    let (rtl_visual_candidates, rtl_logical_ops, rtl_visual_ops) = {
         let on_page = |index: usize| {
             !super::clip_boundaries::excluded_by_clip(&items[index], item_clips[index])
         };
@@ -2502,6 +2503,10 @@ pub(crate) fn extract_page_text_items_with_options(
                 .copied()
                 .filter(|&index| on_page(index))
                 .collect::<Vec<usize>>(),
+            rtl_logical_runs
+                .iter()
+                .filter(|&&index| on_page(index))
+                .count() as u32,
             rtl_visual_runs
                 .iter()
                 .filter(|&&index| on_page(index))
@@ -3678,6 +3683,21 @@ end"#;
             b"q 0 0 10 10 re W n BT /F3 12 Tf 1 0 0 1 100 700 Tm <44434241> Tj 60 0 Td <44434241> Tj ET Q \
             BT 3 Tr /F1 12 Tf 1 0 0 1 160 600 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
         let items = extract_hebrew_items_with(content, true);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, [SHALOM_LOGICAL, SHALOM_LOGICAL]);
+    }
+
+    #[test]
+    fn clipped_runs_cast_no_logical_vote_either() {
+        // Two runs parked outside their clip whose arrays move the pen
+        // backwards past the painted glyphs — logical-storage evidence —
+        // are left out of the page, so they must not turn the visible
+        // visual-order runs on it into logical storage.
+        let content =
+            b"q 0 0 10 10 re W n BT /F3 12 Tf 1 0 0 1 400 700 Tm [<4142> 1200 <4344>] TJ ET Q \
+            q 0 0 10 10 re W n BT /F3 12 Tf 1 0 0 1 400 650 Tm [<4142> 1200 <4344>] TJ ET Q \
+            BT /F1 12 Tf 1 0 0 1 100 500 Tm <44434241> Tj 60 0 Td <44434241> Tj ET";
+        let items = extract_hebrew_items(content);
         let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(texts, [SHALOM_LOGICAL, SHALOM_LOGICAL]);
     }
