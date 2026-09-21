@@ -1,6 +1,6 @@
 use pdf_inspector::{
-    FontCMapGaps, LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions,
-    PdfProcessResult, PdfType, ProcessMode,
+    FontCMapGaps, LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions, PdfProcessResult,
+    PdfType, ProcessMode,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
