@@ -183,15 +183,16 @@ fn destination_is_control(text: &str) -> bool {
 /// ToUnicode stream, from the font itself: give the codes the text
 /// `source` — the font's own reading, when the caller has one — has for
 /// them, then the reading of the encoding a simple font declares by name,
-/// then, with `read_program`, a space for each remaining code of a Type0
-/// font whose glyph has no outline but an advance. What nothing reads
-/// stays a control destination.
+/// then, in `program` — the font's embedded program, read once by the
+/// caller — a space for each remaining code of a Type0 font whose glyph
+/// has no outline but an advance. What nothing reads stays a control
+/// destination.
 fn repair_control_destinations(
     target: &mut ToUnicodeCMap,
     source: Option<&ToUnicodeCMap>,
     font_dict: &lopdf::Dictionary,
     doc: &Document,
-    read_program: bool,
+    program: Option<&[u8]>,
 ) {
     if !target.has_control_destinations() {
         return;
@@ -206,14 +207,29 @@ fn repair_control_destinations(
     for (code, text) in declared_encoding_reading(font_dict, doc, &remaining) {
         target.char_map.insert(code, text);
     }
-    if read_program {
+    if let Some(program) = program {
         let remaining = target.control_destination_codes();
         if !remaining.is_empty() {
-            for (code, text) in blank_cid_glyph_spaces(font_dict, doc, &remaining) {
+            for (code, text) in blank_cid_glyph_spaces(font_dict, doc, program, &remaining) {
                 target.char_map.insert(code, text);
             }
         }
     }
+}
+
+/// Where a control-destination repair reads and writes in a [`CMapEntry`]
+/// once its roles are decided (see [`cmap_entry_with_roles`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RepairRoles {
+    /// The role of the CMap the repair writes to: the one read from the
+    /// ToUnicode stream that is keyed like the font's own reading — the
+    /// remap when one was made (by the glyph indices the subsetter
+    /// assigned), else the original, whose keys no renumbering disturbed —
+    /// or `None` when that CMap was dropped.
+    target: Option<CMapRole>,
+    /// The role of the fallback as built — the font's own reading — that
+    /// the repair reads from, or `None` when none was built.
+    source: Option<CMapRole>,
 }
 
 /// Give a font's CMaps their roles in a [`CMapEntry`]. `primary` is the
@@ -227,26 +243,27 @@ fn repair_control_destinations(
 /// glyphs by encounter order, so the sorted remap scrambles characters
 /// where the program's own cmap is authoritative.
 ///
-/// Also returned is the role that holds the CMap a control-destination
-/// repair writes to — the one read from the ToUnicode stream that is keyed
-/// like the font's own reading: the remap when one was made (by the glyph
-/// indices the subsetter assigned), else the original, whose keys no
-/// renumbering disturbed — or `None` when that CMap was dropped. The
-/// repair follows the roles so that it reaches the CMap the entry keeps.
+/// Also returned is where a control-destination repair reads and writes
+/// once the roles are decided ([`RepairRoles`]): the repair follows the
+/// roles so that it reaches the CMap the entry keeps, and reads the
+/// fallback where it went.
 fn cmap_entry_with_roles(
     mut primary: ToUnicodeCMap,
     mut remapped: Option<ToUnicodeCMap>,
     mut fallback: Option<ToUnicodeCMap>,
     obj_num: u32,
     promote: bool,
-) -> (CMapEntry, Option<CMapRole>) {
+) -> (CMapEntry, RepairRoles) {
     let primary_entries = primary.char_map.len() + primary.ranges.len();
     let remap_made = remapped.is_some();
-    let mut repairable = Some(if remap_made {
-        CMapRole::Remapped
-    } else {
-        CMapRole::Primary
-    });
+    let mut roles = RepairRoles {
+        target: Some(if remap_made {
+            CMapRole::Remapped
+        } else {
+            CMapRole::Primary
+        }),
+        source: fallback.is_some().then_some(CMapRole::Fallback),
+    };
 
     if primary_entries < 10 {
         if let Some(fb) = fallback.take() {
@@ -256,9 +273,13 @@ fn cmap_entry_with_roles(
             );
             remapped = Some(primary);
             primary = fb;
-            // The original is the alternative now. A remap was dropped
-            // with it, and the original's keys are the ones it renumbered.
-            repairable = (!remap_made).then_some(CMapRole::Remapped);
+            // The fallback is the primary now, and the original the
+            // alternative. A remap was dropped with it, and the original's
+            // keys are the ones it renumbered.
+            roles = RepairRoles {
+                target: (!remap_made).then_some(CMapRole::Remapped),
+                source: Some(CMapRole::Primary),
+            };
         }
     }
 
@@ -278,8 +299,12 @@ fn cmap_entry_with_roles(
                 let old_remap = remapped.take().unwrap();
                 remapped = fallback.take();
                 fallback = Some(old_remap);
-                // The remap is the last resort now.
-                repairable = Some(CMapRole::Fallback);
+                // The fallback is the alternative now, and the remap the
+                // last resort.
+                roles = RepairRoles {
+                    target: Some(CMapRole::Fallback),
+                    source: Some(CMapRole::Remapped),
+                };
             }
         }
     }
@@ -290,15 +315,16 @@ fn cmap_entry_with_roles(
             remapped,
             fallback,
         },
-        repairable,
+        roles,
     )
 }
 
 /// The character each of `codes` stands for in the encoding a simple font
-/// declares by name (`/Encoding /WinAnsiEncoding`): the encoding selects
-/// the code's glyph, and so reads it, whatever the ToUnicode CMap says.
-/// Nothing for a font that declares no encoding, or one by dictionary
-/// (whose `/Differences` are read at decode time), or a Type0 font.
+/// declares by name (`/Encoding /WinAnsiEncoding`, written in place or as
+/// an indirect name object): the encoding selects the code's glyph, and so
+/// reads it, whatever the ToUnicode CMap says. Nothing for a font that
+/// declares no encoding, or one by dictionary (whose `/Differences` are
+/// read at decode time), or a Type0 font.
 fn declared_encoding_reading(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
@@ -309,7 +335,12 @@ fn declared_encoding_reading(
         .ok()
         .and_then(|o| o.as_name().ok())
         .is_some_and(|name| name == b"Type0");
-    if is_type0 || !matches!(font_dict.get(b"Encoding"), Ok(Object::Name(_))) {
+    let encoding = match font_dict.get(b"Encoding") {
+        Ok(Object::Reference(r)) => doc.get_object(*r).ok(),
+        Ok(other) => Some(other),
+        Err(_) => None,
+    };
+    if is_type0 || !matches!(encoding, Some(Object::Name(_))) {
         return Vec::new();
     }
     let Ok(encoding @ (Encoding::OneByteEncoding(_) | Encoding::SimpleEncoding(_))) =
@@ -333,22 +364,20 @@ fn declared_encoding_reading(
         .collect()
 }
 
-/// A space for each CID in `codes` whose glyph, in the descendant font's
-/// embedded program, has no outline but an advance (from `/W`, else `/DW`,
-/// else 1000): painted, it leaves a gap and nothing else, whatever the
-/// ToUnicode CMap says of it. The glyph is found by CID through the
-/// charset of a CID-keyed CFF program, else through the CIDToGIDMap, else
-/// by the CID itself. Nothing for a simple font, whose blank glyphs are
-/// read at decode time.
+/// A space for each CID in `codes` whose glyph, in `program` — the
+/// descendant font's embedded program, read once by the caller — has no
+/// outline but an advance (from `/W`, else `/DW`, else 1000): painted, it
+/// leaves a gap and nothing else, whatever the ToUnicode CMap says of it.
+/// The glyph is found by CID through the charset of a CID-keyed CFF
+/// program, else through the CIDToGIDMap, else by the CID itself. Nothing
+/// for a simple font, whose blank glyphs are read at decode time.
 fn blank_cid_glyph_spaces(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
+    program: &[u8],
     codes: &[u16],
 ) -> Vec<(u16, String)> {
     let Some(cid_font_dict) = get_descendant_cid_font(font_dict, doc) else {
-        return Vec::new();
-    };
-    let Some(data) = cid_font_program(cid_font_dict, doc) else {
         return Vec::new();
     };
     let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
@@ -359,7 +388,7 @@ fn blank_cid_glyph_spaces(
     };
     let advances = |cid: u16| cid_advance(cid_font_dict, doc, cid) > 0.0;
     let mut spaces = Vec::new();
-    if let Ok(face) = ttf_parser::Face::parse(&data, 0) {
+    if let Ok(face) = ttf_parser::Face::parse(program, 0) {
         let charset = face
             .tables()
             .cff
@@ -376,7 +405,7 @@ fn blank_cid_glyph_spaces(
                 spaces.push((cid, " ".to_string()));
             }
         }
-    } else if let Some(cff) = ttf_parser::cff::Table::parse(&data) {
+    } else if let Some(cff) = ttf_parser::cff::Table::parse(program) {
         let charset_keyed = cff.glyph_cid(ttf_parser::GlyphId(0)).is_some();
         for &cid in codes {
             let gid = if charset_keyed {
@@ -412,10 +441,10 @@ fn cff_glyph_for_cid(cff: &ttf_parser::cff::Table<'_>, cid: u16) -> Option<u16> 
     (0..cff.number_of_glyphs()).find(|&gid| cff.glyph_cid(ttf_parser::GlyphId(gid)) == Some(cid))
 }
 
-/// The decompressed embedded program of a CIDFont, from `FontFile2` or
-/// `FontFile3`.
-fn cid_font_program(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
-    let descriptor = match cid_font_dict.get(b"FontDescriptor").ok()? {
+/// The decompressed embedded program (`FontFile2` or `FontFile3`) the
+/// descriptor of `font` names, when it names one that decompresses.
+fn font_program(font: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
+    let descriptor = match font.get(b"FontDescriptor").ok()? {
         Object::Reference(r) => doc.get_dictionary(*r).ok()?,
         Object::Dictionary(d) => d,
         _ => return None,
@@ -424,11 +453,84 @@ fn cid_font_program(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Option
         .into_iter()
         .find_map(|key| descriptor.get(key).ok().and_then(|o| o.as_reference().ok()))?;
     let stream = doc.get_object(font_file).ok()?.as_stream().ok()?;
-    Some(
-        stream
-            .decompressed_content()
-            .unwrap_or_else(|_| stream.content.clone()),
-    )
+    stream.decompressed_content().ok()
+}
+
+/// The font's `/Subtype` name.
+fn font_subtype(font_dict: &lopdf::Dictionary) -> Option<&[u8]> {
+    font_dict.get(b"Subtype").ok()?.as_name().ok()
+}
+
+/// The descendant CIDFont of a Type0 font under Identity-H or Identity-V:
+/// the fonts whose codes are glyph indices, which an embedded program can
+/// be read by.
+fn identity_type0_descendant<'a>(
+    font_dict: &'a lopdf::Dictionary,
+    doc: &'a Document,
+) -> Option<&'a lopdf::Dictionary> {
+    let encoding = font_dict
+        .get(b"Encoding")
+        .ok()
+        .and_then(|o| o.as_name().ok())?;
+    if encoding != b"Identity-H" && encoding != b"Identity-V" {
+        return None;
+    }
+    get_descendant_cid_font(font_dict, doc)
+}
+
+/// The embedded program a font's fallback CMap and the repair of its
+/// control destinations read, decompressed once for both: a simple font's
+/// own, an Identity-H or Identity-V Type0 font's descendant's. None for a
+/// Type0 font under another encoding, whose codes are not glyph indices.
+fn embedded_font_program(font_dict: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
+    match font_subtype(font_dict)? {
+        b"Type0" => font_program(identity_type0_descendant(font_dict, doc)?, doc),
+        _ => font_program(font_dict, doc),
+    }
+}
+
+/// The fallback CMap a font's embedded program yields, `program` being
+/// what [`embedded_font_program`] read: for a Type0 font under Identity-H
+/// or Identity-V, its descendant's program read by glyph index, repaired
+/// through the CIDToGIDMap when there is one, else the mapping of its CID
+/// collection; for a simple font, its own program read by code.
+fn program_fallback_cmap(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    program: Option<&[u8]>,
+) -> Option<ToUnicodeCMap> {
+    if font_subtype(font_dict)? == b"Type0" {
+        let cid_font_dict = identity_type0_descendant(font_dict, doc)?;
+        if let Some(cmap) = program.and_then(build_cmap_from_truetype) {
+            if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
+                if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
+                    debug!(
+                        "Fallback TrueType CMap repaired with CIDToGIDMap: {} entries",
+                        repaired.char_map.len()
+                    );
+                    return Some(repaired);
+                }
+            }
+            debug!(
+                "Fallback TrueType CMap (Type0+ToUnicode) char_map={}",
+                cmap.char_map.len()
+            );
+            return Some(cmap);
+        }
+        let cmap = build_cmap_from_cid_system_info(cid_font_dict, doc)?;
+        debug!(
+            "Fallback CIDSystemInfo CMap (Type0+ToUnicode) char_map={}",
+            cmap.char_map.len()
+        );
+        Some(cmap)
+    } else {
+        let cmap = build_simple_cmap_from_truetype(program?)?;
+        debug!(
+            "Fallback simple font cmap (ToUnicode present) char_map={}",
+            cmap.char_map.len()
+        );
+        Some(cmap)
+    }
 }
 
 /// The advance a CIDFont gives `cid`: its `/W` entry, else `/DW`, else the
@@ -462,22 +564,22 @@ pub(crate) fn build_cmap_entry_from_stream(
 ) -> Option<CMapEntry> {
     if let Some(cmap) = ToUnicodeCMap::parse(data) {
         let (primary, remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
-        let fallback = build_fallback_tounicode_from_encoding(font_dict, doc)
-            .or_else(|| build_fallback_cmap_for_type0(font_dict, doc))
-            .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
-
-        // The font's own reading, set aside for the repair while the roles
-        // are decided, so that the repair reaches the CMap the entry keeps.
-        let source = if primary.has_control_destinations() {
-            fallback.clone()
+        let encoding_fallback = build_fallback_tounicode_from_encoding(font_dict, doc);
+        // The embedded program, read once for the fallback, when the CID
+        // collection gives none, and for the repair of a CMap with control
+        // destinations, which follows the roles to the CMap the entry
+        // keeps and reads the fallback where it went.
+        let program = if encoding_fallback.is_none() || primary.has_control_destinations() {
+            embedded_font_program(font_dict, doc)
         } else {
             None
         };
-        let (mut entry, repairable) =
-            cmap_entry_with_roles(primary, remapped, fallback, obj_num, true);
-        if let Some(target) = repairable.and_then(|role| entry.role_mut(role)) {
-            repair_control_destinations(target, source.as_ref(), font_dict, doc, true);
-        }
+        let fallback =
+            encoding_fallback.or_else(|| program_fallback_cmap(font_dict, doc, program.as_deref()));
+        let (mut entry, roles) = cmap_entry_with_roles(primary, remapped, fallback, obj_num, true);
+        entry.repair(roles, |target, source| {
+            repair_control_destinations(target, source, font_dict, doc, program.as_deref())
+        });
         return Some(entry);
     }
 
@@ -2760,11 +2862,48 @@ enum CMapRole {
 
 impl CMapEntry {
     /// The CMap in `role`, when the entry has one there.
-    fn role_mut(&mut self, role: CMapRole) -> Option<&mut ToUnicodeCMap> {
+    fn role(&self, role: CMapRole) -> Option<&ToUnicodeCMap> {
         match role {
-            CMapRole::Primary => Some(&mut self.primary),
-            CMapRole::Remapped => self.remapped.as_mut(),
-            CMapRole::Fallback => self.fallback.as_mut(),
+            CMapRole::Primary => Some(&self.primary),
+            CMapRole::Remapped => self.remapped.as_ref(),
+            CMapRole::Fallback => self.fallback.as_ref(),
+        }
+    }
+
+    /// Run `repair` on the CMap in `roles.target`, given the CMap in
+    /// `roles.source` to read from; nothing when the entry holds no CMap
+    /// in the target role.
+    fn repair(
+        &mut self,
+        roles: RepairRoles,
+        repair: impl FnOnce(&mut ToUnicodeCMap, Option<&ToUnicodeCMap>),
+    ) {
+        let Some(target) = roles.target else {
+            return;
+        };
+        let Some(mut cmap) = self.take(target) else {
+            return;
+        };
+        repair(&mut cmap, roles.source.and_then(|role| self.role(role)));
+        self.put(target, cmap);
+    }
+
+    /// Take the CMap in `role` out of the entry, leaving an empty one in
+    /// the primary role or nothing in the others.
+    fn take(&mut self, role: CMapRole) -> Option<ToUnicodeCMap> {
+        match role {
+            CMapRole::Primary => Some(std::mem::take(&mut self.primary)),
+            CMapRole::Remapped => self.remapped.take(),
+            CMapRole::Fallback => self.fallback.take(),
+        }
+    }
+
+    /// Put `cmap` in `role`.
+    fn put(&mut self, role: CMapRole, cmap: ToUnicodeCMap) {
+        match role {
+            CMapRole::Primary => self.primary = cmap,
+            CMapRole::Remapped => self.remapped = Some(cmap),
+            CMapRole::Fallback => self.fallback = Some(cmap),
         }
     }
 }
@@ -2877,58 +3016,58 @@ impl FontCMaps {
                 // TrueType fonts (decompressing + parsing 100K+ byte font files).
                 // Skip entirely when the primary CMap is sufficient.
                 let primary_entries = primary.char_map.len() + primary.ranges.len();
-                let fallback = if primary_entries < 10 && !skip_truetype_fallback {
-                    // Try cheap fallback first; only attempt expensive TrueType
-                    // parsing if cheap fallbacks don't yield results.
-                    let cheap = build_fallback_tounicode_from_encoding(font_dict, doc)
-                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
-                    if cheap.is_some() {
-                        cheap
-                    } else {
-                        build_fallback_cmap_for_type0(font_dict, doc)
-                    }
-                } else if primary_entries < 10 {
-                    // Fast mode: only try cheap fallbacks, skip TrueType parsing.
-                    // Regions using this font will get needs_ocr=true.
-                    build_fallback_tounicode_from_encoding(font_dict, doc)
-                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
-                } else {
-                    // Primary is rich enough; only try the cheap encoding fallback
-                    build_fallback_tounicode_from_encoding(font_dict, doc)
-                };
-
-                // A code whose entry is a control destination has no text
-                // in the CMap, however rich the rest of it is; the embedded
-                // program may still know the glyph (a ligature named `f_f`,
-                // a blank space glyph), and is read for those codes alone:
-                // the fallback built above when there is one, else a
-                // reading built for the repair and nothing more. The repair
-                // waits for the roles, so that it reaches the CMap the
-                // entry keeps. Fast mode leaves the program unread and the
-                // codes marked.
-                let source = if primary.has_control_destinations() {
-                    fallback.clone().or_else(|| {
-                        if skip_truetype_fallback {
-                            None
-                        } else {
-                            build_fallback_cmap_for_type0(font_dict, doc)
-                                .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
-                        }
-                    })
+                let sparse = primary_entries < 10;
+                let control_destinations = primary.has_control_destinations();
+                let is_type0 = font_subtype(font_dict) == Some(&b"Type0"[..]);
+                // A sparse CMap takes the cheap fallback first — the CID
+                // collection's, else a simple font's program — and a Type0
+                // font's program only outside fast mode, which leaves that
+                // parsing to the regions it sends to OCR. A code whose entry
+                // is a control destination has no text in the CMap, however
+                // rich the rest of it is; the embedded program may still
+                // know the glyph (a ligature named `f_f`, a blank space
+                // glyph), and is read for those codes alone, outside fast
+                // mode, which leaves the codes marked.
+                let program_for_fallback = sparse && !(skip_truetype_fallback && is_type0);
+                let program_for_repair = control_destinations && !skip_truetype_fallback;
+                // The program is decompressed once for all that is taken
+                // from it: the fallback, the reading the repair takes the
+                // fallback's place with when none was built, and the
+                // outlines the repair looks at.
+                let program = if program_for_fallback || program_for_repair {
+                    embedded_font_program(font_dict, doc)
                 } else {
                     None
                 };
-                let (mut entry, repairable) =
+                let encoding_fallback = build_fallback_tounicode_from_encoding(font_dict, doc);
+                let fallback = if sparse {
+                    encoding_fallback.or_else(|| {
+                        program_for_fallback
+                            .then(|| program_fallback_cmap(font_dict, doc, program.as_deref()))
+                            .flatten()
+                    })
+                } else {
+                    // Primary is rich enough; only the cheap encoding fallback
+                    encoding_fallback
+                };
+                let repair_source = if program_for_repair && fallback.is_none() {
+                    program_fallback_cmap(font_dict, doc, program.as_deref())
+                } else {
+                    None
+                };
+                // The repair follows the roles to the CMap the entry keeps,
+                // and reads the fallback where it went.
+                let (mut entry, roles) =
                     cmap_entry_with_roles(primary, remapped, fallback, obj_num, false);
-                if let Some(target) = repairable.and_then(|role| entry.role_mut(role)) {
+                entry.repair(roles, |target, source| {
                     repair_control_destinations(
                         target,
-                        source.as_ref(),
+                        repair_source.as_ref().or(source),
                         font_dict,
                         doc,
-                        !skip_truetype_fallback,
-                    );
-                }
+                        program.as_deref(),
+                    )
+                });
                 by_obj_num.insert(obj_num, entry);
             } else {
                 // ToUnicode present but parse failed; try fallbacks to avoid empty decoding.
@@ -3314,132 +3453,32 @@ impl FontCMaps {
 
 /// For Type0 CID fonts, try to build a fallback CMap from embedded font data
 /// or CIDSystemInfo when a ToUnicode CMap is present but incomplete.
+/// The fallback CMap of a Type0 font under Identity-H or Identity-V, from
+/// its descendant's embedded program or its CID collection (see
+/// [`program_fallback_cmap`]); None for any other font.
 fn build_fallback_cmap_for_type0(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
 ) -> Option<ToUnicodeCMap> {
-    let subtype = font_dict.get(b"Subtype").ok()?.as_name().ok()?;
-    if subtype != b"Type0" {
+    if font_subtype(font_dict)? != b"Type0" {
         return None;
     }
-    let encoding = font_dict
-        .get(b"Encoding")
-        .ok()
-        .and_then(|o| o.as_name().ok())?;
-    if encoding != b"Identity-H" && encoding != b"Identity-V" {
-        return None;
-    }
-
-    let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
-    let desc_fonts = match desc_fonts_obj {
-        Object::Array(arr) => arr,
-        Object::Reference(r) => match doc.get_object(*r) {
-            Ok(Object::Array(arr)) => arr,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    if desc_fonts.is_empty() {
-        return None;
-    }
-    let cid_font_dict = match &desc_fonts[0] {
-        Object::Reference(r) => doc.get_dictionary(*r).ok()?,
-        Object::Dictionary(d) => d,
-        _ => return None,
-    };
-
-    let font_descriptor = cid_font_dict
-        .get(b"FontDescriptor")
-        .ok()
-        .and_then(|o| match o {
-            Object::Reference(r) => doc.get_dictionary(*r).ok(),
-            Object::Dictionary(d) => Some(d),
-            _ => None,
-        });
-
-    let font_file_ref = font_descriptor.and_then(|fd| {
-        fd.get(b"FontFile2")
-            .ok()
-            .and_then(|o| o.as_reference().ok())
-            .or_else(|| {
-                fd.get(b"FontFile3")
-                    .ok()
-                    .and_then(|o| o.as_reference().ok())
-            })
-    });
-
-    if let Some(ff_ref) = font_file_ref {
-        if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-            if let Ok(data) = stream.decompressed_content() {
-                if let Some(cmap) = build_cmap_from_truetype(&data) {
-                    if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
-                        if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
-                            debug!(
-                                "Fallback TrueType CMap repaired with CIDToGIDMap: {} entries",
-                                repaired.char_map.len()
-                            );
-                            return Some(repaired);
-                        }
-                    }
-                    debug!(
-                        "Fallback TrueType CMap (Type0+ToUnicode) char_map={}",
-                        cmap.char_map.len()
-                    );
-                    return Some(cmap);
-                }
-            }
-        }
-    }
-
-    if let Some(cmap) = build_cmap_from_cid_system_info(cid_font_dict, doc) {
-        debug!(
-            "Fallback CIDSystemInfo CMap (Type0+ToUnicode) char_map={}",
-            cmap.char_map.len()
-        );
-        return Some(cmap);
-    }
-
-    None
+    let program = embedded_font_program(font_dict, doc);
+    program_fallback_cmap(font_dict, doc, program.as_deref())
 }
 
+/// The fallback CMap of a simple font from its embedded program (see
+/// [`program_fallback_cmap`]); None for a Type0 font, or a font without a
+/// program.
 fn build_fallback_cmap_for_simple(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
 ) -> Option<ToUnicodeCMap> {
-    let subtype = font_dict.get(b"Subtype").ok()?.as_name().ok()?;
-    if subtype == b"Type0" {
+    if font_subtype(font_dict)? == b"Type0" {
         return None;
     }
-    let font_descriptor = font_dict
-        .get(b"FontDescriptor")
-        .ok()
-        .and_then(|o| match o {
-            Object::Reference(r) => doc.get_dictionary(*r).ok(),
-            Object::Dictionary(d) => Some(d),
-            _ => None,
-        })?;
-    let font_file_ref = font_descriptor
-        .get(b"FontFile2")
-        .ok()
-        .and_then(|o| o.as_reference().ok())
-        .or_else(|| {
-            font_descriptor
-                .get(b"FontFile3")
-                .ok()
-                .and_then(|o| o.as_reference().ok())
-        })?;
-    if let Ok(stream) = doc.get_object(font_file_ref).and_then(Object::as_stream) {
-        if let Ok(data) = stream.decompressed_content() {
-            if let Some(cmap) = build_simple_cmap_from_truetype(&data) {
-                debug!(
-                    "Fallback simple font cmap (ToUnicode present) char_map={}",
-                    cmap.char_map.len()
-                );
-                return Some(cmap);
-            }
-        }
-    }
-    None
+    let program = embedded_font_program(font_dict, doc)?;
+    program_fallback_cmap(font_dict, doc, Some(&program))
 }
 
 #[cfg(test)]

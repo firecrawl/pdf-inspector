@@ -9673,3 +9673,110 @@ fn a_control_destination_in_a_tounicode_cmap_marks_its_code() {
     assert!(markdown.contains("coffee"), "{markdown}");
     assert!(!ordinary.has_encoding_issues);
 }
+
+/// A page showing the bytes `21 22 23 24 24` through the simple TrueType
+/// font `F1` — no embedded program, the given ToUnicode `bfchar` lines and,
+/// when given, an encoding dictionary whose `/Differences` name code 0x22
+/// `o` and code 0x23 `differences_name` (a Differences naming only codes it
+/// cannot read is set aside as a whole, by design; the readable name keeps
+/// it).
+fn make_simple_font_pdf(bfchar: &str, differences_name: Option<&str>) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.4");
+    let cmap = format!(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+         12 beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
+         CMapName currentdict /CMap defineresource pop\nend\nend"
+    );
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "ABCDEF+Subset",
+        "Flags" => 4,
+        "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 700,
+        "Descent" => 0,
+        "CapHeight" => 700,
+        "StemV" => 80,
+    });
+    let mut font = dictionary! {
+        "Type" => "Font",
+        "Subtype" => "TrueType",
+        "BaseFont" => "ABCDEF+Subset",
+        "FirstChar" => 0x21,
+        "LastChar" => 0x2C,
+        "Widths" => vec![Object::Integer(600); 12],
+        "FontDescriptor" => descriptor_id,
+        "ToUnicode" => cmap_id,
+    };
+    if let Some(name) = differences_name {
+        font.set(
+            "Encoding",
+            dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![
+                    0x22.into(),
+                    Object::Name(b"o".to_vec()),
+                    Object::Name(name.as_bytes().to_vec()),
+                ],
+            },
+        );
+    }
+    let font_id = doc.add_object(font);
+    let content_id = doc.add_object(Stream::new(
+        dictionary! {},
+        b"BT /F1 12 Tf 72 700 Td <2122232424> Tj ET\n".to_vec(),
+    ));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// The same defect in a simple font whose `/Differences` name the code by
+/// a name that cannot be read: the code reads as the marker and the
+/// document reports its encoding issue, where the unreadable name alone,
+/// on a code the CMap does not map, reads as nothing and reports none.
+#[test]
+fn a_control_destination_under_an_unreadable_differences_name_is_marked() {
+    const CODES: &str = "<21> <0063>\n<22> <006F>\n<23> <0003>\n<24> <0065>\n<25> <0074>\n\
+         <26> <0061>\n<27> <0062>\n<28> <006C>\n<29> <0073>\n<2A> <0075>\n<2B> <006E>\n\
+         <2C> <0064>";
+    let marked = process_pdf_mem(&make_simple_font_pdf(CODES, Some("f_zzz"))).unwrap();
+    let markdown = marked.markdown.unwrap();
+    assert!(markdown.contains("co\u{FFFD}ee"), "{markdown}");
+    assert!(marked.has_encoding_issues);
+
+    let nameless = process_pdf_mem(&make_simple_font_pdf(
+        &CODES.replace("<23> <0003>\n", ""),
+        Some("f_zzz"),
+    ))
+    .unwrap();
+    let markdown = nameless.markdown.unwrap();
+    assert!(markdown.contains("coee"), "{markdown}");
+    assert!(!nameless.has_encoding_issues);
+}

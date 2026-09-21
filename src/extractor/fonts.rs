@@ -2345,9 +2345,11 @@ pub(crate) fn extract_text_from_operand(
                         }
                         // A code the Differences name but could not map is
                         // that glyph and no other: neither the base
-                        // encoding nor the fallback below has a say.
+                        // encoding nor the fallback below has a say, and it
+                        // reads as nothing — unless its ToUnicode entry is a
+                        // control destination, a loss that is marked.
                         if encoding_map.is_some_and(|map| map.named_codes.contains(&b)) {
-                            return None;
+                            return control_destination.then(|| "\u{FFFD}".to_string());
                         }
                         // 4. The font's base encoding, for printable bytes
                         // (the predefined tables spell out the control
@@ -4897,13 +4899,15 @@ mod tests {
 
     /// A page whose only font is the symbolic TrueType `F1` with the given
     /// ToUnicode `bfchar` lines, embedding `program` and declaring
-    /// `encoding` when given — the way a subsetter writes a font whose
+    /// `encoding` when given (as an indirect object with
+    /// `indirect_encoding`) — the way a subsetter writes a font whose
     /// codes are its glyph indices. Returns the document, the ToUnicode
     /// object number and the page.
     fn simple_font_doc(
         bfchar: &str,
         program: Option<Vec<u8>>,
         encoding: Option<Object>,
+        indirect_encoding: bool,
     ) -> (Document, u32, lopdf::ObjectId) {
         use lopdf::Stream;
         let mut doc = Document::with_version("1.4");
@@ -4944,6 +4948,11 @@ mod tests {
             "ToUnicode" => tounicode_id,
         };
         if let Some(encoding) = encoding {
+            let encoding = if indirect_encoding {
+                Object::Reference(doc.add_object(encoding))
+            } else {
+                encoding
+            };
             font.set("Encoding", encoding);
         }
         let font_id = doc.add_object(font);
@@ -5048,7 +5057,7 @@ mod tests {
         encoding: Option<Object>,
         bytes: &[u8],
     ) -> String {
-        let (doc, tounicode_obj, page_id) = simple_font_doc(bfchar, program, encoding);
+        let (doc, tounicode_obj, page_id) = simple_font_doc(bfchar, program, encoding, false);
         decode_page_font_string(&doc, tounicode_obj, page_id, false, bytes)
     }
 
@@ -5191,6 +5200,63 @@ mod tests {
                 &LIGATURE_INDEX_BYTES
             ),
             "coffee"
+        );
+    }
+
+    #[test]
+    fn a_control_destination_code_with_an_unreadable_differences_name_reads_as_the_marker() {
+        // A code the Differences name by a name that cannot be read reads
+        // as nothing — but one whose ToUnicode entry is a control
+        // destination is a loss the page must report, and is marked. (A
+        // Differences naming only codes it cannot read is set aside as a
+        // whole, by design, and its codes read as their bytes; the readable
+        // name beside this one keeps it.)
+        let differences = |name: &[u8]| {
+            Object::Dictionary(dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![
+                    0x22.into(),
+                    Object::Name(b"o".to_vec()),
+                    Object::Name(name.to_vec()),
+                ],
+            })
+        };
+        assert_eq!(
+            decode_simple_font_string(
+                LIGATURE_INDEX_BFCHAR,
+                None,
+                Some(differences(b"f_zzz")),
+                &LIGATURE_INDEX_BYTES
+            ),
+            "co\u{FFFD}ee"
+        );
+        // The same name on a code the CMap does not map reads as nothing,
+        // as before.
+        let unmapped = LIGATURE_INDEX_BFCHAR.replace("<23> <0003>\n", "");
+        assert_eq!(
+            decode_simple_font_string(
+                &unmapped,
+                None,
+                Some(differences(b"f_zzz")),
+                &LIGATURE_INDEX_BYTES
+            ),
+            "coee"
+        );
+    }
+
+    #[test]
+    fn a_control_destination_code_reads_through_an_encoding_declared_by_an_indirect_name() {
+        // `/Encoding 9 0 R`, the object being the name WinAnsiEncoding:
+        // the same reading as the name written in place.
+        let (doc, tounicode_obj, page_id) = simple_font_doc(
+            LIGATURE_INDEX_BFCHAR,
+            None,
+            Some(Object::Name(b"WinAnsiEncoding".to_vec())),
+            true,
+        );
+        assert_eq!(
+            decode_page_font_string(&doc, tounicode_obj, page_id, false, &LIGATURE_INDEX_BYTES),
+            "co#ee"
         );
     }
 
