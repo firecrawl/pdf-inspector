@@ -139,8 +139,8 @@ pub(super) struct ContentCounts {
     /// Text-showing operators (`Tj`, `TJ`, `'`, `"`), whatever their render
     /// mode.
     pub(super) text_ops: u32,
-    /// Image XObjects among the resources scanned, and inline images among
-    /// the operators.
+    /// Image XObjects among the resources scanned, and — in an executed
+    /// scan — inline images among the operators.
     pub(super) image_count: u32,
     /// Path construction and painting operators.
     pub(super) path_ops: u32,
@@ -993,9 +993,14 @@ fn scan_content_stream<'a>(
             }
         } else if token_at(i, b"BI") {
             // BI = begin an inline image, which paints the unit square
-            // under the matrix in force as an image XObject does, and is
-            // an image of the page as one bound in its resources is.
-            counts.image_count += 1;
+            // under the matrix in force as an image XObject does. It counts
+            // among the page's images only in an executed scan: the walk
+            // over every bound form keeps its tally of bound image
+            // XObjects, which an inline image in a form never invoked is
+            // not.
+            if state.follow_do {
+                counts.image_count += 1;
+            }
             state.image_drawn();
         } else if token_at(i, b"ET") {
             // ET = end a text object: its clip-only text's clip takes effect.

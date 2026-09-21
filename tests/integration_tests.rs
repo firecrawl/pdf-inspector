@@ -2633,18 +2633,12 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
         if page.spare_large_image || (draws && page.large_image) {
             xobjects.push_str(&format!(" /ImBig {large} 0 R"));
         }
-        let draw_image = if page.inline_image {
-            format!(
-                "q 612 0 0 792 {} 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID abcd EI Q\n",
-                page.image_dx
-            )
+        let raster = if page.inline_image {
+            "BI /W 2 /H 2 /BPC 8 /CS /G ID abcd EI".to_string()
         } else {
-            format!(
-                "q 612 0 0 792 {} 0 cm /{} Do Q\n",
-                page.image_dx,
-                if page.large_image { "ImBig" } else { "Im0" }
-            )
+            format!("/{} Do", if page.large_image { "ImBig" } else { "Im0" })
         };
+        let draw_image = format!("q 612 0 0 792 {} 0 cm {raster} Q\n", page.image_dx);
         let mut pattern_entry = String::new();
         if page.pattern_fill {
             let cell = if page.pattern_draws_image {
@@ -2673,10 +2667,9 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
             let strip = 792.0 / page.image_strips as f64;
             for k in 0..page.image_strips {
                 content.push_str(&format!(
-                    "q 612 0 0 {strip} {} {} cm /{} Do Q\n",
+                    "q 612 0 0 {strip} {} {} cm {raster} Q\n",
                     page.image_dx,
-                    k as f64 * strip,
-                    if page.large_image { "ImBig" } else { "Im0" }
+                    k as f64 * strip
                 ));
             }
         } else if page.covering_image {
@@ -3109,26 +3102,36 @@ fn test_inline_image_raster_covers_the_page() {
     assert_eq!(processed.pdf_type, PdfType::Scanned);
 }
 
-/// A scan tiled into two thousand strips covers the page as one draw
-/// does: the hidden layer over it is a layer nobody sees.
+/// A scan tiled into two thousand strips — image XObjects or inline
+/// images — covers the page as one draw does: the hidden layer over it
+/// is a layer nobody sees.
 #[test]
 fn test_scan_tiled_into_strips_is_covered() {
-    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
-        image_strips: 2000,
-        ..SCAN_WITH_INVISIBLE_LAYER
-    }]);
-    let detected = detect_pdf_type_mem(&buf).unwrap();
-    assert_ne!(detected.pdf_type, PdfType::TextBased);
-    assert_eq!(detected.pages_needing_ocr, vec![1]);
-    assert_eq!(
-        detected.ocr_reasons_by_page.get(&1),
-        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
-    );
-    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
-    assert_eq!(
-        pages.pages[0].ocr_reason.as_deref(),
-        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
-    );
+    for inline_image in [false, true] {
+        let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+            image_strips: 2000,
+            inline_image,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        }]);
+        let detected = detect_pdf_type_mem(&buf).unwrap();
+        assert_ne!(
+            detected.pdf_type,
+            PdfType::TextBased,
+            "inline {inline_image}"
+        );
+        assert_eq!(detected.pages_needing_ocr, vec![1], "inline {inline_image}");
+        assert_eq!(
+            detected.ocr_reasons_by_page.get(&1),
+            Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()]),
+            "inline {inline_image}"
+        );
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert_eq!(
+            pages.pages[0].ocr_reason.as_deref(),
+            Some(OCR_REASON_INVISIBLE_TEXT_LAYER),
+            "inline {inline_image}"
+        );
+    }
 }
 
 /// A layer shown only with the `'` and `"` operators is a text layer like

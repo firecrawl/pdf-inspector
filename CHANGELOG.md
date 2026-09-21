@@ -119,9 +119,9 @@ Changes since 1.22.1.
   a grid over the page, so a scan tiled into strips counts — cover at
   least half of it (each draw clipped to the page and to the rectangular
   clipping path in force, a clip of any other shape by its box; an inline
-  image counts as an image — for whether the page has any at all as well
-  — and so does a path filled or stroked with a tiling pattern whose cell
-  draws one; images bound but never drawn, and
+  image the content draws counts as an image — for whether the page has
+  any at all as well — and so does a path filled or stroked with a tiling
+  pattern whose cell draws one; images bound but never drawn, and
   forms never invoked, do not count; a page whose forms outrun the scan's
   budget is not flagged), for OCR with the new reason
   `invisible_text_layer`

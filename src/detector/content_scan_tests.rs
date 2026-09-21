@@ -1266,3 +1266,60 @@ fn a_draw_off_the_page_or_clipped_away_reveals_nothing() {
     );
     assert!(analyze_page_content(&doc, page_id).has_invisible_text_layer);
 }
+
+#[test]
+fn an_inline_image_in_a_form_counts_only_when_the_form_runs() {
+    // No image XObject anywhere; the page's only raster sits in a form.
+    let (mut doc, page_id, content_id) = synthetic_page(
+        false,
+        false,
+        &[TestForm {
+            name: "FmInline",
+            content: "q 612 0 0 792 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q",
+            ..PAGE_FORM
+        }],
+    );
+    let body: String = (0..12)
+        .map(|n| {
+            format!(
+                "BT /F1 12 Tf 72 {} Td (Paragraph line {n} of body text) Tj ET\n",
+                720 - 16 * n
+            )
+        })
+        .collect();
+
+    // Bound but never invoked, the form's inline image is no image of the
+    // page: a text page.
+    set_page_content(&mut doc, content_id, &body);
+    let analysis = analyze_page_content(&doc, page_id);
+    assert!(!analysis.has_images);
+    assert_eq!(analysis.image_count, 0);
+    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+
+    // Invoked, it is: a text page with a picture, and under a hidden layer
+    // an image page with a text layer nobody sees.
+    set_page_content(&mut doc, content_id, &format!("/FmInline Do\n{body}"));
+    let analysis = analyze_page_content(&doc, page_id);
+    assert!(analysis.has_images);
+    assert!(!analysis.has_invisible_text_layer);
+    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+
+    set_page_content(
+        &mut doc,
+        content_id,
+        &format!("/FmInline Do\n{}", glyph_layer(3)),
+    );
+    let analysis = analyze_page_content(&doc, page_id);
+    assert!(analysis.has_images);
+    assert!(analysis.has_invisible_text_layer);
+    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+}
