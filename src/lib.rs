@@ -164,7 +164,8 @@ pub struct PageOcrReasons {
 /// unmapped` of its codes had an entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontCMapGaps {
-    /// The font's `/BaseFont` name, or its resource name when it has none.
+    /// The font's `/BaseFont` name, or its resource name when it has none
+    /// or an empty one.
     pub font: String,
     /// Codes shown through the font's CMap, repeats included: two-byte
     /// codes, or the bytes of a single-byte CMap.

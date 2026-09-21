@@ -116,6 +116,8 @@ impl PositionOptions {
             include_invisible,
             bold_from_weight: self.bold_from_weight,
             bold_weight_threshold: self.bold_weight_threshold.clamp(100, 900),
+            // The position readers report no CMap coverage.
+            cmap_coverage: false,
         }
     }
 }
@@ -535,8 +537,11 @@ fn extract_positioned_text_with_folio_context_impl(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
 ) -> Result<DocumentExtraction, PdfError> {
+    // The selected pages report their CMap coverage; the context pages
+    // gathered below for their folio evidence do not.
     let options = TextExtractionOptions {
         include_invisible,
+        cmap_coverage: true,
         ..TextExtractionOptions::default()
     };
     let Some(required_pages) = page_filter else {
@@ -593,7 +598,10 @@ fn extract_positioned_text_with_folio_context_impl(
         doc,
         font_cmaps,
         Some(&context_pages),
-        options,
+        TextExtractionOptions {
+            cmap_coverage: false,
+            ..options
+        },
         Some(required_pages),
         CoordinateFrame::UserSpace,
     )?;
@@ -738,10 +746,14 @@ fn extract_positioned_text_impl(
             if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
                 let before = items.len();
                 items.retain(|it| !outside(it));
-                // The runs left out take their CMap coverage with them.
-                run_coverage.retain(|run| {
-                    let cx = run.x + run.width / 2.0;
-                    cx >= bx0 - TOL && cx <= bx1 + TOL && run.y >= by0 - TOL && run.y <= by1 + TOL
+                // The runs left out take their CMap coverage with them; a
+                // run without a position (see `RunCoverage`) stays.
+                run_coverage.retain(|run| match run.position {
+                    Some((x, y, width)) => {
+                        let cx = x + width / 2.0;
+                        cx >= bx0 - TOL && cx <= bx1 + TOL && y >= by0 - TOL && y <= by1 + TOL
+                    }
+                    None => true,
                 });
                 if items.len() < before {
                     debug!(
@@ -777,7 +789,12 @@ fn extract_positioned_text_impl(
             gid_encoded_pages.insert(*page_num);
         }
         for RunCoverage { font, stats, .. } in run_coverage {
-            cmap_coverage.entry(font).or_default().add(stats);
+            match cmap_coverage.get_mut(&*font) {
+                Some(total) => total.add(stats),
+                None => {
+                    cmap_coverage.insert(font.to_string(), stats);
+                }
+            }
         }
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {

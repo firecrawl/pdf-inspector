@@ -463,7 +463,7 @@ mod tests {
         };
         let mut clips = vec![Some(CLIP), Some(CLIP), None, Some(inner)];
         let mut replaced = vec![false, false, false, true];
-        let mut coverage = vec![None; 4];
+        let mut coverage = vec![Vec::new(); 4];
         assert_eq!(
             drop_clipped_away_runs(&mut items, &mut clips, &mut replaced, &mut coverage),
             1
@@ -486,7 +486,7 @@ mod tests {
                 &mut untouched,
                 &mut untouched_clips,
                 &mut vec![false],
-                &mut vec![None]
+                &mut vec![Vec::new()]
             ),
             0
         );

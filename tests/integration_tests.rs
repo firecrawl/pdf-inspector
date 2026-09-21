@@ -6253,6 +6253,32 @@ fn test_page_filter_reports_no_cmap_gaps_from_context_pages() {
 }
 
 #[test]
+fn test_blank_runs_count_towards_the_cmap_coverage() {
+    // A run of a single space code makes no item, yet its code was shown
+    // through the CMap: it counts with the next run's, and the text is the
+    // same as without it.
+    let base: [&[u16]; 3] = [&[3], &[45, 36, 61, 61], &[3]];
+    let shown = shown_lines(&base);
+    let pdf = make_type0_pdf_with_tounicode_ranges(&GAPPED_RANGES, &shown);
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, vec!["JAZZ"; SHOWINGS]);
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 6 * SHOWINGS as u32,
+            interpolated: SHOWINGS as u32,
+            unmapped: 0,
+        }]
+    );
+}
+
+#[test]
 fn test_analyze_mode_reports_unmapped_cmap_codes_as_encoding_issues() {
     // Analysis generates no Markdown, so the U+FFFD a code no CMap could
     // read would show is never seen there; the flag follows the coverage

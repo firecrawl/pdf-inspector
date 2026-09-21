@@ -695,8 +695,12 @@ impl ToUnicodeCMap {
     /// Build the table of gaps [`Self::gap_fill`] reads from the entries as
     /// they are now. The crate's own builders call it once a CMap is final,
     /// and again whenever they change one; a caller that builds or edits a
-    /// CMap through its public fields must call it before decoding.
+    /// CMap through its public fields must call it before decoding. It also
+    /// puts `ranges` in the order of their first codes, which
+    /// [`Self::lookup`] searches them in, so entries a caller pushed in any
+    /// order are found.
     pub fn refresh_gap_fills(&mut self) {
+        self.ranges.sort_unstable_by_key(|&(start, _, _)| start);
         self.gap_fills = self.compute_gap_fills();
     }
 
@@ -3566,6 +3570,23 @@ endbfchar
         // With both runs rising code after code the gap reads.
         let cmap = cmap_of_entries(&[(10, "A"), (11, "B"), (12, "C"), (14, "E"), (15, "F")]);
         assert_eq!(cmap.gap_fill(13), Some('D'));
+    }
+
+    #[test]
+    fn ranges_pushed_out_of_order_are_read_once_refreshed() {
+        // A caller that fills `ranges` itself, in any order: the refresh
+        // orders them for the lookup, and the gaps between them read.
+        let mut cmap = ToUnicodeCMap::new();
+        cmap.code_byte_length = 2;
+        cmap.ranges.push((52, 61, 0x51)); // Q..Z
+        cmap.ranges.push((36, 44, 0x41)); // A..I
+        cmap.ranges.push((46, 49, 0x4B)); // K..N
+        cmap.refresh_gap_fills();
+        assert_eq!(cmap.lookup(36).as_deref(), Some("A"));
+        assert_eq!(cmap.lookup(55).as_deref(), Some("T"));
+        assert_eq!(cmap.gap_fill(45), Some('J'));
+        assert_eq!(cmap.gap_fill(50), Some('O'));
+        assert_eq!(decode_codes(&cmap, &[45, 36, 61, 61, 50]).0, "JAZZO");
     }
 
     #[test]

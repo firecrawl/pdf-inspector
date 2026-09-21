@@ -354,6 +354,12 @@ pub(crate) struct TextExtractionOptions {
     /// The weight class from which `bold_from_weight` reads bold — see
     /// `PositionOptions::bold_weight_threshold`.
     pub(crate) bold_weight_threshold: u16,
+    /// Return, per run, the codes shown through each font's CMap and how
+    /// many of them the CMap had no entry for (see `RunCoverage`). Off for
+    /// the passes whose caller discards it — the region and position
+    /// readers, a document-wide pass gathering folio evidence — which then
+    /// neither gather the runs nor sum them.
+    pub(crate) cmap_coverage: bool,
 }
 
 impl Default for TextExtractionOptions {
@@ -362,6 +368,7 @@ impl Default for TextExtractionOptions {
             include_invisible: false,
             bold_from_weight: false,
             bold_weight_threshold: DEFAULT_BOLD_WEIGHT_THRESHOLD,
+            cmap_coverage: false,
         }
     }
 }
@@ -700,11 +707,9 @@ pub(crate) fn extract_page_text_items_with_options(
         // Record all items appended by the preceding operator, including paths
         // that continue the loop early. Forms and ActualText remain unproven.
         item_clips.resize(items.len(), shown_clip);
-        attach_run_coverage(
-            &mut item_coverage,
-            items.len(),
-            cmap_decisions.take_run_coverage(),
-        );
+        attach_run_coverage(&mut item_coverage, items.len(), || {
+            cmap_decisions.take_run_coverage()
+        });
         clips.observe(&op.operator, &op.operands, ctm);
         shown_clip = match op.operator.as_str() {
             "Tj" | "TJ" | "'" => clips.rect(),
@@ -2545,11 +2550,13 @@ pub(crate) fn extract_page_text_items_with_options(
     }
 
     item_clips.resize(items.len(), shown_clip);
-    attach_run_coverage(
-        &mut item_coverage,
-        items.len(),
-        cmap_decisions.take_run_coverage(),
-    );
+    attach_run_coverage(&mut item_coverage, items.len(), || {
+        cmap_decisions.take_run_coverage()
+    });
+    // The coverage of show operators no item followed — a trailing run of
+    // blank codes, of codes that read as nothing — has no item to travel
+    // with; it is kept as a run without a position (see `RunCoverage`).
+    let unplaced_coverage = cmap_decisions.take_run_coverage();
 
     // Decide the storage order of the page's RTL runs while candidate
     // indexes are still valid; merge_text_items below reads visual-order
@@ -2637,19 +2644,30 @@ pub(crate) fn extract_page_text_items_with_options(
     // The runs' coverage with the geometry the caller's page box test sees,
     // taken before the merges below join runs into lines.
     debug_assert_eq!(items.len(), item_coverage.len());
-    let run_coverage: Vec<RunCoverage> = items
-        .iter()
-        .zip(item_coverage.iter())
-        .filter_map(|(item, coverage)| {
-            coverage.as_ref().map(|(font, stats)| RunCoverage {
-                x: item.x,
-                y: item.y,
-                width: item.width,
-                font: font.clone(),
-                stats: *stats,
+    let run_coverage: Vec<RunCoverage> = if options.cmap_coverage {
+        items
+            .iter()
+            .zip(item_coverage.iter())
+            .flat_map(|(item, coverage)| {
+                coverage.iter().map(move |(font, stats)| RunCoverage {
+                    position: Some((item.x, item.y, item.width)),
+                    font: font.clone(),
+                    stats: *stats,
+                })
             })
-        })
-        .collect();
+            .chain(
+                unplaced_coverage
+                    .into_iter()
+                    .map(|(font, stats)| RunCoverage {
+                        position: None,
+                        font,
+                        stats,
+                    }),
+            )
+            .collect()
+    } else {
+        Vec::new()
+    };
     let items = if page_rotation == PageRotation::Upright {
         super::merge_text_items_with_clips(items, &item_clips, visual_rtl, &replaced_text)
     } else {
@@ -2922,6 +2940,161 @@ pub(crate) const SIGNED_WORD: &str =
 
 #[cfg(test)]
 mod tests {
+    /// A one-page document whose page has the given Identity-H CIDFontType2
+    /// fonts, each a resource name, a `/BaseFont` name and a one-byte
+    /// ToUnicode CMap body (its bfchar entries), showing `content`.
+    fn one_byte_cid_font_page(
+        fonts: &[(&str, &str, &str)],
+        content: &[u8],
+    ) -> (lopdf::Document, lopdf::ObjectId) {
+        use lopdf::{dictionary, Dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let mut font_resources = Dictionary::new();
+        for &(resource, base_font, entries) in fonts {
+            let cmap = format!(
+                "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+                 1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+                 1 beginbfchar\n{entries}\nendbfchar\nendcmap\nend\nend\n"
+            );
+            let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+            let cid_font_id = doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "CIDFontType2",
+                "BaseFont" => base_font,
+                "CIDSystemInfo" => dictionary! {
+                    "Registry" => Object::string_literal("Adobe"),
+                    "Ordering" => Object::string_literal("Identity"),
+                    "Supplement" => 0,
+                },
+                "DW" => 600,
+            });
+            let font_id = doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type0",
+                "BaseFont" => base_font,
+                "Encoding" => "Identity-H",
+                "DescendantFonts" => vec![cid_font_id.into()],
+                "ToUnicode" => cmap_id,
+            });
+            font_resources.set(resource, font_id);
+        }
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => font_resources },
+            "Contents" => content_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 }.into(),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        (doc, page_id)
+    }
+
+    /// The items and the CMap coverage of the page, with or without the
+    /// coverage asked for.
+    #[allow(clippy::type_complexity)]
+    fn extract_with_coverage(
+        doc: &lopdf::Document,
+        page_id: lopdf::ObjectId,
+        cmap_coverage: bool,
+    ) -> (Vec<TextItem>, Vec<crate::types::RunCoverage>) {
+        let font_cmaps = crate::tounicode::FontCMaps::from_doc(doc);
+        let ((items, _, _), _, _, _, run_coverage) = extract_page_text_items_with_options(
+            doc,
+            page_id,
+            1,
+            &font_cmaps,
+            TextExtractionOptions {
+                cmap_coverage,
+                ..TextExtractionOptions::default()
+            },
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        (items, run_coverage)
+    }
+
+    /// A blank run — a mapped space and a control byte no CMap has — makes
+    /// no item; its coverage still counts, as a run without a position.
+    #[test]
+    fn a_blank_run_of_a_cid_font_keeps_its_cmap_coverage() {
+        use crate::tounicode::CidDecodeStats;
+        use crate::types::RunCoverage;
+
+        let (doc, page_id) = one_byte_cid_font_page(
+            &[("F1", "AAAAAA+Font", "<20> <0020>")],
+            b"BT /F1 12 Tf 72 700 Td <2001> Tj ET",
+        );
+        let (items, run_coverage) = extract_with_coverage(&doc, page_id, true);
+        assert!(items.is_empty(), "{items:?}");
+        assert_eq!(
+            run_coverage,
+            vec![RunCoverage {
+                position: None,
+                font: crate::types::FontLabel::from("AAAAAA+Font"),
+                stats: CidDecodeStats {
+                    codes: 2,
+                    interpolated: 0,
+                    unmapped: 1
+                },
+            }]
+        );
+        // A pass that does not ask for the coverage gathers none.
+        let (_, run_coverage) = extract_with_coverage(&doc, page_id, false);
+        assert!(run_coverage.is_empty());
+    }
+
+    /// A blank run of one font followed by a run of another: the blank
+    /// run's coverage waits for the next item and rides with it, under its
+    /// own font's name, beside the coverage of the font that made the item.
+    #[test]
+    fn a_blank_run_waiting_beside_another_font_keeps_its_own_name() {
+        use crate::tounicode::CidDecodeStats;
+        use crate::types::{FontLabel, RunCoverage};
+
+        let (doc, page_id) = one_byte_cid_font_page(
+            &[
+                ("F1", "AAAAAA+Font", "<20> <0020>"),
+                ("F2", "BBBBBB+Font", "<41> <0041>"),
+            ],
+            b"BT /F1 12 Tf 72 700 Td <2001> Tj /F2 12 Tf <41> Tj ET",
+        );
+        let (items, run_coverage) = extract_with_coverage(&doc, page_id, true);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].text, "A");
+        let position = Some((items[0].x, items[0].y, items[0].width));
+        assert_eq!(
+            run_coverage,
+            vec![
+                RunCoverage {
+                    position,
+                    font: FontLabel::from("AAAAAA+Font"),
+                    stats: CidDecodeStats {
+                        codes: 2,
+                        interpolated: 0,
+                        unmapped: 1
+                    },
+                },
+                RunCoverage {
+                    position,
+                    font: FontLabel::from("BBBBBB+Font"),
+                    stats: CidDecodeStats {
+                        codes: 1,
+                        interpolated: 0,
+                        unmapped: 0
+                    },
+                },
+            ]
+        );
+    }
     use super::*;
 
     fn rect(x: f32, y: f32, w: f32, h: f32, page: u32) -> PdfRect {

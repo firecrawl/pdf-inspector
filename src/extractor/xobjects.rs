@@ -514,11 +514,9 @@ fn extract_form_xobject_text_inner(
     for op in &content.operations {
         // The coverage of the preceding operator's decodes goes to the first
         // item it appended (see `attach_run_coverage`).
-        attach_run_coverage(
-            item_coverage,
-            items.len(),
-            cmap_decisions.take_run_coverage(),
-        );
+        attach_run_coverage(item_coverage, items.len(), || {
+            cmap_decisions.take_run_coverage()
+        });
         if !budget.charge_operation() {
             break;
         }
@@ -1477,11 +1475,11 @@ fn extract_form_xobject_text_inner(
             _ => {}
         }
     }
-    attach_run_coverage(
-        item_coverage,
-        items.len(),
-        cmap_decisions.take_run_coverage(),
-    );
+    // Coverage no item of the form followed stays waiting for the page's
+    // next item, or for the page's end (see `attach_run_coverage`).
+    attach_run_coverage(item_coverage, items.len(), || {
+        cmap_decisions.take_run_coverage()
+    });
 
     extracted
 }
