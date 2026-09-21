@@ -177,6 +177,14 @@ impl ClipTracker {
 /// how many were removed. A run with no established clip (`None`) always
 /// stays. Both vectors shrink in step, so call this after any fix-up that
 /// indexes into `items`.
+/// Whether the clip in force when `item` was shown hides it wholly (see
+/// `ClipRect::excludes_run`); a run with no established clip is never
+/// hidden. The test `drop_clipped_away_runs` applies, shared with the
+/// page's storage-order vote so that a run not on the page decides nothing.
+pub(super) fn excluded_by_clip(item: &TextItem, clip: Option<ClipRect>) -> bool {
+    clip.is_some_and(|rect| rect.excludes_run(item))
+}
+
 pub(super) fn drop_clipped_away_runs(
     items: &mut Vec<TextItem>,
     clips: &mut Vec<Option<ClipRect>>,
@@ -186,7 +194,7 @@ pub(super) fn drop_clipped_away_runs(
         .iter()
         .zip(clips.iter())
         .map(|(item, clip)| {
-            let excluded = clip.is_some_and(|rect| rect.excludes_run(item));
+            let excluded = excluded_by_clip(item, *clip);
             if excluded {
                 log::trace!(
                     "run painted outside its clip left out: {} chars at ({}, {}) {}x{}",

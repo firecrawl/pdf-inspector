@@ -196,9 +196,9 @@ pub(crate) struct ExtractedText {
     pub(crate) items: Vec<TextItem>,
     pub(crate) rtl_visual_candidates: Vec<usize>,
     pub(crate) rtl_logical_ops: u32,
-    /// Visible show ops of several RTL letters painted forwards (see
-    /// `is_visual_rtl_run`): visual-storage votes.
-    pub(crate) rtl_visual_ops: u32,
+    /// Indexes of the items shown by visible ops of several RTL letters
+    /// painted forwards (see `is_visual_rtl_run`): visual-storage votes.
+    pub(crate) rtl_visual_runs: Vec<usize>,
     /// Baseline angle of every text-producing show operator, in stream
     /// order: this form's share of the page-rotation vote. Per operator,
     /// not per item — one TJ array can split into several items.
@@ -215,7 +215,7 @@ impl ExtractedText {
             items: Vec::new(),
             rtl_visual_candidates: Vec::new(),
             rtl_logical_ops: 0,
-            rtl_visual_ops: 0,
+            rtl_visual_runs: Vec::new(),
             run_rotations: Vec::new(),
             skipped_invisible: false,
         }
@@ -230,14 +230,14 @@ impl ExtractedText {
         items: &mut Vec<TextItem>,
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_ops: &mut u32,
-        rtl_visual_ops: &mut u32,
+        rtl_visual_runs: &mut Vec<usize>,
         run_rotations: &mut Vec<f32>,
         skipped_invisible: &mut bool,
     ) {
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         *rtl_logical_ops += self.rtl_logical_ops;
-        *rtl_visual_ops += self.rtl_visual_ops;
+        rtl_visual_runs.extend(self.rtl_visual_runs.into_iter().map(|c| c + base));
         run_rotations.extend(self.run_rotations);
         *skipped_invisible |= self.skipped_invisible;
         items.extend(self.items);
@@ -257,6 +257,7 @@ pub(crate) fn extract_form_xobject_text(
     inherited_text_rise: f32,
     inherited_horizontal_scale: f32,
     inherited_text_paint: TextPaint,
+    inherited_fill_is_white: bool,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
@@ -272,6 +273,7 @@ pub(crate) fn extract_form_xobject_text(
         inherited_text_rise,
         inherited_horizontal_scale,
         inherited_text_paint,
+        inherited_fill_is_white,
         cmap_decisions,
         style_cache,
         0,
@@ -291,6 +293,7 @@ fn extract_form_xobject_text_inner(
     inherited_text_rise: f32,
     inherited_horizontal_scale: f32,
     inherited_text_paint: TextPaint,
+    inherited_fill_is_white: bool,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
@@ -345,7 +348,7 @@ fn extract_form_xobject_text_inner(
     let items = &mut extracted.items;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_ops = &mut extracted.rtl_logical_ops;
-    let rtl_visual_ops = &mut extracted.rtl_visual_ops;
+    let rtl_visual_runs = &mut extracted.rtl_visual_runs;
     let run_rotations = &mut extracted.run_rotations;
     let skipped_invisible = &mut extracted.skipped_invisible;
 
@@ -477,7 +480,9 @@ fn extract_form_xobject_text_inner(
     let mut text_rendering_mode: i32 = inherited_render_mode;
     let mut text_paint = inherited_text_paint;
     let mut in_text_block = false;
-    let mut fill_is_white = false;
+    // The fill colour is graphics state too: a form invoked under a white
+    // fill paints white until it sets its own colour.
+    let mut fill_is_white = inherited_fill_is_white;
     let mut ctm = base_ctm;
 
     // Text state (Tc/Tw/TL/Tf) and the fill colour are part of the graphics
@@ -564,6 +569,7 @@ fn extract_form_xobject_text_inner(
                                         text_rise,
                                         horizontal_scale,
                                         text_paint,
+                                        fill_is_white,
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
@@ -573,7 +579,7 @@ fn extract_form_xobject_text_inner(
                                         items,
                                         rtl_visual_candidates,
                                         rtl_logical_ops,
-                                        rtl_visual_ops,
+                                        rtl_visual_runs,
                                         run_rotations,
                                         skipped_invisible,
                                     );
@@ -896,7 +902,7 @@ fn extract_form_xobject_text_inner(
                                         )
                                         && crate::text_utils::is_visual_rtl_run(&text)
                                     {
-                                        *rtl_visual_ops += 1;
+                                        rtl_visual_runs.push(items.len());
                                     }
                                 } else {
                                     *rtl_logical_ops += 1;
@@ -1347,7 +1353,7 @@ fn extract_form_xobject_text_inner(
                                             )
                                             && crate::text_utils::is_visual_rtl_run(text)
                                         {
-                                            *rtl_visual_ops += 1;
+                                            rtl_visual_runs.push(items.len());
                                         }
                                     }
                                 }
@@ -1566,6 +1572,7 @@ mod tests {
             0.0,
             1.0,
             TextPaint::default(),
+            false,
             &mut CMapDecisionCache::new(),
             &mut FontStyleCache::new(),
             budget,

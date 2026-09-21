@@ -5753,17 +5753,13 @@ fn clipping_provenance_follows_sorted_items_and_supported_show_operators() {
     );
 }
 
-fn clipped_rtl_items(left_clip: &str, right_clip: &str, visual_order: bool) -> Vec<TextItem> {
+fn clipped_rtl_items(left_clip: &str, right_clip: &str) -> Vec<TextItem> {
     use lopdf::{dictionary, Document, Stream};
 
     let field = |clip: &str, x: u32, text: &str| {
         format!("q {clip} BT /F1 12 Tf 10 Tz 1 0 0 1 {x} 100 Tm ({text}) Tj ET Q\n")
     };
-    let content = if visual_order {
-        field(left_clip, 50, "AB") + &field(right_clip, 52, "CD")
-    } else {
-        field(right_clip, 52, "DC") + &field(left_clip, 50, "BA")
-    };
+    let content = field(left_clip, 50, "AB") + &field(right_clip, 52, "CD");
     let mut doc = Document::load_mem(&make_text_pdf(&content, "0 0 300 300")).unwrap();
     let cmap = doc.add_object(Stream::new(
         dictionary! {},
@@ -5788,7 +5784,7 @@ fn clipped_rtl_items(left_clip: &str, right_clip: &str, visual_order: bool) -> V
 /// fields read back turned round, each keeping its own clip.
 #[test]
 fn separated_rtl_clips_keep_runs_in_visual_storage_order() {
-    let items = clipped_rtl_items("50 98 1.3 15 re W n", "52 98 1.3 15 re W n", true);
+    let items = clipped_rtl_items("50 98 1.3 15 re W n", "52 98 1.3 15 re W n");
     assert_eq!(
         items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
         ["\u{05D1}\u{05D0}", "\u{05D3}\u{05D2}"]
@@ -5797,7 +5793,7 @@ fn separated_rtl_clips_keep_runs_in_visual_storage_order() {
     assert!(items.iter().all(|i| i.advance_known));
     // These narrow, measured runs would otherwise merge; their clip
     // association must survive visual-order character correction too.
-    assert_eq!(clipped_rtl_items("", "", true).len(), 1);
+    assert_eq!(clipped_rtl_items("", "").len(), 1);
 }
 
 #[test]
@@ -5811,11 +5807,7 @@ fn rtl_clips_still_require_separation_and_contained_advances() {
         ("50 98 1.3 15 re W n", ""),
         ("50 98 1.3 15 re W n", "52 98 m 54 98 l 54 110 l h W n"),
     ] {
-        assert_eq!(
-            clipped_rtl_items(left, right, true).len(),
-            1,
-            "{left}; {right}"
-        );
+        assert_eq!(clipped_rtl_items(left, right).len(), 1, "{left}; {right}");
     }
 }
 

@@ -439,7 +439,7 @@ pub(crate) fn extract_page_text_items_with_options(
     // evidence of logical-order storage.
     let mut rtl_visual_candidates: Vec<usize> = Vec::new();
     let mut rtl_logical_ops: u32 = 0;
-    let mut rtl_visual_ops: u32 = 0;
+    let mut rtl_visual_runs: Vec<usize> = Vec::new();
     // Items whose text is logical whatever the page's storage order:
     // ActualText replacements.
     let mut logical_text_items: Vec<usize> = Vec::new();
@@ -612,12 +612,16 @@ pub(crate) fn extract_page_text_items_with_options(
     let mut skipped_invisible = false;
     let mut line_width: f32 = 1.0;
     let mut text_paint = TextPaint::default();
+    // The fill colour is graphics state too: white text on the page shows
+    // nothing, and a form invoked under it inherits the white.
+    let mut fill_is_white = false;
     #[derive(Clone)]
     struct SavedGraphicsState {
         ctm: [f32; 6],
         text_rendering_mode: i32,
         line_width: f32,
         text_paint: TextPaint,
+        fill_is_white: bool,
         char_spacing: f32,
         word_spacing: f32,
         horizontal_scale: f32,
@@ -697,6 +701,7 @@ pub(crate) fn extract_page_text_items_with_options(
                     text_rendering_mode,
                     line_width,
                     text_paint,
+                    fill_is_white,
                     char_spacing,
                     word_spacing,
                     horizontal_scale,
@@ -713,6 +718,7 @@ pub(crate) fn extract_page_text_items_with_options(
                     text_rendering_mode = saved.text_rendering_mode;
                     line_width = saved.line_width;
                     text_paint = saved.text_paint;
+                    fill_is_white = saved.fill_is_white;
                     char_spacing = saved.char_spacing;
                     word_spacing = saved.word_spacing;
                     horizontal_scale = saved.horizontal_scale;
@@ -739,6 +745,41 @@ pub(crate) fn extract_page_text_items_with_options(
             "w" => {
                 if let Some(width) = op.operands.first().and_then(get_number) {
                     line_width = width;
+                }
+            }
+            "g" => {
+                if let Some(gray) = op.operands.first().and_then(get_number) {
+                    fill_is_white = gray > 0.95;
+                }
+            }
+            "rg" => {
+                if op.operands.len() >= 3 {
+                    let r = get_number(&op.operands[0]).unwrap_or(0.0);
+                    let g = get_number(&op.operands[1]).unwrap_or(0.0);
+                    let b = get_number(&op.operands[2]).unwrap_or(0.0);
+                    fill_is_white = r > 0.95 && g > 0.95 && b > 0.95;
+                }
+            }
+            "k" => {
+                if op.operands.len() >= 4 {
+                    let c = get_number(&op.operands[0]).unwrap_or(1.0);
+                    let m = get_number(&op.operands[1]).unwrap_or(1.0);
+                    let y = get_number(&op.operands[2]).unwrap_or(1.0);
+                    let k = get_number(&op.operands[3]).unwrap_or(1.0);
+                    fill_is_white = c < 0.05 && m < 0.05 && y < 0.05 && k < 0.05;
+                }
+            }
+            "sc" | "scn" => {
+                let nums: Vec<f32> = op.operands.iter().filter_map(get_number).collect();
+                match nums.len() {
+                    3 => {
+                        fill_is_white = nums[0] > 0.95 && nums[1] > 0.95 && nums[2] > 0.95;
+                    }
+                    4 => {
+                        fill_is_white =
+                            nums[0] < 0.05 && nums[1] < 0.05 && nums[2] < 0.05 && nums[3] < 0.05;
+                    }
+                    _ => fill_is_white = false,
                 }
             }
             "BT" => {
@@ -1006,11 +1047,13 @@ pub(crate) fn extract_page_text_items_with_options(
                                 if combined[0].abs() > combined[1].abs() {
                                     if combined[0] * horizontal_scale > 0.0 {
                                         rtl_visual_candidates.push(items.len());
-                                        if crate::text_utils::render_mode_paints(
-                                            text_rendering_mode,
-                                        ) && crate::text_utils::is_visual_rtl_run(&text)
+                                        if !fill_is_white
+                                            && crate::text_utils::render_mode_paints(
+                                                text_rendering_mode,
+                                            )
+                                            && crate::text_utils::is_visual_rtl_run(&text)
                                         {
-                                            rtl_visual_ops += 1;
+                                            rtl_visual_runs.push(items.len());
                                         }
                                     } else {
                                         rtl_logical_ops += 1;
@@ -1527,11 +1570,13 @@ pub(crate) fn extract_page_text_items_with_options(
                                         }
                                     } else {
                                         rtl_visual_candidates.push(items.len());
-                                        if crate::text_utils::render_mode_paints(
-                                            text_rendering_mode,
-                                        ) && crate::text_utils::is_visual_rtl_run(text)
+                                        if !fill_is_white
+                                            && crate::text_utils::render_mode_paints(
+                                                text_rendering_mode,
+                                            )
+                                            && crate::text_utils::is_visual_rtl_run(text)
                                         {
-                                            rtl_visual_ops += 1;
+                                            rtl_visual_runs.push(items.len());
                                         }
                                     }
                                 }
@@ -1758,10 +1803,13 @@ pub(crate) fn extract_page_text_items_with_options(
                             {
                                 if combined[0] * horizontal_scale > 0.0 {
                                     rtl_visual_candidates.push(items.len());
-                                    if crate::text_utils::render_mode_paints(text_rendering_mode)
+                                    if !fill_is_white
+                                        && crate::text_utils::render_mode_paints(
+                                            text_rendering_mode,
+                                        )
                                         && crate::text_utils::is_visual_rtl_run(&text)
                                     {
-                                        rtl_visual_ops += 1;
+                                        rtl_visual_runs.push(items.len());
                                     }
                                 } else {
                                     rtl_logical_ops += 1;
@@ -1906,6 +1954,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         text_rise,
                                         horizontal_scale,
                                         text_paint,
+                                        fill_is_white,
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
@@ -1914,7 +1963,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         &mut items,
                                         &mut rtl_visual_candidates,
                                         &mut rtl_logical_ops,
-                                        &mut rtl_visual_ops,
+                                        &mut rtl_visual_runs,
                                         &mut form_runs,
                                         &mut skipped_invisible,
                                     );
@@ -2440,6 +2489,25 @@ pub(crate) fn extract_page_text_items_with_options(
     // Decide the storage order of the page's RTL runs while candidate
     // indexes are still valid; merge_text_items below reads visual-order
     // lines back into logical order as it merges them.
+    // Runs painted wholly outside their clip are left out below; they are
+    // not on the page, so they do not say how its right-to-left runs are
+    // stored either.
+    let (rtl_visual_candidates, rtl_visual_ops) = {
+        let on_page = |index: usize| {
+            !super::clip_boundaries::excluded_by_clip(&items[index], item_clips[index])
+        };
+        (
+            rtl_visual_candidates
+                .iter()
+                .copied()
+                .filter(|&index| on_page(index))
+                .collect::<Vec<usize>>(),
+            rtl_visual_runs
+                .iter()
+                .filter(|&&index| on_page(index))
+                .count() as u32,
+        )
+    };
     let visual_rtl = crate::text_utils::fix_visual_order_rtl(
         &mut items,
         &rtl_visual_candidates,
@@ -3402,10 +3470,22 @@ end
 end"#;
 
     /// A page with `F1`, a TrueType font WITHOUT width metrics whose
-    /// ToUnicode is `cmap`, and `F2`, a measured 600-unit Helvetica.
+    /// ToUnicode is `cmap`, `F2`, a measured 600-unit Helvetica, and `F3`,
+    /// the same glyphs as `F1` with 500-unit widths.
     fn extract_items_with_cmap(
         content: &[u8],
         cmap: &[u8],
+        include_invisible: bool,
+    ) -> Vec<TextItem> {
+        extract_items_with_cmap_and_form(content, cmap, None, include_invisible)
+    }
+
+    /// [`extract_items_with_cmap`] with an optional Form XObject `X1`
+    /// holding `form`, drawn with the page's fonts.
+    fn extract_items_with_cmap_and_form(
+        content: &[u8],
+        cmap: &[u8],
+        form: Option<&[u8]>,
         include_invisible: bool,
     ) -> Vec<TextItem> {
         use crate::tounicode::FontCMaps;
@@ -3428,6 +3508,38 @@ end"#;
             "LastChar" => 255,
             "Widths" => Object::Array(widths),
         });
+        let measured_hebrew_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "TestHebrew",
+            "FirstChar" => 65,
+            "LastChar" => 68,
+            "Widths" => Object::Array(vec![500.into(), 500.into(), 500.into(), 500.into()]),
+            "ToUnicode" => Object::Reference(cmap_id),
+        });
+        let fonts = || {
+            dictionary! {
+                "F1" => Object::Reference(font_id),
+                "F2" => Object::Reference(measured_font_id),
+                "F3" => Object::Reference(measured_hebrew_id),
+            }
+        };
+        let mut resources = dictionary! { "Font" => fonts() };
+        if let Some(form) = form {
+            let form_id = doc.add_object(Object::Stream(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! { "Font" => fonts() },
+                },
+                form.to_vec(),
+            )));
+            resources.set(
+                "XObject",
+                dictionary! { "X1" => Object::Reference(form_id) },
+            );
+        }
         let content_id = doc.add_object(Object::Stream(Stream::new(
             dictionary! {},
             content.to_vec(),
@@ -3435,12 +3547,7 @@ end"#;
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
             "Contents" => Object::Reference(content_id),
-            "Resources" => dictionary! {
-                "Font" => dictionary! {
-                    "F1" => Object::Reference(font_id),
-                    "F2" => Object::Reference(measured_font_id),
-                },
-            },
+            "Resources" => resources,
             "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
         });
         let pages_id = doc.add_object(dictionary! {
@@ -3500,7 +3607,8 @@ end"#;
         // reading order — the OCR-text-layer convention, read with the
         // invisible layer included. Their runs display nothing and cast no
         // visual-storage vote: they must NOT be reversed.
-        let content = b"BT 3 Tr /F1 12 Tf 160 700 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
+        let content =
+            b"BT 3 Tr /F1 12 Tf 1 0 0 1 160 700 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
         let items = extract_hebrew_items_with(content, true);
         assert_eq!(items.len(), 2);
         for item in &items {
@@ -3518,12 +3626,60 @@ end"#;
         // forwards: the walk alone would read as logical storage, but a
         // visible run of several letters painted forwards can only be
         // visual storage, so each run is reversed.
-        let content = b"BT /F1 12 Tf 160 700 Tm <44434241> Tj -60 0 Td <44434241> Tj ET";
+        let content = b"BT /F1 12 Tf 1 0 0 1 160 700 Tm <44434241> Tj -60 0 Td <44434241> Tj ET";
         let items = extract_hebrew_items(content);
         assert_eq!(items.len(), 2);
         for item in &items {
             assert_eq!(item.text, SHALOM_LOGICAL, "visual run must be reversed");
         }
+    }
+
+    #[test]
+    fn white_logical_order_hebrew_ops_cast_no_visual_vote() {
+        // White text is not seen: like an invisible layer, logical-order
+        // runs placed right to left in white cast no visual-storage vote
+        // and keep their reading.
+        let content =
+            b"BT 1 g /F1 12 Tf 1 0 0 1 160 700 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
+        let items = extract_hebrew_items(content);
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(
+                item.text, SHALOM_LOGICAL,
+                "white logical run must not be reversed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_form_inherits_the_pages_fill_for_the_storage_vote() {
+        // `1 g` set by the page before `Do`: the form's runs paint white too
+        // — hidden, like white text the form sets itself — so they are
+        // neither extracted nor counted as visual-storage votes. Once the
+        // form sets its own black fill its runs count again: visual-order
+        // runs shown in reading order are turned round.
+        let logical = b"BT /F1 12 Tf 1 0 0 1 160 700 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
+        let items =
+            extract_items_with_cmap_and_form(b"1 g q /X1 Do Q", HEBREW_CMAP, Some(logical), false);
+        assert!(items.is_empty(), "{items:?}");
+        let visual = b"0 g BT /F1 12 Tf 1 0 0 1 160 700 Tm <44434241> Tj -60 0 Td <44434241> Tj ET";
+        let items =
+            extract_items_with_cmap_and_form(b"1 g q /X1 Do Q", HEBREW_CMAP, Some(visual), false);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, [SHALOM_LOGICAL, SHALOM_LOGICAL]);
+    }
+
+    #[test]
+    fn runs_painted_outside_their_clip_cast_no_vote() {
+        // Visible visual-order runs parked outside their clip are left out
+        // of the page; they must not decide the storage order of the
+        // invisible logical-order layer that is on it.
+        let content =
+            b"q 0 0 10 10 re W n BT /F3 12 Tf 1 0 0 1 100 700 Tm <44434241> Tj 60 0 Td <44434241> Tj ET Q \
+            BT 3 Tr /F1 12 Tf 1 0 0 1 160 600 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
+        let items = extract_hebrew_items_with(content, true);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, [SHALOM_LOGICAL, SHALOM_LOGICAL]);
     }
 
     #[test]
