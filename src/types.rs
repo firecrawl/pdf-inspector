@@ -12,6 +12,20 @@ use crate::text_utils::should_join_items;
 /// and whether fonts with unresolvable gid-encoded glyphs were encountered.
 pub(crate) type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
 
+/// Per font (its `/BaseFont` name, or its resource name without one), how
+/// the two-byte codes shown through the font's CMap fared: the codes shown,
+/// the ones read from the mapped codes around them and the ones left as
+/// U+FFFD. Ordered by name so documents report their fonts the same way.
+pub(crate) type CMapCoverageByFont =
+    std::collections::BTreeMap<String, crate::tounicode::CidDecodeStats>;
+
+/// Fold `from`'s per-font coverage into `into`.
+pub(crate) fn merge_cmap_coverage(into: &mut CMapCoverageByFont, from: CMapCoverageByFont) {
+    for (font, stats) in from {
+        into.entry(font).or_default().add(stats);
+    }
+}
+
 // ── Font types (crate-internal) ──────────────────────────────────────
 
 /// Font encoding map: maps byte codes to Unicode characters

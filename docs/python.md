@@ -166,10 +166,17 @@ class PdfResult:                     # process_pdf / detect_pdf
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool        # broken font encodings — consider OCR fallback
+    cmap_gaps: list[FontCMapGaps]    # fonts whose ToUnicode CMap lacked an entry for a code shown through it
 
 class PageOcrReasons:                # per-page OCR diagnostics
     page: int                        # 1-indexed
     reasons: list[str]               # machine-readable reason identifiers
+
+class FontCMapGaps:                  # what became of a font's codes without a CMap entry
+    font: str                        # /BaseFont name, or the resource name without one
+    codes: int                       # two-byte codes shown through the CMap, repeats included
+    interpolated: int                # read from the mapped codes around them
+    unmapped: int                    # could not be read; each is a U+FFFD in the text
 
 class OcrModelIdentity:
     name: str                        # model family/name

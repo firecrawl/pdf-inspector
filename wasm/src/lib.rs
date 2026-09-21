@@ -1,6 +1,6 @@
 use pdf_inspector::{
-    LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions, PdfProcessResult, PdfType,
-    ProcessMode,
+    FontCMapGaps, LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions,
+    PdfProcessResult, PdfType, ProcessMode,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -29,6 +29,21 @@ export interface PageOcrReasons {
   reasons: string[];
 }
 
+/**
+ * A font whose ToUnicode CMap had no entry for some of the codes the document
+ * shows through it, and what became of those codes.
+ */
+export interface FontCmapGaps {
+  /** The font's /BaseFont name, or its resource name when it has none. */
+  font: string;
+  /** Two-byte codes shown through the font's CMap, repeats included. */
+  codes: number;
+  /** Codes without an entry that were read from the mapped codes around them. */
+  interpolated: number;
+  /** Codes without an entry that could not be read; each is a U+FFFD in the text. */
+  unmapped: number;
+}
+
 export interface LayoutComplexity {
   isComplex: boolean;
   /** 1-indexed page numbers. */
@@ -49,6 +64,11 @@ export interface PdfProcessResult {
   confidence: number;
   layout: LayoutComplexity;
   hasEncodingIssues: boolean;
+  /**
+   * Fonts whose ToUnicode CMap lacked an entry for a code the document shows
+   * through it; empty when every such code had an entry.
+   */
+  cmapGaps: FontCmapGaps[];
 }
 
 export interface PdfClassification {
@@ -101,6 +121,26 @@ impl From<PageOcrReasons> for WasmPageOcrReasons {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct WasmFontCmapGaps {
+    font: String,
+    codes: u32,
+    interpolated: u32,
+    unmapped: u32,
+}
+
+impl From<FontCMapGaps> for WasmFontCmapGaps {
+    fn from(value: FontCMapGaps) -> Self {
+        Self {
+            font: value.font,
+            codes: value.codes,
+            interpolated: value.interpolated,
+            unmapped: value.unmapped,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WasmLayoutComplexity {
     is_complex: bool,
     pages_with_tables: Vec<u32>,
@@ -130,6 +170,7 @@ struct WasmPdfProcessResult {
     confidence: f64,
     layout: WasmLayoutComplexity,
     has_encoding_issues: bool,
+    cmap_gaps: Vec<WasmFontCmapGaps>,
 }
 
 impl From<PdfProcessResult> for WasmPdfProcessResult {
@@ -149,6 +190,7 @@ impl From<PdfProcessResult> for WasmPdfProcessResult {
             confidence: value.confidence as f64,
             layout: value.layout.into(),
             has_encoding_issues: value.has_encoding_issues,
+            cmap_gaps: value.cmap_gaps.into_iter().map(Into::into).collect(),
         }
     }
 }

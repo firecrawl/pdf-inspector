@@ -42,6 +42,21 @@ fn format_ocr_reasons_by_page(reasons: &[pdf_inspector::PageOcrReasons]) -> Stri
         .join(",")
 }
 
+fn format_cmap_gaps(gaps: &[pdf_inspector::FontCMapGaps]) -> String {
+    gaps.iter()
+        .map(|gap| {
+            format!(
+                r#"{{"font":"{}","codes":{},"interpolated":{},"unmapped":{}}}"#,
+                json_escape(&gap.font),
+                gap.codes,
+                gap.interpolated,
+                gap.unmapped
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     for ch in s.chars() {
@@ -150,8 +165,9 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
                     .map(|p| p.to_string())
                     .collect();
                 let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
+                let cmap_gaps = format_cmap_gaps(&result.cmap_gaps);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"detection_time_ms":{}}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"cmap_gaps":[{}],"detection_time_ms":{}}}"#,
                     pdf_type_str(&result.pdf_type),
                     result.page_count,
                     ocr_pages.join(","),
@@ -159,6 +175,7 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
                     result.layout.is_complex,
                     table_pages.join(","),
                     col_pages.join(","),
+                    cmap_gaps,
                     elapsed.as_millis()
                 );
             } else {

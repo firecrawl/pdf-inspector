@@ -56,6 +56,21 @@ fn format_ocr_reasons_by_page(reasons: &[pdf_inspector::PageOcrReasons]) -> Stri
         .join(",")
 }
 
+fn format_cmap_gaps(gaps: &[pdf_inspector::FontCMapGaps]) -> String {
+    gaps.iter()
+        .map(|gap| {
+            format!(
+                r#"{{"font":"{}","codes":{},"interpolated":{},"unmapped":{}}}"#,
+                json_escape(&gap.font),
+                gap.codes,
+                gap.interpolated,
+                gap.unmapped
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn item_type_label(item_type: &ItemType) -> &'static str {
     match item_type {
         ItemType::Text => "text",
@@ -685,8 +700,9 @@ fn main() {
                         .map(|p| p.to_string())
                         .collect();
                     let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
+                    let cmap_gaps = format_cmap_gaps(&result.cmap_gaps);
                     println!(
-                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{}}}"#,
+                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"cmap_gaps":[{}]}}"#,
                         pdf_type_str,
                         result.page_count,
                         result.processing_time_ms,
@@ -696,6 +712,7 @@ fn main() {
                         table_pages.join(","),
                         col_pages.join(","),
                         result.has_encoding_issues,
+                        cmap_gaps,
                     );
                 } else {
                     eprintln!("Type: {}", pdf_type_str);
@@ -733,8 +750,9 @@ fn main() {
                     .map(|p| p.to_string())
                     .collect();
                 let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
+                let cmap_gaps = format_cmap_gaps(&result.cmap_gaps);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"markdown":"{}"}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"cmap_gaps":[{}],"markdown":"{}"}}"#,
                     match result.pdf_type {
                         PdfType::TextBased => "text_based",
                         PdfType::Scanned => "scanned",
@@ -751,6 +769,7 @@ fn main() {
                     table_pages.join(","),
                     col_pages.join(","),
                     result.has_encoding_issues,
+                    cmap_gaps,
                     md_escaped
                 );
             } else if raw_output {

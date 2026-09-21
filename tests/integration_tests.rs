@@ -2109,6 +2109,7 @@ fn test_pages_needing_ocr_field_accessible() {
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
         has_encoding_issues: false,
+        cmap_gaps: Vec::new(),
     };
     assert_eq!(process_result.pages_needing_ocr, vec![1, 3]);
 }
@@ -5748,6 +5749,309 @@ fn test_synthetic_type0_broken_tounicode_emits_fffd_not_latin1_mojibake() {
          pages_needing_ocr={:?}",
         result.pages_needing_ocr
     );
+}
+
+// ============================================================================
+// Type0/Identity-H font whose ToUnicode CMap has gaps
+// ============================================================================
+
+/// A one-page document showing `lines` — each a run of two-byte codes shown
+/// by one `Tj` — through a Type0/Identity-H font whose embedded subset (see
+/// `minimal_truetype_subset`) has neither a cmap nor glyph names, so the
+/// font's ToUnicode CMap — `bfrange` lines of `(first, last, base)` — is the
+/// only reading of the codes.
+fn make_type0_pdf_with_tounicode_ranges(ranges: &[(u16, u16, u32)], lines: &[&[u16]]) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    cmap.push_str(&format!("{} beginbfrange\n", ranges.len()));
+    for &(first, last, base) in ranges {
+        cmap.push_str(&format!("<{first:04X}> <{last:04X}> <{base:04X}>\n"));
+    }
+    cmap.push_str("endbfrange\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+
+    let highest_code = lines
+        .iter()
+        .flat_map(|line| line.iter())
+        .chain(ranges.iter().map(|(_, last, _)| last))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut doc = Document::with_version("1.5");
+    let font_file = minimal_truetype_subset(usize::from(highest_code));
+    let font_file_id = doc.add_object(Stream::new(
+        dictionary! { "Length1" => font_file.len() as i64 },
+        font_file,
+    ));
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "AAAAAA+Subset",
+        "Flags" => 4,
+        "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 700,
+        "Descent" => 0,
+        "CapHeight" => 700,
+        "StemV" => 80,
+        "FontFile2" => font_file_id,
+    });
+    let cid_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "AAAAAA+Subset",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "DW" => 600,
+        "CIDToGIDMap" => "Identity",
+    });
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "AAAAAA+Subset",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![cid_font_id.into()],
+        "ToUnicode" => cmap_id,
+    });
+
+    let mut text = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let hex: String = line.iter().map(|code| format!("{code:04X}")).collect();
+        text.push_str(&format!(
+            "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
+            700 - 20 * index
+        ));
+    }
+    let content_id = doc.add_object(Stream::new(dictionary! {}, text.into_bytes()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Codes of the standard glyph order: space at 3, digits at 19..28, A..Z at
+/// 36..61 and a..z at 68..93.
+fn standard_order_codes(text: &str) -> Vec<u16> {
+    text.chars()
+        .map(|c| match c {
+            ' ' => 3,
+            '0'..='9' => 19 + (c as u16 - '0' as u16),
+            'A'..='Z' => 36 + (c as u16 - 'A' as u16),
+            'a'..='z' => 68 + (c as u16 - 'a' as u16),
+            other => panic!("no code for {other:?}"),
+        })
+        .collect()
+}
+
+/// The lines the gap fixtures show: the letters J, O and P and the digit 3
+/// sit in the holes of the gapped CMap.
+const CMAP_GAP_LINES: [&str; 3] = ["JAZZ POLKA", "ZIP 30 4212", "POP QUIZ"];
+
+/// Detection calls a page with fewer than ten text-showing operators short
+/// of text, so each fixture shows its lines this many times over.
+const SHOWINGS: usize = 4;
+
+/// `lines`, each shown `SHOWINGS` times.
+fn shown_lines<'a>(lines: &[&'a [u16]]) -> Vec<&'a [u16]> {
+    std::iter::repeat_n(lines, SHOWINGS)
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// `texts`, each `SHOWINGS` times, as the items of a fixture read.
+fn shown_texts(texts: &[&str]) -> Vec<String> {
+    std::iter::repeat_n(texts, SHOWINGS)
+        .flatten()
+        .map(|text| text.to_string())
+        .collect()
+}
+
+fn cmap_gap_lines() -> Vec<Vec<u16>> {
+    CMAP_GAP_LINES
+        .iter()
+        .map(|line| standard_order_codes(line))
+        .collect()
+}
+
+/// A CMap covering the space, the digits and A..Z.
+const FULL_RANGES: [(u16, u16, u32); 3] = [(3, 3, 0x20), (19, 28, 0x30), (36, 61, 0x41)];
+
+/// The same CMap with holes at 45 (J) and 50..51 (O, P), and at 22 (3).
+const GAPPED_RANGES: [(u16, u16, u32); 6] = [
+    (3, 3, 0x20),
+    (19, 21, 0x30),
+    (23, 28, 0x34),
+    (36, 44, 0x41),
+    (46, 49, 0x4B),
+    (52, 61, 0x51),
+];
+
+#[test]
+fn test_tounicode_gaps_inside_letter_and_digit_runs_read_as_the_characters_between() {
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let shown = shown_lines(&base);
+    let gapped = make_type0_pdf_with_tounicode_ranges(&GAPPED_RANGES, &shown);
+    let full = make_type0_pdf_with_tounicode_ranges(&FULL_RANGES, &shown);
+
+    let gapped_text: Vec<String> =
+        pdf_inspector::extractor::extract_text_with_positions_mem(&gapped)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+    assert_eq!(
+        gapped_text,
+        shown_texts(&CMAP_GAP_LINES),
+        "the holes read as J, O, P and 3"
+    );
+
+    // The text reads exactly as it does through the complete CMap.
+    let gapped_result = pdf_inspector::process_pdf_mem(&gapped).unwrap();
+    let full_result = pdf_inspector::process_pdf_mem(&full).unwrap();
+    assert_eq!(gapped_result.markdown, full_result.markdown);
+    assert!(gapped_result
+        .markdown
+        .as_deref()
+        .unwrap()
+        .contains("JAZZ POLKA"));
+    assert!(!gapped_result.has_encoding_issues);
+    assert!(gapped_result.pages_needing_ocr.is_empty());
+
+    // J, O, P and 3 are shown eight times over the three lines.
+    let codes: u32 = shown.iter().map(|line| line.len() as u32).sum();
+    let in_holes = shown
+        .iter()
+        .flat_map(|line| line.iter())
+        .filter(|code| matches!(code, 22 | 45 | 50 | 51))
+        .count() as u32;
+    assert_eq!(in_holes, 8 * SHOWINGS as u32);
+    assert_eq!(
+        gapped_result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes,
+            interpolated: in_holes,
+            unmapped: 0,
+        }]
+    );
+    assert!(full_result.cmap_gaps.is_empty());
+}
+
+#[test]
+fn test_tounicode_gap_across_a_change_of_case_or_kind_reads_as_a_replacement_character() {
+    // Z at 61 and a at 68, and 9 at 28 and A at 36, lie as far apart in
+    // code point as in code, but a gap is never read across a change of
+    // case or between a digit and a letter.
+    let ranges = [(3, 3, 0x20), (19, 28, 0x30), (36, 61, 0x41), (68, 93, 0x61)];
+    let base: [&[u16]; 3] = [&[36, 62, 68], &[28, 30, 36], &[68, 69, 70]];
+    let pdf = make_type0_pdf_with_tounicode_ranges(&ranges, &shown_lines(&base));
+
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, shown_texts(&["A\u{FFFD}a", "9\u{FFFD}A", "abc"]));
+
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert!(result.markdown.as_deref().unwrap().contains('\u{FFFD}'));
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 9 * SHOWINGS as u32,
+            interpolated: 0,
+            unmapped: 2 * SHOWINGS as u32,
+        }]
+    );
+}
+
+#[test]
+fn test_tounicode_gap_at_the_edge_of_the_mapped_codes_reads_as_a_replacement_character() {
+    // A..I only: code 45 has no mapped code above it.
+    let ranges = [(3, 3, 0x20), (36, 44, 0x41)];
+    let base: [&[u16]; 3] = [&[44, 45], &[36, 37, 38], &[39, 40, 41]];
+    let pdf = make_type0_pdf_with_tounicode_ranges(&ranges, &shown_lines(&base));
+
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, shown_texts(&["I\u{FFFD}", "ABC", "DEF"]));
+
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 8 * SHOWINGS as u32,
+            interpolated: 0,
+            unmapped: SHOWINGS as u32,
+        }]
+    );
+}
+
+#[test]
+fn test_fully_mapped_tounicode_reports_no_gaps() {
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let pdf = make_type0_pdf_with_tounicode_ranges(&FULL_RANGES, &shown_lines(&base));
+
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, shown_texts(&CMAP_GAP_LINES));
+
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert!(!result.has_encoding_issues);
+    assert!(result.cmap_gaps.is_empty());
+    assert!(!result.markdown.as_deref().unwrap().contains('\u{FFFD}'));
+
+    // Detection alone reads no text, and reports no gaps.
+    let detected = pdf_inspector::process_pdf_mem_with_options(
+        &pdf,
+        pdf_inspector::PdfOptions::new().mode(pdf_inspector::ProcessMode::DetectOnly),
+    )
+    .unwrap();
+    assert!(detected.cmap_gaps.is_empty());
 }
 
 // ============================================================================

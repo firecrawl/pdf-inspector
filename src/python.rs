@@ -51,6 +51,11 @@ pub struct PyPdfResult {
     /// Whether encoding issues were detected.
     #[pyo3(get)]
     pub has_encoding_issues: bool,
+    /// Fonts whose ToUnicode CMap lacked an entry for a code the document
+    /// shows through it, with the counts of codes shown, read from their
+    /// neighbours and left as U+FFFD; empty when every such code had an entry.
+    #[pyo3(get)]
+    pub cmap_gaps: Vec<PyFontCMapGaps>,
 }
 
 #[pymethods]
@@ -81,6 +86,35 @@ impl PyPageOcrReasons {
         format!(
             "PageOcrReasons(page={}, reasons={:?})",
             self.page, self.reasons
+        )
+    }
+}
+
+/// A font whose ToUnicode CMap had no entry for some of the codes the
+/// document shows through it, and what became of those codes.
+#[pyclass(name = "FontCMapGaps")]
+#[derive(Clone)]
+pub struct PyFontCMapGaps {
+    /// The font's /BaseFont name, or its resource name when it has none.
+    #[pyo3(get)]
+    pub font: String,
+    /// Two-byte codes shown through the font's CMap, repeats included.
+    #[pyo3(get)]
+    pub codes: u32,
+    /// Codes without an entry that were read from the mapped codes around them.
+    #[pyo3(get)]
+    pub interpolated: u32,
+    /// Codes without an entry that could not be read; each is a U+FFFD in the text.
+    #[pyo3(get)]
+    pub unmapped: u32,
+}
+
+#[pymethods]
+impl PyFontCMapGaps {
+    fn __repr__(&self) -> String {
+        format!(
+            "FontCMapGaps(font={:?}, codes={}, interpolated={}, unmapped={})",
+            self.font, self.codes, self.interpolated, self.unmapped
         )
     }
 }
@@ -503,7 +537,19 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        cmap_gaps: to_py_font_cmap_gaps(r.cmap_gaps),
     }
+}
+
+fn to_py_font_cmap_gaps(gaps: Vec<crate::FontCMapGaps>) -> Vec<PyFontCMapGaps> {
+    gaps.into_iter()
+        .map(|gap| PyFontCMapGaps {
+            font: gap.font,
+            codes: gap.codes,
+            interpolated: gap.interpolated,
+            unmapped: gap.unmapped,
+        })
+        .collect()
 }
 
 fn to_py_page_ocr_reasons(reasons: Vec<crate::PageOcrReasons>) -> Vec<PyPageOcrReasons> {
@@ -1251,6 +1297,7 @@ fn extract_structure_elements_bytes(
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfResult>()?;
     m.add_class::<PyPageOcrReasons>()?;
+    m.add_class::<PyFontCMapGaps>()?;
     m.add_class::<PyOcrModelIdentity>()?;
     m.add_class::<PyOcrTimings>()?;
     m.add_class::<PyOcrPageProvenance>()?;

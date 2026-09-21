@@ -6,7 +6,8 @@
 use crate::text_utils::{decode_text_string, effective_font_size, expand_ligatures};
 use crate::tounicode::FontCMaps;
 use crate::types::{
-    BoldSource, FontWidthInfo, ItemType, PageExtraction, PdfLine, PdfRect, TextItem,
+    BoldSource, CMapCoverageByFont, FontWidthInfo, ItemType, PageExtraction, PdfLine, PdfRect,
+    TextItem,
 };
 use crate::PdfError;
 use log::trace;
@@ -408,16 +409,23 @@ pub(crate) fn extract_page_text_items(
         style_cache,
         form_budget,
     )
+    .map(
+        |(extraction, has_gid_fonts, rotation, skipped_invisible, _coverage)| {
+            (extraction, has_gid_fonts, rotation, skipped_invisible)
+        },
+    )
 }
 
-/// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible)`
-/// where `has_gid_fonts` indicates the page uses fonts with unresolvable
-/// gid-encoded glyphs, `page_rotation` says whether (and which way) the
-/// coordinate frame was turned so predominantly rotated text reads along +x
-/// — region boxes must follow it (see `PageRotation`) — and
+/// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible,
+/// cmap_coverage)` where `has_gid_fonts` indicates the page uses fonts with
+/// unresolvable gid-encoded glyphs, `page_rotation` says whether (and which
+/// way) the coordinate frame was turned so predominantly rotated text reads
+/// along +x — region boxes must follow it (see `PageRotation`) —
 /// `skipped_invisible` reports that invisible (Tr 3) text was present but
 /// suppressed — callers can use it to decide whether an `include_invisible`
-/// retry could recover anything at all.
+/// retry could recover anything at all — and `cmap_coverage` counts, per
+/// font, the two-byte codes the page showed through the font's CMap and
+/// how many of them the CMap had no entry for.
 pub(crate) fn extract_page_text_items_with_options(
     doc: &Document,
     page_id: ObjectId,
@@ -426,7 +434,7 @@ pub(crate) fn extract_page_text_items_with_options(
     options: TextExtractionOptions,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
-) -> Result<(PageExtraction, bool, PageRotation, bool), PdfError> {
+) -> Result<(PageExtraction, bool, PageRotation, bool, CMapCoverageByFont), PdfError> {
     let include_invisible = options.include_invisible;
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
@@ -575,6 +583,7 @@ pub(crate) fn extract_page_text_items_with_options(
                 false,
                 PageRotation::Upright,
                 false,
+                CMapCoverageByFont::new(),
             ));
         }
     };
@@ -600,6 +609,7 @@ pub(crate) fn extract_page_text_items_with_options(
                 false,
                 PageRotation::Upright,
                 false,
+                CMapCoverageByFont::new(),
             ));
         }
     };
@@ -2615,6 +2625,7 @@ pub(crate) fn extract_page_text_items_with_options(
         has_gid_fonts,
         page_rotation,
         skipped_invisible,
+        cmap_decisions.take_coverage(),
     ))
 }
 

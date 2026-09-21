@@ -87,6 +87,10 @@ pub struct PdfResult {
     pub pages_with_tables: Vec<u32>,
     pub pages_with_columns: Vec<u32>,
     pub has_encoding_issues: bool,
+    /// Fonts whose ToUnicode CMap lacked an entry for a code the document
+    /// shows through it, with the counts of codes shown, read from their
+    /// neighbours and left as U+FFFD; empty when every such code had an entry.
+    pub cmap_gaps: Vec<FontCmapGaps>,
 }
 
 /// OCR reasons for a single 1-indexed page.
@@ -94,6 +98,20 @@ pub struct PdfResult {
 pub struct PageOcrReasons {
     pub page: u32,
     pub reasons: Vec<String>,
+}
+
+/// A font whose ToUnicode CMap had no entry for some of the codes the
+/// document shows through it, and what became of those codes.
+#[napi(object)]
+pub struct FontCmapGaps {
+    /// The font's /BaseFont name, or its resource name when it has none.
+    pub font: String,
+    /// Two-byte codes shown through the font's CMap, repeats included.
+    pub codes: u32,
+    /// Codes without an entry that were read from the mapped codes around them.
+    pub interpolated: u32,
+    /// Codes without an entry that could not be read; each is a U+FFFD in the text.
+    pub unmapped: u32,
 }
 
 /// Lightweight PDF classification result.
@@ -398,7 +416,19 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        cmap_gaps: to_napi_font_cmap_gaps(r.cmap_gaps),
     }
+}
+
+fn to_napi_font_cmap_gaps(gaps: Vec<pdf_inspector::FontCMapGaps>) -> Vec<FontCmapGaps> {
+    gaps.into_iter()
+        .map(|gap| FontCmapGaps {
+            font: gap.font,
+            codes: gap.codes,
+            interpolated: gap.interpolated,
+            unmapped: gap.unmapped,
+        })
+        .collect()
 }
 
 fn to_napi_page_ocr_reasons(reasons: Vec<pdf_inspector::PageOcrReasons>) -> Vec<PageOcrReasons> {

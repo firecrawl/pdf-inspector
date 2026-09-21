@@ -21,7 +21,9 @@ mod xobjects;
 
 use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
-use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
+use crate::types::{
+    merge_cmap_coverage, CMapCoverageByFont, PageExtraction, PdfLine, PdfRect, TextItem,
+};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
@@ -230,7 +232,7 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages, _page_rotations) =
+    let (extraction, _thresholds, _gid_pages, _page_rotations, _cmap_coverage) =
         extract_positioned_text_from_doc_in_page_box(
             &doc,
             &font_cmaps,
@@ -339,7 +341,7 @@ pub fn extract_text_with_positions_and_rotations_mem_with_options(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let ((mut items, _rects, _lines), _thresholds, _gid_pages, page_rotations) =
+    let ((mut items, _rects, _lines), _thresholds, _gid_pages, page_rotations, _cmap_coverage) =
         extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, options)?;
     if options.frame == PositionFrame::Display {
         display_frame::document_items_to_display_frame(&doc, &mut items, &page_rotations);
@@ -406,16 +408,22 @@ pub(crate) fn extract_page_text_items_in_page_box_with_options(
     form_budget: &mut FormWalkBudget,
 ) -> Result<PageBoxExtraction, PdfError> {
     let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
-    let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, skipped_invisible) =
-        extract_page_text_items_with_options(
-            doc,
-            page_id,
-            page_num,
-            font_cmaps,
-            options,
-            style_cache,
-            form_budget,
-        )?;
+    // The region APIs read one page at a time and report no CMap coverage.
+    let (
+        (mut items, mut rects, mut lines),
+        has_gid_fonts,
+        coords_rotated,
+        skipped_invisible,
+        _cmap_coverage,
+    ) = extract_page_text_items_with_options(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        options,
+        style_cache,
+        form_budget,
+    )?;
     page_box.translate_page(&mut items, &mut rects, &mut lines, coords_rotated);
     Ok(PageBoxExtraction {
         items,
@@ -440,6 +448,18 @@ pub(crate) type PageThresholds = HashMap<u32, f32>;
 /// are upright.
 pub(crate) type PageRotations = HashMap<u32, geometry::PageRotation>;
 
+/// What a document-level extraction returns: the text, rectangles and lines
+/// of the extracted pages, their join thresholds, the pages with gid-encoded
+/// fonts, their frame rotations and, per font, the two-byte codes shown
+/// through the font's CMap and how many of them the CMap had no entry for.
+pub(crate) type DocumentExtraction = (
+    PageExtraction,
+    PageThresholds,
+    HashSet<u32>,
+    PageRotations,
+    CMapCoverageByFont,
+);
+
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
 ///
 /// Also returns per-page adaptive join thresholds for Canva-style pages.
@@ -447,7 +467,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -468,7 +488,7 @@ pub(crate) fn extract_positioned_text_from_doc_in_page_box(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     options: PositionOptions,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -498,7 +518,7 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
 }
 
@@ -507,7 +527,7 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
 }
 
@@ -516,7 +536,7 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
     let options = TextExtractionOptions {
         include_invisible,
         ..TextExtractionOptions::default()
@@ -537,6 +557,7 @@ fn extract_positioned_text_with_folio_context_impl(
         mut page_thresholds,
         mut gid_encoded_pages,
         mut page_rotations,
+        mut cmap_coverage,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -551,6 +572,7 @@ fn extract_positioned_text_with_folio_context_impl(
             page_thresholds,
             gid_encoded_pages,
             page_rotations,
+            cmap_coverage,
         ));
     }
 
@@ -565,6 +587,7 @@ fn extract_positioned_text_with_folio_context_impl(
         context_thresholds,
         context_gid_pages,
         context_rotations,
+        context_coverage,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -579,11 +602,13 @@ fn extract_positioned_text_with_folio_context_impl(
     page_thresholds.extend(context_thresholds);
     gid_encoded_pages.extend(context_gid_pages);
     page_rotations.extend(context_rotations);
+    merge_cmap_coverage(&mut cmap_coverage, context_coverage);
     Ok((
         (selected_items, selected_rects, selected_lines),
         page_thresholds,
         gid_encoded_pages,
         page_rotations,
+        cmap_coverage,
     ))
 }
 
@@ -593,7 +618,7 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     doc: &Document,
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -611,13 +636,15 @@ fn extract_positioned_text_impl(
     options: TextExtractionOptions,
     required_pages: Option<&HashSet<u32>>,
     frame: CoordinateFrame,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
+    // Per font, the codes shown through its CMap over every extracted page.
+    let mut cmap_coverage = CMapCoverageByFont::new();
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
@@ -646,20 +673,23 @@ fn extract_positioned_text_impl(
             &mut style_cache,
             &mut FormWalkBudget::new(),
         );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
-            match page_result {
-                Ok(extraction) => extraction,
-                Err(error)
-                    if required_pages.is_some_and(|required| !required.contains(page_num)) =>
-                {
-                    debug!(
-                        "page {}: skipping context-only extraction error: {}",
-                        page_num, error
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+        let (
+            (mut items, mut rects, mut lines),
+            has_gid_fonts,
+            coords_rotated,
+            _skipped_invisible,
+            page_coverage,
+        ) = match page_result {
+            Ok(extraction) => extraction,
+            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
+                debug!(
+                    "page {}: skipping context-only extraction error: {}",
+                    page_num, error
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if coords_rotated != geometry::PageRotation::Upright {
             page_rotations.insert(*page_num, coords_rotated);
         }
@@ -741,6 +771,7 @@ fn extract_positioned_text_impl(
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
+        merge_cmap_coverage(&mut cmap_coverage, page_coverage);
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -840,6 +871,7 @@ fn extract_positioned_text_impl(
         page_thresholds,
         gid_encoded_pages,
         page_rotations,
+        cmap_coverage,
     ))
 }
 
@@ -4853,7 +4885,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, page_rotations) =
+        let ((items, _, _), _, _, page_rotations, _) =
             extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
         assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
         let field = items

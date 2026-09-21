@@ -570,7 +570,8 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PdfOptions` | Builder for processing configuration (mode, detection, markdown, page filter) |
 | `ProcessMode` | `DetectOnly`, `Analyze`, `Full` |
 | `PdfType` | `TextBased`, `Scanned`, `ImageBased`, `Mixed` |
-| `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, timing |
+| `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, cmap_gaps, timing |
+| `FontCMapGaps` | A font whose ToUnicode CMap (or, without one, the embedded program's cmap table) had no entry for some of the two-byte codes the document shows through it: `font` (the `/BaseFont` name, or the resource name without one), `codes` shown, `interpolated` (read from the mapped codes around them: a CMap mapping code 36 to `A` and code 38 to `C` says code 37 is `B`, for a run of digits or of letters of one case in alphabetical glyph order) and `unmapped` (could not be read; each is a U+FFFD in the text). `PdfProcessResult::cmap_gaps` lists such fonts and is empty when every code shown through a CMap had an entry |
 | `PdfTypeResult` | Low-level detection result: type, confidence, page count, pages needing OCR |
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
