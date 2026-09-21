@@ -88,6 +88,7 @@ Changes since 1.22.1.
   i or j under the accent composes as the dotted letter). A circumflex or
   grave standing beside its neighbours rather than over them, as in code or
   mathematics, is left as shown.
+  ([#563](https://github.com/firecrawl/pdf-inspector/pull/563))
 
 ## [1.22.1] - 2026-09-20
 
