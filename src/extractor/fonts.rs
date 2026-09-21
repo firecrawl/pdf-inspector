@@ -2432,34 +2432,53 @@ pub(crate) fn extract_text_from_operand(
                     // CMap that has an entry for it — the ToUnicode CMap,
                     // then the sequential remap when the font's strings are
                     // read through it, then the embedded program's cmap —
-                    // in the order the two-byte reading prefers them.
+                    // in the order the two-byte reading prefers them. A byte
+                    // whose ToUnicode entry is a control destination is a
+                    // miss there like an unmapped byte, and is marked U+FFFD
+                    // when no CMap reads it, where an unmapped byte reads as
+                    // nothing.
                     let key = font_tounicode_refs.get(current_font).copied().unwrap_or(0);
                     let remapped = entry
                         .remapped
                         .as_ref()
                         .filter(|_| cmap_decisions.get_choice(key) == Some(CMapChoice::Remapped));
-                    let labels: Vec<Option<String>> = bytes
+                    let usable = |mapping: CodeMapping| match mapping {
+                        CodeMapping::Text(s) if !s.is_empty() && !s.contains('\u{FFFD}') => Some(s),
+                        _ => None,
+                    };
+                    // Each byte's reading, and whether it counts as unmapped.
+                    let labels: Vec<(Option<String>, bool)> = bytes
                         .iter()
                         .map(|&b| {
-                            [Some(&entry.primary), remapped, entry.fallback.as_ref()]
+                            let code = u16::from(b);
+                            let read = [Some(&entry.primary), remapped, entry.fallback.as_ref()]
                                 .into_iter()
                                 .flatten()
-                                .find_map(|cmap| {
-                                    cmap.lookup(b as u16)
-                                        .filter(|s| !s.is_empty() && !s.contains('\u{FFFD}'))
-                                })
+                                .find_map(|cmap| usable(cmap.lookup_code(code)));
+                            match read {
+                                Some(label) => (Some(label), false),
+                                None => {
+                                    let control = matches!(
+                                        entry.primary.lookup_code(code),
+                                        CodeMapping::ControlDestination
+                                    );
+                                    (control.then(|| "\u{FFFD}".to_string()), true)
+                                }
+                            }
                         })
                         .collect();
                     let mut decoded = String::new();
-                    for label in labels.iter().flatten() {
+                    for label in labels.iter().filter_map(|(label, _)| label.as_ref()) {
                         crate::bidi::push_glyph_characters(&mut decoded, label);
                     }
                     if !decoded.is_empty() {
                         // Read this way, each byte is a code, and a byte no
-                        // CMap has an entry for reads as nothing; no gap is
-                        // read into it, so nothing is interpolated.
+                        // CMap reads — none has an entry for it, or its
+                        // ToUnicode entry is a control destination — counts
+                        // as unmapped; no gap is read into it, so nothing is
+                        // interpolated.
                         if is_type0_cid_font {
-                            let unmapped = labels.iter().filter(|label| label.is_none()).count();
+                            let unmapped = labels.iter().filter(|(_, unmapped)| *unmapped).count();
                             cmap_decisions.record_coverage(
                                 font_label,
                                 CidDecodeStats {
@@ -5108,6 +5127,123 @@ mod tests {
         )
         .expect("text decoded");
         text
+    }
+
+    /// An odd-length string through a Type0 font is read byte by byte
+    /// through the first CMap that reads the byte: the primary, the remap
+    /// once the font's strings are read through it, the font's own reading.
+    /// A byte whose primary entry is a control destination is a miss there
+    /// like an unmapped byte, and is marked only when none of them reads
+    /// it; the coverage counts such a byte as unmapped.
+    #[test]
+    fn an_odd_length_string_reads_a_control_destination_through_the_other_cmaps() {
+        use crate::tounicode::{CMapEntry, ToUnicodeCMap};
+        let two_byte = |entries: &[(u16, &str)]| {
+            let mut cmap = ToUnicodeCMap::new();
+            cmap.code_byte_length = 2;
+            for &(code, text) in entries {
+                cmap.char_map.insert(code, text.to_string());
+            }
+            cmap.refresh_gap_fills();
+            cmap
+        };
+        let primary = two_byte(&[(1, "c"), (2, "o"), (3, "\u{3}"), (4, "e")]);
+        // The text, with the unmapped count the reading recorded for the
+        // font. With `remap_chosen` the font's strings have been found to
+        // read through the remap, as the two-byte path decides from a sample.
+        let decode = |entry: CMapEntry, remap_chosen: bool| -> (String, u32) {
+            let mut decisions = CMapDecisionCache::new();
+            if remap_chosen {
+                let sample = "the and of to in a is that for with on as by from ".repeat(6);
+                decisions.consider(0, "", &sample, 240);
+                assert_eq!(decisions.get_choice(0), Some(CMapChoice::Remapped));
+            }
+            let mut inline_cmaps = HashMap::new();
+            inline_cmaps.insert("F1".to_string(), entry);
+            let mut font_widths: PageFontWidths = HashMap::new();
+            font_widths.insert("F1".to_string(), make_font_info(&[], 1000, true));
+            let (text, _) = extract_text_from_operand(
+                &Object::String(vec![1, 2, 3, 4, 4], lopdf::StringFormat::Hexadecimal),
+                "F1",
+                Some("ABCDEF+Subset"),
+                &FontCMaps::default(),
+                &HashMap::new(),
+                &inline_cmaps,
+                &HashMap::new(),
+                &HashMap::new(),
+                &mut decisions,
+                &font_widths,
+            )
+            .expect("text decoded");
+            let unmapped: u32 = decisions
+                .take_run_coverage()
+                .iter()
+                .map(|(_, stats)| stats.unmapped)
+                .sum();
+            (text, unmapped)
+        };
+        let remap = || Some(two_byte(&[(3, "ff")]));
+        // The remap reads the byte once the font's strings are read through
+        // it ...
+        assert_eq!(
+            decode(
+                CMapEntry {
+                    primary: primary.clone(),
+                    remapped: remap(),
+                    fallback: None,
+                },
+                true
+            ),
+            ("coffee".to_string(), 0)
+        );
+        // ... and not before.
+        assert_eq!(
+            decode(
+                CMapEntry {
+                    primary: primary.clone(),
+                    remapped: remap(),
+                    fallback: None,
+                },
+                false
+            ),
+            ("co\u{FFFD}ee".to_string(), 1)
+        );
+        // The font's own reading does, whatever was decided.
+        assert_eq!(
+            decode(
+                CMapEntry {
+                    primary: primary.clone(),
+                    remapped: None,
+                    fallback: remap(),
+                },
+                false
+            ),
+            ("coffee".to_string(), 0)
+        );
+        // Nothing does: the marker, and the other bytes as the primary reads
+        // them.
+        assert_eq!(
+            decode(
+                CMapEntry {
+                    primary: primary.clone(),
+                    remapped: Some(two_byte(&[(9, "x")])),
+                    fallback: None,
+                },
+                true
+            ),
+            ("co\u{FFFD}ee".to_string(), 1)
+        );
+        assert_eq!(
+            decode(
+                CMapEntry {
+                    primary,
+                    remapped: None,
+                    fallback: None,
+                },
+                false
+            ),
+            ("co\u{FFFD}ee".to_string(), 1)
+        );
     }
 
     /// A sparse ToUnicode CMap — fewer than ten entries — yields the primary

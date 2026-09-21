@@ -1016,18 +1016,15 @@ impl ToUnicodeCMap {
 
     /// Per-byte CMap lookup without Latin-1 fallback.
     /// Returns `(raw_byte, Option<cmap_result>)` for each byte; a code whose
-    /// entry is a control destination reads as U+FFFD.
+    /// entry is a control destination is a miss, like an unmapped one, for
+    /// the caller to read through its other CMaps before marking it.
     /// Only meaningful for single-byte (code_byte_length==1) CMaps.
     pub fn lookup_bytes(&self, bytes: &[u8]) -> Vec<(u8, Option<String>)> {
         bytes
             .iter()
             .map(|&b| {
                 let code = b as u16;
-                let result = match self.lookup_code(code) {
-                    CodeMapping::Text(s) if !s.contains('\u{FFFD}') => Some(s),
-                    CodeMapping::ControlDestination => Some("\u{FFFD}".to_string()),
-                    _ => None,
-                };
+                let result = self.lookup(code).filter(|s| !s.contains('\u{FFFD}'));
                 (b, result)
             })
             .collect()
@@ -3878,9 +3875,11 @@ endbfchar
             cmap.decode_cids(&[0x21, 0x22, 0x23, 0x24, 0x24]),
             "co\u{FFFD}ee"
         );
+        // Byte by byte, the code is a miss like an unmapped one: the caller
+        // reads it through its other CMaps before marking it.
         assert_eq!(
             cmap.lookup_bytes(&[0x23, 0x25]),
-            [(0x23, Some("\u{FFFD}".to_string())), (0x25, None)]
+            [(0x23, None), (0x25, None)]
         );
     }
 
