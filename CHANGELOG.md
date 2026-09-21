@@ -119,9 +119,10 @@ Changes since 1.22.1.
   a grid over the page, so a scan tiled into strips counts — cover at
   least half of it (each draw clipped to the page and to the rectangular
   clipping path in force, a clip of any other shape by its box; an inline
-  image counts as an image; images bound but never drawn, and forms never
-  invoked, do not count; a page whose forms outrun the scan's budget is
-  not flagged), for OCR with the new reason
+  image counts as an image, and so does a path filled or stroked with a
+  tiling pattern whose cell draws one; images bound but never drawn, and
+  forms never invoked, do not count; a page whose forms outrun the scan's
+  budget is not flagged), for OCR with the new reason
   `invisible_text_layer`
   (`OCR_REASON_INVISIBLE_TEXT_LAYER`) — in `pdf_type`, `pages_needing_ocr`,
   `ocr_reasons_by_page` and per-page `needs_ocr`/`ocr_reason` alike, for
@@ -130,10 +131,12 @@ Changes since 1.22.1.
   image, a shading, a painted path or visible text is later drawn through
   — a title filled with a picture — is visible and not counted; a form
   that paints nothing shows nothing through it. Operators are read past
-  strings, comments and inline image data, so text saying `3 Tr` sets no
-  render mode, and text shown with the `'` and `"` operators counts as
-  text, here and in the text-operator tallies, which had always missed
-  it. A page whose layer is painted, a page with a visible
+  strings, comments and inline image data, and whether or not whitespace
+  follows them, so text saying `3 Tr` sets no render mode and `(a)Tj(b)Tj`
+  shows twice; text shown with the `'` and `"` operators counts as text,
+  here and in the text-operator tallies, which had always missed it,
+  while a show operator with nothing to show does not count in either.
+  A page whose layer is painted, a page with a visible
   caption over its image, invisible text with no image under it and an
   image with no text keep their classification and reasons; what is
   extracted is unchanged.

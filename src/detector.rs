@@ -9,6 +9,7 @@ use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+mod content_mask;
 mod content_scan;
 use content_scan::ContentCounts;
 
@@ -2457,7 +2458,8 @@ mod tests {
     fn test_scan_content_malformed_tj_lookback_stays_linear() {
         // `] TJ` with no `[` used to walk the entire prefix for every operator
         // (quadratic). 30k repeats is enough that a prefix rescan would dominate
-        // the test runtime; with the floor it is a single linear pass.
+        // the test runtime; with the floor it is a single linear pass. Such an
+        // operator has no string to show, so none of them is counted.
         let n = 30_000usize;
         let mut content = Vec::with_capacity(n * 5);
         for _ in 0..n {
@@ -2466,7 +2468,7 @@ mod tests {
         let mut uchars = HashSet::new();
         let (ops, _, _, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
-        assert_eq!(ops, n as u32);
+        assert_eq!(ops, 0);
         assert!(uchars.is_empty());
     }
 

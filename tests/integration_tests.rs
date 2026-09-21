@@ -2567,6 +2567,13 @@ struct GlyphLayerPage {
     /// Draw the covering image as an inline image (`BI … ID … EI`)
     /// instead of an image XObject.
     inline_image: bool,
+    /// Fill the whole page with a tiling pattern `P1` — one whose cell
+    /// draws the image when `pattern_draws_image`, else one drawing only
+    /// paths — before the layer.
+    pattern_fill: bool,
+    pattern_draws_image: bool,
+    /// Fill the whole page with a plain colour before the layer.
+    plain_fill: bool,
     /// Show the layer with the `'` and `"` operators instead of `Tj`.
     quote_operators: bool,
     /// Wrap the body text in marked content whose property list has an
@@ -2638,6 +2645,30 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
                 if page.large_image { "ImBig" } else { "Im0" }
             )
         };
+        let mut pattern_entry = String::new();
+        if page.pattern_fill {
+            let cell = if page.pattern_draws_image {
+                "q 612 0 0 792 0 0 cm /Im0 Do Q"
+            } else {
+                "0 0 10 10 re f"
+            };
+            let pattern = add(
+                &mut objects,
+                stream(
+                    &format!(
+                        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                         /BBox [0 0 612 792] /XStep 612 /YStep 792 \
+                         /Resources << /XObject << /Im0 {image} 0 R >> >>"
+                    ),
+                    cell.as_bytes(),
+                ),
+            );
+            pattern_entry = format!(" /Pattern << /P1 {pattern} 0 R >>");
+            content.push_str("/Pattern cs /P1 scn 0 0 612 792 re f\n");
+        }
+        if page.plain_fill {
+            content.push_str("0.5 g 0 0 612 792 re f\n");
+        }
         if page.covering_image && page.image_strips > 0 {
             let strip = 792.0 / page.image_strips as f64;
             for k in 0..page.image_strips {
@@ -2734,7 +2765,7 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
             &mut objects,
             format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-                 /Resources << /Font << /F1 {font} 0 R >>{xobject_entry} >> \
+                 /Resources << /Font << /F1 {font} 0 R >>{xobject_entry}{pattern_entry} >> \
                  /Contents {contents} 0 R >>"
             )
             .into_bytes(),
@@ -2786,6 +2817,9 @@ const SCAN_WITH_INVISIBLE_LAYER: GlyphLayerPage = GlyphLayerPage {
     vector_paths: 0,
     image_strips: 0,
     inline_image: false,
+    pattern_fill: false,
+    pattern_draws_image: false,
+    plain_fill: false,
     quote_operators: false,
     marked_content_id: false,
     caption: None,
@@ -2970,6 +3004,55 @@ fn test_resources_bound_but_unused_are_not_evidence() {
         pages.pages[0].ocr_reason.as_deref(),
         Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
     );
+}
+
+/// A page filled with a tiling pattern whose cell draws the scan image is
+/// covered by that image: a hidden layer over it is a layer nobody sees;
+/// a pattern drawing only paths, or a fill without a pattern, leaves a
+/// text page.
+#[test]
+fn test_pattern_filled_scan_is_covered() {
+    let filled = GlyphLayerPage {
+        covering_image: false,
+        pattern_fill: true,
+        pattern_draws_image: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    };
+    let buf = make_pdf_with_glyph_layer(&[filled]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    for page in [
+        GlyphLayerPage {
+            pattern_draws_image: false,
+            ..filled
+        },
+        GlyphLayerPage {
+            covering_image: false,
+            plain_fill: true,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        },
+    ] {
+        let buf = make_pdf_with_glyph_layer(&[page]);
+        let detected = detect_pdf_type_mem(&buf).unwrap();
+        assert_eq!(detected.pdf_type, PdfType::TextBased);
+        assert!(detected.pages_needing_ocr.is_empty());
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert_ne!(
+            pages.pages[0].ocr_reason.as_deref(),
+            Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+        );
+    }
 }
 
 /// A raster drawn as an inline image covers the page as an image XObject

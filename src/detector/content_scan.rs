@@ -6,10 +6,11 @@
 //! see from those that paint, and to tally the page area the images drawn
 //! cover. The classification rule itself lives in the parent module.
 
-use super::{
-    collect_text_chars_before, extract_font_name_before_tf, is_pdf_name_delimiter,
-    is_pdf_whitespace, preceding_operand_closer,
+use super::content_mask::{
+    mask_strings_comments_and_inline_images, name_operand_before, numeric_operands_before,
+    show_operand_has_text,
 };
+use super::{collect_text_chars_before, extract_font_name_before_tf, preceding_operand_closer};
 use crate::extractor::{get_number, visible_page_box, PageBox};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -208,6 +209,8 @@ struct SavedScanState {
     render_mode: u8,
     ctm: [f64; 6],
     clip: UserBox,
+    fill_paints_image: bool,
+    stroke_paints_image: bool,
     clip_text_ops: u32,
 }
 
@@ -215,9 +218,10 @@ struct SavedScanState {
 /// and restored by `Q`: the text render mode `Tr` sets; the current
 /// transformation matrix `cm` concatenates; the clip the clipping paths
 /// set with `W`/`W*` narrow — a rectangle exactly, any other shape by its
-/// bounding box; and the clip-only (mode 7) text whose clip is in force,
-/// which a painting operator shows through and the `Q` closing its level
-/// discards unseen.
+/// bounding box; whether the fill and stroke colours set with `scn`/`SCN`
+/// are tiling patterns that draw an image; and the clip-only (mode 7)
+/// text whose clip is in force, which a painting operator shows through
+/// and the `Q` closing its level discards unseen.
 ///
 /// One state runs through a page's content streams, which the PDF reads
 /// as one, and — when it follows `Do` — through the Form XObjects they
@@ -247,6 +251,18 @@ struct ContentScanState<'a> {
     /// Whether `W`/`W*` asked for the path under construction to become
     /// the clip once the operator ending the path has run.
     clip_pending: bool,
+    /// Whether the fill colour, and the stroke colour, in force is a tiling
+    /// pattern whose cell draws an image, so that a path painted with it
+    /// is covered by an image.
+    fill_paints_image: bool,
+    stroke_paints_image: bool,
+    /// Whether patterns named by `scn`/`SCN` are looked into — not within
+    /// a pattern's own cell.
+    follow_patterns: bool,
+    /// Whether a pattern draws an image, per pattern looked into.
+    pattern_verdicts: HashMap<ObjectId, bool>,
+    /// Whether an image was drawn at all, wherever it fell.
+    drew_image: bool,
     /// Mode-7 text-showing operators whose clip was set at the current
     /// level and has not been painted through; those set at outer levels
     /// sit in `saved`.
@@ -303,6 +319,11 @@ impl<'a> ContentScanState<'a> {
             ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             path_box: None,
             clip_pending: false,
+            fill_paints_image: false,
+            stroke_paints_image: false,
+            follow_patterns: true,
+            pattern_verdicts: HashMap::new(),
+            drew_image: false,
             clip_text_ops: 0,
             pending_clip_text_ops: 0,
             clip_text_ops_open: 0,
@@ -327,6 +348,8 @@ impl<'a> ContentScanState<'a> {
                 render_mode: self.render_mode,
                 ctm: self.ctm,
                 clip: self.clip,
+                fill_paints_image: self.fill_paints_image,
+                stroke_paints_image: self.stroke_paints_image,
                 clip_text_ops: self.clip_text_ops,
             });
             self.clip_text_ops = 0;
@@ -347,6 +370,8 @@ impl<'a> ContentScanState<'a> {
                 self.render_mode = saved.render_mode;
                 self.ctm = saved.ctm;
                 self.clip = saved.clip;
+                self.fill_paints_image = saved.fill_paints_image;
+                self.stroke_paints_image = saved.stroke_paints_image;
                 self.clip_text_ops = saved.clip_text_ops;
             }
         }
@@ -459,11 +484,74 @@ impl<'a> ContentScanState<'a> {
         self.path_box = None;
     }
 
+    /// A path was filled, or stroked, with a tiling pattern whose cell
+    /// draws an image: the path's box within the clip in force is covered
+    /// by an image, as near as the box comes to the path.
+    fn path_painted_with_image(&mut self) {
+        let Some(painted) = self.path_box.and_then(|path| path.intersect(&self.clip)) else {
+            return;
+        };
+        self.drew_image = true;
+        self.own_image_area += painted.area();
+        self.mark_cells(&painted);
+    }
+
+    /// Whether the pattern `name` names in the first of `resources`
+    /// binding it is a tiling pattern (`/PatternType 1`) whose cell draws
+    /// an image — an image XObject invoked, or an inline image — read once
+    /// per pattern through the masked operator scan, with the cell's own
+    /// resources and then its invoker's; a shading pattern, or a cell that
+    /// draws no image, paints no coverage. Patterns are not looked into
+    /// from within a pattern's cell, and the reading counts against the
+    /// invocation budget, past which the evidence is incomplete.
+    fn pattern_paints_image(&mut self, name: &[u8], resources: &[&'a lopdf::Dictionary]) -> bool {
+        if !self.follow_patterns {
+            return false;
+        }
+        let Some((id, pattern)) = resolve_pattern(self.doc, resources, name) else {
+            return false;
+        };
+        if let Some(&verdict) = self.pattern_verdicts.get(&id) {
+            return verdict;
+        }
+        if self.form_invocations >= FORM_INVOCATIONS_MAX {
+            self.incomplete = true;
+            return false;
+        }
+        self.form_invocations += 1;
+        let verdict = match pattern {
+            Object::Stream(cell) if pattern_type(self.doc, &cell.dict) == Some(1) => {
+                let content = cell
+                    .decompressed_content()
+                    .unwrap_or_else(|_| cell.content.clone());
+                let mut cell_resources = Vec::with_capacity(resources.len() + 1);
+                cell_resources.extend(stream_resources(self.doc, cell));
+                cell_resources.extend_from_slice(resources);
+                let mut cell_state = ContentScanState::new(self.doc, PageBox::LETTER, true);
+                cell_state.follow_patterns = false;
+                scan_content_stream(
+                    &content,
+                    &mut HashSet::new(),
+                    &mut HashSet::new(),
+                    &mut cell_state,
+                    &cell_resources,
+                );
+                self.form_invocations += cell_state.form_invocations;
+                self.incomplete |= cell_state.incomplete;
+                cell_state.drew_image
+            }
+            _ => false,
+        };
+        self.pattern_verdicts.insert(id, verdict);
+        verdict
+    }
+
     /// `Do` of an image, or `BI` of an inline image: it paints the unit
     /// square under the matrix in force, of which the part within the clip
     /// in force counts.
     fn image_drawn(&mut self) {
         self.painted();
+        self.drew_image = true;
         let Some(drawn) = self.transformed_box([0.0, 0.0, 1.0, 1.0]) else {
             return;
         };
@@ -672,6 +760,39 @@ fn stream_resources<'a>(
     }
 }
 
+/// The pattern `name` names, in the first of `resources` binding it: a
+/// stream for a tiling pattern, a dictionary for a shading pattern.
+fn resolve_pattern<'a>(
+    doc: &'a Document,
+    resources: &[&'a lopdf::Dictionary],
+    name: &[u8],
+) -> Option<(ObjectId, &'a Object)> {
+    for scope in resources {
+        let patterns = match scope.get(b"Pattern").ok() {
+            Some(Object::Dictionary(dict)) => dict,
+            Some(Object::Reference(id)) => match doc.get_dictionary(*id) {
+                Ok(dict) => dict,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        let Ok(entry) = patterns.get(name) else {
+            continue;
+        };
+        let id = entry.as_reference().ok()?;
+        return doc.get_object(id).ok().map(|pattern| (id, pattern));
+    }
+    None
+}
+
+/// A pattern's `/PatternType`: 1 for tiling, 2 for shading.
+fn pattern_type(doc: &Document, dict: &lopdf::Dictionary) -> Option<i64> {
+    match dict.get(b"PatternType").ok()? {
+        Object::Reference(id) => doc.get_object(*id).ok()?.as_i64().ok(),
+        other => other.as_i64().ok(),
+    }
+}
+
 /// The first `N` numbers of `dict`'s `key` — a form's `/Matrix` or
 /// `/BBox` — the array and its numbers direct or by reference. An array
 /// with more entries is read by its first `N`, as a page box with
@@ -703,157 +824,6 @@ fn numbers_of<const N: usize>(
     Some(numbers)
 }
 
-/// `content` with everything that is not an operator or its operands
-/// blanked to spaces, at the same offsets: the insides of literal strings
-/// (nesting and escapes honoured), of hex strings and of comments, and
-/// inline image data, from the `ID` of an inline image `BI` opened through
-/// its `EI`. The delimiters stay, so a string still closes an operand; the
-/// strings' bytes are read from the original when a text operator is
-/// found.
-fn mask_strings_comments_and_inline_images(content: &[u8]) -> Vec<u8> {
-    /// Whether an operator token may begin at `i`: at the start, or after
-    /// whitespace or a closing delimiter.
-    fn after_token_break(content: &[u8], i: usize) -> bool {
-        i == 0 || is_pdf_whitespace(content[i - 1]) || matches!(content[i - 1], b')' | b']' | b'>')
-    }
-    let mut masked = content.to_vec();
-    // `ID` begins image data only inside an inline image, which `BI` opens
-    // (its header follows, from this offset); anywhere else — a bare
-    // token, or the name `/ID` — it is left alone.
-    let mut inline_image_header: Option<usize> = None;
-    let mut i = 0;
-    while i < content.len() {
-        match content[i] {
-            b'(' => {
-                let mut depth = 1u32;
-                i += 1;
-                while i < content.len() {
-                    match content[i] {
-                        b'\\' => {
-                            masked[i] = b' ';
-                            if i + 1 < content.len() {
-                                masked[i + 1] = b' ';
-                            }
-                            i += 2;
-                            continue;
-                        }
-                        b'(' => depth += 1,
-                        b')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    masked[i] = b' ';
-                    i += 1;
-                }
-            }
-            b'<' if content.get(i + 1) == Some(&b'<') => i += 1,
-            b'<' => {
-                i += 1;
-                while i < content.len() && content[i] != b'>' {
-                    masked[i] = b' ';
-                    i += 1;
-                }
-            }
-            b'%' => {
-                while i < content.len() && !matches!(content[i], b'\n' | b'\r') {
-                    masked[i] = b' ';
-                    i += 1;
-                }
-                continue;
-            }
-            b'B' if content.get(i + 1) == Some(&b'I')
-                && after_token_break(content, i)
-                && content.get(i + 2).is_none_or(|&b| is_pdf_whitespace(b)) =>
-            {
-                inline_image_header = Some(i + 2);
-                i += 1;
-            }
-            b'I' if inline_image_header.is_some()
-                && content.get(i + 1) == Some(&b'D')
-                && after_token_break(content, i)
-                && content.get(i + 2).is_none_or(|&b| is_pdf_whitespace(b)) =>
-            {
-                let header = &content[inline_image_header.take().unwrap_or(i)..i];
-                let data = (i + 3).min(content.len());
-                let end = inline_image_end(content, data).unwrap_or_else(|| {
-                    data + inline_image_data_bound(header).min(content.len() - data)
-                });
-                masked[i..end].fill(b' ');
-                i = end;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    masked
-}
-
-/// Just past the `EI` that ends inline image data starting at `from`: the
-/// first `EI` set off by whitespace on both sides, or failing that the
-/// first `EI` followed by whitespace or the end of the stream, which data
-/// written flush against its `EI` leaves. `None` when there is neither.
-fn inline_image_end(content: &[u8], from: usize) -> Option<usize> {
-    let mut flush = None;
-    let mut i = from;
-    while i + 1 < content.len() {
-        if content[i] == b'E'
-            && content[i + 1] == b'I'
-            && content.get(i + 2).is_none_or(|&b| is_pdf_whitespace(b))
-        {
-            if i > 0 && is_pdf_whitespace(content[i - 1]) {
-                return Some(i + 2);
-            }
-            flush.get_or_insert(i + 2);
-        }
-        i += 1;
-    }
-    flush
-}
-
-/// How many bytes of inline image data to take when no `EI` ends it: the
-/// data's own length when the header names no filter — width × height ×
-/// components × bits per component, packed by row — or else a fixed
-/// bound, so that a stream is never blanked to its end.
-fn inline_image_data_bound(header: &[u8]) -> usize {
-    const UNKNOWN_LENGTH_BOUND: usize = 4096;
-    let header = String::from_utf8_lossy(header);
-    let tokens: Vec<&str> = header.split_ascii_whitespace().collect();
-    let value_after = |keys: &[&str]| {
-        tokens
-            .iter()
-            .position(|token| keys.contains(token))
-            .and_then(|at| tokens.get(at + 1).copied())
-    };
-    let number_after = |keys: &[&str]| value_after(keys).and_then(|v| v.parse::<usize>().ok());
-    if value_after(&["/F", "/Filter"]).is_some() {
-        return UNKNOWN_LENGTH_BOUND;
-    }
-    let (Some(width), Some(height)) = (
-        number_after(&["/W", "/Width"]),
-        number_after(&["/H", "/Height"]),
-    ) else {
-        return UNKNOWN_LENGTH_BOUND;
-    };
-    let image_mask = matches!(value_after(&["/IM", "/ImageMask"]), Some("true"));
-    let bits = if image_mask {
-        1
-    } else {
-        number_after(&["/BPC", "/BitsPerComponent"]).unwrap_or(8)
-    };
-    let components = match value_after(&["/CS", "/ColorSpace"]) {
-        Some("/RGB" | "/DeviceRGB" | "/CalRGB") => 3,
-        Some("/CMYK" | "/DeviceCMYK") => 4,
-        _ => 1,
-    };
-    let row_bytes = (width.saturating_mul(components).saturating_mul(bits)).div_ceil(8);
-    row_bytes.saturating_mul(height)
-}
-
 /// Fast scan of content stream bytes for text operators
 ///
 /// This is a fast heuristic scan that looks for:
@@ -865,10 +835,15 @@ fn inline_image_data_bound(header: &[u8]) -> usize {
 ///
 /// Operators are found in a copy of the stream with its strings, comments
 /// and inline image data blanked, so none of those can pass for one; the
-/// text itself is read from the original. The scan follows the graphics
-/// state in `state`: `Tr` sets the text render mode, which decides whether
-/// a text-showing operator left anything to see; `cm` concatenates the
-/// matrix an image is drawn under; `q` and `Q` save and restore both. A
+/// text itself is read from the original. An operator ends at whitespace,
+/// at the end of the stream or at an opening delimiter, so `(a)Tj(b)Tj`
+/// counts two shows; a show operator whose operand holds no string byte
+/// shows nothing and is not counted. The scan follows the graphics state
+/// in `state`: `Tr` sets the text render mode, which decides whether a
+/// text-showing operator left anything to see; `cm` concatenates the
+/// matrix an image is drawn under; `W`/`W*` clip; the colour operators
+/// say whether a path painted next is filled, or stroked, with a tiling
+/// pattern that draws an image; `q` and `Q` save and restore all of it. A
 /// `Do` — when the state follows them — draws the image, or runs the
 /// form, that the first of `resources` binding its name holds. Unique
 /// non-whitespace text characters are collected into `unique_chars`.
@@ -885,12 +860,9 @@ fn scan_content_stream<'a>(
 
     // Helper: check if position is a word boundary (start of content or preceded by whitespace)
     let is_word_start = |pos: usize| -> bool { pos == 0 || ops[pos - 1].is_ascii_whitespace() };
-    // Helper: check if position is at end or followed by whitespace
-    let is_word_end =
-        |pos: usize| -> bool { pos + 1 >= ops.len() || ops[pos + 1].is_ascii_whitespace() };
-    // Helpers for the graphics-state operators, which may sit against a
-    // delimiter (`Q/Im0 Do`, `3 Tr(x)`): a token starts after whitespace
-    // or a closing delimiter, and ends before whitespace or an opening one.
+    // A token starts after whitespace or a closing delimiter (`(a)Tj`,
+    // `[<41>]TJ`, `Q/Im0 Do`) and ends before whitespace, the end of the
+    // stream or an opening delimiter (`Tf[`, `Tj(`, `cm/Im0`).
     let is_token_start = |pos: usize| -> bool {
         pos == 0 || ops[pos - 1].is_ascii_whitespace() || matches!(ops[pos - 1], b')' | b']' | b'>')
     };
@@ -899,11 +871,15 @@ fn scan_content_stream<'a>(
             || ops[pos + 1].is_ascii_whitespace()
             || matches!(ops[pos + 1], b'/' | b'[' | b'(' | b'<' | b'%')
     };
+    // Whether the operator `token` sits at `pos`, on token boundaries.
+    let token_at = |pos: usize, token: &[u8]| -> bool {
+        ops[pos..].starts_with(token) && is_token_start(pos) && is_token_end(pos + token.len() - 1)
+    };
 
     // Simple state machine to find operators.
-    // Each Tj/TJ/Tf lookback stops at the previous text/font operator so a
-    // malformed `] TJ` (no `[`) cannot rescan the entire prefix — that was
-    // quadratic in the number of operators.
+    // Each lookback stops at the previous operator so a malformed `] TJ`
+    // (no `[`) cannot rescan the entire prefix — that was quadratic in the
+    // number of operators.
     // `Tj`/`TJ` are only counted when the preceding token closes a string or
     // array (')', '>', ']').
     let mut operand_floor = 0usize;
@@ -914,38 +890,24 @@ fn scan_content_stream<'a>(
         // Look for 'T' followed by 'j', 'J', 'f' or 'r'
         if b == b'T' && i + 1 < ops.len() {
             let next = ops[i + 1];
-            if next == b'j' || next == b'J' {
-                // Verify it's an operator (followed by whitespace or newline)
-                if (i + 2 >= ops.len()
-                    || ops[i + 2].is_ascii_whitespace()
-                    || ops[i + 2] == b'\n'
-                    || ops[i + 2] == b'\r')
-                    && preceding_operand_closer(ops, i, operand_floor)
-                {
+            if (next == b'j' || next == b'J')
+                && is_token_end(i + 1)
+                && preceding_operand_closer(ops, i, operand_floor)
+            {
+                if show_operand_has_text(ops, content, i, operand_floor) {
                     counts.text_ops += 1;
                     state.text_shown();
                     collect_text_chars_before(content, i, unique_chars, operand_floor);
-                    operand_floor = i;
                 }
-            } else if next == b'f' {
-                // Tf = set font operator
-                // Some PDFs concatenate Tf with the next operator without
-                // whitespace (e.g. "25 Tf[<01>..." or "25 Tf(<text>..."),
-                // so also accept '[', '(', '<', '/' as valid followers.
-                if i + 2 >= ops.len()
-                    || ops[i + 2].is_ascii_whitespace()
-                    || ops[i + 2] == b'\n'
-                    || ops[i + 2] == b'\r'
-                    || ops[i + 2] == b'['
-                    || ops[i + 2] == b'('
-                    || ops[i + 2] == b'<'
-                    || ops[i + 2] == b'/'
-                {
-                    if let Some(name) = extract_font_name_before_tf(ops, i, operand_floor) {
-                        used_font_names.insert(name);
-                        counts.font_changes += 1;
-                        operand_floor = i;
-                    }
+                operand_floor = i;
+            } else if next == b'f' && is_token_end(i + 1) {
+                // Tf = set font operator. Some PDFs concatenate Tf with the
+                // next operator without whitespace (e.g. "25 Tf[<01>..." or
+                // "25 Tf(<text>...").
+                if let Some(name) = extract_font_name_before_tf(ops, i, operand_floor) {
+                    used_font_names.insert(name);
+                    counts.font_changes += 1;
+                    operand_floor = i;
                 }
             } else if next == b'r' && is_token_start(i) && is_token_end(i + 1) {
                 // Tr = set text render mode. A mode outside 0..=7 is
@@ -965,25 +927,19 @@ fn scan_content_stream<'a>(
             // ' and " = move to the next line and show text (" sets the
             // word and character spacing first). An apostrophe inside a
             // string was blanked, so it cannot get here.
-            counts.text_ops += 1;
-            state.text_shown();
-            collect_text_chars_before(content, i, unique_chars, operand_floor);
+            if show_operand_has_text(ops, content, i, operand_floor) {
+                counts.text_ops += 1;
+                state.text_shown();
+                collect_text_chars_before(content, i, unique_chars, operand_floor);
+            }
             operand_floor = i;
-        } else if b == b'c'
-            && ops.get(i + 1) == Some(&b'm')
-            && is_token_start(i)
-            && is_token_end(i + 1)
-        {
+        } else if token_at(i, b"cm") {
             // cm = concatenate matrix.
             if let Some(matrix) = numeric_operands_before::<6>(ops, i, operand_floor) {
                 state.concat(matrix);
                 operand_floor = i;
             }
-        } else if b == b'D'
-            && ops.get(i + 1) == Some(&b'o')
-            && is_token_start(i)
-            && is_token_end(i + 1)
-        {
+        } else if token_at(i, b"Do") {
             // Do = paint an XObject: an image is measured, a form run in
             // place. Whether a page has images at all is read from its
             // resources (scan_xobjects_in_resources, analyze_page_images).
@@ -997,31 +953,39 @@ fn scan_content_stream<'a>(
                     }
                 }
             }
-        } else if b == b's'
-            && ops.get(i + 1) == Some(&b'h')
-            && is_token_start(i)
-            && is_token_end(i + 1)
-        {
+        } else if token_at(i, b"sh") {
             // sh = paint a shading.
             state.painted();
-        } else if b == b'B'
-            && ops.get(i + 1) == Some(&b'I')
-            && is_token_start(i)
-            && is_token_end(i + 1)
-        {
+        } else if token_at(i, b"BI") {
             // BI = begin an inline image, which paints the unit square
             // under the matrix in force as an image XObject does.
             state.image_drawn();
-        } else if b == b'E'
-            && ops.get(i + 1) == Some(&b'T')
-            && is_token_start(i)
-            && is_token_end(i + 1)
-        {
+        } else if token_at(i, b"ET") {
             // ET = end a text object: its clip-only text's clip takes effect.
             state.text_object_ended();
-        } else if b == b'q' && is_token_start(i) && is_token_end(i) {
+        } else if token_at(i, b"scn") || token_at(i, b"sc") {
+            // scn/sc = set the fill colour. A name names a pattern, which
+            // draws an image or does not; numbers name none.
+            let paints_image = name_operand_before(ops, i, operand_floor)
+                .is_some_and(|name| state.pattern_paints_image(&name, resources));
+            state.fill_paints_image = paints_image;
+            operand_floor = i;
+        } else if token_at(i, b"SCN") || token_at(i, b"SC") {
+            // SCN/SC = set the stroke colour, likewise.
+            let paints_image = name_operand_before(ops, i, operand_floor)
+                .is_some_and(|name| state.pattern_paints_image(&name, resources));
+            state.stroke_paints_image = paints_image;
+            operand_floor = i;
+        } else if token_at(i, b"cs") || token_at(i, b"g") || token_at(i, b"rg") || token_at(i, b"k")
+        {
+            // A fill colour space or a plain fill colour: no pattern fills.
+            state.fill_paints_image = false;
+        } else if token_at(i, b"CS") || token_at(i, b"G") || token_at(i, b"RG") || token_at(i, b"K")
+        {
+            state.stroke_paints_image = false;
+        } else if token_at(i, b"q") {
             state.save();
-        } else if b == b'Q' && is_token_start(i) && is_token_end(i) {
+        } else if token_at(i, b"Q") {
             state.restore();
         }
 
@@ -1031,20 +995,23 @@ fn scan_content_stream<'a>(
         //              F (fill, variant)
         // These are the high-volume operators in vector-outlined text.
         // A painting operator also shows any clip-only text through its
-        // glyphs; b, B* and b* paint too but are not counted as path
-        // operators. The path's points are followed for the clip a `W` or
-        // `W*` before the operator ending the path asks for; v and y add
-        // points without being counted either.
+        // glyphs, and paints an image over the path's box when the colour
+        // it paints with is a tiling pattern that draws one; b, B* and b*
+        // paint too but are not counted as path operators. The path's
+        // points are followed for its box; v and y add points without
+        // being counted either.
         let mut painted = false;
         let mut path_ended = false;
+        let mut fills = false;
+        let mut strokes = false;
         match b {
-            b'm' | b'l' if is_word_start(i) && is_word_end(i) => {
+            b'm' | b'l' if is_word_start(i) && is_token_end(i) => {
                 counts.path_ops += 1;
                 if let Some([x, y]) = numeric_operands_before::<2>(ops, i, operand_floor) {
                     state.path_point(x, y);
                 }
             }
-            b'c' if is_word_start(i) && is_word_end(i) => {
+            b'c' if is_word_start(i) && is_token_end(i) => {
                 counts.path_ops += 1;
                 if let Some([x1, y1, x2, y2, x3, y3]) =
                     numeric_operands_before::<6>(ops, i, operand_floor)
@@ -1054,71 +1021,78 @@ fn scan_content_stream<'a>(
                     state.path_point(x3, y3);
                 }
             }
-            b'v' | b'y' if is_word_start(i) && is_word_end(i) => {
+            b'v' | b'y' if is_word_start(i) && is_token_end(i) => {
                 if let Some([x1, y1, x2, y2]) = numeric_operands_before::<4>(ops, i, operand_floor)
                 {
                     state.path_point(x1, y1);
                     state.path_point(x2, y2);
                 }
             }
-            b'h' if is_word_start(i) && is_word_end(i) => {
+            b'h' if is_word_start(i) && is_token_end(i) => {
                 counts.path_ops += 1;
             }
-            b'f' | b'S' | b's' | b'B' | b'F' if is_word_start(i) && is_word_end(i) => {
+            b'f' | b'F' if is_word_start(i) && is_token_end(i) => {
                 counts.path_ops += 1;
                 painted = true;
                 path_ended = true;
+                fills = true;
             }
-            b'b' if is_word_start(i) && is_word_end(i) => {
+            b'S' | b's' if is_word_start(i) && is_token_end(i) => {
+                counts.path_ops += 1;
                 painted = true;
                 path_ended = true;
+                strokes = true;
             }
-            b'n' if is_word_start(i) && is_word_end(i) => {
+            b'B' if is_word_start(i) && is_token_end(i) => {
+                counts.path_ops += 1;
+                painted = true;
+                path_ended = true;
+                fills = true;
+                strokes = true;
+            }
+            b'b' if is_word_start(i) && is_token_end(i) => {
+                painted = true;
+                path_ended = true;
+                fills = true;
+                strokes = true;
+            }
+            b'n' if is_word_start(i) && is_token_end(i) => {
                 path_ended = true;
             }
-            b'W' if is_word_start(i) && is_word_end(i) => {
+            b'W' if is_word_start(i) && is_token_end(i) => {
                 state.clip_requested();
             }
-            // Two-byte: re (rect), f* (fill even-odd), W* (clip even-odd)
-            b'r' if i + 1 < ops.len()
-                && ops[i + 1] == b'e'
-                && is_word_start(i)
-                && (i + 2 >= ops.len() || ops[i + 2].is_ascii_whitespace()) =>
-            {
+            // Two-byte: re (rect), f* (fill even-odd), B*/b*, W* (clip even-odd)
+            b'r' if ops.get(i + 1) == Some(&b'e') && is_word_start(i) && is_token_end(i + 1) => {
                 counts.path_ops += 1;
                 if let Some(rect) = numeric_operands_before::<4>(ops, i, operand_floor) {
                     state.path_rect(rect);
                 }
             }
-            b'f' if i + 1 < ops.len()
-                && ops[i + 1] == b'*'
-                && is_word_start(i)
-                && (i + 2 >= ops.len() || ops[i + 2].is_ascii_whitespace()) =>
-            {
+            b'f' if ops.get(i + 1) == Some(&b'*') && is_word_start(i) && is_token_end(i + 1) => {
                 counts.path_ops += 1;
                 painted = true;
                 path_ended = true;
+                fills = true;
             }
             b'B' | b'b'
-                if i + 1 < ops.len()
-                    && ops[i + 1] == b'*'
-                    && is_word_start(i)
-                    && (i + 2 >= ops.len() || ops[i + 2].is_ascii_whitespace()) =>
+                if ops.get(i + 1) == Some(&b'*') && is_word_start(i) && is_token_end(i + 1) =>
             {
                 painted = true;
                 path_ended = true;
+                fills = true;
+                strokes = true;
             }
-            b'W' if i + 1 < ops.len()
-                && ops[i + 1] == b'*'
-                && is_word_start(i)
-                && (i + 2 >= ops.len() || ops[i + 2].is_ascii_whitespace()) =>
-            {
+            b'W' if ops.get(i + 1) == Some(&b'*') && is_word_start(i) && is_token_end(i + 1) => {
                 state.clip_requested();
             }
             _ => {}
         }
         if painted {
             state.painted();
+        }
+        if (fills && state.fill_paints_image) || (strokes && state.stroke_paints_image) {
+            state.path_painted_with_image();
         }
         if path_ended {
             state.path_ended();
@@ -1128,52 +1102,6 @@ fn scan_content_stream<'a>(
     }
 
     counts
-}
-
-/// The `N` numeric operands before the operator at `op_pos`, in stream
-/// order; `None` when a token there is not a number or the lookback would
-/// cross `floor`.
-fn numeric_operands_before<const N: usize>(
-    content: &[u8],
-    op_pos: usize,
-    floor: usize,
-) -> Option<[f64; N]> {
-    let mut values = [0.0f64; N];
-    let mut end = op_pos;
-    for value in values.iter_mut().rev() {
-        while end > floor && content[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-        let mut start = end;
-        while start > floor && matches!(content[start - 1], b'0'..=b'9' | b'.' | b'-' | b'+') {
-            start -= 1;
-        }
-        if start == end {
-            return None;
-        }
-        *value = std::str::from_utf8(&content[start..end])
-            .ok()?
-            .parse()
-            .ok()?;
-        end = start;
-    }
-    Some(values)
-}
-
-/// The name operand (`/Name`, given without its slash) before the operator
-/// at `op_pos`; `None` when the token there is not a name or the lookback
-/// would cross `floor`.
-fn name_operand_before(content: &[u8], op_pos: usize, floor: usize) -> Option<Vec<u8>> {
-    let mut end = op_pos;
-    while end > floor && content[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    let mut start = end;
-    while start > floor && !is_pdf_name_delimiter(content[start - 1]) {
-        start -= 1;
-    }
-    (start > floor && start < end && content[start - 1] == b'/')
-        .then(|| content[start..end].to_vec())
 }
 
 #[cfg(test)]

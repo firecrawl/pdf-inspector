@@ -1,6 +1,7 @@
 //! Tests of the executed-content scan, and of the invisible-text-layer
 //! signal `analyze_page_content` builds on it.
 
+use super::super::content_mask::inline_image_data_bound;
 use super::super::{analyze_page_content, page_ocr_reasons, page_ocr_signals};
 use super::*;
 
@@ -178,6 +179,16 @@ const PAGE_FORM: TestForm<'static> = TestForm {
     bbox: &[0, 0, 612, 792],
 };
 
+/// A pattern of [`synthetic_page_with_patterns`]: a tiling pattern whose
+/// cell runs `content`, with the page's image as `Im0` and font as `F1`
+/// in its resources — or a shading pattern, when `shading`.
+#[derive(Clone, Copy)]
+struct TestPattern<'a> {
+    name: &'a str,
+    content: &'a str,
+    shading: bool,
+}
+
 /// A one-page 612×792 document whose content stream is set with
 /// [`set_page_content`]: a 2×2 gray image `Im0` when `image`; a
 /// 1500×2383 image `ImBig`, bound whether or not the content draws it,
@@ -187,6 +198,16 @@ fn synthetic_page(
     image: bool,
     large_image: bool,
     forms: &[TestForm<'_>],
+) -> (Document, ObjectId, ObjectId) {
+    synthetic_page_with_patterns(image, large_image, forms, &[])
+}
+
+/// [`synthetic_page`] with the given patterns bound as well.
+fn synthetic_page_with_patterns(
+    image: bool,
+    large_image: bool,
+    forms: &[TestForm<'_>],
+    patterns: &[TestPattern<'_>],
 ) -> (Document, ObjectId, ObjectId) {
     use lopdf::dictionary;
     let mut doc = Document::with_version("1.4");
@@ -211,9 +232,11 @@ fn synthetic_page(
             data,
         )));
         xobjects.set(name, Object::Reference(image_id));
+        image_id
     };
+    let mut page_image = None;
     if image {
-        add_image(&mut doc, "Im0", 2, 2, vec![200, 60, 60, 200]);
+        page_image = Some(add_image(&mut doc, "Im0", 2, 2, vec![200, 60, 60, 200]));
     }
     if large_image {
         add_image(&mut doc, "ImBig", 1500, 2383, Vec::new());
@@ -246,6 +269,45 @@ fn synthetic_page(
         )));
         xobjects.set(form.name, Object::Reference(form_id));
     }
+    let mut pattern_dict = dictionary! {};
+    for pattern in patterns {
+        let object = if pattern.shading {
+            Object::Dictionary(dictionary! {
+                "Type" => "Pattern",
+                "PatternType" => Object::Integer(2),
+                "Shading" => dictionary! {
+                    "ShadingType" => Object::Integer(2),
+                    "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
+                    "Coords" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                },
+            })
+        } else {
+            let mut resources = dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            };
+            if let Some(image_id) = page_image {
+                resources.set(
+                    "XObject",
+                    dictionary! { "Im0" => Object::Reference(image_id) },
+                );
+            }
+            Object::Stream(lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "Pattern",
+                    "PatternType" => Object::Integer(1),
+                    "PaintType" => Object::Integer(1),
+                    "TilingType" => Object::Integer(1),
+                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "XStep" => Object::Integer(612),
+                    "YStep" => Object::Integer(792),
+                    "Resources" => resources,
+                },
+                pattern.content.as_bytes().to_vec(),
+            ))
+        };
+        let pattern_id = doc.add_object(object);
+        pattern_dict.set(pattern.name, Object::Reference(pattern_id));
+    }
     let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
         dictionary! {},
         Vec::new(),
@@ -260,6 +322,7 @@ fn synthetic_page(
             "Resources" => dictionary! {
                 "Font" => dictionary! { "F1" => Object::Reference(font_id) },
                 "XObject" => xobjects,
+                "Pattern" => pattern_dict,
             },
             "Contents" => Object::Reference(content_id),
         }),
@@ -386,10 +449,14 @@ fn clip_only_text_painted_through_is_visible() {
     );
 }
 
-/// Within one row or column of grid cells — the resolution image
-/// coverage is measured at.
+/// Within a tenth of the expected area — the grid's resolution costs a
+/// cell along each edge — and nothing but zero for none.
 fn about(covered: f64, expected: f64) -> bool {
-    (covered - expected).abs() <= PAGE_AREA / COVERAGE_GRID as f64
+    if expected == 0.0 {
+        covered == 0.0
+    } else {
+        (covered - expected).abs() <= expected * 0.1
+    }
 }
 
 #[test]
@@ -635,7 +702,7 @@ fn subtype_held_by_reference_is_resolved() {
         .iter()
         .map(|(name, value)| (name.clone(), value.as_reference().unwrap()))
         .collect();
-    let mut point_subtypes_at = |doc: &mut Document, image: ObjectId, form: ObjectId| {
+    let point_subtypes_at = |doc: &mut Document, image: ObjectId, form: ObjectId| {
         for (name, id) in &xobjects {
             if let Ok(Object::Stream(stream)) = doc.get_object_mut(*id) {
                 let target = if name == b"Im0" { image } else { form };
@@ -980,4 +1047,135 @@ fn a_form_box_with_trailing_numbers_is_read_by_its_first_four() {
     // Three numbers are no box: there is nothing to clip by, and the form
     // runs unclipped.
     assert!(close(covered("/FmThree Do"), PAGE_AREA));
+}
+
+#[test]
+fn empty_show_operands_show_no_text() {
+    // Nothing to show is nothing shown: neither counted nor hidden.
+    let (counts, executed_ops, hidden) =
+        scan_alone(b"BT /F1 10 Tf 3 Tr () Tj <> Tj [] TJ [5 -8] TJ ( ) Tj ET");
+    assert_eq!((counts.text_ops, executed_ops, hidden), (1, 1, 1));
+
+    // A covering image with only empty shows over it hides no text layer.
+    let (mut doc, page_id, content_id) = synthetic_page(true, false, &[]);
+    set_page_content(
+        &mut doc,
+        content_id,
+        "q 612 0 0 792 0 0 cm /Im0 Do Q\n3 Tr BT /F1 10 Tf () Tj <> Tj [] TJ [5 -8] TJ ET",
+    );
+    let analysis = analyze_page_content(&doc, page_id);
+    assert_eq!(analysis.executed_text_operator_count, 0);
+    assert!(analysis.has_covering_image);
+    assert!(!analysis.has_invisible_text_layer);
+}
+
+#[test]
+fn operators_need_no_whitespace_after_them() {
+    let (counts, executed_ops, hidden) = scan_alone(b"3 Tr (a)Tj(b)Tj");
+    assert_eq!((counts.text_ops, executed_ops, hidden), (2, 2, 2));
+    let (counts, executed_ops, hidden) = scan_alone(b"(a)Tj[<41>]TJ");
+    assert_eq!((counts.text_ops, executed_ops, hidden), (2, 2, 0));
+    // Path operators and the font operator too.
+    let (counts, _, _) = scan_alone(b"/F1 12 Tf(a)Tj 0 0 m 1 1 l S/Im0 Do 0 0 1 1 re f(b)Tj");
+    assert_eq!(counts.font_changes, 1);
+    assert_eq!(counts.path_ops, 5);
+    assert_eq!(counts.text_ops, 2);
+}
+
+#[test]
+fn a_tiling_pattern_that_draws_an_image_paints_coverage() {
+    let patterns = [
+        TestPattern {
+            name: "PImage",
+            content: "q 612 0 0 792 0 0 cm /Im0 Do Q",
+            shading: false,
+        },
+        TestPattern {
+            name: "PInline",
+            content: "q 10 0 0 10 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q",
+            shading: false,
+        },
+        TestPattern {
+            name: "PPaths",
+            content: "0 0 10 10 re f",
+            shading: false,
+        },
+        TestPattern {
+            name: "PShade",
+            content: "",
+            shading: true,
+        },
+    ];
+    let (doc, page_id, _) = synthetic_page_with_patterns(true, false, &[], &patterns);
+    let covered = |content: &str| executed(&doc, page_id, &[content]).2;
+    let fill = "0 0 612 792 re f";
+
+    // A fill with a pattern whose cell draws an image — an XObject or an
+    // inline image — covers the path's box.
+    assert!(close(
+        covered(&format!("/Pattern cs /PImage scn {fill}")),
+        PAGE_AREA
+    ));
+    assert!(close(
+        covered(&format!("/Pattern cs /PInline scn {fill}")),
+        PAGE_AREA
+    ));
+    // A cell drawing only paths, a shading pattern, or no pattern at all
+    // paints no coverage.
+    assert!(close(
+        covered(&format!("/Pattern cs /PPaths scn {fill}")),
+        0.0
+    ));
+    assert!(close(
+        covered(&format!("/Pattern cs /PShade scn {fill}")),
+        0.0
+    ));
+    assert!(close(covered(fill), 0.0));
+    // A stroke likewise, over the stroked path's box; the stroke colour
+    // does not fill.
+    assert!(close(
+        covered("/Pattern CS /PImage SCN 0 0 m 612 792 l S"),
+        PAGE_AREA
+    ));
+    assert!(close(
+        covered("/Pattern CS /PImage SCN 0 0 612 792 re f"),
+        0.0
+    ));
+    // The selection follows the graphics state: `Q` restores it, and a
+    // plain colour, another colour space or numbers end it.
+    assert!(close(
+        covered(&format!("q /Pattern cs /PImage scn Q {fill}")),
+        0.0
+    ));
+    assert!(close(
+        covered(&format!("/Pattern cs /PImage scn 0.5 g {fill}")),
+        0.0
+    ));
+    assert!(close(
+        covered(&format!("/Pattern cs /PImage scn /DeviceGray cs {fill}")),
+        0.0
+    ));
+    assert!(close(
+        covered(&format!("/Pattern cs /PImage scn 0.2 0.4 scn {fill}")),
+        0.0
+    ));
+    // The clip in force applies.
+    assert!(about(
+        covered(&format!(
+            "0 0 100 100 re W n /Pattern cs /PImage scn {fill}"
+        )),
+        100.0 * 100.0
+    ));
+
+    // A hidden layer over such a fill is a layer nobody sees.
+    let (mut doc, page_id, content_id) =
+        synthetic_page_with_patterns(true, false, &[], &patterns[..1]);
+    set_page_content(
+        &mut doc,
+        content_id,
+        &format!("/Pattern cs /PImage scn {fill}\n{}", glyph_layer(3)),
+    );
+    let analysis = analyze_page_content(&doc, page_id);
+    assert!(analysis.has_covering_image);
+    assert!(analysis.has_invisible_text_layer);
 }
