@@ -11,6 +11,9 @@ use super::content_mask::{
     mask_strings_comments_and_inline_images, name_operand_before, numeric_operands_before,
     show_operand_text_bytes,
 };
+use super::content_resources::{
+    numbers_of, pattern_type, resolve_pattern, resolve_xobject, stream_resources, XObjectDrawn,
+};
 use super::{collect_text_chars_before, extract_font_name_before_tf, preceding_operand_closer};
 use crate::extractor::{visible_page_box, PageBox};
 use lopdf::{Document, Object, ObjectId};
@@ -43,6 +46,12 @@ pub(super) struct ExecutedContent {
     /// while the images drawn cover the page — and nothing went unread
     /// that could say otherwise.
     pub(super) shows_only_a_hidden_text_layer: bool,
+    /// Bytes of form and pattern-cell content executed.
+    pub(super) form_bytes: usize,
+    /// Whether a form, or a pattern's cell, went unread because the bytes
+    /// executed would pass `EXECUTED_FORM_BYTES_MAX` — from which point no
+    /// form is followed and the evidence is incomplete.
+    pub(super) form_bytes_exceeded: bool,
 }
 
 /// The page's content streams read as one — the text render mode and the
@@ -61,14 +70,14 @@ pub(super) fn scan_page_content(
     (state.executed(), counts)
 }
 
-/// Whether the page shows only a text layer nobody sees over images that
-/// cover it — from the executed-content scan alone, without the font,
-/// pixel and path analysis of `analyze_page_content`. For the pages a
-/// sample left out, whose OCR reason is reported all the same.
-pub(super) fn page_shows_only_a_hidden_text_layer(doc: &Document, page_id: ObjectId) -> bool {
+/// What the page's content executed — from the executed-content scan
+/// alone, without the font, pixel and path analysis of
+/// `analyze_page_content`. For the pages a sample left out, whose OCR
+/// reason is reported all the same.
+pub(super) fn page_executed_content(doc: &Document, page_id: ObjectId) -> ExecutedContent {
     scan_page(doc, page_id, &mut HashSet::new(), &mut HashSet::new())
         .0
-        .shows_only_a_hidden_text_layer()
+        .executed()
 }
 
 /// [`scan_content_stream`] of one stream on its own — the initial
@@ -165,6 +174,35 @@ const SCAN_STATE_MAX_DEPTH: usize = 256;
 /// How many form invocations one page's scan follows through `Do`. Past
 /// it, content goes unread and the page's evidence is incomplete.
 const FORM_INVOCATIONS_MAX: usize = 1_000;
+
+/// How many bytes of form and pattern-cell content one page's scan
+/// executes — the invocations alone would let a large form be run into
+/// hundreds of megabytes. From the form that would pass it on, no form is
+/// followed and the page's evidence is incomplete.
+const EXECUTED_FORM_BYTES_MAX: usize = 32 << 20;
+
+/// The byte budget a scan runs under: `EXECUTED_FORM_BYTES_MAX`.
+#[cfg(not(test))]
+fn executed_form_bytes_budget() -> usize {
+    EXECUTED_FORM_BYTES_MAX
+}
+
+/// The byte budget a scan runs under: what the test on this thread set in
+/// place of `EXECUTED_FORM_BYTES_MAX`, to reach the budget without content
+/// of that size, or the constant.
+#[cfg(test)]
+fn executed_form_bytes_budget() -> usize {
+    EXECUTED_FORM_BYTES_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(EXECUTED_FORM_BYTES_MAX)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The byte budget set in place of `EXECUTED_FORM_BYTES_MAX` on this thread.
+    static EXECUTED_FORM_BYTES_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// How many bytes of form content — decompressed, and its masked copy —
 /// one page's scan keeps for forms invoked again.
@@ -353,7 +391,8 @@ struct SavedScanState {
 /// `/Matrix` applied, its `/BBox` clipping what it draws and the form's
 /// own changes undone afterwards, as a renderer runs them; a form
 /// invoking itself is not run again, and past `FORM_INVOCATIONS_MAX`
-/// invocations the rest goes unread. It tallies what the page executes:
+/// invocations, or `EXECUTED_FORM_BYTES_MAX` bytes of form content, the
+/// rest goes unread. It tallies what the page executes:
 /// its text-showing operators, those of them that leave nothing to see,
 /// and the page cells the images it draws cover. A scan that follows no
 /// `Do` only counts.
@@ -433,8 +472,17 @@ struct ContentScanState<'a> {
     active_forms: Vec<ObjectId>,
     /// Form invocations followed so far, against `FORM_INVOCATIONS_MAX`.
     form_invocations: usize,
-    /// Whether content went unread — the invocation budget or the depth
-    /// cap ran out — so that the page's evidence is incomplete.
+    /// Bytes of form and pattern-cell content executed so far, against
+    /// `form_bytes_budget` — `executed_form_bytes_budget()` when the scan
+    /// began.
+    executed_form_bytes: usize,
+    form_bytes_budget: usize,
+    /// Whether a form or a cell went unread for the byte budget; from then
+    /// on none is followed.
+    form_bytes_exceeded: bool,
+    /// Whether content went unread — the invocation budget, the byte
+    /// budget or the depth cap ran out — so that the page's evidence is
+    /// incomplete.
     incomplete: bool,
     /// Form content by object — decompressed, and masked — for forms
     /// invoked again.
@@ -481,6 +529,9 @@ impl<'a> ContentScanState<'a> {
             own_image_area: 0.0,
             active_forms: Vec::new(),
             form_invocations: 0,
+            executed_form_bytes: 0,
+            form_bytes_budget: executed_form_bytes_budget(),
+            form_bytes_exceeded: false,
             incomplete: false,
             form_content: HashMap::new(),
             form_content_bytes: 0,
@@ -766,8 +817,8 @@ impl<'a> ContentScanState<'a> {
     /// its invoker's bind, which one form's may differently from
     /// another's. A shading pattern, or a cell that draws no image,
     /// paints no coverage. Patterns are not looked into from within a
-    /// pattern's cell, and the reading counts against the invocation
-    /// budget, past which the evidence is incomplete.
+    /// pattern's cell, and the reading counts against the invocation and
+    /// byte budgets, past which the evidence is incomplete.
     fn pattern_paints_image(&mut self, name: &[u8], resources: &[&'a lopdf::Dictionary]) -> bool {
         if !self.follow_patterns {
             return false;
@@ -789,11 +840,17 @@ impl<'a> ContentScanState<'a> {
                 let content = cell
                     .decompressed_content()
                     .unwrap_or_else(|_| cell.content.clone());
+                if !self.form_bytes_charged(content.len()) {
+                    return false;
+                }
                 let mut cell_resources = Vec::with_capacity(resources.len() + 1);
                 cell_resources.extend(stream_resources(self.doc, cell));
                 cell_resources.extend_from_slice(resources);
                 let mut cell_state = ContentScanState::new(self.doc, PageBox::LETTER, true);
                 cell_state.follow_patterns = false;
+                // The forms the cell invokes run against the page's budgets.
+                cell_state.executed_form_bytes = self.executed_form_bytes;
+                cell_state.form_bytes_budget = self.form_bytes_budget;
                 scan_content_stream(
                     &content,
                     &mut HashSet::new(),
@@ -802,6 +859,8 @@ impl<'a> ContentScanState<'a> {
                     &cell_resources,
                 );
                 self.form_invocations += cell_state.form_invocations;
+                self.executed_form_bytes = cell_state.executed_form_bytes;
+                self.form_bytes_exceeded |= cell_state.form_bytes_exceeded;
                 self.incomplete |= cell_state.incomplete;
                 cell_state.drew_image
             }
@@ -866,8 +925,8 @@ impl<'a> ContentScanState<'a> {
     /// resolve in its own resources first, then in its invoker's. A form
     /// whose box lies outside the clip in force shows nothing and is not
     /// read; a form invoking itself, directly or through others, is not
-    /// run again; past the invocation budget or the depth cap the form
-    /// goes unread and the page's evidence is incomplete.
+    /// run again; past the invocation budget, the byte budget or the depth
+    /// cap the form goes unread and the page's evidence is incomplete.
     fn form_drawn(
         &mut self,
         id: ObjectId,
@@ -900,19 +959,21 @@ impl<'a> ContentScanState<'a> {
         if let Some(clip) = clip {
             self.clip = clip;
             let content = self.form_content(id, form);
-            let mut resources = Vec::with_capacity(invoker_resources.len() + 1);
-            resources.extend(stream_resources(self.doc, form));
-            resources.extend_from_slice(invoker_resources);
-            self.active_forms.push(id);
-            scan_masked_content(
-                &content.content,
-                &content.masked,
-                &mut HashSet::new(),
-                &mut HashSet::new(),
-                self,
-                &resources,
-            );
-            self.active_forms.pop();
+            if self.form_bytes_charged(content.content.len()) {
+                let mut resources = Vec::with_capacity(invoker_resources.len() + 1);
+                resources.extend(stream_resources(self.doc, form));
+                resources.extend_from_slice(invoker_resources);
+                self.active_forms.push(id);
+                scan_masked_content(
+                    &content.content,
+                    &content.masked,
+                    &mut HashSet::new(),
+                    &mut HashSet::new(),
+                    self,
+                    &resources,
+                );
+                self.active_forms.pop();
+            }
         }
         // Levels the form left open close with it.
         while self.unsaved_depth > 0 || self.saved.len() > base {
@@ -939,6 +1000,20 @@ impl<'a> ContentScanState<'a> {
             self.form_content.insert(id, Rc::clone(&content));
         }
         content
+    }
+
+    /// Whether `bytes` more of form or cell content may be executed within
+    /// the byte budget, charging them when they may. When they may not —
+    /// or once any were refused — nothing further is followed, and the
+    /// page's evidence is incomplete.
+    fn form_bytes_charged(&mut self, bytes: usize) -> bool {
+        if self.form_bytes_exceeded || self.executed_form_bytes + bytes > self.form_bytes_budget {
+            self.form_bytes_exceeded = true;
+            self.incomplete = true;
+            return false;
+        }
+        self.executed_form_bytes += bytes;
+        true
     }
 
     /// The page area the images drawn cover: the cells they covered, to
@@ -974,137 +1049,9 @@ impl<'a> ContentScanState<'a> {
             draws_image: self.drew_image_on_page,
             covers_page: self.covers_page(),
             shows_only_a_hidden_text_layer: self.shows_only_a_hidden_text_layer(),
+            form_bytes: self.executed_form_bytes,
+            form_bytes_exceeded: self.form_bytes_exceeded,
         }
-    }
-}
-
-/// What a `Do` operand names, in the first of the resources binding it.
-enum XObjectDrawn<'a> {
-    Image,
-    Form(ObjectId, &'a lopdf::Stream),
-}
-
-fn resolve_xobject<'a>(
-    doc: &'a Document,
-    resources: &[&'a lopdf::Dictionary],
-    name: &[u8],
-) -> Option<XObjectDrawn<'a>> {
-    for scope in resources {
-        let xobjects = match scope.get(b"XObject").ok() {
-            Some(Object::Dictionary(dict)) => dict,
-            Some(Object::Reference(id)) => match doc.get_dictionary(*id) {
-                Ok(dict) => dict,
-                Err(_) => continue,
-            },
-            _ => continue,
-        };
-        let Ok(entry) = xobjects.get(name) else {
-            continue;
-        };
-        let id = entry.as_reference().ok()?;
-        let Ok(Object::Stream(stream)) = doc.get_object(id) else {
-            return None;
-        };
-        // `/Subtype` may be held by reference; one that does not resolve
-        // to a name leaves the stream neither image nor form, as the
-        // resource walks leave it.
-        let subtype = match stream.dict.get(b"Subtype").ok()? {
-            Object::Name(name) => Some(name.as_slice()),
-            Object::Reference(id) => doc.get_object(*id).ok().and_then(|o| o.as_name().ok()),
-            _ => None,
-        };
-        return match subtype {
-            Some(b"Image") => Some(XObjectDrawn::Image),
-            Some(b"Form") => Some(XObjectDrawn::Form(id, stream)),
-            _ => None,
-        };
-    }
-    None
-}
-
-/// A stream's `/Resources`, inline or by reference.
-fn stream_resources<'a>(
-    doc: &'a Document,
-    stream: &'a lopdf::Stream,
-) -> Option<&'a lopdf::Dictionary> {
-    match stream.dict.get(b"Resources").ok()? {
-        Object::Dictionary(dict) => Some(dict),
-        Object::Reference(id) => doc.get_dictionary(*id).ok(),
-        _ => None,
-    }
-}
-
-/// The pattern `name` names, in the first of `resources` binding it: a
-/// stream for a tiling pattern, a dictionary for a shading pattern.
-fn resolve_pattern<'a>(
-    doc: &'a Document,
-    resources: &[&'a lopdf::Dictionary],
-    name: &[u8],
-) -> Option<(ObjectId, &'a Object)> {
-    for scope in resources {
-        let patterns = match scope.get(b"Pattern").ok() {
-            Some(Object::Dictionary(dict)) => dict,
-            Some(Object::Reference(id)) => match doc.get_dictionary(*id) {
-                Ok(dict) => dict,
-                Err(_) => continue,
-            },
-            _ => continue,
-        };
-        let Ok(entry) = patterns.get(name) else {
-            continue;
-        };
-        let id = entry.as_reference().ok()?;
-        return doc.get_object(id).ok().map(|pattern| (id, pattern));
-    }
-    None
-}
-
-/// A pattern's `/PatternType`: 1 for tiling, 2 for shading.
-fn pattern_type(doc: &Document, dict: &lopdf::Dictionary) -> Option<i64> {
-    match dict.get(b"PatternType").ok()? {
-        Object::Reference(id) => doc.get_object(*id).ok()?.as_i64().ok(),
-        other => other.as_i64().ok(),
-    }
-}
-
-/// The first `N` numbers of `dict`'s `key` — a form's `/Matrix` or
-/// `/BBox` — the array and its numbers direct or by reference. An array
-/// with more entries is read by its first `N`, as a page box with
-/// trailing entries is; one with fewer, or with something other than a
-/// number among the first `N`, gives nothing — the form then runs
-/// unclipped, or under the identity, there being nothing to clip or
-/// scale by.
-fn numbers_of<const N: usize>(
-    doc: &Document,
-    dict: &lopdf::Dictionary,
-    key: &[u8],
-) -> Option<[f64; N]> {
-    let array = match dict.get(key).ok()? {
-        Object::Array(array) => array,
-        Object::Reference(id) => doc.get_object(*id).ok()?.as_array().ok()?,
-        _ => return None,
-    };
-    if array.len() < N {
-        return None;
-    }
-    let mut numbers = [0.0f64; N];
-    for (slot, value) in numbers.iter_mut().zip(array) {
-        *slot = match value {
-            Object::Reference(id) => doc.get_object(*id).ok().and_then(coordinate),
-            other => coordinate(other),
-        }?;
-    }
-    Some(numbers)
-}
-
-/// A coordinate read at full precision: an integer straight into an `f64`
-/// (a large one would lose digits through an `f32`), a real widened from
-/// the single precision the file format gives it.
-fn coordinate(value: &Object) -> Option<f64> {
-    match value {
-        Object::Integer(n) => Some(*n as f64),
-        Object::Real(r) => Some(f64::from(*r)),
-        _ => None,
     }
 }
 

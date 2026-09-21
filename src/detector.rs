@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 mod content_mask;
+mod content_resources;
 mod content_scan;
 use content_scan::ContentCounts;
 
@@ -221,23 +222,33 @@ pub(crate) fn detect_from_document(
     // Cache Phase 1 results to avoid re-analyzing sampled pages in Phase 2
     let mut analysis_cache: HashMap<u32, PageAnalysis> = HashMap::new();
     let mut pages_actually_sampled = 0u32;
+    // Pages read whose form content ran past the scan's byte budget.
+    let mut pages_past_form_budget = 0u32;
 
     for page_num in &sample_indices {
         if let Some(&page_id) = pages.get(page_num) {
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} executed_text_ops={} hidden_text_ops={} images={} image_count={} template={} covering_image={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
+                "page {}: text_ops={} executed_text_ops={} hidden_text_ops={} images={} image_count={} template={} covering_image={} form_bytes={} form_bytes_exceeded={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
                 page_num, analysis.text_operator_count, analysis.executed_text_operator_count,
                 analysis.invisible_text_operator_count,
                 analysis.has_images, analysis.image_count, analysis.has_template_image,
                 analysis.has_covering_image,
+                analysis.executed_form_bytes, analysis.form_bytes_exceeded,
                 analysis.unique_text_chars, analysis.unique_alphanum_chars,
                 analysis.path_op_count, analysis.has_vector_text,
                 analysis.total_image_area, analysis.has_identity_h_no_tounicode,
                 analysis.has_only_type3_fonts, analysis.font_change_count,
                 analysis.has_decodable_text_fonts
             );
+            if analysis.form_bytes_exceeded {
+                pages_past_form_budget += 1;
+                log::debug!(
+                    "page {}: form content past the scan's byte budget after {} bytes; the rest went unread and the page keeps its classification",
+                    page_num, analysis.executed_form_bytes
+                );
+            }
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
             let effective_min_ops = if analysis.has_images || analysis.image_count > 0 {
@@ -481,15 +492,31 @@ pub(crate) fn detect_from_document(
         let reasons = match analysis_cache.get(&page_num) {
             Some(analysis) => page_ocr_reasons(analysis),
             None => match pages.get(&page_num) {
-                Some(&page_id)
-                    if content_scan::page_shows_only_a_hidden_text_layer(doc, page_id) =>
-                {
-                    vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
+                Some(&page_id) => {
+                    let executed = content_scan::page_executed_content(doc, page_id);
+                    if executed.form_bytes_exceeded {
+                        pages_past_form_budget += 1;
+                        log::debug!(
+                            "page {}: form content past the scan's byte budget after {} bytes; the rest went unread and the page keeps its classification",
+                            page_num, executed.form_bytes
+                        );
+                    }
+                    if executed.shows_only_a_hidden_text_layer {
+                        vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
+                    } else {
+                        vec![crate::OCR_REASON_SCANNED]
+                    }
                 }
-                _ => vec![crate::OCR_REASON_SCANNED],
+                None => vec![crate::OCR_REASON_SCANNED],
             },
         };
         ocr_reasons_by_page.insert(page_num, reasons.into_iter().map(String::from).collect());
+    }
+    if pages_past_form_budget > 0 {
+        log::debug!(
+            "{} page(s) ran past the scan's byte budget for form content; their evidence is incomplete and their classification unchanged",
+            pages_past_form_budget
+        );
     }
 
     // Try to get title from metadata
@@ -569,6 +596,13 @@ struct PageAnalysis {
     /// sees. What the layer says is not what the page shows, so the page
     /// is read from its raster.
     has_invisible_text_layer: bool,
+    /// Bytes of Form XObject and pattern-cell content the page's content
+    /// executed, and whether a form went unread because the page's budget
+    /// of them ran out — the page then keeps the classification it had
+    /// before the executed content was followed, never
+    /// `has_invisible_text_layer`.
+    executed_form_bytes: usize,
+    form_bytes_exceeded: bool,
     /// Total image area in pixels (reserved for future use)
     #[allow(dead_code)]
     total_image_area: u64,
@@ -881,6 +915,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let executed_text_ops = executed.text_ops;
     let hidden_text_ops = executed.hidden_text_ops;
     let has_invisible_text_layer = executed.shows_only_a_hidden_text_layer;
+    let executed_form_bytes = executed.form_bytes;
+    let form_bytes_exceeded = executed.form_bytes_exceeded;
 
     let unique_alphanum_chars = all_unique_chars
         .iter()
@@ -936,6 +972,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_template_image,
         has_covering_image,
         has_invisible_text_layer,
+        executed_form_bytes,
+        form_bytes_exceeded,
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,

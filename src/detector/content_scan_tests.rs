@@ -1003,3 +1003,102 @@ fn a_form_s_masked_content_is_kept_with_it() {
     assert!(state.form_content.is_empty());
     assert_eq!(state.form_content_bytes, 0);
 }
+
+/// The executed-form byte budget set for the test's thread, restored
+/// when dropped.
+struct FormBytesBudget(Option<usize>);
+
+impl FormBytesBudget {
+    fn set(bytes: usize) -> Self {
+        Self(EXECUTED_FORM_BYTES_OVERRIDE.with(|budget| budget.replace(Some(bytes))))
+    }
+}
+
+impl Drop for FormBytesBudget {
+    fn drop(&mut self) {
+        EXECUTED_FORM_BYTES_OVERRIDE.with(|budget| budget.set(self.0));
+    }
+}
+
+/// A page whose forms execute more bytes than the budget allows is not
+/// flagged: from the form that would pass the budget on, none is read,
+/// the page's evidence is incomplete and it keeps the classification the
+/// resource walk gives it; the same page within the budget is a layer
+/// nobody sees. A pattern's cell counts against the same budget.
+#[test]
+fn form_content_past_the_byte_budget_leaves_the_page_unflagged() {
+    let layer = glyph_layer(3);
+    let form = TestForm {
+        name: "FmLayer",
+        content: layer.as_str(),
+        ..PAGE_FORM
+    };
+    let (mut doc, page_id, content_id) = synthetic_page(true, false, &[form]);
+    // Two invocations fit the budget; a third would pass it.
+    let _budget = FormBytesBudget::set(2 * layer.len() + layer.len() / 2);
+
+    let within = format!("{FULL_PAGE_IMAGE}/FmLayer Do /FmLayer Do");
+    let state = executed_state(&doc, page_id, &[&within]);
+    assert_eq!(state.executed_form_bytes, 2 * layer.len());
+    assert!(!state.form_bytes_exceeded && !state.incomplete);
+    assert_eq!(
+        (state.executed_text_ops, state.executed_hidden_text_ops),
+        (240, 240)
+    );
+    set_page_content(&mut doc, content_id, &within);
+    let analysis = analyze_page_content(&doc, page_id);
+    assert!(analysis.has_invisible_text_layer);
+    assert_eq!(analysis.executed_form_bytes, 2 * layer.len());
+    assert!(!analysis.form_bytes_exceeded);
+    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+
+    let past = format!("{FULL_PAGE_IMAGE}/FmLayer Do /FmLayer Do /FmLayer Do /FmLayer Do");
+    let state = executed_state(&doc, page_id, &[&past]);
+    assert_eq!(
+        state.executed_form_bytes,
+        2 * layer.len(),
+        "the third invocation would pass the budget: it and the fourth go unread"
+    );
+    assert!(state.form_bytes_exceeded && state.incomplete);
+    assert_eq!(state.executed_text_ops, 240);
+    set_page_content(&mut doc, content_id, &past);
+    let analysis = analyze_page_content(&doc, page_id);
+    assert!(!analysis.has_invisible_text_layer);
+    assert!(analysis.form_bytes_exceeded);
+    assert_eq!(analysis.executed_form_bytes, 2 * layer.len());
+    assert_eq!(
+        analysis.text_operator_count, 120,
+        "the bound form, counted once"
+    );
+    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+
+    // A pattern's cell: within the budget it is read and paints coverage;
+    // past it, it goes unread, and the evidence is incomplete.
+    let pattern = TestPattern {
+        name: "PImage",
+        content: "q 612 0 0 792 0 0 cm /Im0 Do Q",
+        shading: false,
+    };
+    let (doc, page_id, _) = synthetic_page_with_patterns(true, false, &[], &[pattern]);
+    let fill = "/Pattern cs /PImage scn 0 0 612 792 re f";
+    {
+        let _budget = FormBytesBudget::set(pattern.content.len());
+        let state = executed_state(&doc, page_id, &[fill]);
+        assert!(close(state.covered_image_area(), PAGE_AREA));
+        assert_eq!(state.executed_form_bytes, pattern.content.len());
+        assert!(!state.incomplete);
+    }
+    {
+        let _budget = FormBytesBudget::set(pattern.content.len() - 1);
+        let state = executed_state(&doc, page_id, &[fill]);
+        assert!(close(state.covered_image_area(), 0.0));
+        assert!(state.form_bytes_exceeded && state.incomplete);
+        assert_eq!(state.executed_form_bytes, 0);
+    }
+}
