@@ -201,14 +201,25 @@ fn boxes_referenced_by_loaded_forms(doc: &Document) -> Vec<u32> {
 }
 
 /// Whether a loaded dictionary is a Form XObject's: its `/Subtype` is the
-/// name `/Form`, directly or through a reference.
+/// name `/Form`, directly or through a reference ([`subtype_is_form`]).
 fn is_form(dict: &lopdf::Dictionary, doc: &Document) -> bool {
     match dict.get(b"Subtype") {
         Ok(Object::Name(name)) => name == b"Form",
-        Ok(Object::Reference(id)) => {
-            matches!(doc.get_object(*id), Ok(Object::Name(name)) if name == b"Form")
-        }
+        Ok(Object::Reference(id)) => subtype_is_form(*id, doc),
         _ => false,
+    }
+}
+
+/// Whether the object a `/Subtype` refers to names a Form XObject: the
+/// name `/Form`, or an object the document lacks — a name lopdf could not
+/// load (one kept in an object stream it could not expand, say) says
+/// nothing against the form, and only a form carries a `/Subtype` beside a
+/// `/BBox`. A name that loaded and is not `/Form` decides against it.
+fn subtype_is_form(id: lopdf::ObjectId, doc: &Document) -> bool {
+    match doc.get_object(id) {
+        Ok(Object::Name(name)) => name == b"Form",
+        Ok(_) => false,
+        Err(_) => !doc.objects.contains_key(&id),
     }
 }
 
@@ -467,7 +478,8 @@ fn array_range(masked: &[u8], from: usize) -> Option<Range<usize>> {
 
 /// Whether the masked dictionary body `dict` (a range into the whole span)
 /// names a Form XObject: a `/Subtype` key whose value is the name `/Form`,
-/// or a reference to an object of `doc` that is.
+/// or a reference that resolves to it — or to nothing the document holds
+/// ([`subtype_is_form`]).
 fn names_form(masked: &[u8], dict: Range<usize>, doc: &Document) -> bool {
     let mut pos = dict.start;
     while let Some(rel) = find_name(&masked[pos..dict.end], b"/Subtype") {
@@ -482,9 +494,7 @@ fn names_form(masked: &[u8], dict: Range<usize>, doc: &Document) -> bool {
         {
             return true;
         }
-        if reference_at(masked, value, dict.end).is_some_and(
-            |id| matches!(doc.get_object(id), Ok(Object::Name(name)) if name == b"Form"),
-        ) {
+        if reference_at(masked, value, dict.end).is_some_and(|id| subtype_is_form(id, doc)) {
             return true;
         }
         pos = after;
@@ -837,8 +847,8 @@ mod tests {
         assert!(!is_form(b" /Subtype /Formula "));
         assert!(!is_form(b" /Subtype /Image "));
         assert!(
-            !is_form(b" /Subtype 9 0 R "),
-            "nothing to resolve it against"
+            is_form(b" /Subtype 9 0 R "),
+            "an object the document lacks does not speak against the form"
         );
         assert_eq!(reference_at(b"12 3 R ", 0, 7), Some((12, 3)));
         assert_eq!(reference_at(b"12 3 Rx", 0, 7), None);
@@ -1117,6 +1127,28 @@ mod tests {
             .unwrap()
             .get_object((6, 0))
             .is_ok());
+
+        // A `/Subtype` reference to an object the document does not hold
+        // is taken for the form's; one that resolves to another name is not.
+        let form = format!(
+            "<< /Type /XObject /Subtype 9 0 R /BBox [ {bbox} ] /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
+            TEXT.len()
+        );
+        let bytes = pdf_with_objects(&[&form]);
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert!(doc.get_object((9, 0)).is_err());
+        let (_, count) = saturate_overlong_bbox_numerals(&bytes, &doc).unwrap();
+        assert_eq!(count, 4, "the missing name does not speak against the form");
+        let form = format!(
+            "<< /Type /XObject /Subtype 7 0 R /BBox [ {bbox} ] /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
+            TEXT.len()
+        );
+        let bytes = pdf_with_objects(&[&form, "/Image"]);
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert!(
+            saturate_overlong_bbox_numerals(&bytes, &doc).is_none(),
+            "a resolved name other than /Form decides against it"
+        );
     }
 
     #[test]
