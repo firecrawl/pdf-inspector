@@ -1880,8 +1880,11 @@ fn merge_text_items_with_clips(
 
             // Hebrew and Arabic presentation forms stand for letters; now
             // that the text reads in logical order, a ligature's letters
-            // come out in reading order.
-            let text = crate::bidi::normalize_presentation_forms(&text).into_owned();
+            // come out in reading order, and the joiners that held the
+            // characters of one glyph together through the read-back have
+            // done their work.
+            let mut text = crate::bidi::normalize_presentation_forms(&text).into_owned();
+            crate::bidi::strip_glyph_joiners(&mut text);
 
             merged.push(TextItem {
                 text,

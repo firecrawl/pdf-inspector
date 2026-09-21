@@ -85,14 +85,55 @@ fn letter_direction(c: char) -> Option<Strong> {
     }
 }
 
+/// U+034F COMBINING GRAPHEME JOINER, put between the characters that one
+/// code of a right-to-left script reads as — a ligature glyph named
+/// `uni06440627` (lam-alef), or mapped to two code points by the ToUnicode
+/// CMap — when a string is decoded ([`push_glyph_characters`]). A line
+/// stored in visual order holds its glyphs in display order but each
+/// glyph's characters in the order they were named, so the read-back
+/// ([`visual_to_logical`]) has to turn such a glyph round as one cluster:
+/// the joiner, a combining mark, keeps its characters together
+/// (`reverse_clusters`) and is transparent to the bidirectional algorithm.
+/// It is dropped once a line's text is in logical order
+/// ([`strip_glyph_joiners`]).
+pub(crate) const GLYPH_JOINER: char = '\u{034F}';
+
+/// Append `label`, what one code reads as, to `out` — with a
+/// [`GLYPH_JOINER`] between its characters when there are several and one
+/// of them is a right-to-left character.
+pub(crate) fn push_glyph_characters(out: &mut String, label: &str) {
+    let mut chars = label.chars();
+    let several = chars.next().is_some() && chars.next().is_some();
+    if !several || !label.chars().any(crate::text_utils::is_rtl_char) {
+        out.push_str(label);
+        return;
+    }
+    for (i, ch) in label.chars().enumerate() {
+        if i > 0 {
+            out.push(GLYPH_JOINER);
+        }
+        out.push(ch);
+    }
+}
+
+/// Remove the [`GLYPH_JOINER`]s that [`push_glyph_characters`] put in.
+pub(crate) fn strip_glyph_joiners(text: &mut String) {
+    if text.contains(GLYPH_JOINER) {
+        text.retain(|c| c != GLYPH_JOINER);
+    }
+}
+
 /// Split `positions` into clusters of a base character followed by its
-/// combining marks and reverse the order of the clusters, keeping each
-/// cluster's characters in place. `ch_at` reads the character a position
-/// stands for.
+/// combining marks — and by the characters a [`GLYPH_JOINER`] after it
+/// joins on, so that one glyph's characters stay one cluster — and reverse
+/// the order of the clusters, keeping each cluster's characters in place.
+/// `ch_at` reads the character a position stands for.
 fn reverse_clusters(positions: &mut [usize], ch_at: impl Fn(usize) -> char) {
     let mut clusters: Vec<(usize, usize)> = Vec::new();
     for (i, &p) in positions.iter().enumerate() {
-        if i == 0 || !is_combining_mark(ch_at(p)) {
+        let continues =
+            i > 0 && (is_combining_mark(ch_at(p)) || ch_at(positions[i - 1]) == GLYPH_JOINER);
+        if !continues {
             clusters.push((i, i + 1));
         } else if let Some(last) = clusters.last_mut() {
             last.1 = i + 1;
@@ -870,6 +911,42 @@ mod tests {
         assert_eq!(paired_bracket('\u{2329}'), Some(('\u{3008}', true)));
         assert_eq!(paired_bracket('\u{3009}'), Some(('\u{3008}', false)));
         assert_eq!(paired_bracket('\u{00AB}'), None);
+    }
+
+    #[test]
+    fn the_characters_of_one_glyph_stay_together_through_the_read_back() {
+        // A lam-alef glyph decoded as its two letters, joined: turned round
+        // as one cluster, it keeps the order its letters were named in.
+        assert!(is_combining_mark(GLYPH_JOINER));
+        let mut lam_alef = String::new();
+        push_glyph_characters(&mut lam_alef, "\u{0644}\u{0627}");
+        assert_eq!(lam_alef, "\u{0644}\u{034F}\u{0627}");
+        // Displayed left to right: the lam-alef glyph, then heh — the word
+        // heh, lam, alef.
+        let display = format!("{lam_alef}\u{0647}");
+        let logical = format!("\u{0647}{lam_alef}");
+        assert_eq!(logical_text(&display, true), logical);
+        assert_eq!(logical_to_visual(&logical, true), display);
+        // Embedded in a left-to-right paragraph as well.
+        assert_eq!(
+            logical_text(&format!("a {display} b"), false),
+            format!("a {logical} b")
+        );
+        // Without the joiner the two letters change places.
+        assert_eq!(
+            logical_text("\u{0644}\u{0627}\u{0647}", true),
+            "\u{0647}\u{0627}\u{0644}"
+        );
+        // Latin ligature letters, a fraction and single characters are not
+        // joined.
+        for label in ["fi", "1/2", "\u{0627}", "a", ""] {
+            let mut out = String::new();
+            push_glyph_characters(&mut out, label);
+            assert_eq!(out, label);
+        }
+        let mut text = logical.clone();
+        strip_glyph_joiners(&mut text);
+        assert_eq!(text, "\u{0647}\u{0644}\u{0627}");
     }
 
     #[test]

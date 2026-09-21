@@ -25,7 +25,6 @@ Changes since 1.22.1.
   back into the document. The Rust-only `widen_degenerate_form_bboxes_mem`
   (the Python, Node and WebAssembly bindings do not expose it) hands the
   repaired bytes to callers that render elsewhere, as for a zero-area box.
-
 - Right-to-left text whose runs are shown in reading order — right to left
   across the line, one text object per run — while each run's glyphs are
   stored in visual order with forward advances now reads forwards; every
@@ -39,6 +38,31 @@ Changes since 1.22.1.
   display backwards, and such a page now reads as visual storage like any
   other visible page.
   ([#561](https://github.com/firecrawl/pdf-inspector/pull/561))
+- A simple font whose glyphs were re-encoded — a re-distilled file gives
+  the glyphs of its Type1C subsets new codes from 33 upwards, named in
+  `/Differences` (`uni0628.i`, `uni064A.m`, `five.tnum`) — but which kept
+  the original font's ToUnicode CMap reads those codes by their names. The
+  old CMap won wherever a new code landed on a slot it maps, so a letter at
+  a bracket slot read as the bracket (mirrored, as a CMap written for a
+  right-to-left line describes it), a five at the apostrophe slot as `’`, a
+  letter the old CMap never mapped at all as its ASCII slot, and a mark
+  glyph whose name spells no character (`arHamzaAboveCCMP`) as a stray `i`.
+  The existing repair of such fonts now takes a mirrored bracket or the
+  StandardEncoding character of a slot as the slot's own entry, accepts a
+  CMap most of whose codes lie outside the font's `FirstChar`..`LastChar`
+  range as proof that it is stale (besides the three corroborated letters
+  it required), and once the CMap is proven stale repairs every such slot
+  whose name reads as a letter outside ASCII, a ligature, or an ASCII
+  letter or digit other than the slot's — or as nothing, for a name that
+  spells no character. A font whose CMap agrees with its Differences is
+  untouched.
+- A code that reads as several characters of a right-to-left script — a
+  ligature glyph named `uni06440627` (lam-alef), or mapped to two code
+  points by the ToUnicode CMap — came out with those characters reversed on
+  a page whose text is stored in visual order: the read-back into logical
+  order turned every character round on its own. The characters one glyph
+  reads as are now turned round together and keep the order they were
+  named in.
 
 ## [1.22.1] - 2026-09-20
 

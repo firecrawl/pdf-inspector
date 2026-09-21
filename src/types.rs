@@ -35,7 +35,13 @@ pub(crate) enum BaseEncoding {
 /// Explicit glyph encodings and narrowly verified repairs for a stale CMap.
 pub(crate) struct FontEncoding {
     pub(crate) differences: FontEncodingMap,
-    pub(crate) identity_overrides: FontEncodingMap,
+    /// Codes whose entry in a stale ToUnicode CMap describes the slot's
+    /// original occupant rather than the glyph the font's `/Differences`
+    /// put there, and what that glyph reads as by its name: a character,
+    /// the letters of a ligature, or nothing (an empty string) for a glyph
+    /// whose name spells no character (see
+    /// `fonts::stale_identity_cmap_overrides`).
+    pub(crate) identity_overrides: HashMap<u8, String>,
     /// Codes whose embedded glyph has no outline but a positive advance:
     /// painted, they leave a gap and nothing else, so they read as spaces
     /// whatever the font's ToUnicode claims (see `blank_glyph_codes`).
