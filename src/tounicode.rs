@@ -687,7 +687,9 @@ impl ToUnicodeCMap {
     /// of case or of script, at the edge of the mapped codes or beside an
     /// entry of several characters is never read.
     ///
-    /// The gaps are read from the table [`Self::refresh_gap_fills`] built.
+    /// The gaps are read from the table [`Self::refresh_gap_fills`] built,
+    /// which a single-byte CMap never has: no gap is read into one (see
+    /// [`CidDecodeStats::interpolated`]).
     pub fn gap_fill(&self, cid: u16) -> Option<char> {
         self.gap_fills.get(&cid).copied()
     }
@@ -698,10 +700,15 @@ impl ToUnicodeCMap {
     /// CMap through its public fields must call it before decoding. It also
     /// puts `ranges` in the order of their first codes, which
     /// [`Self::lookup`] searches them in, so entries a caller pushed in any
-    /// order are found.
+    /// order are found. A single-byte CMap gets an empty table: gaps are
+    /// read into two-byte CMaps only.
     pub fn refresh_gap_fills(&mut self) {
         self.ranges.sort_unstable_by_key(|&(start, _, _)| start);
-        self.gap_fills = self.compute_gap_fills();
+        self.gap_fills = if self.code_byte_length == 2 {
+            self.compute_gap_fills()
+        } else {
+            HashMap::new()
+        };
     }
 
     /// The maximal runs of consecutive mapped codes, as `(first, last)`,
@@ -3570,6 +3577,21 @@ endbfchar
         // With both runs rising code after code the gap reads.
         let cmap = cmap_of_entries(&[(10, "A"), (11, "B"), (12, "C"), (14, "E"), (15, "F")]);
         assert_eq!(cmap.gap_fill(13), Some('D'));
+    }
+
+    #[test]
+    fn a_single_byte_cmap_reads_no_gaps() {
+        // The same entries either side of a gap: read into a two-byte CMap,
+        // never into a single-byte one, whose unmapped bytes stand in for
+        // themselves.
+        for (byte_length, filled) in [(2u8, Some('B')), (1u8, None)] {
+            let mut cmap = ToUnicodeCMap::new();
+            cmap.code_byte_length = byte_length;
+            cmap.char_map.insert(0x41, "A".to_string());
+            cmap.char_map.insert(0x43, "C".to_string());
+            cmap.refresh_gap_fills();
+            assert_eq!(cmap.gap_fill(0x42), filled, "{byte_length}-byte CMap");
+        }
     }
 
     #[test]
