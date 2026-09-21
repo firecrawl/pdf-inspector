@@ -1,0 +1,27 @@
+src/extractor/fonts.rs
+  s_cc307d8834d01f::t_60beba9c7e234a 2331-2346,2352
+  s_cc307d8834d01f::t_eb848cd3dd65ef 2369
+  s_cc307d8834d01f::t_bb2f55c9b0a30a 5687-5748
+  s_cc307d8834d01f::t_cec4620e7e1b79 2381
+src/tounicode.rs
+  s_cc307d8834d01f::t_c297fd44ac0aab 177-188,200-202,206-210
+  s_cc307d8834d01f::t_56e7610f19122c 322-332,342-344,350-353,355-362,384-409,412
+  s_cc307d8834d01f::t_e537fadac64f67 4037-4060,4062-4085
+  s_cc307d8834d01f::t_9b02ee7323a7ea 410-411,413,4061
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cddcb25058ee75e9583c6358893606293c8048d9",
+  "prompts": {},
+  "sessions": {
+    "s_cc307d8834d01f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2e3a83c4-2606-4dbf-ae45-ae99049b6b51",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
