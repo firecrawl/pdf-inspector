@@ -30,6 +30,11 @@ pub(super) struct ExecutedContent {
     /// Those of `text_ops` that left nothing to see: run under text render
     /// mode 3, or under mode 7 with nothing painted through the clip.
     pub(super) hidden_text_ops: u32,
+    /// Whether an image draw — an image XObject, an inline image or a
+    /// path painted with a tiling pattern that draws one — landed within
+    /// the clip in force: the page shows an image, whatever its resources
+    /// bind.
+    pub(super) draws_image: bool,
     /// Whether the images drawn cover at least
     /// `COVERING_IMAGE_MIN_PAGE_FRACTION` of the visible page box.
     pub(super) covers_page: bool,
@@ -134,7 +139,8 @@ pub(super) struct ContentCounts {
     /// Text-showing operators (`Tj`, `TJ`, `'`, `"`), whatever their render
     /// mode.
     pub(super) text_ops: u32,
-    /// Image XObjects among the resources scanned.
+    /// Image XObjects among the resources scanned, and inline images among
+    /// the operators.
     pub(super) image_count: u32,
     /// Path construction and painting operators.
     pub(super) path_ops: u32,
@@ -263,6 +269,8 @@ struct ContentScanState<'a> {
     pattern_verdicts: HashMap<ObjectId, bool>,
     /// Whether an image was drawn at all, wherever it fell.
     drew_image: bool,
+    /// Whether an image draw landed within the clip in force.
+    drew_image_on_page: bool,
     /// Mode-7 text-showing operators whose clip was set at the current
     /// level and has not been painted through; those set at outer levels
     /// sit in `saved`.
@@ -324,6 +332,7 @@ impl<'a> ContentScanState<'a> {
             follow_patterns: true,
             pattern_verdicts: HashMap::new(),
             drew_image: false,
+            drew_image_on_page: false,
             clip_text_ops: 0,
             pending_clip_text_ops: 0,
             clip_text_ops_open: 0,
@@ -492,8 +501,26 @@ impl<'a> ContentScanState<'a> {
             return;
         };
         self.drew_image = true;
+        self.drew_image_on_page = true;
         self.own_image_area += painted.area();
         self.mark_cells(&painted);
+    }
+
+    /// Whether the clip in force has any extent for a paint to land in.
+    fn clip_is_open(&self) -> bool {
+        self.clip.area() > 0.0
+    }
+
+    /// Whether the path under construction reaches into the clip in force
+    /// — a stroked line has no area, so touching is enough.
+    fn path_touches_clip(&self) -> bool {
+        self.clip_is_open()
+            && self.path_box.is_some_and(|path| {
+                path.x0 <= self.clip.x1
+                    && path.x1 >= self.clip.x0
+                    && path.y0 <= self.clip.y1
+                    && path.y1 >= self.clip.y0
+            })
     }
 
     /// Whether the pattern `name` names in the first of `resources`
@@ -550,14 +577,18 @@ impl<'a> ContentScanState<'a> {
     /// square under the matrix in force, of which the part within the clip
     /// in force counts.
     fn image_drawn(&mut self) {
-        self.painted();
         self.drew_image = true;
         let Some(drawn) = self.transformed_box([0.0, 0.0, 1.0, 1.0]) else {
             return;
         };
+        // Only a draw that lands within the clip in force paints anything:
+        // an image off the page, or clipped away, shows no clip-only text
+        // through it.
         let Some(on_page) = drawn.intersect(&self.clip) else {
             return;
         };
+        self.painted();
+        self.drew_image_on_page = true;
         let [a, b, c, d, _, _] = self.ctm;
         self.own_image_area += (a * d - b * c).abs().min(on_page.area());
         self.mark_cells(&on_page);
@@ -698,6 +729,7 @@ impl<'a> ContentScanState<'a> {
         ExecutedContent {
             text_ops: self.executed_text_ops,
             hidden_text_ops: self.executed_hidden_text_ops,
+            draws_image: self.drew_image_on_page,
             covers_page: self.covers_page(),
             shows_only_a_hidden_text_layer: self.shows_only_a_hidden_text_layer(),
         }
@@ -954,11 +986,16 @@ fn scan_content_stream<'a>(
                 }
             }
         } else if token_at(i, b"sh") {
-            // sh = paint a shading.
-            state.painted();
+            // sh = paint a shading, over the clip in force — nothing when
+            // the clip has no extent.
+            if state.clip_is_open() {
+                state.painted();
+            }
         } else if token_at(i, b"BI") {
             // BI = begin an inline image, which paints the unit square
-            // under the matrix in force as an image XObject does.
+            // under the matrix in force as an image XObject does, and is
+            // an image of the page as one bound in its resources is.
+            counts.image_count += 1;
             state.image_drawn();
         } else if token_at(i, b"ET") {
             // ET = end a text object: its clip-only text's clip takes effect.
@@ -1088,7 +1125,8 @@ fn scan_content_stream<'a>(
             }
             _ => {}
         }
-        if painted {
+        // A path painted off the page, or clipped away, paints nothing.
+        if painted && state.path_touches_clip() {
             state.painted();
         }
         if (fills && state.fill_paints_image) || (strokes && state.stroke_paints_image) {

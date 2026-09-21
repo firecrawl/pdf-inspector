@@ -2627,7 +2627,7 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
         let mut xobjects = String::new();
         let mut content = String::new();
         let draws = page.covering_image || page.image_after_layer;
-        if draws && !page.large_image {
+        if draws && !page.large_image && !page.inline_image {
             xobjects.push_str(&format!(" /Im0 {image} 0 R"));
         }
         if page.spare_large_image || (draws && page.large_image) {
@@ -3090,6 +3090,23 @@ fn test_inline_image_raster_covers_the_page() {
         pages.pages[0].ocr_reason.as_deref(),
         Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
     );
+
+    // The inline image alone, with no text at all, is a scan — the page
+    // has an image though its resources bind none.
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        inline_image: true,
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Scanned);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_SCANNED.to_string()])
+    );
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Scanned);
 }
 
 /// A scan tiled into two thousand strips covers the page as one draw

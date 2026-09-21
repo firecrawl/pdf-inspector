@@ -861,9 +861,11 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let path_ops = counts.path_ops;
     let font_changes = counts.font_changes;
 
-    // Check for XObject images and calculate coverage
+    // Check for XObject images and calculate coverage. An image the
+    // content drew — an inline image, or one a pattern's cell draws — is
+    // an image of the page too, whatever its resources bind.
     let (found_images, total_image_area, has_template_image) = analyze_page_images(doc, page_id);
-    let has_images = image_count > 0 || found_images;
+    let has_images = image_count > 0 || found_images || executed.draws_image;
 
     // The images the page's content drew — in its own streams and in the
     // forms they invoke, each draw clipped to the page — cover the page

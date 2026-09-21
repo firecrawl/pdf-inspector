@@ -2,7 +2,10 @@
 //! signal `analyze_page_content` builds on it.
 
 use super::super::content_mask::inline_image_data_bound;
-use super::super::{analyze_page_content, page_ocr_reasons, page_ocr_signals};
+use super::super::{
+    analyze_page_content, detect_from_document, page_ocr_reasons, page_ocr_signals,
+    DetectionConfig, PdfType,
+};
 use super::*;
 
 /// A scan of `content` on its own — no page, nothing followed through
@@ -335,6 +338,11 @@ fn synthetic_page_with_patterns(
             "Count" => Object::Integer(1),
         }),
     );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog_id));
     (doc, page_id, content_id)
 }
 
@@ -415,14 +423,16 @@ fn clip_only_text_painted_through_is_visible() {
     assert_eq!((executed_ops, hidden), (2, 0));
     assert!(close(covered, PAGE_AREA));
 
-    // Shadings, inline images, path painting and visible text show it
-    // too; mode 3 is never shown, whatever is painted after it.
+    // Shadings, inline images, path painting (of a path that lands on
+    // the page: a painting operator with no path paints nothing) and
+    // visible text show it too; mode 3 is never shown, whatever is
+    // painted after it.
     for painting in [
         "sh",
         "BI /W 1 /H 1 ID x EI",
         "0 0 1 1 re f",
         "0 0 m 1 1 l S",
-        "b",
+        "0 0 m 1 1 l 2 0 l b",
         "BT 0 Tr (v) Tj ET",
     ] {
         let content = format!("q BT 7 Tr (a) Tj ET {painting} Q BT 3 Tr (b) Tj ET {painting}");
@@ -1178,4 +1188,81 @@ fn a_tiling_pattern_that_draws_an_image_paints_coverage() {
     let analysis = analyze_page_content(&doc, page_id);
     assert!(analysis.has_covering_image);
     assert!(analysis.has_invisible_text_layer);
+}
+
+#[test]
+fn an_inline_image_alone_makes_an_image_page() {
+    // No image XObject anywhere: the page's only raster is inline.
+    let (mut doc, page_id, content_id) = synthetic_page(false, false, &[]);
+    let raster = "q 612 0 0 792 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q\n";
+
+    // Under a hidden layer, an image page with a text layer nobody sees,
+    // for the document and for the page alike.
+    set_page_content(&mut doc, content_id, &format!("{raster}{}", glyph_layer(3)));
+    let analysis = analyze_page_content(&doc, page_id);
+    assert!(analysis.has_images);
+    assert_eq!(analysis.image_count, 1);
+    assert!(analysis.has_invisible_text_layer);
+    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    assert!(page_ocr_signals(&doc, page_id).has_invisible_text_layer);
+
+    // With no text at all, a scan.
+    set_page_content(&mut doc, content_id, raster);
+    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Scanned);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![crate::OCR_REASON_SCANNED.to_string()])
+    );
+}
+
+#[test]
+fn a_draw_off_the_page_or_clipped_away_reveals_nothing() {
+    let (doc, page_id, _) = synthetic_page(true, false, &[]);
+    let run = |content: &str| executed(&doc, page_id, &[content]);
+    let clip_text = "BT /F1 10 Tf 7 Tr (a) Tj ET";
+
+    // An image drawn off the page, an XObject or an inline one, and a
+    // fill or a shading that the clip in force leaves nothing of: the
+    // clip-only text stays hidden.
+    for painting in [
+        "q 612 0 0 792 700 0 cm /Im0 Do Q",
+        "q 612 0 0 792 700 0 cm BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q",
+        "q 0 0 10 10 re W n 500 500 50 50 re f Q",
+        "q W n sh Q",
+        "q W n 0 0 612 792 re f Q",
+    ] {
+        let (executed_ops, hidden, _) = run(&format!("{clip_text} {painting}"));
+        assert_eq!((executed_ops, hidden), (1, 1), "{painting}");
+    }
+    // Landing within the clip, each of them shows the text through.
+    for painting in [
+        "q 612 0 0 792 0 0 cm /Im0 Do Q",
+        "q 612 0 0 792 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q",
+        "q 0 0 10 10 re W n 5 5 50 50 re f Q",
+        "q 0 0 10 10 re W n 0 0 m 100 100 l S Q",
+        "sh",
+    ] {
+        let (executed_ops, hidden, _) = run(&format!("{clip_text} {painting}"));
+        assert_eq!((executed_ops, hidden), (1, 0), "{painting}");
+    }
+
+    // A hidden layer over a covering image stays one when an off-page
+    // draw follows.
+    let (mut doc, page_id, content_id) = synthetic_page(true, false, &[]);
+    set_page_content(
+        &mut doc,
+        content_id,
+        &format!(
+            "{FULL_PAGE_IMAGE}{}q 612 0 0 792 700 0 cm /Im0 Do Q",
+            glyph_layer(7)
+        ),
+    );
+    assert!(analyze_page_content(&doc, page_id).has_invisible_text_layer);
 }
