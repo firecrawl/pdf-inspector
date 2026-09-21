@@ -2561,6 +2561,9 @@ struct GlyphLayerPage {
     /// Filled subpaths of five path operators each, painted before the
     /// layer, as outlined glyphs would be.
     vector_paths: usize,
+    /// Draw the covering image as this many horizontal strips instead of
+    /// one draw; 0 for one draw.
+    image_strips: usize,
     /// Show the layer with the `'` and `"` operators instead of `Tj`.
     quote_operators: bool,
     /// Wrap the body text in marked content whose property list has an
@@ -2625,7 +2628,17 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
             page.image_dx,
             if page.large_image { "ImBig" } else { "Im0" }
         );
-        if page.covering_image {
+        if page.covering_image && page.image_strips > 0 {
+            let strip = 792.0 / page.image_strips as f64;
+            for k in 0..page.image_strips {
+                content.push_str(&format!(
+                    "q 612 0 0 {strip} {} {} cm /{} Do Q\n",
+                    page.image_dx,
+                    k as f64 * strip,
+                    if page.large_image { "ImBig" } else { "Im0" }
+                ));
+            }
+        } else if page.covering_image {
             content.push_str(&draw_image);
         }
         for _ in 0..page.vector_paths {
@@ -2761,6 +2774,7 @@ const SCAN_WITH_INVISIBLE_LAYER: GlyphLayerPage = GlyphLayerPage {
     invoke_form: false,
     image_after_layer: false,
     vector_paths: 0,
+    image_strips: 0,
     quote_operators: false,
     marked_content_id: false,
     caption: None,
@@ -2941,6 +2955,28 @@ fn test_resources_bound_but_unused_are_not_evidence() {
     );
     let pages = extract_pages_markdown_mem(&buf, None).unwrap();
     assert!(pages.pages[0].needs_ocr);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+}
+
+/// A scan tiled into two thousand strips covers the page as one draw
+/// does: the hidden layer over it is a layer nobody sees.
+#[test]
+fn test_scan_tiled_into_strips_is_covered() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        image_strips: 2000,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
     assert_eq!(
         pages.pages[0].ocr_reason.as_deref(),
         Some(OCR_REASON_INVISIBLE_TEXT_LAYER)

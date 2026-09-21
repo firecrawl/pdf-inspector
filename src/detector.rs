@@ -9,6 +9,7 @@ use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 
 /// PDF type classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1887,11 +1888,17 @@ impl ContentCounts {
 /// keeps the innermost state, and its `Q`s restore nothing.
 const SCAN_STATE_MAX_DEPTH: usize = 256;
 
-/// How many Form XObjects one page's scan follows through `Do`, each once.
-const FOLLOWED_FORMS_MAX: usize = 1_000;
+/// How many form invocations one page's scan follows through `Do`. Past
+/// it, content goes unread and the page's evidence is incomplete.
+const FORM_INVOCATIONS_MAX: usize = 1_000;
 
-/// How many image draws one page's scan keeps for its coverage.
-const IMAGE_DRAWS_MAX: usize = 1_024;
+/// How many decompressed bytes of form content one page's scan keeps for
+/// forms invoked again.
+const FORM_CONTENT_CACHE_MAX_BYTES: usize = 8 << 20;
+
+/// Cells per side of the grid the images drawn are tallied on, over the
+/// visible page box: 64 × 64 cells, one row per `u64`.
+const COVERAGE_GRID: usize = 64;
 
 /// A box in user space, `x0 <= x1` and `y0 <= y1`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1919,52 +1926,6 @@ impl UserBox {
     }
 }
 
-/// One image a page's content drew: its bounding box clipped to the page,
-/// and its own area under the matrix in force, which the box exceeds when
-/// the image is turned.
-#[derive(Clone, Copy)]
-struct ImageDraw {
-    on_page: UserBox,
-    own_area: f64,
-}
-
-/// The area the boxes cover together, overlaps counted once.
-fn union_area(draws: &[ImageDraw]) -> f64 {
-    let mut xs: Vec<f64> = draws
-        .iter()
-        .flat_map(|draw| [draw.on_page.x0, draw.on_page.x1])
-        .collect();
-    xs.sort_by(f64::total_cmp);
-    xs.dedup();
-    let mut total = 0.0;
-    for slab in xs.windows(2) {
-        let (x0, x1) = (slab[0], slab[1]);
-        let mut spans: Vec<(f64, f64)> = draws
-            .iter()
-            .filter(|draw| draw.on_page.x0 <= x0 && draw.on_page.x1 >= x1)
-            .map(|draw| (draw.on_page.y0, draw.on_page.y1))
-            .collect();
-        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut covered = 0.0;
-        let mut open: Option<(f64, f64)> = None;
-        for (y0, y1) in spans {
-            match open {
-                Some((o0, o1)) if y0 <= o1 => open = Some((o0, o1.max(y1))),
-                Some((o0, o1)) => {
-                    covered += o1 - o0;
-                    open = Some((y0, y1));
-                }
-                None => open = Some((y0, y1)),
-            }
-        }
-        if let Some((o0, o1)) = open {
-            covered += o1 - o0;
-        }
-        total += covered * (x1 - x0);
-    }
-    total
-}
-
 /// What `q` saves of the state the scan follows.
 #[derive(Clone, Copy)]
 struct SavedScanState {
@@ -1981,17 +1942,23 @@ struct SavedScanState {
 ///
 /// One state runs through a page's content streams, which the PDF reads
 /// as one, and — when it follows `Do` — through the Form XObjects they
-/// invoke, each once, with the state in force at the invocation, the
-/// form's `/Matrix` applied and the form's own changes undone afterwards,
-/// as a renderer runs them. It tallies what the page executes: its
-/// text-showing operators, those of them that leave nothing to see, and
-/// the images it draws. A scan that follows no `Do` only counts.
+/// invoke, at each invocation, with the state in force there, the form's
+/// `/Matrix` applied, its `/BBox` clipping what it draws and the form's
+/// own changes undone afterwards, as a renderer runs them; a form
+/// invoking itself is not run again, and past `FORM_INVOCATIONS_MAX`
+/// invocations the rest goes unread. It tallies what the page executes:
+/// its text-showing operators, those of them that leave nothing to see,
+/// and the page cells the images it draws cover. A scan that follows no
+/// `Do` only counts.
 struct ContentScanState<'a> {
     doc: &'a Document,
-    /// The visible page box, which image draws are clipped to.
+    /// The visible page box, which the coverage grid spans.
     page: UserBox,
+    /// The clip in force for image draws: the page box, narrowed by the
+    /// boxes of the forms being run.
+    clip: UserBox,
     /// Whether `Do` is followed: images drawn are measured and forms are
-    /// scanned in place.
+    /// run in place.
     follow_do: bool,
     render_mode: u8,
     ctm: [f64; 6],
@@ -2016,22 +1983,36 @@ struct ContentScanState<'a> {
     /// Those of `executed_text_ops` that left nothing to see: mode 3, or
     /// mode 7 with nothing painted through its clip.
     executed_hidden_text_ops: u32,
-    /// The images drawn, up to `IMAGE_DRAWS_MAX`.
-    image_draws: Vec<ImageDraw>,
-    /// The forms followed so far, each scanned once.
-    followed_forms: HashSet<ObjectId>,
+    /// The grid cells whose centres an image draw covered, one bit per
+    /// cell, a row per word.
+    covered_cells: [u64; COVERAGE_GRID],
+    /// The images' own areas on the page added up, each no more than its
+    /// box there — a turned image's box would overstate it.
+    own_image_area: f64,
+    /// The forms being run, innermost last.
+    active_forms: Vec<ObjectId>,
+    /// Form invocations followed so far, against `FORM_INVOCATIONS_MAX`.
+    form_invocations: usize,
+    /// Whether content went unread — the invocation budget or the depth
+    /// cap ran out — so that the page's evidence is incomplete.
+    incomplete: bool,
+    /// Decompressed form content by object, for forms invoked again.
+    form_content: HashMap<ObjectId, Rc<Vec<u8>>>,
+    form_content_bytes: usize,
 }
 
 impl<'a> ContentScanState<'a> {
     fn new(doc: &'a Document, page_box: PageBox, follow_do: bool) -> Self {
+        let page = UserBox {
+            x0: f64::from(page_box.x0),
+            y0: f64::from(page_box.y0),
+            x1: f64::from(page_box.x1),
+            y1: f64::from(page_box.y1),
+        };
         Self {
             doc,
-            page: UserBox {
-                x0: f64::from(page_box.x0),
-                y0: f64::from(page_box.y0),
-                x1: f64::from(page_box.x1),
-                y1: f64::from(page_box.y1),
-            },
+            page,
+            clip: page,
             follow_do,
             render_mode: 0,
             ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
@@ -2043,8 +2024,13 @@ impl<'a> ContentScanState<'a> {
             stack_floor: 0,
             executed_text_ops: 0,
             executed_hidden_text_ops: 0,
-            image_draws: Vec::new(),
-            followed_forms: HashSet::new(),
+            covered_cells: [0; COVERAGE_GRID],
+            own_image_area: 0.0,
+            active_forms: Vec::new(),
+            form_invocations: 0,
+            incomplete: false,
+            form_content: HashMap::new(),
+            form_content_bytes: 0,
         }
     }
 
@@ -2090,6 +2076,24 @@ impl<'a> ContentScanState<'a> {
         ];
     }
 
+    /// The bounding box of `[x0 y0 x1 y1]` under the matrix in force;
+    /// `None` when it is not finite.
+    fn transformed_box(&self, [x0, y0, x1, y1]: [f64; 4]) -> Option<UserBox> {
+        let [a, b, c, d, e, f] = self.ctm;
+        let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+        let xs = corners.map(|(x, y)| a * x + c * y + e);
+        let ys = corners.map(|(x, y)| b * x + d * y + f);
+        if !xs.iter().chain(&ys).all(|v| v.is_finite()) {
+            return None;
+        }
+        Some(UserBox {
+            x0: xs.iter().copied().fold(f64::INFINITY, f64::min),
+            y0: ys.iter().copied().fold(f64::INFINITY, f64::min),
+            x1: xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            y1: ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        })
+    }
+
     /// A text-showing operator ran. In mode 3 it left nothing to see; in
     /// mode 7 nothing yet — from the text object's `ET` on, its glyphs clip
     /// whatever is painted, until the `Q` closing its level; in any other
@@ -2128,86 +2132,133 @@ impl<'a> ContentScanState<'a> {
     }
 
     /// `Do` of an image: it paints the unit square under the matrix in
-    /// force, of which the part on the page counts.
+    /// force, of which the part within the clip in force counts.
     fn image_drawn(&mut self) {
         self.painted();
-        let [a, b, c, d, e, f] = self.ctm;
-        let xs = [e, a + e, c + e, a + c + e];
-        let ys = [f, b + f, d + f, b + d + f];
-        if !xs.iter().chain(&ys).all(|v| v.is_finite()) {
+        let Some(drawn) = self.transformed_box([0.0, 0.0, 1.0, 1.0]) else {
+            return;
+        };
+        let Some(on_page) = drawn.intersect(&self.clip) else {
+            return;
+        };
+        let [a, b, c, d, _, _] = self.ctm;
+        self.own_image_area += (a * d - b * c).abs().min(on_page.area());
+        self.mark_cells(&on_page);
+    }
+
+    /// Mark the grid cells whose centres lie within `on_page`.
+    fn mark_cells(&mut self, on_page: &UserBox) {
+        let cells = COVERAGE_GRID as f64;
+        let cell_w = (self.page.x1 - self.page.x0) / cells;
+        let cell_h = (self.page.y1 - self.page.y0) / cells;
+        let first_col = ((on_page.x0 - self.page.x0) / cell_w - 0.5).ceil().max(0.0);
+        let last_col = ((on_page.x1 - self.page.x0) / cell_w - 0.5)
+            .floor()
+            .min(cells - 1.0);
+        let first_row = ((on_page.y0 - self.page.y0) / cell_h - 0.5).ceil().max(0.0);
+        let last_row = ((on_page.y1 - self.page.y0) / cell_h - 0.5)
+            .floor()
+            .min(cells - 1.0);
+        if last_col < first_col || last_row < first_row {
             return;
         }
-        let drawn = UserBox {
-            x0: xs.iter().copied().fold(f64::INFINITY, f64::min),
-            y0: ys.iter().copied().fold(f64::INFINITY, f64::min),
-            x1: xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-            y1: ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        let (first_col, last_col) = (first_col as usize, last_col as usize);
+        let width = last_col - first_col + 1;
+        let mask = if width >= COVERAGE_GRID {
+            u64::MAX
+        } else {
+            ((1u64 << width) - 1) << first_col
         };
-        if let Some(on_page) = drawn.intersect(&self.page) {
-            if self.image_draws.len() < IMAGE_DRAWS_MAX {
-                self.image_draws.push(ImageDraw {
-                    on_page,
-                    own_area: (a * d - b * c).abs(),
-                });
-            }
+        for row in first_row as usize..=last_row as usize {
+            self.covered_cells[row] |= mask;
         }
     }
 
-    /// `Do` of a form: run in place, once, as a renderer runs it — under
-    /// the state in force, with its `/Matrix` applied and its own changes
-    /// undone afterwards. Its names resolve in its own resources first,
-    /// then in its invoker's.
+    /// `Do` of a form: run in place, as a renderer runs it — under the
+    /// state in force, with its `/Matrix` applied, its `/BBox` clipping
+    /// what it draws, and its own changes undone afterwards. Its names
+    /// resolve in its own resources first, then in its invoker's. A form
+    /// whose box lies outside the clip in force shows nothing and is not
+    /// read; a form invoking itself, directly or through others, is not
+    /// run again; past the invocation budget or the depth cap the form
+    /// goes unread and the page's evidence is incomplete.
     fn form_drawn(
         &mut self,
         id: ObjectId,
         form: &'a lopdf::Stream,
         invoker_resources: &[&'a lopdf::Dictionary],
     ) {
-        if self.followed_forms.len() >= FOLLOWED_FORMS_MAX
-            || self.saved.len() >= SCAN_STATE_MAX_DEPTH
-            || !self.followed_forms.insert(id)
-        {
+        if self.active_forms.contains(&id) {
             return;
         }
-        let content = form
-            .decompressed_content()
-            .unwrap_or_else(|_| form.content.clone());
-        let mut resources = Vec::with_capacity(invoker_resources.len() + 1);
-        resources.extend(stream_resources(self.doc, form));
-        resources.extend_from_slice(invoker_resources);
+        if self.form_invocations >= FORM_INVOCATIONS_MAX || self.saved.len() >= SCAN_STATE_MAX_DEPTH
+        {
+            self.incomplete = true;
+            return;
+        }
+        self.form_invocations += 1;
 
+        let outer_clip = self.clip;
         let outer_floor = self.stack_floor;
         self.save();
         let base = self.saved.len();
         self.stack_floor = base;
-        if let Some(matrix) = form_matrix(self.doc, form) {
+        if let Some(matrix) = numbers_of(self.doc, &form.dict, b"Matrix") {
             self.concat(matrix);
         }
-        scan_content_stream(
-            &content,
-            &mut HashSet::new(),
-            &mut HashSet::new(),
-            self,
-            &resources,
-        );
+        let clip = match numbers_of(self.doc, &form.dict, b"BBox") {
+            Some(bbox) => self
+                .transformed_box(bbox)
+                .and_then(|drawn| drawn.intersect(&self.clip)),
+            None => Some(self.clip),
+        };
+        if let Some(clip) = clip {
+            self.clip = clip;
+            let content = self.form_content(id, form);
+            let mut resources = Vec::with_capacity(invoker_resources.len() + 1);
+            resources.extend(stream_resources(self.doc, form));
+            resources.extend_from_slice(invoker_resources);
+            self.active_forms.push(id);
+            scan_content_stream(
+                &content,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                self,
+                &resources,
+            );
+            self.active_forms.pop();
+        }
         // Levels the form left open close with it.
         while self.unsaved_depth > 0 || self.saved.len() > base {
             self.restore();
         }
         self.stack_floor = outer_floor;
         self.restore();
+        self.clip = outer_clip;
     }
 
-    /// The page area the images drawn cover: the union of their boxes on
-    /// the page, and no more than their own areas add up to, since a
-    /// turned image's box exceeds it.
+    /// A form's content, decompressed once per page while the cache lasts.
+    fn form_content(&mut self, id: ObjectId, form: &lopdf::Stream) -> Rc<Vec<u8>> {
+        if let Some(content) = self.form_content.get(&id) {
+            return Rc::clone(content);
+        }
+        let content = Rc::new(
+            form.decompressed_content()
+                .unwrap_or_else(|_| form.content.clone()),
+        );
+        if self.form_content_bytes + content.len() <= FORM_CONTENT_CACHE_MAX_BYTES {
+            self.form_content_bytes += content.len();
+            self.form_content.insert(id, Rc::clone(&content));
+        }
+        content
+    }
+
+    /// The page area the images drawn cover: the cells they covered, to
+    /// the grid's resolution, and no more than their own areas add up to.
     fn covered_image_area(&self) -> f64 {
-        let own: f64 = self
-            .image_draws
-            .iter()
-            .map(|draw| draw.own_area.min(draw.on_page.area()))
-            .sum();
-        union_area(&self.image_draws).min(own)
+        let cells: u32 = self.covered_cells.iter().map(|row| row.count_ones()).sum();
+        let cell_area = self.page.area() / (COVERAGE_GRID * COVERAGE_GRID) as f64;
+        (f64::from(cells) * cell_area).min(self.own_image_area)
     }
 
     /// Whether the images drawn cover the page: at least
@@ -2217,11 +2268,12 @@ impl<'a> ContentScanState<'a> {
     }
 
     /// Whether every text-showing operator executed left nothing to see
-    /// while the images drawn cover the page: the raster is all the page
+    /// while the images drawn cover the page — the raster is all the page
     /// shows, and the text layer describes it rather than being its
-    /// content.
+    /// content — and nothing went unread that could say otherwise.
     fn shows_only_a_hidden_text_layer(&self) -> bool {
-        self.executed_text_ops > 0
+        !self.incomplete
+            && self.executed_text_ops > 0
             && self.executed_hidden_text_ops == self.executed_text_ops
             && self.covers_page()
     }
@@ -2254,12 +2306,15 @@ fn resolve_xobject<'a>(
         let Ok(Object::Stream(stream)) = doc.get_object(id) else {
             return None;
         };
-        return match stream
-            .dict
-            .get(b"Subtype")
-            .ok()
-            .and_then(|subtype| subtype.as_name().ok())
-        {
+        // `/Subtype` may be held by reference; one that does not resolve
+        // to a name leaves the stream neither image nor form, as the
+        // resource walks leave it.
+        let subtype = match stream.dict.get(b"Subtype").ok()? {
+            Object::Name(name) => Some(name.as_slice()),
+            Object::Reference(id) => doc.get_object(*id).ok().and_then(|o| o.as_name().ok()),
+            _ => None,
+        };
+        return match subtype {
             Some(b"Image") => Some(XObjectDrawn::Image),
             Some(b"Form") => Some(XObjectDrawn::Form(id, stream)),
             _ => None,
@@ -2280,25 +2335,31 @@ fn stream_resources<'a>(
     }
 }
 
-/// A form's `/Matrix`, when it holds six numbers.
-fn form_matrix(doc: &Document, form: &lopdf::Stream) -> Option<[f64; 6]> {
-    let array = match form.dict.get(b"Matrix").ok()? {
+/// The `N` numbers of `dict`'s `key` — a form's `/Matrix` or `/BBox` —
+/// when it holds exactly that many, the array and its numbers direct or
+/// by reference.
+fn numbers_of<const N: usize>(
+    doc: &Document,
+    dict: &lopdf::Dictionary,
+    key: &[u8],
+) -> Option<[f64; N]> {
+    let array = match dict.get(key).ok()? {
         Object::Array(array) => array,
         Object::Reference(id) => doc.get_object(*id).ok()?.as_array().ok()?,
         _ => return None,
     };
-    if array.len() != 6 {
+    if array.len() != N {
         return None;
     }
-    let mut matrix = [0.0f64; 6];
-    for (slot, value) in matrix.iter_mut().zip(array) {
+    let mut numbers = [0.0f64; N];
+    for (slot, value) in numbers.iter_mut().zip(array) {
         let number = match value {
             Object::Reference(id) => doc.get_object(*id).ok().and_then(get_number),
             other => get_number(other),
         }?;
         *slot = f64::from(number);
     }
-    Some(matrix)
+    Some(numbers)
 }
 
 /// `content` with everything that is not an operator or its operands
@@ -2315,9 +2376,10 @@ fn mask_strings_comments_and_inline_images(content: &[u8]) -> Vec<u8> {
         i == 0 || is_pdf_whitespace(content[i - 1]) || matches!(content[i - 1], b')' | b']' | b'>')
     }
     let mut masked = content.to_vec();
-    // `ID` begins image data only inside an inline image, which `BI` opens;
-    // anywhere else — a bare token, or the name `/ID` — it is left alone.
-    let mut inline_image_open = false;
+    // `ID` begins image data only inside an inline image, which `BI` opens
+    // (its header follows, from this offset); anywhere else — a bare
+    // token, or the name `/ID` — it is left alone.
+    let mut inline_image_header: Option<usize> = None;
     let mut i = 0;
     while i < content.len() {
         match content[i] {
@@ -2366,16 +2428,19 @@ fn mask_strings_comments_and_inline_images(content: &[u8]) -> Vec<u8> {
                 && after_token_break(content, i)
                 && content.get(i + 2).is_none_or(|&b| is_pdf_whitespace(b)) =>
             {
-                inline_image_open = true;
+                inline_image_header = Some(i + 2);
                 i += 1;
             }
-            b'I' if inline_image_open
+            b'I' if inline_image_header.is_some()
                 && content.get(i + 1) == Some(&b'D')
                 && after_token_break(content, i)
                 && content.get(i + 2).is_none_or(|&b| is_pdf_whitespace(b)) =>
             {
-                inline_image_open = false;
-                let end = inline_image_end(content, i + 2).unwrap_or(content.len());
+                let header = &content[inline_image_header.take().unwrap_or(i)..i];
+                let data = (i + 3).min(content.len());
+                let end = inline_image_end(content, data).unwrap_or_else(|| {
+                    data + inline_image_data_bound(header).min(content.len() - data)
+                });
                 masked[i..end].fill(b' ');
                 i = end;
                 continue;
@@ -2388,21 +2453,64 @@ fn mask_strings_comments_and_inline_images(content: &[u8]) -> Vec<u8> {
 }
 
 /// Just past the `EI` that ends inline image data starting at `from`: the
-/// first `EI` set off by whitespace on both sides. `None` when the data
-/// runs to the end of the stream.
+/// first `EI` set off by whitespace on both sides, or failing that the
+/// first `EI` followed by whitespace or the end of the stream, which data
+/// written flush against its `EI` leaves. `None` when there is neither.
 fn inline_image_end(content: &[u8], from: usize) -> Option<usize> {
-    let mut i = from + 1;
+    let mut flush = None;
+    let mut i = from;
     while i + 1 < content.len() {
         if content[i] == b'E'
             && content[i + 1] == b'I'
-            && is_pdf_whitespace(content[i - 1])
             && content.get(i + 2).is_none_or(|&b| is_pdf_whitespace(b))
         {
-            return Some(i + 2);
+            if i > 0 && is_pdf_whitespace(content[i - 1]) {
+                return Some(i + 2);
+            }
+            flush.get_or_insert(i + 2);
         }
         i += 1;
     }
-    None
+    flush
+}
+
+/// How many bytes of inline image data to take when no `EI` ends it: the
+/// data's own length when the header names no filter — width × height ×
+/// components × bits per component, packed by row — or else a fixed
+/// bound, so that a stream is never blanked to its end.
+fn inline_image_data_bound(header: &[u8]) -> usize {
+    const UNKNOWN_LENGTH_BOUND: usize = 4096;
+    let header = String::from_utf8_lossy(header);
+    let tokens: Vec<&str> = header.split_ascii_whitespace().collect();
+    let value_after = |keys: &[&str]| {
+        tokens
+            .iter()
+            .position(|token| keys.contains(token))
+            .and_then(|at| tokens.get(at + 1).copied())
+    };
+    let number_after = |keys: &[&str]| value_after(keys).and_then(|v| v.parse::<usize>().ok());
+    if value_after(&["/F", "/Filter"]).is_some() {
+        return UNKNOWN_LENGTH_BOUND;
+    }
+    let (Some(width), Some(height)) = (
+        number_after(&["/W", "/Width"]),
+        number_after(&["/H", "/Height"]),
+    ) else {
+        return UNKNOWN_LENGTH_BOUND;
+    };
+    let image_mask = matches!(value_after(&["/IM", "/ImageMask"]), Some("true"));
+    let bits = if image_mask {
+        1
+    } else {
+        number_after(&["/BPC", "/BitsPerComponent"]).unwrap_or(8)
+    };
+    let components = match value_after(&["/CS", "/ColorSpace"]) {
+        Some("/RGB" | "/DeviceRGB" | "/CalRGB") => 3,
+        Some("/CMYK" | "/DeviceCMYK") => 4,
+        _ => 1,
+    };
+    let row_bytes = (width.saturating_mul(components).saturating_mul(bits)).div_ceil(8);
+    row_bytes.saturating_mul(height)
 }
 
 /// [`scan_content_stream`] of a stream on its own — the initial graphics
@@ -4555,16 +4663,33 @@ mod tests {
         assert_eq!(hidden, 0, "the outermost `Q` restores mode 0");
     }
 
+    /// A Form XObject of [`synthetic_page`]: the page's font as `F1`, and
+    /// the `/BBox` and `/Matrix` given.
+    #[derive(Clone, Copy)]
+    struct TestForm<'a> {
+        name: &'a str,
+        content: &'a str,
+        matrix: Option<[i64; 6]>,
+        bbox: [i64; 4],
+    }
+
+    /// A page-sized form with nothing in it, to fill in.
+    const PAGE_FORM: TestForm<'static> = TestForm {
+        name: "",
+        content: "",
+        matrix: None,
+        bbox: [0, 0, 612, 792],
+    };
+
     /// A one-page 612×792 document whose content stream is set with
     /// [`set_page_content`]: a 2×2 gray image `Im0` when `image`; a
     /// 1500×2383 image `ImBig`, bound whether or not the content draws it,
-    /// when `large_image`; and the given forms by name — each with the
-    /// page's font as `F1`, a page-sized `/BBox` and the `/Matrix` given —
-    /// bound whether or not the content invokes them.
+    /// when `large_image`; and the given forms, bound whether or not the
+    /// content invokes them.
     fn synthetic_page(
         image: bool,
         large_image: bool,
-        forms: &[(&str, &str, Option<[i64; 6]>)],
+        forms: &[TestForm<'_>],
     ) -> (Document, ObjectId, ObjectId) {
         use lopdf::dictionary;
         let mut doc = Document::with_version("1.4");
@@ -4597,16 +4722,20 @@ mod tests {
         if large_image {
             add_image(&mut doc, "ImBig", 1500, 2383, Vec::new());
         }
-        for &(name, content, matrix) in forms {
+        for form in forms {
             let mut dict = dictionary! {
                 "Type" => "XObject",
                 "Subtype" => Object::Name(b"Form".to_vec()),
-                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "BBox" => form
+                    .bbox
+                    .iter()
+                    .map(|&value| Object::Integer(value))
+                    .collect::<Vec<_>>(),
                 "Resources" => dictionary! {
                     "Font" => dictionary! { "F1" => Object::Reference(font_id) },
                 },
             };
-            if let Some(matrix) = matrix {
+            if let Some(matrix) = form.matrix {
                 dict.set(
                     "Matrix",
                     matrix
@@ -4617,9 +4746,9 @@ mod tests {
             }
             let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(
                 dict,
-                content.as_bytes().to_vec(),
+                form.content.as_bytes().to_vec(),
             )));
-            xobjects.set(name, Object::Reference(form_id));
+            xobjects.set(form.name, Object::Reference(form_id));
         }
         let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
             dictionary! {},
@@ -4761,6 +4890,12 @@ mod tests {
         );
     }
 
+    /// Within one row or column of grid cells — the resolution image
+    /// coverage is measured at.
+    fn about(covered: f64, expected: f64) -> bool {
+        (covered - expected).abs() <= PAGE_AREA / COVERAGE_GRID as f64
+    }
+
     #[test]
     fn covered_image_area_follows_the_matrix_and_the_page() {
         let (doc, page_id, _) = synthetic_page(true, false, &[]);
@@ -4768,21 +4903,21 @@ mod tests {
         assert!(close(covered("q 612 0 0 792 0 0 cm /Im0 Do Q"), PAGE_AREA));
         // Turned, its box runs past the right edge: only what lies on the
         // page counts.
-        assert!(close(
+        assert!(about(
             covered("q 0 612 -792 0 792 0 cm /Im0 Do Q"),
             612.0 * 612.0
         ));
         // Scaled under nested q/Q.
-        assert!(close(
+        assert!(about(
             covered("q 2 0 0 2 0 0 cm q 100 0 0 50 0 0 cm /Im0 Do Q Q"),
             20_000.0
         ));
         // Shifted mostly off the page, or a little.
-        assert!(close(
+        assert!(about(
             covered("q 612 0 0 792 500 0 cm /Im0 Do Q"),
             112.0 * 792.0
         ));
-        assert!(close(
+        assert!(about(
             covered("q 612 0 0 792 -100 0 cm /Im0 Do Q"),
             512.0 * 792.0
         ));
@@ -4795,6 +4930,11 @@ mod tests {
             covered("q 612 0 0 396 0 0 cm /Im0 Do Q q 612 0 0 396 0 396 cm /Im0 Do Q"),
             PAGE_AREA
         ));
+        // A scan tiled into two thousand strips, each thinner than a cell.
+        let strips: String = (0..2000)
+            .map(|k| format!("q 612 0 0 0.396 0 {} cm /Im0 Do Q\n", k as f64 * 0.396))
+            .collect();
+        assert!(about(covered(&strips), PAGE_AREA));
         // A name bound to nothing draws nothing.
         assert!(close(covered("q 612 0 0 792 0 0 cm /Im9 Do Q"), 0.0));
     }
@@ -4805,17 +4945,46 @@ mod tests {
             true,
             false,
             &[
-                ("FmEmpty", "", None),
-                ("FmHidden", "3 Tr BT /F1 10 Tf 72 700 Td (b) Tj ET", None),
-                ("FmImage", "q 612 0 0 792 0 0 cm /Im0 Do Q", None),
-                ("FmText", "BT /F1 10 Tf 0 Tr 72 700 Td (c) Tj ET", None),
-                ("FmPlain", "BT /F1 10 Tf 72 700 Td (c) Tj ET", None),
-                (
-                    "FmScaled",
-                    "306 0 0 396 0 0 cm /Im0 Do",
-                    Some([2, 0, 0, 2, 0, 0]),
-                ),
-                ("FmUnbalanced", "Q Q 3 Tr BT /F1 10 Tf (a) Tj ET q q", None),
+                TestForm {
+                    name: "FmEmpty",
+                    ..PAGE_FORM
+                },
+                TestForm {
+                    name: "FmHidden",
+                    content: "3 Tr BT /F1 10 Tf 72 700 Td (b) Tj ET",
+                    ..PAGE_FORM
+                },
+                TestForm {
+                    name: "FmImage",
+                    content: "q 612 0 0 792 0 0 cm /Im0 Do Q",
+                    ..PAGE_FORM
+                },
+                TestForm {
+                    name: "FmText",
+                    content: "BT /F1 10 Tf 0 Tr 72 700 Td (c) Tj ET",
+                    ..PAGE_FORM
+                },
+                TestForm {
+                    name: "FmPlain",
+                    content: "BT /F1 10 Tf 72 700 Td (c) Tj ET",
+                    ..PAGE_FORM
+                },
+                TestForm {
+                    name: "FmScaled",
+                    content: "306 0 0 396 0 0 cm /Im0 Do",
+                    matrix: Some([2, 0, 0, 2, 0, 0]),
+                    ..PAGE_FORM
+                },
+                TestForm {
+                    name: "FmUnbalanced",
+                    content: "Q Q 3 Tr BT /F1 10 Tf (a) Tj ET q q",
+                    ..PAGE_FORM
+                },
+                TestForm {
+                    name: "FmLoop",
+                    content: "/FmLoop Do BT /F1 10 Tf 0 Tr (z) Tj ET",
+                    ..PAGE_FORM
+                },
             ],
         );
         let run = |content: &str| executed(&doc, page_id, &[content]);
@@ -4851,16 +5020,191 @@ mod tests {
         let (executed_ops, hidden, _) = run("q 3 Tr /FmUnbalanced Do Q BT /F1 10 Tf (d) Tj ET");
         assert_eq!((executed_ops, hidden), (2, 1));
 
-        // A form is run once.
+        // A form is run at each invocation, under the matrix in force
+        // there: drawn off the page first, then over it.
         let (executed_ops, hidden, _) = run("/FmText Do /FmText Do");
+        assert_eq!((executed_ops, hidden), (2, 0));
+        assert!(
+            close(
+                run("q 1 0 0 1 700 0 cm /FmImage Do Q /FmImage Do").2,
+                PAGE_AREA
+            ),
+            "the second invocation draws the image over the page"
+        );
+
+        // A form invoking itself is not run again.
+        let (executed_ops, hidden, _) = run("/FmLoop Do");
         assert_eq!((executed_ops, hidden), (1, 0));
+    }
+
+    #[test]
+    fn a_form_s_bbox_clips_what_it_draws() {
+        let (doc, page_id, _) = synthetic_page(
+            true,
+            false,
+            &[TestForm {
+                name: "FmCorner",
+                content: "q 612 0 0 792 0 0 cm /Im0 Do Q BT /F1 10 Tf 0 Tr 10 10 Td (t) Tj ET",
+                bbox: [0, 0, 50, 50],
+                ..PAGE_FORM
+            }],
+        );
+        let run = |content: &str| executed(&doc, page_id, &[content]);
+
+        // A page-sized image drawn inside a form whose box is a corner of
+        // the page covers that corner only. The text inside still counts:
+        // text positions are not followed.
+        let (executed_ops, _, covered) = run("/FmCorner Do");
+        assert_eq!(executed_ops, 1);
+        assert!(covered > 0.0 && covered < PAGE_AREA / 20.0, "{covered}");
+
+        // The same form moved off the page shows nothing and is not read.
+        let (executed_ops, _, covered) = run("q 1 0 0 1 700 0 cm /FmCorner Do Q");
+        assert_eq!((executed_ops, covered), (0, 0.0));
+
+        // Scaled up, the corner grows with it.
+        let (_, _, covered) = run("q 12.24 0 0 15.84 0 0 cm /FmCorner Do Q");
+        assert!(close(covered, PAGE_AREA));
+    }
+
+    #[test]
+    fn an_exhausted_form_budget_leaves_the_page_unflagged() {
+        let (mut doc, page_id, content_id) = synthetic_page(
+            true,
+            false,
+            &[
+                TestForm {
+                    name: "FmEmpty",
+                    ..PAGE_FORM
+                },
+                TestForm {
+                    name: "FmText",
+                    content: "BT /F1 10 Tf 0 Tr 72 700 Td (c) Tj ET",
+                    ..PAGE_FORM
+                },
+            ],
+        );
+        let layer = glyph_layer(3);
+        let page_with = |empties: usize| {
+            format!(
+                "{FULL_PAGE_IMAGE}{layer}{}/FmText Do",
+                "/FmEmpty Do\n".repeat(empties)
+            )
+        };
+
+        // Within the budget, the visible text in the last form is read,
+        // and the page is no hidden layer.
+        set_page_content(&mut doc, content_id, &page_with(FORM_INVOCATIONS_MAX - 1));
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(analysis.executed_text_operator_count, 121);
+        assert!(!analysis.has_invisible_text_layer);
+
+        // One invocation more and the last form goes unread: the page's
+        // evidence is incomplete, so it is not flagged either.
+        set_page_content(&mut doc, content_id, &page_with(FORM_INVOCATIONS_MAX));
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(
+            analysis.executed_text_operator_count, 120,
+            "the last form was not read"
+        );
+        assert!(analysis.has_covering_image);
+        assert!(!analysis.has_invisible_text_layer);
+        assert!(!page_ocr_signals(&doc, page_id).has_invisible_text_layer);
+    }
+
+    #[test]
+    fn subtype_held_by_reference_is_resolved() {
+        let (mut doc, page_id, content_id) = synthetic_page(
+            true,
+            false,
+            &[TestForm {
+                name: "FmHidden",
+                content: "3 Tr BT /F1 10 Tf 72 700 Td (a) Tj (b) Tj ET",
+                ..PAGE_FORM
+            }],
+        );
+        let form_name = doc.add_object(Object::Name(b"Form".to_vec()));
+        let image_name = doc.add_object(Object::Name(b"Image".to_vec()));
+        let xobjects: Vec<(Vec<u8>, ObjectId)> = doc
+            .get_dictionary(page_id)
+            .unwrap()
+            .get(b"Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"XObject")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_reference().unwrap()))
+            .collect();
+        let mut point_subtypes_at = |doc: &mut Document, image: ObjectId, form: ObjectId| {
+            for (name, id) in &xobjects {
+                if let Ok(Object::Stream(stream)) = doc.get_object_mut(*id) {
+                    let target = if name == b"Im0" { image } else { form };
+                    stream.dict.set("Subtype", Object::Reference(target));
+                }
+            }
+        };
+        set_page_content(
+            &mut doc,
+            content_id,
+            "q 612 0 0 792 0 0 cm /Im0 Do Q /FmHidden Do",
+        );
+
+        // Both `/Subtype`s held by reference to a name object.
+        point_subtypes_at(&mut doc, image_name, form_name);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(
+            (
+                analysis.executed_text_operator_count,
+                analysis.invisible_text_operator_count
+            ),
+            (2, 2)
+        );
+        assert!(analysis.has_covering_image);
+        assert!(analysis.has_invisible_text_layer);
+
+        // A reference that resolves to nothing leaves the stream neither
+        // image nor form, as the resource walks leave it.
+        let dangling = doc.new_object_id();
+        point_subtypes_at(&mut doc, dangling, dangling);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(analysis.executed_text_operator_count, 0);
+        assert!(!analysis.has_covering_image);
+        assert!(!analysis.has_invisible_text_layer);
+    }
+
+    #[test]
+    fn inline_image_data_without_a_delimited_ei_is_bounded() {
+        // Data written flush against its `EI`, and data with no `EI` at
+        // all, blank no more than the image: the text after is counted.
+        let (counts, executed_ops, _) =
+            scan_alone(b"BI /W 1 /H 1 /BPC 8 /CS /G ID xEI BT /F1 10 Tf (a) Tj ET");
+        assert_eq!((counts.text_ops, executed_ops), (1, 1));
+        let (counts, _, _) =
+            scan_alone(b"BI /W 2 /H 1 /BPC 8 /CS /G ID abEIBT /F1 10 Tf (a) Tj ET");
+        assert_eq!(counts.text_ops, 1);
+
+        assert_eq!(inline_image_data_bound(b"/W 3 /H 2 /BPC 1 /CS /G"), 2);
+        assert_eq!(inline_image_data_bound(b"/W 2 /H 2 /BPC 8 /CS /RGB"), 12);
+        assert_eq!(inline_image_data_bound(b"/W 8 /H 1 /IM true"), 1);
+        assert_eq!(inline_image_data_bound(b"/W 2 /H 2 /F /AHx"), 4096);
     }
 
     #[test]
     fn resources_merely_bound_are_not_content() {
         let hidden_layer = "3 Tr BT /F1 10 Tf 72 700 Td (a) Tj (b) Tj ET";
-        let (mut doc, page_id, content_id) =
-            synthetic_page(false, true, &[("FmHidden", hidden_layer, None)]);
+        let (mut doc, page_id, content_id) = synthetic_page(
+            false,
+            true,
+            &[TestForm {
+                name: "FmHidden",
+                content: hidden_layer,
+                ..PAGE_FORM
+            }],
+        );
 
         // Visible text on a page that binds, without using them, a large
         // image and a form holding a hidden layer.
@@ -4941,8 +5285,12 @@ mod tests {
         caption: Option<&str>,
     ) -> (Document, ObjectId) {
         let layer = layer_mode.map(glyph_layer).unwrap_or_default();
-        let forms: Vec<(&str, &str, Option<[i64; 6]>)> = if layer_in_form {
-            vec![("Fm0", layer.as_str(), None)]
+        let forms: Vec<TestForm> = if layer_in_form {
+            vec![TestForm {
+                name: "Fm0",
+                content: layer.as_str(),
+                ..PAGE_FORM
+            }]
         } else {
             Vec::new()
         };
