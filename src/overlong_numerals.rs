@@ -21,19 +21,28 @@
 //! rewritten bytes. Objects that parsed are never touched, nor is anything
 //! outside those dictionaries and arrays: not stream data, not strings, not
 //! comments, not the box of a pattern or a shading.
+//!
+//! A form is a stream, so it is never an object-stream member itself; the
+//! array object a `/BBox n 0 R` refers to can be one. Such an array is
+//! repaired in the object stream's decoded bytes and read again through the
+//! object-stream parser, and the loaded document takes the result (see
+//! [`recover_referenced_bboxes_in_object_streams`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use lopdf::xref::XrefEntry;
-use lopdf::Document;
+use lopdf::{Document, Object, ObjectStream, Stream};
 
 use crate::form_bbox_repair::UNCLIPPED_FORM_BBOX_EXTENT;
 
-/// Unloaded objects examined at most, and bytes read from each: the scan
-/// repairs a handful of forms, it is not a second parser.
-const MAX_OBJECTS_EXAMINED: usize = 256;
+/// Bytes read from one unloaded object at most — its dictionary opens it,
+/// its stream data may run on for megabytes — and bytes examined in all,
+/// across unloaded objects (whose spans end at the next object, so they do
+/// not overlap) and object streams decoded: the scan repairs a handful of
+/// boxes, it is not a second parser.
 const MAX_OBJECT_SPAN: usize = 64 * 1024;
+const MAX_BYTES_EXAMINED: usize = 16 * 1024 * 1024;
 
 /// Where an unloaded form keeps its `/BBox`.
 enum BBoxValue {
@@ -53,6 +62,31 @@ pub(crate) fn saturate_overlong_bbox_numerals(
     doc: &Document,
 ) -> Option<(Vec<u8>, usize)> {
     let loaded: HashSet<u32> = doc.objects.keys().map(|id| id.0).collect();
+    let mut offsets: Vec<usize> = doc
+        .reference_table
+        .entries
+        .values()
+        .filter_map(|entry| match entry {
+            XrefEntry::Normal { offset, .. } => Some(*offset as usize),
+            _ => None,
+        })
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    // An object's span runs to the next object the table places after it.
+    let span_of = |start: usize| -> Option<Range<usize>> {
+        if start >= buffer.len() {
+            return None;
+        }
+        let next = offsets.partition_point(|offset| *offset <= start);
+        let end = offsets
+            .get(next)
+            .copied()
+            .unwrap_or(buffer.len())
+            .min(buffer.len())
+            .min(start + MAX_OBJECT_SPAN);
+        Some(start..end)
+    };
     let offset_of = |id: u32| match doc.reference_table.get(id) {
         Some(XrefEntry::Normal { offset, .. }) => Some(*offset as usize),
         _ => None,
@@ -62,35 +96,14 @@ pub(crate) fn saturate_overlong_bbox_numerals(
     let mut examined = 0usize;
     let mut rewrite = |out: &mut Option<Vec<u8>>, at: usize, len: usize, negative: bool| {
         let bytes = out.get_or_insert_with(|| buffer.to_vec());
-        let mut replacement = Vec::with_capacity(len);
-        if negative {
-            replacement.push(b'-');
-        }
-        replacement.extend_from_slice(UNCLIPPED_FORM_BBOX_EXTENT.to_string().as_bytes());
-        replacement.resize(len, b' ');
-        bytes[at..at + len].copy_from_slice(&replacement);
+        saturate(bytes, at, len, negative);
         rewritten += 1;
     };
 
     // The forms first: their inline boxes are repaired here, their
     // referenced boxes remembered. A form that parsed (its dictionary holds
     // only `/BBox n 0 R`) may still point at an array object that did not.
-    let mut referenced: Vec<u32> = doc
-        .objects
-        .values()
-        .filter_map(|object| match object {
-            lopdf::Object::Stream(stream)
-                if stream.dict.get(b"Subtype").ok()
-                    == Some(&lopdf::Object::Name(b"Form".to_vec())) =>
-            {
-                match stream.dict.get(b"BBox") {
-                    Ok(lopdf::Object::Reference(id)) if !loaded.contains(&id.0) => Some(id.0),
-                    _ => None,
-                }
-            }
-            _ => None,
-        })
-        .collect();
+    let mut referenced = boxes_referenced_by_loaded_forms(doc);
     for (&id, entry) in &doc.reference_table.entries {
         let XrefEntry::Normal { offset, .. } = entry else {
             continue;
@@ -98,23 +111,27 @@ pub(crate) fn saturate_overlong_bbox_numerals(
         if loaded.contains(&id) {
             continue;
         }
-        examined += 1;
-        if examined > MAX_OBJECTS_EXAMINED {
+        let Some(span) = span_of(*offset as usize) else {
+            continue;
+        };
+        examined += span.len();
+        if examined > MAX_BYTES_EXAMINED {
             break;
         }
-        let start = *offset as usize;
-        let Some((span, masked, header_len)) = object_at(buffer, start, id) else {
+        let start = span.start;
+        let Some((masked, header_len)) = object_at(&buffer[span], id) else {
             continue;
         };
         let Some(dict) = dictionary_range(&masked, header_len) else {
             continue;
         };
-        if !names_form(&masked[dict.clone()]) {
+        if !names_form(&masked, dict.clone(), doc) {
             continue;
         }
         match bbox_value(&masked, dict) {
             Some(BBoxValue::Inline(array)) => {
-                for (token_start, token_len, negative) in overlong_numerals(&span[array.clone()]) {
+                for (token_start, token_len, negative) in overlong_numerals(&masked[array.clone()])
+                {
                     rewrite(
                         &mut out,
                         start + array.start + token_start,
@@ -127,25 +144,28 @@ pub(crate) fn saturate_overlong_bbox_numerals(
             None => {}
         }
     }
-    // Then the array objects those forms refer to.
+    // Then the array objects those forms refer to, each once.
+    referenced.sort_unstable();
+    referenced.dedup();
     for number in referenced {
         if loaded.contains(&number) {
             continue;
         }
-        examined += 1;
-        if examined > MAX_OBJECTS_EXAMINED {
-            break;
-        }
-        let Some(start) = offset_of(number) else {
+        let Some(span) = offset_of(number).and_then(span_of) else {
             continue;
         };
-        let Some((span, masked, header_len)) = object_at(buffer, start, number) else {
+        examined += span.len();
+        if examined > MAX_BYTES_EXAMINED {
+            break;
+        }
+        let start = span.start;
+        let Some((masked, header_len)) = object_at(&buffer[span], number) else {
             continue;
         };
         let Some(array) = array_range(&masked, header_len) else {
             continue;
         };
-        for (token_start, token_len, negative) in overlong_numerals(&span[array.clone()]) {
+        for (token_start, token_len, negative) in overlong_numerals(&masked[array.clone()]) {
             rewrite(
                 &mut out,
                 start + array.start + token_start,
@@ -157,16 +177,192 @@ pub(crate) fn saturate_overlong_bbox_numerals(
     out.map(|bytes| (bytes, rewritten))
 }
 
-/// The object `id` at `start`: its span (at most [`MAX_OBJECT_SPAN`]), the
-/// same bytes with comments and strings masked, and the length of its
-/// `<id> <generation> obj` header.
-fn object_at(buffer: &[u8], start: usize, id: u32) -> Option<(&[u8], Vec<u8>, usize)> {
-    if start >= buffer.len() {
-        return None;
+/// The numbers of the array objects that loaded Form XObjects name as
+/// their `/BBox` (`/BBox n 0 R`) but the document lacks, each once.
+fn boxes_referenced_by_loaded_forms(doc: &Document) -> Vec<u32> {
+    let mut numbers: Vec<u32> = doc
+        .objects
+        .values()
+        .filter_map(|object| match object {
+            Object::Stream(stream) if is_form(&stream.dict, doc) => {
+                match stream.dict.get(b"BBox") {
+                    Ok(Object::Reference(id)) if !doc.objects.contains_key(&(id.0, 0)) => {
+                        Some(id.0)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers
+}
+
+/// Whether a loaded dictionary is a Form XObject's: its `/Subtype` is the
+/// name `/Form`, directly or through a reference.
+fn is_form(dict: &lopdf::Dictionary, doc: &Document) -> bool {
+    match dict.get(b"Subtype") {
+        Ok(Object::Name(name)) => name == b"Form",
+        Ok(Object::Reference(id)) => {
+            matches!(doc.get_object(*id), Ok(Object::Name(name)) if name == b"Form")
+        }
+        _ => false,
     }
-    let span = &buffer[start..(start + MAX_OBJECT_SPAN).min(buffer.len())];
+}
+
+/// The numeral of `len` bytes at `at` in `bytes` replaced by the extent a
+/// zero-area box is widened to, with its sign, padded with spaces to the
+/// same length so that no offset moves.
+fn saturate(bytes: &mut [u8], at: usize, len: usize, negative: bool) {
+    let mut replacement = Vec::with_capacity(len);
+    if negative {
+        replacement.push(b'-');
+    }
+    replacement.extend_from_slice(UNCLIPPED_FORM_BBOX_EXTENT.to_string().as_bytes());
+    replacement.resize(len, b' ');
+    bytes[at..at + len].copy_from_slice(&replacement);
+}
+
+/// The `/BBox` arrays that loaded forms refer to but the document lacks,
+/// looked for in its object streams: each is repaired in the object
+/// stream's decoded bytes as an inline box is in the file, the object
+/// stream is parsed again, and the members that now parse are inserted into
+/// `doc`. The file's bytes keep the compressed original, which is why a
+/// repaired document is serialized for rendering rather than re-read.
+/// Returns the count of numerals rewritten.
+pub(crate) fn recover_referenced_bboxes_in_object_streams(doc: &mut Document) -> usize {
+    let missing = boxes_referenced_by_loaded_forms(doc);
+    if missing.is_empty() {
+        return 0;
+    }
+    // The object streams that may hold them: those the cross-reference
+    // table names, else every object stream that loaded.
+    let mut containers: Vec<u32> = missing
+        .iter()
+        .filter_map(|number| match doc.reference_table.get(*number) {
+            Some(XrefEntry::Compressed { container, .. }) => Some(*container),
+            _ => None,
+        })
+        .collect();
+    if containers.is_empty() {
+        containers = doc
+            .objects
+            .iter()
+            .filter_map(|(id, object)| match object {
+                Object::Stream(stream) if stream.dict.has_type(b"ObjStm") => Some(id.0),
+                _ => None,
+            })
+            .collect();
+    }
+    containers.sort_unstable();
+    containers.dedup();
+    let mut rewritten = 0usize;
+    let mut recovered = Vec::new();
+    let mut examined = 0usize;
+    for container in containers {
+        let Some(Object::Stream(stream)) = doc.objects.get(&(container, 0)) else {
+            continue;
+        };
+        let Ok(content) = stream.get_plain_content_with_limit(crate::MAX_STREAM_DECOMPRESSED_BYTES)
+        else {
+            continue;
+        };
+        examined += content.len();
+        if examined > MAX_BYTES_EXAMINED {
+            break;
+        }
+        let Some(members) = object_stream_members(&stream.dict, &content) else {
+            continue;
+        };
+        let mut repaired = content.clone();
+        let mut count = 0usize;
+        for number in &missing {
+            let Some(span) = members.get(number) else {
+                continue;
+            };
+            let masked = mask_noise(&content[span.clone()]);
+            let Some(array) = array_range(&masked, 0) else {
+                continue;
+            };
+            for (token_start, token_len, negative) in overlong_numerals(&masked[array.clone()]) {
+                saturate(
+                    &mut repaired,
+                    span.start + array.start + token_start,
+                    token_len,
+                    negative,
+                );
+                count += 1;
+            }
+        }
+        if count == 0 {
+            continue;
+        }
+        // The decoded bytes stand in for the stream's own, so its filters
+        // must not be applied to them again.
+        let mut dict = stream.dict.clone();
+        dict.remove(b"Filter");
+        dict.remove(b"DecodeParms");
+        let Ok(parsed) = ObjectStream::new(&Stream::new(dict, repaired)) else {
+            continue;
+        };
+        for number in &missing {
+            if let Some(object) = parsed.objects.get(&(*number, 0)) {
+                recovered.push(((*number, 0), object.clone()));
+            }
+        }
+        rewritten += count;
+    }
+    for (id, object) in recovered {
+        doc.objects.insert(id, object);
+    }
+    rewritten
+}
+
+/// The members of an object stream whose dictionary is `dict` and whose
+/// decoded bytes are `content`: each object number with the range of
+/// `content` holding it (from its offset to the next member's, at most
+/// [`MAX_OBJECT_SPAN`] bytes).
+fn object_stream_members(
+    dict: &lopdf::Dictionary,
+    content: &[u8],
+) -> Option<BTreeMap<u32, Range<usize>>> {
+    let first: usize = dict.get(b"First").ok()?.as_i64().ok()?.try_into().ok()?;
+    let header = std::str::from_utf8(content.get(..first)?).ok()?;
+    let numbers: Vec<u32> = header
+        .split_whitespace()
+        .map(|number| number.parse().ok())
+        .collect::<Option<_>>()?;
+    let (pairs, _) = numbers.as_chunks::<2>();
+    let mut starts: Vec<usize> = pairs.iter().map(|pair| first + pair[1] as usize).collect();
+    starts.sort_unstable();
+    Some(
+        pairs
+            .iter()
+            .filter_map(|pair| {
+                let start = first + pair[1] as usize;
+                if start >= content.len() {
+                    return None;
+                }
+                let end = starts
+                    .iter()
+                    .find(|next| **next > start)
+                    .copied()
+                    .unwrap_or(content.len())
+                    .min(content.len())
+                    .min(start + MAX_OBJECT_SPAN);
+                Some((pair[0], start..end))
+            })
+            .collect(),
+    )
+}
+
+/// The object `id` whose bytes are `span`: the same bytes with comments and
+/// strings masked, and the length of its `<id> <generation> obj` header.
+fn object_at(span: &[u8], id: u32) -> Option<(Vec<u8>, usize)> {
     let header_len = object_header_len(span, id)?;
-    Some((span, mask_noise(span), header_len))
+    Some((mask_noise(span), header_len))
 }
 
 /// `span` with every byte of a comment, a literal string or a hex string
@@ -269,18 +465,26 @@ fn array_range(masked: &[u8], from: usize) -> Option<Range<usize>> {
     None
 }
 
-/// Whether a masked dictionary body names a Form XObject: a `/Subtype` key
-/// followed by the name `/Form`.
-fn names_form(dict: &[u8]) -> bool {
-    let mut pos = 0;
-    while let Some(rel) = find_name(&dict[pos..], b"/Subtype") {
+/// Whether the masked dictionary body `dict` (a range into the whole span)
+/// names a Form XObject: a `/Subtype` key whose value is the name `/Form`,
+/// or a reference to an object of `doc` that is.
+fn names_form(masked: &[u8], dict: Range<usize>, doc: &Document) -> bool {
+    let mut pos = dict.start;
+    while let Some(rel) = find_name(&masked[pos..dict.end], b"/Subtype") {
         let after = pos + rel + b"/Subtype".len();
         let value = after
-            + dict[after..]
+            + masked[after..dict.end]
                 .iter()
                 .take_while(|b| b.is_ascii_whitespace())
                 .count();
-        if dict[value..].starts_with(b"/Form") && !dict.get(value + 5).is_some_and(is_regular) {
+        if masked[value..dict.end].starts_with(b"/Form")
+            && !masked.get(value + 5).is_some_and(is_regular)
+        {
+            return true;
+        }
+        if reference_at(masked, value, dict.end).is_some_and(
+            |id| matches!(doc.get_object(id), Ok(Object::Name(name)) if name == b"Form"),
+        ) {
             return true;
         }
         pos = after;
@@ -304,9 +508,14 @@ fn bbox_value(masked: &[u8], dict: Range<usize>) -> Option<BBoxValue> {
         let array = array_range(masked, value)?;
         return (array.end <= dict.end).then_some(BBoxValue::Inline(array));
     }
-    // `<number> <generation> R`
-    let mut pos = value;
-    let digits = masked[pos..dict.end]
+    reference_at(masked, value, dict.end).map(|id| BBoxValue::Reference(id.0))
+}
+
+/// The indirect reference `<number> <generation> R` that opens `masked` at
+/// `pos`, read no further than `end`.
+fn reference_at(masked: &[u8], pos: usize, end: usize) -> Option<lopdf::ObjectId> {
+    let mut pos = pos;
+    let digits = masked[pos..end]
         .iter()
         .take_while(|b| b.is_ascii_digit())
         .count();
@@ -318,7 +527,7 @@ fn bbox_value(masked: &[u8], dict: Range<usize>) -> Option<BBoxValue> {
         .parse()
         .ok()?;
     pos += digits;
-    let space = masked[pos..dict.end]
+    let space = masked[pos..end]
         .iter()
         .take_while(|b| b.is_ascii_whitespace())
         .count();
@@ -326,20 +535,24 @@ fn bbox_value(masked: &[u8], dict: Range<usize>) -> Option<BBoxValue> {
         return None;
     }
     pos += space;
-    let generation = masked[pos..dict.end]
+    let digits = masked[pos..end]
         .iter()
         .take_while(|b| b.is_ascii_digit())
         .count();
-    if generation == 0 {
+    if digits == 0 {
         return None;
     }
-    pos += generation;
-    pos += masked[pos..dict.end]
+    let generation: u16 = std::str::from_utf8(&masked[pos..pos + digits])
+        .ok()?
+        .parse()
+        .ok()?;
+    pos += digits;
+    pos += masked[pos..end]
         .iter()
         .take_while(|b| b.is_ascii_whitespace())
         .count();
     (masked.get(pos) == Some(&b'R') && !masked.get(pos + 1).is_some_and(is_regular))
-        .then_some(BBoxValue::Reference(number))
+        .then_some((number, generation))
 }
 
 /// A byte that continues a name or a keyword: neither white space nor a
@@ -399,8 +612,8 @@ fn object_header_len(span: &[u8], id: u32) -> Option<usize> {
     span[pos..].starts_with(b"obj").then_some(pos + 3)
 }
 
-/// The integer numerals in `array` (an array body, strings and comments
-/// already masked away by the caller) that do not fit an `i64`, as
+/// The integer numerals in `array` (an array body taken from the masked
+/// bytes, so a comment's digits never count) that do not fit an `i64`, as
 /// `(start, length, negative)` — the same test the parser applies, so a
 /// numeral it would have read is left alone.
 fn overlong_numerals(array: &[u8]) -> Vec<(usize, usize, bool)> {
@@ -473,27 +686,7 @@ mod tests {
                 form_content.len()
             ),
         ];
-        let mut pdf = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, body) in objects.iter().enumerate() {
-            offsets.push(pdf.len());
-            pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
-        }
-        let xref = pdf.len();
-        pdf.extend_from_slice(
-            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
-        );
-        for offset in offsets {
-            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-        }
-        pdf.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
-                objects.len() + 1
-            )
-            .as_bytes(),
-        );
-        pdf
+        assemble(&objects)
     }
 
     /// ±(DBL_MAX / 2) as a re-save writes it: 308 digits.
@@ -583,9 +776,18 @@ mod tests {
         };
         assert_eq!(&masked[array], b" 3 ");
         assert_eq!(find_name(b"/BBoxes 1 /BBox [", b"/BBox"), Some(10));
-        assert!(names_form(b" /Type /XObject /Subtype /Form "));
-        assert!(!names_form(b" /Subtype /Formula "));
-        assert!(!names_form(b" /Subtype /Image "));
+        let doc = Document::with_version("1.4");
+        let is_form = |dict: &[u8]| names_form(dict, 0..dict.len(), &doc);
+        assert!(is_form(b" /Type /XObject /Subtype /Form "));
+        assert!(!is_form(b" /Subtype /Formula "));
+        assert!(!is_form(b" /Subtype /Image "));
+        assert!(
+            !is_form(b" /Subtype 9 0 R "),
+            "nothing to resolve it against"
+        );
+        assert_eq!(reference_at(b"12 3 R ", 0, 7), Some((12, 3)));
+        assert_eq!(reference_at(b"12 3 Rx", 0, 7), None);
+        assert_eq!(reference_at(b"12 R", 0, 4), None);
     }
 
     /// The box's array in a string or a comment is not the box; a key that
@@ -602,7 +804,7 @@ mod tests {
              /streamparams 1 /BBox [{bbox}] /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
             TEXT.len()
         );
-        let bytes = pdf_with_objects(&form, None);
+        let bytes = pdf_with_objects(&[&form]);
         let doc = Document::load_mem(&bytes).unwrap();
         let (repaired, count) = saturate_overlong_bbox_numerals(&bytes, &doc).unwrap();
         assert_eq!(count, 4, "only the box's own four numerals");
@@ -618,7 +820,7 @@ mod tests {
             "<< /Type /XObject /Subtype /Form /BBox 7 0 R /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
             TEXT.len()
         );
-        let bytes = pdf_with_objects(&form, Some(&format!("[ {bbox} ]")));
+        let bytes = pdf_with_objects(&[&form, &format!("[ {bbox} ]")]);
         let doc = Document::load_mem(&bytes).unwrap();
         assert!(
             !doc.objects.keys().any(|id| id.0 == 7),
@@ -642,33 +844,37 @@ mod tests {
             "the form loads with its box"
         );
 
+        // A comment inside the box's array, holding digits and a `]`,
+        // neither ends the array nor counts as a numeral.
+        let form = format!(
+            "<< /Type /XObject /Subtype /Form /BBox [ % 99999999999999999999 ]\n{bbox} ] /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
+            TEXT.len()
+        );
+        let bytes = pdf_with_objects(&[&form]);
+        let doc = Document::load_mem(&bytes).unwrap();
+        let (repaired, count) = saturate_overlong_bbox_numerals(&bytes, &doc).unwrap();
+        assert_eq!(count, 4, "the comment's digits are not a numeral");
+        assert!(
+            find(&repaired, b"% 99999999999999999999 ]").is_some(),
+            "the comment is untouched"
+        );
+        let reloaded = Document::load_mem(&repaired).unwrap();
+        assert!(reloaded.get_object((6, 0)).is_ok(), "the form loads");
+
         // A tiling pattern with the same box is not a Form XObject.
         let pattern = format!(
             "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [{bbox}] /XStep 10 /YStep 10 \
              /Resources << >> /Length {} >>\nstream\n{TEXT}\nendstream",
             TEXT.len()
         );
-        let bytes = pdf_with_objects(&pattern, None);
+        let bytes = pdf_with_objects(&[&pattern]);
         let doc = Document::load_mem(&bytes).unwrap();
         assert!(saturate_overlong_bbox_numerals(&bytes, &doc).is_none());
     }
 
-    /// A one-page PDF whose object 6 is `object6` (a form or a pattern with
-    /// a stream) and whose object 7, when given, is `object7`.
-    fn pdf_with_objects(object6: &str, object7: Option<&str>) -> Vec<u8> {
-        let mut objects = vec![
-            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> \
-             /XObject << /Fm1 6 0 R >> >> /Contents 4 0 R >>"
-                .to_string(),
-            "<< /Length 35 >>\nstream\nq Q q 0 0 612 792 re W n /Fm1 Do Q\nendstream".to_string(),
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
-            object6.to_string(),
-        ];
-        if let Some(object7) = object7 {
-            objects.push(object7.to_string());
-        }
+    /// The objects numbered from 1, written out with a cross-reference
+    /// table and a trailer naming the first as the catalog.
+    fn assemble(objects: &[String]) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
         for (index, body) in objects.iter().enumerate() {
@@ -690,5 +896,211 @@ mod tests {
             .as_bytes(),
         );
         pdf
+    }
+
+    /// The same page as [`pdf_with_form`], with `objects` as objects 6, 7,
+    /// ... — the form (or pattern) the page draws as `Fm1` is object 6.
+    fn pdf_with_objects(objects: &[&str]) -> Vec<u8> {
+        let mut all = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> \
+             /XObject << /Fm1 6 0 R >> >> /Contents 4 0 R >>"
+                .to_string(),
+            "<< /Length 35 >>\nstream\nq Q q 0 0 612 792 re W n /Fm1 Do Q\nendstream".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        all.extend(objects.iter().map(|object| object.to_string()));
+        assemble(&all)
+    }
+
+    /// The same page, with the form's box an indirect array object kept in
+    /// an object stream (as a cross-reference stream describes), so that
+    /// the numerals sit in the stream's decoded bytes rather than the file.
+    fn pdf_with_boxed_array_in_object_stream(bbox: &str) -> Vec<u8> {
+        let form = format!(
+            "<< /Type /XObject /Subtype /Form /BBox 7 0 R /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
+            TEXT.len()
+        );
+        let member = format!("[ {bbox} ]");
+        let header = "7 0\n";
+        let object_stream = format!(
+            "<< /Type /ObjStm /N 1 /First {} /Length {} >>\nstream\n{header}{member}\nendstream",
+            header.len(),
+            header.len() + member.len()
+        );
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> \
+             /XObject << /Fm1 6 0 R >> >> /Contents 4 0 R >>"
+                .to_string(),
+            "<< /Length 35 >>\nstream\nq Q q 0 0 612 792 re W n /Fm1 Do Q\nendstream".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            form,
+        ];
+        let mut pdf = b"%PDF-1.5\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+        }
+        let container_offset = pdf.len();
+        pdf.extend_from_slice(format!("8 0 obj\n{object_stream}\nendobj\n").as_bytes());
+        let xref_offset = pdf.len();
+        // Rows of `/W [1 4 2]`: object 7 is member 0 of object stream 8.
+        let mut rows: Vec<u8> = Vec::new();
+        let mut row = |kind: u8, field2: u32, field3: u16| {
+            rows.push(kind);
+            rows.extend_from_slice(&field2.to_be_bytes());
+            rows.extend_from_slice(&field3.to_be_bytes());
+        };
+        row(0, 0, 0xffff);
+        for offset in &offsets {
+            row(1, *offset as u32, 0);
+        }
+        row(2, 8, 0);
+        row(1, container_offset as u32, 0);
+        row(1, xref_offset as u32, 0);
+        pdf.extend_from_slice(
+            format!(
+                "9 0 obj\n<< /Type /XRef /Size 10 /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
+                rows.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&rows);
+        pdf.extend_from_slice(
+            format!("\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn a_referenced_box_in_an_object_stream_is_recovered_into_the_document() {
+        let bytes = pdf_with_boxed_array_in_object_stream(&unbounded());
+        let mut doc = Document::load_mem(&bytes).unwrap();
+        assert!(doc.get_object((6, 0)).is_ok(), "the form itself loads");
+        assert!(
+            doc.get_object((7, 0)).is_err(),
+            "the array with numerals no parser holds does not"
+        );
+        // The file's bytes hold nothing to rewrite: the numerals are not
+        // in an unloaded top-level object.
+        assert!(saturate_overlong_bbox_numerals(&bytes, &doc).is_none());
+
+        let count = recover_referenced_bboxes_in_object_streams(&mut doc);
+        assert_eq!(count, 4);
+        let extent = i64::from(UNCLIPPED_FORM_BBOX_EXTENT);
+        let recovered: Vec<i64> = doc
+            .get_object((7, 0))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_i64().unwrap())
+            .collect();
+        assert_eq!(recovered, vec![-extent, -extent, extent, extent]);
+        assert_eq!(
+            recover_referenced_bboxes_in_object_streams(&mut doc),
+            0,
+            "nothing is left to recover"
+        );
+        // The loader runs the recovery, and the copy written for other
+        // renderers carries the array as a plain object.
+        let copy = crate::widen_degenerate_form_bboxes_mem(&bytes)
+            .unwrap()
+            .expect("the document was repaired");
+        let copy = Document::load_mem(&copy).unwrap();
+        let written: Vec<i64> = copy
+            .get_object((7, 0))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_i64().unwrap())
+            .collect();
+        assert_eq!(written, vec![-extent, -extent, extent, extent]);
+
+        // An array that parses is left where it is, with nothing to count.
+        let bytes = pdf_with_boxed_array_in_object_stream("0 0 612 792");
+        let mut doc = Document::load_mem(&bytes).unwrap();
+        assert!(doc.get_object((7, 0)).is_ok());
+        assert_eq!(recover_referenced_bboxes_in_object_streams(&mut doc), 0);
+    }
+
+    #[test]
+    fn a_form_whose_subtype_is_indirect_is_still_a_form() {
+        // The loaded form's `/Subtype` is a reference to a name object;
+        // its box is an array object that does not load.
+        let bbox = unbounded();
+        let form = format!(
+            "<< /Type /XObject /Subtype 8 0 R /BBox 7 0 R /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
+            TEXT.len()
+        );
+        let bytes = pdf_with_objects(&[&form, &format!("[ {bbox} ]"), "/Form"]);
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert!(doc.get_object((6, 0)).is_ok() && doc.get_object((7, 0)).is_err());
+        let (repaired, count) = saturate_overlong_bbox_numerals(&bytes, &doc).unwrap();
+        assert_eq!(count, 4);
+        assert!(Document::load_mem(&repaired)
+            .unwrap()
+            .get_object((7, 0))
+            .is_ok());
+
+        // An unloaded form may store its `/Subtype` the same way.
+        let form = format!(
+            "<< /Type /XObject /Subtype 7 0 R /BBox [ {bbox} ] /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
+            TEXT.len()
+        );
+        let bytes = pdf_with_objects(&[&form, "/Form"]);
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert!(doc.get_object((6, 0)).is_err());
+        let (repaired, count) = saturate_overlong_bbox_numerals(&bytes, &doc).unwrap();
+        assert_eq!(count, 4);
+        assert!(Document::load_mem(&repaired)
+            .unwrap()
+            .get_object((6, 0))
+            .is_ok());
+    }
+
+    #[test]
+    fn the_form_is_found_behind_any_number_of_other_unloaded_objects() {
+        // Three hundred objects the table lists before the form fail to
+        // parse for their own reasons; the form's box is still repaired.
+        let junk = "<< /Value 99999999999999999999999 >>";
+        let mut objects: Vec<&str> = vec![junk; 300];
+        let form = format!(
+            "<< /Type /XObject /Subtype /Form /BBox [ {} ] /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
+            unbounded(),
+            TEXT.len()
+        );
+        objects.push(&form);
+        let form_number = 5 + objects.len() as u32;
+        let page = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> \
+             /XObject << /Fm1 {form_number} 0 R >> >> /Contents 4 0 R >>"
+        );
+        let mut all = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            page,
+            "<< /Length 35 >>\nstream\nq Q q 0 0 612 792 re W n /Fm1 Do Q\nendstream".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        all.extend(objects.iter().map(|object| object.to_string()));
+        let bytes = assemble(&all);
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert!(doc.get_object((form_number, 0)).is_err());
+        assert_eq!(doc.objects.len(), 5, "only the fixed five objects load");
+        let (repaired, count) = saturate_overlong_bbox_numerals(&bytes, &doc).unwrap();
+        assert_eq!(count, 4);
+        let reloaded = Document::load_mem(&repaired).unwrap();
+        assert!(reloaded.get_object((form_number, 0)).is_ok());
+        assert_eq!(
+            reloaded.objects.len(),
+            6,
+            "the other objects stay as they were"
+        );
     }
 }

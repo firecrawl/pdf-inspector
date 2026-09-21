@@ -20,7 +20,10 @@ Changes since 1.22.1.
   file's bytes and in place, to the extent a zero-area box is widened to,
   before the document is read, so the page's text is extracted and the OCR
   pipeline renders it. The page came out empty and was routed to OCR, and
-  its render was blank. `widen_degenerate_form_bboxes_mem` hands the
+  its render was blank. A box the form refers to (`/BBox n 0 R`) that sits
+  in an object stream is repaired in the stream's decoded bytes and read
+  back into the document. The Rust-only `widen_degenerate_form_bboxes_mem`
+  (the Python, Node and WebAssembly bindings do not expose it) hands the
   repaired bytes to callers that render elsewhere, as for a zero-area box.
 
 ## [1.22.1] - 2026-09-20

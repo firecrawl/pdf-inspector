@@ -4210,23 +4210,33 @@ pub(crate) fn load_document_from_mem_with_repairs(
 
 /// The document loaded again from `bytes` with the `/BBox` numerals of its
 /// unloaded objects saturated (see `overlong_numerals`), when that brings
-/// objects in; otherwise `doc` as it came, and a count of zero.
+/// objects in — otherwise `doc` as it came — and then with the `/BBox`
+/// arrays its object streams could not yield recovered into it; with the
+/// count of numerals saturated either way.
 fn reload_after_saturating_bbox_numerals(
     doc: Document,
     bytes: &[u8],
     password: Option<&str>,
 ) -> (Document, usize) {
-    let Some((rewritten, count)) = overlong_numerals::saturate_overlong_bbox_numerals(bytes, &doc)
-    else {
-        return (doc, 0);
+    let (mut doc, count) = match overlong_numerals::saturate_overlong_bbox_numerals(bytes, &doc) {
+        Some((rewritten, count)) => match load_document_bytes(&rewritten, password) {
+            Ok(reloaded) if reloaded.objects.len() > doc.objects.len() => {
+                log::debug!("loaded PDF after saturating {count} /BBox numeral(s) no parser holds");
+                (reloaded, count)
+            }
+            _ => (doc, 0),
+        },
+        None => (doc, 0),
     };
-    match load_document_bytes(&rewritten, password) {
-        Ok(reloaded) if reloaded.objects.len() > doc.objects.len() => {
-            log::debug!("loaded PDF after saturating {count} /BBox numeral(s) no parser holds");
-            (reloaded, count)
-        }
-        _ => (doc, 0),
+    let in_object_streams =
+        overlong_numerals::recover_referenced_bboxes_in_object_streams(&mut doc);
+    if in_object_streams > 0 {
+        log::debug!(
+            "recovered /BBox array(s) from object streams after saturating {in_object_streams} \
+             numeral(s) no parser holds"
+        );
     }
+    (doc, count + in_object_streams)
 }
 
 /// A loaded document with zero pages is unusable by every caller, and with
