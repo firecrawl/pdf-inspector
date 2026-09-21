@@ -796,12 +796,28 @@ fn find_relative_valleys(
 /// across two "columns," so we reject these candidates.
 fn is_list_marker_column(items: &[&&TextItem]) -> bool {
     use crate::markdown::classify::is_standalone_bullet_glyph;
+    // Layout-only: large squares/diamonds are excluded from BULLET_GLYPHS so
+    // they do not demote decorative heading prefixes, but repeated left-margin
+    // gutters of these glyphs are still real list markers and must not seed
+    // a column split.
+    const LAYOUT_GUTTER_MARKERS: &[char] = &['◆', '◇', '■', '□'];
+    fn is_layout_gutter_marker(text: &str) -> bool {
+        if is_standalone_bullet_glyph(text) {
+            return true;
+        }
+        let trimmed = text.trim();
+        let mut chars = trimmed.chars();
+        matches!(
+            (chars.next(), chars.next()),
+            (Some(c), None) if LAYOUT_GUTTER_MARKERS.contains(&c)
+        )
+    }
     if items.is_empty() {
         return false;
     }
     let marker_count = items
         .iter()
-        .filter(|i| is_standalone_bullet_glyph(&i.text))
+        .filter(|i| is_layout_gutter_marker(&i.text))
         .count();
     // Require ≥80% of items on this side to be standalone markers. A handful
     // of non-marker items (stray page numbers, footnote refs) shouldn't
@@ -4042,7 +4058,7 @@ mod tests {
     #[test]
     fn is_list_marker_column_detects_bullets() {
         // Cover every unambiguous marker, including the newly supported ‣ and ⁃.
-        let markers = ["•", "●", "○", "◦", "▪", "▫", "‣", "⁃"];
+        let markers = ["•", "●", "○", "◦", "▪", "▫", "‣", "⁃", "◆", "◇", "■", "□"];
         let items: Vec<TextItem> = markers
             .iter()
             .enumerate()
