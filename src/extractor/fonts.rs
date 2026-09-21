@@ -927,6 +927,7 @@ pub(crate) fn build_font_encodings(
         if base.is_none() {
             base = builtin_base_encoding(doc, font_dict);
         }
+        let named = named_encoding(doc, font_dict).and_then(|name| BaseEncoding::from_name(&name));
         let blank_codes = blank_glyph_codes(doc, font_dict, font_cache);
         // A font whose Differences name only codes nothing here can read
         // gets no encoding, on purpose: the fallback then reads its codes
@@ -938,6 +939,7 @@ pub(crate) fn build_font_encodings(
             || !sequences.is_empty()
             || !blank_codes.is_empty()
             || base.is_some()
+            || named.is_some()
         {
             encodings.insert(
                 resource_name,
@@ -946,6 +948,7 @@ pub(crate) fn build_font_encodings(
                     identity_overrides,
                     blank_codes,
                     base,
+                    named,
                     named_codes,
                     sequences,
                 },
@@ -2377,6 +2380,19 @@ pub(crate) fn extract_text_from_operand(
                             {
                                 return Some(ch.to_string());
                             }
+                            // For a code whose entry is a control
+                            // destination, the encoding the font declares
+                            // by name: the name that encoding gives the
+                            // code selects its glyph, whatever the entry
+                            // says.
+                            if control_destination {
+                                if let Some(ch) = encoding_map
+                                    .and_then(|map| map.named)
+                                    .and_then(|named| named.char_for(b))
+                                {
+                                    return Some(ch.to_string());
+                                }
+                            }
                         }
                         // 6. Printable single-byte fallback — a guess at a
                         // code the CMap says nothing about, not at one it
@@ -2441,6 +2457,7 @@ pub(crate) fn extract_text_from_operand(
                 }
 
                 // 2-byte CMap: use standard decode_cids path
+                let mut unread_byte_stats: Option<CidDecodeStats> = None;
                 if bytes.len() % 2 == 1 {
                     // Some PDFs emit 1-byte codes even for Type0 fonts; try
                     // per-byte lookup. Each byte is read through the first
@@ -2490,117 +2507,104 @@ pub(crate) fn extract_text_from_operand(
                     // CMap reads — none has an entry for it, or its
                     // ToUnicode entry is a control destination — counts
                     // as unmapped; no gap is read into it, so nothing is
-                    // interpolated. The bytes are counted here whatever they
-                    // read as: when none of them reads, the two-byte reading
-                    // below is tried over the same bytes, and must not count
-                    // them again.
-                    if is_type0_cid_font {
-                        let unmapped = labels.iter().filter(|(_, unmapped)| *unmapped).count();
-                        cmap_decisions.record_coverage(
-                            font_label,
-                            CidDecodeStats {
-                                codes: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
-                                interpolated: 0,
-                                unmapped: u32::try_from(unmapped).unwrap_or(u32::MAX),
-                            },
-                        );
-                    }
+                    // interpolated. The coverage describes the reading that
+                    // produced the text: this one when it read anything;
+                    // else the two-byte reading tried next over the same
+                    // bytes, and this one only if that reads nothing either
+                    // — so the bytes are counted once.
+                    let unmapped = labels.iter().filter(|(_, unmapped)| *unmapped).count();
+                    let byte_stats = CidDecodeStats {
+                        codes: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+                        interpolated: 0,
+                        unmapped: u32::try_from(unmapped).unwrap_or(u32::MAX),
+                    };
                     if !decoded.is_empty() {
+                        if is_type0_cid_font {
+                            cmap_decisions.record_coverage(font_label, byte_stats);
+                        }
                         return Some(decoded);
                     }
+                    if is_type0_cid_font {
+                        unread_byte_stats = Some(byte_stats);
+                    }
                 }
-                let bytes_counted = bytes.len() % 2 == 1 && is_type0_cid_font;
                 // Each reading keeps the CMap it came through, so the one
                 // taken joins the characters of its codes by that CMap's own
                 // code boundaries (see `CidDecode::joined`), and carries its
                 // coverage counts, recorded for the font when it is taken so
                 // a caller can tell text read from an incomplete CMap apart
                 // from text the CMap covered.
-                let two_byte_reading = |cmap_decisions: &mut CMapDecisionCache| -> Option<String> {
-                    let key = font_tounicode_refs.get(current_font).copied().unwrap_or(0);
-                    let primary = CidDecode::new(&entry.primary, bytes);
-                    let primary_stats = primary.stats;
-                    if let Some(remapped) = entry.remapped.as_ref() {
-                        let remap = CidDecode::new(remapped, bytes);
-                        let fallback = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes));
+                let key = font_tounicode_refs.get(current_font).copied().unwrap_or(0);
+                let primary = CidDecode::new(&entry.primary, bytes);
+                let primary_stats = primary.stats;
+                if let Some(remapped) = entry.remapped.as_ref() {
+                    let remap = CidDecode::new(remapped, bytes);
+                    let fallback = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes));
 
-                        if let Some(choice) = cmap_decisions.get_choice(key) {
-                            let chosen = match choice {
-                                CMapChoice::Primary => &primary,
-                                CMapChoice::Remapped => &remap,
-                            };
-                            if !chosen.text.is_empty() {
-                                let chosen = match choice {
-                                    CMapChoice::Primary => primary,
-                                    CMapChoice::Remapped => remap,
-                                };
-                                cmap_decisions.record_coverage(font_label, chosen.stats);
-                                return Some(chosen.joined(bytes));
-                            }
-                        }
-
-                        let choice =
-                            cmap_decisions.consider(key, &primary.text, &remap.text, bytes.len());
-                        let mut decoded = match choice {
-                            Some(CMapChoice::Primary) => primary,
-                            Some(CMapChoice::Remapped) => remap,
-                            None => choose_best_cmap_decode(primary, remap),
+                    if let Some(choice) = cmap_decisions.get_choice(key) {
+                        let chosen = match choice {
+                            CMapChoice::Primary => &primary,
+                            CMapChoice::Remapped => &remap,
                         };
-                        if let Some(fb) = fallback {
-                            let expected = bytes.len() / 2;
-                            let decoded_len = decoded.text.chars().count();
-                            let prefer_fallback = (!fb.text.is_empty() && decoded.text.is_empty())
-                                || (!fb.text.is_empty()
-                                    && expected > 0
-                                    && decoded_len * 2 < expected);
-                            if prefer_fallback
-                                || score_text(&fb.text) > score_text(&decoded.text) + 3
-                            {
-                                decoded = fb;
-                            }
+                        if !chosen.text.is_empty() {
+                            let chosen = match choice {
+                                CMapChoice::Primary => primary,
+                                CMapChoice::Remapped => remap,
+                            };
+                            cmap_decisions.record_coverage(font_label, chosen.stats);
+                            return Some(chosen.joined(bytes));
                         }
-                        if !decoded.text.is_empty() {
-                            cmap_decisions.record_coverage(font_label, decoded.stats);
-                            return Some(decoded.joined(bytes));
-                        }
-                    } else if !primary.text.is_empty() {
-                        if let Some(fb) = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes))
-                        {
-                            let expected = bytes.len() / 2;
-                            let decoded_len = primary.text.chars().count();
-                            let prefer_fallback = (!fb.text.is_empty() && primary.text.is_empty())
-                                || (!fb.text.is_empty()
-                                    && expected > 0
-                                    && decoded_len * 2 < expected);
-                            if prefer_fallback
-                                || score_text(&fb.text) > score_text(&primary.text) + 3
-                            {
-                                cmap_decisions.record_coverage(font_label, fb.stats);
-                                return Some(fb.joined(bytes));
-                            }
-                        }
-                        cmap_decisions.record_coverage(font_label, primary.stats);
-                        return Some(primary.joined(bytes));
                     }
 
-                    // No reading of the string came out. For a CID-keyed font
-                    // the CMap was the string's only reading, so it is recorded
-                    // as it was — the codes read from their neighbours included,
-                    // the codes it could not read as unmapped; a simple font's
-                    // string is read by its encoding below, and a CMap keyed by
-                    // two-byte codes over its one-byte string says nothing.
-                    if is_type0_cid_font {
-                        cmap_decisions.record_coverage(font_label, primary_stats);
+                    let choice =
+                        cmap_decisions.consider(key, &primary.text, &remap.text, bytes.len());
+                    let mut decoded = match choice {
+                        Some(CMapChoice::Primary) => primary,
+                        Some(CMapChoice::Remapped) => remap,
+                        None => choose_best_cmap_decode(primary, remap),
+                    };
+                    if let Some(fb) = fallback {
+                        let expected = bytes.len() / 2;
+                        let decoded_len = decoded.text.chars().count();
+                        let prefer_fallback = (!fb.text.is_empty() && decoded.text.is_empty())
+                            || (!fb.text.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                        if prefer_fallback || score_text(&fb.text) > score_text(&decoded.text) + 3 {
+                            decoded = fb;
+                        }
                     }
-                    None
-                };
-                // An odd-length string's bytes were counted byte by byte
-                // above; its two-byte reading counts nothing more.
-                if bytes_counted {
-                    cmap_decisions.without_coverage(two_byte_reading)
-                } else {
-                    two_byte_reading(cmap_decisions)
+                    if !decoded.text.is_empty() {
+                        cmap_decisions.record_coverage(font_label, decoded.stats);
+                        return Some(decoded.joined(bytes));
+                    }
+                } else if !primary.text.is_empty() {
+                    if let Some(fb) = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes)) {
+                        let expected = bytes.len() / 2;
+                        let decoded_len = primary.text.chars().count();
+                        let prefer_fallback = (!fb.text.is_empty() && primary.text.is_empty())
+                            || (!fb.text.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                        if prefer_fallback || score_text(&fb.text) > score_text(&primary.text) + 3 {
+                            cmap_decisions.record_coverage(font_label, fb.stats);
+                            return Some(fb.joined(bytes));
+                        }
+                    }
+                    cmap_decisions.record_coverage(font_label, primary.stats);
+                    return Some(primary.joined(bytes));
                 }
+
+                // No reading of the string came out. For a CID-keyed font
+                // the CMap was the string's only reading, so it is recorded
+                // as it was — the codes read from their neighbours included,
+                // the codes it could not read as unmapped; a simple font's
+                // string is read by its encoding below, and a CMap keyed by
+                // two-byte codes over its one-byte string says nothing.
+                if is_type0_cid_font {
+                    // An odd-length string none of whose bytes any CMap
+                    // reads is counted byte by byte, as read above, not
+                    // as the one code per two bytes tried here.
+                    cmap_decisions
+                        .record_coverage(font_label, unread_byte_stats.unwrap_or(primary_stats));
+                }
+                None
             };
 
             let mut has_cmap = false;
@@ -3113,6 +3117,7 @@ mod tests {
                 identity_overrides: HashMap::new(),
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
+                named: None,
                 named_codes: Default::default(),
                 sequences: Default::default(),
             },
@@ -3594,6 +3599,7 @@ mod tests {
                 identity_overrides: HashMap::new(),
                 blank_codes: Default::default(),
                 base: None,
+                named: None,
                 named_codes: [0x81, 0x82, 0x9B].into_iter().collect(),
                 sequences: Default::default(),
             },
@@ -3664,6 +3670,7 @@ mod tests {
                 identity_overrides: HashMap::new(),
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
+                named: None,
                 named_codes: result.named_codes.clone(),
                 sequences: result.sequences.clone(),
             },
@@ -3949,6 +3956,7 @@ mod tests {
                 identity_overrides: HashMap::new(),
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
+                named: None,
                 named_codes: [0x81].into_iter().collect(),
                 sequences: Default::default(),
             },
@@ -5036,6 +5044,67 @@ mod tests {
         (doc, tounicode_id.0, page_id)
     }
 
+    /// A page with the simple fonts `F1` and `F2`, TrueType without a
+    /// program, sharing one ToUnicode stream of the given `bfchar` lines and
+    /// each declaring its own encoding from `encodings`. Returns the
+    /// document, the ToUnicode object number and the page.
+    fn simple_fonts_sharing_a_tounicode_doc(
+        bfchar: &str,
+        encodings: [Object; 2],
+    ) -> (Document, u32, lopdf::ObjectId) {
+        use lopdf::Stream;
+        let mut doc = Document::with_version("1.4");
+        let cmap = format!(
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+             1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+             12 beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
+             CMapName currentdict /CMap defineresource pop\nend\nend"
+        );
+        let tounicode_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+        let mut resources = dictionary! {};
+        for (name, encoding) in ["F1", "F2"].into_iter().zip(encodings) {
+            let descriptor_id = doc.add_object(dictionary! {
+                "Type" => "FontDescriptor",
+                "FontName" => "ABCDEF+Subset",
+                "Flags" => 4,
+                "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+                "ItalicAngle" => 0,
+                "Ascent" => 700,
+                "Descent" => 0,
+                "CapHeight" => 700,
+                "StemV" => 80,
+            });
+            let font_id = doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "TrueType",
+                "BaseFont" => "ABCDEF+Subset",
+                "FirstChar" => 0x21,
+                "LastChar" => 0x2C,
+                "Widths" => vec![Object::Integer(600); 12],
+                "FontDescriptor" => descriptor_id,
+                "ToUnicode" => tounicode_id,
+                "Encoding" => encoding,
+            });
+            resources.set(name, Object::Reference(font_id));
+        }
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Resources" => dictionary! { "Font" => resources },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, tounicode_id.0, page_id)
+    }
+
     /// A page whose only font is the Type0 `F1` under Identity-H (declared
     /// as an indirect name object with `indirect_encoding`) with the given
     /// ToUnicode `bfchar` lines, whose CIDFontType2 descendant embeds
@@ -5155,21 +5224,34 @@ mod tests {
         is_cid: bool,
         bytes: &[u8],
     ) -> String {
+        decode_page_font_string_as(doc, "F1", tounicode_obj, page_id, is_cid, bytes)
+    }
+
+    /// [`decode_page_font_string`] through `font`, one of the fonts of
+    /// `page_id`, all of which are read for their encodings.
+    fn decode_page_font_string_as(
+        doc: &Document,
+        font: &str,
+        tounicode_obj: u32,
+        page_id: lopdf::ObjectId,
+        is_cid: bool,
+        bytes: &[u8],
+    ) -> String {
         let cmaps = FontCMaps::from_doc(doc);
         let fonts = doc.get_page_fonts(page_id).unwrap();
         let (font_encodings, _) =
             build_font_encodings(doc, &fonts, &cmaps, &mut FontStyleCache::new());
         let mut encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
-        if let Ok(encoding) = fonts[&b"F1".to_vec()].get_font_encoding(doc) {
-            encoding_cache.insert("F1".to_string(), encoding);
+        if let Ok(encoding) = fonts[font.as_bytes()].get_font_encoding(doc) {
+            encoding_cache.insert(font.to_string(), encoding);
         }
         let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
-        font_tounicode_refs.insert("F1".to_string(), tounicode_obj);
+        font_tounicode_refs.insert(font.to_string(), tounicode_obj);
         let mut font_widths: PageFontWidths = HashMap::new();
-        font_widths.insert("F1".to_string(), make_font_info(&[], 1000, is_cid));
+        font_widths.insert(font.to_string(), make_font_info(&[], 1000, is_cid));
         let (text, _) = extract_text_from_operand(
             &Object::String(bytes.to_vec(), lopdf::StringFormat::Hexadecimal),
-            "F1",
+            font,
             Some("ABCDEF+Subset"),
             &cmaps,
             &font_tounicode_refs,
@@ -5329,7 +5411,7 @@ mod tests {
             .expect("the CMap kept as the alternative");
         assert_eq!(alternative.lookup(3).as_deref(), Some("ff"));
         assert_eq!(alternative.lookup(1).as_deref(), Some("c"));
-        assert!(!alternative.has_control_destinations());
+        assert!(alternative.control_destination_codes().is_empty());
         assert!(entry.fallback.is_none());
         assert_eq!(
             decode_page_font_string(
@@ -5583,6 +5665,61 @@ mod tests {
         );
     }
 
+    /// An odd-length string none of whose bytes any CMap reads by itself,
+    /// but which the two-byte reading tried next reads cleanly (a subset
+    /// keeping high glyph indices, whose bytes are no codes on their own):
+    /// the coverage describes that two-byte reading — its codes, none
+    /// unmapped — not the bytes.
+    #[test]
+    fn an_odd_length_string_read_cleanly_two_bytes_at_a_time_counts_that_reading() {
+        use crate::tounicode::ToUnicodeCMap;
+        let mut primary = ToUnicodeCMap {
+            code_byte_length: 2,
+            ..Default::default()
+        };
+        primary.char_map.insert(0x0141, "A".to_string());
+        primary.char_map.insert(0x0142, "B".to_string());
+        primary.refresh_gap_fills();
+        let (text, coverage) = decode_through(primary, vec![0x01, 0x41, 0x01, 0x42, 0x01]);
+        assert_eq!(text.as_deref(), Some("AB"));
+        assert_eq!(
+            coverage,
+            vec![(
+                FontLabel::from("AAAAAA+Font"),
+                CidDecodeStats {
+                    codes: 2,
+                    interpolated: 0,
+                    unmapped: 0
+                }
+            )]
+        );
+    }
+
+    /// A CID at or past the program's glyph count has no glyph, so no blank
+    /// glyph either: its control destination stays marked, where a CID of a
+    /// glyph the program has but gives no outline reads as a space.
+    #[test]
+    fn a_cid_past_the_programs_glyph_count_has_no_blank_glyph_to_read_as_a_space() {
+        // Three glyphs, none outlined: code 2 is one of them, code 3 is not.
+        let (doc, tounicode_obj, page_id) = cid_font_doc(
+            "<0001> <0063>\n<0002> <0002>\n<0003> <0003>\n<0004> <0065>",
+            sfnt_with_glyph_names(&[None; 3]),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(
+            decode_page_font_string(
+                &doc,
+                tounicode_obj,
+                page_id,
+                true,
+                &[0, 1, 0, 2, 0, 3, 0, 4, 0, 4]
+            ),
+            "c \u{FFFD}ee"
+        );
+    }
+
     /// An odd-length string through a Type0 font none of whose bytes any
     /// CMap reads: its bytes are counted once, as codes the CMap did not
     /// cover, though the two-byte reading is tried over them afterwards.
@@ -5722,6 +5859,56 @@ mod tests {
                 &LIGATURE_INDEX_BYTES
             ),
             "coxee"
+        );
+    }
+
+    /// Two simple fonts sharing one ToUnicode stream, each with its own
+    /// `/Differences` name at the ligature's code: the stream's CMap is
+    /// kept once for both, so the code stays a control destination there,
+    /// and each font reads it by its own name.
+    #[test]
+    fn fonts_sharing_a_tounicode_stream_read_a_control_destination_each_by_its_own_name() {
+        let differences = |name: &[u8]| {
+            Object::Dictionary(dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![
+                    0x22.into(),
+                    Object::Name(b"o".to_vec()),
+                    Object::Name(name.to_vec()),
+                ],
+            })
+        };
+        let (doc, tounicode_obj, page_id) = simple_fonts_sharing_a_tounicode_doc(
+            LIGATURE_INDEX_BFCHAR,
+            [differences(b"f_f"), differences(b"f_i")],
+        );
+        let cmaps = FontCMaps::from_doc(&doc);
+        let entry = cmaps.get_by_obj(tounicode_obj).expect("the shared CMap");
+        assert_eq!(
+            entry.primary.lookup_code(0x23),
+            CodeMapping::ControlDestination
+        );
+        assert_eq!(
+            decode_page_font_string_as(
+                &doc,
+                "F1",
+                tounicode_obj,
+                page_id,
+                false,
+                &LIGATURE_INDEX_BYTES
+            ),
+            "coffee"
+        );
+        assert_eq!(
+            decode_page_font_string_as(
+                &doc,
+                "F2",
+                tounicode_obj,
+                page_id,
+                false,
+                &LIGATURE_INDEX_BYTES
+            ),
+            "cofiee"
         );
     }
 
