@@ -1585,7 +1585,12 @@ fn compose_detached_spacing_accents<'a>(
                 RunEnd::First,
             ),
         ];
-        let mut best: Option<(usize, RunEnd, f32)> = None;
+        // The neighbour whose end glyph the accent lies over and composes
+        // with; when it lies over both, the one it overlaps more. A glyph
+        // that has no composition with the mark is no candidate, so an
+        // accent over a `t` and an `o` composes with the `o` however the
+        // overlaps compare.
+        let mut best: Option<(usize, std::ops::Range<usize>, char, f32)> = None;
         for (index, end) in neighbours {
             let Some(index) = index else {
                 continue;
@@ -1593,26 +1598,31 @@ fn compose_detached_spacing_accents<'a>(
             if replaced(index) || lone_spacing_accent(&items[index]).is_some() {
                 continue;
             }
-            if let Some(overlap) = accent_overlap(&items[i], &items[index], end) {
-                if best.is_none_or(|(_, _, other)| overlap > other) {
-                    best = Some((index, end, overlap));
-                }
+            let Some(overlap) = accent_overlap(&items[i], &items[index], end) else {
+                continue;
+            };
+            let Some((glyph, range, _)) = end_glyph(&items[index].text, end) else {
+                continue;
+            };
+            // A dotless i or j is the form a typesetter puts an accent over,
+            // the dot being what the accent replaces: it composes as the
+            // dotted letter.
+            let base = match glyph {
+                '\u{0131}' => 'i',
+                '\u{0237}' => 'j',
+                other => other,
+            };
+            let Some(composed) = unicode_normalization::char::compose(base, mark) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(_, _, _, other)| overlap > *other)
+            {
+                best = Some((index, range, composed, overlap));
             }
         }
-        let Some((index, end, _)) = best else {
-            continue;
-        };
-        let Some((glyph, range, _)) = end_glyph(&items[index].text, end) else {
-            continue;
-        };
-        // A dotless i or j is the form a typesetter puts an accent over, the
-        // dot being what the accent replaces: it composes as the dotted letter.
-        let base = match glyph {
-            '\u{0131}' => 'i',
-            '\u{0237}' => 'j',
-            other => other,
-        };
-        let Some(composed) = unicode_normalization::char::compose(base, mark) else {
+        let Some((index, range, composed, _)) = best else {
             continue;
         };
         items[index]
@@ -4944,6 +4954,22 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1, "{merged:?}");
         assert_eq!(merged[0].text, "a\u{02C6}b");
+    }
+
+    #[test]
+    fn accent_over_two_glyphs_composes_with_the_one_that_can() {
+        // The macron overlaps the `t` before it more than the `o` after it;
+        // `t` has no composition with a macron, `o` has.
+        let mut accent = make_merge_item("\u{00AF}", 104.5, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("t", 100.0, 7.3),
+            accent,
+            make_merge_item("ohoku", 107.3, 33.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "t\u{014D}hoku");
     }
 
     #[test]
