@@ -183,6 +183,21 @@ Changes since 1.22.1.
   nothing, as a code of a CID font whose CMap cannot be read at all already
   was, so the loss stays visible and `has_encoding_issues` reports it.
   ([#568](https://github.com/firecrawl/pdf-inspector/pull/568))
+- A ToUnicode entry whose destination is a control character — U+0001–U+001F
+  other than TAB, LF and CR, or DEL — maps its code to no text, and the code
+  counts as unmapped. Some producers write a glyph's own index in place of
+  its character (a ligature glyph at index 18 gets `<0012> <0012>`, a space
+  glyph at index 1 `<0001> <0001>`); the control character it decoded to
+  was stripped later without a trace, so a word set with such a ligature
+  lost its letters, words set around such a space ran together, and the
+  document read as clean text. The code now reads through what the font
+  itself says of it — the embedded program's glyph name (`f_f`, `ff`) or
+  cmap entry, its `/Differences` name, the encoding a simple font declares
+  by name, or a space for a CIDFont glyph with no outline but an advance —
+  and as U+FFFD otherwise, so the loss is marked where it happens and
+  `has_encoding_issues` reports it; a single-byte code so mapped is no
+  longer guessed from its byte value. Entries that map to TAB, LF or CR, and
+  CMaps without such entries, read as before.
 
 ## [1.22.1] - 2026-09-20
 

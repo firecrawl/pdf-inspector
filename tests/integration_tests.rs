@@ -8908,6 +8908,17 @@ fn test_widen_degenerate_form_bboxes_mem_repairs_only_zero_area_boxes() {
 /// and `glyf`, no `cmap` — with `glyph_count` glyphs of one square outline
 /// after `.notdef`, as a CID-keyed subset embeds it.
 fn minimal_truetype_subset(glyph_count: usize) -> Vec<u8> {
+    minimal_truetype_subset_with(glyph_count, &[], &[])
+}
+
+/// [`minimal_truetype_subset`] with a `post` table naming the glyphs in
+/// `names` (`(glyph index, name)`) when there are any, the rest `.notdef`,
+/// and the glyphs in `blank` left without an outline (their advance kept).
+fn minimal_truetype_subset_with(
+    glyph_count: usize,
+    names: &[(u16, &str)],
+    blank: &[u16],
+) -> Vec<u8> {
     let square: Vec<u8> = {
         let mut g = Vec::new();
         g.extend(1i16.to_be_bytes()); // one contour
@@ -8925,9 +8936,11 @@ fn minimal_truetype_subset(glyph_count: usize) -> Vec<u8> {
     let num_glyphs = glyph_count as u16 + 1;
     let mut glyf = Vec::new();
     let mut loca = Vec::new();
-    for _ in 0..num_glyphs {
+    for gid in 0..num_glyphs {
         loca.extend((glyf.len() as u32).to_be_bytes());
-        glyf.extend(&square);
+        if !blank.contains(&gid) {
+            glyf.extend(&square);
+        }
     }
     loca.extend((glyf.len() as u32).to_be_bytes());
     let mut head = vec![0u8; 54];
@@ -8946,7 +8959,7 @@ fn minimal_truetype_subset(glyph_count: usize) -> Vec<u8> {
         hmtx.extend(600u16.to_be_bytes());
         hmtx.extend(0i16.to_be_bytes());
     }
-    let tables: [(&[u8; 4], Vec<u8>); 6] = [
+    let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
         (b"glyf", glyf),
         (b"head", head),
         (b"hhea", hhea),
@@ -8954,6 +8967,26 @@ fn minimal_truetype_subset(glyph_count: usize) -> Vec<u8> {
         (b"loca", loca),
         (b"maxp", maxp),
     ];
+    if !names.is_empty() {
+        // post format 2: an index per glyph, 0 for `.notdef`, 258 onwards
+        // for the names that follow as Pascal strings.
+        let mut post = Vec::new();
+        post.extend(0x0002_0000u32.to_be_bytes());
+        post.extend([0u8; 28]);
+        post.extend(num_glyphs.to_be_bytes());
+        for gid in 0..num_glyphs {
+            let index = names
+                .iter()
+                .position(|&(named, _)| named == gid)
+                .map_or(0, |i| 258 + i as u16);
+            post.extend(index.to_be_bytes());
+        }
+        for &(_, name) in names {
+            post.push(name.len() as u8);
+            post.extend(name.as_bytes());
+        }
+        tables.push((b"post", post));
+    }
     let mut font = Vec::new();
     font.extend(0x0001_0000u32.to_be_bytes());
     font.extend((tables.len() as u16).to_be_bytes());
@@ -8989,27 +9022,72 @@ const CID_TEXT_LINES: [&str; 3] = [
 /// CMap saying so. None of the codes' bytes is an ASCII letter or digit.
 /// With `in_form` the text is drawn by a Form XObject the page invokes.
 fn make_cid_text_over_vector_art_pdf(lines: &[&str], paths: usize, in_form: bool) -> Vec<u8> {
-    use lopdf::{dictionary, Document, Object, Stream};
-
     let mut alphabet: Vec<char> = lines.iter().flat_map(|line| line.chars()).collect();
     alphabet.sort_unstable();
     alphabet.dedup();
     let code_of = |c: char| alphabet.iter().position(|&a| a == c).unwrap() as u16 + 1;
 
-    let mut cmap = String::from(
-        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
-         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
-         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
-         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
-    );
+    let mut cmap = String::from(CID_CMAP_HEAD);
     cmap.push_str(&format!("{} beginbfchar\n", alphabet.len()));
     for &c in &alphabet {
         cmap.push_str(&format!("<{:04X}> <{:04X}>\n", code_of(c), c as u32));
     }
-    cmap.push_str("endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    cmap.push_str(CID_CMAP_TAIL);
+
+    let mut art = String::new();
+    for i in 0..paths {
+        let (x, y) = (50 + (i % 40) * 12, 100 + (i / 40) * 20);
+        art.push_str(&format!(
+            "{x} {y} m {} {} l {} {y} l h f\n",
+            x + 5,
+            y + 8,
+            x + 10
+        ));
+    }
+    let mut text = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let hex: String = line
+            .chars()
+            .map(|c| format!("{:04X}", code_of(c)))
+            .collect();
+        text.push_str(&format!(
+            "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
+            700 - 20 * index
+        ));
+    }
+    make_embedded_cid_font_pdf(
+        &cmap,
+        minimal_truetype_subset(alphabet.len()),
+        &art,
+        &text,
+        in_form,
+    )
+}
+
+/// The ToUnicode CMap of [`make_embedded_cid_font_pdf`] up to its `bfchar` section,
+/// and after it.
+const CID_CMAP_HEAD: &str = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+     /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+     /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+     1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n";
+const CID_CMAP_TAIL: &str =
+    "endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n";
+
+/// A page drawing `art` then `text` (content-stream operators showing
+/// two-byte codes through the font `F1`): a Type0 font under Identity-H
+/// whose embedded TrueType subset is `font_file` and whose ToUnicode CMap
+/// is `cmap`. With `in_form` the text is drawn by a Form XObject the page
+/// invokes.
+fn make_embedded_cid_font_pdf(
+    cmap: &str,
+    font_file: Vec<u8>,
+    art: &str,
+    text: &str,
+    in_form: bool,
+) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
 
     let mut doc = Document::with_version("1.5");
-    let font_file = minimal_truetype_subset(alphabet.len());
     let font_file_id = doc.add_object(Stream::new(
         dictionary! { "Length1" => font_file.len() as i64 },
         font_file,
@@ -9039,7 +9117,7 @@ fn make_cid_text_over_vector_art_pdf(lines: &[&str], paths: usize, in_form: bool
         "DW" => 600,
         "CIDToGIDMap" => "Identity",
     });
-    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.as_bytes().to_vec()));
     let font_id = doc.add_object(dictionary! {
         "Type" => "Font",
         "Subtype" => "Type0",
@@ -9049,27 +9127,6 @@ fn make_cid_text_over_vector_art_pdf(lines: &[&str], paths: usize, in_form: bool
         "ToUnicode" => cmap_id,
     });
 
-    let mut art = String::new();
-    for i in 0..paths {
-        let (x, y) = (50 + (i % 40) * 12, 100 + (i / 40) * 20);
-        art.push_str(&format!(
-            "{x} {y} m {} {} l {} {y} l h f\n",
-            x + 5,
-            y + 8,
-            x + 10
-        ));
-    }
-    let mut text = String::new();
-    for (index, line) in lines.iter().enumerate() {
-        let hex: String = line
-            .chars()
-            .map(|c| format!("{:04X}", code_of(c)))
-            .collect();
-        text.push_str(&format!(
-            "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
-            700 - 20 * index
-        ));
-    }
     let mut resources = dictionary! {
         "Font" => dictionary! { "F1" => font_id },
     };
@@ -9081,7 +9138,7 @@ fn make_cid_text_over_vector_art_pdf(lines: &[&str], paths: usize, in_form: bool
                 "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
                 "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
             },
-            text.into_bytes(),
+            text.as_bytes().to_vec(),
         ));
         resources.set("XObject", dictionary! { "Fm1" => form_id });
         format!("{art}q /Fm1 Do Q\n")
@@ -9533,4 +9590,64 @@ fn test_zero_advance_sign_on_a_right_to_left_line_stays_on_its_letter() {
         let markdown = &pages.pages[0].markdown;
         assert!(markdown.contains(POINTED_LINE), "{content}: {markdown:?}");
     }
+}
+
+/// The word "coffee" shown through [`make_embedded_cid_font_pdf`] as codes 1–4 —
+/// c, o, the ff ligature, e — with the ligature's code mapped by
+/// `ligature_entry`, the program's glyphs named `names` and the glyphs in
+/// `blank` left without an outline. The CMap maps eight more codes the
+/// page does not show, as a subset's CMap lists every glyph it kept.
+fn make_ligature_index_pdf(ligature_entry: &str, names: &[(u16, &str)], blank: &[u16]) -> Vec<u8> {
+    let cmap = format!(
+        "{CID_CMAP_HEAD}12 beginbfchar\n<0001> <0063>\n<0002> <006F>\n\
+         <0003> {ligature_entry}\n<0004> <0065>\n<0005> <0074>\n<0006> <0061>\n\
+         <0007> <0062>\n<0008> <006C>\n<0009> <0073>\n<000A> <0075>\n\
+         <000B> <006E>\n<000C> <0064>\n{CID_CMAP_TAIL}"
+    );
+    make_embedded_cid_font_pdf(
+        &cmap,
+        minimal_truetype_subset_with(12, names, blank),
+        "",
+        "BT /F1 12 Tf 72 700 Td <00010002000300040004> Tj ET\n",
+        false,
+    )
+}
+
+/// A ToUnicode entry whose destination is a control character — here the
+/// ligature glyph's own index, `<0003>`, written in place of its character
+/// — maps its code to no text: the code reads as U+FFFD in its place and
+/// the document reports an encoding issue, where the word used to read
+/// "coee" and pass as clean. The program's glyph name reads the glyph when
+/// it has one, and a glyph with no outline but an advance reads as the
+/// space it paints; an entry mapping to TAB, and an ordinary entry, read
+/// as before.
+#[test]
+fn a_control_destination_in_a_tounicode_cmap_marks_its_code() {
+    let marked = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[], &[])).unwrap();
+    let markdown = marked.markdown.unwrap();
+    assert!(markdown.contains("co\u{FFFD}ee"), "{markdown}");
+    assert!(marked.has_encoding_issues);
+
+    let named = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[(3, "f_f")], &[])).unwrap();
+    let markdown = named.markdown.unwrap();
+    assert!(markdown.contains("coffee"), "{markdown}");
+    assert!(!named.has_encoding_issues);
+
+    let blank = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[], &[3])).unwrap();
+    let markdown = blank.markdown.unwrap();
+    assert!(markdown.contains("co ee"), "{markdown}");
+    assert!(!blank.has_encoding_issues);
+
+    let tab = process_pdf_mem(&make_ligature_index_pdf("<0009>", &[], &[])).unwrap();
+    let markdown = tab.markdown.unwrap();
+    assert!(
+        !markdown.contains('\u{FFFD}') && markdown.contains("co") && markdown.contains("ee"),
+        "{markdown}"
+    );
+    assert!(!tab.has_encoding_issues);
+
+    let ordinary = process_pdf_mem(&make_ligature_index_pdf("<00660066>", &[], &[])).unwrap();
+    let markdown = ordinary.markdown.unwrap();
+    assert!(markdown.contains("coffee"), "{markdown}");
+    assert!(!ordinary.has_encoding_issues);
 }
