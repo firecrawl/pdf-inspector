@@ -6,27 +6,8 @@ use super::super::{
     analyze_page_content, detect_from_document, page_ocr_reasons, page_ocr_signals,
     DetectionConfig, PdfType,
 };
+use super::fixtures::*;
 use super::*;
-
-/// A scan of `content` on its own — no page, nothing followed through
-/// `Do` — as its counts and executed tallies: (counts, text ops,
-/// hidden text ops).
-fn scan_alone(content: &[u8]) -> (ContentCounts, u32, u32) {
-    let doc = Document::new();
-    let mut state = ContentScanState::new(&doc, PageBox::LETTER, false);
-    let counts = scan_content_stream(
-        content,
-        &mut HashSet::new(),
-        &mut HashSet::new(),
-        &mut state,
-        &[],
-    );
-    (
-        counts,
-        state.executed_text_ops,
-        state.executed_hidden_text_ops,
-    )
-}
 
 #[test]
 fn render_mode_splits_hidden_text_ops() {
@@ -162,311 +143,6 @@ fn saved_states_past_the_depth_cap_restore_nothing() {
     let (counts, _, hidden) = scan_alone(&content);
     assert_eq!(counts.text_ops, 1);
     assert_eq!(hidden, 0, "the outermost `Q` restores mode 0");
-}
-
-/// A Form XObject of [`synthetic_page`]: the page's font as `F1`, and
-/// the `/BBox` and `/Matrix` given.
-#[derive(Clone, Copy)]
-struct TestForm<'a> {
-    name: &'a str,
-    content: &'a str,
-    matrix: Option<[i64; 6]>,
-    bbox: &'a [i64],
-}
-
-/// A page-sized form with nothing in it, to fill in.
-const PAGE_FORM: TestForm<'static> = TestForm {
-    name: "",
-    content: "",
-    matrix: None,
-    bbox: &[0, 0, 612, 792],
-};
-
-/// A pattern of [`synthetic_page_with_patterns`]: a tiling pattern whose
-/// cell runs `content`, with the page's image as `Im0` and font as `F1`
-/// in its resources — or a shading pattern, when `shading`.
-#[derive(Clone, Copy)]
-struct TestPattern<'a> {
-    name: &'a str,
-    content: &'a str,
-    shading: bool,
-}
-
-/// A one-page 612×792 document whose content stream is set with
-/// [`set_page_content`]: a 2×2 gray image `Im0` when `image`; a
-/// 1500×2383 image `ImBig`, bound whether or not the content draws it,
-/// when `large_image`; and the given forms, bound whether or not the
-/// content invokes them.
-fn synthetic_page(
-    image: bool,
-    large_image: bool,
-    forms: &[TestForm<'_>],
-) -> (Document, ObjectId, ObjectId) {
-    synthetic_page_with_patterns(image, large_image, forms, &[])
-}
-
-/// [`synthetic_page`] with the given patterns bound as well.
-fn synthetic_page_with_patterns(
-    image: bool,
-    large_image: bool,
-    forms: &[TestForm<'_>],
-    patterns: &[TestPattern<'_>],
-) -> (Document, ObjectId, ObjectId) {
-    use lopdf::dictionary;
-    let mut doc = Document::with_version("1.4");
-    let pages_id = doc.new_object_id();
-    let page_id = doc.new_object_id();
-    let font_id = doc.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => Object::Name(b"Type1".to_vec()),
-        "BaseFont" => Object::Name(b"Helvetica".to_vec()),
-    });
-    let mut xobjects = dictionary! {};
-    let mut add_image = |doc: &mut Document, name: &str, width: i64, height: i64, data: Vec<u8>| {
-        let image_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => Object::Name(b"Image".to_vec()),
-                "Width" => Object::Integer(width),
-                "Height" => Object::Integer(height),
-                "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
-                "BitsPerComponent" => Object::Integer(8),
-            },
-            data,
-        )));
-        xobjects.set(name, Object::Reference(image_id));
-        image_id
-    };
-    let mut page_image = None;
-    if image {
-        page_image = Some(add_image(&mut doc, "Im0", 2, 2, vec![200, 60, 60, 200]));
-    }
-    if large_image {
-        add_image(&mut doc, "ImBig", 1500, 2383, Vec::new());
-    }
-    for form in forms {
-        let mut dict = dictionary! {
-            "Type" => "XObject",
-            "Subtype" => Object::Name(b"Form".to_vec()),
-            "BBox" => form
-                .bbox
-                .iter()
-                .map(|&value| Object::Integer(value))
-                .collect::<Vec<_>>(),
-            "Resources" => dictionary! {
-                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
-            },
-        };
-        if let Some(matrix) = form.matrix {
-            dict.set(
-                "Matrix",
-                matrix
-                    .iter()
-                    .map(|&value| Object::Integer(value))
-                    .collect::<Vec<_>>(),
-            );
-        }
-        let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-            dict,
-            form.content.as_bytes().to_vec(),
-        )));
-        xobjects.set(form.name, Object::Reference(form_id));
-    }
-    let mut pattern_dict = dictionary! {};
-    for pattern in patterns {
-        let object = if pattern.shading {
-            Object::Dictionary(dictionary! {
-                "Type" => "Pattern",
-                "PatternType" => Object::Integer(2),
-                "Shading" => dictionary! {
-                    "ShadingType" => Object::Integer(2),
-                    "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
-                    "Coords" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-                },
-            })
-        } else {
-            let mut resources = dictionary! {
-                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
-            };
-            if let Some(image_id) = page_image {
-                resources.set(
-                    "XObject",
-                    dictionary! { "Im0" => Object::Reference(image_id) },
-                );
-            }
-            Object::Stream(lopdf::Stream::new(
-                dictionary! {
-                    "Type" => "Pattern",
-                    "PatternType" => Object::Integer(1),
-                    "PaintType" => Object::Integer(1),
-                    "TilingType" => Object::Integer(1),
-                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-                    "XStep" => Object::Integer(612),
-                    "YStep" => Object::Integer(792),
-                    "Resources" => resources,
-                },
-                pattern.content.as_bytes().to_vec(),
-            ))
-        };
-        let pattern_id = doc.add_object(object);
-        pattern_dict.set(pattern.name, Object::Reference(pattern_id));
-    }
-    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-        dictionary! {},
-        Vec::new(),
-    )));
-
-    doc.objects.insert(
-        page_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Page",
-            "Parent" => Object::Reference(pages_id),
-            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-            "Resources" => dictionary! {
-                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
-                "XObject" => xobjects,
-                "Pattern" => pattern_dict,
-            },
-            "Contents" => Object::Reference(content_id),
-        }),
-    );
-    doc.objects.insert(
-        pages_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Pages",
-            "Kids" => vec![Object::Reference(page_id)],
-            "Count" => Object::Integer(1),
-        }),
-    );
-    let catalog_id = doc.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => Object::Reference(pages_id),
-    });
-    doc.trailer.set("Root", Object::Reference(catalog_id));
-    (doc, page_id, content_id)
-}
-
-fn set_page_content(doc: &mut Document, content_id: ObjectId, content: &str) {
-    doc.objects.insert(
-        content_id,
-        Object::Stream(lopdf::Stream::new(
-            lopdf::dictionary! {},
-            content.as_bytes().to_vec(),
-        )),
-    );
-}
-
-/// The executed tallies of `streams` run, in order, as the page's
-/// content: (text ops, hidden text ops, covered image area).
-fn executed(doc: &Document, page_id: ObjectId, streams: &[&str]) -> (u32, u32, f64) {
-    let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
-    let (own, ancestors) = doc.get_page_resources(page_id).unwrap();
-    let resources: Vec<&lopdf::Dictionary> = own
-        .into_iter()
-        .chain(
-            ancestors
-                .iter()
-                .filter_map(|id| doc.get_dictionary(*id).ok()),
-        )
-        .collect();
-    let mut state = ContentScanState::new(doc, page_box, true);
-    for stream in streams {
-        scan_content_stream(
-            stream.as_bytes(),
-            &mut HashSet::new(),
-            &mut HashSet::new(),
-            &mut state,
-            &resources,
-        );
-    }
-    (
-        state.executed_text_ops,
-        state.executed_hidden_text_ops,
-        state.covered_image_area(),
-    )
-}
-
-const PAGE_AREA: f64 = 612.0 * 792.0;
-const FULL_PAGE_IMAGE: &str = "q 612 0 0 792 0 0 cm /Im0 Do Q\n";
-
-/// 120 one-glyph `Tj` blocks under `mode`, as a producer writes a text
-/// layer.
-fn glyph_layer(mode: u8) -> String {
-    let mut layer = format!("{mode} Tr\n");
-    let glyphs = "thepagecarriesalayernobodysees".chars().cycle().take(120);
-    for (n, glyph) in glyphs.enumerate() {
-        let x = 72 + (n % 40) * 12;
-        let y = 720 - (n / 40) * 14;
-        layer.push_str(&format!(
-            "BT 1 0 0 1 {x} {y} Tm /F1 10 Tf ({glyph}) Tj ET\n"
-        ));
-    }
-    layer
-}
-
-fn close(a: f64, b: f64) -> bool {
-    (a - b).abs() < 1e-6
-}
-
-#[test]
-fn clip_only_text_painted_through_is_visible() {
-    let (doc, page_id, _) = synthetic_page(true, false, &[]);
-    // A title filled with an image: the glyphs clip the image painted
-    // through them, so they are visible. The image under the page,
-    // drawn before the text, shows nothing of it.
-    let (executed_ops, hidden, covered) = executed(
-        &doc,
-        page_id,
-        &["q 612 0 0 792 0 0 cm /Im0 Do Q \
-           q BT 7 Tr (L) Tj (O) Tj ET q 612 0 0 792 0 0 cm /Im0 Do Q Q"],
-    );
-    assert_eq!((executed_ops, hidden), (2, 0));
-    assert!(close(covered, PAGE_AREA));
-
-    // Shadings, inline images, path painting (of a path that lands on
-    // the page: a painting operator with no path paints nothing) and
-    // visible text show it too; mode 3 is never shown, whatever is
-    // painted after it.
-    for painting in [
-        "sh",
-        "BI /W 1 /H 1 ID x EI",
-        "0 0 1 1 re f",
-        "0 0 m 1 1 l S",
-        "0 0 m 1 1 l 2 0 l b",
-        "BT 0 Tr (v) Tj ET",
-    ] {
-        let content = format!("q BT 7 Tr (a) Tj ET {painting} Q BT 3 Tr (b) Tj ET {painting}");
-        let (executed_ops, hidden, _) = executed(&doc, page_id, &[&content]);
-        let visible_text = if painting.contains("Tj") { 2 } else { 0 };
-        assert_eq!(executed_ops, 2 + visible_text, "{painting}");
-        assert_eq!(hidden, 1, "{painting}");
-    }
-
-    // A clip whose level closes unpainted hides its text for good: the
-    // image painted afterwards, in a later stream, is outside it.
-    let (executed_ops, hidden, _) = executed(
-        &doc,
-        page_id,
-        &[
-            "q BT 7 Tr (a) Tj ET Q BT 7 Tr (b) Tj ET",
-            "q 612 0 0 792 0 0 cm /Im0 Do Q",
-        ],
-    );
-    assert_eq!(
-        (executed_ops, hidden),
-        (2, 1),
-        "(b) was painted through, (a) was not"
-    );
-}
-
-/// Within a tenth of the expected area — the grid's resolution costs a
-/// cell along each edge — and nothing but zero for none.
-fn about(covered: f64, expected: f64) -> bool {
-    if expected == 0.0 {
-        covered == 0.0
-    } else {
-        (covered - expected).abs() <= expected * 0.1
-    }
 }
 
 #[test]
@@ -845,44 +521,6 @@ fn an_image_drawn_off_the_page_does_not_cover_it() {
     assert!(analysis.has_invisible_text_layer);
 }
 
-/// A one-page document: a 2×2 gray image drawn over the whole page when
-/// `covering_image`; a layer of 120 one-glyph `Tj` blocks under
-/// `layer_mode` when given, in the page's content or, when
-/// `layer_in_form`, in a Form XObject the page invokes; and a visible
-/// caption line when given.
-fn layered_scan_page(
-    covering_image: bool,
-    layer_mode: Option<u8>,
-    layer_in_form: bool,
-    caption: Option<&str>,
-) -> (Document, ObjectId) {
-    let layer = layer_mode.map(glyph_layer).unwrap_or_default();
-    let forms: Vec<TestForm> = if layer_in_form {
-        vec![TestForm {
-            name: "Fm0",
-            content: layer.as_str(),
-            ..PAGE_FORM
-        }]
-    } else {
-        Vec::new()
-    };
-    let (mut doc, page_id, content_id) = synthetic_page(covering_image, false, &forms);
-    let mut content = String::new();
-    if covering_image {
-        content.push_str(FULL_PAGE_IMAGE);
-    }
-    if layer_in_form {
-        content.push_str("/Fm0 Do\n");
-    } else {
-        content.push_str(&layer);
-    }
-    if let Some(caption) = caption {
-        content.push_str(&format!("BT 0 Tr /F1 12 Tf 72 40 Td ({caption}) Tj ET\n"));
-    }
-    set_page_content(&mut doc, content_id, &content);
-    (doc, page_id)
-}
-
 #[test]
 fn invisible_layer_under_a_covering_image_is_flagged() {
     let (doc, page_id) = layered_scan_page(true, Some(3), false, None);
@@ -1223,51 +861,6 @@ fn an_inline_image_alone_makes_an_image_page() {
 }
 
 #[test]
-fn a_draw_off_the_page_or_clipped_away_reveals_nothing() {
-    let (doc, page_id, _) = synthetic_page(true, false, &[]);
-    let run = |content: &str| executed(&doc, page_id, &[content]);
-    let clip_text = "BT /F1 10 Tf 7 Tr (a) Tj ET";
-
-    // An image drawn off the page, an XObject or an inline one, and a
-    // fill or a shading that the clip in force leaves nothing of: the
-    // clip-only text stays hidden.
-    for painting in [
-        "q 612 0 0 792 700 0 cm /Im0 Do Q",
-        "q 612 0 0 792 700 0 cm BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q",
-        "q 0 0 10 10 re W n 500 500 50 50 re f Q",
-        "q W n sh Q",
-        "q W n 0 0 612 792 re f Q",
-    ] {
-        let (executed_ops, hidden, _) = run(&format!("{clip_text} {painting}"));
-        assert_eq!((executed_ops, hidden), (1, 1), "{painting}");
-    }
-    // Landing within the clip, each of them shows the text through.
-    for painting in [
-        "q 612 0 0 792 0 0 cm /Im0 Do Q",
-        "q 612 0 0 792 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q",
-        "q 0 0 10 10 re W n 5 5 50 50 re f Q",
-        "q 0 0 10 10 re W n 0 0 m 100 100 l S Q",
-        "sh",
-    ] {
-        let (executed_ops, hidden, _) = run(&format!("{clip_text} {painting}"));
-        assert_eq!((executed_ops, hidden), (1, 0), "{painting}");
-    }
-
-    // A hidden layer over a covering image stays one when an off-page
-    // draw follows.
-    let (mut doc, page_id, content_id) = synthetic_page(true, false, &[]);
-    set_page_content(
-        &mut doc,
-        content_id,
-        &format!(
-            "{FULL_PAGE_IMAGE}{}q 612 0 0 792 700 0 cm /Im0 Do Q",
-            glyph_layer(7)
-        ),
-    );
-    assert!(analyze_page_content(&doc, page_id).has_invisible_text_layer);
-}
-
-#[test]
 fn an_inline_image_in_a_form_counts_only_when_the_form_runs() {
     // No image XObject anywhere; the page's only raster sits in a form.
     let (mut doc, page_id, content_id) = synthetic_page(
@@ -1322,4 +915,91 @@ fn an_inline_image_in_a_form_counts_only_when_the_form_runs() {
         detected.ocr_reasons_by_page.get(&1),
         Some(&vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
     );
+}
+
+/// A pattern whose cell draws a name its own resources do not bind draws
+/// what the resources in force where it is used bind: the image in one
+/// form, a form drawing paths in another, nothing in the page's own —
+/// whichever was used first.
+#[test]
+fn a_pattern_is_judged_in_the_resources_in_force_where_it_is_used() {
+    let forms = [
+        TestForm {
+            name: "FmPaths",
+            content: "0 0 10 10 re f",
+            ..PAGE_FORM
+        },
+        TestForm {
+            name: "FmLeft",
+            content: "/Pattern cs /PX scn 0 0 306 792 re f",
+            xobjects: &[("X", "Im0")],
+            ..PAGE_FORM
+        },
+        TestForm {
+            name: "FmRight",
+            content: "/Pattern cs /PX scn 306 0 306 792 re f",
+            xobjects: &[("X", "FmPaths")],
+            ..PAGE_FORM
+        },
+    ];
+    let pattern = TestPattern {
+        name: "PX",
+        content: "q 612 0 0 792 0 0 cm /X Do Q",
+        shading: false,
+    };
+    let (doc, page_id, _) = synthetic_page_with_patterns(true, false, &forms, &[pattern]);
+    let covered = |content: &str| executed(&doc, page_id, &[content]).2;
+    // Used where `X` is the image, and where it is the paths form, in
+    // either order: the half the image fills is covered, the other not.
+    assert!(close(covered("/FmLeft Do /FmRight Do"), PAGE_AREA / 2.0));
+    assert!(close(covered("/FmRight Do /FmLeft Do"), PAGE_AREA / 2.0));
+    // Where nothing binds `X` the pattern draws no image; used there
+    // first, it still draws one where the image is.
+    let page_fill = "/Pattern cs /PX scn 0 0 612 792 re f";
+    assert!(close(covered(page_fill), 0.0));
+    assert!(close(
+        covered(&format!("{page_fill} /FmLeft Do")),
+        PAGE_AREA / 2.0
+    ));
+}
+
+/// A form invoked again is decompressed and masked once: both copies are
+/// kept while the budget lasts, and a form too large for both is kept
+/// not at all.
+#[test]
+fn a_form_s_masked_content_is_kept_with_it() {
+    let form = TestForm {
+        name: "FmTwice",
+        content: "BT /F1 12 Tf (a % not a comment) Tj ET",
+        ..PAGE_FORM
+    };
+    let (doc, page_id, _) = synthetic_page(false, false, &[form]);
+    let state = executed_state(&doc, page_id, &["/FmTwice Do /FmTwice Do"]);
+    assert_eq!(state.executed_text_ops, 2);
+    let kept = state
+        .form_content
+        .values()
+        .next()
+        .expect("the form is kept");
+    assert_eq!(kept.content, form.content.as_bytes());
+    assert_eq!(
+        kept.masked,
+        mask_strings_comments_and_inline_images(form.content.as_bytes())
+    );
+    assert_eq!(state.form_content_bytes, 2 * form.content.len());
+
+    let too_large = "(a) Tj ".repeat(FORM_CONTENT_CACHE_MAX_BYTES / 14 + 1);
+    let form = TestForm {
+        name: "FmLarge",
+        content: too_large.as_str(),
+        ..PAGE_FORM
+    };
+    let (doc, page_id, _) = synthetic_page(false, false, &[form]);
+    let state = executed_state(&doc, page_id, &["/FmLarge Do /FmLarge Do"]);
+    assert_eq!(
+        state.executed_text_ops as usize,
+        2 * (FORM_CONTENT_CACHE_MAX_BYTES / 14 + 1)
+    );
+    assert!(state.form_content.is_empty());
+    assert_eq!(state.form_content_bytes, 0);
 }

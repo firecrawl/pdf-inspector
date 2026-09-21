@@ -1,7 +1,7 @@
 //! What the executed-content scan reads operators through: a copy of the
 //! stream with its strings, comments and inline image data blanked, and
-//! the operand lookbacks — numbers, a name, whether a show operator has
-//! anything to show — that the scan runs on it.
+//! the operand lookbacks — numbers, a name, how much text a show operator
+//! has to show — that the scan runs on it.
 
 use super::{is_pdf_name_delimiter, is_pdf_whitespace};
 
@@ -209,30 +209,36 @@ pub(super) fn name_operand_before(content: &[u8], op_pos: usize, floor: usize) -
         .then(|| content[start..end].to_vec())
 }
 
-/// Whether the operand of the show operator at `op_pos` holds anything to
-/// show: a literal string with a byte in it, a hex string with a digit in
-/// it, or an array with such a string among its elements. `masked` is the
-/// stream with its strings blanked (see
+/// How many bytes of text the operand of the show operator at `op_pos`
+/// holds: the bytes of a literal string, the digit pairs of a hex string,
+/// or those of the strings among an array's elements — 0 when there is
+/// nothing to show. `masked` is the stream with its strings blanked (see
 /// [`mask_strings_comments_and_inline_images`]), in which a string's
 /// delimiters pair up plainly; `content` is the stream itself. `() Tj`,
-/// `<> Tj`, `[] TJ` and `[5 -8] TJ` show nothing.
-pub(super) fn show_operand_has_text(
+/// `<> Tj`, `[] TJ` and `[5 -8] TJ` show nothing. A literal's escape
+/// sequences count by their bytes, near enough for the width the count
+/// estimates.
+pub(super) fn show_operand_text_bytes(
     masked: &[u8],
     content: &[u8],
     op_pos: usize,
     floor: usize,
-) -> bool {
+) -> usize {
     fn opener_before(masked: &[u8], close: usize, floor: usize, opener: u8) -> Option<usize> {
         (floor..close).rev().find(|&at| masked[at] == opener)
     }
     fn closer_after(masked: &[u8], open: usize, end: usize, closer: u8) -> Option<usize> {
         (open + 1..end).find(|&at| masked[at] == closer)
     }
-    fn literal_has_bytes(open: usize, close: usize) -> bool {
-        close > open + 1
+    fn literal_bytes(open: usize, close: usize) -> usize {
+        close - open - 1
     }
-    fn hex_has_digit(content: &[u8], open: usize, close: usize) -> bool {
-        content[open + 1..close].iter().any(u8::is_ascii_hexdigit)
+    fn hex_bytes(content: &[u8], open: usize, close: usize) -> usize {
+        content[open + 1..close]
+            .iter()
+            .filter(|byte| byte.is_ascii_hexdigit())
+            .count()
+            .div_ceil(2)
     }
 
     let mut close = op_pos;
@@ -240,44 +246,42 @@ pub(super) fn show_operand_has_text(
         close -= 1;
     }
     if close == floor {
-        return false;
+        return 0;
     }
     let close = close - 1;
     match masked[close] {
-        b')' => opener_before(masked, close, floor, b'(')
-            .is_some_and(|open| literal_has_bytes(open, close)),
+        b')' => {
+            opener_before(masked, close, floor, b'(').map_or(0, |open| literal_bytes(open, close))
+        }
         b'>' => opener_before(masked, close, floor, b'<')
-            .is_some_and(|open| hex_has_digit(content, open, close)),
+            .map_or(0, |open| hex_bytes(content, open, close)),
         b']' => {
             let Some(array_open) = opener_before(masked, close, floor, b'[') else {
-                return false;
+                return 0;
             };
+            let mut bytes = 0;
             let mut at = array_open + 1;
             while at < close {
                 match masked[at] {
                     b'(' => {
                         let Some(end) = closer_after(masked, at, close, b')') else {
-                            return false;
+                            return 0;
                         };
-                        if literal_has_bytes(at, end) {
-                            return true;
-                        }
+                        bytes += literal_bytes(at, end);
                         at = end + 1;
                     }
                     b'<' => {
                         let Some(end) = closer_after(masked, at, close, b'>') else {
-                            return false;
+                            return 0;
                         };
-                        if hex_has_digit(content, at, end) {
-                            return true;
-                        }
+                        bytes += hex_bytes(content, at, end);
                         at = end + 1;
                     }
                     _ => at += 1,
                 }
             }
-            false
+            bytes
         }
-        _ => false,
+        _ => 0,
     }
 }

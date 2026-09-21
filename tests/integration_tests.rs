@@ -2559,6 +2559,10 @@ struct GlyphLayerPage {
     invoke_form: bool,
     /// Draw the image again after the layer, through any clip it set.
     image_after_layer: bool,
+    /// Draw the 2×2 image after the layer as well, 20 points square with
+    /// its corner at the point given — through any clip the layer set,
+    /// where it lands.
+    small_image_after_layer: Option<(i32, i32)>,
     /// Filled subpaths of five path operators each, painted before the
     /// layer, as outlined glyphs would be.
     vector_paths: usize,
@@ -2615,23 +2619,37 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
             &[200, 60, 60, 200],
         ),
     );
-    let large = add(
-        &mut objects,
-        stream(
-            "/Type /XObject /Subtype /Image /Width 1500 /Height 2383 \
-             /ColorSpace /DeviceGray /BitsPerComponent 8",
-            &[128],
-        ),
-    );
+    // A flat gray raster of scan size, deflated as a producer stores it,
+    // made when a page binds it.
+    let binds_large = |page: &GlyphLayerPage| {
+        page.spare_large_image
+            || ((page.covering_image || page.image_after_layer) && page.large_image)
+    };
+    let large = pages.iter().any(binds_large).then(|| {
+        let mut raster = lopdf::Stream::new(lopdf::dictionary! {}, vec![128u8; 1500 * 2383]);
+        raster.compress().expect("a flat raster deflates");
+        add(
+            &mut objects,
+            stream(
+                "/Type /XObject /Subtype /Image /Width 1500 /Height 2383 \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                &raster.content,
+            ),
+        )
+    });
     let mut kids = Vec::new();
     for page in pages {
         let mut xobjects = String::new();
         let mut content = String::new();
-        let draws = page.covering_image || page.image_after_layer;
-        if draws && !page.large_image && !page.inline_image {
+        let draws =
+            page.covering_image || page.image_after_layer || page.small_image_after_layer.is_some();
+        if (draws && !page.large_image && !page.inline_image)
+            || page.small_image_after_layer.is_some()
+        {
             xobjects.push_str(&format!(" /Im0 {image} 0 R"));
         }
-        if page.spare_large_image || (draws && page.large_image) {
+        if binds_large(page) {
+            let large = large.expect("made when a page binds it");
             xobjects.push_str(&format!(" /ImBig {large} 0 R"));
         }
         let raster = if page.inline_image {
@@ -2746,6 +2764,9 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
         if page.image_after_layer {
             content.push_str(&draw_image);
         }
+        if let Some((x, y)) = page.small_image_after_layer {
+            content.push_str(&format!("q 20 0 0 20 {x} {y} cm /Im0 Do Q\n"));
+        }
         if let Some(caption) = page.caption {
             content.push_str(&format!("BT 0 Tr /F1 12 Tf 72 40 Td ({caption}) Tj ET\n"));
         }
@@ -2808,6 +2829,7 @@ const SCAN_WITH_INVISIBLE_LAYER: GlyphLayerPage = GlyphLayerPage {
     layer_in_form: false,
     invoke_form: false,
     image_after_layer: false,
+    small_image_after_layer: None,
     vector_paths: 0,
     image_strips: 0,
     inline_image: false,
@@ -2923,6 +2945,44 @@ fn test_clip_text_filled_with_an_image_stays_text() {
         detected.ocr_reasons_by_page.get(&1),
         Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
     );
+}
+
+/// Clip-only text shows only where paint lands on its glyphs: a small
+/// image drawn after a mode-7 layer, in a corner the layer does not
+/// reach, leaves it a layer nobody sees; the same image drawn over the
+/// layer's first line shows the glyphs under it, and the page is a text
+/// page.
+#[test]
+fn test_clip_text_shows_only_where_paint_lands_on_it() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(7),
+        small_image_after_layer: Some((580, 20)),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(7),
+        small_image_after_layer: Some((60, 710)),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert_eq!(pages.pages[0].ocr_reason, None);
 }
 
 /// An image drawn mostly off the page covers only the part of it that

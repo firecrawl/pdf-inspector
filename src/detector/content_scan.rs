@@ -2,13 +2,14 @@
 //! byte-level walk of a page's content streams and of the Form XObjects
 //! they invoke, following the graphics state a renderer would — the text
 //! render mode, the transformation matrix, `q`/`Q`, a form's `/Matrix`
-//! and `/BBox` — to tell the text-showing operators that leave nothing to
-//! see from those that paint, and to tally the page area the images drawn
+//! and `/BBox`, and where the text-positioning operators put the text
+//! shown — to tell the text-showing operators that leave nothing to see
+//! from those that paint, and to tally the page area the images drawn
 //! cover. The classification rule itself lives in the parent module.
 
 use super::content_mask::{
     mask_strings_comments_and_inline_images, name_operand_before, numeric_operands_before,
-    show_operand_has_text,
+    show_operand_text_bytes,
 };
 use super::{collect_text_chars_before, extract_font_name_before_tf, preceding_operand_closer};
 use crate::extractor::{visible_page_box, PageBox};
@@ -28,7 +29,7 @@ pub(super) struct ExecutedContent {
     /// the Form XObjects that content invokes.
     pub(super) text_ops: u32,
     /// Those of `text_ops` that left nothing to see: run under text render
-    /// mode 3, or under mode 7 with nothing painted through the clip.
+    /// mode 3, or under mode 7 with nothing painted where its glyphs lie.
     pub(super) hidden_text_ops: u32,
     /// Whether an image draw — an image XObject, an inline image or a
     /// path painted with a tiling pattern that draws one — landed within
@@ -165,9 +166,18 @@ const SCAN_STATE_MAX_DEPTH: usize = 256;
 /// it, content goes unread and the page's evidence is incomplete.
 const FORM_INVOCATIONS_MAX: usize = 1_000;
 
-/// How many decompressed bytes of form content one page's scan keeps for
-/// forms invoked again.
+/// How many bytes of form content — decompressed, and its masked copy —
+/// one page's scan keeps for forms invoked again.
 const FORM_CONTENT_CACHE_MAX_BYTES: usize = 8 << 20;
+
+/// How many text objects' clip-only text one `q` level keeps apart for
+/// the test of what is painted where their glyphs lie. Past it, further
+/// text objects join the last, under the union of their boxes — coarser,
+/// never less revealing.
+const CLIP_TEXT_ENTRIES_MAX: usize = 256;
+
+/// The identity matrix.
+const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
 /// Cells per side of the grid the images drawn are tallied on, over the
 /// visible page box: 64 × 64 cells, one row per `u64`.
@@ -207,17 +217,122 @@ impl UserBox {
         };
         (clipped.x1 > clipped.x0 && clipped.y1 > clipped.y0).then_some(clipped)
     }
+
+    /// Whether the boxes touch — their edges included, so a line along
+    /// an edge touches.
+    fn touches(&self, other: &UserBox) -> bool {
+        self.x0 <= other.x1 && self.x1 >= other.x0 && self.y0 <= other.y1 && self.y1 >= other.y0
+    }
+
+    /// The part of this box within `other`, which may have no area — a
+    /// line, or a point; `None` when they do not touch.
+    fn clamped(&self, other: &UserBox) -> Option<UserBox> {
+        self.touches(other).then(|| UserBox {
+            x0: self.x0.max(other.x0),
+            y0: self.y0.max(other.y0),
+            x1: self.x1.min(other.x1),
+            y1: self.y1.min(other.y1),
+        })
+    }
+}
+
+/// `first` applied before `second`: the product `cm` forms when it puts
+/// a matrix before the one in force, and the text matrix forms under it.
+fn multiply([a1, b1, c1, d1, e1, f1]: [f64; 6], [a2, b2, c2, d2, e2, f2]: [f64; 6]) -> [f64; 6] {
+    [
+        a1 * a2 + b1 * c2,
+        a1 * b2 + b1 * d2,
+        c1 * a2 + d1 * c2,
+        c1 * b2 + d1 * d2,
+        e1 * a2 + f1 * c2 + e2,
+        e1 * b2 + f1 * d2 + f2,
+    ]
+}
+
+/// The bounding box of `[x0 y0 x1 y1]` under `matrix`; `None` when it is
+/// not finite.
+fn box_under([a, b, c, d, e, f]: [f64; 6], [x0, y0, x1, y1]: [f64; 4]) -> Option<UserBox> {
+    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+    let xs = corners.map(|(x, y)| a * x + c * y + e);
+    let ys = corners.map(|(x, y)| b * x + d * y + f);
+    if !xs.iter().chain(&ys).all(|v| v.is_finite()) {
+        return None;
+    }
+    Some(UserBox {
+        x0: xs.iter().copied().fold(f64::INFINITY, f64::min),
+        y0: ys.iter().copied().fold(f64::INFINITY, f64::min),
+        x1: xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        y1: ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    })
+}
+
+/// Where the glyphs of a text object's clip-only text lie, for the paint
+/// that shows through them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Reach {
+    /// Wherever paint lands: a show whose position or font size the scan
+    /// did not see.
+    Anywhere,
+    /// Outside the clip in force, every glyph of it: no paint shows.
+    Nowhere,
+    /// Within this box, inside the clip in force.
+    Within(UserBox),
+}
+
+impl Reach {
+    /// The reach of both together.
+    fn join(self, other: Reach) -> Reach {
+        match (self, other) {
+            (Reach::Anywhere, _) | (_, Reach::Anywhere) => Reach::Anywhere,
+            (Reach::Nowhere, reach) | (reach, Reach::Nowhere) => reach,
+            (Reach::Within(a), Reach::Within(b)) => Reach::Within(a.union(&b)),
+        }
+    }
+
+    /// Whether a paint landing on `landed` — `None` for one of unknown
+    /// extent — shows through the glyphs.
+    fn shown_by(self, landed: Option<UserBox>) -> bool {
+        match (self, landed) {
+            (Reach::Nowhere, _) => false,
+            (Reach::Anywhere, _) | (_, None) => true,
+            (Reach::Within(reach), Some(landed)) => reach.touches(&landed),
+        }
+    }
+}
+
+/// The clip-only text of one text object whose clip is in force: how
+/// many text-showing operators built it, and where its glyphs lie.
+#[derive(Clone, Copy, Debug)]
+struct ClipText {
+    ops: u32,
+    reach: Reach,
+}
+
+/// Where the open text object shows next: the text matrix, and the line
+/// matrix the next line starts from.
+#[derive(Clone, Copy)]
+struct TextPosition {
+    matrix: [f64; 6],
+    line: [f64; 6],
+}
+
+/// A form's content as the scan reads it: decompressed, with the masked
+/// copy the operators are read through.
+struct FormContent {
+    content: Vec<u8>,
+    masked: Vec<u8>,
 }
 
 /// What `q` saves of the state the scan follows.
-#[derive(Clone, Copy)]
 struct SavedScanState {
     render_mode: u8,
     ctm: [f64; 6],
     clip: UserBox,
     fill_paints_image: bool,
     stroke_paints_image: bool,
-    clip_text_ops: u32,
+    font_size: Option<f64>,
+    leading: f64,
+    clip_text: Vec<ClipText>,
 }
 
 /// The part of the graphics state a content scan follows, saved by `q`
@@ -225,9 +340,12 @@ struct SavedScanState {
 /// transformation matrix `cm` concatenates; the clip the clipping paths
 /// set with `W`/`W*` narrow — a rectangle exactly, any other shape by its
 /// bounding box; whether the fill and stroke colours set with `scn`/`SCN`
-/// are tiling patterns that draw an image; and the clip-only (mode 7)
-/// text whose clip is in force, which a painting operator shows through
-/// and the `Q` closing its level discards unseen.
+/// are tiling patterns that draw an image; the font size `Tf` sets and
+/// the leading `TL`/`TD` set, which with the text-positioning operators
+/// place the glyphs shown; and the clip-only (mode 7) text whose clip is
+/// in force — each text object of it with the box its glyphs lie in —
+/// which a painting operator landing on that box shows through, and the
+/// `Q` closing its level discards unseen.
 ///
 /// One state runs through a page's content streams, which the PDF reads
 /// as one, and — when it follows `Do` — through the Form XObjects they
@@ -265,22 +383,34 @@ struct ContentScanState<'a> {
     /// Whether patterns named by `scn`/`SCN` are looked into — not within
     /// a pattern's own cell.
     follow_patterns: bool,
-    /// Whether a pattern draws an image, per pattern looked into.
-    pattern_verdicts: HashMap<ObjectId, bool>,
+    /// Whether a pattern draws an image, per pattern looked into and per
+    /// resources in force where it was used — the forms being run at the
+    /// time, in whose resources its cell's names may resolve.
+    pattern_verdicts: HashMap<(ObjectId, Vec<ObjectId>), bool>,
     /// Whether an image was drawn at all, wherever it fell.
     drew_image: bool,
     /// Whether an image draw landed within the clip in force.
     drew_image_on_page: bool,
-    /// Mode-7 text-showing operators whose clip was set at the current
-    /// level and has not been painted through; those set at outer levels
-    /// sit in `saved`.
-    clip_text_ops: u32,
-    /// `clip_text_ops` over the current and the saved levels together.
+    /// The clip-only text whose clip was set at the current level and has
+    /// not been painted through, a text object at a time; that of outer
+    /// levels sits in `saved`.
+    clip_text: Vec<ClipText>,
+    /// The text-showing operators of `clip_text` over the current and the
+    /// saved levels together.
     pending_clip_text_ops: u32,
-    /// Mode-7 text-showing operators of the open text object: their clip
-    /// takes effect at its `ET`, so what is painted before that — the rest
-    /// of the text object — does not show through them.
+    /// Mode-7 text-showing operators of the open text object, and where
+    /// their glyphs lie: their clip takes effect at its `ET`, so what is
+    /// painted before that — the rest of the text object — does not show
+    /// through them.
     clip_text_ops_open: u32,
+    clip_text_reach_open: Reach,
+    /// The font size `Tf` set; `None` until one is.
+    font_size: Option<f64>,
+    /// The leading `TL` or `TD` set, which `T*`, `'` and `"` move by.
+    leading: f64,
+    /// Where the open text object shows next, once a text-positioning
+    /// operator has said; `None` until then, and outside text objects.
+    text_position: Option<TextPosition>,
     saved: Vec<SavedScanState>,
     /// `q` operators past `SCAN_STATE_MAX_DEPTH`, whose `Q`s restore nothing.
     unsaved_depth: u32,
@@ -298,15 +428,17 @@ struct ContentScanState<'a> {
     /// The images' own areas on the page added up, each no more than its
     /// box there — a turned image's box would overstate it.
     own_image_area: f64,
-    /// The forms being run, innermost last.
+    /// The forms being run, innermost last — through whose resources the
+    /// names in force resolve.
     active_forms: Vec<ObjectId>,
     /// Form invocations followed so far, against `FORM_INVOCATIONS_MAX`.
     form_invocations: usize,
     /// Whether content went unread — the invocation budget or the depth
     /// cap ran out — so that the page's evidence is incomplete.
     incomplete: bool,
-    /// Decompressed form content by object, for forms invoked again.
-    form_content: HashMap<ObjectId, Rc<Vec<u8>>>,
+    /// Form content by object — decompressed, and masked — for forms
+    /// invoked again.
+    form_content: HashMap<ObjectId, Rc<FormContent>>,
     form_content_bytes: usize,
 }
 
@@ -333,9 +465,13 @@ impl<'a> ContentScanState<'a> {
             pattern_verdicts: HashMap::new(),
             drew_image: false,
             drew_image_on_page: false,
-            clip_text_ops: 0,
+            clip_text: Vec::new(),
             pending_clip_text_ops: 0,
             clip_text_ops_open: 0,
+            clip_text_reach_open: Reach::Nowhere,
+            font_size: None,
+            leading: 0.0,
+            text_position: None,
             saved: Vec::new(),
             unsaved_depth: 0,
             stack_floor: 0,
@@ -359,9 +495,10 @@ impl<'a> ContentScanState<'a> {
                 clip: self.clip,
                 fill_paints_image: self.fill_paints_image,
                 stroke_paints_image: self.stroke_paints_image,
-                clip_text_ops: self.clip_text_ops,
+                font_size: self.font_size,
+                leading: self.leading,
+                clip_text: std::mem::take(&mut self.clip_text),
             });
-            self.clip_text_ops = 0;
         } else {
             self.unsaved_depth += 1;
         }
@@ -375,83 +512,182 @@ impl<'a> ContentScanState<'a> {
             self.unsaved_depth -= 1;
         } else if self.saved.len() > self.stack_floor {
             if let Some(saved) = self.saved.pop() {
-                self.pending_clip_text_ops -= self.clip_text_ops;
+                let discarded: u32 = self.clip_text.iter().map(|text| text.ops).sum();
+                self.pending_clip_text_ops -= discarded;
                 self.render_mode = saved.render_mode;
                 self.ctm = saved.ctm;
                 self.clip = saved.clip;
                 self.fill_paints_image = saved.fill_paints_image;
                 self.stroke_paints_image = saved.stroke_paints_image;
-                self.clip_text_ops = saved.clip_text_ops;
+                self.font_size = saved.font_size;
+                self.leading = saved.leading;
+                self.clip_text = saved.clip_text;
             }
         }
     }
 
     /// `cm`: the matrix given goes before the one in force.
-    fn concat(&mut self, [a1, b1, c1, d1, e1, f1]: [f64; 6]) {
-        let [a2, b2, c2, d2, e2, f2] = self.ctm;
-        self.ctm = [
-            a1 * a2 + b1 * c2,
-            a1 * b2 + b1 * d2,
-            c1 * a2 + d1 * c2,
-            c1 * b2 + d1 * d2,
-            e1 * a2 + f1 * c2 + e2,
-            e1 * b2 + f1 * d2 + f2,
-        ];
+    fn concat(&mut self, matrix: [f64; 6]) {
+        self.ctm = multiply(matrix, self.ctm);
     }
 
     /// The bounding box of `[x0 y0 x1 y1]` under the matrix in force;
     /// `None` when it is not finite.
-    fn transformed_box(&self, [x0, y0, x1, y1]: [f64; 4]) -> Option<UserBox> {
-        let [a, b, c, d, e, f] = self.ctm;
-        let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
-        let xs = corners.map(|(x, y)| a * x + c * y + e);
-        let ys = corners.map(|(x, y)| b * x + d * y + f);
-        if !xs.iter().chain(&ys).all(|v| v.is_finite()) {
-            return None;
-        }
-        Some(UserBox {
-            x0: xs.iter().copied().fold(f64::INFINITY, f64::min),
-            y0: ys.iter().copied().fold(f64::INFINITY, f64::min),
-            x1: xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-            y1: ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-        })
+    fn transformed_box(&self, corners: [f64; 4]) -> Option<UserBox> {
+        box_under(self.ctm, corners)
     }
 
-    /// A text-showing operator ran. In mode 3 it left nothing to see; in
-    /// mode 7 nothing yet — from the text object's `ET` on, its glyphs clip
-    /// whatever is painted, until the `Q` closing its level; in any other
-    /// mode it painted, through any clip in force.
-    fn text_shown(&mut self) {
+    /// `BT`: a text object opens, its position yet to be set.
+    fn text_object_began(&mut self) {
+        self.text_position = None;
+    }
+
+    /// `Td`/`TD`: the next line starts `tx`, `ty` from the start of the
+    /// current one — from the text space's origin when nothing has
+    /// positioned the text object yet.
+    fn text_moved(&mut self, tx: f64, ty: f64) {
+        let from = self
+            .text_position
+            .map_or(IDENTITY, |position| position.line);
+        let line = multiply([1.0, 0.0, 0.0, 1.0, tx, ty], from);
+        self.text_position = Some(TextPosition { matrix: line, line });
+    }
+
+    /// `Tm`: the text matrix, and the line matrix, are set outright.
+    fn text_matrix_set(&mut self, matrix: [f64; 6]) {
+        self.text_position = Some(TextPosition {
+            matrix,
+            line: matrix,
+        });
+    }
+
+    /// `T*`, and the move `'` and `"` make first: the next line, a leading
+    /// down.
+    fn next_line(&mut self) {
+        self.text_moved(0.0, -self.leading);
+    }
+
+    /// The box, in user space, of `bytes` bytes of text shown at the pen:
+    /// half an em per byte long, an em tall above the baseline and a
+    /// quarter em below it, under the text matrix and the matrix in
+    /// force. This is an overlap test, not layout: character and word
+    /// spacing, horizontal scaling, rise and the adjustments in a `TJ`
+    /// array are not followed. `None` when the text object has not been
+    /// positioned or no font size has been set: the text is then placed
+    /// nowhere the scan can tell.
+    fn glyph_box(&self, bytes: usize) -> Option<UserBox> {
+        let size = self.font_size?.abs();
+        let position = self.text_position?;
+        let width = 0.5 * size * bytes as f64;
+        box_under(
+            multiply(position.matrix, self.ctm),
+            [0.0, -0.25 * size, width, size],
+        )
+    }
+
+    /// The pen moves past `bytes` bytes shown, half an em each, along the
+    /// baseline.
+    fn pen_advanced(&mut self, bytes: usize) {
+        let Some(size) = self.font_size else {
+            return;
+        };
+        let Some(position) = self.text_position.as_mut() else {
+            return;
+        };
+        let width = 0.5 * size.abs() * bytes as f64;
+        let [a, b, ..] = position.matrix;
+        position.matrix[4] += width * a;
+        position.matrix[5] += width * b;
+    }
+
+    /// A text-showing operator ran, over `bytes` bytes of text. In mode 3
+    /// it left nothing to see; in mode 7 nothing yet — from the text
+    /// object's `ET` on, its glyphs clip whatever is painted where they
+    /// lie, until the `Q` closing its level; in any other mode it painted
+    /// its glyphs, through any clip in force. Text placed nowhere the
+    /// scan can tell is taken to reach wherever paint lands, and to paint
+    /// wherever clip-only text lies — the rule before text was placed at
+    /// all.
+    fn text_shown(&mut self, bytes: usize) {
         self.executed_text_ops += 1;
         match self.render_mode {
             3 => self.executed_hidden_text_ops += 1,
             7 => {
                 self.executed_hidden_text_ops += 1;
                 self.clip_text_ops_open += 1;
+                let reach = match self.glyph_box(bytes) {
+                    None => Reach::Anywhere,
+                    Some(glyphs) => glyphs
+                        .intersect(&self.clip)
+                        .map_or(Reach::Nowhere, Reach::Within),
+                };
+                self.clip_text_reach_open = self.clip_text_reach_open.join(reach);
             }
-            _ => self.painted(),
+            // With no clip-only text in force there is nothing for the
+            // paint to show, and its box is not needed.
+            _ if self.pending_clip_text_ops > 0 => match self.glyph_box(bytes) {
+                None => self.painted(None),
+                Some(glyphs) => {
+                    if let Some(landed) = glyphs.intersect(&self.clip) {
+                        self.painted(Some(landed));
+                    }
+                }
+            },
+            _ => {}
         }
+        self.pen_advanced(bytes);
     }
 
-    /// `ET`: the clip the text object's mode-7 text built takes effect.
+    /// `ET`: the clip the text object's mode-7 text built takes effect,
+    /// where its glyphs lie. Past `CLIP_TEXT_ENTRIES_MAX` text objects at
+    /// one level, further ones join the last, under the union of their
+    /// boxes.
     fn text_object_ended(&mut self) {
-        self.clip_text_ops += self.clip_text_ops_open;
-        self.pending_clip_text_ops += self.clip_text_ops_open;
+        self.text_position = None;
+        if self.clip_text_ops_open == 0 {
+            return;
+        }
+        let text = ClipText {
+            ops: self.clip_text_ops_open,
+            reach: self.clip_text_reach_open,
+        };
         self.clip_text_ops_open = 0;
+        self.clip_text_reach_open = Reach::Nowhere;
+        self.pending_clip_text_ops += text.ops;
+        let full = self.clip_text.len() >= CLIP_TEXT_ENTRIES_MAX;
+        match self.clip_text.last_mut() {
+            Some(last) if full => {
+                last.ops += text.ops;
+                last.reach = last.reach.join(text.reach);
+            }
+            _ => self.clip_text.push(text),
+        }
     }
 
-    /// Something was painted, so the clip-only text in force shows it
-    /// through its glyphs: that text is visible after all.
-    fn painted(&mut self) {
-        let shown = self.pending_clip_text_ops;
-        if shown > 0 {
-            self.executed_hidden_text_ops -= shown;
-            self.pending_clip_text_ops = 0;
-            self.clip_text_ops = 0;
-            for saved in &mut self.saved {
-                saved.clip_text_ops = 0;
-            }
+    /// Something was painted on `landed` — `None` when its extent is not
+    /// known — so the clip-only text in force whose glyphs it landed on
+    /// shows it through them: that text is visible after all.
+    fn painted(&mut self, landed: Option<UserBox>) {
+        if self.pending_clip_text_ops == 0 {
+            return;
         }
+        fn reveal(texts: &mut Vec<ClipText>, landed: Option<UserBox>) -> u32 {
+            let mut shown = 0;
+            texts.retain(|text| {
+                let seen = text.reach.shown_by(landed);
+                if seen {
+                    shown += text.ops;
+                }
+                !seen
+            });
+            shown
+        }
+        let mut shown = reveal(&mut self.clip_text, landed);
+        for saved in &mut self.saved {
+            shown += reveal(&mut saved.clip_text, landed);
+        }
+        self.executed_hidden_text_ops -= shown;
+        self.pending_clip_text_ops -= shown;
     }
 
     /// A point of the path under construction, in user space.
@@ -511,26 +747,27 @@ impl<'a> ContentScanState<'a> {
         self.clip.area() > 0.0
     }
 
-    /// Whether the path under construction reaches into the clip in force
-    /// — a stroked line has no area, so touching is enough.
-    fn path_touches_clip(&self) -> bool {
-        self.clip_is_open()
-            && self.path_box.is_some_and(|path| {
-                path.x0 <= self.clip.x1
-                    && path.x1 >= self.clip.x0
-                    && path.y0 <= self.clip.y1
-                    && path.y1 >= self.clip.y0
-            })
+    /// Where the path under construction lands within the clip in force
+    /// — a stroked line has no area, so touching is enough; `None` when
+    /// it misses the clip, or the clip has no extent.
+    fn path_landed(&self) -> Option<UserBox> {
+        if !self.clip_is_open() {
+            return None;
+        }
+        self.path_box?.clamped(&self.clip)
     }
 
     /// Whether the pattern `name` names in the first of `resources`
     /// binding it is a tiling pattern (`/PatternType 1`) whose cell draws
-    /// an image — an image XObject invoked, or an inline image — read once
-    /// per pattern through the masked operator scan, with the cell's own
-    /// resources and then its invoker's; a shading pattern, or a cell that
-    /// draws no image, paints no coverage. Patterns are not looked into
-    /// from within a pattern's cell, and the reading counts against the
-    /// invocation budget, past which the evidence is incomplete.
+    /// an image — an image XObject invoked, or an inline image — read
+    /// through the masked operator scan, with the cell's own resources
+    /// and then its invoker's, once per pattern and per resources in
+    /// force: a cell whose own resources do not bind a name draws what
+    /// its invoker's bind, which one form's may differently from
+    /// another's. A shading pattern, or a cell that draws no image,
+    /// paints no coverage. Patterns are not looked into from within a
+    /// pattern's cell, and the reading counts against the invocation
+    /// budget, past which the evidence is incomplete.
     fn pattern_paints_image(&mut self, name: &[u8], resources: &[&'a lopdf::Dictionary]) -> bool {
         if !self.follow_patterns {
             return false;
@@ -538,7 +775,8 @@ impl<'a> ContentScanState<'a> {
         let Some((id, pattern)) = resolve_pattern(self.doc, resources, name) else {
             return false;
         };
-        if let Some(&verdict) = self.pattern_verdicts.get(&id) {
+        let scope = (id, self.active_forms.clone());
+        if let Some(&verdict) = self.pattern_verdicts.get(&scope) {
             return verdict;
         }
         if self.form_invocations >= FORM_INVOCATIONS_MAX {
@@ -569,7 +807,7 @@ impl<'a> ContentScanState<'a> {
             }
             _ => false,
         };
-        self.pattern_verdicts.insert(id, verdict);
+        self.pattern_verdicts.insert(scope, verdict);
         verdict
     }
 
@@ -587,7 +825,7 @@ impl<'a> ContentScanState<'a> {
         let Some(on_page) = drawn.intersect(&self.clip) else {
             return;
         };
-        self.painted();
+        self.painted(Some(on_page));
         self.drew_image_on_page = true;
         let [a, b, c, d, _, _] = self.ctm;
         self.own_image_area += (a * d - b * c).abs().min(on_page.area());
@@ -666,8 +904,9 @@ impl<'a> ContentScanState<'a> {
             resources.extend(stream_resources(self.doc, form));
             resources.extend_from_slice(invoker_resources);
             self.active_forms.push(id);
-            scan_content_stream(
-                &content,
+            scan_masked_content(
+                &content.content,
+                &content.masked,
                 &mut HashSet::new(),
                 &mut HashSet::new(),
                 self,
@@ -683,17 +922,20 @@ impl<'a> ContentScanState<'a> {
         self.restore();
     }
 
-    /// A form's content, decompressed once per page while the cache lasts.
-    fn form_content(&mut self, id: ObjectId, form: &lopdf::Stream) -> Rc<Vec<u8>> {
+    /// A form's content, decompressed and masked once per page while the
+    /// cache lasts — both copies count against its budget.
+    fn form_content(&mut self, id: ObjectId, form: &lopdf::Stream) -> Rc<FormContent> {
         if let Some(content) = self.form_content.get(&id) {
             return Rc::clone(content);
         }
-        let content = Rc::new(
-            form.decompressed_content()
-                .unwrap_or_else(|_| form.content.clone()),
-        );
-        if self.form_content_bytes + content.len() <= FORM_CONTENT_CACHE_MAX_BYTES {
-            self.form_content_bytes += content.len();
+        let content = form
+            .decompressed_content()
+            .unwrap_or_else(|_| form.content.clone());
+        let masked = mask_strings_comments_and_inline_images(&content);
+        let content = Rc::new(FormContent { content, masked });
+        let bytes = content.content.len() + content.masked.len();
+        if self.form_content_bytes + bytes <= FORM_CONTENT_CACHE_MAX_BYTES {
+            self.form_content_bytes += bytes;
             self.form_content.insert(id, Rc::clone(&content));
         }
         content
@@ -885,10 +1127,12 @@ fn coordinate(value: &Object) -> Option<f64> {
 /// text-showing operator left anything to see; `cm` concatenates the
 /// matrix an image is drawn under; `W`/`W*` clip; the colour operators
 /// say whether a path painted next is filled, or stroked, with a tiling
-/// pattern that draws an image; `q` and `Q` save and restore all of it. A
-/// `Do` — when the state follows them — draws the image, or runs the
-/// form, that the first of `resources` binding its name holds. Unique
-/// non-whitespace text characters are collected into `unique_chars`.
+/// pattern that draws an image; `Tf`, `Tm`, `Td`, `TD`, `T*` and `TL`
+/// place the text shown, for where clip-only text lies; `q` and `Q` save
+/// and restore all of it. A `Do` — when the state follows them — draws
+/// the image, or runs the form, that the first of `resources` binding its
+/// name holds. Unique non-whitespace text characters are collected into
+/// `unique_chars`.
 fn scan_content_stream<'a>(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
@@ -896,9 +1140,29 @@ fn scan_content_stream<'a>(
     state: &mut ContentScanState<'a>,
     resources: &[&'a lopdf::Dictionary],
 ) -> ContentCounts {
-    let mut counts = ContentCounts::default();
     let masked = mask_strings_comments_and_inline_images(content);
-    let ops: &[u8] = &masked;
+    scan_masked_content(
+        content,
+        &masked,
+        unique_chars,
+        used_font_names,
+        state,
+        resources,
+    )
+}
+
+/// [`scan_content_stream`] over `content` and `masked`, its masked copy —
+/// made once for a form however often it is invoked.
+fn scan_masked_content<'a>(
+    content: &[u8],
+    masked: &[u8],
+    unique_chars: &mut HashSet<u8>,
+    used_font_names: &mut HashSet<Vec<u8>>,
+    state: &mut ContentScanState<'a>,
+    resources: &[&'a lopdf::Dictionary],
+) -> ContentCounts {
+    let mut counts = ContentCounts::default();
+    let ops: &[u8] = masked;
 
     // Helper: check if position is a word boundary (start of content or preceded by whitespace)
     let is_word_start = |pos: usize| -> bool { pos == 0 || ops[pos - 1].is_ascii_whitespace() };
@@ -936,16 +1200,20 @@ fn scan_content_stream<'a>(
                 && is_token_end(i + 1)
                 && preceding_operand_closer(ops, i, operand_floor)
             {
-                if show_operand_has_text(ops, content, i, operand_floor) {
+                let bytes = show_operand_text_bytes(ops, content, i, operand_floor);
+                if bytes > 0 {
                     counts.text_ops += 1;
-                    state.text_shown();
+                    state.text_shown(bytes);
                     collect_text_chars_before(content, i, unique_chars, operand_floor);
                 }
                 operand_floor = i;
             } else if next == b'f' && is_token_end(i + 1) {
-                // Tf = set font operator. Some PDFs concatenate Tf with the
+                // Tf = set font and size. Some PDFs concatenate Tf with the
                 // next operator without whitespace (e.g. "25 Tf[<01>..." or
                 // "25 Tf(<text>...").
+                if let Some([size]) = numeric_operands_before::<1>(ops, i, operand_floor) {
+                    state.font_size = Some(size);
+                }
                 if let Some(name) = extract_font_name_before_tf(ops, i, operand_floor) {
                     used_font_names.insert(name);
                     counts.font_changes += 1;
@@ -960,6 +1228,31 @@ fn scan_content_stream<'a>(
                     }
                     operand_floor = i;
                 }
+            } else if (next == b'd' || next == b'D') && is_token_start(i) && is_token_end(i + 1) {
+                // Td/TD = move to the start of the next line, offset from
+                // the start of the current one; TD sets the leading as well.
+                if let Some([tx, ty]) = numeric_operands_before::<2>(ops, i, operand_floor) {
+                    if next == b'D' {
+                        state.leading = -ty;
+                    }
+                    state.text_moved(tx, ty);
+                    operand_floor = i;
+                }
+            } else if next == b'm' && is_token_start(i) && is_token_end(i + 1) {
+                // Tm = set the text matrix and the line matrix.
+                if let Some(matrix) = numeric_operands_before::<6>(ops, i, operand_floor) {
+                    state.text_matrix_set(matrix);
+                    operand_floor = i;
+                }
+            } else if next == b'*' && is_token_start(i) && is_token_end(i + 1) {
+                // T* = move to the start of the next line.
+                state.next_line();
+            } else if next == b'L' && is_token_start(i) && is_token_end(i + 1) {
+                // TL = set the leading.
+                if let Some([leading]) = numeric_operands_before::<1>(ops, i, operand_floor) {
+                    state.leading = leading;
+                    operand_floor = i;
+                }
             }
         } else if (b == b'\'' || b == b'"')
             && is_token_start(i)
@@ -969,76 +1262,109 @@ fn scan_content_stream<'a>(
             // ' and " = move to the next line and show text (" sets the
             // word and character spacing first). An apostrophe inside a
             // string was blanked, so it cannot get here.
-            if show_operand_has_text(ops, content, i, operand_floor) {
+            state.next_line();
+            let bytes = show_operand_text_bytes(ops, content, i, operand_floor);
+            if bytes > 0 {
                 counts.text_ops += 1;
-                state.text_shown();
+                state.text_shown(bytes);
                 collect_text_chars_before(content, i, unique_chars, operand_floor);
             }
             operand_floor = i;
-        } else if token_at(i, b"cm") {
-            // cm = concatenate matrix.
-            if let Some(matrix) = numeric_operands_before::<6>(ops, i, operand_floor) {
-                state.concat(matrix);
-                operand_floor = i;
-            }
-        } else if token_at(i, b"Do") {
-            // Do = paint an XObject: an image is measured, a form run in
-            // place. Whether a page has images at all is read from its
-            // resources (scan_xobjects_in_resources, analyze_page_images).
-            if let Some(name) = name_operand_before(ops, i, operand_floor) {
-                operand_floor = i;
-                if state.follow_do {
-                    match resolve_xobject(state.doc, resources, &name) {
-                        Some(XObjectDrawn::Image) => state.image_drawn(),
-                        Some(XObjectDrawn::Form(id, form)) => state.form_drawn(id, form, resources),
-                        None => {}
+        } else if matches!(
+            b,
+            b'c' | b'D'
+                | b's'
+                | b'B'
+                | b'E'
+                | b'S'
+                | b'g'
+                | b'r'
+                | b'k'
+                | b'C'
+                | b'G'
+                | b'R'
+                | b'K'
+                | b'q'
+                | b'Q'
+        ) {
+            // The operators below, met by their first byte: a byte that
+            // begins none of them — most bytes — is done with here.
+            if token_at(i, b"cm") {
+                // cm = concatenate matrix.
+                if let Some(matrix) = numeric_operands_before::<6>(ops, i, operand_floor) {
+                    state.concat(matrix);
+                    operand_floor = i;
+                }
+            } else if token_at(i, b"Do") {
+                // Do = paint an XObject: an image is measured, a form run in
+                // place. Whether a page has images at all is read from its
+                // resources (scan_xobjects_in_resources, analyze_page_images).
+                if let Some(name) = name_operand_before(ops, i, operand_floor) {
+                    operand_floor = i;
+                    if state.follow_do {
+                        match resolve_xobject(state.doc, resources, &name) {
+                            Some(XObjectDrawn::Image) => state.image_drawn(),
+                            Some(XObjectDrawn::Form(id, form)) => {
+                                state.form_drawn(id, form, resources)
+                            }
+                            None => {}
+                        }
                     }
                 }
+            } else if token_at(i, b"sh") {
+                // sh = paint a shading, over the clip in force — nothing when
+                // the clip has no extent.
+                if state.clip_is_open() {
+                    state.painted(Some(state.clip));
+                }
+            } else if token_at(i, b"BI") {
+                // BI = begin an inline image, which paints the unit square
+                // under the matrix in force as an image XObject does. It counts
+                // among the page's images only in an executed scan: the walk
+                // over every bound form keeps its tally of bound image
+                // XObjects, which an inline image in a form never invoked is
+                // not.
+                if state.follow_do {
+                    counts.image_count += 1;
+                }
+                state.image_drawn();
+            } else if token_at(i, b"BT") {
+                // BT = begin a text object, which the operators to come position.
+                state.text_object_began();
+            } else if token_at(i, b"ET") {
+                // ET = end a text object: its clip-only text's clip takes effect.
+                state.text_object_ended();
+            } else if token_at(i, b"scn") || token_at(i, b"sc") {
+                // scn/sc = set the fill colour. A name names a pattern, which
+                // draws an image or does not; numbers name none.
+                let paints_image = name_operand_before(ops, i, operand_floor)
+                    .is_some_and(|name| state.pattern_paints_image(&name, resources));
+                state.fill_paints_image = paints_image;
+                operand_floor = i;
+            } else if token_at(i, b"SCN") || token_at(i, b"SC") {
+                // SCN/SC = set the stroke colour, likewise.
+                let paints_image = name_operand_before(ops, i, operand_floor)
+                    .is_some_and(|name| state.pattern_paints_image(&name, resources));
+                state.stroke_paints_image = paints_image;
+                operand_floor = i;
+            } else if token_at(i, b"cs")
+                || token_at(i, b"g")
+                || token_at(i, b"rg")
+                || token_at(i, b"k")
+            {
+                // A fill colour space or a plain fill colour: no pattern fills.
+                state.fill_paints_image = false;
+            } else if token_at(i, b"CS")
+                || token_at(i, b"G")
+                || token_at(i, b"RG")
+                || token_at(i, b"K")
+            {
+                state.stroke_paints_image = false;
+            } else if token_at(i, b"q") {
+                state.save();
+            } else if token_at(i, b"Q") {
+                state.restore();
             }
-        } else if token_at(i, b"sh") {
-            // sh = paint a shading, over the clip in force — nothing when
-            // the clip has no extent.
-            if state.clip_is_open() {
-                state.painted();
-            }
-        } else if token_at(i, b"BI") {
-            // BI = begin an inline image, which paints the unit square
-            // under the matrix in force as an image XObject does. It counts
-            // among the page's images only in an executed scan: the walk
-            // over every bound form keeps its tally of bound image
-            // XObjects, which an inline image in a form never invoked is
-            // not.
-            if state.follow_do {
-                counts.image_count += 1;
-            }
-            state.image_drawn();
-        } else if token_at(i, b"ET") {
-            // ET = end a text object: its clip-only text's clip takes effect.
-            state.text_object_ended();
-        } else if token_at(i, b"scn") || token_at(i, b"sc") {
-            // scn/sc = set the fill colour. A name names a pattern, which
-            // draws an image or does not; numbers name none.
-            let paints_image = name_operand_before(ops, i, operand_floor)
-                .is_some_and(|name| state.pattern_paints_image(&name, resources));
-            state.fill_paints_image = paints_image;
-            operand_floor = i;
-        } else if token_at(i, b"SCN") || token_at(i, b"SC") {
-            // SCN/SC = set the stroke colour, likewise.
-            let paints_image = name_operand_before(ops, i, operand_floor)
-                .is_some_and(|name| state.pattern_paints_image(&name, resources));
-            state.stroke_paints_image = paints_image;
-            operand_floor = i;
-        } else if token_at(i, b"cs") || token_at(i, b"g") || token_at(i, b"rg") || token_at(i, b"k")
-        {
-            // A fill colour space or a plain fill colour: no pattern fills.
-            state.fill_paints_image = false;
-        } else if token_at(i, b"CS") || token_at(i, b"G") || token_at(i, b"RG") || token_at(i, b"K")
-        {
-            state.stroke_paints_image = false;
-        } else if token_at(i, b"q") {
-            state.save();
-        } else if token_at(i, b"Q") {
-            state.restore();
         }
 
         // Count path construction/painting operators.
@@ -1141,8 +1467,9 @@ fn scan_content_stream<'a>(
             _ => {}
         }
         // A path painted off the page, or clipped away, paints nothing.
-        if painted && state.path_touches_clip() {
-            state.painted();
+        let landed = if painted { state.path_landed() } else { None };
+        if let Some(landed) = landed {
+            state.painted(Some(landed));
         }
         if (fills && state.fill_paints_image) || (strokes && state.stroke_paints_image) {
             state.path_painted_with_image();
@@ -1157,6 +1484,12 @@ fn scan_content_stream<'a>(
     counts
 }
 
+#[cfg(test)]
+#[path = "content_scan_clip_tests.rs"]
+mod clip_tests;
+#[cfg(test)]
+#[path = "content_scan_fixtures.rs"]
+mod fixtures;
 #[cfg(test)]
 #[path = "content_scan_tests.rs"]
 mod tests;

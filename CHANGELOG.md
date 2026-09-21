@@ -130,9 +130,12 @@ Changes since 1.22.1.
   the pages a sample left out as well, and first among a page's reasons
   on both surfaces. Mode-7 text that an
   image, a shading, a painted path or visible text is later drawn through
-  — a title filled with a picture — is visible and not counted; a form
-  that paints nothing shows nothing through it, nor does a draw off the
-  page or clipped away. Operators are read past
+  — a title filled with a picture — is visible and not counted, its
+  glyphs placed by the text-positioning operators and the font size
+  (text placed by neither is shown by any paint within the clip); paint
+  that misses the glyphs shows nothing through them, nor does a form that
+  paints nothing, or a draw off the page or clipped away. Operators are
+  read past
   strings, comments and inline image data, and whether or not whitespace
   follows them, so text saying `3 Tr` sets no render mode and `(a)Tj(b)Tj`
   shows twice; text shown with the `'` and `"` operators counts as text,
