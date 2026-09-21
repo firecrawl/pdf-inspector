@@ -125,7 +125,9 @@ Changes since 1.22.1.
   — a title filled with a picture — is visible and not counted; a form
   that paints nothing shows nothing through it. Operators are read past
   strings, comments and inline image data, so text saying `3 Tr` sets no
-  render mode. A page whose layer is painted, a page with a visible
+  render mode, and text shown with the `'` and `"` operators counts as
+  text, here and in the text-operator tallies, which had always missed
+  it. A page whose layer is painted, a page with a visible
   caption over its image, invisible text with no image under it and an
   image with no text keep their classification and reasons; what is
   extracted is unchanged.

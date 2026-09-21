@@ -2561,6 +2561,11 @@ struct GlyphLayerPage {
     /// Groups of four path operators drawn before the layer, as outlined
     /// glyphs would be.
     vector_paths: usize,
+    /// Show the layer with the `'` and `"` operators instead of `Tj`.
+    quote_operators: bool,
+    /// Wrap the body text in marked content whose property list has an
+    /// `/ID` key.
+    marked_content_id: bool,
     /// A line of visible text at the foot of the page.
     caption: Option<&'static str>,
     /// Lines of ordinary visible body text.
@@ -2627,6 +2632,9 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
             content.push_str("100 200 m 150 250 l 200 200 100 100 200 200 c h\n");
         }
         if page.body_lines > 0 {
+            if page.marked_content_id {
+                content.push_str("/Span <</ID 7 /MCID 0>> BDC\n");
+            }
             content.push_str("BT /F1 12 Tf 72 720 Td ");
             for line in 0..page.body_lines {
                 if line > 0 {
@@ -2637,6 +2645,9 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
                 ));
             }
             content.push_str("ET\n");
+            if page.marked_content_id {
+                content.push_str("EMC\n");
+            }
         }
         if let Some(mode) = page.layer_mode {
             let mut layer = format!("{mode} Tr\n");
@@ -2644,12 +2655,26 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
                 .chars()
                 .cycle()
                 .take(page.layer_glyphs);
-            for (n, glyph) in glyphs.enumerate() {
-                let x = 72 + (n % 40) * 12;
-                let y = 720 - (n / 40) * 14;
-                layer.push_str(&format!(
-                    "BT 1 0 0 1 {x} {y} Tm /F1 10 Tf ({glyph}) Tj ET\n"
-                ));
+            if page.quote_operators {
+                // One glyph per line, `'` and `"` in turn, under a leading
+                // small enough to keep every line on the page.
+                layer.push_str("BT /F1 10 Tf 5 TL 72 720 Td\n");
+                for (n, glyph) in glyphs.enumerate() {
+                    if n % 2 == 0 {
+                        layer.push_str(&format!("({glyph}) '\n"));
+                    } else {
+                        layer.push_str(&format!("0 0 ({glyph}) \"\n"));
+                    }
+                }
+                layer.push_str("ET\n");
+            } else {
+                for (n, glyph) in glyphs.enumerate() {
+                    let x = 72 + (n % 40) * 12;
+                    let y = 720 - (n / 40) * 14;
+                    layer.push_str(&format!(
+                        "BT 1 0 0 1 {x} {y} Tm /F1 10 Tf ({glyph}) Tj ET\n"
+                    ));
+                }
             }
             if page.layer_in_form {
                 let form = add(
@@ -2736,6 +2761,8 @@ const SCAN_WITH_INVISIBLE_LAYER: GlyphLayerPage = GlyphLayerPage {
     invoke_form: false,
     image_after_layer: false,
     vector_paths: 0,
+    quote_operators: false,
+    marked_content_id: false,
     caption: None,
     body_lines: 0,
 };
@@ -2918,6 +2945,61 @@ fn test_resources_bound_but_unused_are_not_evidence() {
         pages.pages[0].ocr_reason.as_deref(),
         Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
     );
+}
+
+/// A layer shown only with the `'` and `"` operators is a text layer like
+/// any other: hidden under a covering image it is a layer nobody sees;
+/// painted, it is a text page.
+#[test]
+fn test_quote_operator_layer_follows_the_render_mode() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        quote_operators: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        quote_operators: true,
+        layer_mode: Some(0),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(!pages.pages[0].markdown.is_empty());
+}
+
+/// `/ID` is an ordinary name — here a marked-content property — and not
+/// the start of inline image data: the visible text after it is counted.
+#[test]
+fn test_id_name_is_not_inline_image_data() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: false,
+        layer_mode: None,
+        marked_content_id: true,
+        body_lines: 12,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.contains("Paragraph line 3"));
 }
 
 /// A page that is both vector text and a layer nobody sees under a scan

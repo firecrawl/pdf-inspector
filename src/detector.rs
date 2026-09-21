@@ -1809,7 +1809,8 @@ fn scan_xobjects_in_resources(
 /// What a scan of content streams counted.
 #[derive(Clone, Copy, Default)]
 struct ContentCounts {
-    /// Text-showing operators (`Tj`, `TJ`), whatever their render mode.
+    /// Text-showing operators (`Tj`, `TJ`, `'`, `"`), whatever their render
+    /// mode.
     text_ops: u32,
     /// Image XObjects among the resources scanned.
     image_count: u32,
@@ -2233,11 +2234,20 @@ fn form_matrix(doc: &Document, form: &lopdf::Stream) -> Option<[f64; 6]> {
 /// `content` with everything that is not an operator or its operands
 /// blanked to spaces, at the same offsets: the insides of literal strings
 /// (nesting and escapes honoured), of hex strings and of comments, and
-/// inline image data from `ID` through `EI`. The delimiters stay, so a
-/// string still closes an operand; the strings' bytes are read from the
-/// original when a text operator is found.
+/// inline image data, from the `ID` of an inline image `BI` opened through
+/// its `EI`. The delimiters stay, so a string still closes an operand; the
+/// strings' bytes are read from the original when a text operator is
+/// found.
 fn mask_strings_comments_and_inline_images(content: &[u8]) -> Vec<u8> {
+    /// Whether an operator token may begin at `i`: at the start, or after
+    /// whitespace or a closing delimiter.
+    fn after_token_break(content: &[u8], i: usize) -> bool {
+        i == 0 || is_pdf_whitespace(content[i - 1]) || matches!(content[i - 1], b')' | b']' | b'>')
+    }
     let mut masked = content.to_vec();
+    // `ID` begins image data only inside an inline image, which `BI` opens;
+    // anywhere else — a bare token, or the name `/ID` — it is left alone.
+    let mut inline_image_open = false;
     let mut i = 0;
     while i < content.len() {
         match content[i] {
@@ -2282,10 +2292,19 @@ fn mask_strings_comments_and_inline_images(content: &[u8]) -> Vec<u8> {
                 }
                 continue;
             }
-            b'I' if content.get(i + 1) == Some(&b'D')
-                && (i == 0 || is_pdf_name_delimiter(content[i - 1]))
+            b'B' if content.get(i + 1) == Some(&b'I')
+                && after_token_break(content, i)
                 && content.get(i + 2).is_none_or(|&b| is_pdf_whitespace(b)) =>
             {
+                inline_image_open = true;
+                i += 1;
+            }
+            b'I' if inline_image_open
+                && content.get(i + 1) == Some(&b'D')
+                && after_token_break(content, i)
+                && content.get(i + 2).is_none_or(|&b| is_pdf_whitespace(b)) =>
+            {
+                inline_image_open = false;
                 let end = inline_image_end(content, i + 2).unwrap_or(content.len());
                 masked[i..end].fill(b' ');
                 i = end;
@@ -2341,6 +2360,7 @@ fn scan_content_for_text_operators(
 /// This is a fast heuristic scan that looks for:
 /// - "Tj" - show text string
 /// - "TJ" - show text with individual glyph positioning
+/// - "'" and "\"" - move to the next line and show text
 /// - "Tf" - set font, whose name goes to `used_font_names`
 /// - path construction and painting operators
 ///
@@ -2438,6 +2458,18 @@ fn scan_content_stream<'a>(
                     operand_floor = i;
                 }
             }
+        } else if (b == b'\'' || b == b'"')
+            && is_token_start(i)
+            && is_token_end(i)
+            && preceding_operand_closer(ops, i, operand_floor)
+        {
+            // ' and " = move to the next line and show text (" sets the
+            // word and character spacing first). An apostrophe inside a
+            // string was blanked, so it cannot get here.
+            counts.text_ops += 1;
+            state.text_shown();
+            collect_text_chars_before(content, i, unique_chars, operand_floor);
+            operand_floor = i;
         } else if b == b'c'
             && ops.get(i + 1) == Some(&b'm')
             && is_token_start(i)
@@ -4389,6 +4421,45 @@ mod tests {
                 ch as char
             );
         }
+    }
+
+    #[test]
+    fn quote_show_text_operators_are_counted_and_follow_the_render_mode() {
+        // `'` and `"` show text as `Tj` does; an apostrophe inside a
+        // string is not an operator.
+        let hidden = b"BT /F1 10 Tf 3 Tr 12 TL 72 720 Td (a) ' (b) ' 1 0 (c) \" (don't) Tj ET";
+        let (counts, executed_ops, hidden_ops) = scan_alone(hidden);
+        assert_eq!((counts.text_ops, executed_ops, hidden_ops), (4, 4, 4));
+
+        let visible = b"BT /F1 10 Tf 12 TL 72 720 Td (a) ' (b) ' 1 0 (c) \" ET";
+        let (counts, executed_ops, hidden_ops) = scan_alone(visible);
+        assert_eq!((counts.text_ops, executed_ops, hidden_ops), (3, 3, 0));
+
+        // Their strings are read like `Tj`'s.
+        let mut unique_chars = HashSet::new();
+        let doc = Document::new();
+        let mut state = ContentScanState::new(&doc, PageBox::LETTER, false);
+        scan_content_stream(
+            visible,
+            &mut unique_chars,
+            &mut HashSet::new(),
+            &mut state,
+            &[],
+        );
+        for &ch in b"abc" {
+            assert!(unique_chars.contains(&ch), "{}", ch as char);
+        }
+    }
+
+    #[test]
+    fn id_begins_image_data_only_inside_an_inline_image() {
+        // `/ID` as a name, and a bare `ID` with no inline image open, are
+        // left alone; the `ID` of a `BI` still hides its data through `EI`.
+        let content = b"/Span <</ID 7 /MCID 0>> BDC BT /F1 12 Tf (a) Tj ET EMC \
+                        ID BT (b) Tj ET \
+                        BI /W 1 /H 1 /BPC 8 /CS /G ID q 3 Tr Q EI BT (c) Tj ET";
+        let (counts, executed_ops, hidden) = scan_alone(content);
+        assert_eq!((counts.text_ops, executed_ops, hidden), (3, 3, 0));
     }
 
     #[test]
