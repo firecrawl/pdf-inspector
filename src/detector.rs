@@ -4,6 +4,7 @@
 //! by sampling content streams for text operators (Tj/TJ) without loading
 //! all objects.
 
+use crate::extractor::{visible_page_box, PageBox};
 use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -61,8 +62,8 @@ pub struct PdfTypeResult {
     /// Empty for TextBased. All pages for Scanned/ImageBased. Specific pages for Mixed.
     pub pages_needing_ocr: Vec<u32>,
     /// Per-page explanation for `pages_needing_ocr`: 1-indexed page → reason
-    /// codes (`scanned`, `no_text`, `vector_text`, `suspected_garbled_text`).
-    /// Only contains pages that need OCR.
+    /// codes (`scanned`, `no_text`, `vector_text`, `invisible_text_layer`,
+    /// `suspected_garbled_text`). Only contains pages that need OCR.
     pub ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>>,
 }
 
@@ -223,9 +224,10 @@ pub(crate) fn detect_from_document(
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
-                page_num, analysis.text_operator_count, analysis.has_images,
-                analysis.image_count, analysis.has_template_image,
+                "page {}: text_ops={} invisible_text_ops={} images={} image_count={} template={} covering_image={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
+                page_num, analysis.text_operator_count, analysis.invisible_text_operator_count,
+                analysis.has_images, analysis.image_count, analysis.has_template_image,
+                analysis.has_covering_image,
                 analysis.unique_text_chars, analysis.unique_alphanum_chars,
                 analysis.path_op_count, analysis.has_vector_text,
                 analysis.total_image_area, analysis.has_identity_h_no_tounicode,
@@ -244,6 +246,7 @@ pub(crate) fn detect_from_document(
                 && analysis.unique_text_chars >= 5
                 && !analysis.has_vector_text
                 && !analysis.has_only_type3_fonts
+                && !analysis.has_invisible_text_layer
             {
                 pages_with_text += 1;
             }
@@ -261,8 +264,12 @@ pub(crate) fn detect_from_document(
             // as having real text regardless of raw byte diversity.
             let alphanum_ok = analysis.unique_alphanum_chars < 10
                 && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
-            if analysis.has_template_image
-                && (analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_ok)
+            // A page whose text is all invisible under an image covering
+            // the page is a scan however many operators the layer has:
+            // the page shows its raster, and the layer only describes it.
+            if (analysis.has_template_image
+                && (analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_ok))
+                || analysis.has_invisible_text_layer
             {
                 pages_with_template_images += 1;
             }
@@ -277,7 +284,8 @@ pub(crate) fn detect_from_document(
             if allow_early_exit
                 && (analysis.text_operator_count < config.min_text_ops_per_page
                     || is_image_dominated
-                    || analysis.unique_text_chars < 5)
+                    || analysis.unique_text_chars < 5
+                    || analysis.has_invisible_text_layer)
                 && (analysis.has_images || analysis.has_template_image)
             {
                 break;
@@ -411,6 +419,7 @@ pub(crate) fn detect_from_document(
                     && analysis.text_operator_count < config.min_text_ops_per_page.max(10);
                 if (analysis.has_template_image && looks_like_scan)
                     || analysis.has_vector_text
+                    || analysis.has_invisible_text_layer
                     || sparse_text_over_scan
                     || (analysis.text_operator_count < config.min_text_ops_per_page
                         && analysis.has_images)
@@ -523,9 +532,22 @@ fn distribute_pages(n: u32, total: u32) -> Vec<u32> {
 #[derive(Clone, Default)]
 struct PageAnalysis {
     text_operator_count: u32,
+    /// Those of `text_operator_count` that left nothing to see: run under
+    /// text render mode 3 (invisible), or under mode 7 (clip only) with
+    /// nothing painted through the clip.
+    invisible_text_operator_count: u32,
     has_images: bool,
     /// Whether page has a large background/template image (>50% coverage)
     has_template_image: bool,
+    /// Whether the page's own content draws an image over at least half of
+    /// the page area, by the matrix in force at its `Do`, whatever the
+    /// image's pixel size.
+    has_covering_image: bool,
+    /// Whether every text-showing operator on the page is invisible while
+    /// an image covers the page: a scan carrying a text layer nobody sees.
+    /// What the layer says is not what the page shows, so the page is read
+    /// from its raster.
+    has_invisible_text_layer: bool,
     /// Total image area in pixels (reserved for future use)
     #[allow(dead_code)]
     total_image_area: u64,
@@ -557,10 +579,11 @@ struct PageAnalysis {
 }
 
 /// Explain *why* a page needs OCR, from its content analysis. Priority:
-/// undecodable fonts (`suspected_garbled_text`) and vector-outlined text
-/// (`vector_text`) come first because they persist even when a text layer is
-/// present; otherwise a page with no extractable text is `scanned` when an
-/// image backs it or `no_text` when nothing does.
+/// undecodable fonts (`suspected_garbled_text`), vector-outlined text
+/// (`vector_text`) and a text layer nobody sees under a covering image
+/// (`invisible_text_layer`) come first because they persist even when a
+/// text layer is present; otherwise a page with no extractable text is
+/// `scanned` when an image backs it or `no_text` when nothing does.
 fn page_ocr_reasons(a: &PageAnalysis) -> Vec<&'static str> {
     let mut reasons = Vec::new();
     if a.has_identity_h_no_tounicode || a.has_only_type3_fonts {
@@ -568,6 +591,9 @@ fn page_ocr_reasons(a: &PageAnalysis) -> Vec<&'static str> {
     }
     if a.has_vector_text {
         reasons.push(crate::OCR_REASON_VECTOR_TEXT);
+    }
+    if a.has_invisible_text_layer {
+        reasons.push(crate::OCR_REASON_INVISIBLE_TEXT_LAYER);
     }
     if reasons.is_empty() {
         let has_extractable_text = a.text_operator_count > 0 && a.unique_text_chars > 0;
@@ -740,11 +766,7 @@ fn resolve_with_shadowing(
 
 /// Analyze a page's content stream for text operators and images
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
-    let mut text_ops = 0u32;
-    let mut has_images = false;
-    let mut image_count = 0u32;
-    let mut path_ops = 0u32;
-    let mut font_changes = 0u32;
+    let mut counts = ContentCounts::default();
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
     // Collect font ObjectIds (not names) to avoid cross-scope name collisions.
     // Each content stream resolves its Tf font names against its own resource
@@ -763,6 +785,15 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // inline and indirect resource dicts respectively.
     let page_resources = doc.get_page_resources(page_id).ok();
 
+    // The page's content streams are read as one: the text render mode and
+    // the transformation matrix carry from each to the next. A `Do` there
+    // is matched against the names the page's resources bind to images.
+    let image_names = page_resources
+        .as_ref()
+        .map(|(own, ancestors)| image_xobject_names(doc, *own, ancestors))
+        .unwrap_or_default();
+    let mut scan_state = ContentScanState::new(&image_names);
+
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
             let content = match stream.decompressed_content() {
@@ -772,16 +803,12 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
-            let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
+            counts.add(scan_content_stream(
                 &content,
                 &mut all_unique_chars,
                 &mut page_font_names,
-            );
-            text_ops += ops;
-            image_count += imgs;
-            path_ops += paths;
-            font_changes += fonts;
-            has_images = has_images || imgs > 0;
+                &mut scan_state,
+            ));
 
             // Resolve font names against the page's resource dictionaries,
             // respecting PDF resource inheritance shadowing: the most-specific
@@ -804,46 +831,53 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
             collect_fonts_from_resource_dict(doc, resources, &mut font_map);
-            let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
+            counts.add(scan_xobjects_in_resources(
                 doc,
                 resources,
                 &mut visited,
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
-            );
-            text_ops += ops;
-            image_count += imgs;
-            path_ops += paths;
-            font_changes += fonts;
-            has_images = has_images || imgs > 0;
+            ));
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
                 collect_fonts_from_resource_dict(doc, resources, &mut font_map);
-                let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
+                counts.add(scan_xobjects_in_resources(
                     doc,
                     resources,
                     &mut visited,
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
-                );
-                text_ops += ops;
-                image_count += imgs;
-                path_ops += paths;
-                font_changes += fonts;
-                has_images = has_images || imgs > 0;
+                ));
             }
         }
     }
+    let text_ops = counts.text_ops;
+    let image_count = counts.image_count;
+    let path_ops = counts.path_ops;
+    let font_changes = counts.font_changes;
 
     // Check for XObject images and calculate coverage
     let (found_images, total_image_area, has_template_image) = analyze_page_images(doc, page_id);
+    let has_images = image_count > 0 || found_images;
 
-    if found_images {
-        has_images = true;
-    }
+    // An image drawn over at least half of the page area — measured in user
+    // space from the matrix in force at its `Do` — covers the page whatever
+    // its pixel size. `has_template_image` judges the pixels instead, and
+    // also sees images drawn from within a Form XObject.
+    let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
+    let page_area = f64::from(page_box.width()) * f64::from(page_box.height());
+    let has_covering_image =
+        scan_state.largest_image_area >= COVERING_IMAGE_MIN_PAGE_FRACTION * page_area;
+
+    // A page whose every text-showing operator left nothing to see while
+    // an image covers it shows the raster alone; the text layer describes
+    // the raster rather than being the page's content.
+    let hidden_text_ops = counts.hidden_text_ops();
+    let has_invisible_text_layer =
+        text_ops > 0 && hidden_text_ops == text_ops && (has_covering_image || has_template_image);
 
     let unique_alphanum_chars = all_unique_chars
         .iter()
@@ -893,8 +927,11 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     PageAnalysis {
         text_operator_count: text_ops,
+        invisible_text_operator_count: hidden_text_ops,
         has_images,
         has_template_image,
+        has_covering_image,
+        has_invisible_text_layer,
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,
@@ -906,6 +943,53 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         font_change_count: font_changes,
         has_decodable_text_fonts,
     }
+}
+
+/// The share of the page area one image must be drawn over, by the matrix
+/// in force at its `Do`, to count as covering the page.
+const COVERING_IMAGE_MIN_PAGE_FRACTION: f64 = 0.5;
+
+/// The names the page's content draws Image XObjects by: those its own
+/// `/Resources` bind to an image, then those of its ancestors' that a more
+/// specific scope does not shadow, in lopdf's most-specific-first order
+/// (see `resolve_with_shadowing`).
+fn image_xobject_names(
+    doc: &Document,
+    own_resources: Option<&lopdf::Dictionary>,
+    ancestor_resource_ids: &[ObjectId],
+) -> HashSet<Vec<u8>> {
+    let mut image_names = HashSet::new();
+    let mut bound_names: HashSet<Vec<u8>> = HashSet::new();
+    let ancestors = ancestor_resource_ids
+        .iter()
+        .filter_map(|id| doc.get_dictionary(*id).ok());
+    for resources in own_resources.into_iter().chain(ancestors) {
+        let xobjects = match resources.get(b"XObject").ok() {
+            Some(Object::Dictionary(dict)) => dict,
+            Some(Object::Reference(id)) => match doc.get_dictionary(*id) {
+                Ok(dict) => dict,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        for (name, value) in xobjects.iter() {
+            if !bound_names.insert(name.clone()) {
+                continue;
+            }
+            let is_image = value
+                .as_reference()
+                .ok()
+                .and_then(|id| doc.get_object(id).ok())
+                .and_then(|object| object.as_stream().ok())
+                .and_then(|stream| stream.dict.get(b"Subtype").ok())
+                .and_then(|subtype| subtype.as_name().ok())
+                == Some(b"Image");
+            if is_image {
+                image_names.insert(name.clone());
+            }
+        }
+    }
+    image_names
 }
 
 /// Distinct alphanumeric characters a page must show for its text to count
@@ -1653,11 +1737,8 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
-) -> (u32, u32, u32, u32) {
-    let mut text_ops = 0u32;
-    let mut image_count = 0u32;
-    let mut path_ops = 0u32;
-    let mut font_changes = 0u32;
+) -> ContentCounts {
+    let mut counts = ContentCounts::default();
 
     let xobjects = match resources.get(b"XObject").ok() {
         Some(Object::Dictionary(d)) => Some(d.clone()),
@@ -1686,17 +1767,19 @@ fn scan_xobjects_in_resources(
                     let content = stream
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
-                    // Collect raw font names from this XObject's content stream
+                    // Collect raw font names from this XObject's content stream.
+                    // A form scanned on its own starts from the initial
+                    // graphics state, and the areas its `Do`s draw are in
+                    // form space, so none of them is taken for a covering image.
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
-                    let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
+                    let no_image_names = HashSet::new();
+                    let mut form_state = ContentScanState::new(&no_image_names);
+                    counts.add(scan_content_stream(
                         &content,
                         unique_chars,
                         &mut xobj_font_names,
-                    );
-                    text_ops += ops;
-                    image_count += imgs;
-                    path_ops += paths;
-                    font_changes += fonts;
+                        &mut form_state,
+                    ));
 
                     // Resolve the Form XObject's /Resources — handle both inline
                     // dicts and indirect references (P2 fix: indirect refs were
@@ -1718,29 +1801,191 @@ fn scan_xobjects_in_resources(
                         // Collect font definitions from this scope
                         collect_fonts_from_resource_dict(doc, res, font_map);
                         // Recurse into nested XObjects
-                        let (ops2, imgs2, paths2, fonts2) = scan_xobjects_in_resources(
+                        counts.add(scan_xobjects_in_resources(
                             doc,
                             res,
                             visited,
                             unique_chars,
                             used_font_ids,
                             font_map,
-                        );
-                        text_ops += ops2;
-                        image_count += imgs2;
-                        path_ops += paths2;
-                        font_changes += fonts2;
+                        ));
                     }
                 }
                 Some(b"Image") => {
-                    image_count += 1;
+                    counts.image_count += 1;
                 }
                 _ => {}
             }
         }
     }
 
-    (text_ops, image_count, path_ops, font_changes)
+    counts
+}
+
+/// What a scan of content streams counted.
+#[derive(Clone, Copy, Default)]
+struct ContentCounts {
+    /// Text-showing operators (`Tj`, `TJ`).
+    text_ops: u32,
+    /// Those of `text_ops` run under a text render mode that paints no
+    /// glyph: 3 (invisible) or 7 (clip only).
+    invisible_text_ops: u32,
+    /// Those of `invisible_text_ops` shown in mode 7 whose clip something
+    /// was later painted through — text filled with an image or a shading
+    /// — so they are visible after all.
+    clip_text_ops_shown: u32,
+    /// Image XObjects among the resources scanned.
+    image_count: u32,
+    /// Path construction and painting operators.
+    path_ops: u32,
+    /// `Tf` operators whose font name could be read.
+    font_changes: u32,
+}
+
+impl ContentCounts {
+    fn add(&mut self, other: ContentCounts) {
+        self.text_ops += other.text_ops;
+        self.invisible_text_ops += other.invisible_text_ops;
+        self.clip_text_ops_shown += other.clip_text_ops_shown;
+        self.image_count += other.image_count;
+        self.path_ops += other.path_ops;
+        self.font_changes += other.font_changes;
+    }
+
+    /// Text-showing operators that left nothing to see: mode 3, and mode 7
+    /// with nothing painted through its clip.
+    fn hidden_text_ops(&self) -> u32 {
+        self.invisible_text_ops
+            .saturating_sub(self.clip_text_ops_shown)
+    }
+}
+
+/// Text render modes that paint no glyph: 3 draws nothing at all, and 7
+/// only adds the glyphs to the clipping path.
+fn render_mode_is_invisible(mode: u8) -> bool {
+    matches!(mode, 3 | 7)
+}
+
+/// How many `q` levels the scan keeps a saved state for. Deeper nesting
+/// keeps the innermost state, and its `Q`s restore nothing.
+const SCAN_STATE_MAX_DEPTH: usize = 256;
+
+/// What `q` saves of the state the scan follows.
+#[derive(Clone, Copy)]
+struct SavedScanState {
+    render_mode: u8,
+    unit_area: f64,
+    clip_text_ops: u32,
+}
+
+/// The part of the graphics state the content scan follows, saved by `q`
+/// and restored by `Q`: the text render mode `Tr` sets; the user-space
+/// area of the unit square an image is drawn into, which `cm` scales; and
+/// the clip-only (mode 7) text whose clip is in force, which a painting
+/// operator shows through and the `Q` closing its level discards unseen.
+/// One state runs through a page's content streams, which the PDF reads
+/// as one; a Form XObject scanned on its own starts from the initial state.
+struct ContentScanState<'a> {
+    render_mode: u8,
+    /// |det| of the current transformation matrix.
+    unit_area: f64,
+    /// Mode-7 text-showing operators whose clip was set at the current
+    /// level and has not been painted through; those set at outer levels
+    /// sit in `saved`.
+    clip_text_ops: u32,
+    /// `clip_text_ops` over the current and the saved levels together.
+    pending_clip_text_ops: u32,
+    saved: Vec<SavedScanState>,
+    /// `q` operators past `SCAN_STATE_MAX_DEPTH`, whose `Q`s restore nothing.
+    unsaved_depth: u32,
+    /// Names the page's resources bind to Image XObjects.
+    image_names: &'a HashSet<Vec<u8>>,
+    /// The largest area an image named in `image_names` was drawn over.
+    largest_image_area: f64,
+}
+
+impl<'a> ContentScanState<'a> {
+    fn new(image_names: &'a HashSet<Vec<u8>>) -> Self {
+        Self {
+            render_mode: 0,
+            unit_area: 1.0,
+            clip_text_ops: 0,
+            pending_clip_text_ops: 0,
+            saved: Vec::new(),
+            unsaved_depth: 0,
+            image_names,
+            largest_image_area: 0.0,
+        }
+    }
+
+    fn save(&mut self) {
+        if self.saved.len() < SCAN_STATE_MAX_DEPTH {
+            self.saved.push(SavedScanState {
+                render_mode: self.render_mode,
+                unit_area: self.unit_area,
+                clip_text_ops: self.clip_text_ops,
+            });
+            self.clip_text_ops = 0;
+        } else {
+            self.unsaved_depth += 1;
+        }
+    }
+
+    /// A `Q` with nothing saved is ignored, as renderers ignore it. The
+    /// clips set at the level being left go with it: what they hid, with
+    /// nothing painted through them, stays hidden.
+    fn restore(&mut self) {
+        if self.unsaved_depth > 0 {
+            self.unsaved_depth -= 1;
+        } else if let Some(saved) = self.saved.pop() {
+            self.pending_clip_text_ops -= self.clip_text_ops;
+            self.render_mode = saved.render_mode;
+            self.unit_area = saved.unit_area;
+            self.clip_text_ops = saved.clip_text_ops;
+        }
+    }
+
+    /// A text-showing operator ran in clip-only mode: hidden unless
+    /// something is painted through its clip before its level closes.
+    fn text_shown_as_clip(&mut self) {
+        self.clip_text_ops += 1;
+        self.pending_clip_text_ops += 1;
+    }
+
+    /// Something was painted, so the clip-only text in force shows it
+    /// through its glyphs: that text is visible after all. Returns how many
+    /// text-showing operators that is.
+    fn painted(&mut self) -> u32 {
+        let shown = self.pending_clip_text_ops;
+        if shown > 0 {
+            self.pending_clip_text_ops = 0;
+            self.clip_text_ops = 0;
+            for saved in &mut self.saved {
+                saved.clip_text_ops = 0;
+            }
+        }
+        shown
+    }
+}
+
+/// [`scan_content_stream`] from the initial graphics state, with no image
+/// names, as the counts alone: `(text_ops, image_count, path_ops,
+/// font_changes)`.
+#[cfg(test)]
+fn scan_content_for_text_operators(
+    content: &[u8],
+    unique_chars: &mut HashSet<u8>,
+    used_font_names: &mut HashSet<Vec<u8>>,
+) -> (u32, u32, u32, u32) {
+    let no_image_names = HashSet::new();
+    let mut state = ContentScanState::new(&no_image_names);
+    let counts = scan_content_stream(content, unique_chars, used_font_names, &mut state);
+    (
+        counts.text_ops,
+        counts.image_count,
+        counts.path_ops,
+        counts.font_changes,
+    )
 }
 
 /// Fast scan of content stream bytes for text operators
@@ -1748,26 +1993,40 @@ fn scan_xobjects_in_resources(
 /// This is a fast heuristic scan that looks for:
 /// - "Tj" - show text string
 /// - "TJ" - show text with individual glyph positioning
-/// - "'" - move to next line and show text
-/// - "\"" - set word/char spacing, move to next line, show text
+/// - "Tf" - set font, whose name goes to `used_font_names`
+/// - path construction and painting operators
 ///
-/// Returns (text_op_count, image_count, path_op_count, font_change_count).
-/// Unique non-whitespace text characters are collected into `unique_chars`.
-fn scan_content_for_text_operators(
+/// It follows the graphics state in `state`: `Tr` sets the text render
+/// mode, which decides whether a text-showing operator also counts as
+/// invisible; `cm` scales the area a `Do` draws an image over; `q` and `Q`
+/// save and restore both. Unique non-whitespace text characters are
+/// collected into `unique_chars`.
+fn scan_content_stream(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
     used_font_names: &mut HashSet<Vec<u8>>,
-) -> (u32, u32, u32, u32) {
-    let mut text_ops = 0u32;
-    let image_count = 0u32;
-    let mut path_ops = 0u32;
-    let mut font_changes = 0u32;
+    state: &mut ContentScanState<'_>,
+) -> ContentCounts {
+    let mut counts = ContentCounts::default();
 
     // Helper: check if position is a word boundary (start of content or preceded by whitespace)
     let is_word_start = |pos: usize| -> bool { pos == 0 || content[pos - 1].is_ascii_whitespace() };
     // Helper: check if position is at end or followed by whitespace
     let is_word_end =
         |pos: usize| -> bool { pos + 1 >= content.len() || content[pos + 1].is_ascii_whitespace() };
+    // Helpers for the graphics-state operators, which may sit against a
+    // delimiter (`Q/Im0 Do`, `3 Tr(x)`): a token starts after whitespace
+    // or a closing delimiter, and ends before whitespace or an opening one.
+    let is_token_start = |pos: usize| -> bool {
+        pos == 0
+            || content[pos - 1].is_ascii_whitespace()
+            || matches!(content[pos - 1], b')' | b']' | b'>')
+    };
+    let is_token_end = |pos: usize| -> bool {
+        pos + 1 >= content.len()
+            || content[pos + 1].is_ascii_whitespace()
+            || matches!(content[pos + 1], b'/' | b'[' | b'(' | b'<' | b'%')
+    };
 
     // Simple state machine to find operators.
     // Each Tj/TJ/Tf lookback stops at the previous text/font operator so a
@@ -1780,7 +2039,7 @@ fn scan_content_for_text_operators(
     while i < content.len() {
         let b = content[i];
 
-        // Look for 'T' followed by 'j', 'J', or 'f'
+        // Look for 'T' followed by 'j', 'J', 'f' or 'r'
         if b == b'T' && i + 1 < content.len() {
             let next = content[i + 1];
             if next == b'j' || next == b'J' {
@@ -1791,7 +2050,13 @@ fn scan_content_for_text_operators(
                     || content[i + 2] == b'\r')
                     && preceding_operand_closer(content, i, operand_floor)
                 {
-                    text_ops += 1;
+                    counts.text_ops += 1;
+                    if render_mode_is_invisible(state.render_mode) {
+                        counts.invisible_text_ops += 1;
+                        if state.render_mode == 7 {
+                            state.text_shown_as_clip();
+                        }
+                    }
                     collect_text_chars_before(content, i, unique_chars, operand_floor);
                     operand_floor = i;
                 }
@@ -1811,28 +2076,82 @@ fn scan_content_for_text_operators(
                 {
                     if let Some(name) = extract_font_name_before_tf(content, i, operand_floor) {
                         used_font_names.insert(name);
-                        font_changes += 1;
+                        counts.font_changes += 1;
                         operand_floor = i;
                     }
                 }
+            } else if next == b'r' && is_token_start(i) && is_token_end(i + 1) {
+                // Tr = set text render mode. A mode outside 0..=7 is
+                // ignored, as renderers ignore it.
+                if let Some([mode]) = numeric_operands_before::<1>(content, i, operand_floor) {
+                    if mode.fract() == 0.0 && (0.0..=7.0).contains(&mode) {
+                        state.render_mode = mode as u8;
+                    }
+                    operand_floor = i;
+                }
             }
+        } else if b == b'c'
+            && content.get(i + 1) == Some(&b'm')
+            && is_token_start(i)
+            && is_token_end(i + 1)
+        {
+            // cm = concatenate matrix: the unit square's area scales by the
+            // matrix's |determinant|.
+            if let Some([ma, mb, mc, md, _, _]) =
+                numeric_operands_before::<6>(content, i, operand_floor)
+            {
+                state.unit_area *= (ma * md - mb * mc).abs();
+                operand_floor = i;
+            }
+        } else if b == b'D'
+            && content.get(i + 1) == Some(&b'o')
+            && is_token_start(i)
+            && is_token_end(i + 1)
+        {
+            // Do = paint an XObject. Only the area matters here, and only
+            // for a name the page's resources bind to an image: whether a
+            // page has images at all is read from the resources themselves
+            // (scan_xobjects_in_resources, analyze_page_images), since Do
+            // also invokes Form XObjects, which may hold text.
+            counts.clip_text_ops_shown += state.painted();
+            if let Some(name) = name_operand_before(content, i, operand_floor) {
+                if state.image_names.contains(&name) {
+                    state.largest_image_area = state.largest_image_area.max(state.unit_area);
+                }
+                operand_floor = i;
+            }
+        } else if (b == b's' && content.get(i + 1) == Some(&b'h')
+            || b == b'B' && content.get(i + 1) == Some(&b'I'))
+            && is_token_start(i)
+            && is_token_end(i + 1)
+        {
+            // sh = paint a shading; BI = begin an inline image.
+            counts.clip_text_ops_shown += state.painted();
+        } else if b == b'q' && is_token_start(i) && is_token_end(i) {
+            state.save();
+        } else if b == b'Q' && is_token_start(i) && is_token_end(i) {
+            state.restore();
         }
-
-        // Note: We do NOT count 'Do' operators here because Do invokes any
-        // XObject — including Form XObjects that contain text.  Actual image
-        // detection is handled by scan_xobjects_in_resources (checks Subtype)
-        // and analyze_page_images (measures pixel area).
 
         // Count path construction/painting operators.
         // Single-byte: m (moveto), l (lineto), c (curveto), h (closepath),
         //              f (fill), S (stroke), s (close+stroke), B (fill+stroke),
         //              F (fill, variant)
         // These are the high-volume operators in vector-outlined text.
+        // A painting operator also shows any clip-only text through its
+        // glyphs; b, B* and b* paint too but are not counted as path
+        // operators.
+        let mut painted = false;
         match b {
-            b'm' | b'l' | b'c' | b'h' | b'f' | b'S' | b's' | b'B' | b'F'
-                if is_word_start(i) && is_word_end(i) =>
-            {
-                path_ops += 1;
+            b'm' | b'l' | b'c' | b'h' if is_word_start(i) && is_word_end(i) => {
+                counts.path_ops += 1;
+            }
+            b'f' | b'S' | b's' | b'B' | b'F' if is_word_start(i) && is_word_end(i) => {
+                counts.path_ops += 1;
+                painted = true;
+            }
+            b'b' if is_word_start(i) && is_word_end(i) => {
+                painted = true;
             }
             // Two-byte: re (rect), f* (fill even-odd)
             b'r' if i + 1 < content.len()
@@ -1840,22 +2159,80 @@ fn scan_content_for_text_operators(
                 && is_word_start(i)
                 && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace()) =>
             {
-                path_ops += 1;
+                counts.path_ops += 1;
             }
             b'f' if i + 1 < content.len()
                 && content[i + 1] == b'*'
                 && is_word_start(i)
                 && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace()) =>
             {
-                path_ops += 1;
+                counts.path_ops += 1;
+                painted = true;
+            }
+            b'B' | b'b'
+                if i + 1 < content.len()
+                    && content[i + 1] == b'*'
+                    && is_word_start(i)
+                    && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace()) =>
+            {
+                painted = true;
             }
             _ => {}
+        }
+        if painted {
+            counts.clip_text_ops_shown += state.painted();
         }
 
         i += 1;
     }
 
-    (text_ops, image_count, path_ops, font_changes)
+    counts
+}
+
+/// The `N` numeric operands before the operator at `op_pos`, in stream
+/// order; `None` when a token there is not a number or the lookback would
+/// cross `floor`.
+fn numeric_operands_before<const N: usize>(
+    content: &[u8],
+    op_pos: usize,
+    floor: usize,
+) -> Option<[f64; N]> {
+    let mut values = [0.0f64; N];
+    let mut end = op_pos;
+    for value in values.iter_mut().rev() {
+        while end > floor && content[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > floor && matches!(content[start - 1], b'0'..=b'9' | b'.' | b'-' | b'+') {
+            start -= 1;
+        }
+        if start == end {
+            return None;
+        }
+        *value = std::str::from_utf8(&content[start..end])
+            .ok()?
+            .parse()
+            .ok()?;
+        end = start;
+    }
+    Some(values)
+}
+
+/// The name operand (`/Name`, given without its slash) before the operator
+/// at `op_pos`; `None` when the token there is not a name or the lookback
+/// would cross `floor`.
+fn name_operand_before(content: &[u8], op_pos: usize, floor: usize) -> Option<Vec<u8>> {
+    let mut end = op_pos;
+    while end > floor && content[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > floor && !is_pdf_name_delimiter(content[start - 1]) {
+        start -= 1;
+    }
+    (start > floor && start < end && content[start - 1] == b'/')
+        .then(|| content[start..end].to_vec())
 }
 
 /// True when the token before `op_pos` (skipping whitespace, not crossing
@@ -2165,8 +2542,9 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
     (has_images, total_area, has_template_image)
 }
 
-/// Computes both `(needs_ocr_for_template_image, has_vector_text)` for a
-/// page from a single shared `analyze_page_content` pass — that call
+/// Computes `template_image_needs_ocr`, `has_vector_text` and
+/// `has_invisible_text_layer` (see [`PageOcrSignals`]) for a page from a
+/// single shared `analyze_page_content` pass — that call
 /// decompresses and scans every content stream (page + XObjects) plus
 /// image coverage, so `extract_pages_markdown_mem` must not invoke it
 /// twice per page (once per signal) the way `detect_from_document` avoids
@@ -2210,7 +2588,7 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
 /// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
 /// the same gates classification needs elsewhere instead of treating the
 /// raw signals alone as sufficient — see #227/#231.
-pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool) {
+pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> PageOcrSignals {
     let analysis = analyze_page_content(doc, page_id);
 
     let needs_ocr_for_template_image = if !analysis.has_template_image {
@@ -2225,7 +2603,25 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool
         looks_like_scan || insufficient_text
     };
 
-    (needs_ocr_for_template_image, analysis.has_vector_text)
+    PageOcrSignals {
+        template_image_needs_ocr: needs_ocr_for_template_image,
+        has_vector_text: analysis.has_vector_text,
+        has_invisible_text_layer: analysis.has_invisible_text_layer,
+    }
+}
+
+/// The per-page signals [`page_ocr_signals`] shares between classification
+/// and per-page extraction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PageOcrSignals {
+    /// The page's template image is a scan needing OCR rather than a
+    /// watermark, letterhead or figure under a text page.
+    pub(crate) template_image_needs_ocr: bool,
+    /// The page's text is drawn as vector outlines.
+    pub(crate) has_vector_text: bool,
+    /// Every text-showing operator on the page is invisible while an image
+    /// covers the page.
+    pub(crate) has_invisible_text_layer: bool,
 }
 
 /// Recursively collect image dimensions from XObject resources,
@@ -2404,6 +2800,33 @@ mod tests {
         assert_eq!(
             page_ocr_reasons(&text_with_image),
             vec![crate::OCR_REASON_SCANNED]
+        );
+
+        // A text layer nobody sees under a covering image: the specific
+        // reason, not the `scanned` fall-through, and after garbled fonts.
+        let invisible_layer = PageAnalysis {
+            text_operator_count: 300,
+            invisible_text_operator_count: 300,
+            unique_text_chars: 40,
+            has_images: true,
+            has_covering_image: true,
+            has_invisible_text_layer: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            page_ocr_reasons(&invisible_layer),
+            vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
+        );
+        let garbled_invisible_layer = PageAnalysis {
+            has_identity_h_no_tounicode: true,
+            ..invisible_layer
+        };
+        assert_eq!(
+            page_ocr_reasons(&garbled_invisible_layer),
+            vec![
+                crate::OCR_REASON_SUSPECTED_GARBLED_TEXT,
+                crate::OCR_REASON_INVISIBLE_TEXT_LAYER
+            ]
         );
     }
 
@@ -3482,7 +3905,7 @@ mod tests {
             analysis.unique_alphanum_chars >= 10,
             "sanity: masthead text is diverse, alphanum_low cannot fire"
         );
-        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        let needs_ocr = page_ocr_signals(&doc, page_id).template_image_needs_ocr;
         assert!(
             needs_ocr,
             "template image + text below the pages_with_text floor is a scan"
@@ -3508,11 +3931,335 @@ mod tests {
             analysis.text_operator_count >= 10,
             "sanity: body text clears the floor"
         );
-        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        let needs_ocr = page_ocr_signals(&doc, page_id).template_image_needs_ocr;
         assert!(
             !needs_ocr,
             "a text page with a background image must stay native"
         );
+    }
+
+    // ---------- Text render mode and covering images ----------
+
+    fn scan_alone(content: &[u8], state: &mut ContentScanState<'_>) -> ContentCounts {
+        scan_content_stream(content, &mut HashSet::new(), &mut HashSet::new(), state)
+    }
+
+    #[test]
+    fn render_mode_splits_invisible_text_ops() {
+        let no_image_names = HashSet::new();
+        let mut state = ContentScanState::new(&no_image_names);
+        let content = b"BT /F1 12 Tf 3 Tr (a) Tj 0 Tr (b) Tj 7 Tr [(c)] TJ 1 Tr (d) Tj ET";
+        let counts = scan_alone(content, &mut state);
+        assert_eq!(counts.text_ops, 4);
+        assert_eq!(counts.invisible_text_ops, 2, "modes 3 and 7 paint nothing");
+        assert_eq!(counts.hidden_text_ops(), 2);
+    }
+
+    #[test]
+    fn clip_only_text_painted_through_is_visible() {
+        let image_names: HashSet<Vec<u8>> = [b"Im0".to_vec()].into_iter().collect();
+        let mut state = ContentScanState::new(&image_names);
+        // A title filled with an image: the glyphs clip the image painted
+        // through them, so they are visible. The image under the page,
+        // drawn before the text, shows nothing of it.
+        let content = b"q 612 0 0 792 0 0 cm /Im0 Do Q \
+                        q BT 7 Tr (L) Tj (O) Tj ET q 612 0 0 792 0 0 cm /Im0 Do Q Q";
+        let counts = scan_alone(content, &mut state);
+        assert_eq!(counts.text_ops, 2);
+        assert_eq!(counts.invisible_text_ops, 2);
+        assert_eq!(counts.clip_text_ops_shown, 2);
+        assert_eq!(counts.hidden_text_ops(), 0);
+
+        // Shadings, inline images and path painting show it too; mode 3
+        // is never shown, whatever is painted after it.
+        for painting in [
+            "sh",
+            "BI /W 1 /H 1 ID x EI",
+            "0 0 1 1 re f",
+            "0 0 m 1 1 l S",
+            "b",
+        ] {
+            let content = format!("q BT 7 Tr (a) Tj ET {painting} Q BT 3 Tr (b) Tj ET {painting}");
+            let mut state = ContentScanState::new(&image_names);
+            let counts = scan_alone(content.as_bytes(), &mut state);
+            assert_eq!(counts.text_ops, 2, "{painting}");
+            assert_eq!(counts.hidden_text_ops(), 1, "{painting}");
+        }
+
+        // A clip whose level closes unpainted hides its text for good: the
+        // image painted afterwards is outside it. Text ops painted through
+        // in a stream after the one that showed them are still counted
+        // against the page, never below zero within one stream.
+        let mut state = ContentScanState::new(&image_names);
+        let first = scan_alone(b"q BT 7 Tr (a) Tj ET Q BT 7 Tr (b) Tj ET", &mut state);
+        let second = scan_alone(b"q 612 0 0 792 0 0 cm /Im0 Do Q", &mut state);
+        assert_eq!(first.invisible_text_ops, 2);
+        assert_eq!(first.clip_text_ops_shown, 0);
+        assert_eq!(
+            second.clip_text_ops_shown, 1,
+            "(b) was painted through, (a) was not"
+        );
+        let mut page = first;
+        page.add(second);
+        assert_eq!(page.hidden_text_ops(), 1);
+    }
+
+    #[test]
+    fn render_mode_follows_q_and_capital_q() {
+        let no_image_names = HashSet::new();
+        let mut state = ContentScanState::new(&no_image_names);
+        // `Q` restores the mode `q` saved; a `Q` with nothing saved changes
+        // nothing; a nested save and restore keeps the outer mode.
+        let content = b"Q q 3 Tr (a) Tj Q (b) Tj q q 3 Tr Q (c) Tj Q (d) Tj";
+        let counts = scan_alone(content, &mut state);
+        assert_eq!(counts.text_ops, 4);
+        assert_eq!(counts.invisible_text_ops, 1);
+        assert_eq!(state.render_mode, 0);
+    }
+
+    #[test]
+    fn render_mode_carries_across_a_page_s_content_streams() {
+        let no_image_names = HashSet::new();
+        let mut state = ContentScanState::new(&no_image_names);
+        let first = scan_alone(b"q 3 Tr", &mut state);
+        let second = scan_alone(b"BT (a) Tj ET Q BT (b) Tj ET", &mut state);
+        assert_eq!(first.text_ops, 0);
+        assert_eq!(second.text_ops, 2);
+        assert_eq!(second.invisible_text_ops, 1);
+    }
+
+    #[test]
+    fn render_mode_in_a_string_or_out_of_range_is_not_set() {
+        let no_image_names = HashSet::new();
+        let mut state = ContentScanState::new(&no_image_names);
+        let content = b"(3 Tr) Tj 9 Tr (a) Tj 3.5 Tr (b) Tj";
+        let counts = scan_alone(content, &mut state);
+        assert_eq!(counts.text_ops, 3);
+        assert_eq!(counts.invisible_text_ops, 0);
+        assert_eq!(state.render_mode, 0);
+    }
+
+    #[test]
+    fn saved_states_past_the_depth_cap_restore_nothing() {
+        let no_image_names = HashSet::new();
+        let mut state = ContentScanState::new(&no_image_names);
+        let mut content = Vec::new();
+        for _ in 0..=SCAN_STATE_MAX_DEPTH {
+            content.extend_from_slice(b"q ");
+        }
+        content.extend_from_slice(b"3 Tr ");
+        for _ in 0..=SCAN_STATE_MAX_DEPTH {
+            content.extend_from_slice(b"Q ");
+        }
+        content.extend_from_slice(b"(a) Tj");
+        let counts = scan_alone(&content, &mut state);
+        assert_eq!(counts.text_ops, 1);
+        assert_eq!(
+            counts.invisible_text_ops, 0,
+            "the outermost `Q` restores mode 0"
+        );
+        assert!(state.saved.is_empty());
+    }
+
+    #[test]
+    fn covering_image_area_follows_cm_through_q_and_capital_q() {
+        let image_names: HashSet<Vec<u8>> = [b"Im0".to_vec()].into_iter().collect();
+        let mut state = ContentScanState::new(&image_names);
+        // A rotated full-page draw, a nested scale under a small draw and a
+        // full-page draw of a form (not an image name): the largest image
+        // draw wins.
+        let content = b"q 0 612 -792 0 792 0 cm /Im0 Do Q \
+                        q 2 0 0 2 0 0 cm q 100 0 0 50 0 0 cm /Im0 Do Q Q \
+                        q 612 0 0 792 0 0 cm /Fm0 Do Q";
+        scan_alone(content, &mut state);
+        assert!((state.largest_image_area - 612.0 * 792.0).abs() < 1e-6);
+        assert!(
+            (state.unit_area - 1.0).abs() < 1e-9,
+            "every `q` was restored"
+        );
+
+        let mut state = ContentScanState::new(&image_names);
+        scan_alone(b"q 100 0 0 50 0 0 cm /Im0 Do Q", &mut state);
+        assert!((state.largest_image_area - 5000.0).abs() < 1e-6);
+    }
+
+    /// A one-page document: a 2×2 gray image drawn over the whole page when
+    /// `covering_image`; a layer of 120 one-glyph `Tj` blocks under
+    /// `layer_mode` when given, in the page's content or, when
+    /// `layer_in_form`, in a Form XObject the page invokes; and a visible
+    /// caption line when given.
+    fn layered_scan_page(
+        covering_image: bool,
+        layer_mode: Option<u8>,
+        layer_in_form: bool,
+        caption: Option<&str>,
+    ) -> (Document, ObjectId) {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let image_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Image".to_vec()),
+                "Width" => Object::Integer(2),
+                "Height" => Object::Integer(2),
+                "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
+                "BitsPerComponent" => Object::Integer(8),
+            },
+            vec![200, 60, 60, 200],
+        )));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+
+        let mut layer = String::new();
+        if let Some(mode) = layer_mode {
+            layer.push_str(&format!("{mode} Tr\n"));
+            let glyphs = "thepagecarriesalayernobodysees".chars().cycle().take(120);
+            for (n, glyph) in glyphs.enumerate() {
+                let x = 72 + (n % 40) * 12;
+                let y = 720 - (n / 40) * 14;
+                layer.push_str(&format!(
+                    "BT 1 0 0 1 {x} {y} Tm /F1 10 Tf ({glyph}) Tj ET\n"
+                ));
+            }
+        }
+        let mut xobjects = dictionary! {};
+        if covering_image {
+            xobjects.set("Im0", Object::Reference(image_id));
+        }
+        let mut content = String::new();
+        if covering_image {
+            content.push_str("q 612 0 0 792 0 0 cm /Im0 Do Q\n");
+        }
+        if layer_in_form {
+            let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => Object::Name(b"Form".to_vec()),
+                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! {
+                        "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                    },
+                },
+                layer.into_bytes(),
+            )));
+            xobjects.set("Fm0", Object::Reference(form_id));
+            content.push_str("/Fm0 Do\n");
+        } else {
+            content.push_str(&layer);
+        }
+        if let Some(caption) = caption {
+            content.push_str(&format!("BT 0 Tr /F1 12 Tf 72 40 Td ({caption}) Tj ET\n"));
+        }
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content.into_bytes(),
+        )));
+
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                    "XObject" => xobjects,
+                },
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        (doc, page_id)
+    }
+
+    #[test]
+    fn invisible_layer_under_a_covering_image_is_flagged() {
+        let (doc, page_id) = layered_scan_page(true, Some(3), false, None);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(analysis.text_operator_count, 120);
+        assert_eq!(analysis.invisible_text_operator_count, 120);
+        assert!(
+            analysis.has_covering_image,
+            "a 2×2 image scaled to the page covers it"
+        );
+        assert!(
+            !analysis.has_template_image,
+            "sanity: four pixels are no template image"
+        );
+        assert!(analysis.has_invisible_text_layer);
+        assert_eq!(
+            page_ocr_reasons(&analysis),
+            vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
+        );
+        let signals = page_ocr_signals(&doc, page_id);
+        assert!(signals.has_invisible_text_layer);
+        assert!(!signals.template_image_needs_ocr);
+        assert!(!signals.has_vector_text);
+
+        // Mode 7 (clip only) paints nothing either.
+        let (doc, page_id) = layered_scan_page(true, Some(7), false, None);
+        assert!(analyze_page_content(&doc, page_id).has_invisible_text_layer);
+    }
+
+    #[test]
+    fn invisible_layer_inside_a_form_xobject_is_followed() {
+        let (doc, page_id) = layered_scan_page(true, Some(3), true, None);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(analysis.text_operator_count, 120);
+        assert_eq!(analysis.invisible_text_operator_count, 120);
+        assert!(analysis.has_invisible_text_layer);
+
+        // The form's mode does not reach a caption the page paints itself.
+        let (doc, page_id) = layered_scan_page(true, Some(3), true, Some("Figure 1"));
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(analysis.text_operator_count, 121);
+        assert_eq!(analysis.invisible_text_operator_count, 120);
+        assert!(!analysis.has_invisible_text_layer);
+    }
+
+    #[test]
+    fn painted_layer_caption_no_image_or_image_alone_is_not_an_invisible_layer() {
+        // The same layer painted (mode 0) is a text page over an image.
+        let (doc, page_id) = layered_scan_page(true, Some(0), false, None);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(analysis.has_covering_image);
+        assert_eq!(analysis.invisible_text_operator_count, 0);
+        assert!(!analysis.has_invisible_text_layer);
+        assert!(!page_ocr_signals(&doc, page_id).has_invisible_text_layer);
+
+        // One visible caption over the image: the page shows text of its own.
+        let (doc, page_id) = layered_scan_page(true, Some(3), false, Some("Figure 1"));
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(analysis.text_operator_count, 121);
+        assert_eq!(analysis.invisible_text_operator_count, 120);
+        assert!(!analysis.has_invisible_text_layer);
+
+        // Invisible text with no image under it is not a scan.
+        let (doc, page_id) = layered_scan_page(false, Some(3), false, None);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(analysis.invisible_text_operator_count, 120);
+        assert!(!analysis.has_covering_image);
+        assert!(!analysis.has_invisible_text_layer);
+
+        // An image alone is a scan with no text layer at all.
+        let (doc, page_id) = layered_scan_page(true, None, false, None);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(analysis.has_covering_image);
+        assert_eq!(analysis.text_operator_count, 0);
+        assert!(!analysis.has_invisible_text_layer);
+        assert_eq!(page_ocr_reasons(&analysis), vec![crate::OCR_REASON_SCANNED]);
     }
 
     // ---------- P2 tests: Form XObject font traversal ----------
@@ -4583,7 +5330,7 @@ mod tests {
                 analysis.unique_alphanum_chars
             );
             assert!(!analysis.has_vector_text, "layout {}", layout as u8);
-            assert_eq!(page_ocr_signals(&doc, page_id), (false, false));
+            assert_eq!(page_ocr_signals(&doc, page_id), PageOcrSignals::default());
         }
     }
 
