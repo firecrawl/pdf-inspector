@@ -688,8 +688,9 @@ impl ToUnicodeCMap {
     /// entry of several characters is never read.
     ///
     /// The gaps are read from the table [`Self::refresh_gap_fills`] built,
-    /// which a single-byte CMap never has: no gap is read into one (see
-    /// [`CidDecodeStats::interpolated`]).
+    /// which a single-byte CMap never has — no gap is read into one (see
+    /// [`CidDecodeStats::interpolated`]) — nor a CMap that passes CIDs
+    /// through as code points, whose decoding never asks.
     pub fn gap_fill(&self, cid: u16) -> Option<char> {
         self.gap_fills.get(&cid).copied()
     }
@@ -700,11 +701,15 @@ impl ToUnicodeCMap {
     /// CMap through its public fields must call it before decoding. It also
     /// puts `ranges` in the order of their first codes, which
     /// [`Self::lookup`] searches them in, so entries a caller pushed in any
-    /// order are found. A single-byte CMap gets an empty table: gaps are
-    /// read into two-byte CMaps only.
+    /// order are found. The table follows the decoder's reading of the
+    /// CMap: a single-byte CMap gets an empty table, since no gap is read
+    /// into one, and so does a CMap that passes CIDs through as code
+    /// points, whose decoding never asks; every other width is read two
+    /// bytes at a time — a width not yet set included, as `decode_cids_with`
+    /// reads it — and gets the table.
     pub fn refresh_gap_fills(&mut self) {
         self.ranges.sort_unstable_by_key(|&(start, _, _)| start);
-        self.gap_fills = if self.code_byte_length == 2 {
+        self.gap_fills = if self.code_byte_length != 1 && !self.cid_passthrough {
             self.compute_gap_fills()
         } else {
             HashMap::new()
@@ -3581,10 +3586,12 @@ endbfchar
 
     #[test]
     fn a_single_byte_cmap_reads_no_gaps() {
-        // The same entries either side of a gap: read into a two-byte CMap,
-        // never into a single-byte one, whose unmapped bytes stand in for
-        // themselves.
-        for (byte_length, filled) in [(2u8, Some('B')), (1u8, None)] {
+        // The same entries either side of a gap: read into a two-byte CMap
+        // — and into one whose width is not yet set, which the decoder reads
+        // two bytes at a time, as the built-in binary CMaps are when their
+        // table is built — never into a single-byte one, whose unmapped
+        // bytes stand in for themselves.
+        for (byte_length, filled) in [(2u8, Some('B')), (0u8, Some('B')), (1u8, None)] {
             let mut cmap = ToUnicodeCMap::new();
             cmap.code_byte_length = byte_length;
             cmap.char_map.insert(0x41, "A".to_string());
@@ -3592,6 +3599,23 @@ endbfchar
             cmap.refresh_gap_fills();
             assert_eq!(cmap.gap_fill(0x42), filled, "{byte_length}-byte CMap");
         }
+    }
+
+    #[test]
+    fn a_passthrough_cmap_has_no_gap_table() {
+        // A CMap that passes CIDs through as code points never asks for a
+        // gap: the code between its entries reads as its own code point,
+        // and counts as read, not interpolated.
+        let mut cmap = ToUnicodeCMap::new();
+        cmap.code_byte_length = 2;
+        cmap.cid_passthrough = true;
+        cmap.char_map.insert(0x41, "A".to_string());
+        cmap.char_map.insert(0x43, "C".to_string());
+        cmap.refresh_gap_fills();
+        assert_eq!(cmap.gap_fill(0x42), None);
+        let (text, stats) = decode_codes(&cmap, &[0x41, 0x42, 0x43]);
+        assert_eq!(text, "ABC");
+        assert_eq!((stats.interpolated, stats.unmapped), (0, 0));
     }
 
     #[test]
