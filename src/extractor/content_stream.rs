@@ -25,8 +25,8 @@ use super::geometry::{
 use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
 use super::word_gaps::{
-    offset_takes_spacing_back, tj_gap_thresholds, tj_tracking, word_gap_candidate,
-    word_gap_threshold, PenHighWater, PendingWordGaps, WordGapCandidate,
+    is_dependent_sign, offset_takes_spacing_back, tj_gap_thresholds, tj_tracking,
+    word_gap_candidate, word_gap_threshold, PenHighWater, PendingWordGaps, WordGapCandidate,
 };
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -1378,8 +1378,11 @@ pub(crate) fn extract_page_text_items_with_options(
                                 total_width_ts += element_estimate_ts;
                                 current_estimate_ts += element_estimate_ts;
                             }
-                            if get_operand_bytes(element).is_some_and(|raw| !raw.is_empty()) {
-                                pen_high_water.painted(element_start_width_ts, total_width_ts);
+                            if let Some(raw) =
+                                get_operand_bytes(element).filter(|raw| !raw.is_empty())
+                            {
+                                pen_high_water
+                                    .painted(total_width_ts, is_dependent_sign(raw, font_info));
                             }
                             if suppress_glyph_extraction {
                                 actual_text_glyph_count += element_glyphs;
@@ -5222,6 +5225,37 @@ end"#;
             "{:?}",
             items[0]
         );
+    }
+
+    #[test]
+    fn tj_returns_from_signs_under_character_spacing_open_no_word_gap() {
+        // Under `0.5 Tc` a sign moves the pen by the spacing as a letter
+        // would, and each return ends a hair past the mark: a sign by its
+        // glyph all the same, and the travel past the mark is no word gap.
+        let items = extract_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 0.5 Tc 20 700 Td [<0001> 223 <0002> -221 <0003> <0004> 246 <0005> -221 <0006>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, [SIGNED_WORD]);
+    }
+
+    #[test]
+    fn tj_hidden_text_behind_the_pen_leaves_the_return_a_word_gap() {
+        // Twenty zero-advance glyphs shown 0.3 em behind the pen are hidden
+        // text, not a sign: the return after them reads as written, a
+        // word gap, where the same return after one sign is none.
+        let hidden = "0002".repeat(20);
+        let items = extract_items_with_zero_advance_signs(
+            format!("BT /F1 14 Tf 20 700 Td [<0003> 300 <{hidden}> -300 <0004>] TJ ET").as_bytes(),
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        let expected = format!("\u{179C}{} \u{178F}\u{17D2}", "\u{1789}".repeat(20));
+        assert_eq!(texts, [expected.as_str()]);
+        let items = extract_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 20 700 Td [<0003> 300 <0002> -300 <0004>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["\u{179C}\u{1789}\u{178F}\u{17D2}"]);
     }
 
     #[test]

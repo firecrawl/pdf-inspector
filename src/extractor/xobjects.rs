@@ -19,8 +19,8 @@ use super::geometry::{
     scaled_run_geometry,
 };
 use super::word_gaps::{
-    offset_takes_spacing_back, tj_gap_thresholds, tj_tracking, word_gap_candidate,
-    word_gap_threshold, PenHighWater, PendingWordGaps, WordGapCandidate,
+    is_dependent_sign, offset_takes_spacing_back, tj_gap_thresholds, tj_tracking,
+    word_gap_candidate, word_gap_threshold, PenHighWater, PendingWordGaps, WordGapCandidate,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -1175,7 +1175,6 @@ fn extract_form_xobject_text_inner(
                                     );
                                 }
                             }
-                            let element_start_width_ts = total_width_ts;
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
                                     total_width_ts += compute_string_width_ts(
@@ -1200,8 +1199,11 @@ fn extract_form_xobject_text_inner(
                                 total_width_ts += element_estimate_ts;
                                 current_estimate_ts += element_estimate_ts;
                             }
-                            if get_operand_bytes(element).is_some_and(|raw| !raw.is_empty()) {
-                                pen_high_water.painted(element_start_width_ts, total_width_ts);
+                            if let Some(raw) =
+                                get_operand_bytes(element).filter(|raw| !raw.is_empty())
+                            {
+                                pen_high_water
+                                    .painted(total_width_ts, is_dependent_sign(raw, font_info));
                             }
                             if !hidden {
                                 if let Some((text, legacy_symbol_rewrite)) =
@@ -2675,5 +2677,23 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
         );
         let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
         assert_eq!(texts, ["\u{1789}\u{17D2}\u{1789} \u{179C}"]);
+
+        // Under `0.5 Tc` the sign is a sign by its glyph, though the
+        // spacing moves the pen for it.
+        let items = form_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 0.5 Tc 20 700 Td [<0001> 223 <0002> -221 <0003> <0004> 246 <0005> -221 <0006>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, [SIGNED_WORD]);
+
+        // Twenty zero-advance glyphs behind the pen are hidden text, not a
+        // sign: the return after them is the word gap it reads as.
+        let hidden = "0002".repeat(20);
+        let items = form_items_with_zero_advance_signs(
+            format!("BT /F1 14 Tf 20 700 Td [<0003> 300 <{hidden}> -300 <0004>] TJ ET").as_bytes(),
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        let expected = format!("\u{179C}{} \u{178F}\u{17D2}", "\u{1789}".repeat(20));
+        assert_eq!(texts, [expected.as_str()]);
     }
 }

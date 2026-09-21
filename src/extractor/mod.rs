@@ -1278,9 +1278,6 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     let mut end_x = first.x + effective_merge_width(first);
     let mut end = start;
     for (offset, next) in group[start + 1..].iter().enumerate() {
-        if next.text.trim().chars().count() != 1 {
-            break;
-        }
         if (next.font_size - fs).abs() > fs * 0.20 {
             break;
         }
@@ -1292,14 +1289,17 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
             break;
         }
         let next_end = next.x + effective_merge_width(next);
-        // A dependent sign over the letter before it is no letter of the
-        // run, and the line's right edge does not move for it (as in the
-        // merge loop): the next letter's gap is measured from the pen the
-        // letter under the sign left.
+        // A dependent sign over the letter before it — of a character or
+        // two — is no letter of the run, and the line's right edge does
+        // not move for it (as in the merge loop): the next letter's gap
+        // is measured from the pen the letter under the sign left.
         if is_zero_width_mark(next) {
             end_x = end_x.max(next_end);
             end = start + 1 + offset;
             continue;
+        }
+        if next.text.trim().chars().count() != 1 {
+            break;
         }
         let gap = next.x - end_x;
         if gap > fs * 0.5 || gap < -fs * 0.5 {
@@ -5297,6 +5297,19 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "\u{1780}\u{1781}\u{1782}\u{17BB}");
+    }
+
+    #[test]
+    fn a_two_character_sign_inside_a_tracked_run_keeps_the_run_tracked() {
+        // Display tracking with a sign that decodes to two combining marks
+        // over the `O`: the sign is no letter of the run, the run reads its
+        // tracking across it, and the sign stays in its place without a
+        // space on either side.
+        let mut items = glyph_run("HOW", 100.0, 10.0, 2.3);
+        items.insert(2, make_merge_item("\u{0301}\u{0300}", 118.0, 0.0));
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "HO\u{0301}\u{0300}W");
     }
 
     #[test]

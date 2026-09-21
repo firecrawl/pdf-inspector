@@ -106,6 +106,7 @@ Changes since 1.22.1.
   without zero-advance glyphs, and producers that position right-to-left
   text with real backtracks past painted letters, read as before.
   ([#564](https://github.com/firecrawl/pdf-inspector/pull/564))
+
 ## [1.22.1] - 2026-09-20
 
 Changes since 1.22.0.
