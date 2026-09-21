@@ -2334,8 +2334,11 @@ pub(crate) fn extract_text_from_operand(
                         // 2. For a code whose entry is a control destination,
                         // the font's own encoding first: its Differences
                         // name selects the glyph, whatever the program's cmap
-                        // holds at the raw code. (A code without any entry
-                        // keeps the order below.)
+                        // holds at the raw code — and a name that could not
+                        // be read is that glyph and no other, so the code is
+                        // marked before the fallback CMap, the program's own
+                        // reading of the raw code, gets a say. (A code
+                        // without any entry keeps the order below.)
                         if control_destination {
                             if let Some(map) = encoding_map {
                                 if let Some(&ch) = map.differences.get(&b) {
@@ -2343,6 +2346,9 @@ pub(crate) fn extract_text_from_operand(
                                 }
                                 if let Some(text) = map.sequences.get(&b) {
                                     return Some(text.clone());
+                                }
+                                if map.named_codes.contains(&b) {
+                                    return Some("\u{FFFD}".to_string());
                                 }
                             }
                         }
@@ -5380,6 +5386,124 @@ mod tests {
             ),
             ("co\u{FFFD}ee".to_string(), 1)
         );
+    }
+
+    /// Give the CIDFont of a [`cid_font_doc`] document a `/W` array of
+    /// `widths` starting at CID `first`.
+    fn set_cid_font_widths(doc: &mut Document, first: i64, widths: &[i64]) {
+        let widths: Vec<Object> = widths.iter().map(|&w| w.into()).collect();
+        for object in doc.objects.values_mut() {
+            if let Object::Dictionary(dict) = object {
+                if dict.get(b"Subtype").ok().and_then(|o| o.as_name().ok())
+                    == Some(&b"CIDFontType2"[..])
+                {
+                    dict.set("W", vec![first.into(), Object::Array(widths.clone())]);
+                }
+            }
+        }
+    }
+
+    /// A ToUnicode CMap whose keys a subsetter may have renumbered gets a
+    /// sequential remap beside it, and the font's strings decide between the
+    /// two readings by their text, the original first. Both are repaired,
+    /// from the same sources: the original's control destination reads by
+    /// the program's glyph name where the original is the reading kept.
+    #[test]
+    fn a_control_destination_is_repaired_in_the_original_cmap_beside_its_remap() {
+        // The twelve entries of `LIGATURE_INDEX_BFCHAR`, keyed by two-byte
+        // glyph indices 0x21..=0x2C; the program names glyph 0x23 `f_f`.
+        let bfchar = LIGATURE_INDEX_BFCHAR.replace("<2", "<002");
+        let mut names = vec![None; 0x2D];
+        names[0x23] = Some("f_f");
+        let (mut doc, tounicode_obj, page_id) =
+            cid_font_doc(&bfchar, sfnt_with_glyph_names(&names), None, false, None);
+        // Widths for CIDs 0..=12 only: the CMap's keys lie past them, as a
+        // CMap written before the subsetter renumbered the glyphs would.
+        // Glyph 3 has no advance, so its lack of an outline makes no blank.
+        let mut widths = [600; 13];
+        widths[3] = 0;
+        set_cid_font_widths(&mut doc, 0, &widths);
+        let cmaps = FontCMaps::from_doc(&doc);
+        let entry = cmaps.get_by_obj(tounicode_obj).expect("the font's CMaps");
+        let remapped = entry.remapped.as_ref().expect("the sequential remap");
+        assert_eq!(entry.primary.lookup(0x23).as_deref(), Some("ff"));
+        // Under the remap the ligature is glyph 3, which the program neither
+        // names nor advances: its control destination stays.
+        assert_eq!(remapped.lookup(1).as_deref(), Some("c"));
+        assert_eq!(remapped.lookup_code(3), CodeMapping::ControlDestination);
+        assert_eq!(
+            decode_page_font_string(
+                &doc,
+                tounicode_obj,
+                page_id,
+                true,
+                &[0, 0x21, 0, 0x22, 0, 0x23, 0, 0x24, 0, 0x24]
+            ),
+            "coffee"
+        );
+    }
+
+    /// A control-destination code the `/Differences` name by a name that
+    /// reads as nothing is that glyph and no other, and is marked before
+    /// the font's own reading of the raw code — the fallback an entry built
+    /// from an inline CMap keeps — gets a say; a code the Differences leave
+    /// alone reads through that fallback.
+    #[test]
+    fn an_unreadable_differences_name_marks_a_control_destination_before_the_fallback_reads_it() {
+        use crate::tounicode::{CMapEntry, ToUnicodeCMap};
+        let one_byte = |entries: &[(u16, &str)]| {
+            let mut cmap = ToUnicodeCMap::new();
+            cmap.code_byte_length = 1;
+            for &(code, text) in entries {
+                cmap.char_map.insert(code, text.to_string());
+            }
+            cmap
+        };
+        let decode = |named_codes: &[u8]| -> String {
+            let mut inline_cmaps = HashMap::new();
+            inline_cmaps.insert(
+                "F1".to_string(),
+                CMapEntry {
+                    primary: one_byte(&[(0x21, "c"), (0x22, "o"), (0x23, "\u{3}"), (0x24, "e")]),
+                    remapped: None,
+                    fallback: Some(one_byte(&[(0x23, "x")])),
+                },
+            );
+            let mut font_encodings: PageFontEncodings = HashMap::new();
+            font_encodings.insert(
+                "F1".to_string(),
+                FontEncoding {
+                    differences: [(0x22, 'o')].into_iter().collect(),
+                    identity_overrides: Default::default(),
+                    blank_codes: Default::default(),
+                    base: None,
+                    named: None,
+                    named_codes: named_codes.iter().copied().collect(),
+                    sequences: Default::default(),
+                },
+            );
+            let mut font_widths: PageFontWidths = HashMap::new();
+            font_widths.insert("F1".to_string(), make_font_info(&[], 1000, false));
+            let (text, _) = extract_text_from_operand(
+                &Object::String(
+                    LIGATURE_INDEX_BYTES.to_vec(),
+                    lopdf::StringFormat::Hexadecimal,
+                ),
+                "F1",
+                Some("ABCDEF+Subset"),
+                &FontCMaps::default(),
+                &HashMap::new(),
+                &inline_cmaps,
+                &font_encodings,
+                &HashMap::new(),
+                &mut CMapDecisionCache::new(),
+                &font_widths,
+            )
+            .expect("text decoded");
+            text
+        };
+        assert_eq!(decode(&[0x22, 0x23]), "co\u{FFFD}ee");
+        assert_eq!(decode(&[0x22]), "coxee");
     }
 
     /// A sparse ToUnicode CMap — fewer than ten entries — yields the primary

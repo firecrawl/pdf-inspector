@@ -197,7 +197,7 @@ fn destination_span_is_control_block(base: u32, len: u32) -> bool {
 fn repair_control_destinations<'p>(
     target: &mut ToUnicodeCMap,
     fallback: Option<&ToUnicodeCMap>,
-    program_reading: impl FnOnce() -> Option<ToUnicodeCMap>,
+    program_reading: impl FnOnce() -> Option<&'p ToUnicodeCMap>,
     program: impl FnOnce() -> Option<&'p [u8]>,
     font_dict: &lopdf::Dictionary,
     doc: &Document,
@@ -221,7 +221,7 @@ fn repair_control_destinations<'p>(
     }
     if !codes.is_empty() {
         if let Some(reading) = program_reading() {
-            target.recover_codes(&codes, &reading);
+            target.recover_codes(&codes, reading);
             codes = left(target);
         }
     }
@@ -251,9 +251,8 @@ fn repair_control_destinations<'p>(
 /// characters where the program's own cmap is authoritative.
 ///
 /// The repair of the control destinations ([`repair_control_destinations`])
-/// runs before this, on the remap when one was made — keyed like the
-/// font's own reading — else the original; what it fixed moves with that
-/// CMap into whichever role it takes here.
+/// runs before this, on the ToUnicode CMap and on its remap; what it fixed
+/// moves with each into whichever role it takes here.
 fn cmap_entry(
     mut primary: ToUnicodeCMap,
     mut remapped: Option<ToUnicodeCMap>,
@@ -479,13 +478,14 @@ fn embedded_font_program(font_dict: &lopdf::Dictionary, doc: &Document) -> Optio
 }
 
 /// A font's embedded program (see [`embedded_font_program`]), decompressed
-/// on first need and at most once, for all that a CMap entry takes from
-/// it: the fallback of a sparse CMap, and the reading and the outlines a
-/// control-destination repair looks at.
+/// and read on first need and at most once, for all that a CMap entry
+/// takes from it: the fallback of a sparse CMap, and the reading and the
+/// outlines a control-destination repair looks at.
 struct LazyProgram<'a> {
     font_dict: &'a lopdf::Dictionary,
     doc: &'a Document,
     bytes: std::cell::OnceCell<Option<Vec<u8>>>,
+    reading: std::cell::OnceCell<Option<ToUnicodeCMap>>,
 }
 
 impl<'a> LazyProgram<'a> {
@@ -494,6 +494,7 @@ impl<'a> LazyProgram<'a> {
             font_dict,
             doc,
             bytes: std::cell::OnceCell::new(),
+            reading: std::cell::OnceCell::new(),
         }
     }
 
@@ -504,9 +505,12 @@ impl<'a> LazyProgram<'a> {
             .as_deref()
     }
 
-    /// The fallback CMap the program yields (see [`program_fallback_cmap`]).
-    fn reading(&self) -> Option<ToUnicodeCMap> {
-        program_fallback_cmap(self.font_dict, self.doc, self.bytes())
+    /// The fallback CMap the program yields (see [`program_fallback_cmap`]),
+    /// built now if it was not yet.
+    fn reading(&self) -> Option<&ToUnicodeCMap> {
+        self.reading
+            .get_or_init(|| program_fallback_cmap(self.font_dict, self.doc, self.bytes()))
+            .as_ref()
     }
 }
 
@@ -561,21 +565,24 @@ fn font_cmap_entry(
         ProgramFallback::WhenSparse => sparse,
         ProgramFallback::Never => false,
     };
-    // Whether the program was read for the fallback, whatever it yielded:
-    // the repair does not read it again for what it did not.
+    // Whether the program's reading is the fallback: the repair then has
+    // it there, and does not ask for it again.
     let program_read = program_fallback && encoding_fallback.is_none();
-    let fallback =
-        encoding_fallback.or_else(|| program_fallback.then(|| program.reading()).flatten());
-    // The repair runs on the remap when one was made — keyed like the
-    // font's own reading — else the original, before the roles are
-    // decided: what it fixed moves with that CMap into whichever role it
-    // takes. A remap the sparse swap is about to drop is left alone, and so
-    // is the original it keeps, whose keys are the ones the remap
-    // renumbered.
-    let remap_dropped = sparse && fallback.is_some() && remapped.is_some();
-    if !remap_dropped {
+    let fallback = encoding_fallback.or_else(|| {
+        program_fallback
+            .then(|| program.reading().cloned())
+            .flatten()
+    });
+    // The repair runs before the roles are decided, on the ToUnicode CMap
+    // and on its remap alike: the font's strings decide between the two
+    // readings by their text (the original first, see the decision cache
+    // at decode time), and the fallback — the font's own reading — is
+    // keyed like whichever of them is right, so each is repaired from the
+    // same sources, and what was fixed moves with it into whichever role
+    // it takes.
+    for target in std::iter::once(&mut primary).chain(remapped.as_mut()) {
         repair_control_destinations(
-            remapped.as_mut().unwrap_or(&mut primary),
+            target,
             fallback.as_ref(),
             || {
                 (build.program_repair && !program_read)
@@ -4099,12 +4106,9 @@ endbfrange
             )
             .unwrap()
         };
-        let program = || {
-            let mut program = ToUnicodeCMap::new();
-            program.code_byte_length = 2;
-            program.char_map.insert(3, "x".to_string());
-            program
-        };
+        let mut program = ToUnicodeCMap::new();
+        program.code_byte_length = 2;
+        program.char_map.insert(3, "x".to_string());
         // Whether the program's reading, then its bytes, were asked for.
         let repair = |target: &mut ToUnicodeCMap, font: &lopdf::Dictionary, reads: bool| {
             let (reading_asked, bytes_asked) = (Cell::new(false), Cell::new(false));
@@ -4113,7 +4117,7 @@ endbfrange
                 None,
                 || {
                     reading_asked.set(true);
-                    reads.then(program)
+                    reads.then_some(&program)
                 },
                 || {
                     bytes_asked.set(true);
@@ -4185,7 +4189,7 @@ endbfrange
         repair_control_destinations(
             &mut primary,
             Some(&collection),
-            || Some(program.clone()),
+            || Some(&program),
             || None,
             &lopdf::Dictionary::new(),
             &Document::new(),
