@@ -20,7 +20,7 @@ use super::geometry::{
 };
 use super::word_gaps::{
     offset_takes_spacing_back, tj_gap_thresholds, tj_tracking, word_gap_candidate,
-    word_gap_threshold, PendingWordGaps, WordGapCandidate,
+    word_gap_threshold, PenHighWater, PendingWordGaps, WordGapCandidate,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -1051,6 +1051,11 @@ fn extract_form_xobject_text_inner(
                         // backward past painted glyphs — logical-order RTL
                         // producers position runs right-to-left this way.
                         let mut backward_jump = false;
+                        // The farthest the pen has been, for a return from a
+                        // zero-advance sign placed behind it: no gap opens on
+                        // the page until the pen is past the mark again (see
+                        // `PenHighWater`).
+                        let mut pen_high_water = PenHighWater::new();
                         // The array's last string, when it is a wide-spaced
                         // boundary string, and the sub-run text before it.
                         let mut deferred_word_gaps: Option<(String, WordGapCandidate)> = None;
@@ -1064,6 +1069,16 @@ fn extract_form_xobject_text_inner(
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
                                     let displacement = -n_val / 1000.0 * current_font_size;
+                                    // The offset as the thresholds judge it:
+                                    // itself, or on a return from a sign placed
+                                    // behind the high-water mark only the
+                                    // travel beyond the mark.
+                                    let judged = pen_high_water.judge_offset(
+                                        n_val,
+                                        total_width_ts,
+                                        total_width_ts + displacement,
+                                        current_font_size,
+                                    );
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -1073,7 +1088,7 @@ fn extract_form_xobject_text_inner(
                                     {
                                         backward_jump = true;
                                     }
-                                    if !hidden && n_val < -split_gap && !current_text.is_empty() {
+                                    if !hidden && judged < -split_gap && !current_text.is_empty() {
                                         sub_items.push((
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
@@ -1087,7 +1102,7 @@ fn extract_form_xobject_text_inner(
                                     } else {
                                         total_width_ts += displacement;
                                         if !hidden
-                                            && n_val < -word_gap
+                                            && judged < -word_gap
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
@@ -1099,6 +1114,16 @@ fn extract_form_xobject_text_inner(
                                 Object::Real(n) => {
                                     let n_val = *n;
                                     let displacement = -n_val / 1000.0 * current_font_size;
+                                    // The offset as the thresholds judge it:
+                                    // itself, or on a return from a sign placed
+                                    // behind the high-water mark only the
+                                    // travel beyond the mark.
+                                    let judged = pen_high_water.judge_offset(
+                                        n_val,
+                                        total_width_ts,
+                                        total_width_ts + displacement,
+                                        current_font_size,
+                                    );
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -1108,7 +1133,7 @@ fn extract_form_xobject_text_inner(
                                     {
                                         backward_jump = true;
                                     }
-                                    if !hidden && n_val < -split_gap && !current_text.is_empty() {
+                                    if !hidden && judged < -split_gap && !current_text.is_empty() {
                                         sub_items.push((
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
@@ -1122,7 +1147,7 @@ fn extract_form_xobject_text_inner(
                                     } else {
                                         total_width_ts += displacement;
                                         if !hidden
-                                            && n_val < -word_gap
+                                            && judged < -word_gap
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
@@ -1150,6 +1175,7 @@ fn extract_form_xobject_text_inner(
                                     );
                                 }
                             }
+                            let element_start_width_ts = total_width_ts;
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
                                     total_width_ts += compute_string_width_ts(
@@ -1173,6 +1199,9 @@ fn extract_form_xobject_text_inner(
                                 );
                                 total_width_ts += element_estimate_ts;
                                 current_estimate_ts += element_estimate_ts;
+                            }
+                            if get_operand_bytes(element).is_some_and(|raw| !raw.is_empty()) {
+                                pen_high_water.painted(element_start_width_ts, total_width_ts);
                             }
                             if !hidden {
                                 if let Some((text, legacy_symbol_rewrite)) =
@@ -2568,5 +2597,83 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
             let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
             assert_eq!(texts.join(" "), expected, "{content}: {items:?}");
         }
+    }
+
+    /// Items of a page whose only content is `q /X1 Do Q`, the form showing
+    /// `form_content` through `F1`, the zero-advance-sign font of
+    /// `content_stream::add_zero_advance_sign_font`.
+    fn form_items_with_zero_advance_signs(form_content: &[u8]) -> Vec<TextItem> {
+        let mut doc = Document::new();
+        let font_id = crate::extractor::content_stream::add_zero_advance_sign_font(&mut doc);
+        let form_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                },
+            },
+            form_content.to_vec(),
+        )));
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"q /X1 Do Q".to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "X1" => Object::Reference(form_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        items
+    }
+
+    #[test]
+    fn form_tj_returns_from_signs_placed_behind_the_pen_open_no_word_gap() {
+        // As on the page: a zero-advance sign placed 0.223 em back over
+        // the glyph before it, the pen returned 0.221 em, is no word gap;
+        // a forward offset from the pen's farthest point still is.
+        use crate::extractor::content_stream::SIGNED_WORD;
+
+        let items = form_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -221 <0003> <0004> 246 <0005> -221 <0006>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, [SIGNED_WORD]);
+        assert!(
+            (items[0].x - 20.0).abs() < 0.01 && (items[0].width - 29.4).abs() < 0.01,
+            "{:?}",
+            items[0]
+        );
+
+        let items = form_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -621 <0003>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["\u{1789}\u{17D2}\u{1789} \u{179C}"]);
     }
 }

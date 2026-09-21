@@ -89,6 +89,22 @@ Changes since 1.22.1.
   grave standing beside its neighbours rather than over them, as in code or
   mathematics, is left as shown.
   ([#563](https://github.com/firecrawl/pdf-inspector/pull/563))
+- A dependent sign — a vowel sign, a subscript letter, an accent — that its
+  font gives no advance and that the producer places over the glyph before
+  it with a backward `TJ` offset, returning the pen with a forward one
+  before the next glyph, no longer reads as a word gap: a forward offset
+  counts only for its travel beyond the farthest the pen has been in the
+  array, and only while the pen has shown nothing but zero-advance glyphs
+  since it fell behind that mark. A tracked run keeps its tracking across
+  such a sign. Such a sign shown as a run of its own (`Tm` and `Tj` per
+  glyph) no longer opens a word gap either: the fragment after it is
+  measured from where the glyph under it left the pen, and a sign whose
+  origin lies within that glyph's advance stays after it when the line's
+  fragments are sorted, where a base kerned in ahead of the pen displaced
+  it. A word set in such a script came out with a space before most of its
+  signs, and now and then with a sign shuffled past its neighbour. Arrays
+  without zero-advance glyphs, and producers that position right-to-left
+  text with real backtracks past painted letters, read as before.
 
 ## [1.22.1] - 2026-09-20
 

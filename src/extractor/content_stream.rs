@@ -26,7 +26,7 @@ use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
 use super::word_gaps::{
     offset_takes_spacing_back, tj_gap_thresholds, tj_tracking, word_gap_candidate,
-    word_gap_threshold, PendingWordGaps, WordGapCandidate,
+    word_gap_threshold, PenHighWater, PendingWordGaps, WordGapCandidate,
 };
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -1205,6 +1205,11 @@ pub(crate) fn extract_page_text_items_with_options(
                         // backward past painted glyphs — logical-order RTL
                         // producers position runs right-to-left this way.
                         let mut backward_jump = false;
+                        // The farthest the pen has been, for a return from a
+                        // zero-advance sign placed behind it: no gap opens on
+                        // the page until the pen is past the mark again (see
+                        // `PenHighWater`).
+                        let mut pen_high_water = PenHighWater::new();
                         // The array's last string, when it is a wide-spaced
                         // boundary string, and the sub-run text before it.
                         let mut deferred_word_gaps: Option<(String, WordGapCandidate)> = None;
@@ -1218,6 +1223,16 @@ pub(crate) fn extract_page_text_items_with_options(
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
                                     let displacement = -n_val / 1000.0 * current_font_size;
+                                    // The offset as the thresholds judge it:
+                                    // itself, or on a return from a sign placed
+                                    // behind the high-water mark only the
+                                    // travel beyond the mark.
+                                    let judged = pen_high_water.judge_offset(
+                                        n_val,
+                                        total_width_ts,
+                                        total_width_ts + displacement,
+                                        current_font_size,
+                                    );
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -1228,7 +1243,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         backward_jump = true;
                                     }
                                     if !is_invisible
-                                        && n_val < -split_gap
+                                        && judged < -split_gap
                                         && !current_text.is_empty()
                                     {
                                         // Column gap: flush current segment
@@ -1245,7 +1260,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     } else {
                                         total_width_ts += displacement;
                                         if !is_invisible
-                                            && n_val < -word_gap
+                                            && judged < -word_gap
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
@@ -1257,6 +1272,16 @@ pub(crate) fn extract_page_text_items_with_options(
                                 Object::Real(n) => {
                                     let n_val = *n;
                                     let displacement = -n_val / 1000.0 * current_font_size;
+                                    // The offset as the thresholds judge it:
+                                    // itself, or on a return from a sign placed
+                                    // behind the high-water mark only the
+                                    // travel beyond the mark.
+                                    let judged = pen_high_water.judge_offset(
+                                        n_val,
+                                        total_width_ts,
+                                        total_width_ts + displacement,
+                                        current_font_size,
+                                    );
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -1267,7 +1292,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         backward_jump = true;
                                     }
                                     if !is_invisible
-                                        && n_val < -split_gap
+                                        && judged < -split_gap
                                         && !current_text.is_empty()
                                     {
                                         sub_items.push((
@@ -1283,7 +1308,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     } else {
                                         total_width_ts += displacement;
                                         if !is_invisible
-                                            && n_val < -word_gap
+                                            && judged < -word_gap
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
@@ -1352,6 +1377,9 @@ pub(crate) fn extract_page_text_items_with_options(
                                 // estimate the sub-run's box will carry.
                                 total_width_ts += element_estimate_ts;
                                 current_estimate_ts += element_estimate_ts;
+                            }
+                            if get_operand_bytes(element).is_some_and(|raw| !raw.is_empty()) {
+                                pen_high_water.painted(element_start_width_ts, total_width_ts);
                             }
                             if suppress_glyph_extraction {
                                 actual_text_glyph_count += element_glyphs;
@@ -2757,6 +2785,88 @@ fn dedup_rects(rects: &mut Vec<PdfRect>) {
             && ((a.height - b.height).abs() < 0.5)
     });
 }
+
+/// Add to `doc` a Type0/Identity-H font without a program for a script
+/// whose subscript letters and vowel signs have zero advance: `/W` gives
+/// CIDs 1 to 7 the advances 958, 0, 344, 825, 0, 0 and 276, so CIDs 2, 5
+/// and 6 are such signs, and the ToUnicode CMap maps CIDs 1 and 4 to a
+/// letter plus the sign that makes the letter after it a subscript.
+#[cfg(test)]
+pub(crate) fn add_zero_advance_sign_font(doc: &mut Document) -> ObjectId {
+    use lopdf::{dictionary, Object, Stream};
+
+    const CMAP: &[u8] = b"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Test-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+6 beginbfchar
+<0001> <178917D2>
+<0002> <1789>
+<0003> <179C>
+<0004> <178F17D2>
+<0005> <1790>
+<0006> <17BB>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end";
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, CMAP.to_vec()));
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "AAAAAA+Signs",
+        "Flags" => 4,
+        "FontBBox" => vec![
+            Object::Integer(-100),
+            Object::Integer(-300),
+            1000.into(),
+            900.into(),
+        ],
+        "ItalicAngle" => 0,
+        "Ascent" => 900,
+        "Descent" => Object::Integer(-300),
+        "CapHeight" => 700,
+        "StemV" => 80,
+    });
+    let widths: Vec<Object> = [958, 0, 344, 825, 0, 0, 276]
+        .iter()
+        .map(|&width| Object::Integer(width))
+        .collect();
+    let cid_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "AAAAAA+Signs",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "DW" => 1000,
+        "W" => vec![1.into(), Object::Array(widths)],
+        "CIDToGIDMap" => "Identity",
+    });
+    doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "AAAAAA+Signs",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![cid_font_id.into()],
+        "ToUnicode" => cmap_id,
+    })
+}
+
+/// The six glyphs CIDs 1 to 6 of [`add_zero_advance_sign_font`] decode to:
+/// a word of a script whose subscript letters and vowel signs have zero
+/// advance.
+#[cfg(test)]
+pub(crate) const SIGNED_WORD: &str =
+    "\u{1789}\u{17D2}\u{1789}\u{179C}\u{178F}\u{17D2}\u{1790}\u{17BB}";
 
 #[cfg(test)]
 mod tests {
@@ -5048,5 +5158,113 @@ end"#;
         );
         assert_eq!(items[0].text, "\u{4E2D}\u{6587}", "{items:?}");
         assert!(items.iter().all(|i| !i.text.contains(' ')), "{items:?}");
+    }
+
+    /// A page whose `F1` is the zero-advance-sign font of
+    /// [`add_zero_advance_sign_font`].
+    fn extract_items_with_zero_advance_signs(content: &[u8]) -> Vec<TextItem> {
+        use crate::tounicode::FontCMaps;
+        use lopdf::{dictionary, Object, Stream};
+
+        let mut doc = lopdf::Document::new();
+        let font_id = add_zero_advance_sign_font(&mut doc);
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            content.to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        items
+    }
+
+    #[test]
+    fn tj_returns_from_signs_placed_behind_the_pen_open_no_word_gap() {
+        // Each zero-advance sign is placed 0.223 em back over the glyph
+        // before it and the pen returned 0.221 em before the next glyph:
+        // wider than a word gap as an offset, the return ends short of
+        // where the pen had been, and the glyphs touch on the page.
+        let items = extract_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -221 <0003> <0004> 246 <0005> -221 <0006>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, [SIGNED_WORD]);
+        // The box ends where the pen does: the last sign has no advance.
+        assert!(
+            (items[0].x - 20.0).abs() < 0.01 && (items[0].width - 29.4).abs() < 0.01,
+            "{:?}",
+            items[0]
+        );
+    }
+
+    #[test]
+    fn tj_travel_beyond_the_pens_mark_is_still_a_word_gap() {
+        // A forward offset from the pen's farthest point is a word gap as
+        // ever, and so is the part of a return that carries past that
+        // point: 0.223 em back, 0.621 em on. Wide enough, that part ends
+        // the sub-run as a column gap would.
+        let items = extract_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 20 700 Td [<0002> -400 <0003>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["\u{1789} \u{179C}"]);
+        let items = extract_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -621 <0003>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["\u{1789}\u{17D2}\u{1789} \u{179C}"]);
+        let items = extract_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -1021 <0003>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["\u{1789}\u{17D2}\u{1789}", "\u{179C}"]);
+        assert!((items[1].x - 44.584).abs() < 0.01, "{:?}", items[1]);
+    }
+
+    #[test]
+    fn signs_shown_from_their_own_tm_open_no_word_gap() {
+        // The same word one `Tm` and `Tj` per glyph, each sign 0.22 em
+        // behind the pen: the glyph after a sign is measured from where
+        // the glyph under the sign left the pen, not from the sign.
+        let content: String = [20.0, 30.28, 33.41, 38.23, 46.33, 49.78]
+            .iter()
+            .enumerate()
+            .map(|(index, x)| {
+                format!(
+                    "BT /F1 14 Tf 1 0 0 1 {x} 700 Tm <{:04X}> Tj ET\n",
+                    index + 1
+                )
+            })
+            .collect();
+        let items = extract_items_with_zero_advance_signs(content.as_bytes());
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, [SIGNED_WORD]);
     }
 }
