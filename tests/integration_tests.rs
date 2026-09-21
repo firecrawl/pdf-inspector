@@ -2549,7 +2549,8 @@ struct GlyphLayerPage {
     /// Bind `ImBig` in the page's resources without drawing it.
     spare_large_image: bool,
     /// Text render mode, set once, of a layer of `layer_glyphs` one-glyph
-    /// `Tj` blocks; `None` for no layer.
+    /// showing blocks (`Tj`, or `'` and `"` with `quote_operators`); `None`
+    /// for no layer.
     layer_mode: Option<u8>,
     layer_glyphs: usize,
     /// Put the layer in a Form XObject `Fm0` instead of the page's content,

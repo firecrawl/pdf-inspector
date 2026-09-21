@@ -11,7 +11,7 @@ use super::content_mask::{
     show_operand_has_text,
 };
 use super::{collect_text_chars_before, extract_font_name_before_tf, preceding_operand_closer};
-use crate::extractor::{get_number, visible_page_box, PageBox};
+use crate::extractor::{visible_page_box, PageBox};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -847,13 +847,23 @@ fn numbers_of<const N: usize>(
     }
     let mut numbers = [0.0f64; N];
     for (slot, value) in numbers.iter_mut().zip(array) {
-        let number = match value {
-            Object::Reference(id) => doc.get_object(*id).ok().and_then(get_number),
-            other => get_number(other),
+        *slot = match value {
+            Object::Reference(id) => doc.get_object(*id).ok().and_then(coordinate),
+            other => coordinate(other),
         }?;
-        *slot = f64::from(number);
     }
     Some(numbers)
+}
+
+/// A coordinate read at full precision: an integer straight into an `f64`
+/// (a large one would lose digits through an `f32`), a real widened from
+/// the single precision the file format gives it.
+fn coordinate(value: &Object) -> Option<f64> {
+    match value {
+        Object::Integer(n) => Some(*n as f64),
+        Object::Real(r) => Some(f64::from(*r)),
+        _ => None,
+    }
 }
 
 /// Fast scan of content stream bytes for text operators
