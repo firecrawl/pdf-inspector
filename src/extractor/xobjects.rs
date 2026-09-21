@@ -3,7 +3,7 @@
 use super::fonts::{font_style, FontStyle};
 use super::text_paint::{PaintResources, TextPaint};
 use crate::text_utils::{effective_font_size, expand_ligatures};
-use crate::tounicode::FontCMaps;
+use crate::tounicode::{build_resource_scoped_cmap_entry, FontCMaps};
 use crate::types::{BoldSource, ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
@@ -409,7 +409,9 @@ fn extract_form_xobject_text_inner(
                 }
             }
             Err(_) => {
-                if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
+                if let Some(entry) = build_resource_scoped_cmap_entry(font_dict, doc) {
+                    inline_cmaps.insert(resource_name, entry);
+                } else if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
                     font_tounicode_refs.insert(resource_name, ff2_obj_num);
                 }
             }
