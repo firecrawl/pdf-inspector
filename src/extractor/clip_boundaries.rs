@@ -182,15 +182,18 @@ pub(super) fn excluded_by_clip(item: &TextItem, clip: Option<ClipRect>) -> bool 
 
 /// Remove from `items` the runs their own clip hides — those
 /// `ClipRect::excludes_run` judges wholly outside the rectangle in force
-/// when they were shown — keeping `clips` aligned with `items`, and return
-/// how many were removed. A run with no established clip (`None`) always
-/// stays. Both vectors shrink in step, so call this after any fix-up that
-/// indexes into `items`.
+/// when they were shown — keeping `clips` and `replaced_text` (another
+/// vector parallel to `items`: which runs carry an ActualText replacement)
+/// aligned with `items`, and return how many were removed. A run with no
+/// established clip (`None`) always stays. The vectors shrink in step, so
+/// call this after any fix-up that indexes into `items`.
 pub(super) fn drop_clipped_away_runs(
     items: &mut Vec<TextItem>,
     clips: &mut Vec<Option<ClipRect>>,
+    replaced_text: &mut Vec<bool>,
 ) -> usize {
     debug_assert_eq!(items.len(), clips.len());
+    debug_assert_eq!(items.len(), replaced_text.len());
     let keep: Vec<bool> = items
         .iter()
         .zip(clips.iter())
@@ -217,6 +220,8 @@ pub(super) fn drop_clipped_away_runs(
     items.retain(|_| *kept.next().unwrap_or(&true));
     let mut kept = keep.iter();
     clips.retain(|_| *kept.next().unwrap_or(&true));
+    let mut kept = keep.iter();
+    replaced_text.retain(|_| *kept.next().unwrap_or(&true));
     before - items.len()
 }
 
@@ -453,7 +458,11 @@ mod tests {
             top: 400.0,
         };
         let mut clips = vec![Some(CLIP), Some(CLIP), None, Some(inner)];
-        assert_eq!(drop_clipped_away_runs(&mut items, &mut clips), 1);
+        let mut replaced = vec![false, false, false, true];
+        assert_eq!(
+            drop_clipped_away_runs(&mut items, &mut clips, &mut replaced),
+            1
+        );
         let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -463,11 +472,12 @@ mod tests {
         assert_eq!(clips[0].map(|c| c.left), Some(100.0));
         assert!(clips[1].is_none());
         assert_eq!(clips[2].map(|c| c.left), Some(190.0));
+        assert_eq!(replaced, [false, false, true]);
 
         let mut untouched = vec![run("a", 150.0, 250.0, 50.0, 10.0)];
         let mut untouched_clips = vec![Some(CLIP)];
         assert_eq!(
-            drop_clipped_away_runs(&mut untouched, &mut untouched_clips),
+            drop_clipped_away_runs(&mut untouched, &mut untouched_clips, &mut vec![false]),
             0
         );
         assert_eq!(untouched.len(), 1);

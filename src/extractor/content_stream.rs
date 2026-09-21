@@ -2534,7 +2534,20 @@ pub(crate) fn extract_page_text_items_with_options(
     // reports no text, like an image-only page. After the RTL fix, which
     // indexes items; before the rotation correction, which moves them out
     // of the clip's frame.
-    let dropped = super::clip_boundaries::drop_clipped_away_runs(&mut items, &mut item_clips);
+    // Which runs carry a producer's ActualText replacement rather than their
+    // glyphs' decoding, parallel to the items like their clips: the merge
+    // must not read such a run's characters as its glyphs.
+    let mut replaced_text = vec![false; items.len()];
+    for &index in &logical_text_items {
+        if let Some(flag) = replaced_text.get_mut(index) {
+            *flag = true;
+        }
+    }
+    let dropped = super::clip_boundaries::drop_clipped_away_runs(
+        &mut items,
+        &mut item_clips,
+        &mut replaced_text,
+    );
     if dropped > 0 {
         log::debug!("page {page_num}: {dropped} text run(s) painted outside their clip left out");
     }
@@ -2559,11 +2572,11 @@ pub(crate) fn extract_page_text_items_with_options(
         read_bold_from_weight(&mut items, options.bold_weight_threshold);
     }
     let items = if page_rotation == PageRotation::Upright {
-        super::merge_text_items_with_clips(items, &item_clips, visual_rtl)
+        super::merge_text_items_with_clips(items, &item_clips, visual_rtl, &replaced_text)
     } else {
         // Clips use the original page frame; rotated-page correction is an
         // intentionally unsupported provenance case.
-        super::merge_text_items_with_clips(items, &[], visual_rtl)
+        super::merge_text_items_with_clips(items, &[], visual_rtl, &replaced_text)
     };
     let items = super::merge_subscript_items(items);
     Ok((
