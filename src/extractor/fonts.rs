@@ -1348,10 +1348,18 @@ fn slot_identity_entry(code: u8, mapped: &str) -> bool {
 ///
 /// The repair needs proof that the CMap is stale: three distinct letters
 /// outside ASCII that the Differences name at such slots and that the old
-/// CMap still maps at other codes, or a CMap most of whose codes lie
-/// outside the font's own `FirstChar`..=`LastChar` range — a CMap written
-/// for another set of codes. Every repaired code must also be a glyph of the
-/// embedded Type1C program under the name the Differences give it. Each
+/// CMap still maps at other codes; or a CMap written for another set of
+/// codes — most of the codes it maps lie outside the font's own
+/// `FirstChar`..=`LastChar` range, and the names contradict it at the
+/// named slots it does describe. (A current CMap that is merely wider
+/// than the font's use, under a width table that stops short, has the
+/// first mark too; but at the slots both describe it agrees with the
+/// names — `A` at `A`, `a.sc` at `a` — where a stale one contradicts them:
+/// every one of them when it shares few slots with the font, a majority
+/// and three at least when it shares many, so that a couple of odd names
+/// in a wide overlap do not condemn a current CMap.) Every repaired code
+/// must also be a glyph of the embedded Type1C program under the name the
+/// Differences give it. Each
 /// such slot then reads as its name says: a letter outside ASCII, a
 /// no-break space, the letters of a ligature, an ASCII letter or digit
 /// other than the slot's (capitalization alone is no disagreement: `A.sc`
@@ -1386,7 +1394,10 @@ fn stale_identity_cmap_overrides(
             .iter()
             .filter_map(|&code| mapped(code))
             .collect();
-        // What each named ASCII slot under such an entry reads as by its name.
+        // The named ASCII slots the old CMap describes as their own
+        // occupant, and what each of those reads as by its name where the
+        // name says otherwise.
+        let mut described = 0usize;
         let mut repairs: HashMap<u8, String> = HashMap::new();
         for &code in &encoding.named_codes {
             if !code.is_ascii_graphic() {
@@ -1398,6 +1409,7 @@ fn stale_identity_cmap_overrides(
             if !slot_identity_entry(code, &old) {
                 continue;
             }
+            described += 1;
             let reading = if let Some(&ch) = encoding.map.get(&code) {
                 let disagrees = if ch.is_ascii() {
                     ch.is_ascii_alphanumeric()
@@ -1458,7 +1470,17 @@ fn stale_identity_cmap_overrides(
             }
             _ => false,
         };
-        if anchors(&repairs) < 3 && !mostly_elsewhere {
+        // A CMap written for another set of codes: mostly outside the
+        // font's own, and contradicted by the names at the slots it does
+        // describe — at every one of them, or at a majority and three at
+        // least where the two share many.
+        let foreign = |repairs: &HashMap<u8, String>| {
+            mostly_elsewhere
+                && !repairs.is_empty()
+                && (repairs.len() == described
+                    || (repairs.len() >= 3 && repairs.len() * 2 > described))
+        };
+        if anchors(&repairs) < 3 && !foreign(&repairs) {
             return None;
         }
         let descriptor = resolve_dict(doc, font_dict.get(b"FontDescriptor").ok()?)?;
@@ -1476,7 +1498,7 @@ fn stale_identity_cmap_overrides(
                 .or_else(|| encoding.unread_names.get(code))
                 .is_some_and(|name| cff.glyph_index_by_name(name).is_some())
         });
-        (mostly_elsewhere || anchors(&repairs) >= 3).then_some(repairs)
+        (foreign(&repairs) || anchors(&repairs) >= 3).then_some(repairs)
     };
     verified().unwrap_or_default()
 }

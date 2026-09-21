@@ -48,14 +48,17 @@ Changes since 1.22.1.
   letter the old CMap never mapped at all as its ASCII slot, and a mark
   glyph whose name spells no character (`arHamzaAboveCCMP`) as a stray `i`.
   The existing repair of such fonts now takes a mirrored bracket or the
-  StandardEncoding character of a slot as the slot's own entry, accepts a
-  CMap most of whose codes lie outside the font's `FirstChar`..`LastChar`
-  range as proof that it is stale (besides the three corroborated letters
-  it required), and once the CMap is proven stale repairs every such slot
-  whose name reads as a letter outside ASCII, a ligature, or an ASCII
-  letter or digit other than the slot's — or as nothing, for a name that
-  spells no character. A font whose CMap agrees with its Differences is
-  untouched.
+  StandardEncoding character of a slot as the slot's own entry; accepts as
+  proof that the CMap is stale, besides the three corroborated letters it
+  required, a CMap most of whose codes lie outside the font's
+  `FirstChar`..`LastChar` range whose entries the names contradict at the
+  named slots it does describe — at every one of them when it shares few
+  slots with the font, at a majority and three at least when it shares
+  many; and once the CMap is proven stale repairs every such slot whose
+  name reads as a letter outside ASCII, a no-break space, a ligature, or
+  an ASCII letter or digit other than the slot's — or as nothing, for a
+  name that spells no character. A font whose CMap agrees with its
+  Differences is untouched.
 - A code that reads as several characters of a right-to-left script — a
   ligature glyph named `uni06440627` (lam-alef), or mapped to two code
   points by the ToUnicode CMap — came out with those characters reversed on

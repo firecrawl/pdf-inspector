@@ -303,10 +303,11 @@ const RTL_DIFFERENCES: &[(u8, &str)] = &[
 ];
 const RTL_STALE_MAP: &str = "1 begincodespacerange\n<00><FF>\nendcodespacerange\n\
 2 beginbfrange\n<01><1F><0660>\n<7F><F4><FB50>\nendbfrange\n\
-5 beginbfchar\n<28><0029>\n<29><0028>\n<2E><002E>\n<3C><003E>\n<69><0069>\nendbfchar";
-// Lines painted in display order (left to right), one word each: the four
-// letters heh, meem, yeh, beh; a lam-alef glyph then heh; heh then the
-// mark glyph; heh then alef with madda.
+6 beginbfchar\n<28><0029>\n<29><0028>\n<2E><002E>\n<3C><003E>\n<3E><003C>\n<69><0069>\nendbfchar";
+// (Its code 0x3E, mapped to the mirror image of `>`, is named by another
+// fixture only.) Lines painted in display order (left to right), one word
+// each: the four letters heh, meem, yeh, beh; a lam-alef glyph then heh;
+// heh then the mark glyph; heh then alef with madda.
 const RTL_CONTENT: &[u8] = b"BT /F1 12 Tf 1 0 0 1 40 700 Tm <21262829> Tj ET\n\
 BT /F1 12 Tf 1 0 0 1 40 670 Tm <3C21> Tj ET\n\
 BT /F1 12 Tf 1 0 0 1 40 640 Tm <2169> Tj ET\n\
@@ -348,11 +349,12 @@ fn re_encoded_right_to_left_font_reads_by_its_differences_under_its_stale_cmap()
 }
 
 #[test]
-fn stale_cmap_proven_by_its_code_range_repairs_a_digit_slot() {
+fn stale_cmap_proven_by_its_code_range_repairs_the_digit_slots() {
     // Tabular digits at codes 33 upwards under a CMap copied from the
-    // parent subset: the letter slots it maps are all outside the font's
-    // seven codes, and its apostrophe slot — `quoteright` at 0x27, as
-    // StandardEncoding has it — is where the five now sits.
+    // parent subset: it maps every printable ASCII code to itself — the
+    // letter slots all outside the font's six codes, the apostrophe slot
+    // as `quoteright`, U+2019, as StandardEncoding has it — and at every
+    // one of the font's named slots the name reads as a digit instead.
     let glyphs = [
         "one.tnum",
         "zero.tnum",
@@ -360,7 +362,6 @@ fn stale_cmap_proven_by_its_code_range_repairs_a_digit_slot() {
         "three.tnum",
         "four.tnum",
         "five.tnum",
-        "period",
     ];
     let differences = [
         (0x21, "one.tnum"),
@@ -369,23 +370,79 @@ fn stale_cmap_proven_by_its_code_range_repairs_a_digit_slot() {
         (0x24, "three.tnum"),
         (0x25, "four.tnum"),
         (0x27, "five.tnum"),
-        (0x2E, "period"),
     ];
+    let stale = "1 begincodespacerange\n<00><FF>\nendcodespacerange\n\
+1 beginbfrange\n<20><7E><0020>\nendbfrange\n\
+1 beginbfchar\n<27><2019>\nendbfchar";
+    let content = b"BT /F1 12 Tf 1 0 0 1 40 700 Tm <272E23> Tj ET";
+    let (mut doc, font_id) = font_doc(&glyphs, &differences, stale, (0x21, 0x27), content);
+    let repairs = overrides(&doc, font_id);
+    assert_eq!(repairs.get(&0x27).map(String::as_str), Some("5"));
+    assert_eq!(repairs.len(), 6);
+    // The period is the CMap's own, at a slot the font does not name.
+    assert_eq!(line_texts(&mut doc), ["5.2"]);
+    // The same font under a CMap as wide, but mapping its six slots as
+    // the digits they are, needs none.
+    let agreeing = "1 begincodespacerange\n<00><FF>\nendcodespacerange\n\
+1 beginbfrange\n<28><7E><0028>\nendbfrange\n\
+6 beginbfchar\n<21><0031>\n<22><0030>\n<23><0032>\n<24><0033>\n<25><0034>\n<27><0035>\nendbfchar";
+    let (mut doc, font_id) = font_doc(&glyphs, &differences, agreeing, (0x21, 0x27), content);
+    assert!(overrides(&doc, font_id).is_empty());
+    assert_eq!(line_texts(&mut doc), ["5.2"]);
+}
+
+#[test]
+fn a_stale_cmap_sharing_one_slot_with_the_font_is_repaired_where_the_name_contradicts_it() {
+    // The parent CMap maps only letters the font does not have and the
+    // apostrophe slot: one slot shared with the font, and the name
+    // contradicts it there. Few shared slots, every one of them at odds
+    // with its name: the CMap is stale, and the slot reads as the five.
+    let glyphs = ["one.tnum", "two.tnum", "five.tnum"];
+    let differences = [(0x21, "one.tnum"), (0x23, "two.tnum"), (0x27, "five.tnum")];
     let stale = "1 begincodespacerange\n<00><FF>\nendcodespacerange\n\
 3 beginbfrange\n<27><27><2019>\n<41><5A><0041>\n<61><7A><0061>\nendbfrange\n\
 1 beginbfchar\n<2E><002E>\nendbfchar";
     let content = b"BT /F1 12 Tf 1 0 0 1 40 700 Tm <272E23> Tj ET";
-    let (mut doc, font_id) = font_doc(&glyphs, &differences, stale, (0x21, 0x2E), content);
+    let (mut doc, font_id) = font_doc(&glyphs, &differences, stale, (0x21, 0x27), content);
     let repairs = overrides(&doc, font_id);
     assert_eq!(repairs.get(&0x27).map(String::as_str), Some("5"));
-    // The period agrees with its slot and is no repair.
     assert_eq!(repairs.len(), 1);
     assert_eq!(line_texts(&mut doc), ["5.2"]);
-    // The same font under a CMap that maps the five as a five needs none.
+    // The same CMap agreeing at that one slot has nothing against it.
     let agreeing = stale.replace("<27><27><2019>", "<27><27><0035>");
-    let (mut doc, font_id) = font_doc(&glyphs, &differences, &agreeing, (0x21, 0x2E), content);
+    let (mut doc, font_id) = font_doc(&glyphs, &differences, &agreeing, (0x21, 0x27), content);
     assert!(overrides(&doc, font_id).is_empty());
     assert_eq!(line_texts(&mut doc), ["5.2"]);
+}
+
+#[test]
+fn a_current_cmap_wider_than_the_fonts_use_is_left_alone() {
+    // A CMap for all of printable ASCII over a width table that covers
+    // only the codes in use: most of the CMap lies outside the font's
+    // range, but at the slots the two share the names agree with it — a
+    // small capital differing only in capitalization included — so the
+    // CMap stands and the string reads through it as before.
+    let glyphs = ["A", "B", "C", "A.sc"];
+    let differences = [(0x41, "A"), (0x42, "B"), (0x43, "C"), (0x61, "A.sc")];
+    let cmap = "1 begincodespacerange\n<00><FF>\nendcodespacerange\n\
+1 beginbfrange\n<20><7E><0020>\nendbfrange";
+    let content = b"BT /F1 12 Tf 1 0 0 1 40 700 Tm <41424361> Tj ET";
+    let (mut doc, font_id) = font_doc(&glyphs, &differences, cmap, (0x41, 0x61), content);
+    assert!(overrides(&doc, font_id).is_empty());
+    assert_eq!(line_texts(&mut doc), ["ABCa"]);
+    // Two of the four shared slots at odds with their names — letters the
+    // CMap maps nowhere else — are neither all of them nor the three a
+    // majority needs.
+    let glyphs = ["uni05D0", "uni05D1", "C", "A.sc"];
+    let differences = [
+        (0x41, "uni05D0"),
+        (0x42, "uni05D1"),
+        (0x43, "C"),
+        (0x61, "A.sc"),
+    ];
+    let (mut doc, font_id) = font_doc(&glyphs, &differences, cmap, (0x41, 0x61), content);
+    assert!(overrides(&doc, font_id).is_empty());
+    assert_eq!(line_texts(&mut doc), ["ABCa"]);
 }
 
 #[test]
@@ -450,19 +507,29 @@ fn a_nameless_glyph_reads_as_nothing_only_under_a_proven_stale_cmap() {
 
 #[test]
 fn stale_cmap_repair_reaches_a_font_naming_only_ligatures_and_nameless_glyphs() {
-    // No name reads as a single character: the ligature and the mark glyph
-    // are the whole encoding, and the CMap's range still proves it stale.
-    let glyphs = ["uni06440627.f", "arHamzaAboveCCMP"];
-    let differences = [(0x3C, "uni06440627.f"), (0x69, "arHamzaAboveCCMP")];
-    let content = b"BT /F1 12 Tf 1 0 0 1 40 700 Tm <3C69> Tj ET";
+    // No name reads as a single character: two ligatures and the mark
+    // glyph are the whole encoding, and the CMap's range — with every
+    // named slot at odds with its name — still proves it stale.
+    let glyphs = ["uni06440627.f", "uni06490631.f", "arHamzaAboveCCMP"];
+    let differences = [
+        (0x3C, "uni06440627.f"),
+        (0x3E, "uni06490631.f"),
+        (0x69, "arHamzaAboveCCMP"),
+    ];
+    // Displayed left to right: alef maksura-reh, lam-alef, the mark glyph.
+    let content = b"BT /F1 12 Tf 1 0 0 1 40 700 Tm <3E3C69> Tj ET";
     let (mut doc, font_id) = font_doc(&glyphs, &differences, RTL_STALE_MAP, (0x3C, 0x69), content);
     let repairs = overrides(&doc, font_id);
     assert_eq!(
         repairs.get(&0x3C).map(String::as_str),
         Some("\u{0644}\u{0627}")
     );
+    assert_eq!(
+        repairs.get(&0x3E).map(String::as_str),
+        Some("\u{0649}\u{0631}")
+    );
     assert_eq!(repairs.get(&0x69).map(String::as_str), Some(""));
-    assert_eq!(line_texts(&mut doc), ["\u{0644}\u{0627}"]);
+    assert_eq!(line_texts(&mut doc), ["\u{0644}\u{0627}\u{0649}\u{0631}"]);
 }
 
 #[test]
