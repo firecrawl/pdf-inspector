@@ -780,7 +780,9 @@ fn extract_form_xobject_text_inner(
                     {
                         *skipped_invisible = true;
                     }
-                    if fill_is_white || invisible {
+                    if crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)
+                        || invisible
+                    {
                         if let Some(font_info) = font_widths.get(&current_font) {
                             if let Some(raw_bytes) = get_operand_bytes(show_operand) {
                                 let w_ts = compute_string_width_ts(
@@ -896,11 +898,12 @@ fn extract_form_xobject_text_inner(
                             {
                                 if combined[0] * horizontal_scale > 0.0 {
                                     rtl_visual_candidates.push(items.len());
-                                    if !fill_is_white
-                                        && crate::text_utils::render_mode_paints(
-                                            text_rendering_mode,
-                                        )
-                                        && crate::text_utils::is_visual_rtl_run(&text)
+                                    if !crate::text_utils::white_fill_hides(
+                                        text_rendering_mode,
+                                        fill_is_white,
+                                    ) && crate::text_utils::render_mode_paints(
+                                        text_rendering_mode,
+                                    ) && crate::text_utils::is_visual_rtl_run(&text)
                                     {
                                         rtl_visual_runs.push(items.len());
                                     }
@@ -992,7 +995,9 @@ fn extract_form_xobject_text_inner(
                         {
                             *skipped_invisible = true;
                         }
-                        let hidden = fill_is_white || invisible;
+                        let hidden =
+                            crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)
+                                || invisible;
                         let font_info = font_widths.get(&current_font);
 
                         // Word-space threshold for `TJ` offsets and character

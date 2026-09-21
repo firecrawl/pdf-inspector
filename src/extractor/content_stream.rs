@@ -1047,11 +1047,12 @@ pub(crate) fn extract_page_text_items_with_options(
                                 if combined[0].abs() > combined[1].abs() {
                                     if combined[0] * horizontal_scale > 0.0 {
                                         rtl_visual_candidates.push(items.len());
-                                        if !fill_is_white
-                                            && crate::text_utils::render_mode_paints(
-                                                text_rendering_mode,
-                                            )
-                                            && crate::text_utils::is_visual_rtl_run(&text)
+                                        if !crate::text_utils::white_fill_hides(
+                                            text_rendering_mode,
+                                            fill_is_white,
+                                        ) && crate::text_utils::render_mode_paints(
+                                            text_rendering_mode,
+                                        ) && crate::text_utils::is_visual_rtl_run(&text)
                                         {
                                             rtl_visual_runs.push(items.len());
                                         }
@@ -1570,11 +1571,12 @@ pub(crate) fn extract_page_text_items_with_options(
                                         }
                                     } else {
                                         rtl_visual_candidates.push(items.len());
-                                        if !fill_is_white
-                                            && crate::text_utils::render_mode_paints(
-                                                text_rendering_mode,
-                                            )
-                                            && crate::text_utils::is_visual_rtl_run(text)
+                                        if !crate::text_utils::white_fill_hides(
+                                            text_rendering_mode,
+                                            fill_is_white,
+                                        ) && crate::text_utils::render_mode_paints(
+                                            text_rendering_mode,
+                                        ) && crate::text_utils::is_visual_rtl_run(text)
                                         {
                                             rtl_visual_runs.push(items.len());
                                         }
@@ -1803,11 +1805,12 @@ pub(crate) fn extract_page_text_items_with_options(
                             {
                                 if combined[0] * horizontal_scale > 0.0 {
                                     rtl_visual_candidates.push(items.len());
-                                    if !fill_is_white
-                                        && crate::text_utils::render_mode_paints(
-                                            text_rendering_mode,
-                                        )
-                                        && crate::text_utils::is_visual_rtl_run(&text)
+                                    if !crate::text_utils::white_fill_hides(
+                                        text_rendering_mode,
+                                        fill_is_white,
+                                    ) && crate::text_utils::render_mode_paints(
+                                        text_rendering_mode,
+                                    ) && crate::text_utils::is_visual_rtl_run(&text)
                                     {
                                         rtl_visual_runs.push(items.len());
                                     }
@@ -3672,6 +3675,30 @@ end"#;
             extract_items_with_cmap_and_form(b"1 g q /X1 Do Q", HEBREW_CMAP, Some(visual), false);
         let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(texts, [SHALOM_LOGICAL, SHALOM_LOGICAL]);
+    }
+
+    #[test]
+    fn a_white_fill_does_not_hide_stroked_runs_from_the_vote() {
+        // Stroked text (`1 Tr`) shows its stroke whatever the fill colour:
+        // under a white fill, visual-order runs shown in reading order still
+        // count as seen and are turned round.
+        let content =
+            b"BT 1 g 1 Tr /F1 12 Tf 1 0 0 1 160 700 Tm <44434241> Tj -60 0 Td <44434241> Tj ET";
+        let items = extract_hebrew_items(content);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, [SHALOM_LOGICAL, SHALOM_LOGICAL]);
+    }
+
+    #[test]
+    fn a_forms_stroked_text_under_the_pages_white_fill_stays_visible() {
+        // The inherited white fill hides only text painted with the fill: a
+        // form that strokes its text (`1 Tr`) under the page's `1 g` is
+        // extracted, and its visual-order run reads forwards.
+        let stroked = b"BT 1 Tr /F1 12 Tf 1 0 0 1 100 700 Tm <44434241> Tj ET";
+        let items =
+            extract_items_with_cmap_and_form(b"1 g q /X1 Do Q", HEBREW_CMAP, Some(stroked), false);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, [SHALOM_LOGICAL]);
     }
 
     #[test]
