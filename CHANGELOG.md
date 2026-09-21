@@ -80,8 +80,9 @@ Changes since 1.22.1.
   are level, measured runs without right-to-left letters, neither carries
   an ActualText replacement, their baselines lie within 0.3 em and the
   accent's centre falls within that glyph's advance (estimated from the
-  run's width, whitespace counted at 0.28 em and the glyph at no less than
-  0.6 em), and only when Unicode has one character for the pair (a dotless
+  run's width, whitespace counted at 0.28 em — at the run's uniform advance
+  for a fixed-pitch face — and the glyph at no less than 0.6 em), and only
+  when Unicode has one character for the pair (a dotless
   i or j under the accent composes as the dotted letter). A circumflex or
   grave standing beside its neighbours rather than over them, as in code or
   mathematics, is left as shown.
