@@ -1218,6 +1218,28 @@ fn unfiltered_inline_image_data_is_skipped_by_its_length() {
     assert_eq!(counts.text_ops, 1);
 }
 
+/// A comment inside an inline image's header — between `BI` and `ID` — is
+/// passed over, whichever line ending closes it, and the header read on
+/// past it.
+#[test]
+fn a_comment_in_an_inline_image_header_is_passed_over() {
+    // The eight gray samples spelling ` EI 3 Tr` behind a header that
+    // carries a comment.
+    for header in [
+        "/W 8 % eight wide\n/H 1 /BPC 8 /CS /G",
+        "/W 8 /H 1 % one high\r/BPC 8 /CS /G",
+        "/W 8 /H 1 /BPC 8 /CS /G % gray, and ID is no data yet\n",
+    ] {
+        let content = format!("BI {header} ID  EI 3 Tr EI BT /F1 12 Tf (a) Tj ET");
+        let (counts, executed_ops, hidden) = scan_alone(content.as_bytes());
+        assert_eq!(
+            (counts.text_ops, executed_ops, hidden),
+            (1, 1, 0),
+            "{header:?}"
+        );
+    }
+}
+
 /// A colour space an inline image names from the resources gives its
 /// samples' components: an `/ICCBased` space by its `/N`, a device space
 /// by its name, `/Indexed` and `/Separation` as one, `/DeviceN` by its
@@ -1272,4 +1294,133 @@ fn an_inline_image_s_named_colour_space_is_resolved_in_the_resources() {
         (1, 1),
         "unbound: the `EI` among the bytes ends the data"
     );
+}
+
+/// A form whose inline image names a colour space its own resources do
+/// not bind takes it from the invoker's, and is masked under each
+/// invoker: the length that colour space gives the data — and with it
+/// where the operators resume — may differ from one to the next. A form
+/// whose own resources answer is masked once and kept.
+#[test]
+fn a_form_taking_a_colour_space_from_its_invoker_is_masked_at_each_invocation() {
+    use lopdf::dictionary;
+    // Two gray samples, or six RGB ones: read as gray, the data ends at
+    // the `EI` among the bytes and the text after it is shown; read as
+    // RGB, the data runs on to the `BT`, and the text is data through
+    // the last `EI`.
+    let (mut doc, page_id, _) = synthetic_page(
+        false,
+        false,
+        &[
+            TestForm {
+                name: "FmCs",
+                content: "BI /W 2 /H 1 /BPC 8 /CS /Cs1 ID AB EI BT /F1 12 Tf (a) Tj ET EI\n",
+                ..PAGE_FORM
+            },
+            TestForm {
+                name: "FmRgb",
+                content: "/FmCs Do",
+                xobjects: &[("FmCs", "FmCs")],
+                ..PAGE_FORM
+            },
+        ],
+    );
+    let form_id = |doc: &Document, name: &[u8]| -> ObjectId {
+        doc.get_dictionary(page_id)
+            .unwrap()
+            .get(b"Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"XObject")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(name)
+            .unwrap()
+            .as_reference()
+            .unwrap()
+    };
+    let bind = |resources: &mut lopdf::Dictionary, space: &[u8]| {
+        resources.set(
+            "ColorSpace",
+            dictionary! { "Cs1" => Object::Name(space.to_vec()) },
+        );
+    };
+    let wrapper = form_id(&doc, b"FmRgb");
+    let inner = form_id(&doc, b"FmCs");
+    // The page binds `Cs1` as gray, the wrapper form as RGB.
+    let mut page_resources = doc
+        .get_dictionary(page_id)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    bind(&mut page_resources, b"DeviceGray");
+    doc.get_dictionary_mut(page_id)
+        .unwrap()
+        .set("Resources", page_resources);
+    let mut wrapper_resources = doc
+        .get_object(wrapper)
+        .unwrap()
+        .as_stream()
+        .unwrap()
+        .dict
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    bind(&mut wrapper_resources, b"DeviceRGB");
+    doc.get_object_mut(wrapper)
+        .unwrap()
+        .as_stream_mut()
+        .unwrap()
+        .dict
+        .set("Resources", wrapper_resources);
+
+    // Invoked by the page the text is shown, invoked through the wrapper
+    // it is data — in either order, so the first invocation's reading is
+    // not kept for the second; the wrapper, which asked after no colour
+    // space, is kept.
+    for content in ["/FmCs Do /FmRgb Do", "/FmRgb Do /FmCs Do"] {
+        let state = executed_state(&doc, page_id, &[content]);
+        assert_eq!(
+            (state.executed_text_ops, state.executed_hidden_text_ops),
+            (1, 0),
+            "{content}"
+        );
+        assert_eq!(state.form_content.len(), 1, "{content}");
+        assert!(state.form_content.contains_key(&wrapper), "{content}");
+    }
+
+    // Bound in the form's own resources, the colour space is the form's
+    // whoever invokes it: read as gray under the wrapper too, and kept.
+    let mut inner_resources = doc
+        .get_object(inner)
+        .unwrap()
+        .as_stream()
+        .unwrap()
+        .dict
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    bind(&mut inner_resources, b"DeviceGray");
+    doc.get_object_mut(inner)
+        .unwrap()
+        .as_stream_mut()
+        .unwrap()
+        .dict
+        .set("Resources", inner_resources);
+    let state = executed_state(&doc, page_id, &["/FmRgb Do /FmCs Do"]);
+    assert_eq!(
+        (state.executed_text_ops, state.executed_hidden_text_ops),
+        (2, 0)
+    );
+    assert_eq!(state.form_content.len(), 2);
+    assert!(state.form_content.contains_key(&inner));
 }

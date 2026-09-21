@@ -183,7 +183,8 @@ enum HeaderToken<'h> {
 }
 
 /// The header's tokens, split at whitespace and at delimiters — a name
-/// runs into the next token without whitespace (`/W 1/H 1`), as names do.
+/// runs into the next token without whitespace (`/W 1/H 1`), as names do;
+/// a comment, which runs to the end of its line, is no token.
 fn header_tokens(header: &[u8]) -> Vec<HeaderToken<'_>> {
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -240,6 +241,11 @@ fn header_tokens(header: &[u8]) -> Vec<HeaderToken<'_>> {
                 }
                 tokens.push(HeaderToken::Other);
                 i += 1;
+            }
+            b'%' => {
+                while i < header.len() && !matches!(header[i], b'\n' | b'\r') {
+                    i += 1;
+                }
             }
             b')' | b'>' | b'{' | b'}' => {
                 tokens.push(HeaderToken::Other);

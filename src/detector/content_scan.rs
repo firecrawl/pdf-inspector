@@ -22,6 +22,7 @@ use super::{
 };
 use crate::extractor::{visible_page_box, PageBox};
 use lopdf::{Document, Object, ObjectId};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -240,7 +241,8 @@ const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 const COVERAGE_GRID: usize = 64;
 
 /// A form's content as the scan reads it: decompressed, with the masked
-/// copy the operators are read through.
+/// copy the operators are read through — kept for the page when the
+/// masking owed nothing to the invoker's resources (see `form_content`).
 struct FormContent {
     content: Vec<u8>,
     masked: Vec<u8>,
@@ -868,11 +870,16 @@ impl<'a> ContentScanState<'a> {
     }
 
     /// A form's content, charged to the byte budget at each invocation:
-    /// admitted to it (see `form_bytes_admitted`) and masked once per page
-    /// while the cache lasts — the colour spaces its inline images name
-    /// resolved in `resources`, those in force at that first invocation,
-    /// the form's own first — both copies counting against the cache's
-    /// budget. `None` when the byte budget refuses it.
+    /// admitted to it (see `form_bytes_admitted`) and masked — the colour
+    /// spaces its inline images name resolved in `resources`, those in
+    /// force at the invocation, the form's own first. It is kept for the
+    /// page while the cache lasts, both copies counting against the
+    /// cache's budget, only when the form's own resources answered for
+    /// every colour space the masking asked after: a name they leave to
+    /// the invoker's resources may be answered otherwise under another
+    /// invoker, and with it the length of the data and where the operators
+    /// resume, so such a form is masked at each invocation. `None` when
+    /// the byte budget refuses it.
     fn form_content(
         &mut self,
         id: ObjectId,
@@ -887,12 +894,19 @@ impl<'a> ContentScanState<'a> {
         }
         let content = self.form_bytes_admitted(form)?;
         let doc = self.doc;
+        let own: Vec<&lopdf::Dictionary> = stream_resources(doc, form).into_iter().collect();
+        let asked_the_invoker = Cell::new(false);
         let masked = mask_strings_comments_and_inline_images(&content, &|name| {
-            colour_space_components(doc, resources, name)
+            colour_space_components(doc, &own, name).or_else(|| {
+                asked_the_invoker.set(true);
+                colour_space_components(doc, resources, name)
+            })
         });
         let content = Rc::new(FormContent { content, masked });
         let bytes = content.content.len() + content.masked.len();
-        if self.form_content_bytes + bytes <= FORM_CONTENT_CACHE_MAX_BYTES {
+        if !asked_the_invoker.get()
+            && self.form_content_bytes + bytes <= FORM_CONTENT_CACHE_MAX_BYTES
+        {
             self.form_content_bytes += bytes;
             self.form_content.insert(id, Rc::clone(&content));
         }
