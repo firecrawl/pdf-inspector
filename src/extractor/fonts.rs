@@ -2471,99 +2471,121 @@ pub(crate) fn extract_text_from_operand(
                     for label in labels.iter().filter_map(|(label, _)| label.as_ref()) {
                         crate::bidi::push_glyph_characters(&mut decoded, label);
                     }
+                    // Read this way, each byte is a code, and a byte no
+                    // CMap reads — none has an entry for it, or its
+                    // ToUnicode entry is a control destination — counts
+                    // as unmapped; no gap is read into it, so nothing is
+                    // interpolated. The bytes are counted here whatever they
+                    // read as: when none of them reads, the two-byte reading
+                    // below is tried over the same bytes, and must not count
+                    // them again.
+                    if is_type0_cid_font {
+                        let unmapped = labels.iter().filter(|(_, unmapped)| *unmapped).count();
+                        cmap_decisions.record_coverage(
+                            font_label,
+                            CidDecodeStats {
+                                codes: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+                                interpolated: 0,
+                                unmapped: u32::try_from(unmapped).unwrap_or(u32::MAX),
+                            },
+                        );
+                    }
                     if !decoded.is_empty() {
-                        // Read this way, each byte is a code, and a byte no
-                        // CMap reads — none has an entry for it, or its
-                        // ToUnicode entry is a control destination — counts
-                        // as unmapped; no gap is read into it, so nothing is
-                        // interpolated.
-                        if is_type0_cid_font {
-                            let unmapped = labels.iter().filter(|(_, unmapped)| *unmapped).count();
-                            cmap_decisions.record_coverage(
-                                font_label,
-                                CidDecodeStats {
-                                    codes: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
-                                    interpolated: 0,
-                                    unmapped: u32::try_from(unmapped).unwrap_or(u32::MAX),
-                                },
-                            );
-                        }
                         return Some(decoded);
                     }
                 }
+                let bytes_counted = bytes.len() % 2 == 1 && is_type0_cid_font;
                 // Each reading keeps the CMap it came through, so the one
                 // taken joins the characters of its codes by that CMap's own
                 // code boundaries (see `CidDecode::joined`), and carries its
                 // coverage counts, recorded for the font when it is taken so
                 // a caller can tell text read from an incomplete CMap apart
                 // from text the CMap covered.
-                let key = font_tounicode_refs.get(current_font).copied().unwrap_or(0);
-                let primary = CidDecode::new(&entry.primary, bytes);
-                let primary_stats = primary.stats;
-                if let Some(remapped) = entry.remapped.as_ref() {
-                    let remap = CidDecode::new(remapped, bytes);
-                    let fallback = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes));
+                let two_byte_reading = |cmap_decisions: &mut CMapDecisionCache| -> Option<String> {
+                    let key = font_tounicode_refs.get(current_font).copied().unwrap_or(0);
+                    let primary = CidDecode::new(&entry.primary, bytes);
+                    let primary_stats = primary.stats;
+                    if let Some(remapped) = entry.remapped.as_ref() {
+                        let remap = CidDecode::new(remapped, bytes);
+                        let fallback = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes));
 
-                    if let Some(choice) = cmap_decisions.get_choice(key) {
-                        let chosen = match choice {
-                            CMapChoice::Primary => &primary,
-                            CMapChoice::Remapped => &remap,
-                        };
-                        if !chosen.text.is_empty() {
+                        if let Some(choice) = cmap_decisions.get_choice(key) {
                             let chosen = match choice {
-                                CMapChoice::Primary => primary,
-                                CMapChoice::Remapped => remap,
+                                CMapChoice::Primary => &primary,
+                                CMapChoice::Remapped => &remap,
                             };
-                            cmap_decisions.record_coverage(font_label, chosen.stats);
-                            return Some(chosen.joined(bytes));
+                            if !chosen.text.is_empty() {
+                                let chosen = match choice {
+                                    CMapChoice::Primary => primary,
+                                    CMapChoice::Remapped => remap,
+                                };
+                                cmap_decisions.record_coverage(font_label, chosen.stats);
+                                return Some(chosen.joined(bytes));
+                            }
                         }
+
+                        let choice =
+                            cmap_decisions.consider(key, &primary.text, &remap.text, bytes.len());
+                        let mut decoded = match choice {
+                            Some(CMapChoice::Primary) => primary,
+                            Some(CMapChoice::Remapped) => remap,
+                            None => choose_best_cmap_decode(primary, remap),
+                        };
+                        if let Some(fb) = fallback {
+                            let expected = bytes.len() / 2;
+                            let decoded_len = decoded.text.chars().count();
+                            let prefer_fallback = (!fb.text.is_empty() && decoded.text.is_empty())
+                                || (!fb.text.is_empty()
+                                    && expected > 0
+                                    && decoded_len * 2 < expected);
+                            if prefer_fallback
+                                || score_text(&fb.text) > score_text(&decoded.text) + 3
+                            {
+                                decoded = fb;
+                            }
+                        }
+                        if !decoded.text.is_empty() {
+                            cmap_decisions.record_coverage(font_label, decoded.stats);
+                            return Some(decoded.joined(bytes));
+                        }
+                    } else if !primary.text.is_empty() {
+                        if let Some(fb) = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes))
+                        {
+                            let expected = bytes.len() / 2;
+                            let decoded_len = primary.text.chars().count();
+                            let prefer_fallback = (!fb.text.is_empty() && primary.text.is_empty())
+                                || (!fb.text.is_empty()
+                                    && expected > 0
+                                    && decoded_len * 2 < expected);
+                            if prefer_fallback
+                                || score_text(&fb.text) > score_text(&primary.text) + 3
+                            {
+                                cmap_decisions.record_coverage(font_label, fb.stats);
+                                return Some(fb.joined(bytes));
+                            }
+                        }
+                        cmap_decisions.record_coverage(font_label, primary.stats);
+                        return Some(primary.joined(bytes));
                     }
 
-                    let choice =
-                        cmap_decisions.consider(key, &primary.text, &remap.text, bytes.len());
-                    let mut decoded = match choice {
-                        Some(CMapChoice::Primary) => primary,
-                        Some(CMapChoice::Remapped) => remap,
-                        None => choose_best_cmap_decode(primary, remap),
-                    };
-                    if let Some(fb) = fallback {
-                        let expected = bytes.len() / 2;
-                        let decoded_len = decoded.text.chars().count();
-                        let prefer_fallback = (!fb.text.is_empty() && decoded.text.is_empty())
-                            || (!fb.text.is_empty() && expected > 0 && decoded_len * 2 < expected);
-                        if prefer_fallback || score_text(&fb.text) > score_text(&decoded.text) + 3 {
-                            decoded = fb;
-                        }
+                    // No reading of the string came out. For a CID-keyed font
+                    // the CMap was the string's only reading, so it is recorded
+                    // as it was — the codes read from their neighbours included,
+                    // the codes it could not read as unmapped; a simple font's
+                    // string is read by its encoding below, and a CMap keyed by
+                    // two-byte codes over its one-byte string says nothing.
+                    if is_type0_cid_font {
+                        cmap_decisions.record_coverage(font_label, primary_stats);
                     }
-                    if !decoded.text.is_empty() {
-                        cmap_decisions.record_coverage(font_label, decoded.stats);
-                        return Some(decoded.joined(bytes));
-                    }
-                } else if !primary.text.is_empty() {
-                    if let Some(fb) = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes)) {
-                        let expected = bytes.len() / 2;
-                        let decoded_len = primary.text.chars().count();
-                        let prefer_fallback = (!fb.text.is_empty() && primary.text.is_empty())
-                            || (!fb.text.is_empty() && expected > 0 && decoded_len * 2 < expected);
-                        if prefer_fallback || score_text(&fb.text) > score_text(&primary.text) + 3 {
-                            cmap_decisions.record_coverage(font_label, fb.stats);
-                            return Some(fb.joined(bytes));
-                        }
-                    }
-                    cmap_decisions.record_coverage(font_label, primary.stats);
-                    return Some(primary.joined(bytes));
+                    None
+                };
+                // An odd-length string's bytes were counted byte by byte
+                // above; its two-byte reading counts nothing more.
+                if bytes_counted {
+                    cmap_decisions.without_coverage(two_byte_reading)
+                } else {
+                    two_byte_reading(cmap_decisions)
                 }
-
-                // No reading of the string came out. For a CID-keyed font
-                // the CMap was the string's only reading, so it is recorded
-                // as it was — the codes read from their neighbours included,
-                // the codes it could not read as unmapped; a simple font's
-                // string is read by its encoding below, and a CMap keyed by
-                // two-byte codes over its one-byte string says nothing.
-                if is_type0_cid_font {
-                    cmap_decisions.record_coverage(font_label, primary_stats);
-                }
-                None
             };
 
             let mut has_cmap = false;
@@ -4999,15 +5021,19 @@ mod tests {
         (doc, tounicode_id.0, page_id)
     }
 
-    /// A page whose only font is the Type0 `F1` under Identity-H with the
-    /// given ToUnicode `bfchar` lines, whose CIDFontType2 descendant embeds
+    /// A page whose only font is the Type0 `F1` under Identity-H (declared
+    /// as an indirect name object with `indirect_encoding`) with the given
+    /// ToUnicode `bfchar` lines, whose CIDFontType2 descendant embeds
     /// `program` (in a stream declaring `program_filter` when given, the
-    /// bytes left as they are). Returns the document, the ToUnicode object
-    /// number and the page.
+    /// bytes left as they are) and maps CIDs to glyphs through `cid_to_gid`
+    /// as a CIDToGIDMap stream, or one to one without it. Returns the
+    /// document, the ToUnicode object number and the page.
     fn cid_font_doc(
         bfchar: &str,
         program: Vec<u8>,
         program_filter: Option<&[u8]>,
+        indirect_encoding: bool,
+        cid_to_gid: Option<&[u16]>,
     ) -> (Document, u32, lopdf::ObjectId) {
         use lopdf::Stream;
         let mut doc = Document::with_version("1.5");
@@ -5037,6 +5063,13 @@ mod tests {
             "StemV" => 80,
             "FontFile2" => font_file,
         });
+        let cid_to_gid_map = match cid_to_gid {
+            Some(map) => {
+                let bytes: Vec<u8> = map.iter().flat_map(|gid| gid.to_be_bytes()).collect();
+                Object::Reference(doc.add_object(Stream::new(dictionary! {}, bytes)))
+            }
+            None => Object::Name(b"Identity".to_vec()),
+        };
         let cid_font_id = doc.add_object(dictionary! {
             "Type" => "Font",
             "Subtype" => "CIDFontType2",
@@ -5048,13 +5081,19 @@ mod tests {
             },
             "FontDescriptor" => descriptor_id,
             "DW" => 600,
-            "CIDToGIDMap" => "Identity",
+            "CIDToGIDMap" => cid_to_gid_map,
         });
+        let encoding = Object::Name(b"Identity-H".to_vec());
+        let encoding = if indirect_encoding {
+            Object::Reference(doc.add_object(encoding))
+        } else {
+            encoding
+        };
         let font_id = doc.add_object(dictionary! {
             "Type" => "Font",
             "Subtype" => "Type0",
             "BaseFont" => "ABCDEF+Subset",
-            "Encoding" => "Identity-H",
+            "Encoding" => encoding,
             "DescendantFonts" => vec![cid_font_id.into()],
             "ToUnicode" => tounicode_id,
         });
@@ -5258,6 +5297,8 @@ mod tests {
             "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>",
             sfnt_with_glyph_names(&names),
             None,
+            false,
+            None,
         );
         let cmaps = FontCMaps::from_doc(&doc);
         let entry = cmaps.get_by_obj(tounicode_obj).expect("the font's CMaps");
@@ -5415,6 +5456,8 @@ mod tests {
                 "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>",
                 sfnt_with_glyph_names(&names),
                 Some(filter),
+                false,
+                None,
             );
             assert_eq!(
                 decode_page_font_string(
@@ -5429,6 +5472,93 @@ mod tests {
                 String::from_utf8_lossy(filter)
             );
         }
+    }
+
+    /// A Type0 font that declares Identity-H as an indirect name object
+    /// (`/Encoding 9 0 R`) is read through its program like one that names
+    /// the encoding in place: the ligature reads by its glyph name.
+    #[test]
+    fn a_type0_encoding_declared_by_an_indirect_name_still_yields_the_program() {
+        let mut names = vec![None; 5];
+        names[3] = Some("f_f");
+        let (doc, tounicode_obj, page_id) = cid_font_doc(
+            "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>",
+            sfnt_with_glyph_names(&names),
+            None,
+            true,
+            None,
+        );
+        assert_eq!(
+            decode_page_font_string(
+                &doc,
+                tounicode_obj,
+                page_id,
+                true,
+                &[0, 1, 0, 2, 0, 3, 0, 4, 0, 4]
+            ),
+            "coffee"
+        );
+    }
+
+    /// A CID the CIDToGIDMap has no entry for — past the map's end — has
+    /// no glyph, so no blank glyph either: its control destination stays
+    /// marked, where the same CID mapped to a blank glyph reads as the
+    /// space that glyph paints. The program here names nothing and has no
+    /// outlines at all, so every glyph it does have is blank.
+    #[test]
+    fn a_cid_past_the_cid_to_gid_map_has_no_blank_glyph_to_read_as_a_space() {
+        let bfchar = "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>";
+        let coffee = [0, 1, 0, 2, 0, 3, 0, 4, 0, 4];
+        // Two entries: CID 3 lies past the map.
+        let (doc, tounicode_obj, page_id) = cid_font_doc(
+            bfchar,
+            sfnt_with_glyph_names(&[None; 5]),
+            None,
+            false,
+            Some(&[0, 1]),
+        );
+        assert_eq!(
+            decode_page_font_string(&doc, tounicode_obj, page_id, true, &coffee),
+            "co\u{FFFD}ee"
+        );
+        // Mapped to a blank glyph, the CID reads as a space.
+        let (doc, tounicode_obj, page_id) = cid_font_doc(
+            bfchar,
+            sfnt_with_glyph_names(&[None; 5]),
+            None,
+            false,
+            Some(&[0, 1, 2, 3, 4]),
+        );
+        assert_eq!(
+            decode_page_font_string(&doc, tounicode_obj, page_id, true, &coffee),
+            "co ee"
+        );
+    }
+
+    /// An odd-length string through a Type0 font none of whose bytes any
+    /// CMap reads: its bytes are counted once, as codes the CMap did not
+    /// cover, though the two-byte reading is tried over them afterwards.
+    #[test]
+    fn an_odd_length_string_none_of_whose_bytes_reads_counts_them_once() {
+        use crate::tounicode::ToUnicodeCMap;
+        let mut primary = ToUnicodeCMap {
+            code_byte_length: 2,
+            ..Default::default()
+        };
+        primary.char_map.insert(1, "A".to_string());
+        primary.refresh_gap_fills();
+        let (_, coverage) = decode_through(primary, vec![0x80, 0x81, 0x82]);
+        assert_eq!(
+            coverage,
+            vec![(
+                FontLabel::from("AAAAAA+Font"),
+                CidDecodeStats {
+                    codes: 3,
+                    interpolated: 0,
+                    unmapped: 3
+                }
+            )]
+        );
     }
 
     #[test]

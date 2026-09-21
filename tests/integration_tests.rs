@@ -9783,3 +9783,33 @@ fn a_control_destination_under_an_unreadable_differences_name_is_marked() {
     assert!(markdown.contains("coee"), "{markdown}");
     assert!(!nameless.has_encoding_issues);
 }
+
+/// An odd-length string through a Type0 font none of whose bytes any CMap
+/// reads: the bytes are counted once as the font's codes, all unmapped, and
+/// the document reports the gap — not the one-and-a-half codes of the
+/// two-byte reading tried over the same bytes afterwards.
+#[test]
+fn an_odd_length_string_no_cmap_reads_counts_its_bytes_once() {
+    let cmap = format!(
+        "{CID_CMAP_HEAD}4 beginbfchar\n<0001> <0063>\n<0002> <006F>\n<0003> <0066>\n\
+         <0004> <0065>\n{CID_CMAP_TAIL}"
+    );
+    let pdf = make_embedded_cid_font_pdf(
+        &cmap,
+        minimal_truetype_subset_with(12, &[], &[]),
+        "",
+        "BT /F1 12 Tf 72 700 Td <808182> Tj ET\n",
+        false,
+    );
+    let result = process_pdf_mem(&pdf).unwrap();
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 3,
+            interpolated: 0,
+            unmapped: 3,
+        }]
+    );
+}

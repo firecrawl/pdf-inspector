@@ -194,26 +194,30 @@ fn repair_control_destinations(
     doc: &Document,
     program: Option<&[u8]>,
 ) {
-    if !target.has_control_destinations() {
+    let before = target.control_destination_codes();
+    if before.is_empty() {
         return;
     }
     if let Some(source) = source {
         target.recover_control_destinations(source);
     }
     let remaining = target.control_destination_codes();
-    if remaining.is_empty() {
-        return;
-    }
-    for (code, text) in declared_encoding_reading(font_dict, doc, &remaining) {
-        target.char_map.insert(code, text);
-    }
-    if let Some(program) = program {
-        let remaining = target.control_destination_codes();
-        if !remaining.is_empty() {
-            for (code, text) in blank_cid_glyph_spaces(font_dict, doc, program, &remaining) {
-                target.char_map.insert(code, text);
+    if !remaining.is_empty() {
+        for (code, text) in declared_encoding_reading(font_dict, doc, &remaining) {
+            target.char_map.insert(code, text);
+        }
+        if let Some(program) = program {
+            let remaining = target.control_destination_codes();
+            if !remaining.is_empty() {
+                for (code, text) in blank_cid_glyph_spaces(font_dict, doc, program, &remaining) {
+                    target.char_map.insert(code, text);
+                }
             }
         }
+    }
+    // The entries changed: the gaps between them are read afresh, once.
+    if target.control_destination_codes() != before {
+        target.refresh_gap_fills();
     }
 }
 
@@ -381,10 +385,14 @@ fn blank_cid_glyph_spaces(
         return Vec::new();
     };
     let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
-    let mapped = |cid: u16| -> u16 {
-        cid_to_gid
-            .as_ref()
-            .map_or(cid, |map| map.get(usize::from(cid)).copied().unwrap_or(0))
+    // The glyph a CID selects through the CIDToGIDMap, when the map has
+    // one for it: a CID past the map's end, or sent to glyph 0, has no
+    // glyph of its own, and its code stays what the CMap says of it.
+    let mapped = |cid: u16| -> Option<u16> {
+        match cid_to_gid.as_ref() {
+            None => Some(cid),
+            Some(map) => map.get(usize::from(cid)).copied().filter(|&gid| gid != 0),
+        }
     };
     let advances = |cid: u16| cid_advance(cid_font_dict, doc, cid) > 0.0;
     let mut spaces = Vec::new();
@@ -392,11 +400,12 @@ fn blank_cid_glyph_spaces(
         let charset = face
             .tables()
             .cff
-            .filter(|cff| cff.glyph_cid(ttf_parser::GlyphId(0)).is_some());
+            .filter(|cff| cff.glyph_cid(ttf_parser::GlyphId(0)).is_some())
+            .map(|cff| cff_cid_to_gid(&cff));
         for &cid in codes {
-            let gid = match charset {
-                Some(cff) => cff_glyph_for_cid(&cff, cid),
-                None => Some(mapped(cid)),
+            let gid = match &charset {
+                Some(by_cid) => by_cid.get(&cid).copied(),
+                None => mapped(cid),
             };
             let Some(gid) = gid else {
                 continue;
@@ -406,12 +415,14 @@ fn blank_cid_glyph_spaces(
             }
         }
     } else if let Some(cff) = ttf_parser::cff::Table::parse(program) {
-        let charset_keyed = cff.glyph_cid(ttf_parser::GlyphId(0)).is_some();
+        let charset = cff
+            .glyph_cid(ttf_parser::GlyphId(0))
+            .is_some()
+            .then(|| cff_cid_to_gid(&cff));
         for &cid in codes {
-            let gid = if charset_keyed {
-                cff_glyph_for_cid(&cff, cid)
-            } else {
-                Some(mapped(cid))
+            let gid = match &charset {
+                Some(by_cid) => by_cid.get(&cid).copied(),
+                None => mapped(cid),
             };
             let Some(gid) = gid else {
                 continue;
@@ -436,9 +447,15 @@ impl ttf_parser::OutlineBuilder for NoOutline {
     fn close(&mut self) {}
 }
 
-/// The glyph a CID-keyed CFF program's charset gives `cid`.
-fn cff_glyph_for_cid(cff: &ttf_parser::cff::Table<'_>, cid: u16) -> Option<u16> {
-    (0..cff.number_of_glyphs()).find(|&gid| cff.glyph_cid(ttf_parser::GlyphId(gid)) == Some(cid))
+/// The glyph of each CID in a CID-keyed CFF program's charset, read once
+/// for all the codes a repair looks up.
+fn cff_cid_to_gid(cff: &ttf_parser::cff::Table<'_>) -> HashMap<u16, u16> {
+    (0..cff.number_of_glyphs())
+        .filter_map(|gid| {
+            cff.glyph_cid(ttf_parser::GlyphId(gid))
+                .map(|cid| (cid, gid))
+        })
+        .collect()
 }
 
 /// The embedded program (`FontFile2` or `FontFile3`) the descriptor of
@@ -474,10 +491,12 @@ fn identity_type0_descendant<'a>(
     font_dict: &'a lopdf::Dictionary,
     doc: &'a Document,
 ) -> Option<&'a lopdf::Dictionary> {
-    let encoding = font_dict
-        .get(b"Encoding")
-        .ok()
-        .and_then(|o| o.as_name().ok())?;
+    // The encoding as named, written in place or as an indirect name object.
+    let encoding = match font_dict.get(b"Encoding").ok()? {
+        Object::Reference(r) => doc.get_object(*r).ok()?,
+        other => other,
+    };
+    let encoding = encoding.as_name().ok()?;
     if encoding != b"Identity-H" && encoding != b"Identity-V" {
         return None;
     }
@@ -3937,6 +3956,37 @@ endbfrange
         assert_eq!(
             cmap.decode_cids(&[0, 0x41, 0, 1, 0, 0x5A, 0, 2, 0, 3]),
             "A\tZ fi"
+        );
+    }
+
+    #[test]
+    fn a_repair_refreshes_the_gaps_the_entries_read() {
+        // A at 36, a control destination at 37, C at 38 and E at 40. The
+        // run 36..38 does not rise while 37 reads as no text, so the gap at
+        // 39 is not read; repaired to B, the run rises and 39 reads as D.
+        let mut cmap = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+              4 beginbfchar\n<0024> <0041>\n<0025> <0003>\n<0026> <0043>\n<0028> <0045>\nendbfchar\n",
+        )
+        .unwrap();
+        assert_eq!(cmap.lookup_code(37), CodeMapping::ControlDestination);
+        assert_eq!(cmap.gap_fill(39), None);
+        let mut program = ToUnicodeCMap::new();
+        program.code_byte_length = 2;
+        program.char_map.insert(37, "B".to_string());
+        program.refresh_gap_fills();
+        repair_control_destinations(
+            &mut cmap,
+            Some(&program),
+            &lopdf::Dictionary::new(),
+            &Document::new(),
+            None,
+        );
+        assert_eq!(cmap.lookup(37).as_deref(), Some("B"));
+        assert_eq!(cmap.gap_fill(39), Some('D'));
+        assert_eq!(
+            cmap.decode_cids(&[0, 36, 0, 37, 0, 38, 0, 39, 0, 40]),
+            "ABCDE"
         );
     }
 
