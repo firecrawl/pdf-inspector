@@ -17,8 +17,8 @@ use pdf_inspector::{
     PdfType, TextItem,
 };
 use pdf_inspector::{
-    detect_pdf_type_mem, PageOcrReasons, OCR_REASON_INVISIBLE_TEXT_LAYER, OCR_REASON_SCANNED,
-    OCR_REASON_VECTOR_TEXT,
+    detect_pdf_type_mem, detect_pdf_type_mem_with_config, PageOcrReasons,
+    OCR_REASON_INVISIBLE_TEXT_LAYER, OCR_REASON_SCANNED, OCR_REASON_VECTOR_TEXT,
 };
 use pdf_inspector::{
     extract_tables_in_regions_mem_in_frame, extract_text_in_regions_mem_in_frame,
@@ -3255,8 +3255,8 @@ fn test_id_name_is_not_inline_image_data() {
 /// `invisible_text_layer`, the other pages `scanned`.
 #[test]
 fn test_hidden_layer_page_outside_the_sample_reports_its_reason() {
-    // Twelve pages sample as 1–7 and 12; page 9 is not read for
-    // classification.
+    // Twelve pages, sampled eight at a time — 1–7 and 12 — so that page 9
+    // is not read for classification, whatever the default strategy.
     let image_only = GlyphLayerPage {
         layer_mode: None,
         ..SCAN_WITH_INVISIBLE_LAYER
@@ -3264,8 +3264,12 @@ fn test_hidden_layer_page_outside_the_sample_reports_its_reason() {
     let mut pages = [image_only; 12];
     pages[8] = SCAN_WITH_INVISIBLE_LAYER;
     let buf = make_pdf_with_glyph_layer(&pages);
+    let sample_of_eight = || DetectionConfig {
+        strategy: ScanStrategy::Sample(8),
+        ..DetectionConfig::default()
+    };
 
-    let detected = detect_pdf_type_mem(&buf).unwrap();
+    let detected = detect_pdf_type_mem_with_config(&buf, sample_of_eight()).unwrap();
     assert_eq!(detected.pdf_type, PdfType::Scanned);
     assert_eq!(detected.pages_sampled, 8);
     assert_eq!(detected.pages_needing_ocr, (1..=12).collect::<Vec<u32>>());
@@ -3281,7 +3285,8 @@ fn test_hidden_layer_page_outside_the_sample_reports_its_reason() {
         );
     }
 
-    let processed = process_pdf_mem(&buf).unwrap();
+    let processed =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().detection(sample_of_eight())).unwrap();
     assert_eq!(processed.pdf_type, PdfType::Scanned);
     assert_eq!(
         processed

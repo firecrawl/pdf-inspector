@@ -1,7 +1,8 @@
 //! What the executed-content scan reads operators through: a copy of the
 //! stream with its strings, comments and inline image data blanked, and
 //! the operand lookbacks — numbers, a name, how much text a show operator
-//! has to show — that the scan runs on it.
+//! has to show — that the scan runs on it. Whitespace throughout is the
+//! file format's: NUL, TAB, LF, FF, CR and SPACE.
 
 use super::{is_pdf_name_delimiter, is_pdf_whitespace};
 
@@ -174,7 +175,7 @@ pub(super) fn numeric_operands_before<const N: usize>(
     let mut values = [0.0f64; N];
     let mut end = op_pos;
     for value in values.iter_mut().rev() {
-        while end > floor && content[end - 1].is_ascii_whitespace() {
+        while end > floor && is_pdf_whitespace(content[end - 1]) {
             end -= 1;
         }
         let mut start = end;
@@ -193,12 +194,12 @@ pub(super) fn numeric_operands_before<const N: usize>(
     Some(values)
 }
 
-/// The name operand (`/Name`, given without its slash) before the operator
-/// at `op_pos`; `None` when the token there is not a name or the lookback
-/// would cross `floor`.
+/// The name operand (`/Name`, given without its slash, its escapes
+/// decoded) before the operator at `op_pos`; `None` when the token there
+/// is not a name or the lookback would cross `floor`.
 pub(super) fn name_operand_before(content: &[u8], op_pos: usize, floor: usize) -> Option<Vec<u8>> {
     let mut end = op_pos;
-    while end > floor && content[end - 1].is_ascii_whitespace() {
+    while end > floor && is_pdf_whitespace(content[end - 1]) {
         end -= 1;
     }
     let mut start = end;
@@ -206,7 +207,39 @@ pub(super) fn name_operand_before(content: &[u8], op_pos: usize, floor: usize) -
         start -= 1;
     }
     (start > floor && start < end && content[start - 1] == b'/')
-        .then(|| content[start..end].to_vec())
+        .then(|| decode_name_escapes(&content[start..end]))
+}
+
+/// The bytes a name written in a content stream stands for: each `#xx` —
+/// a `#` and two hex digits — decoded to the byte it spells, as the
+/// parser decodes the names that key a resource dictionary, so that
+/// `/Im#30 Do` finds the `Im0` the resources bind. A `#` not followed by
+/// two hex digits is kept as it is.
+pub(super) fn decode_name_escapes(name: &[u8]) -> Vec<u8> {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut decoded = Vec::with_capacity(name.len());
+    let mut i = 0;
+    while i < name.len() {
+        if name[i] == b'#' {
+            if let (Some(&high), Some(&low)) = (name.get(i + 1), name.get(i + 2)) {
+                if let (Some(high), Some(low)) = (hex(high), hex(low)) {
+                    decoded.push(high << 4 | low);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        decoded.push(name[i]);
+        i += 1;
+    }
+    decoded
 }
 
 /// How many bytes of text the operand of the show operator at `op_pos`
@@ -242,7 +275,7 @@ pub(super) fn show_operand_text_bytes(
     }
 
     let mut close = op_pos;
-    while close > floor && masked[close - 1].is_ascii_whitespace() {
+    while close > floor && is_pdf_whitespace(masked[close - 1]) {
         close -= 1;
     }
     if close == floor {

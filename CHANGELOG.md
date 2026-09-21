@@ -124,12 +124,12 @@ Changes since 1.22.1.
   pattern whose cell draws one; images bound but never drawn, and
   forms never invoked, do not count; a page whose forms outrun the scan's
   budget of invocations or of bytes executed is not flagged), for OCR
-  with the new reason
-  `invisible_text_layer`
-  (`OCR_REASON_INVISIBLE_TEXT_LAYER`) — in `pdf_type`, `pages_needing_ocr`,
-  `ocr_reasons_by_page` and per-page `needs_ocr`/`ocr_reason` alike, for
-  the pages a sample left out as well, and first among a page's reasons
-  on both surfaces. Mode-7 text that an
+  with the new reason `invisible_text_layer`
+  (`OCR_REASON_INVISIBLE_TEXT_LAYER`): the reason appears in
+  `pages_needing_ocr`/`ocr_reasons_by_page` and in the per-page
+  `needs_ocr`/`ocr_reason`, for the pages a sample left out as well, and
+  first among a page's reasons on both surfaces; the classification
+  (`pdf_type`) changes in response. Mode-7 text that an
   image, a shading, a painted path or visible text is later drawn through
   — a title filled with a picture — is visible and not counted, its
   glyphs placed by the text-positioning operators and the font size
@@ -141,7 +141,9 @@ Changes since 1.22.1.
   follows them, so text saying `3 Tr` sets no render mode and `(a)Tj(b)Tj`
   shows twice; text shown with the `'` and `"` operators counts as text,
   here and in the text-operator tallies, which had always missed it,
-  while a show operator with nothing to show does not count in either.
+  while a show operator with nothing to show does not count in either;
+  a name written with `#xx` escapes (`/Im#30 Do`) finds the resource it
+  names, and NUL separates operands as the other whitespace bytes do.
   A page whose layer is painted, a page with a visible
   caption over its image, invisible text with no image under it and an
   image with no text keep their classification and reasons; what is

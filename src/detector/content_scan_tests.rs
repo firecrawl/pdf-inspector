@@ -1,7 +1,7 @@
 //! Tests of the executed-content scan, and of the invisible-text-layer
 //! signal `analyze_page_content` builds on it.
 
-use super::super::content_mask::inline_image_data_bound;
+use super::super::content_mask::{decode_name_escapes, inline_image_data_bound};
 use super::super::{
     analyze_page_content, detect_from_document, page_ocr_reasons, page_ocr_signals,
     DetectionConfig, PdfType,
@@ -1235,4 +1235,120 @@ fn a_form_past_the_budget_is_refused_before_it_is_decoded() {
         assert!(!state.incomplete);
         assert_eq!(state.executed_form_bytes, cell.len());
     }
+}
+
+/// A name written with `#xx` escapes names the same resource as one
+/// written plainly: `/Im#30` is `Im0`, for an image, a form, a pattern
+/// and a font alike; a `#` not followed by two hex digits is kept.
+#[test]
+fn names_written_with_escapes_find_their_resources() {
+    assert_eq!(decode_name_escapes(b"Im#30"), b"Im0");
+    assert_eq!(decode_name_escapes(b"#46#6d#30"), b"Fm0");
+    assert_eq!(decode_name_escapes(b"A#2"), b"A#2");
+    assert_eq!(decode_name_escapes(b"A#zz"), b"A#zz");
+    assert_eq!(decode_name_escapes(b"plain"), b"plain");
+
+    let form = TestForm {
+        name: "Fm0",
+        content: "q 612 0 0 792 0 0 cm /Im#30 Do Q",
+        ..PAGE_FORM
+    };
+    let pattern = TestPattern {
+        name: "PImage",
+        content: "q 612 0 0 792 0 0 cm /Im0 Do Q",
+        shading: false,
+    };
+    let (mut doc, page_id, content_id) =
+        synthetic_page_with_patterns(true, false, &[form], &[pattern]);
+    let covered = |content: &str| executed(&doc, page_id, &[content]).2;
+    assert!(close(
+        covered("q 612 0 0 792 0 0 cm /Im#30 Do Q"),
+        PAGE_AREA
+    ));
+    assert!(close(covered("/Fm#30 Do"), PAGE_AREA));
+    assert!(close(
+        covered("/Pattern cs /P#49mage scn 0 0 612 792 re f"),
+        PAGE_AREA
+    ));
+    assert!(close(covered("q 612 0 0 792 0 0 cm /Im#31 Do Q"), 0.0));
+
+    let mut fonts = HashSet::new();
+    let empty = Document::new();
+    let mut state = ContentScanState::new(&empty, PageBox::LETTER, false);
+    scan_content_stream(
+        b"BT /F#31 12 Tf (a) Tj ET",
+        &mut HashSet::new(),
+        &mut fonts,
+        &mut state,
+        &[],
+    );
+    assert!(fonts.contains(b"F1".as_slice()));
+
+    // A scan drawn by its escaped name under a hidden layer is a layer
+    // nobody sees.
+    set_page_content(
+        &mut doc,
+        content_id,
+        &format!("q 612 0 0 792 0 0 cm /Im#30 Do Q\n{}", glyph_layer(3)),
+    );
+    let analysis = analyze_page_content(&doc, page_id);
+    assert!(analysis.has_covering_image && analysis.has_invisible_text_layer);
+    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+}
+
+/// NUL separates operands and operators as the other whitespace bytes of
+/// the file format do — in the scan's token boundaries and in every
+/// operand lookback: numbers, names, show operands, font names.
+#[test]
+fn nul_is_whitespace_between_operands() {
+    let content = b"BT\0/F1\x0012\0Tf\x003\0Tr\0(a)\0Tj\0[(b)]\0TJ\0ET";
+    let mut fonts = HashSet::new();
+    let doc = Document::new();
+    let mut state = ContentScanState::new(&doc, PageBox::LETTER, false);
+    let counts = scan_content_stream(content, &mut HashSet::new(), &mut fonts, &mut state, &[]);
+    assert_eq!(counts.text_ops, 2);
+    assert_eq!(counts.font_changes, 1);
+    assert!(fonts.contains(b"F1".as_slice()));
+    assert_eq!(state.executed_hidden_text_ops, 2, "`3 Tr` read across NULs");
+    assert_eq!(state.font_size, Some(12.0));
+
+    let (doc, page_id, _) = synthetic_page(true, false, &[]);
+    let (executed_ops, hidden, covered) = executed(
+        &doc,
+        page_id,
+        &["q\x00612\x000\x000\x00792\x000\x000\x00cm\x00/Im0\x00Do\x00Q\x00BT\x007\x00Tr\x00/F1\x0010\x00Tf\x0072\x00700\x00Td\x00(a)\x00Tj\x00ET"],
+    );
+    assert!(close(covered, PAGE_AREA), "`cm` and `Do` read across NULs");
+    assert_eq!(
+        (executed_ops, hidden),
+        (1, 1),
+        "placed and clip-only across NULs"
+    );
+}
+
+/// `q` and `Q` save and restore the text state with the rest of the
+/// graphics state — the render mode, the font size, the leading — so text
+/// shown after the `Q` that closes a `3 Tr` paints, as a renderer paints
+/// it.
+#[test]
+fn text_state_is_saved_and_restored_with_the_graphics_state() {
+    let (doc, page_id, _) = synthetic_page(false, false, &[]);
+    let page =
+        "q 3 Tr BT /F1 12 Tf 72 700 Td (hidden) Tj ET Q BT /F1 12 Tf 72 680 Td (shown) Tj ET";
+    let (executed_ops, hidden, _) = executed(&doc, page_id, &[page]);
+    assert_eq!(executed_ops, 2);
+    assert_eq!(
+        hidden, 1,
+        "the second string paints once the `Q` restores mode 0"
+    );
+    assert!(hidden < executed_ops);
+
+    let state = executed_state(&doc, page_id, &["/F1 12 Tf 14 TL q /F1 36 Tf 40 TL 7 Tr Q"]);
+    assert_eq!(state.render_mode, 0);
+    assert_eq!(state.font_size, Some(12.0));
+    assert_eq!(state.leading, 14.0);
 }

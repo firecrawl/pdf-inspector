@@ -15,7 +15,10 @@ use super::content_resources::{
     decoded_within, numbers_of, pattern_type, resolve_pattern, resolve_xobject, stream_resources,
     XObjectDrawn,
 };
-use super::{collect_text_chars_before, extract_font_name_before_tf, preceding_operand_closer};
+use super::{
+    collect_text_chars_before, extract_font_name_before_tf, is_pdf_whitespace,
+    preceding_operand_closer,
+};
 use crate::extractor::{visible_page_box, PageBox};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -1147,17 +1150,18 @@ fn scan_masked_content<'a>(
     let mut counts = ContentCounts::default();
     let ops: &[u8] = masked;
 
-    // Helper: check if position is a word boundary (start of content or preceded by whitespace)
-    let is_word_start = |pos: usize| -> bool { pos == 0 || ops[pos - 1].is_ascii_whitespace() };
+    // Helper: check if position is a word boundary (start of content or
+    // preceded by whitespace — the file format's, NUL included).
+    let is_word_start = |pos: usize| -> bool { pos == 0 || is_pdf_whitespace(ops[pos - 1]) };
     // A token starts after whitespace or a closing delimiter (`(a)Tj`,
     // `[<41>]TJ`, `Q/Im0 Do`) and ends before whitespace, the end of the
     // stream or an opening delimiter (`Tf[`, `Tj(`, `cm/Im0`).
     let is_token_start = |pos: usize| -> bool {
-        pos == 0 || ops[pos - 1].is_ascii_whitespace() || matches!(ops[pos - 1], b')' | b']' | b'>')
+        pos == 0 || is_pdf_whitespace(ops[pos - 1]) || matches!(ops[pos - 1], b')' | b']' | b'>')
     };
     let is_token_end = |pos: usize| -> bool {
         pos + 1 >= ops.len()
-            || ops[pos + 1].is_ascii_whitespace()
+            || is_pdf_whitespace(ops[pos + 1])
             || matches!(ops[pos + 1], b'/' | b'[' | b'(' | b'<' | b'%')
     };
     // Whether the operator `token` sits at `pos`, on token boundaries.

@@ -1842,7 +1842,7 @@ fn preceding_operand_closer(content: &[u8], op_pos: usize, floor: usize) -> bool
     let mut j = op_pos;
     while j > floor {
         j -= 1;
-        if !content[j].is_ascii_whitespace() {
+        if !is_pdf_whitespace(content[j]) {
             return matches!(content[j], b')' | b'>' | b']');
         }
     }
@@ -1855,13 +1855,15 @@ fn preceding_operand_closer(content: &[u8], op_pos: usize, floor: usize) -> bool
 /// We scan backward from the position of 'T' in 'Tf' past the size number and
 /// whitespace to find the `/Name` token.
 ///
-/// Returns the font name bytes (without the leading `/`), e.g. `b"F1"` for `/F1`.
-/// `floor` is the start of the previous text/font operator (or 0); lookback
-/// must not cross it.
+/// Returns the font name bytes (without the leading `/`, its `#xx` escapes
+/// decoded as the resource dictionary's keys are), e.g. `b"F1"` for `/F1`
+/// or `/F#31`. `floor` is the start of the previous text/font operator (or
+/// 0); lookback must not cross it. Whitespace is the file format's, NUL
+/// included.
 fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> Option<Vec<u8>> {
     // Scan backward past whitespace before "Tf"
     let mut j = tf_pos;
-    while j > floor && content[j - 1].is_ascii_whitespace() {
+    while j > floor && is_pdf_whitespace(content[j - 1]) {
         j -= 1;
     }
     // Scan backward past the size number (digits, '.', '-')
@@ -1871,15 +1873,14 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> O
         j -= 1;
     }
     // Scan backward past whitespace between font name and size
-    while j > floor && content[j - 1].is_ascii_whitespace() {
+    while j > floor && is_pdf_whitespace(content[j - 1]) {
         j -= 1;
     }
     // Now j should point just after the font name. Scan backward to find '/'.
     let name_end = j;
     while j > floor && content[j - 1] != b'/' {
         // Font names consist of regular characters (not whitespace, not delimiters)
-        if content[j - 1].is_ascii_whitespace() || content[j - 1] == b'(' || content[j - 1] == b')'
-        {
+        if is_pdf_whitespace(content[j - 1]) || content[j - 1] == b'(' || content[j - 1] == b')' {
             return None;
         }
         j -= 1;
@@ -1889,7 +1890,7 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> O
     }
     // j-1 is the '/', font name is content[j..name_end]
     if j < name_end {
-        Some(content[j..name_end].to_vec())
+        Some(content_mask::decode_name_escapes(&content[j..name_end]))
     } else {
         None
     }
@@ -1907,11 +1908,12 @@ fn collect_text_chars_before(
     unique_chars: &mut HashSet<u8>,
     floor: usize,
 ) {
-    // Walk backward past whitespace to find the closing delimiter
+    // Walk backward past whitespace (the file format's, NUL included) to
+    // find the closing delimiter
     let mut j = op_pos;
     while j > floor {
         j -= 1;
-        if !content[j].is_ascii_whitespace() {
+        if !is_pdf_whitespace(content[j]) {
             break;
         }
     }
