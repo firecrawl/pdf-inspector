@@ -756,7 +756,11 @@ fn joins_number(c: char) -> bool {
 /// them when they are. Each item then takes the next stretch of the
 /// logical line, as long as its own text, so a bracket pair split across
 /// runs — `(IFRS` and `16)` painted as separate words — keeps both runs
-/// whole. Items without a single character (empty text) follow the others
+/// whole. An item of combining marks alone — a point or a vowel sign shown
+/// apart from its letter, over the lettered item before it in screen order
+/// and inside that item's advance — is that letter's own characters and
+/// follows it in the reading, whichever way the stretch reads. Items
+/// without a single character (empty text) follow the others
 /// in screen order.
 pub(crate) fn logical_line_order<T>(
     items: &[T],
@@ -835,6 +839,29 @@ pub(crate) fn logical_line_order<T>(
         let mut run: Vec<usize> = (run_start..k).filter(|&i| counts[i] > 0).collect();
         let left = (0..run_start).rev().find(|&i| lettered(i));
         let right = (k..items.len()).find(|&i| lettered(i));
+        // Combining marks shown as items of their own over the lettered
+        // item to their left, inside its advance, are that letter's own
+        // characters and follow it in the reading, whichever way the
+        // stretch reads; the rest of the run is placed by its neighbours.
+        if let Some(l) = left {
+            let (left_x, left_width) = span_of(&items[l]);
+            let over_left = |i: usize| {
+                let (x, _) = span_of(&items[i]);
+                text_of(&items[i]).chars().all(is_combining_mark)
+                    && x >= left_x.min(left_x + left_width)
+                    && x < left_x.max(left_x + left_width)
+            };
+            let marks = run.iter().take_while(|&&i| over_left(i)).count();
+            if marks > 0 {
+                let at = reading.iter().position(|&r| r == l).map_or(0, |p| p + 1);
+                for (offset, i) in run.drain(..marks).enumerate() {
+                    reading.insert(at + offset, i);
+                }
+                if run.is_empty() {
+                    continue;
+                }
+            }
+        }
         let place = |i: usize| reading.iter().position(|&r| r == i).unwrap_or(0);
         let (insert_at, reversed) = match (left, right) {
             // Between two lettered items: right after the one read first,
@@ -1145,6 +1172,61 @@ mod tests {
                 (0, "\u{05E2}\u{05D5}\u{05DC}\u{05DD}".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn a_vowel_sign_shown_apart_follows_its_letter_in_the_reading() {
+        // A pointed word one glyph per item in screen order, the sign an
+        // item of its own over the second letter, inside its advance: the
+        // sign follows that letter in the reading, not the letter read
+        // before it, whether the items' texts are visual or logical.
+        let items = [
+            ("\u{05DC}", 110.0f32, 10.0f32),
+            ("\u{05D0}", 120.0, 10.0),
+            ("\u{05B8}", 124.0, 0.0),
+            ("\u{05D1}", 130.0, 10.0),
+        ];
+        for visual in [false, true] {
+            let order = logical_line_order(
+                &items,
+                |i| i.0,
+                |i| (i.1, i.2),
+                |_| 12.0,
+                |_| visual,
+                None,
+                true,
+            );
+            assert_eq!(
+                order,
+                vec![
+                    (3, "\u{05D1}".to_string()),
+                    (1, "\u{05D0}".to_string()),
+                    (2, "\u{05B8}".to_string()),
+                    (0, "\u{05DC}".to_string()),
+                ],
+                "visual={visual}"
+            );
+        }
+        // A sign shown before its letter, at the letter's own x, is not
+        // over the letter to its left, and its neighbours place it as
+        // before: after the letter read first of the two.
+        let items = [
+            ("\u{05DC}", 110.0f32, 10.0f32),
+            ("\u{05B8}", 120.0, 0.0),
+            ("\u{05D0}", 120.0, 10.0),
+            ("\u{05D1}", 130.0, 10.0),
+        ];
+        let order = logical_line_order(
+            &items,
+            |i| i.0,
+            |i| (i.1, i.2),
+            |_| 12.0,
+            |_| false,
+            None,
+            true,
+        );
+        let reading: Vec<usize> = order.iter().map(|(index, _)| *index).collect();
+        assert_eq!(reading, [3, 2, 1, 0]);
     }
 
     #[test]

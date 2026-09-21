@@ -445,9 +445,13 @@ fn lower_median(sorted: &[f32]) -> f32 {
 /// word-gap threshold, such offsets make a word of every letter; the caller
 /// judges each offset over the tracking instead, so the letter gaps stay
 /// inside the word and only a gap wider by a word gap ends it. A dependent
-/// sign placed over the letter before it with an offset each way (see
-/// [`is_dependent_sign`] and [`PenHighWater`]) is not a letter of the run:
-/// its offsets net into the junction around it.
+/// sign (see [`is_dependent_sign`]) bracketed by one offset on each side —
+/// its placement over the letter before it and the return (see
+/// [`PenHighWater`]) — is not a letter of the run: the two offsets net
+/// into that junction's one offset. A sign arranged any other way — two
+/// numbers before it, no number on one side, another sign beside it — is
+/// a string of the run like any other, and the rules below judge the
+/// numbers around it as they stand.
 ///
 /// The run's own offsets tell letter gaps from word gaps: the letter gaps
 /// cluster around one value and a word gap stands a space width above the
@@ -482,16 +486,22 @@ pub(crate) fn tj_tracking(
     space_threshold: f32,
     mut decode: impl FnMut(&Object) -> Option<(String, bool)>,
 ) -> Option<f32> {
-    // Junction gaps between consecutive glyph strings, positive when the
-    // offset widens the gap (a negative `TJ` number moves the pen on).
-    let mut gaps: Vec<f32> = Vec::new();
-    let mut strings: Vec<&Object> = Vec::new();
-    let mut pending = 0.0f32;
-    let mut numbers_since_string = 0usize;
+    /// An element of the array as the reader walks it: an offset, or a
+    /// string that shows something.
+    #[derive(Clone, Copy)]
+    enum Element<'a> {
+        Offset(f32),
+        /// A non-empty string, and whether it shows a dependent sign.
+        String {
+            object: &'a Object,
+            raw: &'a [u8],
+            sign: bool,
+        },
+    }
+    let mut elements: Vec<Element<'_>> = Vec::with_capacity(array.len());
     for element in array {
         if let Some(offset) = get_number(element) {
-            pending -= offset;
-            numbers_since_string += 1;
+            elements.push(Element::Offset(offset));
             continue;
         }
         let Some(raw) = get_operand_bytes(element) else {
@@ -500,13 +510,58 @@ pub(crate) fn tj_tracking(
         if raw.is_empty() {
             continue;
         }
-        // A dependent sign is no letter of the run: its offsets net into
-        // the gap around it, and the number on either side of it is one
-        // offset apiece.
-        if is_dependent_sign(raw, font_info) {
-            numbers_since_string = numbers_since_string.saturating_sub(1);
-            continue;
+        elements.push(Element::String {
+            object: element,
+            raw,
+            sign: is_dependent_sign(raw, font_info),
+        });
+    }
+    // A dependent sign with exactly one offset before it since the string
+    // before, and exactly one after it before the string after — its
+    // placement and the return — folds into that junction: the two offsets
+    // net into one. Any other arrangement leaves the sign a string of the
+    // run, and its numbers where they are.
+    let is_letters = |element: Option<&Element<'_>>| {
+        matches!(element, None | Some(Element::String { sign: false, .. }))
+    };
+    let mut folded: Vec<Element<'_>> = Vec::with_capacity(elements.len());
+    let mut index = 0;
+    while index < elements.len() {
+        if let Element::String { sign: true, .. } = elements[index] {
+            if let (Some(Element::Offset(_)), Some(Element::Offset(on))) = (
+                index.checked_sub(1).map(|at| &elements[at]),
+                elements.get(index + 1),
+            ) {
+                if is_letters(index.checked_sub(2).map(|at| &elements[at]))
+                    && is_letters(elements.get(index + 2))
+                {
+                    if let Some(Element::Offset(back)) = folded.last_mut() {
+                        *back += on;
+                        index += 2;
+                        continue;
+                    }
+                }
+            }
         }
+        folded.push(elements[index]);
+        index += 1;
+    }
+
+    // Junction gaps between consecutive glyph strings, positive when the
+    // offset widens the gap (a negative `TJ` number moves the pen on).
+    let mut gaps: Vec<f32> = Vec::new();
+    let mut strings: Vec<&Object> = Vec::new();
+    let mut pending = 0.0f32;
+    let mut numbers_since_string = 0usize;
+    for element in folded {
+        let (object, raw) = match element {
+            Element::Offset(offset) => {
+                pending -= offset;
+                numbers_since_string += 1;
+                continue;
+            }
+            Element::String { object, raw, .. } => (object, raw),
+        };
         if !is_single_glyph(raw, font_info) {
             return None;
         }
@@ -518,7 +573,7 @@ pub(crate) fn tj_tracking(
         }
         pending = 0.0;
         numbers_since_string = 0;
-        strings.push(element);
+        strings.push(object);
     }
     if gaps.len() < 2 || gaps.iter().any(|gap| *gap < 0.0) {
         return None;
@@ -1244,6 +1299,10 @@ mod tests {
             Some(250.0)
         );
         assert_eq!(
+            tracking_with_sign("(V) -250 (A) 223 (^) -471 (L) -250 (L) -250 (E) -250 (Y)"),
+            Some(250.0)
+        );
+        assert_eq!(
             tracking_with_sign("(V) -250 (A) 200 (^) -400 -50 (L) -250 (L) -250 (E) -250 (Y)"),
             None
         );
@@ -1253,6 +1312,39 @@ mod tests {
         );
         assert_eq!(
             tracking_with_sign("(V) -250 (A) 200 (~) -450 (L) -250 (L) -250 (E) -250 (Y)"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_sign_folds_only_when_one_offset_brackets_it_on_each_side() {
+        // Two numbers before the sign and none after: the junction before
+        // the sign is an offset written as several numbers, whatever the
+        // sign, and the run is not tracked. Nor is it with two numbers
+        // before the sign and one after.
+        let font = font_with_sign();
+        let threshold = word_gap_threshold(Some(&font));
+        let tracking_with_sign = |spec: &str| tj_tracking(&tj(spec), Some(&font), threshold, latin);
+        assert_eq!(
+            tracking_with_sign("(V) -250 (A) -100 -150 (^) (L) -250 (L) -250 (E) -250 (Y)"),
+            None
+        );
+        assert_eq!(
+            tracking_with_sign("(V) -250 (A) 100 100 (^) -100 (L) -250 (L) -250 (E) -250 (Y)"),
+            None
+        );
+        // No offset before the sign: the sign is a string of the run as it
+        // always was, the junction after it one offset of -250 like the
+        // others — and the sign's glyph is no letter of a tracked title,
+        // so the run keeps the fixed thresholds as before.
+        assert_eq!(
+            tracking_with_sign("(V) -250 (A) (^) -250 (L) -250 (L) -250 (E) -250 (Y)"),
+            None
+        );
+        assert_eq!(tracking_with_sign("(V) (^) -5 (A)"), None);
+        // Two signs in a row with numbers between them: neither folds.
+        assert_eq!(
+            tracking_with_sign("(V) -250 (A) 200 (^) 30 (^) -480 (L) -250 (L) -250 (E) -250 (Y)"),
             None
         );
     }

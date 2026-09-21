@@ -1879,7 +1879,8 @@ fn merge_text_items_with_clips(
         /// For a `bidi` line, each fragment's position in screen order.
         display_index: Vec<usize>,
         /// For a `bidi` line, the gap between each pair of screen
-        /// neighbours, in points, by screen position.
+        /// neighbours, in points, by screen position: from the line's right
+        /// edge so far, which a dependent sign does not move.
         display_gaps: Vec<f32>,
         /// For a `bidi` line shown one glyph per fragment, the word-gap
         /// floor its own gaps give (`glyph_run_word_gap_floor`), in em of
@@ -1913,22 +1914,36 @@ fn merge_text_items_with_clips(
                 |i| *i,
                 page_rtl.get(&page).copied().unwrap_or(false),
             );
-            group.sort_by(|a, b| a.x.total_cmp(&b.x));
+            // Screen order, with a dependent sign kept after the letter it
+            // was shown on, as on a left-to-right line.
+            sort_along_x_keeping_marks(&mut group);
             // The gaps between screen neighbours, taken once here: two
             // glyphs at one x (a mark over its letter) sort either way, and
-            // the reading order below must index the same sequence.
-            display_gaps = group
-                .windows(2)
-                .map(|pair| pair[1].x - (pair[0].x + effective_merge_width(pair[0])))
-                .collect();
+            // the reading order below must index the same sequence. A
+            // dependent sign sits behind the pen and does not move the
+            // line's right edge: the fragment after it is measured from
+            // where the letter under it left the pen.
+            display_gaps = Vec::with_capacity(group.len().saturating_sub(1));
+            let mut right_edge: Option<f32> = None;
+            for item in &group {
+                let end = item.x + effective_merge_width(item);
+                if let Some(edge) = right_edge {
+                    display_gaps.push(item.x - edge);
+                }
+                right_edge = Some(match right_edge {
+                    Some(edge) if is_zero_width_mark(item) => edge.max(end),
+                    _ => end,
+                });
+            }
             // Glyph-by-glyph positioned RTL text clusters into words by the
             // line's own gaps: adjacent glyphs abut, word gaps do not, with
             // the floor below where declared widths are off. Junctions
             // inside a number are never word gaps and say nothing about the
             // letters' gaps either (digits of another font keep true
-            // widths), so they stay out of the sample. The same floor
-            // separates the words for the bidi analysis and, below, for the
-            // merge.
+            // widths), so they stay out of the sample, and so do the
+            // junctions at a dependent sign, which is no letter of the
+            // line. The same floor separates the words for the bidi
+            // analysis and, below, for the merge.
             let single_glyphs = group
                 .iter()
                 .filter(|i| i.text.trim().chars().count() == 1)
@@ -1937,7 +1952,11 @@ fn merge_text_items_with_clips(
                 let gaps: Vec<f32> = group
                     .windows(2)
                     .zip(&display_gaps)
-                    .filter(|(pair, _)| !inside_number(&pair[0].text, &pair[1].text))
+                    .filter(|(pair, _)| {
+                        !inside_number(&pair[0].text, &pair[1].text)
+                            && !is_zero_width_mark(pair[0])
+                            && !is_zero_width_mark(pair[1])
+                    })
                     .map(|(pair, gap)| gap / pair[0].font_size.min(pair[1].font_size).max(1.0))
                     .collect();
                 glyph_floor = glyph_run_word_gap_floor(&gaps);
@@ -5310,6 +5329,48 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "HO\u{0301}\u{0300}W");
+    }
+
+    /// A pointed right-to-left word shown one glyph per item by a producer
+    /// walking the line right to left: the first letter, then the second
+    /// with its vowel sign 0.3 em behind the pen, then the third.
+    fn pointed_rtl_word() -> Vec<TextItem> {
+        vec![
+            make_merge_item("\u{05D1}", 130.0, 6.0),
+            make_merge_item("\u{05D0}", 124.0, 6.0),
+            make_merge_item("\u{05B8}", 126.4, 0.0),
+            make_merge_item("\u{05DC}", 118.0, 6.0),
+        ]
+    }
+
+    #[test]
+    fn a_sign_on_a_right_to_left_line_follows_its_letter_in_the_reading() {
+        // The sign follows the letter it was shown on once the line is
+        // read into logical order, with no space on either side, whether
+        // the page stores its runs in visual or in logical order.
+        for visual in [false, true] {
+            let merged = merge_text_items_with_clips(pointed_rtl_word(), &[], visual, &[]);
+            assert_eq!(merged.len(), 1, "visual={visual}: {merged:?}");
+            assert_eq!(
+                merged[0].text, "\u{05D1}\u{05D0}\u{05B8}\u{05DC}",
+                "visual={visual}"
+            );
+        }
+        // The next letter kerned in over the end of the pointed one, the
+        // sign a hair past it in x: the sign still sorts after its letter.
+        let mut items = pointed_rtl_word();
+        items[0].x = 129.7;
+        items[2].x = 129.8;
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "\u{05D1}\u{05D0}\u{05B8}\u{05DC}");
+        // A quarter em from the sign's letter to the next is a word gap,
+        // measured from the letter, not from the sign behind the pen.
+        let mut items = pointed_rtl_word();
+        items[3].x = 115.0;
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "\u{05D1}\u{05D0}\u{05B8} \u{05DC}");
     }
 
     #[test]
