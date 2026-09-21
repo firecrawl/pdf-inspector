@@ -38,6 +38,7 @@ Changes since 1.22.1.
   3), the convention of OCR layers; the same words shown visibly would
   display backwards, and such a page now reads as visual storage like any
   other visible page.
+  ([#561](https://github.com/firecrawl/pdf-inspector/pull/561))
 
 ## [1.22.1] - 2026-09-20
 
