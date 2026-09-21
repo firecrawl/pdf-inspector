@@ -122,6 +122,7 @@ Changes since 1.22.1.
   A page whose layer is painted, a page with a visible caption over its
   image, invisible text with no image under it and an image with no text
   keep their classification and reasons; what is extracted is unchanged.
+  ([#566](https://github.com/firecrawl/pdf-inspector/pull/566))
 
 ## [1.22.1] - 2026-09-20
 
