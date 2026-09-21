@@ -180,15 +180,18 @@ fn destination_is_control(text: &str) -> bool {
 }
 
 /// Repair the control destinations of `target`, a CMap read from a
-/// ToUnicode stream, from the font itself: give the codes the text the
-/// `sources` — the font's own readings, in order: the fallback the entry
-/// keeps (the CID collection's reading when the font has one, else the
-/// embedded program's), then the program's reading when it is not that
-/// fallback — have for them, then the reading of the encoding a simple
-/// font declares by name, then, in `program` — the font's embedded
-/// program, read once by the caller — a space for each remaining code of a
-/// Type0 font whose glyph has no outline but an advance. What nothing
-/// reads stays a control destination.
+/// ToUnicode stream, from the font itself, in this order: the reading of
+/// the encoding a simple font declares — by dictionary, whose
+/// `/Differences` name the glyph a code selects, or by name — since that
+/// is how such a font reaches a code's glyph, whatever its program's cmap
+/// holds at the raw code; then the text the `sources` — the font's own
+/// readings: the fallback the entry keeps (the CID collection's reading
+/// when the font has one, else the embedded program's), then the program's
+/// reading when it is not that fallback — have for the codes still left;
+/// then, in `program` — the font's embedded program, read once by the
+/// caller — a space for each remaining code of a Type0 font whose glyph
+/// has no outline but an advance. What nothing reads stays a control
+/// destination.
 fn repair_control_destinations(
     target: &mut ToUnicodeCMap,
     sources: &[&ToUnicodeCMap],
@@ -200,20 +203,17 @@ fn repair_control_destinations(
     if before.is_empty() {
         return;
     }
+    for (code, text) in pdf_encoding_reading(font_dict, doc, &before) {
+        target.char_map.insert(code, text);
+    }
     for source in sources {
         target.recover_control_destinations(source);
     }
-    let remaining = target.control_destination_codes();
-    if !remaining.is_empty() {
-        for (code, text) in declared_encoding_reading(font_dict, doc, &remaining) {
-            target.char_map.insert(code, text);
-        }
-        if let Some(program) = program {
-            let remaining = target.control_destination_codes();
-            if !remaining.is_empty() {
-                for (code, text) in blank_cid_glyph_spaces(font_dict, doc, program, &remaining) {
-                    target.char_map.insert(code, text);
-                }
+    if let Some(program) = program {
+        let remaining = target.control_destination_codes();
+        if !remaining.is_empty() {
+            for (code, text) in blank_cid_glyph_spaces(font_dict, doc, program, &remaining) {
+                target.char_map.insert(code, text);
             }
         }
     }
@@ -325,13 +325,17 @@ fn cmap_entry_with_roles(
     )
 }
 
-/// The character each of `codes` stands for in the encoding a simple font
-/// declares by name (`/Encoding /WinAnsiEncoding`, written in place or as
-/// an indirect name object): the encoding selects the code's glyph, and so
-/// reads it, whatever the ToUnicode CMap says. Nothing for a font that
-/// declares no encoding, or one by dictionary (whose `/Differences` are
-/// read at decode time), or a Type0 font.
-fn declared_encoding_reading(
+/// What each of `codes` reads as through the encoding a simple font
+/// declares, which is how such a font selects a code's glyph — whatever
+/// the ToUnicode CMap says of the code, and whatever the program's cmap
+/// holds at the raw code. By dictionary, the `/Differences` name the glyph
+/// (a name of several letters, `f_f`, reads as them) and the
+/// `/BaseEncoding` names the rest; a code named by a name that reads as
+/// nothing is left as it is (see the decode-time rule). By name
+/// (`/Encoding /WinAnsiEncoding`, written in place or as an indirect name
+/// object), the named table reads the code. Nothing for a font that
+/// declares no encoding, or a Type0 font.
+fn pdf_encoding_reading(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
     codes: &[u16],
@@ -341,14 +345,27 @@ fn declared_encoding_reading(
         .ok()
         .and_then(|o| o.as_name().ok())
         .is_some_and(|name| name == b"Type0");
+    if is_type0 {
+        return Vec::new();
+    }
     let encoding = match font_dict.get(b"Encoding") {
         Ok(Object::Reference(r)) => doc.get_object(*r).ok(),
         Ok(other) => Some(other),
         Err(_) => None,
     };
-    if is_type0 || !matches!(encoding, Some(Object::Name(_))) {
-        return Vec::new();
+    match encoding {
+        Some(Object::Name(_)) => named_encoding_reading(font_dict, doc, codes),
+        Some(Object::Dictionary(_)) => dictionary_encoding_reading(font_dict, doc, codes),
+        _ => Vec::new(),
     }
+}
+
+/// [`pdf_encoding_reading`] for a font whose `/Encoding` is a name.
+fn named_encoding_reading(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    codes: &[u16],
+) -> Vec<(u16, String)> {
     let Ok(encoding @ (Encoding::OneByteEncoding(_) | Encoding::SimpleEncoding(_))) =
         font_dict.get_font_encoding(doc)
     else {
@@ -366,6 +383,36 @@ fn declared_encoding_reading(
                 }
                 _ => None,
             }
+        })
+        .collect()
+}
+
+/// [`pdf_encoding_reading`] for a font whose `/Encoding` is a dictionary:
+/// its `/Differences` first, then its `/BaseEncoding` for the printable
+/// codes the Differences leave alone.
+fn dictionary_encoding_reading(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    codes: &[u16],
+) -> Vec<(u16, String)> {
+    let Some(encoding) = crate::extractor::fonts::parse_font_encoding(doc, font_dict) else {
+        return Vec::new();
+    };
+    codes
+        .iter()
+        .filter_map(|&code| {
+            let byte = u8::try_from(code).ok()?;
+            if let Some(&ch) = encoding.map.get(&byte) {
+                return Some((code, ch.to_string()));
+            }
+            if let Some(text) = encoding.sequences.get(&byte) {
+                return Some((code, text.clone()));
+            }
+            if encoding.named_codes.contains(&byte) || byte < 0x20 {
+                return None;
+            }
+            let ch = encoding.base?.char_for(byte)?;
+            Some((code, ch.to_string()))
         })
         .collect()
 }
@@ -4011,6 +4058,55 @@ endbfrange
         let (text, stats) = cmap.decode_cids_with_stats(&[0, 1, 0, 9, 0, 9, 0, 9]);
         assert_eq!(text, "");
         assert_eq!(stats.unmapped, 3);
+    }
+
+    /// The promotion of a fallback with more entries than the ToUnicode
+    /// CMap over a sequential remap is the inline-CMap builder's alone: the
+    /// page-font collection never did it, and passes `promote` false. The
+    /// flag decides it, and the roles the repair follows move with it.
+    #[test]
+    fn the_promotion_over_a_sequential_remap_follows_the_promote_flag() {
+        let cmap_of = |codes: std::ops::Range<u16>| {
+            let mut cmap = ToUnicodeCMap::new();
+            cmap.code_byte_length = 2;
+            for code in codes {
+                cmap.char_map
+                    .insert(code, char::from(b'A' + (code % 26) as u8).to_string());
+            }
+            cmap.refresh_gap_fills();
+            cmap
+        };
+        // Twelve entries keep the ToUnicode CMap primary; the remap has as
+        // many, the fallback twenty.
+        let build = |promote: bool| {
+            cmap_entry_with_roles(
+                cmap_of(40..52),
+                Some(cmap_of(1..13)),
+                Some(cmap_of(1..21)),
+                0,
+                promote,
+            )
+        };
+        let (entry, roles) = build(false);
+        assert_eq!(entry.remapped.as_ref().map(|c| c.char_map.len()), Some(12));
+        assert_eq!(entry.fallback.as_ref().map(|c| c.char_map.len()), Some(20));
+        assert_eq!(
+            roles,
+            RepairRoles {
+                target: Some(CMapRole::Remapped),
+                source: Some(CMapRole::Fallback),
+            }
+        );
+        let (entry, roles) = build(true);
+        assert_eq!(entry.remapped.as_ref().map(|c| c.char_map.len()), Some(20));
+        assert_eq!(entry.fallback.as_ref().map(|c| c.char_map.len()), Some(12));
+        assert_eq!(
+            roles,
+            RepairRoles {
+                target: Some(CMapRole::Fallback),
+                source: Some(CMapRole::Remapped),
+            }
+        );
     }
 
     #[test]

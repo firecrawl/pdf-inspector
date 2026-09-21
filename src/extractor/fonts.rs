@@ -2328,13 +2328,28 @@ pub(crate) fn extract_text_from_operand(
                             CodeMapping::ControlDestination => control_destination = true,
                             CodeMapping::Text(_) | CodeMapping::Unmapped => {}
                         }
-                        // 2. Fallback CMap (embedded font cmap)
+                        // 2. For a code whose entry is a control destination,
+                        // the font's own encoding first: its Differences
+                        // name selects the glyph, whatever the program's cmap
+                        // holds at the raw code. (A code without any entry
+                        // keeps the order below.)
+                        if control_destination {
+                            if let Some(map) = encoding_map {
+                                if let Some(&ch) = map.differences.get(&b) {
+                                    return Some(ch.to_string());
+                                }
+                                if let Some(text) = map.sequences.get(&b) {
+                                    return Some(text.clone());
+                                }
+                            }
+                        }
+                        // 3. Fallback CMap (embedded font cmap)
                         if let Some(fb) = entry.fallback.as_ref().and_then(|c| c.lookup(code)) {
                             if !fb.contains('\u{FFFD}') {
                                 return Some(fb);
                             }
                         }
-                        // 3. Differences mapped it? Use Differences result
+                        // 4. Differences mapped it? Use Differences result
                         if let Some(map) = encoding_map {
                             if let Some(&ch) = map.differences.get(&b) {
                                 return Some(ch.to_string());
@@ -2351,7 +2366,7 @@ pub(crate) fn extract_text_from_operand(
                         if encoding_map.is_some_and(|map| map.named_codes.contains(&b)) {
                             return control_destination.then(|| "\u{FFFD}".to_string());
                         }
-                        // 4. The font's base encoding, for printable bytes
+                        // 5. The font's base encoding, for printable bytes
                         // (the predefined tables spell out the control
                         // codes too, and those are dropped like they are
                         // by the fallback below)
@@ -2363,7 +2378,7 @@ pub(crate) fn extract_text_from_operand(
                                 return Some(ch.to_string());
                             }
                         }
-                        // 5. Printable single-byte fallback — a guess at a
+                        // 6. Printable single-byte fallback — a guess at a
                         // code the CMap says nothing about, not at one it
                         // maps to no text
                         if b >= 0x20 && !control_destination {
@@ -5665,6 +5680,68 @@ mod tests {
         );
         assert_eq!(
             decode_page_font_string(&doc, tounicode_obj, page_id, false, &LIGATURE_INDEX_BYTES),
+            "co#ee"
+        );
+    }
+
+    /// A simple font with a dictionary encoding reaches a code's glyph by
+    /// its `/Differences` name, not through the program's cmap at the raw
+    /// code: for a control-destination code the Differences glyph wins
+    /// over the program's reading of the raw code, which serves only a
+    /// code the Differences leave alone.
+    #[test]
+    fn a_differences_glyph_wins_over_the_programs_reading_of_the_raw_code() {
+        // The program names glyph 0x23 `x`: read by the raw code, the
+        // ligature's code would be an x.
+        let mut names = vec![None; 0x25];
+        names[0x23] = Some("x");
+        let differences = Object::Dictionary(dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![
+                0x22.into(),
+                Object::Name(b"o".to_vec()),
+                Object::Name(b"f_f".to_vec()),
+            ],
+        });
+        assert_eq!(
+            decode_simple_font_string(
+                LIGATURE_INDEX_BFCHAR,
+                Some(sfnt_with_glyph_names(&names)),
+                Some(differences),
+                &LIGATURE_INDEX_BYTES
+            ),
+            "coffee"
+        );
+        // Without a Differences for the code, the program's reading of the
+        // raw code is what there is.
+        assert_eq!(
+            decode_simple_font_string(
+                LIGATURE_INDEX_BFCHAR,
+                Some(sfnt_with_glyph_names(&names)),
+                None,
+                &LIGATURE_INDEX_BYTES
+            ),
+            "coxee"
+        );
+    }
+
+    #[test]
+    fn a_control_destination_code_reads_through_the_dictionarys_base_encoding() {
+        // `/Encoding << /BaseEncoding /WinAnsiEncoding /Differences [...] >>`
+        // with Differences that leave code 0x23 alone: the base encoding
+        // names its glyph numbersign, and the code reads as '#'.
+        let encoding = Object::Dictionary(dictionary! {
+            "Type" => "Encoding",
+            "BaseEncoding" => "WinAnsiEncoding",
+            "Differences" => vec![0x22.into(), Object::Name(b"o".to_vec())],
+        });
+        assert_eq!(
+            decode_simple_font_string(
+                LIGATURE_INDEX_BFCHAR,
+                None,
+                Some(encoding),
+                &LIGATURE_INDEX_BYTES
+            ),
             "co#ee"
         );
     }
