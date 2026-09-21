@@ -198,6 +198,7 @@ Changes since 1.22.1.
   `has_encoding_issues` reports it; a single-byte code so mapped is no
   longer guessed from its byte value. Entries that map to TAB, LF or CR, and
   CMaps without such entries, read as before.
+  ([#567](https://github.com/firecrawl/pdf-inspector/pull/567))
 
 ## [1.22.1] - 2026-09-20
 
