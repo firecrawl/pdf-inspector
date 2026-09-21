@@ -9,6 +9,7 @@ use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+mod content_geometry;
 mod content_mask;
 mod content_resources;
 mod content_scan;
@@ -1768,11 +1769,16 @@ fn scan_xobjects_in_resources(
                     // page executes is followed from its own content, so
                     // this scan follows no `Do`.
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
+                    let own_resources: Vec<&lopdf::Dictionary> =
+                        content_resources::stream_resources(doc, stream)
+                            .into_iter()
+                            .collect();
                     counts.add(content_scan::scan_content_stream_alone(
                         doc,
                         &content,
                         unique_chars,
                         &mut xobj_font_names,
+                        &own_resources,
                     ));
 
                     // Resolve the Form XObject's /Resources — handle both inline
@@ -1826,7 +1832,7 @@ fn scan_content_for_text_operators(
 ) -> (u32, u32, u32, u32) {
     let doc = Document::new();
     let counts =
-        content_scan::scan_content_stream_alone(&doc, content, unique_chars, used_font_names);
+        content_scan::scan_content_stream_alone(&doc, content, unique_chars, used_font_names, &[]);
     (
         counts.text_ops,
         counts.image_count,

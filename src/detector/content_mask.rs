@@ -13,14 +13,25 @@ fn ends_token(byte: u8) -> bool {
     is_pdf_whitespace(byte) || matches!(byte, b'/' | b'[' | b'(' | b'<' | b'%')
 }
 
+/// How many components a colour space named in an inline image's header
+/// has, when the name is not a device space's — resolved by the scan in
+/// the resources in force; `None` when it cannot say.
+pub(super) type ColourSpaceComponents<'r> = &'r dyn Fn(&[u8]) -> Option<u32>;
+
 /// `content` with everything that is not an operator or its operands
 /// blanked to spaces, at the same offsets: the insides of literal strings
 /// (nesting and escapes honoured), of hex strings and of comments, and
 /// inline image data, from the `ID` of an inline image `BI` opened through
-/// its `EI`. The delimiters stay, so a string still closes an operand; the
-/// strings' bytes are read from the original when a text operator is
-/// found.
-pub(super) fn mask_strings_comments_and_inline_images(content: &[u8]) -> Vec<u8> {
+/// its `EI` — unfiltered data skipped by the length its header gives (see
+/// [`inline_image_data_length`]), so that an `EI` among its bytes ends
+/// nothing; filtered data, whose length is not known, to the first `EI`
+/// set off by whitespace. The delimiters stay, so a string still closes an
+/// operand; the strings' bytes are read from the original when a text
+/// operator is found.
+pub(super) fn mask_strings_comments_and_inline_images(
+    content: &[u8],
+    colour_space_components: ColourSpaceComponents<'_>,
+) -> Vec<u8> {
     /// Whether an operator token may begin at `i`: at the start, or after
     /// whitespace or a closing delimiter.
     fn after_token_break(content: &[u8], i: usize) -> bool {
@@ -89,9 +100,26 @@ pub(super) fn mask_strings_comments_and_inline_images(content: &[u8]) -> Vec<u8>
             {
                 let header = &content[inline_image_header.take().unwrap_or(i)..i];
                 let data = (i + 3).min(content.len());
-                let end = inline_image_end(content, data).unwrap_or_else(|| {
-                    data + inline_image_data_bound(header).min(content.len() - data)
-                });
+                let end = match inline_image_data_length(header, colour_space_components) {
+                    // The data's length is known: it is skipped whole,
+                    // whatever bytes it holds, and the `EI` after it ends
+                    // the image — or, should the length not lead to one,
+                    // the first `EI` beyond the data does.
+                    Some(length) => {
+                        let after = data.saturating_add(length).min(content.len());
+                        ei_at(content, after)
+                            .or_else(|| inline_image_end(content, after))
+                            .unwrap_or(after)
+                    }
+                    // Filtered data has no known length, nor has data under
+                    // a header that cannot be read: the first `EI` set off
+                    // by whitespace ends it, failing that the first flush
+                    // `EI`, failing that a fixed bound, so that a stream is
+                    // never blanked to its end.
+                    None => inline_image_end(content, data).unwrap_or_else(|| {
+                        data + UNKNOWN_INLINE_IMAGE_LENGTH_BOUND.min(content.len() - data)
+                    }),
+                };
                 masked[i..end].fill(b' ');
                 i = end;
                 continue;
@@ -101,6 +129,17 @@ pub(super) fn mask_strings_comments_and_inline_images(content: &[u8]) -> Vec<u8>
         i += 1;
     }
     masked
+}
+
+/// Just past the `EI` at `at`, after any whitespace; `None` when the token
+/// there is not `EI`.
+fn ei_at(content: &[u8], at: usize) -> Option<usize> {
+    let mut j = at;
+    while j < content.len() && is_pdf_whitespace(content[j]) {
+        j += 1;
+    }
+    (content[j..].starts_with(b"EI") && content.get(j + 2).is_none_or(|&b| ends_token(b)))
+        .then_some(j + 2)
 }
 
 /// Just past the `EI` that ends inline image data starting at `from`: the
@@ -125,43 +164,190 @@ fn inline_image_end(content: &[u8], from: usize) -> Option<usize> {
     flush
 }
 
-/// How many bytes of inline image data to take when no `EI` ends it: the
-/// data's own length when the header names no filter — width × height ×
-/// components × bits per component, packed by row — or else a fixed
-/// bound, so that a stream is never blanked to its end.
-pub(super) fn inline_image_data_bound(header: &[u8]) -> usize {
-    const UNKNOWN_LENGTH_BOUND: usize = 4096;
-    let header = String::from_utf8_lossy(header);
-    let tokens: Vec<&str> = header.split_ascii_whitespace().collect();
-    let value_after = |keys: &[&str]| {
+/// How many bytes of inline image data of unknown length to take when no
+/// `EI` ends it.
+const UNKNOWN_INLINE_IMAGE_LENGTH_BOUND: usize = 4096;
+
+/// A token of an inline image's header: the entries between `BI` and `ID`.
+enum HeaderToken<'h> {
+    /// `/Name`, its escapes decoded.
+    Name(Vec<u8>),
+    Number(f64),
+    /// A bare word: `true`, `false`, `null`.
+    Word(&'h [u8]),
+    ArrayOpen,
+    ArrayClose,
+    /// A string, or a dictionary's delimiter: a value that bears on
+    /// nothing here.
+    Other,
+}
+
+/// The header's tokens, split at whitespace and at delimiters — a name
+/// runs into the next token without whitespace (`/W 1/H 1`), as names do.
+fn header_tokens(header: &[u8]) -> Vec<HeaderToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < header.len() {
+        let byte = header[i];
+        if is_pdf_whitespace(byte) {
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'/' => {
+                let start = i + 1;
+                let mut end = start;
+                while end < header.len() && !is_pdf_name_delimiter(header[end]) {
+                    end += 1;
+                }
+                tokens.push(HeaderToken::Name(decode_name_escapes(&header[start..end])));
+                i = end;
+            }
+            b'[' => {
+                tokens.push(HeaderToken::ArrayOpen);
+                i += 1;
+            }
+            b']' => {
+                tokens.push(HeaderToken::ArrayClose);
+                i += 1;
+            }
+            b'<' if header.get(i + 1) == Some(&b'<') => {
+                tokens.push(HeaderToken::Other);
+                i += 2;
+            }
+            b'<' => {
+                while i < header.len() && header[i] != b'>' {
+                    i += 1;
+                }
+                tokens.push(HeaderToken::Other);
+                i += 1;
+            }
+            b'(' => {
+                let mut depth = 0u32;
+                while i < header.len() {
+                    match header[i] {
+                        b'\\' => i += 1,
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                tokens.push(HeaderToken::Other);
+                i += 1;
+            }
+            b')' | b'>' | b'{' | b'}' => {
+                tokens.push(HeaderToken::Other);
+                i += 1;
+            }
+            _ => {
+                let start = i;
+                while i < header.len() && !is_pdf_name_delimiter(header[i]) {
+                    i += 1;
+                }
+                let word = &header[start..i];
+                tokens.push(
+                    match std::str::from_utf8(word).ok().and_then(|w| w.parse().ok()) {
+                        Some(number) => HeaderToken::Number(number),
+                        None => HeaderToken::Word(word),
+                    },
+                );
+            }
+        }
+    }
+    tokens
+}
+
+/// How many components a device or CIE-based colour space has, by its
+/// name as an inline image's header abbreviates it or a resource
+/// dictionary spells it; `None` for any other.
+pub(super) fn device_colour_space_components(name: &[u8]) -> Option<u32> {
+    match name {
+        b"G" | b"DeviceGray" | b"CalGray" | b"I" | b"Indexed" => Some(1),
+        b"RGB" | b"DeviceRGB" | b"CalRGB" | b"Lab" => Some(3),
+        b"CMYK" | b"DeviceCMYK" => Some(4),
+        _ => None,
+    }
+}
+
+/// The length in bytes of an inline image's data, from its header: the
+/// `/L` (`/Length`) it states, or — for data with no `/F` (`/Filter`) —
+/// width × components × bits per component bits per row, each row padded
+/// to whole bytes, by the height; an image mask (`/IM true`) has one bit
+/// per sample. The components come from `/CS` (`/ColorSpace`): a device
+/// space by its name, an `/Indexed` array as one, any other name as the
+/// resources in force say through `colour_space_components`. `None` when
+/// the data is filtered and its length not stated, or the header cannot
+/// be read — a width, height, bits or colour space missing or unknown —
+/// and the data's end must be looked for instead. `/D` (`/Decode`) and
+/// `/DP` bear on the samples' meaning, not on their count.
+pub(super) fn inline_image_data_length(
+    header: &[u8],
+    colour_space_components: ColourSpaceComponents<'_>,
+) -> Option<usize> {
+    let tokens = header_tokens(header);
+    let value_at = |keys: &[&[u8]]| {
         tokens
             .iter()
-            .position(|token| keys.contains(token))
-            .and_then(|at| tokens.get(at + 1).copied())
+            .position(
+                |token| matches!(token, HeaderToken::Name(name) if keys.contains(&name.as_slice())),
+            )
+            .map(|at| at + 1)
     };
-    let number_after = |keys: &[&str]| value_after(keys).and_then(|v| v.parse::<usize>().ok());
-    if value_after(&["/F", "/Filter"]).is_some() {
-        return UNKNOWN_LENGTH_BOUND;
+    let integer_after = |keys: &[&[u8]]| match value_at(keys).and_then(|at| tokens.get(at)) {
+        Some(HeaderToken::Number(number)) if number.fract() == 0.0 && *number >= 0.0 => {
+            Some(*number as usize)
+        }
+        _ => None,
+    };
+    if let Some(length) = integer_after(&[b"L", b"Length"]) {
+        return Some(length);
     }
-    let (Some(width), Some(height)) = (
-        number_after(&["/W", "/Width"]),
-        number_after(&["/H", "/Height"]),
-    ) else {
-        return UNKNOWN_LENGTH_BOUND;
+    let filtered = match value_at(&[b"F", b"Filter"]).map(|at| (tokens.get(at), tokens.get(at + 1)))
+    {
+        Some((Some(HeaderToken::Name(_)), _)) => true,
+        Some((Some(HeaderToken::ArrayOpen), next)) => {
+            !matches!(next, Some(HeaderToken::ArrayClose))
+        }
+        _ => false,
     };
-    let image_mask = matches!(value_after(&["/IM", "/ImageMask"]), Some("true"));
-    let bits = if image_mask {
-        1
+    if filtered {
+        return None;
+    }
+    let width = integer_after(&[b"W", b"Width"])?;
+    let height = integer_after(&[b"H", b"Height"])?;
+    let image_mask = matches!(
+        value_at(&[b"IM", b"ImageMask"]).and_then(|at| tokens.get(at)),
+        Some(HeaderToken::Word(b"true"))
+    );
+    let (bits, components) = if image_mask {
+        (1, 1)
     } else {
-        number_after(&["/BPC", "/BitsPerComponent"]).unwrap_or(8)
+        let bits = integer_after(&[b"BPC", b"BitsPerComponent"])?;
+        let at = value_at(&[b"CS", b"ColorSpace"])?;
+        let components = match (tokens.get(at), tokens.get(at + 1)) {
+            (Some(HeaderToken::Name(name)), _) => {
+                device_colour_space_components(name).or_else(|| colour_space_components(name))?
+            }
+            (Some(HeaderToken::ArrayOpen), Some(HeaderToken::Name(family)))
+                if matches!(family.as_slice(), b"I" | b"Indexed") =>
+            {
+                1
+            }
+            _ => return None,
+        };
+        (bits, components as usize)
     };
-    let components = match value_after(&["/CS", "/ColorSpace"]) {
-        Some("/RGB" | "/DeviceRGB" | "/CalRGB") => 3,
-        Some("/CMYK" | "/DeviceCMYK") => 4,
-        _ => 1,
-    };
-    let row_bytes = (width.saturating_mul(components).saturating_mul(bits)).div_ceil(8);
-    row_bytes.saturating_mul(height)
+    let row_bytes = width
+        .saturating_mul(components)
+        .saturating_mul(bits)
+        .div_ceil(8);
+    Some(row_bytes.saturating_mul(height))
 }
 
 /// The `N` numeric operands before the operator at `op_pos`, in stream

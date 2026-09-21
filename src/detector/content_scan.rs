@@ -7,13 +7,14 @@
 //! from those that paint, and to tally the page area the images drawn
 //! cover. The classification rule itself lives in the parent module.
 
+use super::content_geometry::{box_under, multiply, ClipText, Reach, TextPosition, UserBox};
 use super::content_mask::{
     mask_strings_comments_and_inline_images, name_operand_before, numeric_operands_before,
     show_operand_text_bytes,
 };
 use super::content_resources::{
-    decoded_within, numbers_of, pattern_type, resolve_pattern, resolve_xobject, stream_resources,
-    XObjectDrawn,
+    colour_space_components, decoded_within, numbers_of, pattern_type, resolve_pattern,
+    resolve_xobject, stream_resources, XObjectDrawn,
 };
 use super::{
     collect_text_chars_before, extract_font_name_before_tf, is_pdf_whitespace,
@@ -86,16 +87,26 @@ pub(super) fn page_executed_content(doc: &Document, page_id: ObjectId) -> Execut
 }
 
 /// [`scan_content_stream`] of one stream on its own — the initial
-/// graphics state, nothing followed through `Do` — as the counts alone,
-/// which is all the walk over every form bound wants of it.
-pub(super) fn scan_content_stream_alone(
-    doc: &Document,
+/// graphics state, nothing followed through `Do`, no pattern looked into
+/// — as the counts alone, which is all the walk over every form bound
+/// wants of it. `resources` are the stream's own, for the colour spaces
+/// its inline images name.
+pub(super) fn scan_content_stream_alone<'a>(
+    doc: &'a Document,
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
     used_font_names: &mut HashSet<Vec<u8>>,
+    resources: &[&'a lopdf::Dictionary],
 ) -> ContentCounts {
     let mut state = ContentScanState::new(doc, PageBox::LETTER, false);
-    scan_content_stream(content, unique_chars, used_font_names, &mut state, &[])
+    state.follow_patterns = false;
+    scan_content_stream(
+        content,
+        unique_chars,
+        used_font_names,
+        &mut state,
+        resources,
+    )
 }
 
 /// The dictionaries a page's names resolve in, most specific first: its
@@ -227,139 +238,6 @@ const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 /// Cells per side of the grid the images drawn are tallied on, over the
 /// visible page box: 64 × 64 cells, one row per `u64`.
 const COVERAGE_GRID: usize = 64;
-
-/// A box in user space, `x0 <= x1` and `y0 <= y1`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct UserBox {
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-}
-
-impl UserBox {
-    fn area(&self) -> f64 {
-        (self.x1 - self.x0) * (self.y1 - self.y0)
-    }
-
-    /// The smallest box holding both.
-    fn union(&self, other: &UserBox) -> UserBox {
-        UserBox {
-            x0: self.x0.min(other.x0),
-            y0: self.y0.min(other.y0),
-            x1: self.x1.max(other.x1),
-            y1: self.y1.max(other.y1),
-        }
-    }
-
-    /// `None` when the boxes do not overlap.
-    fn intersect(&self, other: &UserBox) -> Option<UserBox> {
-        let clipped = UserBox {
-            x0: self.x0.max(other.x0),
-            y0: self.y0.max(other.y0),
-            x1: self.x1.min(other.x1),
-            y1: self.y1.min(other.y1),
-        };
-        (clipped.x1 > clipped.x0 && clipped.y1 > clipped.y0).then_some(clipped)
-    }
-
-    /// Whether the boxes touch — their edges included, so a line along
-    /// an edge touches.
-    fn touches(&self, other: &UserBox) -> bool {
-        self.x0 <= other.x1 && self.x1 >= other.x0 && self.y0 <= other.y1 && self.y1 >= other.y0
-    }
-
-    /// The part of this box within `other`, which may have no area — a
-    /// line, or a point; `None` when they do not touch.
-    fn clamped(&self, other: &UserBox) -> Option<UserBox> {
-        self.touches(other).then(|| UserBox {
-            x0: self.x0.max(other.x0),
-            y0: self.y0.max(other.y0),
-            x1: self.x1.min(other.x1),
-            y1: self.y1.min(other.y1),
-        })
-    }
-}
-
-/// `first` applied before `second`: the product `cm` forms when it puts
-/// a matrix before the one in force, and the text matrix forms under it.
-fn multiply([a1, b1, c1, d1, e1, f1]: [f64; 6], [a2, b2, c2, d2, e2, f2]: [f64; 6]) -> [f64; 6] {
-    [
-        a1 * a2 + b1 * c2,
-        a1 * b2 + b1 * d2,
-        c1 * a2 + d1 * c2,
-        c1 * b2 + d1 * d2,
-        e1 * a2 + f1 * c2 + e2,
-        e1 * b2 + f1 * d2 + f2,
-    ]
-}
-
-/// The bounding box of `[x0 y0 x1 y1]` under `matrix`; `None` when it is
-/// not finite.
-fn box_under([a, b, c, d, e, f]: [f64; 6], [x0, y0, x1, y1]: [f64; 4]) -> Option<UserBox> {
-    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
-    let xs = corners.map(|(x, y)| a * x + c * y + e);
-    let ys = corners.map(|(x, y)| b * x + d * y + f);
-    if !xs.iter().chain(&ys).all(|v| v.is_finite()) {
-        return None;
-    }
-    Some(UserBox {
-        x0: xs.iter().copied().fold(f64::INFINITY, f64::min),
-        y0: ys.iter().copied().fold(f64::INFINITY, f64::min),
-        x1: xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-        y1: ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-    })
-}
-
-/// Where the glyphs of a text object's clip-only text lie, for the paint
-/// that shows through them.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Reach {
-    /// Wherever paint lands: a show whose position or font size the scan
-    /// did not see.
-    Anywhere,
-    /// Outside the clip in force, every glyph of it: no paint shows.
-    Nowhere,
-    /// Within this box, inside the clip in force.
-    Within(UserBox),
-}
-
-impl Reach {
-    /// The reach of both together.
-    fn join(self, other: Reach) -> Reach {
-        match (self, other) {
-            (Reach::Anywhere, _) | (_, Reach::Anywhere) => Reach::Anywhere,
-            (Reach::Nowhere, reach) | (reach, Reach::Nowhere) => reach,
-            (Reach::Within(a), Reach::Within(b)) => Reach::Within(a.union(&b)),
-        }
-    }
-
-    /// Whether a paint landing on `landed` — `None` for one of unknown
-    /// extent — shows through the glyphs.
-    fn shown_by(self, landed: Option<UserBox>) -> bool {
-        match (self, landed) {
-            (Reach::Nowhere, _) => false,
-            (Reach::Anywhere, _) | (_, None) => true,
-            (Reach::Within(reach), Some(landed)) => reach.touches(&landed),
-        }
-    }
-}
-
-/// The clip-only text of one text object whose clip is in force: how
-/// many text-showing operators built it, and where its glyphs lie.
-#[derive(Clone, Copy, Debug)]
-struct ClipText {
-    ops: u32,
-    reach: Reach,
-}
-
-/// Where the open text object shows next: the text matrix, and the line
-/// matrix the next line starts from.
-#[derive(Clone, Copy)]
-struct TextPosition {
-    matrix: [f64; 6],
-    line: [f64; 6],
-}
 
 /// A form's content as the scan reads it: decompressed, with the masked
 /// copy the operators are read through.
@@ -965,10 +843,10 @@ impl<'a> ContentScanState<'a> {
         };
         if let Some(clip) = clip {
             self.clip = clip;
-            if let Some(content) = self.form_content(id, form) {
-                let mut resources = Vec::with_capacity(invoker_resources.len() + 1);
-                resources.extend(stream_resources(self.doc, form));
-                resources.extend_from_slice(invoker_resources);
+            let mut resources = Vec::with_capacity(invoker_resources.len() + 1);
+            resources.extend(stream_resources(self.doc, form));
+            resources.extend_from_slice(invoker_resources);
+            if let Some(content) = self.form_content(id, form, &resources) {
                 self.active_forms.push(id);
                 scan_masked_content(
                     &content.content,
@@ -991,9 +869,16 @@ impl<'a> ContentScanState<'a> {
 
     /// A form's content, charged to the byte budget at each invocation:
     /// admitted to it (see `form_bytes_admitted`) and masked once per page
-    /// while the cache lasts, both copies counting against the cache's
+    /// while the cache lasts — the colour spaces its inline images name
+    /// resolved in `resources`, those in force at that first invocation,
+    /// the form's own first — both copies counting against the cache's
     /// budget. `None` when the byte budget refuses it.
-    fn form_content(&mut self, id: ObjectId, form: &lopdf::Stream) -> Option<Rc<FormContent>> {
+    fn form_content(
+        &mut self,
+        id: ObjectId,
+        form: &lopdf::Stream,
+        resources: &[&'a lopdf::Dictionary],
+    ) -> Option<Rc<FormContent>> {
         if let Some(content) = self.form_content.get(&id) {
             let content = Rc::clone(content);
             return self
@@ -1001,7 +886,10 @@ impl<'a> ContentScanState<'a> {
                 .then_some(content);
         }
         let content = self.form_bytes_admitted(form)?;
-        let masked = mask_strings_comments_and_inline_images(&content);
+        let doc = self.doc;
+        let masked = mask_strings_comments_and_inline_images(&content, &|name| {
+            colour_space_components(doc, resources, name)
+        });
         let content = Rc::new(FormContent { content, masked });
         let bytes = content.content.len() + content.masked.len();
         if self.form_content_bytes + bytes <= FORM_CONTENT_CACHE_MAX_BYTES {
@@ -1126,7 +1014,10 @@ fn scan_content_stream<'a>(
     state: &mut ContentScanState<'a>,
     resources: &[&'a lopdf::Dictionary],
 ) -> ContentCounts {
-    let masked = mask_strings_comments_and_inline_images(content);
+    let doc = state.doc;
+    let masked = mask_strings_comments_and_inline_images(content, &|name| {
+        colour_space_components(doc, resources, name)
+    });
     scan_masked_content(
         content,
         &masked,
@@ -1471,6 +1362,9 @@ fn scan_masked_content<'a>(
     counts
 }
 
+#[cfg(test)]
+#[path = "content_scan_budget_tests.rs"]
+mod budget_tests;
 #[cfg(test)]
 #[path = "content_scan_clip_tests.rs"]
 mod clip_tests;

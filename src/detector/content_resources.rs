@@ -1,10 +1,85 @@
 //! What the names in a content stream resolve to — the XObject a `Do`
 //! names, the pattern an `scn` names, each in the first of the resource
 //! dictionaries in force that binds it — what a stream's dictionary says:
-//! its own resources, a pattern's type, a form's `/Matrix` and `/BBox` —
-//! and a stream's content, decoded within a limit.
+//! its own resources, a pattern's type, a form's `/Matrix` and `/BBox`,
+//! the components of a colour space it names — and a stream's content,
+//! decoded within a limit.
 
+use super::content_mask::device_colour_space_components;
 use lopdf::{DecompressError, Document, Error, Object, ObjectId};
+
+/// How many components the colour space `name` names in the first of
+/// `resources` binding it has — for the length of an inline image's data
+/// drawn in that space: a device or CIE-based space by its family,
+/// `/ICCBased` by its stream's `/N`, `/Indexed` and `/Separation` one,
+/// `/DeviceN` as many as its names. `None` when the name is unbound or the
+/// space is of no family known here.
+pub(super) fn colour_space_components(
+    doc: &Document,
+    resources: &[&lopdf::Dictionary],
+    name: &[u8],
+) -> Option<u32> {
+    for scope in resources {
+        let spaces = match scope.get(b"ColorSpace").ok() {
+            Some(Object::Dictionary(dict)) => dict,
+            Some(Object::Reference(id)) => match doc.get_dictionary(*id) {
+                Ok(dict) => dict,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        let Ok(space) = spaces.get(name) else {
+            continue;
+        };
+        return components_of_colour_space(doc, space, 0);
+    }
+    None
+}
+
+/// The components of the colour space object `space`: a name, or an array
+/// led by its family's name — either direct or by reference.
+fn components_of_colour_space(doc: &Document, space: &Object, depth: u8) -> Option<u32> {
+    if depth > 4 {
+        return None;
+    }
+    match space {
+        Object::Reference(id) => {
+            components_of_colour_space(doc, doc.get_object(*id).ok()?, depth + 1)
+        }
+        Object::Name(name) => device_colour_space_components(name),
+        Object::Array(items) => {
+            let family = match items.first()? {
+                Object::Reference(id) => doc.get_object(*id).ok()?.as_name().ok()?,
+                other => other.as_name().ok()?,
+            };
+            match family {
+                b"ICCBased" => {
+                    let stream = match items.get(1)? {
+                        Object::Reference(id) => doc.get_object(*id).ok()?,
+                        other => other,
+                    };
+                    let n = stream.as_stream().ok()?.dict.get(b"N").ok()?;
+                    let n = match n {
+                        Object::Reference(id) => doc.get_object(*id).ok()?.as_i64().ok()?,
+                        other => other.as_i64().ok()?,
+                    };
+                    u32::try_from(n).ok().filter(|n| matches!(n, 1 | 3 | 4))
+                }
+                b"Indexed" | b"I" | b"Separation" => Some(1),
+                b"DeviceN" => {
+                    let names = match items.get(1)? {
+                        Object::Reference(id) => doc.get_object(*id).ok()?.as_array().ok()?,
+                        other => other.as_array().ok()?,
+                    };
+                    u32::try_from(names.len()).ok()
+                }
+                b"Pattern" => None,
+                other => device_colour_space_components(other),
+            }
+        }
+        _ => None,
+    }
+}
 
 /// A stream's content decoded within `limit` bytes — a form's or a
 /// pattern cell's, for a scan that may execute no more than that: `None`

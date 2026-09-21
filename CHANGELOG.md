@@ -143,7 +143,9 @@ Changes since 1.22.1.
   here and in the text-operator tallies, which had always missed it,
   while a show operator with nothing to show does not count in either;
   a name written with `#xx` escapes (`/Im#30 Do`) finds the resource it
-  names, and NUL separates operands as the other whitespace bytes do.
+  names, NUL separates operands as the other whitespace bytes do, and
+  unfiltered inline image data is skipped by the length its header gives,
+  so that an `EI` among its bytes ends nothing.
   A page whose layer is painted, a page with a visible
   caption over its image, invisible text with no image under it and an
   image with no text keep their classification and reasons; what is

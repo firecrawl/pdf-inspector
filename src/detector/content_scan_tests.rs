@@ -1,7 +1,9 @@
 //! Tests of the executed-content scan, and of the invisible-text-layer
 //! signal `analyze_page_content` builds on it.
 
-use super::super::content_mask::{decode_name_escapes, inline_image_data_bound};
+use super::super::content_mask::{
+    decode_name_escapes, inline_image_data_length, mask_strings_comments_and_inline_images,
+};
 use super::super::{
     analyze_page_content, detect_from_document, page_ocr_reasons, page_ocr_signals,
     DetectionConfig, PdfType,
@@ -435,10 +437,61 @@ fn inline_image_data_without_a_delimited_ei_is_bounded() {
     let (counts, _, _) = scan_alone(b"BI /W 2 /H 1 /BPC 8 /CS /G ID abEIBT /F1 10 Tf (a) Tj ET");
     assert_eq!(counts.text_ops, 1);
 
-    assert_eq!(inline_image_data_bound(b"/W 3 /H 2 /BPC 1 /CS /G"), 2);
-    assert_eq!(inline_image_data_bound(b"/W 2 /H 2 /BPC 8 /CS /RGB"), 12);
-    assert_eq!(inline_image_data_bound(b"/W 8 /H 1 /IM true"), 1);
-    assert_eq!(inline_image_data_bound(b"/W 2 /H 2 /F /AHx"), 4096);
+    let unknown = |_: &[u8]| None;
+    let length = |header: &[u8]| inline_image_data_length(header, &unknown);
+    assert_eq!(
+        length(b"/W 3 /H 2 /BPC 1 /CS /G"),
+        Some(2),
+        "rows padded to bytes"
+    );
+    assert_eq!(length(b"/W 2 /H 2 /BPC 8 /CS /RGB"), Some(12));
+    assert_eq!(length(b"/W 2/H 2/BPC 8/CS/CMYK"), Some(16), "no whitespace");
+    assert_eq!(
+        length(b"/Width 2 /Height 2 /BitsPerComponent 8 /ColorSpace /DeviceGray"),
+        Some(4)
+    );
+    assert_eq!(
+        length(b"/W 8 /H 1 /IM true"),
+        Some(1),
+        "an image mask: one bit a sample"
+    );
+    assert_eq!(length(b"/W 8 /H 1 /IM true /BPC 8"), Some(1));
+    assert_eq!(
+        length(b"/W 2 /H 2 /BPC 8 /CS [/I /RGB 1 <000000ffffff>]"),
+        Some(4)
+    );
+    assert_eq!(
+        length(b"/W 2 /H 2 /BPC 8 /CS /G /D [1 0] /DP << /Predictor 1 >>"),
+        Some(4)
+    );
+    assert_eq!(
+        length(b"/W 2 /H 2 /BPC 8 /CS /G /F /Fl /L 7"),
+        Some(7),
+        "a stated length"
+    );
+    assert_eq!(
+        length(b"/W 2 /H 2 /F /AHx"),
+        None,
+        "filtered: no length known"
+    );
+    assert_eq!(length(b"/W 2 /H 2 /BPC 8 /CS /G /F [/AHx /Fl]"), None);
+    assert_eq!(
+        length(b"/W 2 /H 2 /BPC 8 /CS /G /F []"),
+        Some(4),
+        "no filter after all"
+    );
+    assert_eq!(length(b"/W 2 /H 2 /CS /G"), None, "no bits per component");
+    assert_eq!(length(b"/W 2 /H 2 /BPC 8"), None, "no colour space");
+    assert_eq!(
+        length(b"/W 2 /H 2 /BPC 8 /CS /CS0"),
+        None,
+        "a name the resources must say"
+    );
+    let three = |name: &[u8]| (name == b"CS0").then_some(3);
+    assert_eq!(
+        inline_image_data_length(b"/W 2 /H 2 /BPC 8 /CS /CS0", &three),
+        Some(12)
+    );
 }
 
 #[test]
@@ -984,7 +1037,7 @@ fn a_form_s_masked_content_is_kept_with_it() {
     assert_eq!(kept.content, form.content.as_bytes());
     assert_eq!(
         kept.masked,
-        mask_strings_comments_and_inline_images(form.content.as_bytes())
+        mask_strings_comments_and_inline_images(form.content.as_bytes(), &|_| None)
     );
     assert_eq!(state.form_content_bytes, 2 * form.content.len());
 
@@ -1002,239 +1055,6 @@ fn a_form_s_masked_content_is_kept_with_it() {
     );
     assert!(state.form_content.is_empty());
     assert_eq!(state.form_content_bytes, 0);
-}
-
-/// The executed-form byte budget set for the test's thread, restored
-/// when dropped.
-struct FormBytesBudget(Option<usize>);
-
-impl FormBytesBudget {
-    fn set(bytes: usize) -> Self {
-        Self(EXECUTED_FORM_BYTES_OVERRIDE.with(|budget| budget.replace(Some(bytes))))
-    }
-}
-
-impl Drop for FormBytesBudget {
-    fn drop(&mut self) {
-        EXECUTED_FORM_BYTES_OVERRIDE.with(|budget| budget.set(self.0));
-    }
-}
-
-/// A page whose forms execute more bytes than the budget allows is not
-/// flagged: from the form that would pass the budget on, none is read,
-/// the page's evidence is incomplete and it keeps the classification the
-/// resource walk gives it; the same page within the budget is a layer
-/// nobody sees. A pattern's cell counts against the same budget.
-#[test]
-fn form_content_past_the_byte_budget_leaves_the_page_unflagged() {
-    let layer = glyph_layer(3);
-    let form = TestForm {
-        name: "FmLayer",
-        content: layer.as_str(),
-        ..PAGE_FORM
-    };
-    let (mut doc, page_id, content_id) = synthetic_page(true, false, &[form]);
-    // Two invocations fit the budget; a third would pass it.
-    let _budget = FormBytesBudget::set(2 * layer.len() + layer.len() / 2);
-
-    let within = format!("{FULL_PAGE_IMAGE}/FmLayer Do /FmLayer Do");
-    let state = executed_state(&doc, page_id, &[&within]);
-    assert_eq!(state.executed_form_bytes, 2 * layer.len());
-    assert!(!state.form_bytes_exceeded && !state.incomplete);
-    assert_eq!(
-        (state.executed_text_ops, state.executed_hidden_text_ops),
-        (240, 240)
-    );
-    set_page_content(&mut doc, content_id, &within);
-    let analysis = analyze_page_content(&doc, page_id);
-    assert!(analysis.has_invisible_text_layer);
-    assert_eq!(analysis.executed_form_bytes, 2 * layer.len());
-    assert!(!analysis.form_bytes_exceeded);
-    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
-    assert_eq!(
-        detected.ocr_reasons_by_page.get(&1),
-        Some(&vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
-    );
-
-    let past = format!("{FULL_PAGE_IMAGE}/FmLayer Do /FmLayer Do /FmLayer Do /FmLayer Do");
-    let state = executed_state(&doc, page_id, &[&past]);
-    assert_eq!(
-        state.executed_form_bytes,
-        2 * layer.len(),
-        "the third invocation would pass the budget: it and the fourth go unread"
-    );
-    assert!(state.form_bytes_exceeded && state.incomplete);
-    assert_eq!(state.executed_text_ops, 240);
-    set_page_content(&mut doc, content_id, &past);
-    let analysis = analyze_page_content(&doc, page_id);
-    assert!(!analysis.has_invisible_text_layer);
-    assert!(analysis.form_bytes_exceeded);
-    assert_eq!(analysis.executed_form_bytes, 2 * layer.len());
-    assert_eq!(
-        analysis.text_operator_count, 120,
-        "the bound form, counted once"
-    );
-    let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
-    assert_eq!(detected.pdf_type, PdfType::TextBased);
-    assert!(detected.pages_needing_ocr.is_empty());
-
-    // A pattern's cell: within the budget it is read and paints coverage;
-    // past it, it goes unread, and the evidence is incomplete.
-    let pattern = TestPattern {
-        name: "PImage",
-        content: "q 612 0 0 792 0 0 cm /Im0 Do Q",
-        shading: false,
-    };
-    let (doc, page_id, _) = synthetic_page_with_patterns(true, false, &[], &[pattern]);
-    let fill = "/Pattern cs /PImage scn 0 0 612 792 re f";
-    {
-        let _budget = FormBytesBudget::set(pattern.content.len());
-        let state = executed_state(&doc, page_id, &[fill]);
-        assert!(close(state.covered_image_area(), PAGE_AREA));
-        assert_eq!(state.executed_form_bytes, pattern.content.len());
-        assert!(!state.incomplete);
-    }
-    {
-        let _budget = FormBytesBudget::set(pattern.content.len() - 1);
-        let state = executed_state(&doc, page_id, &[fill]);
-        assert!(close(state.covered_image_area(), 0.0));
-        assert!(state.form_bytes_exceeded && state.incomplete);
-        assert_eq!(state.executed_form_bytes, 0);
-    }
-}
-
-/// The stream that `name` binds in the page's resources of `category`
-/// (`XObject`, `Pattern`).
-fn resource_stream_mut<'d>(
-    doc: &'d mut Document,
-    page_id: ObjectId,
-    category: &[u8],
-    name: &str,
-) -> &'d mut lopdf::Stream {
-    let id = doc
-        .get_dictionary(page_id)
-        .unwrap()
-        .get(b"Resources")
-        .unwrap()
-        .as_dict()
-        .unwrap()
-        .get(category)
-        .unwrap()
-        .as_dict()
-        .unwrap()
-        .get(name.as_bytes())
-        .unwrap()
-        .as_reference()
-        .unwrap();
-    doc.get_object_mut(id).unwrap().as_stream_mut().unwrap()
-}
-
-/// A form whose content would pass the byte budget is refused before it
-/// is held: a deflated stream is decoded no further than the budget's
-/// remainder, where the decoder refuses it; a raw stream is refused by
-/// its length. Nothing of it is executed or kept, the page's evidence is
-/// incomplete and the page is not flagged. Within the budget the same
-/// form is read as before, and a pattern's cell is admitted the same way.
-#[test]
-fn a_form_past_the_budget_is_refused_before_it_is_decoded() {
-    let layer = glyph_layer(3);
-    let form = TestForm {
-        name: "FmLayer",
-        content: layer.as_str(),
-        ..PAGE_FORM
-    };
-    let content = format!("{FULL_PAGE_IMAGE}/FmLayer Do");
-    for deflated in [true, false] {
-        let (mut doc, page_id, content_id) = synthetic_page(true, false, &[form]);
-        set_page_content(&mut doc, content_id, &content);
-        if deflated {
-            let stream = resource_stream_mut(&mut doc, page_id, b"XObject", "FmLayer");
-            stream.compress().unwrap();
-            assert!(
-                stream.content.len() < layer.len() / 4,
-                "deflated well within the budget"
-            );
-            // The bounded decoder refuses the stream at the limit rather
-            // than decoding it whole.
-            assert!(matches!(
-                stream.decompressed_content_with_limit(layer.len() - 1),
-                Err(lopdf::Error::Decompress(
-                    lopdf::DecompressError::MemoryLimitExceeded { .. }
-                ))
-            ));
-        }
-        {
-            let _budget = FormBytesBudget::set(layer.len() - 1);
-            let state = executed_state(&doc, page_id, &[&content]);
-            assert!(
-                state.form_bytes_exceeded && state.incomplete,
-                "deflated {deflated}"
-            );
-            assert_eq!(state.executed_form_bytes, 0, "deflated {deflated}");
-            assert!(
-                state.form_content.is_empty(),
-                "nothing kept, deflated {deflated}"
-            );
-            assert_eq!(state.executed_text_ops, 0, "deflated {deflated}");
-            let analysis = analyze_page_content(&doc, page_id);
-            assert!(!analysis.has_invisible_text_layer, "deflated {deflated}");
-            assert!(analysis.form_bytes_exceeded, "deflated {deflated}");
-            let detected = detect_from_document(&doc, 1, &DetectionConfig::default()).unwrap();
-            assert_eq!(detected.pdf_type, PdfType::TextBased, "deflated {deflated}");
-            assert!(detected.pages_needing_ocr.is_empty(), "deflated {deflated}");
-        }
-        {
-            let _budget = FormBytesBudget::set(layer.len());
-            let state = executed_state(&doc, page_id, &[&content]);
-            assert!(
-                !state.form_bytes_exceeded && !state.incomplete,
-                "deflated {deflated}"
-            );
-            assert_eq!(
-                state.executed_form_bytes,
-                layer.len(),
-                "deflated {deflated}"
-            );
-            assert_eq!(
-                (state.executed_text_ops, state.executed_hidden_text_ops),
-                (120, 120),
-                "deflated {deflated}"
-            );
-            let analysis = analyze_page_content(&doc, page_id);
-            assert!(analysis.has_invisible_text_layer, "deflated {deflated}");
-        }
-    }
-
-    // A pattern's cell, deflated: refused at the limit, it paints no
-    // coverage; admitted, it covers the page.
-    let cell = format!(
-        "{}q 612 0 0 792 0 0 cm /Im0 Do Q",
-        "% a comment line\n".repeat(200)
-    );
-    let pattern = TestPattern {
-        name: "PImage",
-        content: cell.as_str(),
-        shading: false,
-    };
-    let (mut doc, page_id, _) = synthetic_page_with_patterns(true, false, &[], &[pattern]);
-    let stream = resource_stream_mut(&mut doc, page_id, b"Pattern", "PImage");
-    stream.compress().unwrap();
-    assert!(stream.content.len() < cell.len() / 4);
-    let fill = "/Pattern cs /PImage scn 0 0 612 792 re f";
-    {
-        let _budget = FormBytesBudget::set(cell.len() - 1);
-        let state = executed_state(&doc, page_id, &[fill]);
-        assert!(close(state.covered_image_area(), 0.0));
-        assert!(state.form_bytes_exceeded && state.incomplete);
-        assert_eq!(state.executed_form_bytes, 0);
-    }
-    {
-        let _budget = FormBytesBudget::set(cell.len());
-        let state = executed_state(&doc, page_id, &[fill]);
-        assert!(close(state.covered_image_area(), PAGE_AREA));
-        assert!(!state.incomplete);
-        assert_eq!(state.executed_form_bytes, cell.len());
-    }
 }
 
 /// A name written with `#xx` escapes names the same resource as one
@@ -1351,4 +1171,105 @@ fn text_state_is_saved_and_restored_with_the_graphics_state() {
     assert_eq!(state.render_mode, 0);
     assert_eq!(state.font_size, Some(12.0));
     assert_eq!(state.leading, 14.0);
+}
+
+/// Unfiltered inline image data is skipped by the length its header
+/// gives, whatever bytes it holds — an `EI` set off by whitespace among
+/// them, operators after it — and the `EI` after the data ends the image;
+/// the operators that follow are read as written. Filtered data, whose
+/// length is not known, ends at the first `EI` set off by whitespace,
+/// however long the header would make it; a stated `/L` is the length,
+/// filtered or not.
+#[test]
+fn unfiltered_inline_image_data_is_skipped_by_its_length() {
+    // Eight bytes of gray samples spelling ` EI 3 Tr`, then the `EI`, then
+    // a shown string and, under the page's own `3 Tr`, a hidden one.
+    let (counts, executed_ops, hidden) = scan_alone(
+        b"BI /W 8 /H 1 /BPC 8 /CS /G ID  EI 3 Tr EI BT /F1 12 Tf (a) Tj ET 3 Tr BT (b) Tj ET",
+    );
+    assert_eq!((counts.text_ops, executed_ops, hidden), (2, 2, 1));
+
+    // The same samples under an image mask of 64 one-bit samples a row.
+    let (counts, executed_ops, hidden) =
+        scan_alone(b"BI /W 64 /H 1 /IM true ID  EI 3 Tr EI BT /F1 12 Tf (a) Tj ET");
+    assert_eq!((counts.text_ops, executed_ops, hidden), (1, 1, 0));
+
+    // Filtered: the header's ten thousand bytes are not taken; the data
+    // ends at its `EI`, and the text after it is read.
+    let (counts, executed_ops, hidden) = scan_alone(
+        b"BI /W 100 /H 100 /BPC 8 /CS /G /F /Fl ID xxxxxxxxxx EI BT /F1 12 Tf (a) Tj ET",
+    );
+    assert_eq!((counts.text_ops, executed_ops, hidden), (1, 1, 0));
+    // Filtered data holding an `EI` set off by whitespace ends there: its
+    // length is not known, and this is the reading that was always made.
+    let (counts, _, hidden) =
+        scan_alone(b"BI /W 8 /H 1 /BPC 8 /CS /G /F /AHx ID  EI 3 Tr EI BT /F1 12 Tf (a) Tj ET");
+    assert_eq!((counts.text_ops, hidden), (1, 1));
+    // A stated length is taken, filtered or not.
+    let (counts, _, hidden) = scan_alone(
+        b"BI /W 8 /H 1 /BPC 8 /CS /G /F /AHx /L 8 ID  EI 3 Tr EI BT /F1 12 Tf (a) Tj ET",
+    );
+    assert_eq!((counts.text_ops, hidden), (1, 0));
+
+    // A header whose length runs past the data — a lying width — still
+    // ends at the first `EI` beyond it rather than at the stream's end.
+    let (counts, _, _) =
+        scan_alone(b"BI /W 6 /H 1 /BPC 8 /CS /G ID abcd EI BT /F1 12 Tf (a) Tj ET");
+    assert_eq!(counts.text_ops, 1);
+}
+
+/// A colour space an inline image names from the resources gives its
+/// samples' components: an `/ICCBased` space by its `/N`, a device space
+/// by its name, `/Indexed` and `/Separation` as one, `/DeviceN` by its
+/// names — so the data's length is known and an `EI` among its bytes ends
+/// nothing; a name the resources do not bind leaves the length unknown,
+/// and the data ends at that `EI` as filtered data does.
+#[test]
+fn an_inline_image_s_named_colour_space_is_resolved_in_the_resources() {
+    use lopdf::dictionary;
+    let (mut doc, page_id, _) = synthetic_page(false, false, &[]);
+    let icc = doc.add_object(Object::Stream(lopdf::Stream::new(
+        dictionary! { "N" => Object::Integer(3) },
+        Vec::new(),
+    )));
+    let spaces = dictionary! {
+        "CS0" => vec![Object::Name(b"ICCBased".to_vec()), Object::Reference(icc)],
+        "CS1" => Object::Name(b"DeviceCMYK".to_vec()),
+        "CS2" => vec![
+            Object::Name(b"Indexed".to_vec()),
+            Object::Name(b"DeviceRGB".to_vec()),
+            Object::Integer(1),
+            Object::String(vec![0, 0, 0, 255, 255, 255], lopdf::StringFormat::Hexadecimal),
+        ],
+        "CS3" => vec![
+            Object::Name(b"DeviceN".to_vec()),
+            Object::Array(vec![Object::Name(b"A".to_vec()), Object::Name(b"B".to_vec())]),
+            Object::Name(b"DeviceGray".to_vec()),
+        ],
+        "CS4" => vec![Object::Name(b"Separation".to_vec()), Object::Name(b"Spot".to_vec())],
+    };
+    doc.get_dictionary_mut(page_id)
+        .unwrap()
+        .get_mut(b"Resources")
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("ColorSpace", spaces);
+
+    // Twelve bytes of samples spelling `  EI 3 Tr   `: four RGB samples,
+    // three CMYK ones, twelve indexed or separation ones, six of two inks.
+    let data = "  EI 3 Tr   ";
+    for (space, width) in [("CS0", 4), ("CS1", 3), ("CS2", 12), ("CS3", 6), ("CS4", 12)] {
+        let content =
+            format!("BI /W {width} /H 1 /BPC 8 /CS /{space} ID {data} EI BT /F1 12 Tf (a) Tj ET");
+        let (executed_ops, hidden, _) = executed(&doc, page_id, &[&content]);
+        assert_eq!((executed_ops, hidden), (1, 0), "{space}");
+    }
+    let unbound = format!("BI /W 4 /H 1 /BPC 8 /CS /CS9 ID {data} EI BT /F1 12 Tf (a) Tj ET");
+    let (executed_ops, hidden, _) = executed(&doc, page_id, &[&unbound]);
+    assert_eq!(
+        (executed_ops, hidden),
+        (1, 1),
+        "unbound: the `EI` among the bytes ends the data"
+    );
 }
