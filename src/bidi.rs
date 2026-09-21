@@ -78,25 +78,39 @@ enum Strong {
 /// The direction of a letter: `L`, or `R` for the right-to-left classes.
 /// Digits are not letters here.
 fn letter_direction(c: char) -> Option<Strong> {
-    match bidi_class(c) {
+    match class_of(c) {
         BidiClass::L => Some(Strong::Left),
         BidiClass::R | BidiClass::AL => Some(Strong::Right),
         _ => None,
     }
 }
 
-/// U+034F COMBINING GRAPHEME JOINER, put between the characters that one
-/// code of a right-to-left script reads as — a ligature glyph named
-/// `uni06440627` (lam-alef), or mapped to two code points by the ToUnicode
-/// CMap — when a string is decoded ([`push_glyph_characters`]). A line
-/// stored in visual order holds its glyphs in display order but each
-/// glyph's characters in the order they were named, so the read-back
-/// ([`visual_to_logical`]) has to turn such a glyph round as one cluster:
-/// the joiner, a combining mark, keeps its characters together
-/// (`reverse_clusters`) and is transparent to the bidirectional algorithm.
-/// It is dropped once a line's text is in logical order
-/// ([`strip_glyph_joiners`]).
-pub(crate) const GLYPH_JOINER: char = '\u{034F}';
+/// U+FFFE, a noncharacter — a code point that never stands for text — put
+/// between the characters that one code of a right-to-left script reads as
+/// (a ligature glyph named `uni06440627`, lam-alef, or mapped to two code
+/// points by the ToUnicode CMap) when a string is decoded
+/// ([`push_glyph_characters`]). A line stored in visual order holds its
+/// glyphs in display order but each glyph's characters in the order they
+/// were named, so the read-back ([`visual_to_logical`]) has to turn such a
+/// glyph round as one cluster: the joiner keeps its characters together
+/// (`reverse_clusters`) and is a boundary neutral to the bidirectional
+/// algorithm ([`class_of`]). It is dropped once a line's text is in logical
+/// order ([`strip_glyph_joiners`]); a character of the document's own is
+/// never mistaken for it, since no text holds a noncharacter.
+pub(crate) const GLYPH_JOINER: char = '\u{FFFE}';
+
+/// The bidirectional class of `c`. Unicode gives noncharacters the class
+/// BN (boundary neutral) as a default, which the `unicode_bidi` tables do
+/// not carry: the [`GLYPH_JOINER`] is given it here, so that it is neither
+/// a letter nor a strong character to any rule, and takes the level of the
+/// character before it as boundary neutrals do.
+fn class_of(c: char) -> BidiClass {
+    if c == GLYPH_JOINER {
+        BidiClass::BN
+    } else {
+        bidi_class(c)
+    }
+}
 
 /// Append `label`, what one code reads as, to `out` — with a
 /// [`GLYPH_JOINER`] between its characters when there are several and one
@@ -124,15 +138,17 @@ pub(crate) fn strip_glyph_joiners(text: &mut String) {
 }
 
 /// Split `positions` into clusters of a base character followed by its
-/// combining marks — and by the characters a [`GLYPH_JOINER`] after it
-/// joins on, so that one glyph's characters stay one cluster — and reverse
-/// the order of the clusters, keeping each cluster's characters in place.
-/// `ch_at` reads the character a position stands for.
+/// combining marks — and by a [`GLYPH_JOINER`] and the character after it,
+/// so that one glyph's characters stay one cluster — and reverse the order
+/// of the clusters, keeping each cluster's characters in place. `ch_at`
+/// reads the character a position stands for.
 fn reverse_clusters(positions: &mut [usize], ch_at: impl Fn(usize) -> char) {
     let mut clusters: Vec<(usize, usize)> = Vec::new();
     for (i, &p) in positions.iter().enumerate() {
-        let continues =
-            i > 0 && (is_combining_mark(ch_at(p)) || ch_at(positions[i - 1]) == GLYPH_JOINER);
+        let continues = i > 0
+            && (is_combining_mark(ch_at(p))
+                || ch_at(p) == GLYPH_JOINER
+                || ch_at(positions[i - 1]) == GLYPH_JOINER);
         if !continues {
             clusters.push((i, i + 1));
         } else if let Some(last) = clusters.last_mut() {
@@ -201,13 +217,15 @@ fn resolved_levels(sequence: &[AnalysisChar], rtl_base: bool, out_len: usize) ->
     // in for the start-of-text context of the weak and neutral rules.
     let mut text = String::with_capacity(sequence.len() * 2 + 3);
     text.push(mark);
-    let is_digit = |c: char| matches!(bidi_class(c), BidiClass::EN | BidiClass::AN);
-    let is_dash = |c: char| {
-        bidi_class(c) == BidiClass::ES || matches!(c, '\u{2010}'..='\u{2015}' | '\u{2212}')
-    };
+    let is_digit = |c: char| matches!(class_of(c), BidiClass::EN | BidiClass::AN);
+    let is_dash =
+        |c: char| class_of(c) == BidiClass::ES || matches!(c, '\u{2010}'..='\u{2015}' | '\u{2212}');
     for (i, a) in sequence.iter().enumerate() {
-        text.push(match bidi_class(a.ch) {
+        text.push(match class_of(a.ch) {
             BidiClass::B | BidiClass::S => ' ',
+            // The glyph joiner, as a boundary neutral the algorithm's
+            // tables know (a zero width space).
+            _ if a.ch == GLYPH_JOINER => '\u{200B}',
             // A dash between two digits is part of the number — a range, a
             // date, a phone number — whichever digits they are. Rule W4
             // only joins a European separator to European digits; after
@@ -286,7 +304,7 @@ fn bracket_pairs(chars: &[char], rtl_base: bool) -> Vec<BracketPair> {
         if inner.is_empty()
             && chars[open + 1..i]
                 .iter()
-                .any(|&c| matches!(bidi_class(c), BidiClass::EN | BidiClass::AN))
+                .any(|&c| matches!(class_of(c), BidiClass::EN | BidiClass::AN))
         {
             inner.push(opposite_dir);
         }
@@ -351,7 +369,7 @@ fn phantom_before_pair(chars: &[char], pair: &BracketPair, level: u8) -> char {
 /// The class of a letter for the purpose of finding the strong character
 /// that precedes a number: `L`, `R` or `AL`. Digits are not letters here.
 fn letter_class(c: char) -> Option<BidiClass> {
-    match bidi_class(c) {
+    match class_of(c) {
         class @ (BidiClass::L | BidiClass::R | BidiClass::AL) => Some(class),
         _ => None,
     }
@@ -380,7 +398,7 @@ fn analysis_sequence(
     replaced: &[(usize, char)],
     phantoms: &[(usize, char)],
 ) -> Vec<AnalysisChar> {
-    let class_at = |k: usize| bidi_class(chars[read_back[k]]);
+    let class_at = |k: usize| class_of(chars[read_back[k]]);
     // Number tokens as `(start, end)` ranges of the read-back: European
     // digits with the terminators rule W5 joins to them on either side and
     // the single separators rule W4 joins between two digits.
@@ -426,7 +444,7 @@ fn analysis_sequence(
         it.find(|&q| {
             paired_bracket(chars[q]).is_some()
                 || !matches!(
-                    bidi_class(chars[q]),
+                    class_of(chars[q]),
                     BidiClass::WS
                         | BidiClass::ON
                         | BidiClass::CS
@@ -704,7 +722,7 @@ const NUMBER_GAP_EM: f32 = 0.3;
 /// and terminators rules W4 and W5 join to digits.
 fn joins_number(c: char) -> bool {
     matches!(
-        bidi_class(c),
+        class_of(c),
         BidiClass::EN | BidiClass::AN | BidiClass::ES | BidiClass::CS | BidiClass::ET
     )
 }
@@ -914,13 +932,41 @@ mod tests {
     }
 
     #[test]
+    fn the_glyph_joiner_is_transparent_to_the_embedding_levels() {
+        let levels = |text: &str, rtl_base: bool| -> Vec<u8> {
+            let chars: Vec<char> = text.chars().collect();
+            let sequence: Vec<AnalysisChar> = chars
+                .iter()
+                .enumerate()
+                .map(|(p, &ch)| AnalysisChar {
+                    ch,
+                    position: Some(p),
+                })
+                .collect();
+            resolved_levels(&sequence, rtl_base, chars.len())
+        };
+        assert_eq!(class_of(GLYPH_JOINER), BidiClass::BN);
+        // a لاه 12 b, with the joiner inside the lam-alef: in either
+        // paragraph direction the joiner takes the level of the letter
+        // before it and changes no other level.
+        let plain = "a \u{0644}\u{0627}\u{0647} 12 b";
+        let joined = format!("a \u{0644}{GLYPH_JOINER}\u{0627}\u{0647} 12 b");
+        for rtl_base in [true, false] {
+            let expected = levels(plain, rtl_base);
+            let mut with_joiner = levels(&joined, rtl_base);
+            let joiner = with_joiner.remove(3);
+            assert_eq!(with_joiner, expected, "rtl_base {rtl_base}");
+            assert_eq!(joiner, expected[2], "rtl_base {rtl_base}");
+        }
+    }
+
+    #[test]
     fn the_characters_of_one_glyph_stay_together_through_the_read_back() {
         // A lam-alef glyph decoded as its two letters, joined: turned round
         // as one cluster, it keeps the order its letters were named in.
-        assert!(is_combining_mark(GLYPH_JOINER));
         let mut lam_alef = String::new();
         push_glyph_characters(&mut lam_alef, "\u{0644}\u{0627}");
-        assert_eq!(lam_alef, "\u{0644}\u{034F}\u{0627}");
+        assert_eq!(lam_alef, format!("\u{0644}{GLYPH_JOINER}\u{0627}"));
         // Displayed left to right: the lam-alef glyph, then heh — the word
         // heh, lam, alef.
         let display = format!("{lam_alef}\u{0647}");

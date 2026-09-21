@@ -447,3 +447,35 @@ fn a_nameless_glyph_reads_as_nothing_only_under_a_proven_stale_cmap() {
     assert!(overrides(&doc, font_id).is_empty());
     assert_eq!(line_texts(&mut doc), [")i"]);
 }
+
+#[test]
+fn stale_cmap_repair_reaches_a_font_naming_only_ligatures_and_nameless_glyphs() {
+    // No name reads as a single character: the ligature and the mark glyph
+    // are the whole encoding, and the CMap's range still proves it stale.
+    let glyphs = ["uni06440627.f", "arHamzaAboveCCMP"];
+    let differences = [(0x3C, "uni06440627.f"), (0x69, "arHamzaAboveCCMP")];
+    let content = b"BT /F1 12 Tf 1 0 0 1 40 700 Tm <3C69> Tj ET";
+    let (mut doc, font_id) = font_doc(&glyphs, &differences, RTL_STALE_MAP, (0x3C, 0x69), content);
+    let repairs = overrides(&doc, font_id);
+    assert_eq!(
+        repairs.get(&0x3C).map(String::as_str),
+        Some("\u{0644}\u{0627}")
+    );
+    assert_eq!(repairs.get(&0x69).map(String::as_str), Some(""));
+    assert_eq!(line_texts(&mut doc), ["\u{0644}\u{0627}"]);
+}
+
+#[test]
+fn a_grapheme_joiner_of_the_documents_own_survives_the_read_back() {
+    // A code reading as shin, combining grapheme joiner, shin dot: the
+    // joiner that keeps the mark in its place is a character of the text
+    // and stays, where it was.
+    let glyphs = ["uni05E9034F05C1"];
+    let differences = [(0x21, "uni05E9034F05C1")];
+    let cmap = "1 begincodespacerange\n<00><FF>\nendcodespacerange\n\
+1 beginbfchar\n<21><05E9034F05C1>\nendbfchar";
+    let content = b"BT /F1 12 Tf 1 0 0 1 40 700 Tm <21> Tj ET";
+    let (mut doc, font_id) = font_doc(&glyphs, &differences, cmap, (0x21, 0x21), content);
+    assert!(overrides(&doc, font_id).is_empty());
+    assert_eq!(line_texts(&mut doc), ["\u{05E9}\u{034F}\u{05C1}"]);
+}

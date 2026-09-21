@@ -449,20 +449,41 @@ impl ToUnicodeCMap {
 
     /// Decode a byte slice to a Unicode string, respecting the CMap's code byte width
     pub fn decode_cids(&self, bytes: &[u8]) -> String {
+        self.decode_cids_with(bytes, |out, label| out.push_str(label))
+            .0
+    }
+
+    /// Decode `bytes` as [`decode_cids`](Self::decode_cids) does, appending
+    /// what each mapped code reads as through `append` (given the text so
+    /// far and the code's text; the stand-in for an unmapped code — the
+    /// Latin-1 character of a single byte, a CID passed through as a code
+    /// point — is one character and goes in as it is). Returns the text
+    /// with the number of codes that contributed to it: an empty text and
+    /// zero when too many codes were unmapped.
+    pub(crate) fn decode_cids_with(
+        &self,
+        bytes: &[u8],
+        mut append: impl FnMut(&mut String, &str),
+    ) -> (String, usize) {
         let mut result = String::new();
         let mut unmapped_count = 0usize;
+        let mut decoded_codes = 0usize;
 
         if self.code_byte_length == 1 {
             // Single-byte codes: each byte is a code
             for &b in bytes {
                 let code = b as u16;
                 match self.lookup(code) {
-                    Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
+                    Some(s) if !s.contains('\u{FFFD}') => {
+                        append(&mut result, &s);
+                        decoded_codes += 1;
+                    }
                     _ => {
                         // For single-byte unmapped codes, try as Latin-1
                         // (the byte IS the character code in most legacy encodings)
                         if b >= 0x20 {
                             result.push(b as char);
+                            decoded_codes += 1;
                         }
                         unmapped_count += 1;
                     }
@@ -474,7 +495,10 @@ impl ToUnicodeCMap {
                 if chunk.len() == 2 {
                     let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
                     match self.lookup(cid) {
-                        Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
+                        Some(s) if !s.contains('\u{FFFD}') => {
+                            append(&mut result, &s);
+                            decoded_codes += 1;
+                        }
                         _ => {
                             if self.cid_passthrough {
                                 // Last-resort: treat CID as Unicode codepoint.
@@ -483,6 +507,7 @@ impl ToUnicodeCMap {
                                 if let Some(ch) = char::from_u32(cid as u32) {
                                     if !ch.is_control() || ch == '\t' || ch == '\n' {
                                         result.push(ch);
+                                        decoded_codes += 1;
                                     } else {
                                         unmapped_count += 1;
                                     }
@@ -508,10 +533,10 @@ impl ToUnicodeCMap {
             bytes.len() / 2
         };
         if total > 0 && unmapped_count > total / 2 {
-            return String::new();
+            return (String::new(), 0);
         }
 
-        result
+        (result, decoded_codes)
     }
 
     /// Get the minimum source CID across all mappings (char_map + ranges).
