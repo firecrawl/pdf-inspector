@@ -45,10 +45,14 @@ pub struct CidDecodeStats {
     /// them (see [`ToUnicodeCMap::gap_fill`]); two-byte codes only, as no
     /// gap is read into a single-byte CMap.
     pub interpolated: u32,
-    /// Codes without an entry that were not read from their neighbours. A
-    /// two-byte code among them is a U+FFFD in the decoded text; a byte of
-    /// a single-byte CMap is stood in for by its Latin-1 character when it
-    /// is printable and reads as nothing otherwise, so not every unmapped
+    /// Codes without an entry that were not read from their neighbours, and
+    /// what they show as. A two-byte code among them is a U+FFFD in the
+    /// decoded text, except through a CMap that passes CIDs through as code
+    /// points (`cid_passthrough`), which counts only a code that is a control
+    /// character other than TAB and LF, or no scalar value at all, and
+    /// shows it as nothing. A byte of a single-byte CMap at or above 0x20 —
+    /// DEL and the C1 range included — is stood in for by its Latin-1
+    /// character, a byte below 0x20 reads as nothing; so not every unmapped
     /// code shows as a replacement character.
     pub unmapped: u32,
 }

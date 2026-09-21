@@ -5837,8 +5837,6 @@ fn make_type0_pdf_with_tounicode_ranges_spaced(
     lines: &[&[u16]],
     char_spacing: f32,
 ) -> Vec<u8> {
-    use lopdf::{dictionary, Document, Stream};
-
     let highest_code = lines
         .iter()
         .flat_map(|line| line.iter())
@@ -5846,7 +5844,7 @@ fn make_type0_pdf_with_tounicode_ranges_spaced(
         .copied()
         .max()
         .unwrap_or(0);
-    let mut doc = Document::with_version("1.5");
+    let mut doc = lopdf::Document::with_version("1.5");
     let font_id = add_type0_font_with_tounicode_ranges(&mut doc, ranges, highest_code);
 
     let spacing = if char_spacing > 0.0 {
@@ -5854,29 +5852,77 @@ fn make_type0_pdf_with_tounicode_ranges_spaced(
     } else {
         String::new()
     };
-    let mut text = String::new();
+    let mut content = String::new();
     for (index, line) in lines.iter().enumerate() {
         let hex: String = line.iter().map(|code| format!("{code:04X}")).collect();
-        text.push_str(&format!(
+        content.push_str(&format!(
             "BT /F1 12 Tf {spacing}72 {} Td <{hex}> Tj ET\n",
             700 - 20 * index
         ));
     }
-    let content_id = doc.add_object(Stream::new(dictionary! {}, text.into_bytes()));
     let pages_id = doc.new_object_id();
-    let page_id = doc.add_object(dictionary! {
+    let page_id = add_page(
+        &mut doc,
+        pages_id,
+        &content,
+        LETTER_BOX,
+        None,
+        &[("F1", font_id)],
+    );
+    finish_document(doc, pages_id, vec![page_id])
+}
+
+/// A US-letter page box, in points.
+const LETTER_BOX: [i64; 4] = [0, 0, 612, 792];
+
+/// A page of `content` added to `doc` under the page tree `pages_id`, with
+/// `media_box`, `crop_box` when given, and the fonts named in `fonts`;
+/// returns the page's id.
+fn add_page(
+    doc: &mut lopdf::Document,
+    pages_id: lopdf::ObjectId,
+    content: &str,
+    media_box: [i64; 4],
+    crop_box: Option<[i64; 4]>,
+    fonts: &[(&str, lopdf::ObjectId)],
+) -> lopdf::ObjectId {
+    use lopdf::{dictionary, Object, Stream};
+
+    let boxed = |b: [i64; 4]| -> Object { Object::Array(b.iter().map(|&v| v.into()).collect()) };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let mut font_dict = lopdf::Dictionary::new();
+    for &(name, id) in fonts {
+        font_dict.set(name, id);
+    }
+    let mut page = dictionary! {
         "Type" => "Page",
         "Parent" => pages_id,
-        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        "MediaBox" => boxed(media_box),
+        "Resources" => dictionary! { "Font" => font_dict },
         "Contents" => content_id,
-    });
+    };
+    if let Some(crop_box) = crop_box {
+        page.set("CropBox", boxed(crop_box));
+    }
+    doc.add_object(page)
+}
+
+/// `doc` finished with the page tree `pages_id` over `kids` and a catalog,
+/// serialized.
+fn finish_document(
+    mut doc: lopdf::Document,
+    pages_id: lopdf::ObjectId,
+    kids: Vec<lopdf::ObjectId>,
+) -> Vec<u8> {
+    use lopdf::dictionary;
+
+    let count = kids.len() as i64;
     doc.objects.insert(
         pages_id,
         dictionary! {
             "Type" => "Pages",
-            "Kids" => vec![page_id.into()],
-            "Count" => 1,
+            "Kids" => kids.into_iter().map(Into::into).collect::<Vec<lopdf::Object>>(),
+            "Count" => count,
         }
         .into(),
     );
@@ -6136,7 +6182,7 @@ fn test_word_gap_analysis_does_not_count_a_string_twice() {
 /// after the first also show lines through the font of
 /// `add_type0_font_with_tounicode_ranges` with `GAPPED_RANGES`.
 fn make_contextual_folio_pdf_with_gapped_later_pages() -> Vec<u8> {
-    use lopdf::{dictionary, Document, Stream};
+    use lopdf::{dictionary, Document};
 
     let lines = cmap_gap_lines();
     let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
@@ -6171,36 +6217,16 @@ fn make_contextual_folio_pdf_with_gapped_later_pages() -> Vec<u8> {
                 ));
             }
         }
-        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-        let page_id = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-            "Resources" => dictionary! {
-                "Font" => dictionary! { "F1" => text_font_id, "F2" => gapped_font_id },
-            },
-            "Contents" => content_id,
-        });
-        kids.push(page_id.into());
+        kids.push(add_page(
+            &mut doc,
+            pages_id,
+            &content,
+            LETTER_BOX,
+            None,
+            &[("F1", text_font_id), ("F2", gapped_font_id)],
+        ));
     }
-    doc.objects.insert(
-        pages_id,
-        dictionary! {
-            "Type" => "Pages",
-            "Kids" => kids,
-            "Count" => 4,
-        }
-        .into(),
-    );
-    let catalog_id = doc.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => pages_id,
-    });
-    doc.trailer.set("Root", catalog_id);
-
-    let mut bytes = Vec::new();
-    doc.save_to(&mut bytes).unwrap();
-    bytes
+    finish_document(doc, pages_id, kids)
 }
 
 #[test]
@@ -6268,7 +6294,7 @@ fn test_analyze_mode_reports_unmapped_cmap_codes_as_encoding_issues() {
 /// the box and once again, on other baselines, out on the right half, as a
 /// single-page extract of an imposed spread keeps its neighbour's text.
 fn make_spread_pdf_with_gapped_font_off_page() -> Vec<u8> {
-    use lopdf::{dictionary, Document, Stream};
+    use lopdf::Document;
 
     let lines = cmap_gap_lines();
     let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
@@ -6294,34 +6320,16 @@ fn make_spread_pdf_with_gapped_font_off_page() -> Vec<u8> {
             690 - 20 * index
         ));
     }
-    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
     let pages_id = doc.new_object_id();
-    let page_id = doc.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => pages_id,
-        "MediaBox" => vec![0.into(), 0.into(), 1224.into(), 792.into()],
-        "CropBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
-        "Contents" => content_id,
-    });
-    doc.objects.insert(
+    let page_id = add_page(
+        &mut doc,
         pages_id,
-        dictionary! {
-            "Type" => "Pages",
-            "Kids" => vec![page_id.into()],
-            "Count" => 1,
-        }
-        .into(),
+        &content,
+        [0, 0, 1224, 792],
+        Some(LETTER_BOX),
+        &[("F1", font_id)],
     );
-    let catalog_id = doc.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => pages_id,
-    });
-    doc.trailer.set("Root", catalog_id);
-
-    let mut bytes = Vec::new();
-    doc.save_to(&mut bytes).unwrap();
-    bytes
+    finish_document(doc, pages_id, vec![page_id])
 }
 
 #[test]
