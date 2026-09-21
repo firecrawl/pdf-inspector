@@ -167,7 +167,7 @@ struct TestForm<'a> {
     name: &'a str,
     content: &'a str,
     matrix: Option<[i64; 6]>,
-    bbox: [i64; 4],
+    bbox: &'a [i64],
 }
 
 /// A page-sized form with nothing in it, to fill in.
@@ -175,7 +175,7 @@ const PAGE_FORM: TestForm<'static> = TestForm {
     name: "",
     content: "",
     matrix: None,
-    bbox: [0, 0, 612, 792],
+    bbox: &[0, 0, 612, 792],
 };
 
 /// A one-page 612×792 document whose content stream is set with
@@ -541,7 +541,7 @@ fn a_form_s_bbox_clips_what_it_draws() {
         &[TestForm {
             name: "FmCorner",
             content: "q 612 0 0 792 0 0 cm /Im0 Do Q BT /F1 10 Tf 0 Tr 10 10 Td (t) Tj ET",
-            bbox: [0, 0, 50, 50],
+            bbox: &[0, 0, 50, 50],
             ..PAGE_FORM
         }],
     );
@@ -885,4 +885,99 @@ fn painted_layer_caption_no_image_or_image_alone_is_not_an_invisible_layer() {
     assert_eq!(analysis.executed_text_operator_count, 0);
     assert!(!analysis.has_invisible_text_layer);
     assert_eq!(page_ocr_reasons(&analysis), vec![crate::OCR_REASON_SCANNED]);
+}
+
+#[test]
+fn an_inline_image_paints_the_unit_square_as_an_image_xobject_does() {
+    let (doc, page_id, _) = synthetic_page(true, false, &[]);
+    let run = |content: &str| executed(&doc, page_id, &[content]);
+    let inline = "BI /W 1 /H 1 /BPC 8 /CS /G ID x EI";
+    // Covering the page, or shifted mostly off it.
+    assert!(close(
+        run(&format!("q 612 0 0 792 0 0 cm {inline} Q")).2,
+        PAGE_AREA
+    ));
+    assert!(about(
+        run(&format!("q 612 0 0 792 500 0 cm {inline} Q")).2,
+        112.0 * 792.0
+    ));
+    // It paints through a clip-only text's clip like any image.
+    let (executed_ops, hidden, _) = run(&format!("q BT /F1 10 Tf 7 Tr (a) Tj ET {inline} Q"));
+    assert_eq!((executed_ops, hidden), (1, 0));
+}
+
+#[test]
+fn a_clipping_path_narrows_what_an_image_covers() {
+    let (doc, page_id, _) = synthetic_page(
+        true,
+        false,
+        &[TestForm {
+            name: "FmImage",
+            content: "q 612 0 0 792 0 0 cm /Im0 Do Q",
+            ..PAGE_FORM
+        }],
+    );
+    let covered = |content: &str| executed(&doc, page_id, &[content]).2;
+    let full = "q 612 0 0 792 0 0 cm /Im0 Do Q";
+    // A rectangle clips exactly; `Q` restores the clip that was in force.
+    assert!(about(
+        covered(&format!("0 0 100 100 re W n {full}")),
+        100.0 * 100.0
+    ));
+    assert!(close(
+        covered(&format!("q 0 0 100 100 re W n {full} Q {full}")),
+        PAGE_AREA
+    ));
+    assert!(about(
+        covered(&format!("0 0 100 100 re W* n {full}")),
+        100.0 * 100.0
+    ));
+    // The clip is set under the matrix in force, and narrows forms too.
+    assert!(about(
+        covered(&format!("q 2 0 0 2 0 0 cm 0 0 50 50 re W n {full} Q")),
+        100.0 * 100.0
+    ));
+    assert!(about(
+        covered("0 0 100 100 re W n /FmImage Do"),
+        100.0 * 100.0
+    ));
+    // Any other shape is approximated by its bounding box; a path with no
+    // extent clips everything away.
+    assert!(about(
+        covered(&format!("0 0 m 100 0 l 0 100 l h W n {full}")),
+        100.0 * 100.0
+    ));
+    assert!(close(covered(&format!("W n {full}")), 0.0));
+    // A path that is painted rather than clipped changes nothing.
+    assert!(close(
+        covered(&format!("0 0 100 100 re f {full}")),
+        PAGE_AREA
+    ));
+}
+
+#[test]
+fn a_form_box_with_trailing_numbers_is_read_by_its_first_four() {
+    let (doc, page_id, _) = synthetic_page(
+        true,
+        false,
+        &[
+            TestForm {
+                name: "FmSix",
+                content: "q 612 0 0 792 0 0 cm /Im0 Do Q",
+                bbox: &[0, 0, 50, 50, 612, 792],
+                ..PAGE_FORM
+            },
+            TestForm {
+                name: "FmThree",
+                content: "q 612 0 0 792 0 0 cm /Im0 Do Q",
+                bbox: &[0, 0, 50],
+                ..PAGE_FORM
+            },
+        ],
+    );
+    let covered = |content: &str| executed(&doc, page_id, &[content]).2;
+    assert!(about(covered("/FmSix Do"), 50.0 * 50.0));
+    // Three numbers are no box: there is nothing to clip by, and the form
+    // runs unclipped.
+    assert!(close(covered("/FmThree Do"), PAGE_AREA));
 }

@@ -117,9 +117,11 @@ Changes since 1.22.1.
   form's `/BBox`), and flags a page whose every executed text-showing
   operator leaves nothing to see, while the images it draws — tallied on
   a grid over the page, so a scan tiled into strips counts — cover at
-  least half of it (each draw clipped to the page; images bound but never
-  drawn, and forms never invoked, do not count; a page whose forms outrun
-  the scan's budget is not flagged), for OCR with the new reason
+  least half of it (each draw clipped to the page and to the rectangular
+  clipping path in force, a clip of any other shape by its box; an inline
+  image counts as an image; images bound but never drawn, and forms never
+  invoked, do not count; a page whose forms outrun the scan's budget is
+  not flagged), for OCR with the new reason
   `invisible_text_layer`
   (`OCR_REASON_INVISIBLE_TEXT_LAYER`) — in `pdf_type`, `pages_needing_ocr`,
   `ocr_reasons_by_page` and per-page `needs_ocr`/`ocr_reason` alike, for

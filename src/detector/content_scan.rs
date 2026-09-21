@@ -180,6 +180,16 @@ impl UserBox {
         (self.x1 - self.x0) * (self.y1 - self.y0)
     }
 
+    /// The smallest box holding both.
+    fn union(&self, other: &UserBox) -> UserBox {
+        UserBox {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
     /// `None` when the boxes do not overlap.
     fn intersect(&self, other: &UserBox) -> Option<UserBox> {
         let clipped = UserBox {
@@ -197,14 +207,17 @@ impl UserBox {
 struct SavedScanState {
     render_mode: u8,
     ctm: [f64; 6],
+    clip: UserBox,
     clip_text_ops: u32,
 }
 
 /// The part of the graphics state a content scan follows, saved by `q`
 /// and restored by `Q`: the text render mode `Tr` sets; the current
-/// transformation matrix `cm` concatenates; and the clip-only (mode 7)
-/// text whose clip is in force, which a painting operator shows through
-/// and the `Q` closing its level discards unseen.
+/// transformation matrix `cm` concatenates; the clip the clipping paths
+/// set with `W`/`W*` narrow — a rectangle exactly, any other shape by its
+/// bounding box; and the clip-only (mode 7) text whose clip is in force,
+/// which a painting operator shows through and the `Q` closing its level
+/// discards unseen.
 ///
 /// One state runs through a page's content streams, which the PDF reads
 /// as one, and — when it follows `Do` — through the Form XObjects they
@@ -221,13 +234,19 @@ struct ContentScanState<'a> {
     /// The visible page box, which the coverage grid spans.
     page: UserBox,
     /// The clip in force for image draws: the page box, narrowed by the
-    /// boxes of the forms being run.
+    /// boxes of the forms being run and by the clipping paths set with
+    /// `W`/`W*`.
     clip: UserBox,
     /// Whether `Do` is followed: images drawn are measured and forms are
     /// run in place.
     follow_do: bool,
     render_mode: u8,
     ctm: [f64; 6],
+    /// The bounding box, in user space, of the path under construction.
+    path_box: Option<UserBox>,
+    /// Whether `W`/`W*` asked for the path under construction to become
+    /// the clip once the operator ending the path has run.
+    clip_pending: bool,
     /// Mode-7 text-showing operators whose clip was set at the current
     /// level and has not been painted through; those set at outer levels
     /// sit in `saved`.
@@ -282,6 +301,8 @@ impl<'a> ContentScanState<'a> {
             follow_do,
             render_mode: 0,
             ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            path_box: None,
+            clip_pending: false,
             clip_text_ops: 0,
             pending_clip_text_ops: 0,
             clip_text_ops_open: 0,
@@ -305,6 +326,7 @@ impl<'a> ContentScanState<'a> {
             self.saved.push(SavedScanState {
                 render_mode: self.render_mode,
                 ctm: self.ctm,
+                clip: self.clip,
                 clip_text_ops: self.clip_text_ops,
             });
             self.clip_text_ops = 0;
@@ -324,6 +346,7 @@ impl<'a> ContentScanState<'a> {
                 self.pending_clip_text_ops -= self.clip_text_ops;
                 self.render_mode = saved.render_mode;
                 self.ctm = saved.ctm;
+                self.clip = saved.clip;
                 self.clip_text_ops = saved.clip_text_ops;
             }
         }
@@ -397,8 +420,48 @@ impl<'a> ContentScanState<'a> {
         }
     }
 
-    /// `Do` of an image: it paints the unit square under the matrix in
-    /// force, of which the part within the clip in force counts.
+    /// A point of the path under construction, in user space.
+    fn path_point(&mut self, x: f64, y: f64) {
+        if let Some(point) = self.transformed_box([x, y, x, y]) {
+            self.path_box = Some(self.path_box.map_or(point, |path| path.union(&point)));
+        }
+    }
+
+    /// A rectangle of the path under construction (`re`), in user space.
+    fn path_rect(&mut self, [x, y, w, h]: [f64; 4]) {
+        if let Some(rect) = self.transformed_box([x, y, x + w, y + h]) {
+            self.path_box = Some(self.path_box.map_or(rect, |path| path.union(&rect)));
+        }
+    }
+
+    /// `W`/`W*`: the path under construction is to clip, once ended.
+    fn clip_requested(&mut self) {
+        self.clip_pending = true;
+    }
+
+    /// A painting operator or `n` ended the path. A clip asked for narrows
+    /// the clip in force to the path's box — a rectangle exactly, a path
+    /// of several rectangles or of any other shape by its bounding box —
+    /// or to nothing when the path has no extent.
+    fn path_ended(&mut self) {
+        if self.clip_pending {
+            self.clip = match self.path_box.and_then(|path| path.intersect(&self.clip)) {
+                Some(clip) => clip,
+                None => UserBox {
+                    x0: self.clip.x0,
+                    y0: self.clip.y0,
+                    x1: self.clip.x0,
+                    y1: self.clip.y0,
+                },
+            };
+            self.clip_pending = false;
+        }
+        self.path_box = None;
+    }
+
+    /// `Do` of an image, or `BI` of an inline image: it paints the unit
+    /// square under the matrix in force, of which the part within the clip
+    /// in force counts.
     fn image_drawn(&mut self) {
         self.painted();
         let Some(drawn) = self.transformed_box([0.0, 0.0, 1.0, 1.0]) else {
@@ -464,7 +527,6 @@ impl<'a> ContentScanState<'a> {
         }
         self.form_invocations += 1;
 
-        let outer_clip = self.clip;
         let outer_floor = self.stack_floor;
         self.save();
         let base = self.saved.len();
@@ -500,7 +562,6 @@ impl<'a> ContentScanState<'a> {
         }
         self.stack_floor = outer_floor;
         self.restore();
-        self.clip = outer_clip;
     }
 
     /// A form's content, decompressed once per page while the cache lasts.
@@ -611,9 +672,13 @@ fn stream_resources<'a>(
     }
 }
 
-/// The `N` numbers of `dict`'s `key` — a form's `/Matrix` or `/BBox` —
-/// when it holds exactly that many, the array and its numbers direct or
-/// by reference.
+/// The first `N` numbers of `dict`'s `key` — a form's `/Matrix` or
+/// `/BBox` — the array and its numbers direct or by reference. An array
+/// with more entries is read by its first `N`, as a page box with
+/// trailing entries is; one with fewer, or with something other than a
+/// number among the first `N`, gives nothing — the form then runs
+/// unclipped, or under the identity, there being nothing to clip or
+/// scale by.
 fn numbers_of<const N: usize>(
     doc: &Document,
     dict: &lopdf::Dictionary,
@@ -624,7 +689,7 @@ fn numbers_of<const N: usize>(
         Object::Reference(id) => doc.get_object(*id).ok()?.as_array().ok()?,
         _ => return None,
     };
-    if array.len() != N {
+    if array.len() < N {
         return None;
     }
     let mut numbers = [0.0f64; N];
@@ -932,13 +997,21 @@ fn scan_content_stream<'a>(
                     }
                 }
             }
-        } else if (b == b's' && ops.get(i + 1) == Some(&b'h')
-            || b == b'B' && ops.get(i + 1) == Some(&b'I'))
+        } else if b == b's'
+            && ops.get(i + 1) == Some(&b'h')
             && is_token_start(i)
             && is_token_end(i + 1)
         {
-            // sh = paint a shading; BI = begin an inline image.
+            // sh = paint a shading.
             state.painted();
+        } else if b == b'B'
+            && ops.get(i + 1) == Some(&b'I')
+            && is_token_start(i)
+            && is_token_end(i + 1)
+        {
+            // BI = begin an inline image, which paints the unit square
+            // under the matrix in force as an image XObject does.
+            state.image_drawn();
         } else if b == b'E'
             && ops.get(i + 1) == Some(&b'T')
             && is_token_start(i)
@@ -959,26 +1032,63 @@ fn scan_content_stream<'a>(
         // These are the high-volume operators in vector-outlined text.
         // A painting operator also shows any clip-only text through its
         // glyphs; b, B* and b* paint too but are not counted as path
-        // operators.
+        // operators. The path's points are followed for the clip a `W` or
+        // `W*` before the operator ending the path asks for; v and y add
+        // points without being counted either.
         let mut painted = false;
+        let mut path_ended = false;
         match b {
-            b'm' | b'l' | b'c' | b'h' if is_word_start(i) && is_word_end(i) => {
+            b'm' | b'l' if is_word_start(i) && is_word_end(i) => {
+                counts.path_ops += 1;
+                if let Some([x, y]) = numeric_operands_before::<2>(ops, i, operand_floor) {
+                    state.path_point(x, y);
+                }
+            }
+            b'c' if is_word_start(i) && is_word_end(i) => {
+                counts.path_ops += 1;
+                if let Some([x1, y1, x2, y2, x3, y3]) =
+                    numeric_operands_before::<6>(ops, i, operand_floor)
+                {
+                    state.path_point(x1, y1);
+                    state.path_point(x2, y2);
+                    state.path_point(x3, y3);
+                }
+            }
+            b'v' | b'y' if is_word_start(i) && is_word_end(i) => {
+                if let Some([x1, y1, x2, y2]) = numeric_operands_before::<4>(ops, i, operand_floor)
+                {
+                    state.path_point(x1, y1);
+                    state.path_point(x2, y2);
+                }
+            }
+            b'h' if is_word_start(i) && is_word_end(i) => {
                 counts.path_ops += 1;
             }
             b'f' | b'S' | b's' | b'B' | b'F' if is_word_start(i) && is_word_end(i) => {
                 counts.path_ops += 1;
                 painted = true;
+                path_ended = true;
             }
             b'b' if is_word_start(i) && is_word_end(i) => {
                 painted = true;
+                path_ended = true;
             }
-            // Two-byte: re (rect), f* (fill even-odd)
+            b'n' if is_word_start(i) && is_word_end(i) => {
+                path_ended = true;
+            }
+            b'W' if is_word_start(i) && is_word_end(i) => {
+                state.clip_requested();
+            }
+            // Two-byte: re (rect), f* (fill even-odd), W* (clip even-odd)
             b'r' if i + 1 < ops.len()
                 && ops[i + 1] == b'e'
                 && is_word_start(i)
                 && (i + 2 >= ops.len() || ops[i + 2].is_ascii_whitespace()) =>
             {
                 counts.path_ops += 1;
+                if let Some(rect) = numeric_operands_before::<4>(ops, i, operand_floor) {
+                    state.path_rect(rect);
+                }
             }
             b'f' if i + 1 < ops.len()
                 && ops[i + 1] == b'*'
@@ -987,6 +1097,7 @@ fn scan_content_stream<'a>(
             {
                 counts.path_ops += 1;
                 painted = true;
+                path_ended = true;
             }
             b'B' | b'b'
                 if i + 1 < ops.len()
@@ -995,11 +1106,22 @@ fn scan_content_stream<'a>(
                     && (i + 2 >= ops.len() || ops[i + 2].is_ascii_whitespace()) =>
             {
                 painted = true;
+                path_ended = true;
+            }
+            b'W' if i + 1 < ops.len()
+                && ops[i + 1] == b'*'
+                && is_word_start(i)
+                && (i + 2 >= ops.len() || ops[i + 2].is_ascii_whitespace()) =>
+            {
+                state.clip_requested();
             }
             _ => {}
         }
         if painted {
             state.painted();
+        }
+        if path_ended {
+            state.path_ended();
         }
 
         i += 1;

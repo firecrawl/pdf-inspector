@@ -2564,6 +2564,9 @@ struct GlyphLayerPage {
     /// Draw the covering image as this many horizontal strips instead of
     /// one draw; 0 for one draw.
     image_strips: usize,
+    /// Draw the covering image as an inline image (`BI … ID … EI`)
+    /// instead of an image XObject.
+    inline_image: bool,
     /// Show the layer with the `'` and `"` operators instead of `Tj`.
     quote_operators: bool,
     /// Wrap the body text in marked content whose property list has an
@@ -2623,11 +2626,18 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
         if page.spare_large_image || (draws && page.large_image) {
             xobjects.push_str(&format!(" /ImBig {large} 0 R"));
         }
-        let draw_image = format!(
-            "q 612 0 0 792 {} 0 cm /{} Do Q\n",
-            page.image_dx,
-            if page.large_image { "ImBig" } else { "Im0" }
-        );
+        let draw_image = if page.inline_image {
+            format!(
+                "q 612 0 0 792 {} 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID abcd EI Q\n",
+                page.image_dx
+            )
+        } else {
+            format!(
+                "q 612 0 0 792 {} 0 cm /{} Do Q\n",
+                page.image_dx,
+                if page.large_image { "ImBig" } else { "Im0" }
+            )
+        };
         if page.covering_image && page.image_strips > 0 {
             let strip = 792.0 / page.image_strips as f64;
             for k in 0..page.image_strips {
@@ -2775,6 +2785,7 @@ const SCAN_WITH_INVISIBLE_LAYER: GlyphLayerPage = GlyphLayerPage {
     image_after_layer: false,
     vector_paths: 0,
     image_strips: 0,
+    inline_image: false,
     quote_operators: false,
     marked_content_id: false,
     caption: None,
@@ -2956,6 +2967,43 @@ fn test_resources_bound_but_unused_are_not_evidence() {
     let pages = extract_pages_markdown_mem(&buf, None).unwrap();
     assert!(pages.pages[0].needs_ocr);
     assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+}
+
+/// A raster drawn as an inline image covers the page as an image XObject
+/// does: the hidden layer over it is a layer nobody sees, while the same
+/// inline image shifted mostly off the page leaves a text page.
+#[test]
+fn test_inline_image_raster_covers_the_page() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        inline_image: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        inline_image: true,
+        image_dx: 500,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_ne!(
         pages.pages[0].ocr_reason.as_deref(),
         Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
     );
