@@ -16,9 +16,12 @@ Changes since 1.22.1.
 - `PdfProcessResult::cmap_gaps`: the fonts whose ToUnicode CMap (or, for a
   font without one, the embedded program's cmap table) had no entry for
   some of the two-byte codes the document shows through it, each a
-  `FontCMapGaps` with the font's `/BaseFont` name and the counts of `codes`
-  shown, `interpolated` (read from the mapped codes around them, see below)
-  and `unmapped` (left as U+FFFD); empty when every such code had an entry.
+  `FontCMapGaps` with the font's `/BaseFont` name (or its resource name
+  when it has none) and the counts of `codes` shown, `interpolated` (read
+  from the mapped codes around them, see below) and `unmapped` (left as
+  U+FFFD). The list is always empty in `ProcessMode::DetectOnly`
+  (`detect_pdf`, `detectPdf`, `detect-pdf` without `--analyze`), which
+  decodes no text, and otherwise empty when every such code had an entry.
   Node `cmapGaps` (`FontCmapGaps[]`), Python `cmap_gaps`
   (`list[FontCMapGaps]`), the WebAssembly result's `cmapGaps` and the
   `pdf2md --json` and `detect-pdf --analyze --json` field `cmap_gaps` report

@@ -87,9 +87,11 @@ pub struct PdfResult {
     pub pages_with_tables: Vec<u32>,
     pub pages_with_columns: Vec<u32>,
     pub has_encoding_issues: bool,
-    /// Fonts whose ToUnicode CMap lacked an entry for a code the document
-    /// shows through it, with the counts of codes shown, read from their
-    /// neighbours and left as U+FFFD; empty when every such code had an entry.
+    /// Fonts whose ToUnicode CMap — or, for a font without one, the embedded
+    /// program's cmap table — lacked an entry for a code the document shows
+    /// through it, with the counts of codes shown, read from their neighbours
+    /// and left as U+FFFD. Always empty for `detectPdf`, which decodes no
+    /// text; otherwise empty when every such code had an entry.
     pub cmap_gaps: Vec<FontCmapGaps>,
 }
 
@@ -100,8 +102,9 @@ pub struct PageOcrReasons {
     pub reasons: Vec<String>,
 }
 
-/// A font whose ToUnicode CMap had no entry for some of the codes the
-/// document shows through it, and what became of those codes.
+/// A font whose ToUnicode CMap — or, for a font without one, the embedded
+/// program's cmap table — had no entry for some of the codes the document
+/// shows through it, and what became of those codes.
 #[napi(object)]
 pub struct FontCmapGaps {
     /// The font's /BaseFont name, or its resource name when it has none.

@@ -30,7 +30,8 @@ export interface PageOcrReasons {
 }
 
 /**
- * A font whose ToUnicode CMap had no entry for some of the codes the document
+ * A font whose ToUnicode CMap — or, for a font without one, the embedded
+ * program's cmap table — had no entry for some of the codes the document
  * shows through it, and what became of those codes.
  */
 export interface FontCmapGaps {
@@ -65,8 +66,10 @@ export interface PdfProcessResult {
   layout: LayoutComplexity;
   hasEncodingIssues: boolean;
   /**
-   * Fonts whose ToUnicode CMap lacked an entry for a code the document shows
-   * through it; empty when every such code had an entry.
+   * Fonts whose ToUnicode CMap — or, for a font without one, the embedded
+   * program's cmap table — lacked an entry for a code the document shows
+   * through it. Always empty for `detectPdf`, which decodes no text;
+   * otherwise empty when every such code had an entry.
    */
   cmapGaps: FontCmapGaps[];
 }

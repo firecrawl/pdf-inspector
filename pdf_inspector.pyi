@@ -20,8 +20,10 @@ class PdfResult:
     pages_with_columns: list[int]
     has_encoding_issues: bool
     cmap_gaps: list["FontCMapGaps"]
-    """Fonts whose ToUnicode CMap lacked an entry for a code the document
-    shows through it; empty when every such code had an entry."""
+    """Fonts whose ToUnicode CMap (or, for a font without one, the embedded
+    program's cmap table) lacked an entry for a code the document shows
+    through it. Always empty for detect_pdf, which decodes no text; otherwise
+    empty when every such code had an entry."""
 
 class PageOcrReasons:
     """OCR reasons for a single 1-indexed page."""
@@ -31,8 +33,9 @@ class PageOcrReasons:
     """Machine-readable OCR reason identifiers."""
 
 class FontCMapGaps:
-    """A font whose ToUnicode CMap had no entry for some of the codes the
-    document shows through it, and what became of those codes."""
+    """A font whose ToUnicode CMap (or, for a font without one, the embedded
+    program's cmap table) had no entry for some of the codes the document
+    shows through it, and what became of those codes."""
     font: str
     """The font's /BaseFont name, or its resource name when it has none."""
     codes: int

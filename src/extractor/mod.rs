@@ -557,7 +557,7 @@ fn extract_positioned_text_with_folio_context_impl(
         mut page_thresholds,
         mut gid_encoded_pages,
         mut page_rotations,
-        mut cmap_coverage,
+        cmap_coverage,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -582,12 +582,15 @@ fn extract_positioned_text_with_folio_context_impl(
         .copied()
         .filter(|page| !required_pages.contains(page))
         .collect();
+    // The context pages' items are dropped again once the folios are
+    // decided; their fonts' coverage is no part of the selected pages'
+    // either, so it is left out here.
     let (
         (context_items, context_rects, context_lines),
         context_thresholds,
         context_gid_pages,
         context_rotations,
-        context_coverage,
+        _context_coverage,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -602,7 +605,6 @@ fn extract_positioned_text_with_folio_context_impl(
     page_thresholds.extend(context_thresholds);
     gid_encoded_pages.extend(context_gid_pages);
     page_rotations.extend(context_rotations);
-    merge_cmap_coverage(&mut cmap_coverage, context_coverage);
     Ok((
         (selected_items, selected_rects, selected_lines),
         page_thresholds,

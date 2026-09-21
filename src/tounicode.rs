@@ -8,7 +8,6 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use crate::glyph_names::glyph_name_to_string;
 
@@ -29,8 +28,11 @@ pub struct ToUnicodeCMap {
     /// Used as a last resort for Identity-H fonts without ToUnicode/cmap/glyph names.
     pub cid_passthrough: bool,
     /// The characters read into the CMap's gaps (see [`Self::gap_fill`]),
-    /// computed from the entries the first time a two-byte code has none.
-    pub(crate) gap_fills: OnceLock<HashMap<u16, char>>,
+    /// built from the entries by [`Self::refresh_gap_fills`]. The crate's
+    /// own builders call it once a CMap's entries are final; a caller that
+    /// builds or edits a CMap through its public fields must call it before
+    /// decoding, as no gap is read until then.
+    pub(crate) gap_fills: HashMap<u16, char>,
 }
 
 /// What decoding a string through a CMap amounted to, for the two-byte
@@ -293,6 +295,7 @@ impl ToUnicodeCMap {
                 warn!("usecmap={} could not be loaded", name);
             }
         }
+        cmap.refresh_gap_fills();
 
         Some(cmap)
     }
@@ -672,15 +675,22 @@ impl ToUnicodeCMap {
     /// codes, every code point between them is a character of that same
     /// kind, the gap is no wider than [`MAX_GAP_FILL_WIDTH`], and the runs
     /// of mapped codes on both sides (and the next run beyond each, when
-    /// there is one) rise with their codes the way a font's glyph order
-    /// does. A gap next to punctuation, across a change of case or of
-    /// script, at the edge of the mapped codes or beside an entry of several
-    /// characters is never read.
+    /// there is one) rise with their codes, every code of them, the way a
+    /// font's glyph order does. A gap next to punctuation, across a change
+    /// of case or of script, at the edge of the mapped codes or beside an
+    /// entry of several characters is never read.
+    ///
+    /// The gaps are read from the table [`Self::refresh_gap_fills`] built.
     pub fn gap_fill(&self, cid: u16) -> Option<char> {
-        self.gap_fills
-            .get_or_init(|| self.compute_gap_fills())
-            .get(&cid)
-            .copied()
+        self.gap_fills.get(&cid).copied()
+    }
+
+    /// Build the table of gaps [`Self::gap_fill`] reads from the entries as
+    /// they are now. The crate's own builders call it once a CMap is final,
+    /// and again whenever they change one; a caller that builds or edits a
+    /// CMap through its public fields must call it before decoding.
+    pub fn refresh_gap_fills(&mut self) {
+        self.gap_fills = self.compute_gap_fills();
     }
 
     /// The maximal runs of consecutive mapped codes, as `(first, last)`,
@@ -723,10 +733,25 @@ impl ToUnicodeCMap {
         Some((first, last))
     }
 
-    /// Whether the codes of `run` rise in code point from first to last.
+    /// Whether the codes of `run` read as rising code points, code after
+    /// code — the last character of each code's text below the first of
+    /// the next code's — as the alphabet runs of a font's glyph order do.
+    /// A code that reads as nothing breaks the run.
     fn run_rises(&self, run: (u16, u16)) -> bool {
-        self.run_ends(run)
-            .is_some_and(|(first, last)| (first as u32) <= (last as u32))
+        let mut previous: Option<char> = None;
+        for cid in run.0..=run.1 {
+            let Some(text) = self.lookup(cid) else {
+                return false;
+            };
+            let (Some(first), Some(last)) = (text.chars().next(), text.chars().last()) else {
+                return false;
+            };
+            if previous.is_some_and(|previous| (previous as u32) >= (first as u32)) {
+                return false;
+            }
+            previous = Some(last);
+        }
+        previous.is_some()
     }
 
     /// Whether the last code of `earlier` reads below the first of `later`.
@@ -737,10 +762,15 @@ impl ToUnicodeCMap {
         }
     }
 
-    /// Every gap [`Self::gap_fill`] reads, computed once over the entries.
+    /// Every gap [`Self::gap_fill`] reads, computed over the entries.
     fn compute_gap_fills(&self) -> HashMap<u16, char> {
         let runs = self.mapped_runs();
         let mut fills = HashMap::new();
+        // Whether each run rises, read once however many gaps it borders.
+        let mut rises: Vec<Option<bool>> = vec![None; runs.len()];
+        let mut run_rises = |index: usize| -> bool {
+            *rises[index].get_or_insert_with(|| self.run_rises(runs[index]))
+        };
         for (index, pair) in runs.windows(2).enumerate() {
             let (below, above) = (pair[0], pair[1]);
             let (lo, hi) = (below.1, above.0);
@@ -765,18 +795,18 @@ impl ToUnicodeCMap {
             if !between_same_kind {
                 continue;
             }
-            if !self.run_rises(below) || !self.run_rises(above) {
+            if !run_rises(index) || !run_rises(index + 1) {
                 continue;
             }
-            if let Some(&previous) = index.checked_sub(1).and_then(|i| runs.get(i)) {
-                if !self.run_rises(previous) || !self.runs_rise_across(previous, below) {
+            if let Some(previous) = index.checked_sub(1) {
+                if !run_rises(previous) || !self.runs_rise_across(runs[previous], below) {
                     continue;
                 }
             }
-            if let Some(&next) = runs.get(index + 2) {
-                if !self.run_rises(next) || !self.runs_rise_across(above, next) {
-                    continue;
-                }
+            if index + 2 < runs.len()
+                && (!run_rises(index + 2) || !self.runs_rise_across(above, runs[index + 2]))
+            {
+                continue;
             }
             for offset in 1..distance {
                 if let Some(ch) = char::from_u32(a as u32 + offset) {
@@ -840,6 +870,7 @@ impl ToUnicodeCMap {
             }
         }
         new_cmap.code_byte_length = self.code_byte_length;
+        new_cmap.refresh_gap_fills();
 
         new_cmap
     }
@@ -1142,6 +1173,7 @@ fn build_cmap_with_cid_to_gid_map(
         None
     } else {
         new_cmap.code_byte_length = 2;
+        new_cmap.refresh_gap_fills();
         Some(new_cmap)
     }
 }
@@ -1257,6 +1289,7 @@ pub fn build_cmap_from_truetype(font_data: &[u8]) -> Option<ToUnicodeCMap> {
         cmap.char_map.insert(*gid, text.clone());
     }
     cmap.code_byte_length = 2; // Identity-H uses 2-byte CIDs
+    cmap.refresh_gap_fills();
 
     Some(cmap)
 }
@@ -1367,6 +1400,7 @@ fn build_simple_cmap_from_truetype(font_data: &[u8]) -> Option<ToUnicodeCMap> {
         cmap.char_map.len()
     );
     cmap.code_byte_length = 1;
+    cmap.refresh_gap_fills();
     Some(cmap)
 }
 
@@ -1599,6 +1633,7 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
             warn!("bcmap usecmap={} could not be loaded", name);
         }
     }
+    cmap.refresh_gap_fills();
     Ok(cmap)
 }
 
@@ -1752,6 +1787,7 @@ fn build_fallback_tounicode_from_encoding(
         return None;
     }
     cmap.code_byte_length = encoding.code_byte_length;
+    cmap.refresh_gap_fills();
     Some(cmap)
 }
 
@@ -2150,7 +2186,7 @@ fn merge_cmaps(mut base: ToUnicodeCMap, overlay: ToUnicodeCMap) -> ToUnicodeCMap
     base.ranges.sort_unstable_by_key(|&(start, _, _)| start);
     base.code_byte_length = base.code_byte_length.max(overlay.code_byte_length);
     // The gaps are those of the merged entries.
-    base.gap_fills = OnceLock::new();
+    base.refresh_gap_fills();
     base
 }
 
@@ -2270,6 +2306,7 @@ fn build_cmap_from_cid_system_info(
                 }
             }
             cmap.code_byte_length = 2;
+            cmap.refresh_gap_fills();
             debug!(
                 "Adobe-Korea1 predefined CMap: {} entries",
                 cmap.char_map.len()
@@ -3375,6 +3412,7 @@ endbfchar
         for &(cid, text) in entries {
             cmap.char_map.insert(cid, text.to_string());
         }
+        cmap.refresh_gap_fills();
         cmap
     }
 
@@ -3507,6 +3545,36 @@ endbfchar
         // of 36 codes.
         let cmap = cmap_of_ranges(&[(100, 100, 0x531), (137, 137, 0x556)]);
         assert_eq!(cmap.gap_fill(101), None);
+    }
+
+    #[test]
+    fn gap_beside_a_run_that_falls_inside_is_not_read() {
+        // The run below the gap reads A, C, B: its ends rise, its inside
+        // does not.
+        let cmap = cmap_of_entries(&[(10, "A"), (11, "C"), (12, "B"), (14, "D")]);
+        assert_eq!(cmap.gap_fill(13), None);
+        // The same for the run above the gap: C, E, D.
+        let cmap = cmap_of_entries(&[(10, "A"), (12, "C"), (13, "E"), (14, "D")]);
+        assert_eq!(cmap.gap_fill(11), None);
+        // With both runs rising code after code the gap reads.
+        let cmap = cmap_of_entries(&[(10, "A"), (11, "B"), (12, "C"), (14, "E"), (15, "F")]);
+        assert_eq!(cmap.gap_fill(13), Some('D'));
+    }
+
+    #[test]
+    fn gaps_follow_the_entries_once_refreshed() {
+        let mut cmap = cmap_of_entries(&[(36, "A"), (38, "C")]);
+        assert_eq!(decode_codes(&cmap, &[37]).0, "B");
+        // An entry changed after a decode: the refreshed table reads the
+        // gap as the entries now say, and so does the next decode.
+        cmap.char_map.insert(38, "Z".to_string());
+        cmap.refresh_gap_fills();
+        assert_eq!(cmap.gap_fill(37), None);
+        assert_eq!(decode_codes(&cmap, &[36, 37]).0, "A\u{FFFD}");
+        cmap.char_map.insert(38, "C".to_string());
+        cmap.char_map.insert(39, "D".to_string());
+        cmap.refresh_gap_fills();
+        assert_eq!(decode_codes(&cmap, &[37, 39]).0, "BD");
     }
 
     #[test]

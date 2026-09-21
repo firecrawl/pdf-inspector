@@ -1120,20 +1120,22 @@ pub(crate) fn extract_page_text_items_with_options(
                                         &ctm,
                                         horizontal_scale,
                                         |code| {
-                                            extract_text_from_operand(
-                                                code,
-                                                &current_font,
-                                                font_base_names
-                                                    .get(&current_font)
-                                                    .map(|s| s.as_str()),
-                                                font_cmaps,
-                                                &font_tounicode_refs,
-                                                &inline_cmaps,
-                                                &font_encodings,
-                                                &encoding_cache,
-                                                &mut cmap_decisions,
-                                                &font_widths,
-                                            )
+                                            cmap_decisions.without_coverage(|decisions| {
+                                                extract_text_from_operand(
+                                                    code,
+                                                    &current_font,
+                                                    font_base_names
+                                                        .get(&current_font)
+                                                        .map(|s| s.as_str()),
+                                                    font_cmaps,
+                                                    &font_tounicode_refs,
+                                                    &inline_cmaps,
+                                                    &font_encodings,
+                                                    &encoding_cache,
+                                                    decisions,
+                                                    &font_widths,
+                                                )
+                                            })
                                         },
                                     )
                                 });
@@ -1461,20 +1463,22 @@ pub(crate) fn extract_page_text_items_with_options(
                                             word_spacing,
                                             space_threshold,
                                             |code| {
-                                                extract_text_from_operand(
-                                                    code,
-                                                    &current_font,
-                                                    font_base_names
-                                                        .get(&current_font)
-                                                        .map(|s| s.as_str()),
-                                                    font_cmaps,
-                                                    &font_tounicode_refs,
-                                                    &inline_cmaps,
-                                                    &font_encodings,
-                                                    &encoding_cache,
-                                                    &mut cmap_decisions,
-                                                    &font_widths,
-                                                )
+                                                cmap_decisions.without_coverage(|decisions| {
+                                                    extract_text_from_operand(
+                                                        code,
+                                                        &current_font,
+                                                        font_base_names
+                                                            .get(&current_font)
+                                                            .map(|s| s.as_str()),
+                                                        font_cmaps,
+                                                        &font_tounicode_refs,
+                                                        &inline_cmaps,
+                                                        &font_encodings,
+                                                        &encoding_cache,
+                                                        decisions,
+                                                        &font_widths,
+                                                    )
+                                                })
                                             },
                                         )
                                     });
@@ -1912,20 +1916,22 @@ pub(crate) fn extract_page_text_items_with_options(
                                         &ctm,
                                         horizontal_scale,
                                         |code| {
-                                            extract_text_from_operand(
-                                                code,
-                                                &current_font,
-                                                font_base_names
-                                                    .get(&current_font)
-                                                    .map(|s| s.as_str()),
-                                                font_cmaps,
-                                                &font_tounicode_refs,
-                                                &inline_cmaps,
-                                                &font_encodings,
-                                                &encoding_cache,
-                                                &mut cmap_decisions,
-                                                &font_widths,
-                                            )
+                                            cmap_decisions.without_coverage(|decisions| {
+                                                extract_text_from_operand(
+                                                    code,
+                                                    &current_font,
+                                                    font_base_names
+                                                        .get(&current_font)
+                                                        .map(|s| s.as_str()),
+                                                    font_cmaps,
+                                                    &font_tounicode_refs,
+                                                    &inline_cmaps,
+                                                    &font_encodings,
+                                                    &encoding_cache,
+                                                    decisions,
+                                                    &font_widths,
+                                                )
+                                            })
                                         },
                                     )
                                 });

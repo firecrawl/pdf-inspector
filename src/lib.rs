@@ -200,10 +200,12 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
-    /// The fonts whose ToUnicode CMap lacked an entry for a code the
+    /// The fonts whose ToUnicode CMap — or, for a font without one, the
+    /// embedded program's cmap table — lacked an entry for a code the
     /// document shows through it, with the counts of codes shown, read from
-    /// their neighbours and left as U+FFFD (see [`FontCMapGaps`]); empty
-    /// when every such code had an entry, and in [`ProcessMode::DetectOnly`].
+    /// their neighbours and left as U+FFFD (see [`FontCMapGaps`]). Always
+    /// empty in [`ProcessMode::DetectOnly`], which decodes no text;
+    /// otherwise empty when every such code had an entry.
     pub cmap_gaps: Vec<FontCMapGaps>,
 }
 

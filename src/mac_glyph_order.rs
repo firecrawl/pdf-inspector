@@ -386,6 +386,7 @@ pub(crate) fn build_cmap_from_mac_glyph_order(font_data: &[u8]) -> Option<ToUnic
         return None;
     }
     cmap.code_byte_length = 2;
+    cmap.refresh_gap_fills();
     Some(cmap)
 }
 
