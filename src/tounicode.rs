@@ -3027,16 +3027,22 @@ mod tests {
             "Adobe-Korea1-UCS2.bcmap",
             "90ms-RKSJ-H.bcmap",
         ] {
-            let embedded =
-                read_builtin_cmap_file(name).unwrap_or_else(|| panic!("{name} was not embedded"));
+            // Read the compiled-in copy directly. read_builtin_cmap_file
+            // prefers PDF_INSPECTOR_BCMAPS_DIR, so a set override would
+            // compare that directory to the source tree and never check
+            // the bytes in the binary.
+            let embedded = BUILTIN_CMAPS
+                .get_file(name)
+                .unwrap_or_else(|| panic!("{name} was not embedded"))
+                .contents();
             let disk = std::fs::read(format!(
                 "{}/external/bcmaps/{name}",
                 env!("CARGO_MANIFEST_DIR")
             ))
             .unwrap_or_else(|err| panic!("reading {name}: {err}"));
-            assert_eq!(embedded.as_ref(), disk.as_slice(), "{name}");
+            assert_eq!(embedded, disk.as_slice(), "{name}");
         }
-        assert!(read_builtin_cmap_file("does-not-exist.bcmap").is_none());
+        assert!(BUILTIN_CMAPS.get_file("does-not-exist.bcmap").is_none());
     }
 
     #[test]
