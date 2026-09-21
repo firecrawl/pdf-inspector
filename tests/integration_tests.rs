@@ -9596,13 +9596,23 @@ fn test_zero_advance_sign_on_a_right_to_left_line_stays_on_its_letter() {
 /// c, o, the ff ligature, e — with the ligature's code mapped by
 /// `ligature_entry`, the program's glyphs named `names` and the glyphs in
 /// `blank` left without an outline. The CMap maps eight more codes the
-/// page does not show, as a subset's CMap lists every glyph it kept.
-fn make_ligature_index_pdf(ligature_entry: &str, names: &[(u16, &str)], blank: &[u16]) -> Vec<u8> {
+/// page does not show, as a subset's CMap lists every glyph it kept —
+/// unless `sparse`, when it maps the four shown and no more.
+fn make_ligature_index_pdf(
+    ligature_entry: &str,
+    names: &[(u16, &str)],
+    blank: &[u16],
+    sparse: bool,
+) -> Vec<u8> {
+    let more = if sparse {
+        ""
+    } else {
+        "<0005> <0074>\n<0006> <0061>\n<0007> <0062>\n<0008> <006C>\n<0009> <0073>\n\
+         <000A> <0075>\n<000B> <006E>\n<000C> <0064>\n"
+    };
     let cmap = format!(
         "{CID_CMAP_HEAD}12 beginbfchar\n<0001> <0063>\n<0002> <006F>\n\
-         <0003> {ligature_entry}\n<0004> <0065>\n<0005> <0074>\n<0006> <0061>\n\
-         <0007> <0062>\n<0008> <006C>\n<0009> <0073>\n<000A> <0075>\n\
-         <000B> <006E>\n<000C> <0064>\n{CID_CMAP_TAIL}"
+         <0003> {ligature_entry}\n<0004> <0065>\n{more}{CID_CMAP_TAIL}"
     );
     make_embedded_cid_font_pdf(
         &cmap,
@@ -9618,35 +9628,47 @@ fn make_ligature_index_pdf(ligature_entry: &str, names: &[(u16, &str)], blank: &
 /// — maps its code to no text: the code reads as U+FFFD in its place and
 /// the document reports an encoding issue, where the word used to read
 /// "coee" and pass as clean. The program's glyph name reads the glyph when
-/// it has one, and a glyph with no outline but an advance reads as the
-/// space it paints; an entry mapping to TAB, and an ordinary entry, read
-/// as before.
+/// it has one — also when the CMap is sparse and the program's reading
+/// takes its place, the CMap staying as the alternative — and a glyph
+/// with no outline but an advance reads as the space it paints. An entry
+/// mapping to TAB reads as the tab it always did, and an ordinary entry
+/// as its letters.
 #[test]
 fn a_control_destination_in_a_tounicode_cmap_marks_its_code() {
-    let marked = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[], &[])).unwrap();
+    let marked = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[], &[], false)).unwrap();
     let markdown = marked.markdown.unwrap();
     assert!(markdown.contains("co\u{FFFD}ee"), "{markdown}");
     assert!(marked.has_encoding_issues);
 
-    let named = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[(3, "f_f")], &[])).unwrap();
+    let named = process_pdf_mem(&make_ligature_index_pdf(
+        "<0003>",
+        &[(3, "f_f")],
+        &[],
+        false,
+    ))
+    .unwrap();
     let markdown = named.markdown.unwrap();
     assert!(markdown.contains("coffee"), "{markdown}");
     assert!(!named.has_encoding_issues);
 
-    let blank = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[], &[3])).unwrap();
+    let sparse =
+        process_pdf_mem(&make_ligature_index_pdf("<0003>", &[(3, "f_f")], &[], true)).unwrap();
+    let markdown = sparse.markdown.unwrap();
+    assert!(markdown.contains("coffee"), "{markdown}");
+    assert!(!sparse.has_encoding_issues);
+
+    let blank = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[], &[3], false)).unwrap();
     let markdown = blank.markdown.unwrap();
     assert!(markdown.contains("co ee"), "{markdown}");
     assert!(!blank.has_encoding_issues);
 
-    let tab = process_pdf_mem(&make_ligature_index_pdf("<0009>", &[], &[])).unwrap();
+    let tab = process_pdf_mem(&make_ligature_index_pdf("<0009>", &[], &[], false)).unwrap();
     let markdown = tab.markdown.unwrap();
-    assert!(
-        !markdown.contains('\u{FFFD}') && markdown.contains("co") && markdown.contains("ee"),
-        "{markdown}"
-    );
+    assert!(markdown.contains("co\tee"), "{markdown:?}");
     assert!(!tab.has_encoding_issues);
 
-    let ordinary = process_pdf_mem(&make_ligature_index_pdf("<00660066>", &[], &[])).unwrap();
+    let ordinary =
+        process_pdf_mem(&make_ligature_index_pdf("<00660066>", &[], &[], false)).unwrap();
     let markdown = ordinary.markdown.unwrap();
     assert!(markdown.contains("coffee"), "{markdown}");
     assert!(!ordinary.has_encoding_issues);

@@ -179,30 +179,23 @@ fn destination_is_control(text: &str) -> bool {
     chars.peek().is_some() && chars.all(is_control_destination_char)
 }
 
-/// Repair the control destinations of a parsed ToUnicode CMap from the font
-/// itself: give the codes the text `source` — the embedded program's own
-/// reading of the font, when the caller could build one — has for them,
-/// then the reading of the encoding a simple font declares by name, then,
-/// with `read_program`, a space for each remaining code of a Type0 font
-/// whose glyph has no outline but an advance. A subset remap is keyed like
-/// the program, by the glyph indices the subsetter assigned; the CMap it
-/// was made from is not, so the remap is the one repaired when there is
-/// one. What nothing reads stays a control destination.
+/// Repair the control destinations of `target`, a CMap read from a
+/// ToUnicode stream, from the font itself: give the codes the text
+/// `source` — the font's own reading, when the caller has one — has for
+/// them, then the reading of the encoding a simple font declares by name,
+/// then, with `read_program`, a space for each remaining code of a Type0
+/// font whose glyph has no outline but an advance. What nothing reads
+/// stays a control destination.
 fn repair_control_destinations(
-    primary: &mut ToUnicodeCMap,
-    remapped: Option<&mut ToUnicodeCMap>,
+    target: &mut ToUnicodeCMap,
     source: Option<&ToUnicodeCMap>,
     font_dict: &lopdf::Dictionary,
     doc: &Document,
     read_program: bool,
 ) {
-    if !primary.has_control_destinations() {
+    if !target.has_control_destinations() {
         return;
     }
-    let target = match remapped {
-        Some(remapped) => remapped,
-        None => primary,
-    };
     if let Some(source) = source {
         target.recover_control_destinations(source);
     }
@@ -221,6 +214,84 @@ fn repair_control_destinations(
             }
         }
     }
+}
+
+/// Give a font's CMaps their roles in a [`CMapEntry`]. `primary` is the
+/// parsed ToUnicode CMap, `remapped` its subset remap when
+/// [`try_remap_subset_cmap`] made one, `fallback` the font's own reading
+/// when the caller built one. A sparse ToUnicode CMap — fewer than ten
+/// entries — yields the primary role to the fallback and becomes the
+/// alternative reading, its remap dropped. With `promote`, a fallback with
+/// more entries than the ToUnicode CMap a remap was made of becomes the
+/// alternative and the remap the last resort: subset fonts number their
+/// glyphs by encounter order, so the sorted remap scrambles characters
+/// where the program's own cmap is authoritative.
+///
+/// Also returned is the role that holds the CMap a control-destination
+/// repair writes to — the one read from the ToUnicode stream that is keyed
+/// like the font's own reading: the remap when one was made (by the glyph
+/// indices the subsetter assigned), else the original, whose keys no
+/// renumbering disturbed — or `None` when that CMap was dropped. The
+/// repair follows the roles so that it reaches the CMap the entry keeps.
+fn cmap_entry_with_roles(
+    mut primary: ToUnicodeCMap,
+    mut remapped: Option<ToUnicodeCMap>,
+    mut fallback: Option<ToUnicodeCMap>,
+    obj_num: u32,
+    promote: bool,
+) -> (CMapEntry, Option<CMapRole>) {
+    let primary_entries = primary.char_map.len() + primary.ranges.len();
+    let remap_made = remapped.is_some();
+    let mut repairable = Some(if remap_made {
+        CMapRole::Remapped
+    } else {
+        CMapRole::Primary
+    });
+
+    if primary_entries < 10 {
+        if let Some(fb) = fallback.take() {
+            debug!(
+                "ToUnicode CMap obj={} too sparse ({} entries); using fallback",
+                obj_num, primary_entries
+            );
+            remapped = Some(primary);
+            primary = fb;
+            // The original is the alternative now. A remap was dropped
+            // with it, and the original's keys are the ones it renumbered.
+            repairable = (!remap_made).then_some(CMapRole::Remapped);
+        }
+    }
+
+    // When a sequential remap was applied and a TrueType fallback has more
+    // entries than the primary ToUnicode CMap, prefer the TrueType cmap.
+    // Subset fonts number GIDs by document encounter order, so the sorted
+    // sequential remap scrambles characters.  The TrueType cmap table maps
+    // the real GID→Unicode and is authoritative.
+    if promote && remapped.is_some() {
+        if let Some(ref fb) = fallback {
+            let fb_entries = fb.char_map.len() + fb.ranges.len();
+            if fb_entries > primary_entries {
+                debug!(
+                    "ToUnicode CMap obj={}: TrueType fallback ({} entries) > primary ({}); promoting over sequential remap",
+                    obj_num, fb_entries, primary_entries
+                );
+                let old_remap = remapped.take().unwrap();
+                remapped = fallback.take();
+                fallback = Some(old_remap);
+                // The remap is the last resort now.
+                repairable = Some(CMapRole::Fallback);
+            }
+        }
+    }
+
+    (
+        CMapEntry {
+            primary,
+            remapped,
+            fallback,
+        },
+        repairable,
+    )
 }
 
 /// The character each of `codes` stands for in the encoding a simple font
@@ -390,56 +461,24 @@ pub(crate) fn build_cmap_entry_from_stream(
     obj_num: u32,
 ) -> Option<CMapEntry> {
     if let Some(cmap) = ToUnicodeCMap::parse(data) {
-        let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
-        let mut fallback = build_fallback_tounicode_from_encoding(font_dict, doc)
+        let (primary, remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+        let fallback = build_fallback_tounicode_from_encoding(font_dict, doc)
             .or_else(|| build_fallback_cmap_for_type0(font_dict, doc))
             .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
 
-        let primary_entries = primary.char_map.len() + primary.ranges.len();
-        repair_control_destinations(
-            &mut primary,
-            remapped.as_mut(),
-            fallback.as_ref(),
-            font_dict,
-            doc,
-            true,
-        );
-        if primary_entries < 10 {
-            if let Some(fb) = fallback.take() {
-                debug!(
-                    "ToUnicode CMap obj={} too sparse ({} entries); using fallback",
-                    obj_num, primary_entries
-                );
-                remapped = Some(primary);
-                primary = fb;
-            }
+        // The font's own reading, set aside for the repair while the roles
+        // are decided, so that the repair reaches the CMap the entry keeps.
+        let source = if primary.has_control_destinations() {
+            fallback.clone()
+        } else {
+            None
+        };
+        let (mut entry, repairable) =
+            cmap_entry_with_roles(primary, remapped, fallback, obj_num, true);
+        if let Some(target) = repairable.and_then(|role| entry.role_mut(role)) {
+            repair_control_destinations(target, source.as_ref(), font_dict, doc, true);
         }
-
-        // When a sequential remap was applied and a TrueType fallback has more
-        // entries than the primary ToUnicode CMap, prefer the TrueType cmap.
-        // Subset fonts number GIDs by document encounter order, so the sorted
-        // sequential remap scrambles characters.  The TrueType cmap table maps
-        // the real GID→Unicode and is authoritative.
-        if remapped.is_some() {
-            if let Some(ref fb) = fallback {
-                let fb_entries = fb.char_map.len() + fb.ranges.len();
-                if fb_entries > primary_entries {
-                    debug!(
-                        "ToUnicode CMap obj={}: TrueType fallback ({} entries) > primary ({}); promoting over sequential remap",
-                        obj_num, fb_entries, primary_entries
-                    );
-                    let old_remap = remapped.take().unwrap();
-                    remapped = fallback.take();
-                    fallback = Some(old_remap);
-                }
-            }
-        }
-
-        return Some(CMapEntry {
-            primary,
-            remapped,
-            fallback,
-        });
+        return Some(entry);
     }
 
     let fallback = build_fallback_cmap_for_type0(font_dict, doc)
@@ -2711,6 +2750,25 @@ pub struct CMapEntry {
     pub fallback: Option<ToUnicodeCMap>,
 }
 
+/// A member of a [`CMapEntry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CMapRole {
+    Primary,
+    Remapped,
+    Fallback,
+}
+
+impl CMapEntry {
+    /// The CMap in `role`, when the entry has one there.
+    fn role_mut(&mut self, role: CMapRole) -> Option<&mut ToUnicodeCMap> {
+        match role {
+            CMapRole::Primary => Some(&mut self.primary),
+            CMapRole::Remapped => self.remapped.as_mut(),
+            CMapRole::Fallback => self.fallback.as_mut(),
+        }
+    }
+}
+
 impl FontCMaps {
     /// Build FontCMaps from a lopdf Document model.
     ///
@@ -2812,40 +2870,14 @@ impl FontCMaps {
                     cmap.char_map.len(),
                     cmap.ranges.len()
                 );
-                let (mut primary, mut remapped) =
-                    try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+                let (primary, remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
 
                 // Only build expensive fallbacks when the primary CMap is sparse.
                 // build_fallback_cmap_for_type0 can take seconds on large embedded
                 // TrueType fonts (decompressing + parsing 100K+ byte font files).
                 // Skip entirely when the primary CMap is sufficient.
                 let primary_entries = primary.char_map.len() + primary.ranges.len();
-
-                // A code whose entry is a control destination has no text
-                // in the CMap, however rich the rest of it is; the embedded
-                // program may still know the glyph (a ligature named `f_f`,
-                // a blank space glyph), and is read for those codes alone.
-                // Fast mode leaves the program unread and the codes marked.
-                if primary.has_control_destinations() {
-                    let source =
-                        build_fallback_tounicode_from_encoding(font_dict, doc).or_else(|| {
-                            if skip_truetype_fallback {
-                                None
-                            } else {
-                                build_fallback_cmap_for_type0(font_dict, doc)
-                                    .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
-                            }
-                        });
-                    repair_control_destinations(
-                        &mut primary,
-                        remapped.as_mut(),
-                        source.as_ref(),
-                        font_dict,
-                        doc,
-                        !skip_truetype_fallback,
-                    );
-                }
-                let mut fallback = if primary_entries < 10 && !skip_truetype_fallback {
+                let fallback = if primary_entries < 10 && !skip_truetype_fallback {
                     // Try cheap fallback first; only attempt expensive TrueType
                     // parsing if cheap fallbacks don't yield results.
                     let cheap = build_fallback_tounicode_from_encoding(font_dict, doc)
@@ -2865,24 +2897,39 @@ impl FontCMaps {
                     build_fallback_tounicode_from_encoding(font_dict, doc)
                 };
 
-                if primary_entries < 10 {
-                    if let Some(fb) = fallback.take() {
-                        debug!(
-                            "ToUnicode CMap obj={} too sparse ({} entries); using fallback",
-                            obj_num, primary_entries
-                        );
-                        remapped = Some(primary);
-                        primary = fb;
-                    }
+                // A code whose entry is a control destination has no text
+                // in the CMap, however rich the rest of it is; the embedded
+                // program may still know the glyph (a ligature named `f_f`,
+                // a blank space glyph), and is read for those codes alone:
+                // the fallback built above when there is one, else a
+                // reading built for the repair and nothing more. The repair
+                // waits for the roles, so that it reaches the CMap the
+                // entry keeps. Fast mode leaves the program unread and the
+                // codes marked.
+                let source = if primary.has_control_destinations() {
+                    fallback.clone().or_else(|| {
+                        if skip_truetype_fallback {
+                            None
+                        } else {
+                            build_fallback_cmap_for_type0(font_dict, doc)
+                                .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
+                        }
+                    })
+                } else {
+                    None
+                };
+                let (mut entry, repairable) =
+                    cmap_entry_with_roles(primary, remapped, fallback, obj_num, false);
+                if let Some(target) = repairable.and_then(|role| entry.role_mut(role)) {
+                    repair_control_destinations(
+                        target,
+                        source.as_ref(),
+                        font_dict,
+                        doc,
+                        !skip_truetype_fallback,
+                    );
                 }
-                by_obj_num.insert(
-                    obj_num,
-                    CMapEntry {
-                        primary,
-                        remapped,
-                        fallback,
-                    },
-                );
+                by_obj_num.insert(obj_num, entry);
             } else {
                 // ToUnicode present but parse failed; try fallbacks to avoid empty decoding.
                 let fallback = if skip_truetype_fallback {

@@ -4967,6 +4967,79 @@ mod tests {
         (doc, tounicode_id.0, page_id)
     }
 
+    /// A page whose only font is the Type0 `F1` under Identity-H with the
+    /// given ToUnicode `bfchar` lines, whose CIDFontType2 descendant embeds
+    /// `program`. Returns the document, the ToUnicode object number and
+    /// the page.
+    fn cid_font_doc(bfchar: &str, program: Vec<u8>) -> (Document, u32, lopdf::ObjectId) {
+        use lopdf::Stream;
+        let mut doc = Document::with_version("1.5");
+        let cmap = format!(
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+             /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+             1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+             4 beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
+             CMapName currentdict /CMap defineresource pop\nend\nend"
+        );
+        let tounicode_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+        let font_file = doc.add_object(Stream::new(
+            dictionary! { "Length1" => program.len() as i64 },
+            program,
+        ));
+        let descriptor_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "ABCDEF+Subset",
+            "Flags" => 4,
+            "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 700,
+            "Descent" => 0,
+            "CapHeight" => 700,
+            "StemV" => 80,
+            "FontFile2" => font_file,
+        });
+        let cid_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "ABCDEF+Subset",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("Identity"),
+                "Supplement" => 0,
+            },
+            "FontDescriptor" => descriptor_id,
+            "DW" => 600,
+            "CIDToGIDMap" => "Identity",
+        });
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "ABCDEF+Subset",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![cid_font_id.into()],
+            "ToUnicode" => tounicode_id,
+        });
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, tounicode_id.0, page_id)
+    }
+
     /// `bytes` shown through the font of [`simple_font_doc`], with the
     /// encoding cache the page would hold for it.
     fn decode_simple_font_string(
@@ -4976,18 +5049,32 @@ mod tests {
         bytes: &[u8],
     ) -> String {
         let (doc, tounicode_obj, page_id) = simple_font_doc(bfchar, program, encoding);
-        let cmaps = FontCMaps::from_doc(&doc);
+        decode_page_font_string(&doc, tounicode_obj, page_id, false, bytes)
+    }
+
+    /// `bytes` shown through `F1`, the one font of `page_id`, whose
+    /// ToUnicode CMap is the object `tounicode_obj`, with the encoding
+    /// cache the page would hold for it; `is_cid` as the page's width
+    /// table reports the font.
+    fn decode_page_font_string(
+        doc: &Document,
+        tounicode_obj: u32,
+        page_id: lopdf::ObjectId,
+        is_cid: bool,
+        bytes: &[u8],
+    ) -> String {
+        let cmaps = FontCMaps::from_doc(doc);
         let fonts = doc.get_page_fonts(page_id).unwrap();
         let (font_encodings, _) =
-            build_font_encodings(&doc, &fonts, &cmaps, &mut FontStyleCache::new());
+            build_font_encodings(doc, &fonts, &cmaps, &mut FontStyleCache::new());
         let mut encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
-        if let Ok(encoding) = fonts[&b"F1".to_vec()].get_font_encoding(&doc) {
+        if let Ok(encoding) = fonts[&b"F1".to_vec()].get_font_encoding(doc) {
             encoding_cache.insert("F1".to_string(), encoding);
         }
         let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
         font_tounicode_refs.insert("F1".to_string(), tounicode_obj);
         let mut font_widths: PageFontWidths = HashMap::new();
-        font_widths.insert("F1".to_string(), make_font_info(&[], 1000, false));
+        font_widths.insert("F1".to_string(), make_font_info(&[], 1000, is_cid));
         let (text, _) = extract_text_from_operand(
             &Object::String(bytes.to_vec(), lopdf::StringFormat::Hexadecimal),
             "F1",
@@ -5002,6 +5089,46 @@ mod tests {
         )
         .expect("text decoded");
         text
+    }
+
+    /// A sparse ToUnicode CMap — fewer than ten entries — yields the primary
+    /// role to the program's own reading and stays as the alternative: the
+    /// repair of its control destination reaches it there, and the text
+    /// reads the ligature by its glyph name, not as the marker.
+    #[test]
+    fn a_sparse_cmaps_control_destination_is_repaired_where_the_cmap_ends_up() {
+        let mut names = vec![None; 5];
+        names[3] = Some("f_f");
+        let (doc, tounicode_obj, page_id) = cid_font_doc(
+            "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>",
+            sfnt_with_glyph_names(&names),
+        );
+        let cmaps = FontCMaps::from_doc(&doc);
+        let entry = cmaps.get_by_obj(tounicode_obj).expect("the font's CMaps");
+        // The program's reading took the primary role: it knows the
+        // ligature and nothing else.
+        assert_eq!(entry.primary.lookup(3).as_deref(), Some("ff"));
+        assert_eq!(entry.primary.lookup_code(1), CodeMapping::Unmapped);
+        // The CMap is the alternative, and was repaired there: the
+        // ligature reads by its name, the other codes as written.
+        let alternative = entry
+            .remapped
+            .as_ref()
+            .expect("the CMap kept as the alternative");
+        assert_eq!(alternative.lookup(3).as_deref(), Some("ff"));
+        assert_eq!(alternative.lookup(1).as_deref(), Some("c"));
+        assert!(!alternative.has_control_destinations());
+        assert!(entry.fallback.is_none());
+        assert_eq!(
+            decode_page_font_string(
+                &doc,
+                tounicode_obj,
+                page_id,
+                true,
+                &[0, 1, 0, 2, 0, 3, 0, 4, 0, 4]
+            ),
+            "coffee"
+        );
     }
 
     /// Codes 0x21..=0x2C are glyph indices; the ligature at 0x23 is mapped
