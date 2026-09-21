@@ -66,6 +66,22 @@ Changes since 1.22.1.
   order turned every character round on its own. The characters one glyph
   reads as are now turned round together and keep the order they were
   named in.
+- A spacing accent shown as a text object of its own over a letter — the
+  way some producers set an accented letter: the run up to the letter, one
+  glyph of `macron`, `acute`, `caron` or another accent the standard Latin
+  encodings carry with an advance of its own, placed by its own text matrix
+  over the letter, and the run from the letter on — is composed with that
+  letter (`o` and a macron read `ō`) and dropped as a fragment. Its origin
+  lies a fraction of a point right of the run it decorates, so the line's
+  fragments sorted along the baseline put it after that whole run: the text
+  read with a stray accent a word on and the letter bare. The accent is
+  matched only against the fragments shown just before and just after it,
+  over the last glyph of the one or the first glyph of the other, when their
+  baselines lie within 0.3 em and the accent's centre falls within that
+  glyph's advance, and only when Unicode has one character for the pair (a
+  dotless i or j under the accent composes as the dotted letter). A
+  circumflex or grave standing beside its neighbours rather than over them,
+  as in code or mathematics, is left as shown.
 
 ## [1.22.1] - 2026-09-20
 

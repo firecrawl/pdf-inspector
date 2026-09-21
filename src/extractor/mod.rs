@@ -1396,6 +1396,217 @@ fn trimmed_suffix(next: &TextItem) -> &str {
     next.text.trim()
 }
 
+/// The combining mark a spacing accent stands for. These are the accents
+/// the standard Latin encodings carry as glyphs of their own, each with an
+/// advance: macron, acute, grave, circumflex, tilde, dieresis, caron,
+/// breve, ring, cedilla, ogonek, dot accent and double acute. `None` for
+/// any other character.
+fn combining_mark_of_spacing_accent(c: char) -> Option<char> {
+    Some(match c {
+        '\u{00AF}' => '\u{0304}', // macron
+        '\u{00B4}' => '\u{0301}', // acute
+        '\u{0060}' => '\u{0300}', // grave
+        '\u{02C6}' => '\u{0302}', // circumflex
+        '\u{02DC}' => '\u{0303}', // tilde
+        '\u{00A8}' => '\u{0308}', // dieresis
+        '\u{02C7}' => '\u{030C}', // caron
+        '\u{02D8}' => '\u{0306}', // breve
+        '\u{02DA}' => '\u{030A}', // ring
+        '\u{00B8}' => '\u{0327}', // cedilla
+        '\u{02DB}' => '\u{0328}', // ogonek
+        '\u{02D9}' => '\u{0307}', // dot accent
+        '\u{02DD}' => '\u{030B}', // double acute
+        _ => return None,
+    })
+}
+
+/// The combining mark of a fragment that is one spacing accent and nothing
+/// else: a show operator of the single accent glyph.
+fn lone_spacing_accent(item: &TextItem) -> Option<char> {
+    let mut chars = item.text.chars();
+    let accent = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    combining_mark_of_spacing_accent(accent)
+}
+
+/// The end of a run a detached accent is matched against: the glyph that
+/// begins the run or the glyph that closes it.
+#[derive(Clone, Copy)]
+enum RunEnd {
+    First,
+    Last,
+}
+
+/// The glyph at `end` of `text`: its character, the byte range it takes in
+/// the text and the number of whitespace characters between it and that
+/// end of the run. `None` for a run of nothing but whitespace.
+fn end_glyph(text: &str, end: RunEnd) -> Option<(char, std::ops::Range<usize>, usize)> {
+    let found = match end {
+        RunEnd::First => text
+            .char_indices()
+            .enumerate()
+            .find(|(_, (_, c))| !c.is_whitespace()),
+        RunEnd::Last => text
+            .char_indices()
+            .rev()
+            .enumerate()
+            .find(|(_, (_, c))| !c.is_whitespace()),
+    };
+    found.map(|(skipped, (offset, c))| (c, offset..offset + c.len_utf8(), skipped))
+}
+
+/// How much of a detached accent lies over the glyph at `end` of `run`, in
+/// points along the baseline; `None` when it does not stand over that
+/// glyph. Both must be upright text runs of one page with measured
+/// advances, their baselines within 0.3 em of each other (an accent over a
+/// capital is set a little higher than one over a small letter). The item
+/// keeps no advance per glyph, so the glyph's advance is taken as the run's
+/// width shared equally among its characters; the accent stands over the
+/// glyph when its centre falls within that advance, with a quarter of the
+/// accent's own width of play beyond either edge, for an accent wider than
+/// a narrow letter. An accent shown beside a glyph rather than over it, a
+/// circumflex or grave that is text of its own, has its centre at least
+/// half its width beyond the glyph's edge and is never matched.
+fn accent_overlap(accent: &TextItem, run: &TextItem, end: RunEnd) -> Option<f32> {
+    let upright_text = |item: &TextItem| {
+        matches!(item.item_type, crate::types::ItemType::Text)
+            && item.is_upright()
+            && item.advance_known
+            && item.width > 0.0
+    };
+    if run.page != accent.page
+        || !upright_text(run)
+        || !upright_text(accent)
+        || run.font_size <= 0.0
+        || (accent.y - run.y).abs() > run.font_size * 0.3
+    {
+        return None;
+    }
+    let (_, _, skipped) = end_glyph(&run.text, end)?;
+    let advance = run.width / run.text.chars().count() as f32;
+    let (left, right) = match end {
+        RunEnd::First => {
+            let left = run.x + advance * skipped as f32;
+            (left, left + advance)
+        }
+        RunEnd::Last => {
+            let right = run.x + run.width - advance * skipped as f32;
+            (right - advance, right)
+        }
+    };
+    let centre = accent.x + accent.width / 2.0;
+    let play = accent.width * 0.25;
+    if centre < left - play || centre > right + play {
+        return None;
+    }
+    Some(((accent.x + accent.width).min(right) - accent.x.max(left)).max(0.0))
+}
+
+/// Composes a spacing accent shown as a text object of its own with the
+/// letter it is painted over.
+///
+/// Some producers set an accented letter as three show operators: the run
+/// up to the letter, one glyph of a spacing accent placed by its own text
+/// matrix over the letter, and the run from the letter on. The standard
+/// Latin encodings carry these accents (`macron`, `acute`, `caron` and
+/// their kin) as glyphs with an advance of their own, and the producer
+/// spells the letter by overprinting one on the other. Rendered, the accent
+/// lands on the letter; read back, it is a fragment of one glyph that
+/// starts a fraction of a point to the right of the run it decorates, and
+/// the line's fragments sorted along the baseline put it after that whole
+/// run: a stray accent a word on, and a letter without its mark.
+///
+/// So, before the line is ordered, a fragment that is nothing but a spacing
+/// accent is matched against the fragments shown just before and just
+/// after it: it stands over the last glyph of the one or the first glyph of
+/// the other when their baselines lie within 0.3 em and the accent's centre
+/// falls within that glyph's advance (`accent_overlap`; the glyph with the
+/// larger overlap wins when both qualify). That glyph and the accent's
+/// combining mark are then replaced by their canonical composition, when
+/// Unicode has one character for the pair, and the accent fragment is
+/// dropped; a dotless i or j under the accent composes as the dotted letter,
+/// the dot being what the accent replaces. An accent over neither
+/// neighbour, or over a glyph its mark does not compose with, is left
+/// exactly as shown: a lone circumflex or grave in code or mathematics has
+/// no letter under it and stays a character of its own.
+///
+/// `clips` runs parallel to `items` (see `merge_text_items_with_clips`);
+/// the entries of dropped fragments go with them.
+fn compose_detached_spacing_accents<'a>(
+    mut items: Vec<TextItem>,
+    clips: &'a [Option<clip_boundaries::ClipRect>],
+) -> (Vec<TextItem>, Cow<'a, [Option<clip_boundaries::ClipRect>]>) {
+    let mut dropped: Vec<usize> = Vec::new();
+    for i in 0..items.len() {
+        let Some(mark) = lone_spacing_accent(&items[i]) else {
+            continue;
+        };
+        let neighbours = [
+            (i.checked_sub(1), RunEnd::Last),
+            (
+                Some(i + 1).filter(|&next| next < items.len()),
+                RunEnd::First,
+            ),
+        ];
+        let mut best: Option<(usize, RunEnd, f32)> = None;
+        for (index, end) in neighbours {
+            let Some(index) = index else {
+                continue;
+            };
+            if lone_spacing_accent(&items[index]).is_some() {
+                continue;
+            }
+            if let Some(overlap) = accent_overlap(&items[i], &items[index], end) {
+                if best.is_none_or(|(_, _, other)| overlap > other) {
+                    best = Some((index, end, overlap));
+                }
+            }
+        }
+        let Some((index, end, _)) = best else {
+            continue;
+        };
+        let Some((glyph, range, _)) = end_glyph(&items[index].text, end) else {
+            continue;
+        };
+        // A dotless i or j is the form a typesetter puts an accent over, the
+        // dot being what the accent replaces: it composes as the dotted letter.
+        let base = match glyph {
+            '\u{0131}' => 'i',
+            '\u{0237}' => 'j',
+            other => other,
+        };
+        let Some(composed) = unicode_normalization::char::compose(base, mark) else {
+            continue;
+        };
+        items[index]
+            .text
+            .replace_range(range, composed.encode_utf8(&mut [0; 4]));
+        dropped.push(i);
+    }
+    if dropped.is_empty() {
+        return (items, Cow::Borrowed(clips));
+    }
+    let mut kept = vec![true; items.len()];
+    for &index in &dropped {
+        kept[index] = false;
+    }
+    let clips: Vec<Option<clip_boundaries::ClipRect>> = clips
+        .iter()
+        .zip(&kept)
+        .filter(|(_, &keep)| keep)
+        .map(|(clip, _)| *clip)
+        .collect();
+    let mut index = 0;
+    items.retain(|_| {
+        let keep = kept[index];
+        index += 1;
+        keep
+    });
+    (items, Cow::Owned(clips))
+}
+
 #[cfg(test)]
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     merge_text_items_with_clips(items, &[], false)
@@ -1496,6 +1707,12 @@ fn merge_text_items_with_clips(
     if items.is_empty() {
         return items;
     }
+
+    // A spacing accent shown as a fragment of its own over a letter of the
+    // run before or after it is composed with that letter first, so the
+    // line is ordered without it.
+    let (items, owned_clips) = compose_detached_spacing_accents(items, clips);
+    let clips: &[Option<clip_boundaries::ClipRect>] = &owned_clips;
 
     // References into `items` remain stable throughout grouping and sorting.
     // Keep clipping provenance private rather than changing the public item type.
@@ -4602,5 +4819,160 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         second.rotation = 90.0;
         let merged = merge_text_items(vec![first, second]);
         assert_eq!(merged.len(), 2, "{merged:?}");
+    }
+
+    #[test]
+    fn detached_accent_before_its_letter_composes_with_the_next_run() {
+        // An accented letter set as three show operators: the run up to the
+        // letter, the macron placed by its own text matrix over the "o"
+        // that begins the next run (raised a fraction of a point, as
+        // accents are), and the run from that letter on. Sorted along the
+        // baseline the accent starts right of "ohoku" and would land after
+        // it; composed, the line reads "Tōhoku".
+        let mut accent = make_merge_item("\u{00AF}", 108.6, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("T", 100.0, 7.3),
+            accent,
+            make_merge_item("ohoku", 107.3, 33.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "T\u{014D}hoku");
+    }
+
+    #[test]
+    fn detached_accent_after_its_letter_composes_with_the_previous_run() {
+        // A run positioned glyph by glyph, the accent shown after the letter
+        // it stands over: "m", "a", the macron over the "a", "jas".
+        let mut accent = make_merge_item("\u{00AF}", 111.3, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("m", 100.0, 10.0),
+            make_merge_item("a", 110.0, 6.7),
+            accent,
+            make_merge_item("jas", 116.7, 15.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "m\u{0101}jas");
+    }
+
+    #[test]
+    fn detached_accent_over_the_last_glyph_of_a_longer_run_composes_with_it() {
+        // "sta", the macron over its closing "a", "tus": the glyph's advance
+        // is read as a third of the run's width.
+        let mut accent = make_merge_item("\u{00AF}", 113.0, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("sta", 100.0, 18.0),
+            accent,
+            make_merge_item("tus", 118.0, 16.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "st\u{0101}tus");
+    }
+
+    #[test]
+    fn spacing_accent_over_no_letter_stays_a_character_of_its_own() {
+        // A grave shown a word gap away from the runs on either side is
+        // text of its own, a quotation mark or a code delimiter, not an
+        // accent.
+        let items = vec![
+            make_merge_item("code", 100.0, 24.0),
+            make_merge_item("\u{0060}", 128.0, 4.0),
+            make_merge_item("more", 136.0, 24.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "code \u{0060} more");
+    }
+
+    #[test]
+    fn spacing_accent_shown_beside_a_letter_is_not_composed() {
+        // "a", a circumflex whose advance follows the "a" exactly, "b": an
+        // exponent operator set glyph by glyph. The accent stands beside
+        // both letters and over neither, and keeps its place in "aˆb".
+        let items = vec![
+            make_merge_item("a", 100.0, 6.7),
+            make_merge_item("\u{02C6}", 106.7, 4.0),
+            make_merge_item("b", 110.7, 6.7),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "a\u{02C6}b");
+    }
+
+    #[test]
+    fn accent_whose_pair_has_no_composed_character_is_left_as_shown() {
+        // A macron over a "t": Unicode has no single character for the
+        // pair, so nothing is rewritten and the accent fragment survives.
+        let mut accent = make_merge_item("\u{00AF}", 107.0, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("u", 100.0, 6.7),
+            accent,
+            make_merge_item("tter", 106.7, 16.0),
+        ];
+        let merged = merge_text_items(items);
+        assert!(merged.iter().any(|item| item.text == "utter"), "{merged:?}");
+        assert!(
+            merged.iter().any(|item| item.text == "\u{00AF}"),
+            "{merged:?}"
+        );
+    }
+
+    #[test]
+    fn accent_on_another_baseline_is_not_composed() {
+        // The same glyphs with the accent a third of an em above the
+        // letters' baseline: not an accent over them.
+        let mut accent = make_merge_item("\u{00AF}", 108.6, 4.0);
+        accent.y = 704.0;
+        let items = vec![
+            make_merge_item("T", 100.0, 7.3),
+            accent,
+            make_merge_item("ohoku", 107.3, 33.0),
+        ];
+        let merged = merge_text_items(items);
+        assert!(
+            merged.iter().any(|item| item.text == "Tohoku"),
+            "{merged:?}"
+        );
+        assert!(
+            merged.iter().any(|item| item.text == "\u{00AF}"),
+            "{merged:?}"
+        );
+    }
+
+    #[test]
+    fn detached_accent_over_a_dotless_i_composes_as_the_dotted_letter() {
+        // "Garc", the acute over the dotless i that begins "ıa": the
+        // typesetter's form of the letter under an accent reads "García".
+        let mut accent = make_merge_item("\u{00B4}", 123.0, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("Garc", 100.0, 24.0),
+            accent,
+            make_merge_item("\u{0131}a", 124.0, 9.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "Garc\u{00ED}a");
+    }
+
+    #[test]
+    fn composing_an_accent_drops_its_clip_entry_with_it() {
+        let mut accent = make_merge_item("\u{00AF}", 108.6, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("T", 100.0, 7.3),
+            accent,
+            make_merge_item("ohoku", 107.3, 33.0),
+        ];
+        let (items, clips) = compose_detached_spacing_accents(items, &[None, None, None]);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(clips.len(), 2);
+        assert_eq!(items[1].text, "\u{014D}hoku");
     }
 }
