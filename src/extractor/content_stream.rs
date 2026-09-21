@@ -3702,6 +3702,29 @@ end"#;
     }
 
     #[test]
+    fn a_forms_clip_only_text_under_the_pages_white_fill_stays_hidden() {
+        // Clipping-only text (`7 Tr`) paints neither fill nor stroke: under
+        // the page's white fill a form's run stays hidden, as it was before
+        // the fill was inherited; under a black fill it is extracted as
+        // before.
+        let clip_only = b"BT 7 Tr /F1 12 Tf 1 0 0 1 100 700 Tm <44434241> Tj ET";
+        let items = extract_items_with_cmap_and_form(
+            b"1 g q /X1 Do Q",
+            HEBREW_CMAP,
+            Some(clip_only),
+            false,
+        );
+        assert!(items.is_empty(), "{items:?}");
+        let items = extract_items_with_cmap_and_form(
+            b"0 g q /X1 Do Q",
+            HEBREW_CMAP,
+            Some(clip_only),
+            false,
+        );
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
     fn runs_painted_outside_their_clip_cast_no_vote() {
         // Visible visual-order runs parked outside their clip are left out
         // of the page; they must not decide the storage order of the

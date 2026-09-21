@@ -646,12 +646,13 @@ pub(crate) fn render_mode_paints(mode: i32) -> bool {
     !matches!(mode, 3 | 7)
 }
 
-/// Whether a white fill hides a run shown in `mode`: only when the run is
-/// painted with the fill alone (modes 0 and 4). A stroked run (1, 2, 5, 6)
-/// shows its stroke whatever the fill, and modes 3 and 7 paint nothing at
-/// all, which [`render_mode_paints`] says.
+/// Whether a white fill hides a run shown in `mode`: when the run strokes
+/// nothing. A stroked run (modes 1, 2, 5, 6) shows its stroke whatever the
+/// fill; a filled run (0, 4) shows the white fill, and a clipping-only run
+/// (7) paints neither and shows nothing of its own. Mode 3 is invisible
+/// outright and handled on its own.
 pub(crate) fn white_fill_hides(mode: i32, fill_is_white: bool) -> bool {
-    fill_is_white && matches!(mode, 0 | 4)
+    fill_is_white && matches!(mode, 0 | 4 | 7)
 }
 
 /// Whether a page's right-to-left runs are stored in visual (screen
@@ -1692,12 +1693,12 @@ mod tests {
         assert!(!is_visual_rtl_run("\u{05E9}\u{05B0}"));
         assert!(render_mode_paints(0) && render_mode_paints(2) && render_mode_paints(4));
         assert!(!render_mode_paints(3) && !render_mode_paints(7));
-        // A white fill hides filled text only; stroked text shows its stroke.
+        // A white fill hides text that strokes nothing — filled or clip-only;
+        // stroked text shows its stroke.
         assert!(white_fill_hides(0, true) && white_fill_hides(4, true));
-        assert!(
-            !white_fill_hides(1, true) && !white_fill_hides(2, true) && !white_fill_hides(5, true)
-        );
-        assert!(!white_fill_hides(0, false));
+        assert!(white_fill_hides(7, true) && !white_fill_hides(7, false));
+        assert!(!white_fill_hides(1, true) && !white_fill_hides(2, true));
+        assert!(!white_fill_hides(5, true) && !white_fill_hides(0, false));
     }
 
     #[test]
