@@ -12,7 +12,8 @@ use super::content_mask::{
     show_operand_text_bytes,
 };
 use super::content_resources::{
-    numbers_of, pattern_type, resolve_pattern, resolve_xobject, stream_resources, XObjectDrawn,
+    decoded_within, numbers_of, pattern_type, resolve_pattern, resolve_xobject, stream_resources,
+    XObjectDrawn,
 };
 use super::{collect_text_chars_before, extract_font_name_before_tf, preceding_operand_closer};
 use crate::extractor::{visible_page_box, PageBox};
@@ -48,9 +49,10 @@ pub(super) struct ExecutedContent {
     pub(super) shows_only_a_hidden_text_layer: bool,
     /// Bytes of form and pattern-cell content executed.
     pub(super) form_bytes: usize,
-    /// Whether a form, or a pattern's cell, went unread because the bytes
-    /// executed would pass `EXECUTED_FORM_BYTES_MAX` — from which point no
-    /// form is followed and the evidence is incomplete.
+    /// Whether a form, or a pattern's cell, went unread because its
+    /// content would take the bytes executed past `EXECUTED_FORM_BYTES_MAX`,
+    /// or is itself past `FORM_CONTENT_CACHE_MAX_BYTES` — from which point
+    /// no form is followed and the evidence is incomplete.
     pub(super) form_bytes_exceeded: bool,
 }
 
@@ -205,7 +207,9 @@ thread_local! {
 }
 
 /// How many bytes of form content — decompressed, and its masked copy —
-/// one page's scan keeps for forms invoked again.
+/// one page's scan keeps for forms invoked again; and how many one form's
+/// or cell's stream may decode to, whatever the page's byte budget has
+/// left: a stream past it is not read.
 const FORM_CONTENT_CACHE_MAX_BYTES: usize = 8 << 20;
 
 /// How many text objects' clip-only text one `q` level keeps apart for
@@ -477,8 +481,9 @@ struct ContentScanState<'a> {
     /// began.
     executed_form_bytes: usize,
     form_bytes_budget: usize,
-    /// Whether a form or a cell went unread for the byte budget; from then
-    /// on none is followed.
+    /// Whether a form or a cell went unread for the byte budget — its
+    /// content would have taken the bytes executed past it, or is itself
+    /// past `FORM_CONTENT_CACHE_MAX_BYTES`; from then on none is followed.
     form_bytes_exceeded: bool,
     /// Whether content went unread — the invocation budget, the byte
     /// budget or the depth cap ran out — so that the page's evidence is
@@ -837,12 +842,9 @@ impl<'a> ContentScanState<'a> {
         self.form_invocations += 1;
         let verdict = match pattern {
             Object::Stream(cell) if pattern_type(self.doc, &cell.dict) == Some(1) => {
-                let content = cell
-                    .decompressed_content()
-                    .unwrap_or_else(|_| cell.content.clone());
-                if !self.form_bytes_charged(content.len()) {
+                let Some(content) = self.form_bytes_admitted(cell) else {
                     return false;
-                }
+                };
                 let mut cell_resources = Vec::with_capacity(resources.len() + 1);
                 cell_resources.extend(stream_resources(self.doc, cell));
                 cell_resources.extend_from_slice(resources);
@@ -925,8 +927,10 @@ impl<'a> ContentScanState<'a> {
     /// resolve in its own resources first, then in its invoker's. A form
     /// whose box lies outside the clip in force shows nothing and is not
     /// read; a form invoking itself, directly or through others, is not
-    /// run again; past the invocation budget, the byte budget or the depth
-    /// cap the form goes unread and the page's evidence is incomplete.
+    /// run again; past the invocation budget or the depth cap, or with
+    /// content the byte budget does not admit — which is not decoded past
+    /// what it admits — the form goes unread and the page's evidence is
+    /// incomplete.
     fn form_drawn(
         &mut self,
         id: ObjectId,
@@ -958,8 +962,7 @@ impl<'a> ContentScanState<'a> {
         };
         if let Some(clip) = clip {
             self.clip = clip;
-            let content = self.form_content(id, form);
-            if self.form_bytes_charged(content.content.len()) {
+            if let Some(content) = self.form_content(id, form) {
                 let mut resources = Vec::with_capacity(invoker_resources.len() + 1);
                 resources.extend(stream_resources(self.doc, form));
                 resources.extend_from_slice(invoker_resources);
@@ -983,15 +986,18 @@ impl<'a> ContentScanState<'a> {
         self.restore();
     }
 
-    /// A form's content, decompressed and masked once per page while the
-    /// cache lasts — both copies count against its budget.
-    fn form_content(&mut self, id: ObjectId, form: &lopdf::Stream) -> Rc<FormContent> {
+    /// A form's content, charged to the byte budget at each invocation:
+    /// admitted to it (see `form_bytes_admitted`) and masked once per page
+    /// while the cache lasts, both copies counting against the cache's
+    /// budget. `None` when the byte budget refuses it.
+    fn form_content(&mut self, id: ObjectId, form: &lopdf::Stream) -> Option<Rc<FormContent>> {
         if let Some(content) = self.form_content.get(&id) {
-            return Rc::clone(content);
+            let content = Rc::clone(content);
+            return self
+                .form_bytes_charged(content.content.len())
+                .then_some(content);
         }
-        let content = form
-            .decompressed_content()
-            .unwrap_or_else(|_| form.content.clone());
+        let content = self.form_bytes_admitted(form)?;
         let masked = mask_strings_comments_and_inline_images(&content);
         let content = Rc::new(FormContent { content, masked });
         let bytes = content.content.len() + content.masked.len();
@@ -999,21 +1005,51 @@ impl<'a> ContentScanState<'a> {
             self.form_content_bytes += bytes;
             self.form_content.insert(id, Rc::clone(&content));
         }
-        content
+        Some(content)
     }
 
-    /// Whether `bytes` more of form or cell content may be executed within
-    /// the byte budget, charging them when they may. When they may not —
-    /// or once any were refused — nothing further is followed, and the
-    /// page's evidence is incomplete.
+    /// A form's or a cell's content admitted to the byte budget and
+    /// charged to it. The stream is decoded no further than the budget's
+    /// remainder — nothing once any was refused — nor than
+    /// `FORM_CONTENT_CACHE_MAX_BYTES`, so that no more than either is ever
+    /// held: a raw stream is refused by its length before any copy, a
+    /// filtered one by the bounded decoder at the limit. `None` when it is
+    /// refused: nothing further is followed, and the page's evidence is
+    /// incomplete.
+    fn form_bytes_admitted(&mut self, stream: &lopdf::Stream) -> Option<Vec<u8>> {
+        if self.form_bytes_exceeded {
+            self.form_bytes_refused();
+            return None;
+        }
+        let limit = self
+            .form_bytes_budget
+            .saturating_sub(self.executed_form_bytes)
+            .min(FORM_CONTENT_CACHE_MAX_BYTES);
+        let Some(content) = decoded_within(stream, limit) else {
+            self.form_bytes_refused();
+            return None;
+        };
+        self.executed_form_bytes += content.len();
+        Some(content)
+    }
+
+    /// Whether `bytes` more of form content already decoded may be
+    /// executed within the byte budget, charging them when they may. When
+    /// they may not — or once any were refused — the form is refused.
     fn form_bytes_charged(&mut self, bytes: usize) -> bool {
         if self.form_bytes_exceeded || self.executed_form_bytes + bytes > self.form_bytes_budget {
-            self.form_bytes_exceeded = true;
-            self.incomplete = true;
+            self.form_bytes_refused();
             return false;
         }
         self.executed_form_bytes += bytes;
         true
+    }
+
+    /// A form or a cell is refused for the byte budget: nothing further is
+    /// followed, and the page's evidence is incomplete.
+    fn form_bytes_refused(&mut self) {
+        self.form_bytes_exceeded = true;
+        self.incomplete = true;
     }
 
     /// The page area the images drawn cover: the cells they covered, to

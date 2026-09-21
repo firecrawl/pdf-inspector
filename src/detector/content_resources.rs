@@ -1,10 +1,29 @@
 //! What the names in a content stream resolve to — the XObject a `Do`
 //! names, the pattern an `scn` names, each in the first of the resource
-//! dictionaries in force that binds it — and what a stream's dictionary
-//! says: its own resources, a pattern's type, a form's `/Matrix` and
-//! `/BBox`.
+//! dictionaries in force that binds it — what a stream's dictionary says:
+//! its own resources, a pattern's type, a form's `/Matrix` and `/BBox` —
+//! and a stream's content, decoded within a limit.
 
-use lopdf::{Document, Object, ObjectId};
+use lopdf::{DecompressError, Document, Error, Object, ObjectId};
+
+/// A stream's content decoded within `limit` bytes — a form's or a
+/// pattern cell's, for a scan that may execute no more than that: `None`
+/// when it would take more. A stream without a `/Filter` is its bytes,
+/// refused by their length before any copy; a filtered one is decoded by
+/// the bounded decoder, which reads no further than the limit before
+/// refusing it; one that cannot be decoded is read as its raw bytes, as
+/// the unbounded reading read it, when they fit.
+pub(super) fn decoded_within(stream: &lopdf::Stream, limit: usize) -> Option<Vec<u8>> {
+    let raw_within = || (stream.content.len() <= limit).then(|| stream.content.clone());
+    if stream.dict.get(b"Filter").is_err() {
+        return raw_within();
+    }
+    match stream.decompressed_content_with_limit(limit) {
+        Ok(content) => Some(content),
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => None,
+        Err(_) => raw_within(),
+    }
+}
 
 /// What a `Do` operand names, in the first of the resources binding it.
 pub(super) enum XObjectDrawn<'a> {
