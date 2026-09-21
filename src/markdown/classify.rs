@@ -1,0 +1,377 @@
+//! Line classification: captions, lists, code detection.
+
+/// Unambiguous glyphs that identify a list item. Large squares and diamonds
+/// are kept out because documents also use them as decorative heading prefixes.
+pub(crate) const BULLET_GLYPHS: &[char] =
+    &['•', '●', '○', '◦', '▪', '▫', '‣', '⁃'];
+
+/// True when `text` is exactly one `BULLET_GLYPHS` entry (standalone marker).
+pub(crate) fn is_standalone_bullet_glyph(text: &str) -> bool {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(c), None) if BULLET_GLYPHS.contains(&c)
+    )
+}
+
+fn starts_with_bullet_glyph_and_space(text: &str) -> bool {
+    BULLET_GLYPHS.iter().any(|glyph| {
+        text.strip_prefix(*glyph)
+            .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
+/// Check if text is a figure/table caption or source citation
+pub(crate) fn is_caption_line(text: &str) -> bool {
+    let trimmed = text.trim();
+
+    // Caption prefixes that always match (always followed by identifiers)
+    let always_prefixes = [
+        "Figura ",
+        "Fig. ",
+        "Fig ",
+        "Tabela ",
+        "Source:",
+        "Fonte:",
+        "Source ",
+        "Fonte ",
+        "Note:",
+        "Nota:",
+        "Chart ",
+        "Gráfico ",
+        "Graph ",
+        "Diagram ",
+        "Image ",
+        "Imagem ",
+        "Photo ",
+        "Foto ",
+    ];
+    for prefix in &always_prefixes {
+        if trimmed.starts_with(prefix) {
+            return true;
+        }
+    }
+
+    // "Figure" and "Table" need a digit/reference after them to distinguish
+    // captions ("Table 1", "Figure 3.2") from headings ("Table of Contents")
+    for prefix in ["Figure ", "Table "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if rest
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit() || c == '(' || c == '#')
+            {
+                return true;
+            }
+        }
+    }
+
+    // Check case-insensitive patterns — require digit or punctuation after
+    // prefix to avoid matching "Table of Contents" or "Figure drawing" etc.
+    let lower = trimmed.to_lowercase();
+    for pfx in ["figure ", "table "] {
+        if let Some(rest) = lower.strip_prefix(pfx) {
+            if rest
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit() || c == '(' || c == '#')
+            {
+                return true;
+            }
+        }
+    }
+    if lower.starts_with("source:") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if text starts with an unambiguous bullet marker (●, •, ○, ◦, ▪, …).
+///
+/// Narrower than [`is_list_item`]: it excludes numbered/lettered patterns
+/// like `1.` or `a)`, which legitimately appear as section headings in many
+/// documents. Used by the heading classifier to reject bullet lines without
+/// also demoting numbered headings.
+pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    starts_with_bullet_glyph_and_space(trimmed)
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+}
+
+/// Check if text looks like a list item
+pub(crate) fn is_list_item(text: &str) -> bool {
+    let trimmed = text.trim_start();
+
+    // Bullet patterns
+    if starts_with_bullet_glyph_and_space(trimmed)
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+    {
+        return true;
+    }
+
+    // Numbered list patterns: "1.", "1)", "(1)", "a.", "a)"
+    let first_chars: String = trimmed.chars().take(5).collect();
+    if first_chars.contains(|c: char| c.is_ascii_digit()) {
+        // Check for "1.", "1)", "10."
+        if let Some(idx) = first_chars.find(['.', ')']) {
+            let prefix = &first_chars[..idx];
+            if prefix.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+
+    // Letter list: "a.", "a)", "(a)"
+    let mut chars = trimmed.chars();
+    if let (Some(first), Some(second)) = (chars.next(), chars.next()) {
+        if first.is_ascii_alphabetic() && (second == '.' || second == ')') {
+            return true;
+        }
+        if first == '(' && chars.next() == Some(')') {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Format list item to markdown
+pub(crate) fn format_list_item(text: &str) -> String {
+    let trimmed = text.trim_start();
+
+    // Convert various bullet styles to markdown
+    // Note: bullet characters like • are multi-byte in UTF-8, use char indices
+    for bullet in BULLET_GLYPHS {
+        if let Some(rest) = trimmed.strip_prefix(*bullet) {
+            return format!("- {}", rest.trim_start());
+        }
+        // Bullet inside a leading style run (e.g. "**● Label:** rest" or
+        // "<u>● Label</u>"). The run wraps both the marker and the following
+        // label because both carry the style in the PDF. The marker must move
+        // outside the wrapper so markdown still sees a list item.
+        for wrapper in ["**", "*", "<u>"] {
+            if let Some(after_open) = trimmed.strip_prefix(wrapper) {
+                if let Some(rest) = after_open.strip_prefix(*bullet) {
+                    return format!("- {}{}", wrapper, rest.trim_start());
+                }
+            }
+        }
+    }
+
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        return trimmed.to_string();
+    }
+
+    // Keep numbered lists as-is (markdown supports them)
+    trimmed.to_string()
+}
+
+/// Check if text looks like code
+pub(crate) fn is_code_like(text: &str) -> bool {
+    let trimmed = text.trim();
+
+    // Code patterns
+    let code_patterns = [
+        // Language keywords
+        "import ",
+        "export ",
+        "from ",
+        "const ",
+        "let ",
+        "var ",
+        "function ",
+        "class ",
+        "def ",
+        "pub fn ",
+        "fn ",
+        "async fn ",
+        "impl ",
+        // Syntax patterns
+        "=> ",
+        "-> ",
+        ":: ",
+        ":= ",
+    ];
+
+    for pattern in &code_patterns {
+        if trimmed.starts_with(pattern) {
+            return true;
+        }
+    }
+
+    // Check for code-like syntax
+    let special_chars: usize = trimmed
+        .chars()
+        .filter(|c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | ';' | '=' | '<' | '>'))
+        .count();
+
+    if special_chars >= 3 && trimmed.len() < 200 {
+        return true;
+    }
+
+    // Ends with semicolon or braces
+    if trimmed.ends_with(';') || trimmed.ends_with('{') || trimmed.ends_with('}') {
+        return true;
+    }
+
+    false
+}
+
+/// True when a line's text is essentially all monospace (≥90% by character
+/// count). Code lines are wholly monospace; anything less is prose carrying
+/// mono-styled fragments — a URL sidebar, or a sentence quoting an inline
+/// code literal — and fencing it would split paragraphs mid-sentence.
+/// Any-item matching was safe only while items carried opaque font resource
+/// names that never matched the monospace patterns; items now carry real
+/// family names.
+pub(crate) fn line_is_monospace(line: &crate::types::TextLine) -> bool {
+    let mut monospace_chars = 0usize;
+    let mut total_chars = 0usize;
+    for item in &line.items {
+        let text = item.text.trim();
+        let chars = text.chars().count();
+        total_chars += chars;
+        // Hyperlinks and underlined text set in a mono face are link
+        // styling, not code — a URL sidebar must not fence lyric lines.
+        let looks_like_link = item.is_underline
+            || matches!(item.item_type, crate::types::ItemType::Link(_))
+            || text.contains("://")
+            || text.starts_with("www.");
+        if is_monospace_font(&item.font) && !looks_like_link {
+            monospace_chars += chars;
+        }
+    }
+    total_chars > 0 && monospace_chars * 10 >= total_chars * 9
+}
+
+/// Check if font name indicates monospace
+pub(crate) fn is_monospace_font(font_name: &str) -> bool {
+    let lower = font_name.to_lowercase();
+    // "Monotype" is a foundry prefix on proportional faces (Monotype
+    // Corsiva, Monotype Garamond) — it must not satisfy the generic "mono"
+    // token below.
+    if lower.contains("monotype") {
+        return false;
+    }
+    let patterns = [
+        "courier",
+        "consolas",
+        "monaco",
+        "menlo",
+        "mono",
+        "fixed",
+        "terminal",
+        "typewriter",
+        "source code",
+        "fira code",
+        "jetbrains",
+        "inconsolata",
+        "dejavu sans mono",
+        "liberation mono",
+    ];
+
+    patterns.iter().any(|p| lower.contains(p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monotype_foundry_faces_are_not_monospace() {
+        // "Monotype" is a foundry prefix on proportional faces; the generic
+        // "mono" token must not classify them as code fonts.
+        assert!(!is_monospace_font("MonotypeCorsiva"));
+        assert!(!is_monospace_font("ABCDEF+Monotype-Garamond"));
+        assert!(is_monospace_font("RobotoMono-Regular"));
+        assert!(is_monospace_font("PTMono"));
+        assert!(is_monospace_font("Courier"));
+    }
+
+    #[test]
+    fn format_list_item_plain_bullet() {
+        assert_eq!(format_list_item("● Item"), "- Item");
+        assert_eq!(format_list_item("• Item"), "- Item");
+    }
+
+    #[test]
+    fn format_list_item_bullet_inside_underline() {
+        // Fully-underlined bullet line: the marker must move outside the
+        // <u> wrapper so markdown still renders a list item.
+        assert_eq!(format_list_item("<u>● Item text</u>"), "- <u>Item text</u>");
+    }
+
+    #[test]
+    fn format_list_item_bullet_inside_bold() {
+        // PDF that uses bold font for both the marker and the label produces
+        // a single bold run like "**● Label:** rest"; the bullet must still
+        // be stripped and the bold wrapper preserved on the label.
+        assert_eq!(
+            format_list_item("**● Fraud: Willing cooperation;**"),
+            "- **Fraud: Willing cooperation;**"
+        );
+        assert_eq!(
+            format_list_item("**● Label:** rest of line"),
+            "- **Label:** rest of line"
+        );
+        assert_eq!(format_list_item("*● Italic:* rest"), "- *Italic:* rest");
+        assert_eq!(format_list_item("**▪ Label:** rest"), "- **Label:** rest");
+    }
+
+    #[test]
+    fn format_list_item_already_dash() {
+        assert_eq!(format_list_item("- existing"), "- existing");
+    }
+
+    #[test]
+    fn is_list_item_extended_bullet_glyphs() {
+        for &glyph in BULLET_GLYPHS {
+            let text = format!("{glyph} Item");
+            assert!(is_list_item(&text), "{text}");
+            assert!(starts_with_bullet_marker(&text), "{text}");
+            assert_eq!(format_list_item(&text), "- Item", "{text}");
+        }
+    }
+
+    #[test]
+    fn decorative_glyph_prefixes_are_not_list_items() {
+        for text in ["■ Overview", "□ Details", "◆ Resources", "◇ Notes"] {
+            assert!(!is_list_item(text), "{text}");
+            assert!(!starts_with_bullet_marker(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn standalone_bullet_glyphs_match_list_markers() {
+        for &glyph in BULLET_GLYPHS {
+            assert!(is_standalone_bullet_glyph(&glyph.to_string()), "{glyph}");
+        }
+    }
+
+    #[test]
+    fn is_list_item_preserves_original_styles() {
+        assert!(is_list_item("● Item"));
+        assert!(is_list_item("• Item"));
+        assert!(is_list_item("- Item"));
+        assert!(is_list_item("* Item"));
+        assert!(is_list_item("1. Item"));
+        assert!(is_list_item("a) Item"));
+    }
+
+    #[test]
+    fn is_list_item_rejects_non_bullets() {
+        assert!(!is_list_item("▪Item"));
+        assert!(!is_list_item("Item ▪"));
+        assert!(!is_list_item("· Item"));
+        assert_eq!(format_list_item("· Item"), "· Item");
+        assert!(!is_list_item("– Item"));
+        assert!(!is_list_item("— Item"));
+        assert!(!is_list_item("not a list"));
+        assert!(!is_list_item("**bold** not a list"));
+        assert!(!starts_with_bullet_marker("· Item"));
+        assert!(!starts_with_bullet_marker("– Item"));
+        assert!(!starts_with_bullet_marker("— Item"));
+    }
+}
