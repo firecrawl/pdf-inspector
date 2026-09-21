@@ -2259,6 +2259,30 @@ impl<'a> CidDecode<'a> {
     }
 }
 
+/// What a simple font's `/Differences` say of a code (see
+/// [`differences_reading`]).
+enum NamedReading {
+    /// The character, or the letters, the code's name reads as.
+    Text(String),
+    /// The code is named, by a name that could not be read: it is that
+    /// glyph and no other.
+    Unread,
+}
+
+/// What `encoding`'s `/Differences` say of `code`, or `None` for a code
+/// they leave alone.
+fn differences_reading(encoding: &FontEncoding, code: u8) -> Option<NamedReading> {
+    if let Some(&ch) = encoding.differences.get(&code) {
+        Some(NamedReading::Text(ch.to_string()))
+    } else if let Some(text) = encoding.sequences.get(&code) {
+        Some(NamedReading::Text(text.clone()))
+    } else if encoding.named_codes.contains(&code) {
+        Some(NamedReading::Unread)
+    } else {
+        None
+    }
+}
+
 /// Decode a PDF string and record whether legacy symbol cleanup changed a character.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_text_from_operand(
@@ -2331,25 +2355,22 @@ pub(crate) fn extract_text_from_operand(
                             CodeMapping::ControlDestination => control_destination = true,
                             CodeMapping::Text(_) | CodeMapping::Unmapped => {}
                         }
+                        // What the font's own Differences say of the code:
+                        // the name selects the glyph, whatever the program's
+                        // cmap holds at the raw code.
+                        let by_name = encoding_map.and_then(|map| differences_reading(map, b));
                         // 2. For a code whose entry is a control destination,
-                        // the font's own encoding first: its Differences
-                        // name selects the glyph, whatever the program's cmap
-                        // holds at the raw code — and a name that could not
-                        // be read is that glyph and no other, so the code is
-                        // marked before the fallback CMap, the program's own
-                        // reading of the raw code, gets a say. (A code
-                        // without any entry keeps the order below.)
+                        // the Differences first — before the fallback CMap,
+                        // the program's own reading of the raw code: a name
+                        // that reads is the code's text, and a name that
+                        // could not be read is that glyph and no other, so
+                        // the code is marked. (A code without any entry
+                        // keeps the order below.)
                         if control_destination {
-                            if let Some(map) = encoding_map {
-                                if let Some(&ch) = map.differences.get(&b) {
-                                    return Some(ch.to_string());
-                                }
-                                if let Some(text) = map.sequences.get(&b) {
-                                    return Some(text.clone());
-                                }
-                                if map.named_codes.contains(&b) {
-                                    return Some("\u{FFFD}".to_string());
-                                }
+                            match by_name {
+                                Some(NamedReading::Text(text)) => return Some(text),
+                                Some(NamedReading::Unread) => return Some("\u{FFFD}".to_string()),
+                                None => {}
                             }
                         }
                         // 3. Fallback CMap (embedded font cmap)
@@ -2358,22 +2379,15 @@ pub(crate) fn extract_text_from_operand(
                                 return Some(fb);
                             }
                         }
-                        // 4. Differences mapped it? Use Differences result
-                        if let Some(map) = encoding_map {
-                            if let Some(&ch) = map.differences.get(&b) {
-                                return Some(ch.to_string());
-                            }
-                            if let Some(text) = map.sequences.get(&b) {
-                                return Some(text.clone());
-                            }
-                        }
-                        // A code the Differences name but could not map is
-                        // that glyph and no other: neither the base
-                        // encoding nor the fallback below has a say, and it
-                        // reads as nothing — unless its ToUnicode entry is a
-                        // control destination, a loss that is marked.
-                        if encoding_map.is_some_and(|map| map.named_codes.contains(&b)) {
-                            return control_destination.then(|| "\u{FFFD}".to_string());
+                        // 4. Differences mapped it? Use Differences result. A
+                        // code the Differences name but could not map is
+                        // that glyph and no other: neither the base encoding
+                        // nor the fallback below has a say, and it reads as
+                        // nothing.
+                        match by_name {
+                            Some(NamedReading::Text(text)) => return Some(text),
+                            Some(NamedReading::Unread) => return None,
+                            None => {}
                         }
                         // 5. The font's base encoding, for printable bytes
                         // (the predefined tables spell out the control
@@ -4380,11 +4394,20 @@ mod tests {
 
     /// A TrueType program of `names.len()` glyphs whose `post` table names
     /// glyph `i` `names[i]` (`None` leaves it `.notdef`), with no `cmap`,
-    /// so that a simple font addresses glyph `i` by code `i`.
+    /// so that a simple font addresses glyph `i` by code `i`, and a `glyf`
+    /// table in which every glyph is empty: each has an advance and no
+    /// outline.
     fn sfnt_with_glyph_names(names: &[Option<&str>]) -> Vec<u8> {
+        sfnt_with_glyph_names_and_outlines(names, true)
+    }
+
+    /// [`sfnt_with_glyph_names`] without the outline table when `outlines`
+    /// is false: a face that says nothing of its glyphs' outlines.
+    fn sfnt_with_glyph_names_and_outlines(names: &[Option<&str>], outlines: bool) -> Vec<u8> {
         let num_glyphs = names.len() as u16;
         let mut head = vec![0u8; 54];
         head[18..20].copy_from_slice(&1000u16.to_be_bytes()); // unitsPerEm
+        head[50..52].copy_from_slice(&1i16.to_be_bytes()); // long loca offsets
         let hhea = vec![0u8; 36];
         let mut maxp = vec![0u8; 6];
         maxp[..4].copy_from_slice(&0x00005000u32.to_be_bytes());
@@ -4409,12 +4432,19 @@ mod tests {
             }
         }
         post.extend(strings);
-        sfnt_from_tables(vec![
+        let mut tables = vec![
             (*b"head", head),
             (*b"hhea", hhea),
             (*b"maxp", maxp),
             (*b"post", post),
-        ])
+        ];
+        if outlines {
+            // Every glyph starts and ends at offset 0 of an empty `glyf`.
+            let loca = vec![0u8; 4 * (usize::from(num_glyphs) + 1)];
+            tables.push((*b"loca", loca));
+            tables.push((*b"glyf", Vec::new()));
+        }
+        sfnt_from_tables(tables)
     }
 
     fn descriptor_flags_from_sfnt(mac_style: u16, os2_selection: Option<u16>) -> (bool, bool) {
@@ -5724,8 +5754,8 @@ mod tests {
     /// A CID the CIDToGIDMap has no entry for — past the map's end — has
     /// no glyph, so no blank glyph either: its control destination stays
     /// marked, where the same CID mapped to a blank glyph reads as the
-    /// space that glyph paints. The program here names nothing and has no
-    /// outlines at all, so every glyph it does have is blank.
+    /// space that glyph paints. The program here names nothing and outlines
+    /// nothing, so every glyph it does have is blank.
     #[test]
     fn a_cid_past_the_cid_to_gid_map_has_no_blank_glyph_to_read_as_a_space() {
         let bfchar = "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>";
@@ -5842,6 +5872,29 @@ mod tests {
             ),
             "c \u{FFFD}ee"
         );
+    }
+
+    /// A program without an outline table — a bitmap-only face, or one
+    /// whose outlines do not parse — has no outline to read for any glyph,
+    /// and tells no blank: a control destination of such a font stays
+    /// marked, where the same program with an outline table of empty glyphs
+    /// reads it as a space.
+    #[test]
+    fn a_program_without_an_outline_table_tells_no_blank_glyph() {
+        let bfchar = "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>";
+        let coffee = [0, 1, 0, 2, 0, 3, 0, 4, 0, 4];
+        let decode = |outlines: bool| {
+            let (doc, tounicode_obj, page_id) = cid_font_doc(
+                bfchar,
+                sfnt_with_glyph_names_and_outlines(&[None; 5], outlines),
+                None,
+                false,
+                None,
+            );
+            decode_page_font_string(&doc, tounicode_obj, page_id, true, &coffee)
+        };
+        assert_eq!(decode(false), "co\u{FFFD}ee");
+        assert_eq!(decode(true), "co ee");
     }
 
     /// An odd-length string through a Type0 font none of whose bytes any

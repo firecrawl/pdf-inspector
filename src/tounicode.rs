@@ -329,7 +329,8 @@ fn differences_named_codes(
 /// leaves a gap and nothing else, whatever the ToUnicode CMap says of it.
 /// The glyph is found by CID through the charset of a CID-keyed CFF
 /// program, else through the CIDToGIDMap, else by the CID itself. Nothing
-/// for a simple font, whose blank glyphs are read at decode time.
+/// for a simple font, whose blank glyphs are read at decode time, or for a
+/// program that tells nothing of its outlines (see [`ProgramGlyphs`]).
 fn blank_cid_glyph_spaces(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
@@ -339,64 +340,89 @@ fn blank_cid_glyph_spaces(
     let Some(cid_font_dict) = get_descendant_cid_font(font_dict, doc) else {
         return Vec::new();
     };
+    let Some(glyphs) = ProgramGlyphs::parse(program) else {
+        return Vec::new();
+    };
     let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
-    // The glyph a CID selects through the CIDToGIDMap, when the map has
-    // one for it: a CID past the map's end, or sent to glyph 0, has no
-    // glyph of its own, and its code stays what the CMap says of it.
-    let mapped = |cid: u16| -> Option<u16> {
-        match cid_to_gid.as_ref() {
-            None => Some(cid),
-            Some(map) => map.get(usize::from(cid)).copied().filter(|&gid| gid != 0),
+    // The glyph a CID selects: through the charset of a CID-keyed CFF
+    // program; else through the CIDToGIDMap, when the map has one for it —
+    // a CID past the map's end, or sent to glyph 0, has no glyph of its
+    // own, and its code stays what the CMap says of it; else the CID itself.
+    let glyph_of = |cid: u16| -> Option<u16> {
+        match (&glyphs.charset, cid_to_gid.as_ref()) {
+            (Some(by_cid), _) => by_cid.get(&cid).copied(),
+            (None, None) => Some(cid),
+            (None, Some(map)) => map.get(usize::from(cid)).copied().filter(|&gid| gid != 0),
         }
     };
-    let advances = |cid: u16| cid_advance(cid_font_dict, doc, cid) > 0.0;
-    let mut spaces = Vec::new();
-    if let Ok(face) = ttf_parser::Face::parse(program, 0) {
-        let charset = face
-            .tables()
-            .cff
+    codes
+        .iter()
+        .copied()
+        .filter(|&cid| {
+            glyph_of(cid).is_some_and(|gid| glyphs.blank(gid))
+                && cid_advance(cid_font_dict, doc, cid) > 0.0
+        })
+        .map(|cid| (cid, " ".to_string()))
+        .collect()
+}
+
+/// The glyphs of a CIDFont's embedded program, as far as a blank among
+/// them can be told: an sfnt (TrueType or OpenType) with an outline table,
+/// or a bare CFF program. An sfnt without one — a bitmap-only face, or one
+/// whose outline table does not parse — has no outline to read for any
+/// glyph, and says nothing of blanks.
+struct ProgramGlyphs<'a> {
+    outlines: Outlines<'a>,
+    /// The glyph of each CID in the charset of a CID-keyed CFF program;
+    /// `None` when the program is not CID-keyed, and a CID finds its glyph
+    /// through the CIDToGIDMap.
+    charset: Option<HashMap<u16, u16>>,
+}
+
+/// Where a program keeps its outlines (both boxed: a parsed face is a
+/// large value, and the two variants are kept the same size).
+enum Outlines<'a> {
+    Sfnt(Box<ttf_parser::Face<'a>>),
+    Cff(Box<ttf_parser::cff::Table<'a>>),
+}
+
+impl<'a> ProgramGlyphs<'a> {
+    fn parse(program: &'a [u8]) -> Option<Self> {
+        let (outlines, cff) = if let Ok(face) = ttf_parser::Face::parse(program, 0) {
+            let tables = face.tables();
+            if tables.glyf.is_none() && tables.cff.is_none() && tables.cff2.is_none() {
+                return None;
+            }
+            let cff = tables.cff;
+            (Outlines::Sfnt(Box::new(face)), cff)
+        } else {
+            let cff = ttf_parser::cff::Table::parse(program)?;
+            (Outlines::Cff(Box::new(cff)), Some(cff))
+        };
+        let charset = cff
             .filter(|cff| cff.glyph_cid(ttf_parser::GlyphId(0)).is_some())
             .map(|cff| cff_cid_to_gid(&cff));
-        for &cid in codes {
-            let gid = match &charset {
-                Some(by_cid) => by_cid.get(&cid).copied(),
-                None => mapped(cid),
-            };
-            let Some(gid) = gid else {
-                continue;
-            };
-            // A glyph index at or past the program's glyph count is no
-            // glyph; its outline, unread, says nothing of a blank.
-            if gid >= face.number_of_glyphs() {
-                continue;
+        Some(Self { outlines, charset })
+    }
+
+    /// Whether glyph `gid` has no outline. An index at or past the
+    /// program's glyph count is no glyph, and its outline, unread, says
+    /// nothing of a blank.
+    fn blank(&self, gid: u16) -> bool {
+        let glyph = ttf_parser::GlyphId(gid);
+        match &self.outlines {
+            Outlines::Sfnt(face) => {
+                gid < face.number_of_glyphs() && face.glyph_bounding_box(glyph).is_none()
             }
-            if face.glyph_bounding_box(ttf_parser::GlyphId(gid)).is_none() && advances(cid) {
-                spaces.push((cid, " ".to_string()));
-            }
-        }
-    } else if let Some(cff) = ttf_parser::cff::Table::parse(program) {
-        let charset = cff
-            .glyph_cid(ttf_parser::GlyphId(0))
-            .is_some()
-            .then(|| cff_cid_to_gid(&cff));
-        for &cid in codes {
-            let gid = match &charset {
-                Some(by_cid) => by_cid.get(&cid).copied(),
-                None => mapped(cid),
-            };
-            let Some(gid) = gid else {
-                continue;
-            };
-            if gid >= cff.number_of_glyphs() {
-                continue;
-            }
-            let outline = cff.outline(ttf_parser::GlyphId(gid), &mut NoOutline);
-            if matches!(outline, Err(ttf_parser::CFFError::ZeroBBox)) && advances(cid) {
-                spaces.push((cid, " ".to_string()));
+            Outlines::Cff(cff) => {
+                gid < cff.number_of_glyphs()
+                    && matches!(
+                        cff.outline(glyph, &mut NoOutline),
+                        Err(ttf_parser::CFFError::ZeroBBox)
+                    )
             }
         }
     }
-    spaces
 }
 
 /// An outline sink that keeps nothing: only whether a glyph has one is asked.
