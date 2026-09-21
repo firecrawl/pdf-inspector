@@ -615,13 +615,16 @@ fn object_header_len(span: &[u8], id: u32) -> Option<usize> {
 /// The integer numerals in `array` (an array body taken from the masked
 /// bytes, so a comment's digits never count) that do not fit an `i64`, as
 /// `(start, length, negative)` — the same test the parser applies, so a
-/// numeral it would have read is left alone.
+/// numeral it would have read is left alone. A numeral is a token of its
+/// own: digits inside a name or run on by other regular characters are not
+/// one, nor is the object number of an indirect reference `n g R`.
 fn overlong_numerals(array: &[u8]) -> Vec<(usize, usize, bool)> {
     let mut found = Vec::new();
     let mut at = 0;
     while at < array.len() {
         let b = array[at];
-        if b == b'+' || b == b'-' || b.is_ascii_digit() {
+        let opens_token = at == 0 || !is_regular(&array[at - 1]);
+        if opens_token && (b == b'+' || b == b'-' || b.is_ascii_digit()) {
             let token_start = at;
             let negative = b == b'-';
             if b == b'+' || b == b'-' {
@@ -642,7 +645,14 @@ fn overlong_numerals(array: &[u8]) -> Vec<(usize, usize, bool)> {
                     .count();
             }
             let token = &array[token_start..at];
+            let closes_token = !array.get(at).is_some_and(is_regular);
+            if let Some(end) = reference_end(array, at) {
+                // `n g R`: an object number, not a coordinate.
+                at = end;
+                continue;
+            }
             if !real
+                && closes_token
                 && digits > 0
                 && std::str::from_utf8(token)
                     .ok()
@@ -656,6 +666,35 @@ fn overlong_numerals(array: &[u8]) -> Vec<(usize, usize, bool)> {
         }
     }
     found
+}
+
+/// When the bytes of `array` from `after_number` on read ` g R` — the rest
+/// of an indirect reference whose object number just ended — the position
+/// past the `R`.
+fn reference_end(array: &[u8], after_number: usize) -> Option<usize> {
+    let mut pos = after_number;
+    let space = array[pos..]
+        .iter()
+        .take_while(|b| b.is_ascii_whitespace())
+        .count();
+    if space == 0 {
+        return None;
+    }
+    pos += space;
+    let generation = array[pos..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if generation == 0 {
+        return None;
+    }
+    pos += generation;
+    pos += array[pos..]
+        .iter()
+        .take_while(|b| b.is_ascii_whitespace())
+        .count();
+    (array.get(pos) == Some(&b'R') && !array.get(pos + 1).is_some_and(is_regular))
+        .then_some(pos + 1)
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -755,6 +794,22 @@ mod tests {
         assert_eq!(
             overlong_numerals(b" -1.5 2 99999999999999999999 "),
             vec![(8, 20, false)]
+        );
+        // Digits inside a name, a run-on token and the object number of an
+        // indirect reference are not numerals; the numeral after them is.
+        assert_eq!(
+            overlong_numerals(
+                b"/A99999999999999999999x 99999999999999999999x 99999999999999999999 0 R -99999999999999999999"
+            ),
+            vec![(71, 21, true)]
+        );
+        assert_eq!(
+            overlong_numerals(b"99999999999999999999"),
+            vec![(0, 20, false)]
+        );
+        assert_eq!(
+            overlong_numerals(b"[99999999999999999999]"),
+            vec![(1, 20, false)]
         );
         // A string (with a nested pair and an escaped delimiter), a hex
         // string and a comment are blanked; the dictionary delimiters and
