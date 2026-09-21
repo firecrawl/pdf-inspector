@@ -13,32 +13,37 @@ use lopdf::{DecompressError, Document, Error, Object, ObjectId};
 /// drawn in that space: a device or CIE-based space by its family,
 /// `/ICCBased` by its stream's `/N`, `/Indexed` and `/Separation` one,
 /// `/DeviceN` as many as its names. `None` when the name is unbound or the
-/// space is of no family known here.
+/// space is of no family known here; the first binding decides, whatever
+/// it reads as.
 pub(super) fn colour_space_components(
     doc: &Document,
     resources: &[&lopdf::Dictionary],
     name: &[u8],
 ) -> Option<u32> {
-    for scope in resources {
-        let spaces = match scope.get(b"ColorSpace").ok() {
-            Some(Object::Dictionary(dict)) => dict,
-            Some(Object::Reference(id)) => match doc.get_dictionary(*id) {
-                Ok(dict) => dict,
-                Err(_) => continue,
-            },
-            _ => continue,
-        };
-        let Ok(space) = spaces.get(name) else {
-            continue;
-        };
-        return components_of_colour_space(doc, space, 0);
-    }
-    None
+    resources
+        .iter()
+        .find_map(|scope| colour_space_bound(doc, scope, name))
+        .and_then(|space| components_of_colour_space(doc, space, 0))
+}
+
+/// The colour space object the `/ColorSpace` dictionary of `scope` binds
+/// to `name`, of a family known here or not; `None` when it binds none.
+pub(super) fn colour_space_bound<'a>(
+    doc: &'a Document,
+    scope: &'a lopdf::Dictionary,
+    name: &[u8],
+) -> Option<&'a Object> {
+    let spaces = match scope.get(b"ColorSpace").ok()? {
+        Object::Dictionary(dict) => dict,
+        Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+        _ => return None,
+    };
+    spaces.get(name).ok()
 }
 
 /// The components of the colour space object `space`: a name, or an array
 /// led by its family's name — either direct or by reference.
-fn components_of_colour_space(doc: &Document, space: &Object, depth: u8) -> Option<u32> {
+pub(super) fn components_of_colour_space(doc: &Document, space: &Object, depth: u8) -> Option<u32> {
     if depth > 4 {
         return None;
     }

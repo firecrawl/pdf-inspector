@@ -351,3 +351,72 @@ pub(super) fn layered_scan_page(
     set_page_content(&mut doc, content_id, &content);
     (doc, page_id)
 }
+
+/// The object id of the form `name` bound in the page's resources.
+pub(super) fn bound_form_id(doc: &Document, page_id: ObjectId, name: &[u8]) -> ObjectId {
+    doc.get_dictionary(page_id)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"XObject")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(name)
+        .unwrap()
+        .as_reference()
+        .unwrap()
+}
+
+/// Binds `name` to the colour space object `space` in the `/ColorSpace`
+/// dictionary of the page's resources, or of the form's own when `form`
+/// is given.
+pub(super) fn bind_colour_space(
+    doc: &mut Document,
+    page_id: ObjectId,
+    form: Option<ObjectId>,
+    name: &str,
+    space: Object,
+) {
+    let mut resources = match form {
+        None => doc
+            .get_dictionary(page_id)
+            .unwrap()
+            .get(b"Resources")
+            .unwrap(),
+        Some(id) => doc
+            .get_object(id)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .dict
+            .get(b"Resources")
+            .unwrap(),
+    }
+    .as_dict()
+    .unwrap()
+    .clone();
+    let mut spaces = resources
+        .get(b"ColorSpace")
+        .ok()
+        .and_then(|spaces| spaces.as_dict().ok())
+        .cloned()
+        .unwrap_or_else(lopdf::Dictionary::new);
+    spaces.set(name, space);
+    resources.set("ColorSpace", spaces);
+    match form {
+        None => doc
+            .get_dictionary_mut(page_id)
+            .unwrap()
+            .set("Resources", resources),
+        Some(id) => doc
+            .get_object_mut(id)
+            .unwrap()
+            .as_stream_mut()
+            .unwrap()
+            .dict
+            .set("Resources", resources),
+    }
+}

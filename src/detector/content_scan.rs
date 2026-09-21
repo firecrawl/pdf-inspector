@@ -13,8 +13,8 @@ use super::content_mask::{
     show_operand_text_bytes,
 };
 use super::content_resources::{
-    colour_space_components, decoded_within, numbers_of, pattern_type, resolve_pattern,
-    resolve_xobject, stream_resources, XObjectDrawn,
+    colour_space_bound, colour_space_components, components_of_colour_space, decoded_within,
+    numbers_of, pattern_type, resolve_pattern, resolve_xobject, stream_resources, XObjectDrawn,
 };
 use super::{
     collect_text_chars_before, extract_font_name_before_tf, is_pdf_whitespace,
@@ -874,12 +874,13 @@ impl<'a> ContentScanState<'a> {
     /// spaces its inline images name resolved in `resources`, those in
     /// force at the invocation, the form's own first. It is kept for the
     /// page while the cache lasts, both copies counting against the
-    /// cache's budget, only when the form's own resources answered for
-    /// every colour space the masking asked after: a name they leave to
-    /// the invoker's resources may be answered otherwise under another
+    /// cache's budget, only when the form's own resources bound every
+    /// colour space the masking asked after — a space they bind is the
+    /// form's reading, of a family known here or not: a name they leave to
+    /// the invoker's resources may be bound otherwise under another
     /// invoker, and with it the length of the data and where the operators
-    /// resume, so such a form is masked at each invocation. `None` when
-    /// the byte budget refuses it.
+    /// resume change, so such a form is masked at each invocation. `None`
+    /// when the byte budget refuses it.
     fn form_content(
         &mut self,
         id: ObjectId,
@@ -894,13 +895,19 @@ impl<'a> ContentScanState<'a> {
         }
         let content = self.form_bytes_admitted(form)?;
         let doc = self.doc;
-        let own: Vec<&lopdf::Dictionary> = stream_resources(doc, form).into_iter().collect();
+        let own = stream_resources(doc, form);
         let asked_the_invoker = Cell::new(false);
         let masked = mask_strings_comments_and_inline_images(&content, &|name| {
-            colour_space_components(doc, &own, name).or_else(|| {
-                asked_the_invoker.set(true);
-                colour_space_components(doc, resources, name)
-            })
+            match own.and_then(|scope| colour_space_bound(doc, scope, name)) {
+                // Bound by the form's own resources, the space reads as
+                // they have it — of no family known here, as unknown —
+                // as the first binding decides everywhere else.
+                Some(space) => components_of_colour_space(doc, space, 0),
+                None => {
+                    asked_the_invoker.set(true);
+                    colour_space_components(doc, resources, name)
+                }
+            }
         });
         let content = Rc::new(FormContent { content, masked });
         let bytes = content.content.len() + content.masked.len();

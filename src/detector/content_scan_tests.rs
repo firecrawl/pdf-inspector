@@ -1325,61 +1325,23 @@ fn a_form_taking_a_colour_space_from_its_invoker_is_masked_at_each_invocation() 
             },
         ],
     );
-    let form_id = |doc: &Document, name: &[u8]| -> ObjectId {
-        doc.get_dictionary(page_id)
-            .unwrap()
-            .get(b"Resources")
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .get(b"XObject")
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .get(name)
-            .unwrap()
-            .as_reference()
-            .unwrap()
-    };
-    let bind = |resources: &mut lopdf::Dictionary, space: &[u8]| {
-        resources.set(
-            "ColorSpace",
-            dictionary! { "Cs1" => Object::Name(space.to_vec()) },
-        );
-    };
-    let wrapper = form_id(&doc, b"FmRgb");
-    let inner = form_id(&doc, b"FmCs");
+    let wrapper = bound_form_id(&doc, page_id, b"FmRgb");
+    let inner = bound_form_id(&doc, page_id, b"FmCs");
     // The page binds `Cs1` as gray, the wrapper form as RGB.
-    let mut page_resources = doc
-        .get_dictionary(page_id)
-        .unwrap()
-        .get(b"Resources")
-        .unwrap()
-        .as_dict()
-        .unwrap()
-        .clone();
-    bind(&mut page_resources, b"DeviceGray");
-    doc.get_dictionary_mut(page_id)
-        .unwrap()
-        .set("Resources", page_resources);
-    let mut wrapper_resources = doc
-        .get_object(wrapper)
-        .unwrap()
-        .as_stream()
-        .unwrap()
-        .dict
-        .get(b"Resources")
-        .unwrap()
-        .as_dict()
-        .unwrap()
-        .clone();
-    bind(&mut wrapper_resources, b"DeviceRGB");
-    doc.get_object_mut(wrapper)
-        .unwrap()
-        .as_stream_mut()
-        .unwrap()
-        .dict
-        .set("Resources", wrapper_resources);
+    bind_colour_space(
+        &mut doc,
+        page_id,
+        None,
+        "Cs1",
+        Object::Name(b"DeviceGray".to_vec()),
+    );
+    bind_colour_space(
+        &mut doc,
+        page_id,
+        Some(wrapper),
+        "Cs1",
+        Object::Name(b"DeviceRGB".to_vec()),
+    );
 
     // Invoked by the page the text is shown, invoked through the wrapper
     // it is data — in either order, so the first invocation's reading is
@@ -1398,24 +1360,13 @@ fn a_form_taking_a_colour_space_from_its_invoker_is_masked_at_each_invocation() 
 
     // Bound in the form's own resources, the colour space is the form's
     // whoever invokes it: read as gray under the wrapper too, and kept.
-    let mut inner_resources = doc
-        .get_object(inner)
-        .unwrap()
-        .as_stream()
-        .unwrap()
-        .dict
-        .get(b"Resources")
-        .unwrap()
-        .as_dict()
-        .unwrap()
-        .clone();
-    bind(&mut inner_resources, b"DeviceGray");
-    doc.get_object_mut(inner)
-        .unwrap()
-        .as_stream_mut()
-        .unwrap()
-        .dict
-        .set("Resources", inner_resources);
+    bind_colour_space(
+        &mut doc,
+        page_id,
+        Some(inner),
+        "Cs1",
+        Object::Name(b"DeviceGray".to_vec()),
+    );
     let state = executed_state(&doc, page_id, &["/FmRgb Do /FmCs Do"]);
     assert_eq!(
         (state.executed_text_ops, state.executed_hidden_text_ops),
@@ -1423,4 +1374,70 @@ fn a_form_taking_a_colour_space_from_its_invoker_is_masked_at_each_invocation() 
     );
     assert_eq!(state.form_content.len(), 2);
     assert!(state.form_content.contains_key(&inner));
+}
+
+/// A colour space the form's own resources bind is the form's reading
+/// whatever the invoker binds to the same name — of no family known
+/// here, or unreadable, an unknown length, not the invoker's: the form
+/// asked nothing of the invoker, and is kept.
+#[test]
+fn a_colour_space_the_form_binds_is_read_as_the_form_has_it() {
+    // The form and wrapper of the test above, the page binding `Cs1` as
+    // gray and the wrapper as RGB. With the length unknown the data ends
+    // at the `EI` among its bytes and the text after it is shown under
+    // either invoker; read as the wrapper has it, the text would be data.
+    let unknown = Object::Name(b"NoSuchFamily".to_vec());
+    let unreadable = vec![
+        Object::Name(b"ICCBased".to_vec()),
+        Object::Reference((999_999, 0)),
+    ];
+    for space in [unknown, Object::Array(unreadable)] {
+        let (mut doc, page_id, _) = synthetic_page(
+            false,
+            false,
+            &[
+                TestForm {
+                    name: "FmCs",
+                    content: "BI /W 2 /H 1 /BPC 8 /CS /Cs1 ID AB EI BT /F1 12 Tf (a) Tj ET EI\n",
+                    ..PAGE_FORM
+                },
+                TestForm {
+                    name: "FmRgb",
+                    content: "/FmCs Do",
+                    xobjects: &[("FmCs", "FmCs")],
+                    ..PAGE_FORM
+                },
+            ],
+        );
+        let wrapper = bound_form_id(&doc, page_id, b"FmRgb");
+        let inner = bound_form_id(&doc, page_id, b"FmCs");
+        bind_colour_space(
+            &mut doc,
+            page_id,
+            None,
+            "Cs1",
+            Object::Name(b"DeviceGray".to_vec()),
+        );
+        bind_colour_space(
+            &mut doc,
+            page_id,
+            Some(wrapper),
+            "Cs1",
+            Object::Name(b"DeviceRGB".to_vec()),
+        );
+        bind_colour_space(&mut doc, page_id, Some(inner), "Cs1", space.clone());
+        for content in ["/FmCs Do /FmRgb Do", "/FmRgb Do /FmCs Do"] {
+            let state = executed_state(&doc, page_id, &[content]);
+            assert_eq!(
+                (state.executed_text_ops, state.executed_hidden_text_ops),
+                (2, 0),
+                "{content} under {space:?}"
+            );
+            assert_eq!(state.form_content.len(), 2, "{content} under {space:?}");
+            assert!(
+                state.form_content.contains_key(&inner),
+                "{content} under {space:?}"
+            );
+        }
+    }
 }
