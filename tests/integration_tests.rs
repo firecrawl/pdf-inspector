@@ -9610,8 +9610,11 @@ fn make_ligature_index_pdf(
         "<0005> <0074>\n<0006> <0061>\n<0007> <0062>\n<0008> <006C>\n<0009> <0073>\n\
          <000A> <0075>\n<000B> <006E>\n<000C> <0064>\n"
     };
+    // The header declares the entries the CMap holds: four when sparse,
+    // twelve otherwise.
+    let count = if sparse { 4 } else { 12 };
     let cmap = format!(
-        "{CID_CMAP_HEAD}12 beginbfchar\n<0001> <0063>\n<0002> <006F>\n\
+        "{CID_CMAP_HEAD}{count} beginbfchar\n<0001> <0063>\n<0002> <006F>\n\
          <0003> {ligature_entry}\n<0004> <0065>\n{more}{CID_CMAP_TAIL}"
     );
     make_embedded_cid_font_pdf(
