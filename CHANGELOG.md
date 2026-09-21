@@ -81,8 +81,10 @@ Changes since 1.22.1.
   an ActualText replacement, their baselines lie within 0.3 em and the
   accent's centre falls within that glyph's advance (estimated from the
   run's width, whitespace counted at 0.28 em — at the run's uniform advance
-  for a fixed-pitch face — and the glyph at no less than 0.6 em), and only
-  when Unicode has one character for the pair (a dotless
+  for a fixed-pitch face — and the glyph at no less than 0.6 em, with a
+  quarter of the accent's own width of play beyond the run's edge for an
+  accent overhanging a narrow letter), and only when Unicode has one
+  character for the pair (a dotless
   i or j under the accent composes as the dotted letter). A circumflex or
   grave standing beside its neighbours rather than over them, as in code or
   mathematics, is left as shown.
