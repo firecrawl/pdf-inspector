@@ -536,15 +536,25 @@ fn lay_out(fixture: &Fixture, hebrew: &EmbeddedFont, arabic: &EmbeddedFont) -> L
             }
             Painting::InvisibleLogicalWords => {
                 // A right-to-left run's glyphs in reading order are its
-                // display order turned round; a Latin run is already read
-                // left to right.
+                // display clusters — a base glyph with the marks that follow
+                // it — turned round, each cluster kept whole; a Latin run is
+                // already read left to right.
                 content.push_str("BT\n3 Tr\n");
                 for &(i, j) in &reading_order {
                     let run = &glyphs[i..j];
                     let codes: Vec<u8> = if run[0].font == FontUse::Latin {
                         run.iter().flat_map(code_of).collect()
                     } else {
-                        run.iter().rev().flat_map(code_of).collect()
+                        let mut clusters: Vec<Vec<u8>> = Vec::new();
+                        for glyph in run {
+                            match clusters.last_mut() {
+                                Some(cluster) if is_mark(glyph.ch) => {
+                                    cluster.extend(code_of(glyph))
+                                }
+                                _ => clusters.push(code_of(glyph)),
+                            }
+                        }
+                        clusters.into_iter().rev().flatten().collect()
                     };
                     show_run(&mut content, &glyphs[i], &codes);
                 }
@@ -826,10 +836,11 @@ fn main() {
             presentation_forms: false,
             declared_width_scale: 1.0,
             lines: vec![
-                // הספרייה פתוחה בכל ימות השבוע
+                // הספרייה פתוחה בכָל ימות השבוע — one letter carries a vowel
+                // point, a combining mark that must stay after its base.
                 Line::rtl(
                     "\u{05D4}\u{05E1}\u{05E4}\u{05E8}\u{05D9}\u{05D9}\u{05D4} \u{05E4}\u{05EA}\u{05D5}\u{05D7}\u{05D4} \
-                     \u{05D1}\u{05DB}\u{05DC} \u{05D9}\u{05DE}\u{05D5}\u{05EA} \u{05D4}\u{05E9}\u{05D1}\u{05D5}\u{05E2}",
+                     \u{05D1}\u{05DB}\u{05B8}\u{05DC} \u{05D9}\u{05DE}\u{05D5}\u{05EA} \u{05D4}\u{05E9}\u{05D1}\u{05D5}\u{05E2}",
                 ),
                 // הקוראים מוזמנים להשאיל ספרים
                 Line::rtl(

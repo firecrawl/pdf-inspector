@@ -171,20 +171,21 @@ impl ClipTracker {
     }
 }
 
+/// Whether the clip in force when `item` was shown hides it wholly (see
+/// `ClipRect::excludes_run`); a run with no established clip is never
+/// hidden. The same predicate `drop_clipped_away_runs` applies, shared with
+/// the page's storage-order vote so that a run not on the page decides
+/// nothing.
+pub(super) fn excluded_by_clip(item: &TextItem, clip: Option<ClipRect>) -> bool {
+    clip.is_some_and(|rect| rect.excludes_run(item))
+}
+
 /// Remove from `items` the runs their own clip hides — those
 /// `ClipRect::excludes_run` judges wholly outside the rectangle in force
 /// when they were shown — keeping `clips` aligned with `items`, and return
 /// how many were removed. A run with no established clip (`None`) always
 /// stays. Both vectors shrink in step, so call this after any fix-up that
 /// indexes into `items`.
-/// Whether the clip in force when `item` was shown hides it wholly (see
-/// `ClipRect::excludes_run`); a run with no established clip is never
-/// hidden. The test `drop_clipped_away_runs` applies, shared with the
-/// page's storage-order vote so that a run not on the page decides nothing.
-pub(super) fn excluded_by_clip(item: &TextItem, clip: Option<ClipRect>) -> bool {
-    clip.is_some_and(|rect| rect.excludes_run(item))
-}
-
 pub(super) fn drop_clipped_away_runs(
     items: &mut Vec<TextItem>,
     clips: &mut Vec<Option<ClipRect>>,

@@ -1626,8 +1626,8 @@ fn test_snapshot_rtl_hebrew_visual_words_in_reading_order() {
     );
 }
 
-// הספרייה פתוחה בכל ימות השבוע
-const RTL_LIBRARY_LINE_1: &str = "\u{05D4}\u{05E1}\u{05E4}\u{05E8}\u{05D9}\u{05D9}\u{05D4} \u{05E4}\u{05EA}\u{05D5}\u{05D7}\u{05D4} \u{05D1}\u{05DB}\u{05DC} \u{05D9}\u{05DE}\u{05D5}\u{05EA} \u{05D4}\u{05E9}\u{05D1}\u{05D5}\u{05E2}";
+// הספרייה פתוחה בכָל ימות השבוע (one vowel point, kept after its base)
+const RTL_LIBRARY_LINE_1: &str = "\u{05D4}\u{05E1}\u{05E4}\u{05E8}\u{05D9}\u{05D9}\u{05D4} \u{05E4}\u{05EA}\u{05D5}\u{05D7}\u{05D4} \u{05D1}\u{05DB}\u{05B8}\u{05DC} \u{05D9}\u{05DE}\u{05D5}\u{05EA} \u{05D4}\u{05E9}\u{05D1}\u{05D5}\u{05E2}";
 // הקוראים מוזמנים להשאיל ספרים
 const RTL_LIBRARY_LINE_2: &str = "\u{05D4}\u{05E7}\u{05D5}\u{05E8}\u{05D0}\u{05D9}\u{05DD} \u{05DE}\u{05D5}\u{05D6}\u{05DE}\u{05E0}\u{05D9}\u{05DD} \u{05DC}\u{05D4}\u{05E9}\u{05D0}\u{05D9}\u{05DC} \u{05E1}\u{05E4}\u{05E8}\u{05D9}\u{05DD}";
 // ההרשמה נעשית בדלפק הכניסה
@@ -5753,14 +5753,13 @@ fn clipping_provenance_follows_sorted_items_and_supported_show_operators() {
     );
 }
 
-fn clipped_rtl_items(left_clip: &str, right_clip: &str) -> Vec<TextItem> {
+/// Items of a small page whose `F1` maps the codes `A`..`D` to the first
+/// four Hebrew letters (500-unit widths), for tests of right-to-left runs
+/// built from a content stream.
+fn hebrew_items(content: &str) -> Vec<TextItem> {
     use lopdf::{dictionary, Document, Stream};
 
-    let field = |clip: &str, x: u32, text: &str| {
-        format!("q {clip} BT /F1 12 Tf 10 Tz 1 0 0 1 {x} 100 Tm ({text}) Tj ET Q\n")
-    };
-    let content = field(left_clip, 50, "AB") + &field(right_clip, 52, "CD");
-    let mut doc = Document::load_mem(&make_text_pdf(&content, "0 0 300 300")).unwrap();
+    let mut doc = Document::load_mem(&make_text_pdf(content, "0 0 300 300")).unwrap();
     let cmap = doc.add_object(Stream::new(
         dictionary! {},
         b"begincmap\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
@@ -5776,6 +5775,25 @@ fn clipped_rtl_items(left_clip: &str, right_clip: &str) -> Vec<TextItem> {
     let mut bytes = Vec::new();
     doc.save_to(&mut bytes).unwrap();
     extract_text_with_positions_mem(&bytes).unwrap()
+}
+
+fn clipped_rtl_items(left_clip: &str, right_clip: &str) -> Vec<TextItem> {
+    let field = |clip: &str, x: u32, text: &str| {
+        format!("q {clip} BT /F1 12 Tf 10 Tz 1 0 0 1 {x} 100 Tm ({text}) Tj ET Q\n")
+    };
+    hebrew_items(&(field(left_clip, 50, "AB") + &field(right_clip, 52, "CD")))
+}
+
+/// A visible run stored in reading order is still recognised when its
+/// geometry says so: a text matrix mirrored in x paints the glyphs right
+/// to left, the run displays correctly as stored, and it is read as stored.
+#[test]
+fn visible_logical_order_runs_painted_right_to_left_stay_logical() {
+    let items = hebrew_items("BT /F1 12 Tf -1 0 0 1 100 100 Tm (ABCD) Tj ET\n");
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["\u{05D0}\u{05D1}\u{05D2}\u{05D3}"]
+    );
 }
 
 /// Visible runs of right-to-left letters painted forwards are visual
