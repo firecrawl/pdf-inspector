@@ -4,7 +4,7 @@ use super::fonts::{font_style, FontStyle};
 use super::text_paint::{PaintResources, TextPaint};
 use crate::text_utils::{effective_font_size, expand_ligatures};
 use crate::tounicode::FontCMaps;
-use crate::types::{BoldSource, ItemType, TextItem};
+use crate::types::{attach_run_coverage, BoldSource, ItemCoverage, ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -194,6 +194,8 @@ fn collect_xobjects_from_dict(
 /// `is_visual_rtl_candidate`) and of the items shown by logical-order ops.
 pub(crate) struct ExtractedText {
     pub(crate) items: Vec<TextItem>,
+    /// The CMap coverage of each item, parallel to `items`.
+    pub(crate) item_coverage: ItemCoverage,
     pub(crate) rtl_visual_candidates: Vec<usize>,
     pub(crate) rtl_logical_runs: Vec<usize>,
     /// Indexes of the items shown by visible ops of several RTL letters
@@ -213,6 +215,7 @@ impl ExtractedText {
     fn new() -> Self {
         Self {
             items: Vec::new(),
+            item_coverage: Vec::new(),
             rtl_visual_candidates: Vec::new(),
             rtl_logical_runs: Vec::new(),
             rtl_visual_runs: Vec::new(),
@@ -225,9 +228,11 @@ impl ExtractedText {
     /// candidate indexes onto the caller's item vector. Keeping the rebase
     /// here is what stops item and RTL-evidence bookkeeping from drifting
     /// apart across the page/form extraction paths.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_into(
         self,
         items: &mut Vec<TextItem>,
+        item_coverage: &mut ItemCoverage,
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_runs: &mut Vec<usize>,
         rtl_visual_runs: &mut Vec<usize>,
@@ -240,7 +245,9 @@ impl ExtractedText {
         rtl_visual_runs.extend(self.rtl_visual_runs.into_iter().map(|c| c + base));
         run_rotations.extend(self.run_rotations);
         *skipped_invisible |= self.skipped_invisible;
+        debug_assert_eq!(self.items.len(), self.item_coverage.len());
         items.extend(self.items);
+        item_coverage.extend(self.item_coverage);
     }
 }
 
@@ -346,6 +353,7 @@ fn extract_form_xobject_text_inner(
         return extracted;
     };
     let items = &mut extracted.items;
+    let item_coverage = &mut extracted.item_coverage;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_runs = &mut extracted.rtl_logical_runs;
     let rtl_visual_runs = &mut extracted.rtl_visual_runs;
@@ -504,6 +512,13 @@ fn extract_form_xobject_text_inner(
     let mut ctm_stack: Vec<GraphicsState> = Vec::new();
 
     for op in &content.operations {
+        // The coverage of the preceding operator's decodes goes to the first
+        // item it appended (see `attach_run_coverage`).
+        attach_run_coverage(
+            item_coverage,
+            items.len(),
+            cmap_decisions.take_run_coverage(),
+        );
         if !budget.charge_operation() {
             break;
         }
@@ -577,6 +592,7 @@ fn extract_form_xobject_text_inner(
                                     )
                                     .append_into(
                                         items,
+                                        item_coverage,
                                         rtl_visual_candidates,
                                         rtl_logical_runs,
                                         rtl_visual_runs,
@@ -1461,6 +1477,11 @@ fn extract_form_xobject_text_inner(
             _ => {}
         }
     }
+    attach_run_coverage(
+        item_coverage,
+        items.len(),
+        cmap_decisions.take_run_coverage(),
+    );
 
     extracted
 }

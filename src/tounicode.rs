@@ -35,18 +35,21 @@ pub struct ToUnicodeCMap {
     pub(crate) gap_fills: HashMap<u16, char>,
 }
 
-/// What decoding a string through a CMap amounted to, for the two-byte
-/// codes of a CID-keyed font (a single-byte CMap counts only its codes and
-/// the ones it read through the Latin-1 fallback as unmapped).
+/// What decoding a string through a CMap amounted to.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CidDecodeStats {
-    /// Codes decoded, repeats included.
+    /// Codes decoded, repeats included: two-byte codes, or the bytes of a
+    /// single-byte CMap.
     pub codes: u32,
     /// Codes without an entry that were read from the mapped codes around
-    /// them (see [`ToUnicodeCMap::gap_fill`]).
+    /// them (see [`ToUnicodeCMap::gap_fill`]); two-byte codes only, as no
+    /// gap is read into a single-byte CMap.
     pub interpolated: u32,
-    /// Codes without an entry that could not be read; each is a U+FFFD in
-    /// the decoded text.
+    /// Codes without an entry that were not read from their neighbours. A
+    /// two-byte code among them is a U+FFFD in the decoded text; a byte of
+    /// a single-byte CMap is stood in for by its Latin-1 character when it
+    /// is printable and reads as nothing otherwise, so not every unmapped
+    /// code shows as a replacement character.
     pub unmapped: u32,
 }
 

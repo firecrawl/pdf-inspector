@@ -4808,8 +4808,13 @@ fn process_document(
                 ))
             };
 
+            // A code no CMap could read is an encoding issue whether or not
+            // the Markdown that would show its U+FFFD is generated in this
+            // mode; a gap read from its neighbours is not one.
+            let cmap_unmapped = cmap_coverage.values().any(|stats| stats.unmapped > 0);
             let enc = !ocr_reasons_by_page.is_empty()
                 || text_quality.has_encoding_issues
+                || cmap_unmapped
                 || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
             (
                 md,

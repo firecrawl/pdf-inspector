@@ -6226,6 +6226,129 @@ fn test_page_filter_reports_no_cmap_gaps_from_context_pages() {
     assert_eq!(result.cmap_gaps[0].unmapped, 0);
 }
 
+#[test]
+fn test_analyze_mode_reports_unmapped_cmap_codes_as_encoding_issues() {
+    // Analysis generates no Markdown, so the U+FFFD a code no CMap could
+    // read would show is never seen there; the flag follows the coverage
+    // instead, in both modes alike, and a gap read from its neighbours does
+    // not raise it.
+    let analyze = || pdf_inspector::PdfOptions::new().mode(pdf_inspector::ProcessMode::Analyze);
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let interpolated_only =
+        make_type0_pdf_with_tounicode_ranges(&GAPPED_RANGES, &shown_lines(&base));
+    let edge: [&[u16]; 3] = [&[44, 45], &[36, 37, 38], &[39, 40, 41]];
+    let unmapped =
+        make_type0_pdf_with_tounicode_ranges(&[(3, 3, 0x20), (36, 44, 0x41)], &shown_lines(&edge));
+
+    let analyzed = pdf_inspector::process_pdf_mem_with_options(&unmapped, analyze()).unwrap();
+    assert!(analyzed.markdown.is_none());
+    assert!(analyzed.has_encoding_issues);
+    assert_eq!(analyzed.cmap_gaps.len(), 1);
+    assert!(analyzed.cmap_gaps[0].unmapped > 0);
+    let processed = pdf_inspector::process_pdf_mem(&unmapped).unwrap();
+    assert!(processed.has_encoding_issues);
+    assert_eq!(processed.cmap_gaps, analyzed.cmap_gaps);
+
+    let analyzed =
+        pdf_inspector::process_pdf_mem_with_options(&interpolated_only, analyze()).unwrap();
+    assert!(analyzed.markdown.is_none());
+    assert!(!analyzed.has_encoding_issues);
+    assert_eq!(analyzed.cmap_gaps.len(), 1);
+    assert!(analyzed.cmap_gaps[0].interpolated > 0);
+    assert_eq!(analyzed.cmap_gaps[0].unmapped, 0);
+    let processed = pdf_inspector::process_pdf_mem(&interpolated_only).unwrap();
+    assert!(!processed.has_encoding_issues);
+    assert_eq!(processed.cmap_gaps, analyzed.cmap_gaps);
+}
+
+/// A spread whose page box (its `/CropBox`) is the left half of the sheet:
+/// the lines of `cmap_gap_lines` shown through the font of
+/// `add_type0_font_with_tounicode_ranges` with `GAPPED_RANGES` once inside
+/// the box and once again, on other baselines, out on the right half, as a
+/// single-page extract of an imposed spread keeps its neighbour's text.
+fn make_spread_pdf_with_gapped_font_off_page() -> Vec<u8> {
+    use lopdf::{dictionary, Document, Stream};
+
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let shown = shown_lines(&base);
+    let highest_code = shown
+        .iter()
+        .flat_map(|line| line.iter())
+        .chain(GAPPED_RANGES.iter().map(|(_, last, _)| last))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut doc = Document::with_version("1.5");
+    let font_id = add_type0_font_with_tounicode_ranges(&mut doc, &GAPPED_RANGES, highest_code);
+    let mut content = String::new();
+    for (index, line) in shown.iter().enumerate() {
+        let hex: String = line.iter().map(|code| format!("{code:04X}")).collect();
+        content.push_str(&format!(
+            "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
+            700 - 20 * index
+        ));
+        content.push_str(&format!(
+            "BT /F1 12 Tf 700 {} Td <{hex}> Tj ET\n",
+            690 - 20 * index
+        ));
+    }
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 1224.into(), 792.into()],
+        "CropBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_text_outside_the_page_box_takes_its_cmap_coverage_with_it() {
+    let pdf = make_spread_pdf_with_gapped_font_off_page();
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    let markdown = result.markdown.as_deref().unwrap();
+    // The neighbour's text is left out of the page ...
+    assert_eq!(
+        markdown.matches("JAZZ POLKA").count(),
+        SHOWINGS,
+        "{markdown}"
+    );
+    // ... and so are its codes: the coverage is that of the lines in the box.
+    let lines = cmap_gap_lines();
+    let codes: u32 = lines.iter().map(|line| line.len() as u32).sum::<u32>() * SHOWINGS as u32;
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes,
+            interpolated: 8 * SHOWINGS as u32,
+            unmapped: 0,
+        }]
+    );
+}
+
 // ============================================================================
 // Image XObject emission
 // ============================================================================

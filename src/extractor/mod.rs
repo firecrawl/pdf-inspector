@@ -21,9 +21,7 @@ mod xobjects;
 
 use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
-use crate::types::{
-    merge_cmap_coverage, CMapCoverageByFont, PageExtraction, PdfLine, PdfRect, TextItem,
-};
+use crate::types::{CMapCoverageByFont, PageExtraction, PdfLine, PdfRect, RunCoverage, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
@@ -414,7 +412,7 @@ pub(crate) fn extract_page_text_items_in_page_box_with_options(
         has_gid_fonts,
         coords_rotated,
         skipped_invisible,
-        _cmap_coverage,
+        _run_coverage,
     ) = extract_page_text_items_with_options(
         doc,
         page_id,
@@ -680,7 +678,7 @@ fn extract_positioned_text_impl(
             has_gid_fonts,
             coords_rotated,
             _skipped_invisible,
-            page_coverage,
+            mut run_coverage,
         ) = match page_result {
             Ok(extraction) => extraction,
             Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
@@ -740,6 +738,11 @@ fn extract_positioned_text_impl(
             if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
                 let before = items.len();
                 items.retain(|it| !outside(it));
+                // The runs left out take their CMap coverage with them.
+                run_coverage.retain(|run| {
+                    let cx = run.x + run.width / 2.0;
+                    cx >= bx0 - TOL && cx <= bx1 + TOL && run.y >= by0 - TOL && run.y <= by1 + TOL
+                });
                 if items.len() < before {
                     debug!(
                         "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
@@ -773,7 +776,9 @@ fn extract_positioned_text_impl(
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
-        merge_cmap_coverage(&mut cmap_coverage, page_coverage);
+        for RunCoverage { font, stats, .. } in run_coverage {
+            cmap_coverage.entry(font).or_default().add(stats);
+        }
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);

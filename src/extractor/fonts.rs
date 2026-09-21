@@ -4,8 +4,8 @@ use super::get_number;
 use crate::glyph_names::glyph_name_to_string;
 use crate::tounicode::{CidDecodeStats, FontCMaps};
 use crate::types::{
-    BaseEncoding, BoldSource, CMapCoverageByFont, FontEncoding, FontEncodingMap, FontWidthInfo,
-    PageFontEncodings, PageFontWidths,
+    BaseEncoding, BoldSource, FontEncoding, FontEncodingMap, FontWidthInfo, PageFontEncodings,
+    PageFontWidths,
 };
 use log::debug;
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -20,9 +20,10 @@ pub(crate) enum CMapChoice {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct CMapDecisionCache {
     decisions: HashMap<u32, CMapDecision>,
-    /// Per font (its `/BaseFont` name, or its resource name without one),
-    /// how the two-byte codes shown through the font's CMap fared.
-    coverage: CMapCoverageByFont,
+    /// The coverage recorded since the walker last took it: the decodes of
+    /// the show operator under way, summed under the font's name (its
+    /// `/BaseFont` name, or its resource name without one).
+    pending_coverage: Option<(String, CidDecodeStats)>,
     /// Depth of [`Self::without_coverage`] calls under way; no coverage is
     /// recorded inside one.
     coverage_off: u32,
@@ -45,20 +46,24 @@ impl CMapDecisionCache {
         self.decisions.get(&obj_num).and_then(|d| d.choice)
     }
 
-    /// Count a decoded string's codes towards `font`'s CMap coverage.
+    /// Count a decoded string's codes towards `font`'s CMap coverage, for
+    /// the walker to attach to the item the string becomes
+    /// ([`Self::take_run_coverage`]).
     pub(crate) fn record_coverage(&mut self, font: &str, stats: CidDecodeStats) {
         if stats.codes == 0 || self.coverage_off > 0 {
             return;
         }
-        self.coverage
-            .entry(font.to_string())
-            .or_default()
-            .add(stats);
+        match &mut self.pending_coverage {
+            Some((_, pending)) => pending.add(stats),
+            pending => *pending = Some((font.to_string(), stats)),
+        }
     }
 
-    /// The coverage counted so far, leaving none behind.
-    pub(crate) fn take_coverage(&mut self) -> CMapCoverageByFont {
-        std::mem::take(&mut self.coverage)
+    /// The coverage recorded since the last take — the show operator's
+    /// decodes, under the font they were read through — leaving none
+    /// behind.
+    pub(crate) fn take_run_coverage(&mut self) -> Option<(String, CidDecodeStats)> {
+        self.pending_coverage.take()
     }
 
     /// Run `read` with coverage recording off. A string's codes are decoded
@@ -2398,6 +2403,21 @@ pub(crate) fn extract_text_from_operand(
                         }
                     }
                     if !decoded.is_empty() {
+                        // Read this way, each byte is a code, and a byte the
+                        // CMap has no entry for reads as nothing; no gap is
+                        // read into it, so nothing is interpolated.
+                        if is_type0_cid_font {
+                            let unmapped =
+                                lookups.iter().filter(|(_, label)| label.is_none()).count();
+                            cmap_decisions.record_coverage(
+                                font_label,
+                                CidDecodeStats {
+                                    codes: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+                                    interpolated: 0,
+                                    unmapped: u32::try_from(unmapped).unwrap_or(u32::MAX),
+                                },
+                            );
+                        }
                         return Some(decoded);
                     }
                 }
@@ -3101,11 +3121,11 @@ mod tests {
     }
 
     /// `bytes` read through a Type0 font whose only CMap is `primary`, with
-    /// the coverage the reading recorded.
+    /// the coverage the reading recorded for the run.
     fn decode_through(
         primary: crate::tounicode::ToUnicodeCMap,
         bytes: Vec<u8>,
-    ) -> (Option<String>, CMapCoverageByFont) {
+    ) -> (Option<String>, Option<(String, CidDecodeStats)>) {
         let mut inline_cmaps = HashMap::new();
         inline_cmaps.insert(
             "F0".to_string(),
@@ -3129,7 +3149,7 @@ mod tests {
             &cid_font_widths(),
         )
         .map(|(text, _)| text);
-        (text, decisions.take_coverage())
+        (text, decisions.take_run_coverage())
     }
 
     #[test]
@@ -3149,12 +3169,15 @@ mod tests {
         let (text, coverage) = decode_through(primary, vec![0, 37, 0, 0x80, 0, 0x81, 0, 0x82]);
         assert_eq!(text.as_deref(), Some("\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"));
         assert_eq!(
-            coverage.get("AAAAAA+Font").copied(),
-            Some(CidDecodeStats {
-                codes: 4,
-                interpolated: 1,
-                unmapped: 3
-            })
+            coverage,
+            Some((
+                "AAAAAA+Font".to_string(),
+                CidDecodeStats {
+                    codes: 4,
+                    interpolated: 1,
+                    unmapped: 3
+                }
+            ))
         );
     }
 
@@ -3171,12 +3194,15 @@ mod tests {
         // codes, not one two-byte code.
         let (_, coverage) = decode_through(primary, vec![0x01, 0x02]);
         assert_eq!(
-            coverage.get("AAAAAA+Font").copied(),
-            Some(CidDecodeStats {
-                codes: 2,
-                interpolated: 0,
-                unmapped: 2
-            })
+            coverage,
+            Some((
+                "AAAAAA+Font".to_string(),
+                CidDecodeStats {
+                    codes: 2,
+                    interpolated: 0,
+                    unmapped: 2
+                }
+            ))
         );
     }
 
@@ -3195,12 +3221,15 @@ mod tests {
         let (text, coverage) = decode_through(primary, vec![0x41, 0x42, 0x43]);
         assert_eq!(text.as_deref(), Some("ABC"));
         assert_eq!(
-            coverage.get("AAAAAA+Font").copied(),
-            Some(CidDecodeStats {
-                codes: 3,
-                interpolated: 0,
-                unmapped: 1
-            })
+            coverage,
+            Some((
+                "AAAAAA+Font".to_string(),
+                CidDecodeStats {
+                    codes: 3,
+                    interpolated: 0,
+                    unmapped: 1
+                }
+            ))
         );
     }
 
@@ -3241,7 +3270,7 @@ mod tests {
         )
         .map(|(text, _)| text);
         assert_eq!(text.as_deref(), Some("Te"));
-        assert!(decisions.take_coverage().is_empty());
+        assert!(decisions.take_run_coverage().is_none());
     }
 
     #[test]
@@ -3253,9 +3282,42 @@ mod tests {
         };
         let mut decisions = CMapDecisionCache::new();
         decisions.without_coverage(|decisions| decisions.record_coverage("F", stats));
-        assert!(decisions.take_coverage().is_empty());
+        assert!(decisions.take_run_coverage().is_none());
         decisions.record_coverage("F", stats);
-        assert_eq!(decisions.take_coverage().get("F").copied(), Some(stats));
+        decisions.record_coverage("F", stats);
+        let mut twice = stats;
+        twice.add(stats);
+        assert_eq!(
+            decisions.take_run_coverage(),
+            Some(("F".to_string(), twice))
+        );
+        assert!(decisions.take_run_coverage().is_none());
+    }
+
+    #[test]
+    fn an_odd_length_string_read_byte_by_byte_through_a_two_byte_cmap_counts_its_bytes() {
+        use crate::tounicode::ToUnicodeCMap;
+        let mut primary = ToUnicodeCMap {
+            code_byte_length: 2,
+            ..Default::default()
+        };
+        primary.char_map.insert(0x41, "A".to_string());
+        primary.refresh_gap_fills();
+        // Three bytes, an odd count for a two-byte CMap, read one byte at a
+        // time: the first has an entry, the other two read as nothing.
+        let (text, coverage) = decode_through(primary, vec![0x41, 0x42, 0x43]);
+        assert_eq!(text.as_deref(), Some("A"));
+        assert_eq!(
+            coverage,
+            Some((
+                "AAAAAA+Font".to_string(),
+                CidDecodeStats {
+                    codes: 3,
+                    interpolated: 0,
+                    unmapped: 2
+                }
+            ))
+        );
     }
 
     #[test]

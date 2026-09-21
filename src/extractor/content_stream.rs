@@ -6,8 +6,8 @@
 use crate::text_utils::{decode_text_string, effective_font_size, expand_ligatures};
 use crate::tounicode::FontCMaps;
 use crate::types::{
-    BoldSource, CMapCoverageByFont, FontWidthInfo, ItemType, PageExtraction, PdfLine, PdfRect,
-    TextItem,
+    attach_run_coverage, BoldSource, FontWidthInfo, ItemCoverage, ItemType, PageExtraction,
+    PdfLine, PdfRect, RunCoverage, TextItem,
 };
 use crate::PdfError;
 use log::trace;
@@ -417,15 +417,17 @@ pub(crate) fn extract_page_text_items(
 }
 
 /// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible,
-/// cmap_coverage)` where `has_gid_fonts` indicates the page uses fonts with
+/// run_coverage)` where `has_gid_fonts` indicates the page uses fonts with
 /// unresolvable gid-encoded glyphs, `page_rotation` says whether (and which
 /// way) the coordinate frame was turned so predominantly rotated text reads
 /// along +x — region boxes must follow it (see `PageRotation`) —
 /// `skipped_invisible` reports that invisible (Tr 3) text was present but
 /// suppressed — callers can use it to decide whether an `include_invisible`
-/// retry could recover anything at all — and `cmap_coverage` counts, per
-/// font, the two-byte codes the page showed through the font's CMap and
-/// how many of them the CMap had no entry for.
+/// retry could recover anything at all — and `run_coverage` gives, per run
+/// of text, the codes the run showed through its font's CMap and how many
+/// of them the CMap had no entry for, with the run's geometry in the
+/// items' frame so a caller that leaves runs out can leave their codes
+/// out too.
 pub(crate) fn extract_page_text_items_with_options(
     doc: &Document,
     page_id: ObjectId,
@@ -434,7 +436,7 @@ pub(crate) fn extract_page_text_items_with_options(
     options: TextExtractionOptions,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
-) -> Result<(PageExtraction, bool, PageRotation, bool, CMapCoverageByFont), PdfError> {
+) -> Result<(PageExtraction, bool, PageRotation, bool, Vec<RunCoverage>), PdfError> {
     let include_invisible = options.include_invisible;
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
@@ -583,7 +585,7 @@ pub(crate) fn extract_page_text_items_with_options(
                 false,
                 PageRotation::Upright,
                 false,
-                CMapCoverageByFont::new(),
+                Vec::new(),
             ));
         }
     };
@@ -609,7 +611,7 @@ pub(crate) fn extract_page_text_items_with_options(
                 false,
                 PageRotation::Upright,
                 false,
-                CMapCoverageByFont::new(),
+                Vec::new(),
             ));
         }
     };
@@ -691,11 +693,18 @@ pub(crate) fn extract_page_text_items_with_options(
 
     let mut clips = super::clip_boundaries::ClipTracker::default();
     let mut item_clips = Vec::new();
+    // The CMap coverage of each item, parallel to `items` like its clip.
+    let mut item_coverage: ItemCoverage = Vec::new();
     let mut shown_clip = None;
     for op in &content.operations {
         // Record all items appended by the preceding operator, including paths
         // that continue the loop early. Forms and ActualText remain unproven.
         item_clips.resize(items.len(), shown_clip);
+        attach_run_coverage(
+            &mut item_coverage,
+            items.len(),
+            cmap_decisions.take_run_coverage(),
+        );
         clips.observe(&op.operator, &op.operands, ctm);
         shown_clip = match op.operator.as_str() {
             "Tj" | "TJ" | "'" => clips.rect(),
@@ -2011,6 +2020,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     )
                                     .append_into(
                                         &mut items,
+                                        &mut item_coverage,
                                         &mut rtl_visual_candidates,
                                         &mut rtl_logical_runs,
                                         &mut rtl_visual_runs,
@@ -2535,6 +2545,11 @@ pub(crate) fn extract_page_text_items_with_options(
     }
 
     item_clips.resize(items.len(), shown_clip);
+    attach_run_coverage(
+        &mut item_coverage,
+        items.len(),
+        cmap_decisions.take_run_coverage(),
+    );
 
     // Decide the storage order of the page's RTL runs while candidate
     // indexes are still valid; merge_text_items below reads visual-order
@@ -2594,6 +2609,7 @@ pub(crate) fn extract_page_text_items_with_options(
         &mut items,
         &mut item_clips,
         &mut replaced_text,
+        &mut item_coverage,
     );
     if dropped > 0 {
         log::debug!("page {page_num}: {dropped} text run(s) painted outside their clip left out");
@@ -2618,6 +2634,22 @@ pub(crate) fn extract_page_text_items_with_options(
     if options.bold_from_weight {
         read_bold_from_weight(&mut items, options.bold_weight_threshold);
     }
+    // The runs' coverage with the geometry the caller's page box test sees,
+    // taken before the merges below join runs into lines.
+    debug_assert_eq!(items.len(), item_coverage.len());
+    let run_coverage: Vec<RunCoverage> = items
+        .iter()
+        .zip(item_coverage.iter())
+        .filter_map(|(item, coverage)| {
+            coverage.as_ref().map(|(font, stats)| RunCoverage {
+                x: item.x,
+                y: item.y,
+                width: item.width,
+                font: font.clone(),
+                stats: *stats,
+            })
+        })
+        .collect();
     let items = if page_rotation == PageRotation::Upright {
         super::merge_text_items_with_clips(items, &item_clips, visual_rtl, &replaced_text)
     } else {
@@ -2631,7 +2663,7 @@ pub(crate) fn extract_page_text_items_with_options(
         has_gid_fonts,
         page_rotation,
         skipped_invisible,
-        cmap_decisions.take_coverage(),
+        run_coverage,
     ))
 }
 

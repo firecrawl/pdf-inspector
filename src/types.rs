@@ -13,16 +13,44 @@ use crate::text_utils::should_join_items;
 pub(crate) type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
 
 /// Per font (its `/BaseFont` name, or its resource name without one), how
-/// the two-byte codes shown through the font's CMap fared: the codes shown,
-/// the ones read from the mapped codes around them and the ones left as
-/// U+FFFD. Ordered by name so documents report their fonts the same way.
+/// the codes shown through the font's CMap fared: the codes shown, the ones
+/// read from the mapped codes around them and the ones left unmapped.
+/// Ordered by name so documents report their fonts the same way.
 pub(crate) type CMapCoverageByFont =
     std::collections::BTreeMap<String, crate::tounicode::CidDecodeStats>;
 
-/// Fold `from`'s per-font coverage into `into`.
-pub(crate) fn merge_cmap_coverage(into: &mut CMapCoverageByFont, from: CMapCoverageByFont) {
-    for (font, stats) in from {
-        into.entry(font).or_default().add(stats);
+/// The CMap coverage of one run of text — one item as a content stream
+/// walker first pushed it — with the geometry the run had once the page's
+/// frame was settled, so a run the page box leaves out takes its codes
+/// with it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RunCoverage {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    /// The font's `/BaseFont` name, or its resource name without one.
+    pub(crate) font: String,
+    pub(crate) stats: crate::tounicode::CidDecodeStats,
+}
+
+/// Per item of a content stream walker, parallel to its items like their
+/// clips: the coverage of the decodes that produced the item. A show
+/// operator's coverage goes to the first item it appended, `None` to the
+/// rest (one TJ array can split into several).
+pub(crate) type ItemCoverage = Vec<Option<(String, crate::tounicode::CidDecodeStats)>>;
+
+/// Attach `pending`, the coverage the last show operator's decodes
+/// recorded, to the first of the items the operator appended, bringing
+/// `item_coverage` up to `items_len` entries; a decode that appended no
+/// item counts nothing.
+pub(crate) fn attach_run_coverage(
+    item_coverage: &mut ItemCoverage,
+    items_len: usize,
+    pending: Option<(String, crate::tounicode::CidDecodeStats)>,
+) {
+    if items_len > item_coverage.len() {
+        item_coverage.push(pending);
+        item_coverage.resize(items_len, None);
     }
 }
 
