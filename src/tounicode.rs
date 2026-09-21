@@ -441,8 +441,11 @@ fn cff_glyph_for_cid(cff: &ttf_parser::cff::Table<'_>, cid: u16) -> Option<u16> 
     (0..cff.number_of_glyphs()).find(|&gid| cff.glyph_cid(ttf_parser::GlyphId(gid)) == Some(cid))
 }
 
-/// The decompressed embedded program (`FontFile2` or `FontFile3`) the
-/// descriptor of `font` names, when it names one that decompresses.
+/// The embedded program (`FontFile2` or `FontFile3`) the descriptor of
+/// `font` names, decompressed — or as the stream holds it when its content
+/// does not decompress, or decompresses to nothing (a filter the decoder
+/// cannot apply, or one declared over bytes that are in fact plain), as
+/// the loaders before this one read it.
 fn font_program(font: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
     let descriptor = match font.get(b"FontDescriptor").ok()? {
         Object::Reference(r) => doc.get_dictionary(*r).ok()?,
@@ -453,7 +456,10 @@ fn font_program(font: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
         .into_iter()
         .find_map(|key| descriptor.get(key).ok().and_then(|o| o.as_reference().ok()))?;
     let stream = doc.get_object(font_file).ok()?.as_stream().ok()?;
-    stream.decompressed_content().ok()
+    Some(match stream.decompressed_content() {
+        Ok(data) if !data.is_empty() => data,
+        _ => stream.content.clone(),
+    })
 }
 
 /// The font's `/Subtype` name.

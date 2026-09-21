@@ -4898,14 +4898,16 @@ mod tests {
     }
 
     /// A page whose only font is the symbolic TrueType `F1` with the given
-    /// ToUnicode `bfchar` lines, embedding `program` and declaring
-    /// `encoding` when given (as an indirect object with
+    /// ToUnicode `bfchar` lines, embedding `program` (in a stream declaring
+    /// `program_filter` when given, the bytes left as they are) and
+    /// declaring `encoding` when given (as an indirect object with
     /// `indirect_encoding`) — the way a subsetter writes a font whose
     /// codes are its glyph indices. Returns the document, the ToUnicode
     /// object number and the page.
     fn simple_font_doc(
         bfchar: &str,
         program: Option<Vec<u8>>,
+        program_filter: Option<&[u8]>,
         encoding: Option<Object>,
         indirect_encoding: bool,
     ) -> (Document, u32, lopdf::ObjectId) {
@@ -4930,10 +4932,12 @@ mod tests {
             "StemV" => 80,
         };
         if let Some(program) = program {
-            let font_file = doc.add_object(Stream::new(
-                dictionary! { "Length1" => program.len() as i64 },
-                program,
-            ));
+            let mut stream =
+                Stream::new(dictionary! { "Length1" => program.len() as i64 }, program);
+            if let Some(filter) = program_filter {
+                stream.dict.set("Filter", Object::Name(filter.to_vec()));
+            }
+            let font_file = doc.add_object(stream);
             descriptor.set("FontFile2", font_file);
         }
         let descriptor_id = doc.add_object(descriptor);
@@ -4978,9 +4982,14 @@ mod tests {
 
     /// A page whose only font is the Type0 `F1` under Identity-H with the
     /// given ToUnicode `bfchar` lines, whose CIDFontType2 descendant embeds
-    /// `program`. Returns the document, the ToUnicode object number and
-    /// the page.
-    fn cid_font_doc(bfchar: &str, program: Vec<u8>) -> (Document, u32, lopdf::ObjectId) {
+    /// `program` (in a stream declaring `program_filter` when given, the
+    /// bytes left as they are). Returns the document, the ToUnicode object
+    /// number and the page.
+    fn cid_font_doc(
+        bfchar: &str,
+        program: Vec<u8>,
+        program_filter: Option<&[u8]>,
+    ) -> (Document, u32, lopdf::ObjectId) {
         use lopdf::Stream;
         let mut doc = Document::with_version("1.5");
         let cmap = format!(
@@ -4992,10 +5001,11 @@ mod tests {
              CMapName currentdict /CMap defineresource pop\nend\nend"
         );
         let tounicode_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
-        let font_file = doc.add_object(Stream::new(
-            dictionary! { "Length1" => program.len() as i64 },
-            program,
-        ));
+        let mut stream = Stream::new(dictionary! { "Length1" => program.len() as i64 }, program);
+        if let Some(filter) = program_filter {
+            stream.dict.set("Filter", Object::Name(filter.to_vec()));
+        }
+        let font_file = doc.add_object(stream);
         let descriptor_id = doc.add_object(dictionary! {
             "Type" => "FontDescriptor",
             "FontName" => "ABCDEF+Subset",
@@ -5057,7 +5067,7 @@ mod tests {
         encoding: Option<Object>,
         bytes: &[u8],
     ) -> String {
-        let (doc, tounicode_obj, page_id) = simple_font_doc(bfchar, program, encoding, false);
+        let (doc, tounicode_obj, page_id) = simple_font_doc(bfchar, program, None, encoding, false);
         decode_page_font_string(&doc, tounicode_obj, page_id, false, bytes)
     }
 
@@ -5111,6 +5121,7 @@ mod tests {
         let (doc, tounicode_obj, page_id) = cid_font_doc(
             "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>",
             sfnt_with_glyph_names(&names),
+            None,
         );
         let cmaps = FontCMaps::from_doc(&doc);
         let entry = cmaps.get_by_obj(tounicode_obj).expect("the font's CMaps");
@@ -5186,6 +5197,104 @@ mod tests {
         );
     }
 
+    /// The program stream of `doc` (the one with a `Length1`), as the
+    /// decoder reads it.
+    fn program_stream_content(doc: &Document) -> lopdf::Result<Vec<u8>> {
+        doc.objects
+            .values()
+            .find_map(|object| {
+                let stream = object.as_stream().ok()?;
+                stream.dict.get(b"Length1").ok()?;
+                Some(stream)
+            })
+            .expect("the program stream")
+            .decompressed_content()
+    }
+
+    /// The program of a stream that does not decompress — one under no
+    /// filter, one under a filter the decoder cannot apply, one declaring a
+    /// filter over bytes that are in fact plain, which the decoder turns
+    /// into nothing — is read as the stream holds it, for the fallback and
+    /// the repair alike: the ligature reads by its glyph name every time,
+    /// in a simple font and through a Type0 font's descendant.
+    #[test]
+    fn a_program_in_a_stream_that_does_not_decompress_is_read_as_it_is() {
+        let mut names = vec![None; 0x25];
+        names[0x23] = Some("f_f");
+        let program = sfnt_with_glyph_names(&names);
+        // No filter at all.
+        let (doc, tounicode_obj, page_id) = simple_font_doc(
+            LIGATURE_INDEX_BFCHAR,
+            Some(program.clone()),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            program_stream_content(&doc).ok().as_deref(),
+            Some(&program[..]),
+            "the unfiltered stream reads as its bytes"
+        );
+        assert_eq!(
+            decode_page_font_string(&doc, tounicode_obj, page_id, false, &LIGATURE_INDEX_BYTES),
+            "coffee"
+        );
+        // A filter the decoder cannot apply.
+        let (doc, tounicode_obj, page_id) = simple_font_doc(
+            LIGATURE_INDEX_BFCHAR,
+            Some(program.clone()),
+            Some(b"DCTDecode"),
+            None,
+            false,
+        );
+        assert!(
+            program_stream_content(&doc).is_err(),
+            "the decoder must reject the filter"
+        );
+        assert_eq!(
+            decode_page_font_string(&doc, tounicode_obj, page_id, false, &LIGATURE_INDEX_BYTES),
+            "coffee"
+        );
+        // A filter declared over plain bytes: the decoder yields nothing.
+        let (doc, tounicode_obj, page_id) = simple_font_doc(
+            LIGATURE_INDEX_BFCHAR,
+            Some(program),
+            Some(b"FlateDecode"),
+            None,
+            false,
+        );
+        assert!(
+            matches!(program_stream_content(&doc), Ok(data) if data.is_empty()),
+            "the decoder must yield nothing for plain bytes"
+        );
+        assert_eq!(
+            decode_page_font_string(&doc, tounicode_obj, page_id, false, &LIGATURE_INDEX_BYTES),
+            "coffee"
+        );
+        // The same through a Type0 font's descendant.
+        let mut names = vec![None; 5];
+        names[3] = Some("f_f");
+        for filter in [&b"DCTDecode"[..], &b"FlateDecode"[..]] {
+            let (doc, tounicode_obj, page_id) = cid_font_doc(
+                "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>",
+                sfnt_with_glyph_names(&names),
+                Some(filter),
+            );
+            assert_eq!(
+                decode_page_font_string(
+                    &doc,
+                    tounicode_obj,
+                    page_id,
+                    true,
+                    &[0, 1, 0, 2, 0, 3, 0, 4, 0, 4]
+                ),
+                "coffee",
+                "{}",
+                String::from_utf8_lossy(filter)
+            );
+        }
+    }
+
     #[test]
     fn a_control_destination_code_reads_through_its_differences_name() {
         let encoding = dictionary! {
@@ -5250,6 +5359,7 @@ mod tests {
         // the same reading as the name written in place.
         let (doc, tounicode_obj, page_id) = simple_font_doc(
             LIGATURE_INDEX_BFCHAR,
+            None,
             None,
             Some(Object::Name(b"WinAnsiEncoding".to_vec())),
             true,
