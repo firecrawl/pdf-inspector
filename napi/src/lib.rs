@@ -109,7 +109,8 @@ pub struct PageOcrReasons {
 pub struct FontCmapGaps {
     /// The font's /BaseFont name, or its resource name when it has none.
     pub font: String,
-    /// Two-byte codes shown through the font's CMap, repeats included.
+    /// Codes shown through the font's CMap, repeats included: two-byte codes,
+    /// or the bytes of a single-byte CMap.
     pub codes: u32,
     /// Codes without an entry that were read from the mapped codes around them.
     pub interpolated: u32,

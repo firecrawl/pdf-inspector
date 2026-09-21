@@ -175,7 +175,7 @@ class PageOcrReasons:                # per-page OCR diagnostics
 
 class FontCMapGaps:                  # what became of a font's codes its ToUnicode CMap (or cmap table) lacks
     font: str                        # /BaseFont name, or the resource name without one
-    codes: int                       # two-byte codes shown through the CMap, repeats included
+    codes: int                       # codes shown through the CMap (two-byte, or the bytes of a single-byte CMap)
     interpolated: int                # read from the mapped codes around them
     unmapped: int                    # could not be read; each is a U+FFFD in the text
 

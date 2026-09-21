@@ -39,7 +39,8 @@ class FontCMapGaps:
     font: str
     """The font's /BaseFont name, or its resource name when it has none."""
     codes: int
-    """Two-byte codes shown through the font's CMap, repeats included."""
+    """Codes shown through the font's CMap, repeats included: two-byte codes,
+    or the bytes of a single-byte CMap."""
     interpolated: int
     """Codes without an entry that were read from the mapped codes around them."""
     unmapped: int

@@ -151,8 +151,8 @@ pub struct PageOcrReasons {
 }
 
 /// A font whose ToUnicode CMap (or, for a font without one, the embedded
-/// program's own cmap table) had no entry for some of the two-byte codes the
-/// document shows through it, and what became of those codes.
+/// program's own cmap table) had no entry for some of the codes the document
+/// shows through it, and what became of those codes.
 ///
 /// A CMap written for some of a font's glyphs but not all of them loses the
 /// others' letters from the text. A code without an entry is read from the
@@ -166,7 +166,8 @@ pub struct PageOcrReasons {
 pub struct FontCMapGaps {
     /// The font's `/BaseFont` name, or its resource name when it has none.
     pub font: String,
-    /// Two-byte codes shown through the font's CMap, repeats included.
+    /// Codes shown through the font's CMap, repeats included: two-byte
+    /// codes, or the bytes of a single-byte CMap.
     pub codes: u32,
     /// Codes without an entry that were read from the mapped codes around
     /// them.

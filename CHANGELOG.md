@@ -15,7 +15,7 @@ Changes since 1.22.1.
 
 - `PdfProcessResult::cmap_gaps`: the fonts whose ToUnicode CMap (or, for a
   font without one, the embedded program's cmap table) had no entry for
-  some of the two-byte codes the document shows through it, each a
+  some of the codes the document shows through it, each a
   `FontCMapGaps` with the font's `/BaseFont` name (or its resource name
   when it has none) and the counts of `codes` shown, `interpolated` (read
   from the mapped codes around them, see below) and `unmapped` (left as

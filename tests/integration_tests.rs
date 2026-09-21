@@ -6091,22 +6091,37 @@ fn test_fully_mapped_tounicode_reports_no_gaps() {
 fn test_word_gap_analysis_does_not_count_a_string_twice() {
     // Three codes shown with a character spacing wide enough for a word gap
     // are decoded once more, one code at a time, by the word-gap analysis
-    // of the string; the coverage counts the string once. J, O and P sit in
-    // the holes of the CMap.
+    // of the string; the coverage counts the string once, and the text —
+    // its spaces included — reads exactly as through the complete CMap.
+    // J, O and P sit in the holes of the CMap.
     let base: [&[u16]; 3] = [&[45, 36, 61], &[51, 50, 47], &[46, 36, 55]];
     let shown = shown_lines(&base);
-    let pdf = make_type0_pdf_with_tounicode_ranges_spaced(&GAPPED_RANGES, &shown, 4.0);
+    let gapped = make_type0_pdf_with_tounicode_ranges_spaced(&GAPPED_RANGES, &shown, 4.0);
+    let full = make_type0_pdf_with_tounicode_ranges_spaced(&FULL_RANGES, &shown, 4.0);
 
-    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
-        .unwrap()
-        .into_iter()
-        .map(|item| item.text.replace(' ', ""))
-        .collect();
-    assert_eq!(text, shown_texts(&["JAZ", "POL", "KAT"]));
+    let texts = |pdf: &[u8]| -> Vec<String> {
+        pdf_inspector::extractor::extract_text_with_positions_mem(pdf)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    };
+    let gapped_texts = texts(&gapped);
+    assert_eq!(gapped_texts, texts(&full));
+    assert_eq!(gapped_texts.len(), 3 * SHOWINGS);
+    for (text, letters) in gapped_texts
+        .iter()
+        .zip(["JAZ", "POL", "KAT"].iter().cycle())
+    {
+        assert_eq!(text.replace(' ', ""), *letters, "{text:?}");
+    }
 
-    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    let gapped_result = pdf_inspector::process_pdf_mem(&gapped).unwrap();
+    let full_result = pdf_inspector::process_pdf_mem(&full).unwrap();
+    assert_eq!(gapped_result.markdown, full_result.markdown);
+    assert!(full_result.cmap_gaps.is_empty());
     assert_eq!(
-        result.cmap_gaps,
+        gapped_result.cmap_gaps,
         vec![pdf_inspector::FontCMapGaps {
             font: "AAAAAA+Subset".to_string(),
             codes: 9 * SHOWINGS as u32,
