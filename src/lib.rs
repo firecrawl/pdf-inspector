@@ -40,6 +40,7 @@ mod form_bbox_repair;
 pub mod glyph_names;
 mod mac_glyph_order;
 pub mod markdown;
+mod overlong_numerals;
 pub mod process_mode;
 pub mod structure_tree;
 pub mod tables;
@@ -412,16 +413,20 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     })
 }
 
-/// The PDF written back out with the zero-area `/BBox` of its Form XObjects
-/// widened, for callers that render the document with their own renderer.
-/// Rust only: the Python, Node.js and WebAssembly bindings do not expose it.
+/// The PDF written back out with the `/BBox` of its Form XObjects repaired
+/// — a zero-area box widened, numerals too large for any parser saturated
+/// — for callers that render the document with their own renderer. Rust
+/// only: the Python, Node.js and WebAssembly bindings do not expose it.
 ///
 /// Some producers write `/BBox [0 0 0 0]` on a form XObject that holds a
-/// page's content. Taken as the clip it declares, the box hides the form
-/// entirely, and a page drawn through it renders blank. pdf-inspector
-/// repairs such forms whenever it loads a document, so its own extraction
-/// and the renderer of its OCR pipeline see the content; a renderer given
-/// the original bytes does not, and can be given these instead.
+/// page's content; taken as the clip it declares, the box hides the form
+/// entirely, and a page drawn through it renders blank. Others write the
+/// box as ±(DBL_MAX / 2) in full, 308-digit numerals no integer parser
+/// holds: the form drops out of the document for one reader and clips to
+/// nothing for another. pdf-inspector repairs both whenever it loads a
+/// document, so its own extraction and the renderer of its OCR pipeline
+/// see the content; a renderer given the original bytes does not, and can
+/// be given these instead.
 ///
 /// Returns `Ok(None)` when no form needs the repair, and for an encrypted
 /// document — whether or not it opens without a password — since a plain
@@ -438,7 +443,7 @@ pub fn widen_degenerate_form_bboxes_mem(buffer: &[u8]) -> Result<Option<Vec<u8>>
         Err(PdfError::Encrypted) => return Ok(None),
         Err(error) => return Err(error),
     };
-    if repairs.widened_form_bboxes == 0 || doc.is_encrypted() || doc.encryption_state.is_some() {
+    if !repairs.repaired_forms() || doc.is_encrypted() || doc.encryption_state.is_some() {
         return Ok(None);
     }
     Ok(form_bbox_repair::serialize_for_rendering(&mut doc))
@@ -787,7 +792,7 @@ fn extract_pages_markdown_mem_impl(
         // A renderer reading the original bytes would clip a repaired form
         // to nothing, so the OCR pipeline renders the repaired document.
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
-        render_bytes: if render_repairs && repairs.widened_form_bboxes > 0 {
+        render_bytes: if render_repairs && repairs.repaired_forms() {
             // A renderer given the original bytes would clip the repaired
             // forms to nothing again, so a copy that cannot be written is
             // an error, not a fallback.
@@ -4142,6 +4147,17 @@ pub(crate) struct LoadRepairs {
     /// Form XObjects whose zero-area `/BBox` was widened
     /// (see `form_bbox_repair`).
     pub(crate) widened_form_bboxes: usize,
+    /// `/BBox` numerals too large for any parser, saturated in the file's
+    /// bytes before it was read (see `overlong_numerals`).
+    pub(crate) saturated_bbox_numerals: usize,
+}
+
+impl LoadRepairs {
+    /// Whether a Form XObject was repaired: a renderer given the original
+    /// bytes would lose it again.
+    pub(crate) fn repaired_forms(&self) -> bool {
+        self.widened_form_bboxes > 0 || self.saturated_bbox_numerals > 0
+    }
 }
 
 /// [`load_document_from_mem_with_password`], also reporting the repairs
@@ -4166,14 +4182,19 @@ pub(crate) fn load_document_from_mem_with_repairs(
     let fixed = structure_tree::fix_bare_struct_names(buffer);
     let buf = fixed.as_ref();
 
-    let doc = match load_document_bytes(buf, password) {
-        Ok(doc) => doc,
+    match load_document_bytes(buf, password) {
+        Ok(doc) => {
+            let (doc, saturated) = reload_after_saturating_bbox_numerals(doc, buf, password);
+            finish_loaded_document(doc, saturated)
+        }
         Err(first_err) => {
             for repaired in repair_pdf_container_candidates(buf) {
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
-                        return finish_loaded_document(doc);
+                        let (doc, saturated) =
+                            reload_after_saturating_bbox_numerals(doc, &repaired, password);
+                        return finish_loaded_document(doc, saturated);
                     }
                     Err(e) => {
                         if is_encrypted_lopdf_error(&e) {
@@ -4182,10 +4203,30 @@ pub(crate) fn load_document_from_mem_with_repairs(
                     }
                 }
             }
-            return Err(first_err.into());
+            Err(first_err.into())
         }
+    }
+}
+
+/// The document loaded again from `bytes` with the `/BBox` numerals of its
+/// unloaded objects saturated (see `overlong_numerals`), when that brings
+/// objects in; otherwise `doc` as it came, and a count of zero.
+fn reload_after_saturating_bbox_numerals(
+    doc: Document,
+    bytes: &[u8],
+    password: Option<&str>,
+) -> (Document, usize) {
+    let Some((rewritten, count)) = overlong_numerals::saturate_overlong_bbox_numerals(bytes, &doc)
+    else {
+        return (doc, 0);
     };
-    finish_loaded_document(doc)
+    match load_document_bytes(&rewritten, password) {
+        Ok(reloaded) if reloaded.objects.len() > doc.objects.len() => {
+            log::debug!("loaded PDF after saturating {count} /BBox numeral(s) no parser holds");
+            (reloaded, count)
+        }
+        _ => (doc, 0),
+    }
 }
 
 /// A loaded document with zero pages is unusable by every caller, and with
@@ -4193,7 +4234,10 @@ pub(crate) fn load_document_from_mem_with_repairs(
 /// an object stream lopdf skipped for exceeding the bound. Fail the load
 /// either way rather than letting a pageless document masquerade as a
 /// successful parse.
-fn finish_loaded_document(mut doc: Document) -> Result<(Document, u32, LoadRepairs), PdfError> {
+fn finish_loaded_document(
+    mut doc: Document,
+    saturated_bbox_numerals: usize,
+) -> Result<(Document, u32, LoadRepairs), PdfError> {
     let page_count = doc.get_pages().len() as u32;
     if page_count == 0 {
         return Err(PdfError::Parse(
@@ -4221,6 +4265,7 @@ fn finish_loaded_document(mut doc: Document) -> Result<(Document, u32, LoadRepai
     }
     let repairs = LoadRepairs {
         widened_form_bboxes: form_bbox_repair::widen_degenerate_form_bboxes(&mut doc),
+        saturated_bbox_numerals,
     };
     Ok((doc, page_count, repairs))
 }

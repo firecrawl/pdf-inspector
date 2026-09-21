@@ -7,6 +7,22 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+Changes since 1.22.1.
+
+### Fixed
+
+- A Form XObject whose `/BBox` holds numerals too large for any parser —
+  a re-save that wraps a page's content in a form writes the box as
+  ±(DBL_MAX / 2) in full, 308-digit integers meaning "unbounded" — no
+  longer drops out of the document: such numerals are saturated, in the
+  file's bytes and in place, to the extent a zero-area box is widened to,
+  before the document is read, so the page's text is extracted and the OCR
+  pipeline renders it. The page came out empty and was routed to OCR, and
+  its render was blank. `widen_degenerate_form_bboxes_mem` hands the
+  repaired bytes to callers that render elsewhere, as for a zero-area box.
+
 ## [1.22.1] - 2026-09-20
 
 Changes since 1.22.0.

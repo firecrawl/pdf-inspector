@@ -7156,6 +7156,64 @@ fn test_form_with_zero_area_bbox_is_extracted_as_a_text_page() {
     assert!(!page.needs_ocr);
 }
 
+/// ±(DBL_MAX / 2) written out in full, as a re-save writes an unbounded
+/// form box: 308-digit numerals no integer parser holds.
+fn unbounded_form_bbox() -> String {
+    let digits = format!("8988465674311578{}", "0".repeat(292));
+    format!("-{digits} -{digits} {digits} {digits}")
+}
+
+/// A Form XObject whose `/BBox` numerals no integer parser holds used to
+/// drop out of the document, and the page drawn through it came out empty
+/// and was routed to OCR. The numerals are saturated in the file's bytes
+/// before it is read, so the page is a text page like any other, and the
+/// repaired bytes hand a renderer a form with a finite box.
+#[test]
+fn test_form_with_overlong_bbox_numerals_is_extracted_as_a_text_page() {
+    let buf = make_pdf_with_form(FORM_PAGE_CONTENT, &unbounded_form_bbox(), FORM_TEXT_CONTENT);
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let title = items
+        .iter()
+        .find(|item| item.text == "Drawn through the form")
+        .unwrap_or_else(|| panic!("{}", joined_text(&items)));
+    assert!((title.x - 72.0).abs() < 0.01 && (title.y - 700.0).abs() < 0.01);
+
+    let result = process_pdf_mem(&buf).unwrap();
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(result.pages_needing_ocr.is_empty(), "{:?}", result);
+    assert!(result
+        .markdown
+        .unwrap()
+        .contains("Second line inside the form"));
+
+    let repaired = widen_degenerate_form_bboxes_mem(&buf)
+        .unwrap()
+        .expect("the numerals are saturated");
+    let doc = lopdf::Document::load_mem(&repaired).unwrap();
+    let bbox: Vec<i64> = doc
+        .objects
+        .values()
+        .find_map(|object| match object {
+            lopdf::Object::Stream(stream)
+                if stream
+                    .dict
+                    .get(b"Subtype")
+                    .ok()
+                    .and_then(|s| s.as_name().ok())
+                    == Some(b"Form") =>
+            {
+                stream.dict.get(b"BBox").ok()
+            }
+            _ => None,
+        })
+        .and_then(|bbox| bbox.as_array().ok())
+        .expect("the form survives the round trip")
+        .iter()
+        .map(|v| v.as_i64().unwrap())
+        .collect();
+    assert_eq!(bbox, vec![-1_000_000, -1_000_000, 1_000_000, 1_000_000]);
+}
+
 /// `widen_degenerate_form_bboxes_mem` hands renderers the repaired
 /// document: the zero-area box is widened, the text extracts the same from
 /// the repaired bytes, and a form with a real box is left alone.

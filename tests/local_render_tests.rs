@@ -156,6 +156,31 @@ fn zero_area_form_bbox_renders_after_the_repair() {
     assert!(dark > 100, "a form with a real box renders as written");
 }
 
+/// A form box written as ±(DBL_MAX / 2) in full — 308-digit numerals — is
+/// saturated to a box that clips nothing, and the repaired bytes render
+/// the form's text where it stands.
+#[test]
+fn overlong_form_bbox_numerals_render_after_the_repair() {
+    let Some(renderer) = load_renderer() else {
+        return;
+    };
+    let digits = format!("8988465674311578{}", "0".repeat(292));
+    let original = page_drawn_through_form(&format!("-{digits} -{digits} {digits} {digits}"));
+    let repaired = pdf_inspector::widen_degenerate_form_bboxes_mem(&original)
+        .unwrap()
+        .expect("the numerals are saturated");
+    let (dark, rows) = rendered_ink(&renderer, &repaired);
+    assert!(
+        dark > 100,
+        "the repaired form paints its text: {dark} dark pixels"
+    );
+    let (top, bottom) = rows.unwrap();
+    assert!(
+        (70..=95).contains(&top) && (85..=100).contains(&bottom),
+        "rows {top}..{bottom}"
+    );
+}
+
 #[test]
 fn rejects_zero_and_out_of_range_page_numbers() {
     let Some(renderer) = load_renderer() else {
