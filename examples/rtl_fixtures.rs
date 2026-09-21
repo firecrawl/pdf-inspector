@@ -13,7 +13,10 @@
 //! the content stream holds every right-to-left word spelled backwards.
 //! One fixture positions every glyph on its own; one shapes Arabic into its
 //! presentation forms and maps the glyphs to those code points, as fonts
-//! subset by glyph do.
+//! subset by glyph do; one shows its word runs in reading order — right to
+//! left across the line, one text object each — the way word processors
+//! hand their runs to a PDF context; and one is an invisible text layer
+//! holding its words in logical order, the convention of OCR layers.
 //!
 //! Regenerate with `cargo run --example rtl_fixtures`. The output is
 //! deterministic (no timestamps, no compression, no document ID).
@@ -348,6 +351,16 @@ enum Painting {
     /// Every glyph positioned by its own `Tm`, with the small rounding
     /// jitter producers leave in their coordinates.
     GlyphByGlyph,
+    /// The runs of `WordRuns`, each shown by its own text object, in reading
+    /// order: right to left across a right-to-left line, the way word
+    /// processors hand their runs to a PDF context. Each run's glyphs stay
+    /// in visual order with forward advances.
+    WordRunsInReadingOrder,
+    /// One show operator per word holding the word's glyphs in logical
+    /// (reading) order with forward advances, positioned at the word's place
+    /// on the line, in reading order, as invisible text (render mode 3): the
+    /// convention of OCR text layers, whose glyphs are never displayed.
+    InvisibleLogicalWords,
 }
 
 /// A painted glyph: its font, code, advance and the pen position it was
@@ -470,36 +483,75 @@ fn lay_out(fixture: &Fixture, hebrew: &EmbeddedFont, arabic: &EmbeddedFont) -> L
             FontUse::Latin => "FL",
         };
 
-        content.push_str("BT\n");
+        // A run: consecutive glyphs of one font with no word space between
+        // them — a word, or a Latin phrase.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < glyphs.len() {
+            let font = glyphs[i].font;
+            let mut j = i + 1;
+            while j < glyphs.len()
+                && glyphs[j].font == font
+                && (glyphs[j].x - (glyphs[j - 1].x + glyphs[j - 1].advance)).abs() < 0.01
+            {
+                j += 1;
+            }
+            runs.push((i, j));
+            i = j;
+        }
+        // The runs in reading order: right to left across a right-to-left
+        // line.
+        let mut reading_order = runs.clone();
+        if line.rtl_base {
+            reading_order.reverse();
+        }
+        let show_run = |content: &mut String, first: &PaintedGlyph, codes: &[u8]| {
+            writeln!(
+                content,
+                "/{} {} Tf 1 0 0 1 {:.2} {:.2} Tm <{}> Tj",
+                resource(first.font),
+                line.size,
+                x0 + first.x,
+                y,
+                hex(codes)
+            )
+            .unwrap();
+        };
         match fixture.painting {
             Painting::WordRuns => {
-                // A run: consecutive glyphs of one font with no word space
-                // between them.
-                let mut i = 0;
-                while i < glyphs.len() {
-                    let font = glyphs[i].font;
-                    let mut j = i + 1;
-                    while j < glyphs.len()
-                        && glyphs[j].font == font
-                        && (glyphs[j].x - (glyphs[j - 1].x + glyphs[j - 1].advance)).abs() < 0.01
-                    {
-                        j += 1;
-                    }
+                content.push_str("BT\n");
+                for &(i, j) in &runs {
                     let codes: Vec<u8> = glyphs[i..j].iter().flat_map(code_of).collect();
-                    writeln!(
-                        content,
-                        "/{} {} Tf 1 0 0 1 {:.2} {:.2} Tm <{}> Tj",
-                        resource(font),
-                        line.size,
-                        x0 + glyphs[i].x,
-                        y,
-                        hex(&codes)
-                    )
-                    .unwrap();
-                    i = j;
+                    show_run(&mut content, &glyphs[i], &codes);
+                }
+                content.push_str("ET\n");
+            }
+            Painting::WordRunsInReadingOrder => {
+                for &(i, j) in &reading_order {
+                    let codes: Vec<u8> = glyphs[i..j].iter().flat_map(code_of).collect();
+                    content.push_str("BT\n");
+                    show_run(&mut content, &glyphs[i], &codes);
+                    content.push_str("ET\n");
                 }
             }
+            Painting::InvisibleLogicalWords => {
+                // A right-to-left run's glyphs in reading order are its
+                // display order turned round; a Latin run is already read
+                // left to right.
+                content.push_str("BT\n3 Tr\n");
+                for &(i, j) in &reading_order {
+                    let run = &glyphs[i..j];
+                    let codes: Vec<u8> = if run[0].font == FontUse::Latin {
+                        run.iter().flat_map(code_of).collect()
+                    } else {
+                        run.iter().rev().flat_map(code_of).collect()
+                    };
+                    show_run(&mut content, &glyphs[i], &codes);
+                }
+                content.push_str("ET\n");
+            }
             Painting::GlyphByGlyph => {
+                content.push_str("BT\n");
                 for (k, glyph) in glyphs.iter().enumerate() {
                     let jitter = [0.0, 0.02, -0.02][k % 3];
                     writeln!(
@@ -513,9 +565,9 @@ fn lay_out(fixture: &Fixture, hebrew: &EmbeddedFont, arabic: &EmbeddedFont) -> L
                     )
                     .unwrap();
                 }
+                content.push_str("ET\n");
             }
         }
-        content.push_str("ET\n");
         y -= LEADING + (line.size - BODY_SIZE);
     }
     Layout {
@@ -695,28 +747,10 @@ fn write_fixture(fixture: &Fixture, hebrew: &EmbeddedFont, arabic: &EmbeddedFont
     }
 }
 
-fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let fonts = root.join("tests/fixtures/fonts");
-    let hebrew = EmbeddedFont::load(
-        "FH",
-        "NotoSansHebrew-Regular",
-        &fonts.join("NotoSansHebrew-Regular.subset.ttf"),
-    );
-    let arabic = EmbeddedFont::load(
-        "FA",
-        "NotoSansArabic-Regular",
-        &fonts.join("NotoSansArabic-Regular.subset.ttf"),
-    );
-
-    let fixtures = [
-        Fixture {
-            file: "rtl_hebrew_visual_words.pdf",
-            title: "Hebrew text stored in visual order, one run per word",
-            painting: Painting::WordRuns,
-            presentation_forms: false,
-            declared_width_scale: 1.0,
-            lines: vec![
+/// The lines of the Hebrew report page, shared by the fixtures that store
+/// them in visual order.
+fn hebrew_report_lines() -> Vec<Line> {
+    vec![
                 // דוח שנתי 2024
                 Line::heading("\u{05D3}\u{05D5}\u{05D7} \u{05E9}\u{05E0}\u{05EA}\u{05D9} 2024"),
                 // מספר העובדים גדל ב-12% לעומת השנה הקודמת.
@@ -750,6 +784,62 @@ fn main() {
                     "\u{05D4}\u{05D9}\u{05D9}\u{05E9}\u{05D5}\u{05DD} \u{05D9}\u{05D7}\u{05DC} \
                      \u{05D1}\u{05EA}\u{05D7}\u{05D9}\u{05DC}\u{05EA} \u{05D4}\u{05E9}\u{05E0}\u{05D4} \
                      \u{05D4}\u{05D1}\u{05D0}\u{05D4}.",
+                ),
+    ]
+}
+
+fn main() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fonts = root.join("tests/fixtures/fonts");
+    let hebrew = EmbeddedFont::load(
+        "FH",
+        "NotoSansHebrew-Regular",
+        &fonts.join("NotoSansHebrew-Regular.subset.ttf"),
+    );
+    let arabic = EmbeddedFont::load(
+        "FA",
+        "NotoSansArabic-Regular",
+        &fonts.join("NotoSansArabic-Regular.subset.ttf"),
+    );
+
+    let fixtures = [
+        Fixture {
+            file: "rtl_hebrew_visual_words.pdf",
+            title: "Hebrew text stored in visual order, one run per word",
+            painting: Painting::WordRuns,
+            presentation_forms: false,
+            declared_width_scale: 1.0,
+            lines: hebrew_report_lines(),
+        },
+        Fixture {
+            file: "rtl_hebrew_visual_words_in_reading_order.pdf",
+            title: "Hebrew text stored in visual order, one text object per word, shown in reading order",
+            painting: Painting::WordRunsInReadingOrder,
+            presentation_forms: false,
+            declared_width_scale: 1.0,
+            lines: hebrew_report_lines(),
+        },
+        Fixture {
+            file: "rtl_hebrew_invisible_logical_words.pdf",
+            title: "Hebrew text in logical order shown as an invisible text layer, one word per show operator",
+            painting: Painting::InvisibleLogicalWords,
+            presentation_forms: false,
+            declared_width_scale: 1.0,
+            lines: vec![
+                // הספרייה פתוחה בכל ימות השבוע
+                Line::rtl(
+                    "\u{05D4}\u{05E1}\u{05E4}\u{05E8}\u{05D9}\u{05D9}\u{05D4} \u{05E4}\u{05EA}\u{05D5}\u{05D7}\u{05D4} \
+                     \u{05D1}\u{05DB}\u{05DC} \u{05D9}\u{05DE}\u{05D5}\u{05EA} \u{05D4}\u{05E9}\u{05D1}\u{05D5}\u{05E2}",
+                ),
+                // הקוראים מוזמנים להשאיל ספרים
+                Line::rtl(
+                    "\u{05D4}\u{05E7}\u{05D5}\u{05E8}\u{05D0}\u{05D9}\u{05DD} \u{05DE}\u{05D5}\u{05D6}\u{05DE}\u{05E0}\u{05D9}\u{05DD} \
+                     \u{05DC}\u{05D4}\u{05E9}\u{05D0}\u{05D9}\u{05DC} \u{05E1}\u{05E4}\u{05E8}\u{05D9}\u{05DD}",
+                ),
+                // ההרשמה נעשית בדלפק הכניסה
+                Line::rtl(
+                    "\u{05D4}\u{05D4}\u{05E8}\u{05E9}\u{05DE}\u{05D4} \u{05E0}\u{05E2}\u{05E9}\u{05D9}\u{05EA} \
+                     \u{05D1}\u{05D3}\u{05DC}\u{05E4}\u{05E7} \u{05D4}\u{05DB}\u{05E0}\u{05D9}\u{05E1}\u{05D4}",
                 ),
             ],
         },

@@ -622,6 +622,30 @@ pub(crate) fn is_visual_rtl_candidate(text: &str) -> bool {
     })
 }
 
+/// A decoded show-op string that is evidence of visual storage on its own
+/// when it is painted forwards and seen: a run of two or more right-to-left
+/// letters shown with forward advances displays its letters in the order
+/// they are stored, so a run meant to be read can only be stored in visual
+/// order. A single letter reads the same either way. An invisible run — the
+/// convention of OCR text layers, which store their words in logical order
+/// — displays nothing and proves nothing; see [`render_mode_paints`].
+pub(crate) fn is_visual_rtl_run(text: &str) -> bool {
+    text.chars()
+        .filter(|&c| {
+            c.is_alphabetic()
+                && !unicode_normalization::char::is_combining_mark(c)
+                && is_rtl_char(c)
+        })
+        .nth(1)
+        .is_some()
+}
+
+/// Whether a text render mode puts glyphs on the page: modes 3 and 7 paint
+/// nothing (invisible text, clipping only).
+pub(crate) fn render_mode_paints(mode: i32) -> bool {
+    !matches!(mode, 3 | 7)
+}
+
 /// Whether a page's right-to-left runs are stored in visual (screen
 /// left-to-right) order.
 ///
@@ -634,7 +658,16 @@ pub(crate) fn is_visual_rtl_candidate(text: &str) -> bool {
 /// left-to-right along a shared baseline vote for visual storage,
 /// right-to-left emission votes for logical storage. `logical_ops` carries
 /// extra logical votes observed during parsing — show ops whose internal
-/// glyph progression already walks right-to-left.
+/// glyph progression already walks right-to-left — and `visual_ops` extra
+/// visual votes: visible runs of several RTL letters painted forwards
+/// ([`is_visual_rtl_run`]), which display their letters in stored order and
+/// so can only be visual storage when they are meant to be read. They
+/// decide the case the walk alone gets wrong: a producer that shows its
+/// runs in reading order — right to left across the line, one text object
+/// each — with every run's glyphs stored in visual order. The walk of such
+/// a page reads as logical storage, and every word would come out
+/// backwards. A logical-order layer keeps its reading when it is invisible,
+/// as OCR text layers are.
 ///
 /// Votes are pooled per page deliberately: a page is written by one
 /// producer, so its storage convention is uniform, while individual lines
@@ -642,11 +675,16 @@ pub(crate) fn is_visual_rtl_candidate(text: &str) -> bool {
 /// vote-less single-run case — read as visual: RTL text painted with
 /// forward advances renders correctly only when stored in visual order, so
 /// visual storage is the dominant convention.
-fn stored_in_visual_order(items: &[TextItem], candidates: &[usize], logical_ops: u32) -> bool {
+fn stored_in_visual_order(
+    items: &[TextItem],
+    candidates: &[usize],
+    logical_ops: u32,
+    visual_ops: u32,
+) -> bool {
     if candidates.is_empty() {
         return false;
     }
-    let mut rightward = 0u32;
+    let mut rightward = visual_ops;
     let mut leftward = logical_ops;
     for pair in candidates.windows(2) {
         let (a, b) = (&items[pair[0]], &items[pair[1]]);
@@ -679,10 +717,11 @@ pub(crate) fn fix_visual_order_rtl(
     items: &mut [TextItem],
     candidates: &[usize],
     logical_ops: u32,
+    visual_ops: u32,
     logical_text_items: &[usize],
 ) -> bool {
     let page_rtl = is_rtl_text(items.iter().map(|i| &i.text));
-    if !stored_in_visual_order(items, candidates, logical_ops) {
+    if !stored_in_visual_order(items, candidates, logical_ops, visual_ops) {
         // Runs of shaped glyphs — presentation forms — come out of a
         // shaping engine in display order whatever order the runs are
         // shown in. A page that shows its words in reading order still
@@ -1604,7 +1643,7 @@ mod tests {
             make_rtl_item("\u{05DD}\u{05DC}\u{05D5}\u{05E2}", 100.0, 700.0), // visual עולם
             make_rtl_item("\u{05DD}\u{05D5}\u{05DC}\u{05E9}", 160.0, 700.0), // visual שלום
         ];
-        assert!(fix_visual_order_rtl(&mut items, &[0, 1], 0, &[]));
+        assert!(fix_visual_order_rtl(&mut items, &[0, 1], 0, 0, &[]));
         // The items themselves are left for the merge to read.
         assert_eq!(items[0].text, "\u{05DD}\u{05DC}\u{05D5}\u{05E2}");
     }
@@ -1616,7 +1655,35 @@ mod tests {
             make_rtl_item("\u{05E9}\u{05DC}\u{05D5}\u{05DD}", 160.0, 700.0),
             make_rtl_item("\u{05E2}\u{05D5}\u{05DC}\u{05DD}", 100.0, 700.0),
         ];
-        assert!(!fix_visual_order_rtl(&mut items, &[0, 1], 0, &[]));
+        assert!(!fix_visual_order_rtl(&mut items, &[0, 1], 0, 0, &[]));
+    }
+
+    #[test]
+    fn visible_runs_painted_forwards_outvote_a_leftward_walk() {
+        // Words shown in reading order, right to left across the line, each
+        // holding its glyphs in visual order with forward advances: the walk
+        // alone reads as logical storage, but a visible run of several
+        // letters painted forwards can only be visual storage.
+        let mut items = vec![
+            make_rtl_item("\u{05DD}\u{05D5}\u{05DC}\u{05E9}", 160.0, 700.0), // visual שלום
+            make_rtl_item("\u{05DD}\u{05DC}\u{05D5}\u{05E2}", 100.0, 700.0), // visual עולם
+        ];
+        assert!(fix_visual_order_rtl(&mut items, &[0, 1], 0, 2, &[]));
+        // The same walk of an invisible text layer, whose runs display
+        // nothing and cast no visual vote, still reads as logical storage.
+        assert!(!fix_visual_order_rtl(&mut items, &[0, 1], 0, 0, &[]));
+    }
+
+    #[test]
+    fn a_visual_rtl_run_holds_two_letters() {
+        assert!(is_visual_rtl_run("\u{05E9}\u{05DC}"));
+        assert!(is_visual_rtl_run("see \u{05E9}\u{05DC}\u{05D5}\u{05DD} 12"));
+        // One letter reads the same either way; digits and marks are not letters.
+        assert!(!is_visual_rtl_run("\u{05E9}"));
+        assert!(!is_visual_rtl_run("\u{0661}\u{0662}"));
+        assert!(!is_visual_rtl_run("\u{05E9}\u{05B0}"));
+        assert!(render_mode_paints(0) && render_mode_paints(2) && render_mode_paints(4));
+        assert!(!render_mode_paints(3) && !render_mode_paints(7));
     }
 
     #[test]
@@ -1628,9 +1695,9 @@ mod tests {
             100.0,
             700.0,
         )];
-        assert!(fix_visual_order_rtl(&mut items, &[0], 0, &[]));
+        assert!(fix_visual_order_rtl(&mut items, &[0], 0, 0, &[]));
         // No candidate at all: nothing to decide.
-        assert!(!fix_visual_order_rtl(&mut items, &[], 0, &[]));
+        assert!(!fix_visual_order_rtl(&mut items, &[], 0, 0, &[]));
     }
 
     #[test]
@@ -1641,7 +1708,7 @@ mod tests {
             make_rtl_item(logical, 100.0, 700.0),
             make_rtl_item(logical, 160.0, 700.0),
         ];
-        assert!(!fix_visual_order_rtl(&mut items, &[0, 1], 2, &[]));
+        assert!(!fix_visual_order_rtl(&mut items, &[0, 1], 2, 0, &[]));
     }
 
     #[test]
@@ -1652,7 +1719,7 @@ mod tests {
             make_rtl_item("\u{05D1}\u{05D0}", 160.0, 700.0),
             make_rtl_item("\u{05D3}\u{05D2}", 100.0, 650.0),
         ];
-        assert!(fix_visual_order_rtl(&mut items, &[0, 1], 0, &[]));
+        assert!(fix_visual_order_rtl(&mut items, &[0, 1], 0, 0, &[]));
     }
 
     #[test]
@@ -1666,9 +1733,9 @@ mod tests {
             make_rtl_item("\u{05DC}", 112.0, 700.0),
             make_rtl_item("\u{05E9}", 118.0, 700.0),
         ];
-        assert!(fix_visual_order_rtl(&mut items, &[0, 1, 2, 3], 0, &[]));
+        assert!(fix_visual_order_rtl(&mut items, &[0, 1, 2, 3], 0, 0, &[]));
         items.reverse();
-        assert!(!fix_visual_order_rtl(&mut items, &[0, 1, 2, 3], 0, &[]));
+        assert!(!fix_visual_order_rtl(&mut items, &[0, 1, 2, 3], 0, 0, &[]));
     }
 
     #[test]
@@ -1681,7 +1748,7 @@ mod tests {
             make_rtl_item("\u{FEE6}\u{FEFB}", 160.0, 700.0), // لان displayed: noon-final, lam-alef
             make_rtl_item("\u{FEF3}\u{FEE1}", 100.0, 700.0), // مي displayed: yeh-initial, meem-medial
         ];
-        assert!(!fix_visual_order_rtl(&mut items, &[0, 1], 0, &[]));
+        assert!(!fix_visual_order_rtl(&mut items, &[0, 1], 0, 0, &[]));
         assert_eq!(items[0].text, "\u{FEFB}\u{FEE6}");
         assert_eq!(items[1].text, "\u{FEE1}\u{FEF3}");
     }
@@ -1695,7 +1762,7 @@ mod tests {
             make_rtl_item("\u{05DD}\u{05DC}\u{05D5}\u{05E2}", 100.0, 700.0),
             make_rtl_item("\u{05E9}\u{05DC}\u{05D5}\u{05DD} 12", 160.0, 700.0),
         ];
-        assert!(fix_visual_order_rtl(&mut items, &[0], 0, &[1]));
+        assert!(fix_visual_order_rtl(&mut items, &[0], 0, 0, &[1]));
         assert_eq!(items[1].text, "12 \u{05DD}\u{05D5}\u{05DC}\u{05E9}");
     }
 

@@ -26,6 +26,19 @@ Changes since 1.22.1.
   (the Python, Node and WebAssembly bindings do not expose it) hands the
   repaired bytes to callers that render elsewhere, as for a zero-area box.
 
+- Right-to-left text whose runs are shown in reading order — right to left
+  across the line, one text object per run — while each run's glyphs are
+  stored in visual order with forward advances now reads forwards; every
+  word of such a page came out backwards. The page's storage vote counts
+  each visible run of two or more right-to-left letters painted forwards as
+  visual storage, since a run meant to be read can only display correctly
+  when stored that way, so the order of the runs across the line no longer
+  reads as logical storage on its own. A text layer that stores its words in
+  logical order keeps that reading when it is invisible (text render mode
+  3), the convention of OCR layers; the same words shown visibly would
+  display backwards, and such a page now reads as visual storage like any
+  other visible page.
+
 ## [1.22.1] - 2026-09-20
 
 Changes since 1.22.0.

@@ -196,6 +196,9 @@ pub(crate) struct ExtractedText {
     pub(crate) items: Vec<TextItem>,
     pub(crate) rtl_visual_candidates: Vec<usize>,
     pub(crate) rtl_logical_ops: u32,
+    /// Visible show ops of several RTL letters painted forwards (see
+    /// `is_visual_rtl_run`): visual-storage votes.
+    pub(crate) rtl_visual_ops: u32,
     /// Baseline angle of every text-producing show operator, in stream
     /// order: this form's share of the page-rotation vote. Per operator,
     /// not per item — one TJ array can split into several items.
@@ -212,6 +215,7 @@ impl ExtractedText {
             items: Vec::new(),
             rtl_visual_candidates: Vec::new(),
             rtl_logical_ops: 0,
+            rtl_visual_ops: 0,
             run_rotations: Vec::new(),
             skipped_invisible: false,
         }
@@ -226,12 +230,14 @@ impl ExtractedText {
         items: &mut Vec<TextItem>,
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_ops: &mut u32,
+        rtl_visual_ops: &mut u32,
         run_rotations: &mut Vec<f32>,
         skipped_invisible: &mut bool,
     ) {
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         *rtl_logical_ops += self.rtl_logical_ops;
+        *rtl_visual_ops += self.rtl_visual_ops;
         run_rotations.extend(self.run_rotations);
         *skipped_invisible |= self.skipped_invisible;
         items.extend(self.items);
@@ -339,6 +345,7 @@ fn extract_form_xobject_text_inner(
     let items = &mut extracted.items;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_ops = &mut extracted.rtl_logical_ops;
+    let rtl_visual_ops = &mut extracted.rtl_visual_ops;
     let run_rotations = &mut extracted.run_rotations;
     let skipped_invisible = &mut extracted.skipped_invisible;
 
@@ -566,6 +573,7 @@ fn extract_form_xobject_text_inner(
                                         items,
                                         rtl_visual_candidates,
                                         rtl_logical_ops,
+                                        rtl_visual_ops,
                                         run_rotations,
                                         skipped_invisible,
                                     );
@@ -882,6 +890,14 @@ fn extract_form_xobject_text_inner(
                             {
                                 if combined[0] * horizontal_scale > 0.0 {
                                     rtl_visual_candidates.push(items.len());
+                                    if !fill_is_white
+                                        && crate::text_utils::render_mode_paints(
+                                            text_rendering_mode,
+                                        )
+                                        && crate::text_utils::is_visual_rtl_run(&text)
+                                    {
+                                        *rtl_visual_ops += 1;
+                                    }
                                 } else {
                                     *rtl_logical_ops += 1;
                                 }
@@ -1325,6 +1341,14 @@ fn extract_form_xobject_text_inner(
                                         }
                                     } else {
                                         rtl_visual_candidates.push(items.len());
+                                        if !hidden
+                                            && crate::text_utils::render_mode_paints(
+                                                text_rendering_mode,
+                                            )
+                                            && crate::text_utils::is_visual_rtl_run(text)
+                                        {
+                                            *rtl_visual_ops += 1;
+                                        }
                                     }
                                 }
                                 if let Some(pending) = pending_space.take() {

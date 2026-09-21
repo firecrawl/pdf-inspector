@@ -439,6 +439,7 @@ pub(crate) fn extract_page_text_items_with_options(
     // evidence of logical-order storage.
     let mut rtl_visual_candidates: Vec<usize> = Vec::new();
     let mut rtl_logical_ops: u32 = 0;
+    let mut rtl_visual_ops: u32 = 0;
     // Items whose text is logical whatever the page's storage order:
     // ActualText replacements.
     let mut logical_text_items: Vec<usize> = Vec::new();
@@ -1005,6 +1006,12 @@ pub(crate) fn extract_page_text_items_with_options(
                                 if combined[0].abs() > combined[1].abs() {
                                     if combined[0] * horizontal_scale > 0.0 {
                                         rtl_visual_candidates.push(items.len());
+                                        if crate::text_utils::render_mode_paints(
+                                            text_rendering_mode,
+                                        ) && crate::text_utils::is_visual_rtl_run(&text)
+                                        {
+                                            rtl_visual_ops += 1;
+                                        }
                                     } else {
                                         rtl_logical_ops += 1;
                                     }
@@ -1520,6 +1527,12 @@ pub(crate) fn extract_page_text_items_with_options(
                                         }
                                     } else {
                                         rtl_visual_candidates.push(items.len());
+                                        if crate::text_utils::render_mode_paints(
+                                            text_rendering_mode,
+                                        ) && crate::text_utils::is_visual_rtl_run(text)
+                                        {
+                                            rtl_visual_ops += 1;
+                                        }
                                     }
                                 }
                                 if let Some(pending) = pending_space.take() {
@@ -1745,6 +1758,11 @@ pub(crate) fn extract_page_text_items_with_options(
                             {
                                 if combined[0] * horizontal_scale > 0.0 {
                                     rtl_visual_candidates.push(items.len());
+                                    if crate::text_utils::render_mode_paints(text_rendering_mode)
+                                        && crate::text_utils::is_visual_rtl_run(&text)
+                                    {
+                                        rtl_visual_ops += 1;
+                                    }
                                 } else {
                                     rtl_logical_ops += 1;
                                 }
@@ -1896,6 +1914,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         &mut items,
                                         &mut rtl_visual_candidates,
                                         &mut rtl_logical_ops,
+                                        &mut rtl_visual_ops,
                                         &mut form_runs,
                                         &mut skipped_invisible,
                                     );
@@ -2425,6 +2444,7 @@ pub(crate) fn extract_page_text_items_with_options(
         &mut items,
         &rtl_visual_candidates,
         rtl_logical_ops,
+        rtl_visual_ops,
         &logical_text_items,
     );
 
@@ -3352,7 +3372,13 @@ BT 30 700 Tm <41> Tj ET";
     /// שלום letters (41→ש 42→ל 43→ו 44→ם) via ToUnicode, run extraction, and
     /// return the items.
     fn extract_hebrew_items(content: &[u8]) -> Vec<TextItem> {
-        extract_items_with_cmap(content, HEBREW_CMAP)
+        extract_hebrew_items_with(content, false)
+    }
+
+    /// `extract_hebrew_items` with invisible (render mode 3) text included,
+    /// as the invisible-layer retry reads it.
+    fn extract_hebrew_items_with(content: &[u8], include_invisible: bool) -> Vec<TextItem> {
+        extract_items_with_cmap(content, HEBREW_CMAP, include_invisible)
     }
 
     const HEBREW_CMAP: &[u8] = br#"/CIDInit /ProcSet findresource begin
@@ -3377,7 +3403,11 @@ end"#;
 
     /// A page with `F1`, a TrueType font WITHOUT width metrics whose
     /// ToUnicode is `cmap`, and `F2`, a measured 600-unit Helvetica.
-    fn extract_items_with_cmap(content: &[u8], cmap: &[u8]) -> Vec<TextItem> {
+    fn extract_items_with_cmap(
+        content: &[u8],
+        cmap: &[u8],
+        include_invisible: bool,
+    ) -> Vec<TextItem> {
         use crate::tounicode::FontCMaps;
         use lopdf::{dictionary, Object, Stream};
 
@@ -3430,7 +3460,7 @@ end"#;
             page_id,
             1,
             &font_cmaps,
-            false,
+            include_invisible,
             &mut FontStyleCache::new(),
             &mut FormWalkBudget::new(),
         )
@@ -3465,17 +3495,34 @@ end"#;
     }
 
     #[test]
-    fn logical_order_hebrew_ops_stay_logical() {
-        // Two show ops positioned right-to-left, each already in reading
-        // order — the OCR-text-layer convention. Must NOT be reversed.
-        let content = b"BT /F1 12 Tf 160 700 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
-        let items = extract_hebrew_items(content);
+    fn invisible_logical_order_hebrew_ops_stay_logical() {
+        // Two invisible show ops positioned right-to-left, each already in
+        // reading order — the OCR-text-layer convention, read with the
+        // invisible layer included. Their runs display nothing and cast no
+        // visual-storage vote: they must NOT be reversed.
+        let content = b"BT 3 Tr /F1 12 Tf 160 700 Tm <41424344> Tj -60 0 Td <41424344> Tj ET";
+        let items = extract_hebrew_items_with(content, true);
         assert_eq!(items.len(), 2);
         for item in &items {
             assert_eq!(
                 item.text, SHALOM_LOGICAL,
                 "logical run must not be reversed"
             );
+        }
+    }
+
+    #[test]
+    fn visual_order_hebrew_ops_shown_in_reading_order_are_reversed() {
+        // Two visible show ops positioned right-to-left — shown in reading
+        // order — each holding the visual (reversed) string painted
+        // forwards: the walk alone would read as logical storage, but a
+        // visible run of several letters painted forwards can only be
+        // visual storage, so each run is reversed.
+        let content = b"BT /F1 12 Tf 160 700 Tm <44434241> Tj -60 0 Td <44434241> Tj ET";
+        let items = extract_hebrew_items(content);
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(item.text, SHALOM_LOGICAL, "visual run must be reversed");
         }
     }
 
@@ -3511,7 +3558,8 @@ endcmap
 CMapName currentdict /CMap defineresource pop
 end
 end"#;
-        let items = extract_items_with_cmap(b"BT /F1 12 Tf 100 700 Td <45> Tj ET", LIGATURE_CMAP);
+        let items =
+            extract_items_with_cmap(b"BT /F1 12 Tf 100 700 Td <45> Tj ET", LIGATURE_CMAP, false);
         assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!(items[0].text, "fi");
         assert!(!items[0].advance_known);
@@ -3610,6 +3658,7 @@ end"#;
         let items = extract_items_with_cmap(
             b"BT /F1 12 Tf 2 Tc 5 Tw 100 700 Td <412042> Tj <43> Tj ET",
             LATIN_CMAP,
+            false,
         );
         assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!(items[0].text, "A BC");
@@ -4756,6 +4805,7 @@ end"#;
         let items = extract_items_with_cmap(
             b"BT /F1 10 Tf 72 700 Td 3 Tc <4142> Tj 0 Tc 10 0 Td <41> Tj ET",
             HAN_CMAP,
+            false,
         );
         assert_eq!(items[0].text, "\u{4E2D}\u{6587}", "{items:?}");
         assert!(items.iter().all(|i| !i.text.contains(' ')), "{items:?}");
