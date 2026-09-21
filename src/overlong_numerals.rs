@@ -11,8 +11,10 @@
 //!
 //! The repair is byte-level and offset-preserving. For each object the
 //! cross-reference table lists but the loaded document lacks, the object's
-//! dictionary is read with comments and strings masked out; when it is a
-//! Form XObject (`/Subtype /Form`), the numerals of its `/BBox` array that
+//! dictionary is read with comments and strings masked out, its keys taken
+//! at the dictionary's own level (a pattern's box inside the form's
+//! `/Resources` is not the form's); when it is a Form XObject
+//! (`/Subtype /Form`), the numerals of its `/BBox` array that
 //! do not fit an `i64` are replaced, in place and padded to their own
 //! length, by the extent a zero-area box is widened to (see
 //! `form_bbox_repair`) — in the dictionary itself, or in the array object a
@@ -482,7 +484,7 @@ fn array_range(masked: &[u8], from: usize) -> Option<Range<usize>> {
 /// ([`subtype_is_form`]).
 fn names_form(masked: &[u8], dict: Range<usize>, doc: &Document) -> bool {
     let mut pos = dict.start;
-    while let Some(rel) = find_name(&masked[pos..dict.end], b"/Subtype") {
+    while let Some(rel) = find_key(&masked[pos..dict.end], b"/Subtype") {
         let after = pos + rel + b"/Subtype".len();
         let value = after
             + masked[after..dict.end]
@@ -507,7 +509,7 @@ fn names_form(masked: &[u8], dict: Range<usize>, doc: &Document) -> bool {
 /// refers to.
 fn bbox_value(masked: &[u8], dict: Range<usize>) -> Option<BBoxValue> {
     let body = &masked[dict.clone()];
-    let rel = find_name(body, b"/BBox")?;
+    let rel = find_key(body, b"/BBox")?;
     let after = dict.start + rel + b"/BBox".len();
     let value = after
         + masked[after..dict.end]
@@ -575,17 +577,36 @@ fn is_regular(b: &u8) -> bool {
         )
 }
 
-/// The position of the name `name` (with its leading slash) in `haystack`
-/// as a whole token: followed by white space or a delimiter, not by more
-/// regular characters.
-fn find_name(haystack: &[u8], name: &[u8]) -> Option<usize> {
-    let mut pos = 0;
-    while let Some(rel) = find(&haystack[pos..], name) {
-        let at = pos + rel;
-        if !haystack.get(at + name.len()).is_some_and(is_regular) {
-            return Some(at);
+/// The position of the key `name` (with its leading slash) at the top
+/// level of the dictionary body `body`, as a whole token: the keys of
+/// nested dictionaries and the names inside arrays — a pattern's `/BBox`
+/// in the form's own `/Resources`, an image's `/Subtype` — are passed over.
+fn find_key(body: &[u8], name: &[u8]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        match body[i] {
+            b'<' if body.get(i + 1) == Some(&b'<') => {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            b'>' if body.get(i + 1) == Some(&b'>') => {
+                depth = depth.saturating_sub(1);
+                i += 2;
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b'/' if depth == 0
+                && body[i..].starts_with(name)
+                && !body.get(i + name.len()).is_some_and(is_regular) =>
+            {
+                return Some(i);
+            }
+            _ => {}
         }
-        pos = at + 1;
+        i += 1;
     }
     None
 }
@@ -840,7 +861,18 @@ mod tests {
             panic!("the real box is read: {shown}");
         };
         assert_eq!(&masked[array], b" 3 ");
-        assert_eq!(find_name(b"/BBoxes 1 /BBox [", b"/BBox"), Some(10));
+        assert_eq!(find_key(b"/BBoxes 1 /BBox [", b"/BBox"), Some(10));
+        // Keys of nested dictionaries and names in arrays are not the
+        // dictionary's own.
+        assert_eq!(find_key(b"/A << /BBox [1] >> /BBox [", b"/BBox"), Some(19));
+        assert_eq!(find_key(b"/A [ /BBox ] /C 1", b"/BBox"), None);
+        assert_eq!(
+            find_key(
+                b"/R << /X << /Subtype /Image >> >> /Subtype /Form",
+                b"/Subtype"
+            ),
+            Some(34)
+        );
         let doc = Document::with_version("1.4");
         let is_form = |dict: &[u8]| names_form(dict, 0..dict.len(), &doc);
         assert!(is_form(b" /Type /XObject /Subtype /Form "));
@@ -1189,5 +1221,48 @@ mod tests {
             6,
             "the other objects stay as they were"
         );
+    }
+
+    #[test]
+    fn a_nested_dictionarys_key_is_not_the_forms() {
+        let bbox = unbounded();
+        // A pattern's box inside the form's own Resources precedes the
+        // form's box: the form's is repaired, the pattern's is untouched.
+        let form = format!(
+            "<< /Type /XObject /Subtype /Form /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 << /PatternType 2 /BBox [ 0 0 10 10 ] >> >> >> /BBox [ {bbox} ] /Length {} >>\nstream\n{TEXT}\nendstream",
+            TEXT.len()
+        );
+        let bytes = pdf_with_objects(&[&form]);
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert!(doc.get_object((6, 0)).is_err());
+        let (repaired, count) = saturate_overlong_bbox_numerals(&bytes, &doc).unwrap();
+        assert_eq!(count, 4);
+        assert!(
+            find(&repaired, b"/BBox [ 0 0 10 10 ]").is_some(),
+            "the pattern's box is untouched"
+        );
+        assert!(Document::load_mem(&repaired)
+            .unwrap()
+            .get_object((6, 0))
+            .is_ok());
+
+        // The numerals only in a nested box: not the form's, left alone.
+        let form = format!(
+            "<< /Type /XObject /Subtype /Form /Resources << /Pattern << /P1 << /PatternType 2 /BBox [ {bbox} ] >> >> >> /Length {} >>\nstream\n{TEXT}\nendstream",
+            TEXT.len()
+        );
+        let bytes = pdf_with_objects(&[&form]);
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert!(saturate_overlong_bbox_numerals(&bytes, &doc).is_none());
+
+        // A `/Subtype /Form` inside a nested dictionary does not make the
+        // object a form.
+        let pattern = format!(
+            "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /XStep 10 /YStep 10 /Resources << /XObject << /Im1 << /Subtype /Form >> >> >> /BBox [ {bbox} ] /Length {} >>\nstream\n{TEXT}\nendstream",
+            TEXT.len()
+        );
+        let bytes = pdf_with_objects(&[&pattern]);
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert!(saturate_overlong_bbox_numerals(&bytes, &doc).is_none());
     }
 }
