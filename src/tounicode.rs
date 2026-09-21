@@ -7,11 +7,17 @@ use lopdf::{Document, Object, ObjectId};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::glyph_names::glyph_name_to_string;
 
-#[cfg(target_arch = "wasm32")]
+/// pdf.js built-in CMaps, compiled into the binary.
+///
+/// `cargo install` bakes `CARGO_MANIFEST_DIR` in as the registry (or a
+/// temporary) checkout and does not keep that directory around as a
+/// resource root. Reading the maps from disk at that path fails once the
+/// checkout is gone, so the files are embedded and the directory is only
+/// consulted when `PDF_INSPECTOR_BCMAPS_DIR` points at a replacement.
 static BUILTIN_CMAPS: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/external/bcmaps");
 
@@ -1531,33 +1537,23 @@ fn build_cmap_from_builtin_cmap(ordering: &str) -> Option<ToUnicodeCMap> {
     Some(cmap)
 }
 
+/// Replacement directory for the embedded CMaps. Unset means the copy
+/// compiled into the binary is used, which is what `cargo install` and the
+/// published wheels have at runtime.
 #[cfg(not(target_arch = "wasm32"))]
-fn find_bcmaps_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("PDF_INSPECTOR_BCMAPS_DIR") {
-        let p = PathBuf::from(dir);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    let default = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("external")
-        .join("bcmaps");
-    if default.is_dir() {
-        return Some(default);
-    }
-    None
+fn read_bcmap_override(name: &str) -> Option<Vec<u8>> {
+    let dir = std::env::var_os("PDF_INSPECTOR_BCMAPS_DIR")?;
+    std::fs::read(PathBuf::from(dir).join(name)).ok()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
-    let path = find_bcmaps_dir()?.join(name);
-    std::fs::read(path).ok().map(Cow::Owned)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
-    let file = BUILTIN_CMAPS.get_file(name)?;
-    Some(Cow::Borrowed(file.contents()))
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(bytes) = read_bcmap_override(name) {
+        return Some(Cow::Owned(bytes));
+    }
+    BUILTIN_CMAPS
+        .get_file(name)
+        .map(|file| Cow::Borrowed(file.contents()))
 }
 
 fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
@@ -3018,6 +3014,30 @@ fn build_fallback_cmap_for_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_cmaps_are_embedded_in_the_binary() {
+        // cargo install must not need external/bcmaps on disk. The bytes
+        // compiled in are the files shipped with the crate.
+        assert!(BUILTIN_CMAPS.files().count() >= 100);
+        for name in [
+            "Adobe-Japan1-UCS2.bcmap",
+            "Adobe-GB1-UCS2.bcmap",
+            "Adobe-CNS1-UCS2.bcmap",
+            "Adobe-Korea1-UCS2.bcmap",
+            "90ms-RKSJ-H.bcmap",
+        ] {
+            let embedded =
+                read_builtin_cmap_file(name).unwrap_or_else(|| panic!("{name} was not embedded"));
+            let disk = std::fs::read(format!(
+                "{}/external/bcmaps/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap_or_else(|err| panic!("reading {name}: {err}"));
+            assert_eq!(embedded.as_ref(), disk.as_slice(), "{name}");
+        }
+        assert!(read_builtin_cmap_file("does-not-exist.bcmap").is_none());
+    }
 
     #[test]
     fn embedded_glyph_names_of_several_letters_map_their_glyphs() {

@@ -1033,7 +1033,7 @@ pub fn extract_pages_markdown<P: AsRef<Path>>(
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
     validate_pdf_file(&path)?;
-    let buffer = std::fs::read(path.as_ref())?;
+    let buffer = read_file(path.as_ref())?;
     extract_pages_markdown_mem(&buffer, pages)
 }
 
@@ -1107,7 +1107,7 @@ pub fn extract_structure_elements<P: AsRef<Path>>(
     pages: Option<&[u32]>,
 ) -> Result<Vec<StructureElement>, PdfError> {
     validate_pdf_file(&path)?;
-    let buffer = std::fs::read(path.as_ref())?;
+    let buffer = read_file(path.as_ref())?;
     extract_structure_elements_mem(&buffer, pages)
 }
 
@@ -4183,7 +4183,7 @@ pub(crate) fn load_document_from_path_with_password<P: AsRef<Path>>(
     path: P,
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
-    let buffer = std::fs::read(&path)?;
+    let buffer = read_file(path.as_ref())?;
     load_document_from_mem_with_password(&buffer, password)
 }
 
@@ -7012,14 +7012,37 @@ pub(crate) fn validate_pdf_bytes(buffer: &[u8]) -> Result<(), PdfError> {
     }
 }
 
+/// Attach `path` to an IO error so a missing input is distinguishable from
+/// a missing built-in resource. Relative paths also name the working
+/// directory they were resolved against.
+pub(crate) fn io_error_at(path: &Path, err: std::io::Error) -> PdfError {
+    let location = if path.is_absolute() {
+        path.display().to_string()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        format!("{} (working directory {})", path.display(), cwd.display())
+    } else {
+        path.display().to_string()
+    };
+    PdfError::Io(std::io::Error::new(
+        err.kind(),
+        format!("{location}: {err}"),
+    ))
+}
+
+/// Read a whole file, reporting `path` in the error.
+pub(crate) fn read_file(path: &Path) -> Result<Vec<u8>, PdfError> {
+    std::fs::read(path).map_err(|err| io_error_at(path, err))
+}
+
 /// Validate that a file on disk looks like a PDF.
 ///
 /// Reads only the header search window and delegates to [`validate_pdf_bytes`].
 pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path).map_err(|err| io_error_at(path, err))?;
     let mut buf = [0u8; PDF_HEADER_SEARCH_WINDOW + PDF_HEADER_PROBE_LEN];
-    let n = file.read(&mut buf)?;
+    let n = file.read(&mut buf).map_err(|err| io_error_at(path, err))?;
     validate_pdf_bytes(&buf[..n])
 }
 
@@ -7027,6 +7050,20 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    #[test]
+    fn missing_file_error_names_the_path() {
+        let err = validate_pdf_file("this-file-does-not-exist.pdf").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("this-file-does-not-exist.pdf"),
+            "missing-file error should name the path, got {msg}"
+        );
+        assert!(
+            msg.contains("working directory"),
+            "relative path should name the working directory, got {msg}"
+        );
+    }
 
     #[test]
     fn pdf_header_offset_finds_header_at_start() {

@@ -293,7 +293,7 @@ fn extract_items_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_items_json, format_items_json, format_ocr_error_json};
+    use super::{extract_items_json, format_items_json, format_ocr_error_json, positional_args};
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     use super::{format_ocr_json, process_pdf_with_ocr, OcrPdfOptions};
     use pdf_inspector::extractor::ItemType;
@@ -374,6 +374,33 @@ mod tests {
     }
 
     #[test]
+    fn options_may_precede_the_pdf_path() {
+        let args = |list: &[&str]| {
+            std::iter::once("pdf2md".to_string())
+                .chain(list.iter().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            positional_args(&args(&["--json", "document.pdf"])).unwrap(),
+            vec!["document.pdf".to_string()]
+        );
+        assert_eq!(
+            positional_args(&args(&["--password", "secret", "document.pdf", "out.md"])).unwrap(),
+            vec!["document.pdf".to_string(), "out.md".to_string()]
+        );
+        assert_eq!(
+            positional_args(&args(&["document.pdf", "--select-pages", "1,3-5", "--raw"])).unwrap(),
+            vec!["document.pdf".to_string()]
+        );
+        assert_eq!(
+            positional_args(&args(&["--", "--json"])).unwrap(),
+            vec!["--json".to_string()]
+        );
+        assert!(positional_args(&args(&["--json"])).is_err());
+        assert!(positional_args(&args(&["a.pdf", "b.md", "c.md"])).is_err());
+    }
+
+    #[test]
     fn ocr_json_errors_use_the_same_versioned_envelope() {
         assert_eq!(
             format_ocr_error_json("bad \"value\""),
@@ -432,42 +459,96 @@ fn print_layout_info(layout: &LayoutComplexity) {
     }
 }
 
+const VALUE_OPTIONS: &[&str] = &[
+    "--select-pages",
+    "--password",
+    "--ocr",
+    "--ocr-dpi",
+    "--ocr-min-confidence",
+    "--ocr-hosted-threshold",
+    "--ocr-model-dir",
+];
+
+fn print_usage(argv0: &str) {
+    eprintln!("Usage: {argv0} <pdf_file> [output_file]");
+    eprintln!("       {argv0} --json <pdf_file>");
+    eprintln!("       {argv0} --items-json <pdf_file>");
+    eprintln!("       {argv0} --raw <pdf_file>");
+    eprintln!();
+    eprintln!("Converts PDF to Markdown with smart type detection.");
+    eprintln!("Returns early if PDF is scanned (OCR needed).");
+    eprintln!();
+    eprintln!("Options may appear before or after the PDF path.");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --json              Output result as JSON");
+    eprintln!("  --items-json        Output positioned TextItem JSON");
+    eprintln!("  --raw               Output only markdown (no headers)");
+    eprintln!("  --compact           Collapse token-heavy source formatting such as dot leaders");
+    eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
+    eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
+    eprintln!("  --password PW       Password for an encrypted PDF");
+    eprintln!("  --detect-only       Only detect PDF type (no extraction)");
+    eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
+    eprintln!("  --ocr MODE          OCR mode: off, auto, or force (requires feature `ocr`)");
+    eprintln!("  --ocr-dpi N         OCR render resolution (default: 150)");
+    eprintln!("  --ocr-min-confidence N  Drop OCR spans below N (default: 0)");
+    eprintln!("  --ocr-hosted-threshold N  Recommend hosted parsing below N (default: 0.5)");
+    eprintln!("  --ocr-model-dir DIR Use a package-managed local model directory");
+    eprintln!("  --ocr-offline       Never download missing OCR models");
+}
+
+/// Non-option arguments, in order. Options may precede the PDF path
+/// (`pdf2md --json file.pdf`). A flag in [`VALUE_OPTIONS`] consumes the
+/// following argument. `--` ends option parsing.
+fn positional_args(args: &[String]) -> Result<Vec<String>, ()> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    let mut positional = false;
+    while i < args.len() {
+        let arg = &args[i];
+        if positional {
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            positional = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--help" || arg == "-h" {
+            return Err(());
+        }
+        if arg.starts_with('-') && arg != "-" {
+            if VALUE_OPTIONS.contains(&arg.as_str()) && i + 1 < args.len() {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    if out.is_empty() || out.len() > 2 {
+        return Err(());
+    }
+    Ok(out)
+}
+
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <pdf_file> [output_file]", args[0]);
-        eprintln!("       {} <pdf_file> --json", args[0]);
-        eprintln!("       {} <pdf_file> --items-json", args[0]);
-        eprintln!("       {} <pdf_file> --raw", args[0]);
-        eprintln!();
-        eprintln!("Converts PDF to Markdown with smart type detection.");
-        eprintln!("Returns early if PDF is scanned (OCR needed).");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  --json              Output result as JSON");
-        eprintln!("  --items-json        Output positioned TextItem JSON");
-        eprintln!("  --raw               Output only markdown (no headers)");
-        eprintln!(
-            "  --compact           Collapse token-heavy source formatting such as dot leaders"
-        );
-        eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
-        eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
-        eprintln!("  --password PW       Password for an encrypted PDF");
-        eprintln!("  --detect-only       Only detect PDF type (no extraction)");
-        eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
-        eprintln!("  --ocr MODE          OCR mode: off, auto, or force (requires feature `ocr`)");
-        eprintln!("  --ocr-dpi N         OCR render resolution (default: 150)");
-        eprintln!("  --ocr-min-confidence N  Drop OCR spans below N (default: 0)");
-        eprintln!("  --ocr-hosted-threshold N  Recommend hosted parsing below N (default: 0.5)");
-        eprintln!("  --ocr-model-dir DIR Use a package-managed local model directory");
-        eprintln!("  --ocr-offline       Never download missing OCR models");
-        process::exit(1);
-    }
-
-    let pdf_path = &args[1];
+    let positionals = match positional_args(&args) {
+        Ok(positionals) => positionals,
+        Err(()) => {
+            print_usage(&args[0]);
+            process::exit(1);
+        }
+    };
+    let pdf_path = positionals[0].as_str();
     let json_output = args.iter().any(|a| a == "--json");
     let items_json_output = args.iter().any(|a| a == "--items-json");
     let raw_output = args.iter().any(|a| a == "--raw");
@@ -509,10 +590,7 @@ fn main() {
             })
         });
 
-    let output_file = args
-        .get(2)
-        .filter(|a| !a.starts_with("--"))
-        .map(|s| s.as_str());
+    let output_file = positionals.get(1).map(String::as_str);
 
     let has_ocr_only_option = [
         "--ocr-dpi",
@@ -863,7 +941,7 @@ fn main() {
         }
         Err(e) => {
             if json_output {
-                println!(r#"{{"error":"{}"}}"#, e);
+                println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));
             } else {
                 eprintln!("Error: {}", e);
             }

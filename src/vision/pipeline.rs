@@ -201,7 +201,8 @@ pub fn process_pdf_with_ocr(
     path: impl AsRef<Path>,
     options: OcrPdfOptions,
 ) -> Result<OcrPdfResult, OcrPipelineError> {
-    let bytes = std::fs::read(path).map_err(PdfError::from)?;
+    let path = path.as_ref();
+    let bytes = crate::read_file(path)?;
     process_pdf_with_ocr_mem(&bytes, options)
 }
 

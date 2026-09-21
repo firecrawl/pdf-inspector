@@ -924,7 +924,7 @@ fn detect_pdf_bytes(data: &[u8]) -> PyResult<PyPdfResult> {
 /// Pages in pages_needing_ocr are 0-indexed.
 #[pyfunction]
 fn classify_pdf(path: &str) -> PyResult<PyPdfClassification> {
-    let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let data = crate::read_file(std::path::Path::new(path)).map_err(to_py_err)?;
     classify_pdf_bytes(&data)
 }
 
@@ -989,7 +989,7 @@ fn extract_text_with_positions(
     // The threshold is checked whichever path the call takes.
     position_options(bold_from_weight, bold_weight_threshold)?;
     if bold_from_weight {
-        let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
+        let data = crate::read_file(std::path::Path::new(path)).map_err(to_py_err)?;
         return extract_text_with_positions_bytes(
             &data,
             pages,
@@ -1102,7 +1102,7 @@ fn extract_text_with_positions_and_rotations(
 ) -> PyResult<PyPositionedText> {
     // The threshold is checked before the file is read.
     position_options(bold_from_weight, bold_weight_threshold)?;
-    let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
+    let data = crate::read_file(std::path::Path::new(path)).map_err(to_py_err)?;
     extract_text_with_positions_and_rotations_bytes(&data, bold_from_weight, bold_weight_threshold)
 }
 
@@ -1178,7 +1178,7 @@ fn extract_text_in_regions(
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     // The threshold is checked before the file is read.
     position_options(bold_from_weight, bold_weight_threshold)?;
-    let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let data = crate::read_file(std::path::Path::new(path)).map_err(to_py_err)?;
     extract_text_in_regions_bytes(&data, page_regions, bold_from_weight, bold_weight_threshold)
 }
 
