@@ -748,9 +748,10 @@ fn extract_pages_markdown_mem_impl(
         let has_decoding_issue = has_text_quality_issue
             || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
         // First among a page's reasons, as classification's
-        // `page_ocr_reasons` lists it too, so both surfaces name the same
-        // first reason: a page whose whole text layer is hidden under a
-        // scan is a scan whatever its fonts are.
+        // `page_ocr_reasons` lists it too, so a page whose whole text layer
+        // is hidden under a scan — a scan whatever its fonts are — gets the
+        // same first reason from both surfaces; the reasons after it keep
+        // this surface's own order.
         if has_invisible_text_layer {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,

@@ -466,14 +466,23 @@ pub(crate) fn detect_from_document(
     pages_needing_ocr.dedup();
 
     // Explain each OCR-flagged page. Pages we analyzed get a signal-derived
-    // reason; pages flagged only by whole-document classification (unsampled
-    // pages of a Scanned/ImageBased doc) default to `scanned`.
+    // reason. Pages flagged only by whole-document classification — the
+    // pages a sample left out of a Scanned/ImageBased document — are still
+    // read for the one signal the byte scan alone gives, so a text layer
+    // nobody sees is named wherever it is; the font and path signals come
+    // from the full analysis and stay with the sampled pages, so such a
+    // page otherwise defaults to `scanned`.
     let mut ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>> =
         std::collections::BTreeMap::new();
     for &page_num in &pages_needing_ocr {
         let reasons = match analysis_cache.get(&page_num) {
             Some(analysis) => page_ocr_reasons(analysis),
-            None => vec![crate::OCR_REASON_SCANNED],
+            None => match pages.get(&page_num) {
+                Some(&page_id) if page_shows_only_a_hidden_text_layer(doc, page_id) => {
+                    vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
+                }
+                _ => vec![crate::OCR_REASON_SCANNED],
+            },
         };
         ocr_reasons_by_page.insert(page_num, reasons.into_iter().map(String::from).collect());
     }
@@ -592,7 +601,9 @@ struct PageAnalysis {
 /// (`vector_text`), which persist even when a text layer is present;
 /// otherwise a page with no extractable text is `scanned` when an image
 /// backs it or `no_text` when nothing does. `extract_pages_markdown_mem`
-/// orders the same reasons the same way.
+/// puts `invisible_text_layer` first as well; the reasons after it keep
+/// each surface's own order (there, `scanned` can stand beside the font
+/// and path reasons, which here pre-empt it).
 fn page_ocr_reasons(a: &PageAnalysis) -> Vec<&'static str> {
     let mut reasons = Vec::new();
     if a.has_invisible_text_layer {
@@ -786,65 +797,40 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // page-level Resources + Form XObject Resources.
     let mut font_map: HashMap<ObjectId, FontInfo> = HashMap::new();
 
-    // Get content streams for this page — these use the page's resource dict
-    let content_streams = doc.get_page_contents(page_id);
-
     // We need the page's resource dict to resolve font names from page content.
     // get_page_resources returns (Option<&Dictionary>, Vec<ObjectId>) for
     // inline and indirect resource dicts respectively.
     let page_resources = doc.get_page_resources(page_id).ok();
 
-    // The page's content streams are read as one — the text render mode
-    // and the matrix carry from each to the next — and what they invoke
-    // with `Do` is followed: an image is measured on the visible page
-    // box, a form is run in place. Names resolve in the page's own
-    // resources first, then in those it inherits.
+    // The page's content streams, read as one and followed through `Do`
+    // (see `scan_page_content`), with the raw font names they use.
     let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
-    let resource_chain: Vec<&lopdf::Dictionary> = page_resources
+    let resources = page_resources
         .as_ref()
-        .map(|(own, ancestors)| {
-            (*own)
-                .into_iter()
-                .chain(
-                    ancestors
-                        .iter()
-                        .filter_map(|id| doc.get_dictionary(*id).ok()),
-                )
-                .collect()
-        })
+        .map(|(own, ancestors)| resource_chain(doc, *own, ancestors))
         .unwrap_or_default();
-    let mut scan_state = ContentScanState::new(doc, page_box, true);
+    let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
+    let (scan_state, page_counts) = scan_page_content(
+        doc,
+        page_id,
+        page_box,
+        &resources,
+        &mut all_unique_chars,
+        &mut page_font_names,
+    );
+    counts.add(page_counts);
 
-    for content_id in content_streams {
-        if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
-                Ok(data) => data,
-                Err(_) => stream.content.clone(),
-            };
-
-            // Scan for text operators, collecting raw font names
-            let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
-            counts.add(scan_content_stream(
-                &content,
-                &mut all_unique_chars,
-                &mut page_font_names,
-                &mut scan_state,
-                &resource_chain,
-            ));
-
-            // Resolve font names against the page's resource dictionaries,
-            // respecting PDF resource inheritance shadowing: the most-specific
-            // scope (page's own /Resources) wins over inherited ancestors.
-            if let Some((ref resource_dict, ref resource_ids)) = page_resources {
-                resolve_with_shadowing(
-                    doc,
-                    *resource_dict,
-                    resource_ids,
-                    &page_font_names,
-                    &mut used_font_ids,
-                );
-            }
-        }
+    // Resolve font names against the page's resource dictionaries,
+    // respecting PDF resource inheritance shadowing: the most-specific
+    // scope (page's own /Resources) wins over inherited ancestors.
+    if let Some((ref resource_dict, ref resource_ids)) = page_resources {
+        resolve_with_shadowing(
+            doc,
+            *resource_dict,
+            resource_ids,
+            &page_font_names,
+            &mut used_font_ids,
+        );
     }
 
     // Scan XObject Form contents for text operators, collect their fonts,
@@ -891,17 +877,14 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // pixel size. Images the resources merely bind, and forms never
     // invoked, are not content: `has_template_image` judges the pixels of
     // whatever is bound and has no say here.
-    let page_area = f64::from(page_box.width()) * f64::from(page_box.height());
-    let has_covering_image =
-        scan_state.covered_image_area() >= COVERING_IMAGE_MIN_PAGE_FRACTION * page_area;
+    let has_covering_image = scan_state.covers_page();
 
     // A page whose every executed text-showing operator left nothing to
     // see while images cover it shows the raster alone; the text layer
     // describes the raster rather than being the page's content.
     let executed_text_ops = scan_state.executed_text_ops;
     let hidden_text_ops = scan_state.executed_hidden_text_ops;
-    let has_invisible_text_layer =
-        executed_text_ops > 0 && hidden_text_ops == executed_text_ops && has_covering_image;
+    let has_invisible_text_layer = scan_state.shows_only_a_hidden_text_layer();
 
     let unique_alphanum_chars = all_unique_chars
         .iter()
@@ -974,6 +957,77 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 /// cover, their boxes clipped to the page, for the page to count as
 /// covered.
 const COVERING_IMAGE_MIN_PAGE_FRACTION: f64 = 0.5;
+
+/// The dictionaries a page's names resolve in, most specific first: its
+/// own `/Resources`, then those it inherits from its ancestors (see
+/// `resolve_with_shadowing`).
+fn resource_chain<'a>(
+    doc: &'a Document,
+    own: Option<&'a lopdf::Dictionary>,
+    ancestors: &[ObjectId],
+) -> Vec<&'a lopdf::Dictionary> {
+    own.into_iter()
+        .chain(
+            ancestors
+                .iter()
+                .filter_map(|id| doc.get_dictionary(*id).ok()),
+        )
+        .collect()
+}
+
+/// The page's content streams read as one — the text render mode and the
+/// matrix carry from each to the next — and followed through `Do`: an
+/// image is measured on the visible page box, a form is run in place.
+/// Returns the state at the end and the streams' own counts; the text
+/// characters and font names met go to the sets given.
+fn scan_page_content<'a>(
+    doc: &'a Document,
+    page_id: ObjectId,
+    page_box: PageBox,
+    resources: &[&'a lopdf::Dictionary],
+    unique_chars: &mut HashSet<u8>,
+    used_font_names: &mut HashSet<Vec<u8>>,
+) -> (ContentScanState<'a>, ContentCounts) {
+    let mut state = ContentScanState::new(doc, page_box, true);
+    let mut counts = ContentCounts::default();
+    for content_id in doc.get_page_contents(page_id) {
+        if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
+            let content = stream
+                .decompressed_content()
+                .unwrap_or_else(|_| stream.content.clone());
+            counts.add(scan_content_stream(
+                &content,
+                unique_chars,
+                used_font_names,
+                &mut state,
+                resources,
+            ));
+        }
+    }
+    (state, counts)
+}
+
+/// Whether the page shows only a text layer nobody sees over images that
+/// cover it — from the executed-content scan alone, without the font,
+/// pixel and path analysis of `analyze_page_content`. For the pages a
+/// sample left out, whose OCR reason is reported all the same.
+fn page_shows_only_a_hidden_text_layer(doc: &Document, page_id: ObjectId) -> bool {
+    let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
+    let page_resources = doc.get_page_resources(page_id).ok();
+    let resources = page_resources
+        .as_ref()
+        .map(|(own, ancestors)| resource_chain(doc, *own, ancestors))
+        .unwrap_or_default();
+    let (state, _) = scan_page_content(
+        doc,
+        page_id,
+        page_box,
+        &resources,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+    );
+    state.shows_only_a_hidden_text_layer()
+}
 
 /// Distinct alphanumeric characters a page must show for its text to count
 /// as real text next to a mass of path operators — below it, the paths are
@@ -2154,6 +2208,22 @@ impl<'a> ContentScanState<'a> {
             .map(|draw| draw.own_area.min(draw.on_page.area()))
             .sum();
         union_area(&self.image_draws).min(own)
+    }
+
+    /// Whether the images drawn cover the page: at least
+    /// `COVERING_IMAGE_MIN_PAGE_FRACTION` of its area.
+    fn covers_page(&self) -> bool {
+        self.covered_image_area() >= COVERING_IMAGE_MIN_PAGE_FRACTION * self.page.area()
+    }
+
+    /// Whether every text-showing operator executed left nothing to see
+    /// while the images drawn cover the page: the raster is all the page
+    /// shows, and the text layer describes it rather than being its
+    /// content.
+    fn shows_only_a_hidden_text_layer(&self) -> bool {
+        self.executed_text_ops > 0
+            && self.executed_hidden_text_ops == self.executed_text_ops
+            && self.covers_page()
     }
 }
 

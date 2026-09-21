@@ -2558,8 +2558,8 @@ struct GlyphLayerPage {
     invoke_form: bool,
     /// Draw the image again after the layer, through any clip it set.
     image_after_layer: bool,
-    /// Groups of four path operators drawn before the layer, as outlined
-    /// glyphs would be.
+    /// Filled subpaths of five path operators each, painted before the
+    /// layer, as outlined glyphs would be.
     vector_paths: usize,
     /// Show the layer with the `'` and `"` operators instead of `Tj`.
     quote_operators: bool,
@@ -2629,7 +2629,7 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
             content.push_str(&draw_image);
         }
         for _ in 0..page.vector_paths {
-            content.push_str("100 200 m 150 250 l 200 200 100 100 200 200 c h\n");
+            content.push_str("100 200 m 150 250 l 200 200 100 100 200 200 c h f\n");
         }
         if page.body_lines > 0 {
             if page.marked_content_id {
@@ -3000,6 +3000,55 @@ fn test_id_name_is_not_inline_image_data() {
     let pages = extract_pages_markdown_mem(&buf, None).unwrap();
     assert!(!pages.pages[0].needs_ocr);
     assert!(pages.pages[0].markdown.contains("Paragraph line 3"));
+}
+
+/// A document longer than classification's sample, whose one page with a
+/// hidden layer lies outside the sample: that page still reports
+/// `invisible_text_layer`, the other pages `scanned`.
+#[test]
+fn test_hidden_layer_page_outside_the_sample_reports_its_reason() {
+    // Twelve pages sample as 1–7 and 12; page 9 is not read for
+    // classification.
+    let image_only = GlyphLayerPage {
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    };
+    let mut pages = [image_only; 12];
+    pages[8] = SCAN_WITH_INVISIBLE_LAYER;
+    let buf = make_pdf_with_glyph_layer(&pages);
+
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Scanned);
+    assert_eq!(detected.pages_sampled, 8);
+    assert_eq!(detected.pages_needing_ocr, (1..=12).collect::<Vec<u32>>());
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&9),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    for page in [1u32, 8, 10, 12] {
+        assert_eq!(
+            detected.ocr_reasons_by_page.get(&page),
+            Some(&vec![OCR_REASON_SCANNED.to_string()]),
+            "page {page}"
+        );
+    }
+
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Scanned);
+    assert_eq!(
+        processed
+            .ocr_reasons_by_page
+            .iter()
+            .find(|entry| entry.page == 9)
+            .map(|entry| entry.reasons.clone()),
+        Some(vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[8].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
 }
 
 /// A page that is both vector text and a layer nobody sees under a scan

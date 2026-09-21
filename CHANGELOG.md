@@ -119,8 +119,9 @@ Changes since 1.22.1.
   bound but never drawn, and forms never invoked, do not count), for OCR
   with the new reason `invisible_text_layer`
   (`OCR_REASON_INVISIBLE_TEXT_LAYER`) — in `pdf_type`, `pages_needing_ocr`,
-  `ocr_reasons_by_page` and per-page `needs_ocr`/`ocr_reason` alike, and
-  first among a page's reasons on both surfaces. Mode-7 text that an
+  `ocr_reasons_by_page` and per-page `needs_ocr`/`ocr_reason` alike, for
+  the pages a sample left out as well, and first among a page's reasons
+  on both surfaces. Mode-7 text that an
   image, a shading, a painted path or visible text is later drawn through
   — a title filled with a picture — is visible and not counted; a form
   that paints nothing shows nothing through it. Operators are read past
