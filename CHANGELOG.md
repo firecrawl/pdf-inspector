@@ -23,6 +23,7 @@ Changes since 1.22.1.
   (`list[FontCMapGaps]`), the WebAssembly result's `cmapGaps` and the
   `pdf2md --json` and `detect-pdf --analyze --json` field `cmap_gaps` report
   the same list.
+  ([#568](https://github.com/firecrawl/pdf-inspector/pull/568))
 
 ### Fixed
 
@@ -178,6 +179,7 @@ Changes since 1.22.1.
   alphabet is not read; such a code is now a U+FFFD in the text instead of
   nothing, as a code of a CID font whose CMap cannot be read at all already
   was, so the loss stays visible and `has_encoding_issues` reports it.
+  ([#568](https://github.com/firecrawl/pdf-inspector/pull/568))
 
 ## [1.22.1] - 2026-09-20
 
