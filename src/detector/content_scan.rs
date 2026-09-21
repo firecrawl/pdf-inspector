@@ -185,7 +185,9 @@ impl ContentCounts {
 }
 
 /// How many `q` levels the scan keeps a saved state for. Deeper nesting
-/// keeps the innermost state, and its `Q`s restore nothing.
+/// keeps the innermost state, its `Q`s restore nothing, and the page's
+/// evidence is incomplete: a render mode or clip set past the cap would
+/// outlive its `Q`.
 const SCAN_STATE_MAX_DEPTH: usize = 256;
 
 /// How many form invocations one page's scan follows through `Do`. Past
@@ -440,6 +442,7 @@ impl<'a> ContentScanState<'a> {
             });
         } else {
             self.unsaved_depth += 1;
+            self.incomplete = true;
         }
     }
 
@@ -1219,14 +1222,14 @@ fn scan_masked_content<'a>(
             } else if token_at(i, b"BI") {
                 // BI = begin an inline image, which paints the unit square
                 // under the matrix in force as an image XObject does. It counts
-                // among the page's images only in an executed scan: the walk
-                // over every bound form keeps its tally of bound image
-                // XObjects, which an inline image in a form never invoked is
-                // not.
+                // among the page's images, and is measured, only in an
+                // executed scan: the walk over every bound form keeps its
+                // tally of bound image XObjects, which an inline image in a
+                // form never invoked is not, and reads nothing of its state.
                 if state.follow_do {
                     counts.image_count += 1;
+                    state.image_drawn();
                 }
-                state.image_drawn();
             } else if token_at(i, b"BT") {
                 // BT = begin a text object, which the operators to come position.
                 state.text_object_began();

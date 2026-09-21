@@ -123,7 +123,8 @@ Changes since 1.22.1.
   any at all as well — and so does a path filled or stroked with a tiling
   pattern whose cell draws one; images bound but never drawn, and
   forms never invoked, do not count; a page whose forms outrun the scan's
-  budget of invocations or of bytes executed is not flagged), for OCR
+  budget of invocations or of bytes executed, or whose graphics state
+  nests deeper than the scan follows, is not flagged), for OCR
   with the new reason `invisible_text_layer`
   (`OCR_REASON_INVISIBLE_TEXT_LAYER`): the reason appears in
   `pages_needing_ocr`/`ocr_reasons_by_page` and in the per-page

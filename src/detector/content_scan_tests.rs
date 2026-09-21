@@ -131,20 +131,71 @@ fn render_mode_out_of_range_is_not_set() {
     assert_eq!(hidden, 0);
 }
 
+/// Past the depth cap a `q` saves nothing and its `Q` restores nothing:
+/// the outermost `Q` still restores the mode saved with it, but a mode set
+/// past the cap outlives its own `Q`, which the scan cannot tell — so the
+/// evidence is incomplete, and a page nesting that deep is not flagged.
 #[test]
-fn saved_states_past_the_depth_cap_restore_nothing() {
-    let mut content = Vec::new();
-    for _ in 0..=SCAN_STATE_MAX_DEPTH {
-        content.extend_from_slice(b"q ");
-    }
-    content.extend_from_slice(b"3 Tr ");
-    for _ in 0..=SCAN_STATE_MAX_DEPTH {
-        content.extend_from_slice(b"Q ");
-    }
-    content.extend_from_slice(b"(a) Tj");
-    let (counts, _, hidden) = scan_alone(&content);
+fn saved_states_past_the_depth_cap_leave_the_evidence_incomplete() {
+    let nested = |levels: usize, inside: &str| {
+        let mut content = String::new();
+        for _ in 0..levels {
+            content.push_str("q ");
+        }
+        content.push_str(inside);
+        for _ in 0..levels {
+            content.push_str("Q ");
+        }
+        content
+    };
+    let doc = Document::new();
+    let scan = |content: &str| {
+        let mut state = ContentScanState::new(&doc, PageBox::LETTER, false);
+        let counts = scan_content_stream(
+            content.as_bytes(),
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut state,
+            &[],
+        );
+        (counts, state)
+    };
+    let content = format!("{}(a) Tj", nested(SCAN_STATE_MAX_DEPTH + 1, "3 Tr "));
+    let (counts, state) = scan(&content);
     assert_eq!(counts.text_ops, 1);
-    assert_eq!(hidden, 0, "the outermost `Q` restores mode 0");
+    assert_eq!(
+        state.executed_hidden_text_ops, 0,
+        "the outermost `Q` restores mode 0"
+    );
+    assert!(state.incomplete, "a level past the cap was not saved");
+    // Within the cap every level is saved, and the evidence is complete.
+    let content = format!("{}(a) Tj", nested(SCAN_STATE_MAX_DEPTH, "3 Tr "));
+    let (_, state) = scan(&content);
+    assert_eq!(state.executed_hidden_text_ops, 0);
+    assert!(!state.incomplete);
+
+    // A hidden layer under a covering image, its mode set past the cap:
+    // the page is not flagged; set within the cap, it is.
+    let (mut doc, page_id, content_id) = synthetic_page(true, false, &[]);
+    for (levels, flagged) in [
+        (SCAN_STATE_MAX_DEPTH + 1, false),
+        (SCAN_STATE_MAX_DEPTH, true),
+    ] {
+        set_page_content(
+            &mut doc,
+            content_id,
+            &format!("{FULL_PAGE_IMAGE}{}", nested(levels, &glyph_layer(3))),
+        );
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(
+            analysis.has_invisible_text_layer, flagged,
+            "{levels} levels"
+        );
+        assert_eq!(
+            analysis.invisible_text_operator_count, 120,
+            "{levels} levels"
+        );
+    }
 }
 
 #[test]
@@ -1240,6 +1291,28 @@ fn a_comment_in_an_inline_image_header_is_passed_over() {
     }
 }
 
+/// A dictionary or array nested in an inline image's header — decode
+/// parameters, a decode array — is a value of the header, not an entry of
+/// it: a `/W` or `/F` inside one names no width and no filter.
+#[test]
+fn a_value_nested_in_an_inline_image_header_is_no_entry_of_it() {
+    // The eight gray samples spelling ` EI 3 Tr`, behind headers whose
+    // nested values would give a width of a hundred or a filter.
+    for header in [
+        "/DP << /W 100 /H 100 /Columns 8 >> /W 8 /H 1 /BPC 8 /CS /G",
+        "/W 8 /H 1 /BPC 8 /CS /G /DP << /F /Fl /Predictor 2 >>",
+        "/W 8 /D [0 1] /H 1 /BPC 8 /CS /G /DP [<< /W 100 >>]",
+    ] {
+        let content = format!("BI {header} ID  EI 3 Tr EI BT /F1 12 Tf (a) Tj ET");
+        let (counts, executed_ops, hidden) = scan_alone(content.as_bytes());
+        assert_eq!(
+            (counts.text_ops, executed_ops, hidden),
+            (1, 1, 0),
+            "{header:?}"
+        );
+    }
+}
+
 /// A colour space an inline image names from the resources gives its
 /// samples' components: an `/ICCBased` space by its `/N`, a device space
 /// by its name, `/Indexed` and `/Separation` as one, `/DeviceN` by its
@@ -1439,5 +1512,33 @@ fn a_colour_space_the_form_binds_is_read_as_the_form_has_it() {
                 "{content} under {space:?}"
             );
         }
+    }
+}
+
+/// A form the page invokes is counted once among the forms bound, as the
+/// text tally always has, and once per invocation among the operators
+/// executed; the two tallies are kept apart, so an invoked form is not
+/// counted twice in either.
+#[test]
+fn an_invoked_form_counts_once_as_bound_and_once_per_invocation_as_executed() {
+    let (mut doc, page_id, content_id) = synthetic_page(
+        false,
+        false,
+        &[TestForm {
+            name: "FmText",
+            content: "BT /F1 12 Tf 72 600 Td (a) Tj (b) Tj (c) Tj ET",
+            ..PAGE_FORM
+        }],
+    );
+    let own = "BT /F1 12 Tf 72 700 Td (x) Tj (y) Tj ET\n";
+    for (invocations, executed) in [(0, 2), (1, 5), (2, 8)] {
+        let content = format!("{own}{}", "/FmText Do\n".repeat(invocations));
+        set_page_content(&mut doc, content_id, &content);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert_eq!(analysis.text_operator_count, 5, "{invocations} invocations");
+        assert_eq!(
+            analysis.executed_text_operator_count, executed,
+            "{invocations} invocations"
+        );
     }
 }

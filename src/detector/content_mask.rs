@@ -177,8 +177,9 @@ enum HeaderToken<'h> {
     Word(&'h [u8]),
     ArrayOpen,
     ArrayClose,
-    /// A string, or a dictionary's delimiter: a value that bears on
-    /// nothing here.
+    DictOpen,
+    DictClose,
+    /// A string, or a brace: a value that bears on nothing here.
     Other,
 }
 
@@ -213,7 +214,11 @@ fn header_tokens(header: &[u8]) -> Vec<HeaderToken<'_>> {
                 i += 1;
             }
             b'<' if header.get(i + 1) == Some(&b'<') => {
-                tokens.push(HeaderToken::Other);
+                tokens.push(HeaderToken::DictOpen);
+                i += 2;
+            }
+            b'>' if header.get(i + 1) == Some(&b'>') => {
+                tokens.push(HeaderToken::DictClose);
                 i += 2;
             }
             b'<' => {
@@ -291,19 +296,29 @@ pub(super) fn device_colour_space_components(name: &[u8]) -> Option<u32> {
 /// the data is filtered and its length not stated, or the header cannot
 /// be read — a width, height, bits or colour space missing or unknown —
 /// and the data's end must be looked for instead. `/D` (`/Decode`) and
-/// `/DP` bear on the samples' meaning, not on their count.
+/// `/DP` bear on the samples' meaning, not on their count. An entry is
+/// read from the header itself, never from a dictionary or array nested
+/// in it: `/DP << /Columns 8 >>` names no width.
 pub(super) fn inline_image_data_length(
     header: &[u8],
     colour_space_components: ColourSpaceComponents<'_>,
 ) -> Option<usize> {
     let tokens = header_tokens(header);
+    // The index after the header's own entry named by one of `keys`: a name
+    // inside a nested dictionary or array is a value, not an entry.
     let value_at = |keys: &[&[u8]]| {
-        tokens
-            .iter()
-            .position(
-                |token| matches!(token, HeaderToken::Name(name) if keys.contains(&name.as_slice())),
-            )
-            .map(|at| at + 1)
+        let mut depth = 0usize;
+        for (at, token) in tokens.iter().enumerate() {
+            match token {
+                HeaderToken::ArrayOpen | HeaderToken::DictOpen => depth += 1,
+                HeaderToken::ArrayClose | HeaderToken::DictClose => depth = depth.saturating_sub(1),
+                HeaderToken::Name(name) if depth == 0 && keys.contains(&name.as_slice()) => {
+                    return Some(at + 1);
+                }
+                _ => {}
+            }
+        }
+        None
     };
     let integer_after = |keys: &[&[u8]]| match value_at(keys).and_then(|at| tokens.get(at)) {
         Some(HeaderToken::Number(number)) if number.fract() == 0.0 && *number >= 0.0 => {
