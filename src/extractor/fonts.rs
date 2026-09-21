@@ -5535,6 +5535,39 @@ mod tests {
         );
     }
 
+    /// A two-byte string of one letter and three control destinations reads
+    /// as the letter and three markers: the markers are the CMap's own
+    /// reading, so the string is not abandoned to the readings tried after
+    /// a failed CMap — which would decode the low bytes as control
+    /// characters and lose the loss — while the coverage counts the three
+    /// codes as unmapped.
+    #[test]
+    fn a_string_of_mostly_control_destinations_reads_as_the_letter_and_the_markers() {
+        use crate::tounicode::ToUnicodeCMap;
+        let mut primary = ToUnicodeCMap {
+            code_byte_length: 2,
+            ..Default::default()
+        };
+        primary.char_map.insert(1, "c".to_string());
+        for code in 2..=4u16 {
+            primary.char_map.insert(code, "\u{3}".to_string());
+        }
+        primary.refresh_gap_fills();
+        let (text, coverage) = decode_through(primary, vec![0, 1, 0, 2, 0, 3, 0, 4]);
+        assert_eq!(text.as_deref(), Some("c\u{FFFD}\u{FFFD}\u{FFFD}"));
+        assert_eq!(
+            coverage,
+            vec![(
+                FontLabel::from("AAAAAA+Font"),
+                CidDecodeStats {
+                    codes: 4,
+                    interpolated: 0,
+                    unmapped: 3
+                }
+            )]
+        );
+    }
+
     /// An odd-length string through a Type0 font none of whose bytes any
     /// CMap reads: its bytes are counted once, as codes the CMap did not
     /// cover, though the two-byte reading is tried over them afterwards.

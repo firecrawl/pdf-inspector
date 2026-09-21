@@ -9784,6 +9784,42 @@ fn a_control_destination_under_an_unreadable_differences_name_is_marked() {
     assert!(!nameless.has_encoding_issues);
 }
 
+/// A string of one letter and three control destinations reads as the
+/// letter and three markers, never as the letter alone or as control
+/// characters: the markers are the CMap's own reading of those codes, so
+/// the string is not abandoned to the readings tried after a failed CMap.
+/// The document reports the encoding issue, and the three codes as unmapped.
+#[test]
+fn a_string_of_mostly_control_destinations_keeps_its_markers_end_to_end() {
+    let cmap = format!(
+        "{CID_CMAP_HEAD}4 beginbfchar\n<0001> <0063>\n<0002> <0002>\n<0003> <0003>\n\
+         <0004> <0004>\n{CID_CMAP_TAIL}"
+    );
+    let pdf = make_embedded_cid_font_pdf(
+        &cmap,
+        minimal_truetype_subset_with(12, &[], &[]),
+        "",
+        "BT /F1 12 Tf 72 700 Td <0001000200030004> Tj ET\n",
+        false,
+    );
+    let result = process_pdf_mem(&pdf).unwrap();
+    let markdown = result.markdown.clone().unwrap_or_default();
+    assert!(
+        markdown.contains("c\u{FFFD}\u{FFFD}\u{FFFD}"),
+        "{markdown:?}"
+    );
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 4,
+            interpolated: 0,
+            unmapped: 3,
+        }]
+    );
+}
+
 /// An odd-length string through a Type0 font none of whose bytes any CMap
 /// reads: the bytes are counted once as the font's codes, all unmapped, and
 /// the document reports the gap — not the one-and-a-half codes of the

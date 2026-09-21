@@ -180,16 +180,18 @@ fn destination_is_control(text: &str) -> bool {
 }
 
 /// Repair the control destinations of `target`, a CMap read from a
-/// ToUnicode stream, from the font itself: give the codes the text
-/// `source` — the font's own reading, when the caller has one — has for
-/// them, then the reading of the encoding a simple font declares by name,
-/// then, in `program` — the font's embedded program, read once by the
-/// caller — a space for each remaining code of a Type0 font whose glyph
-/// has no outline but an advance. What nothing reads stays a control
-/// destination.
+/// ToUnicode stream, from the font itself: give the codes the text the
+/// `sources` — the font's own readings, in order: the fallback the entry
+/// keeps (the CID collection's reading when the font has one, else the
+/// embedded program's), then the program's reading when it is not that
+/// fallback — have for them, then the reading of the encoding a simple
+/// font declares by name, then, in `program` — the font's embedded
+/// program, read once by the caller — a space for each remaining code of a
+/// Type0 font whose glyph has no outline but an advance. What nothing
+/// reads stays a control destination.
 fn repair_control_destinations(
     target: &mut ToUnicodeCMap,
-    source: Option<&ToUnicodeCMap>,
+    sources: &[&ToUnicodeCMap],
     font_dict: &lopdf::Dictionary,
     doc: &Document,
     program: Option<&[u8]>,
@@ -198,7 +200,7 @@ fn repair_control_destinations(
     if before.is_empty() {
         return;
     }
-    if let Some(source) = source {
+    for source in sources {
         target.recover_control_destinations(source);
     }
     let remaining = target.control_destination_codes();
@@ -590,20 +592,31 @@ pub(crate) fn build_cmap_entry_from_stream(
     if let Some(cmap) = ToUnicodeCMap::parse(data) {
         let (primary, remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
         let encoding_fallback = build_fallback_tounicode_from_encoding(font_dict, doc);
+        let control_destinations = primary.has_control_destinations();
         // The embedded program, read once for the fallback, when the CID
         // collection gives none, and for the repair of a CMap with control
         // destinations, which follows the roles to the CMap the entry
-        // keeps and reads the fallback where it went.
-        let program = if encoding_fallback.is_none() || primary.has_control_destinations() {
+        // keeps and reads the fallback where it went — and the program's
+        // reading besides it, when the collection's is the fallback.
+        let program = if encoding_fallback.is_none() || control_destinations {
             embedded_font_program(font_dict, doc)
         } else {
             None
         };
-        let fallback =
-            encoding_fallback.or_else(|| program_fallback_cmap(font_dict, doc, program.as_deref()));
+        let program_reading = if encoding_fallback.is_none() || control_destinations {
+            program_fallback_cmap(font_dict, doc, program.as_deref())
+        } else {
+            None
+        };
+        let (fallback, program_source) = match encoding_fallback {
+            Some(collection) => (Some(collection), program_reading),
+            None => (program_reading, None),
+        };
         let (mut entry, roles) = cmap_entry_with_roles(primary, remapped, fallback, obj_num, true);
         entry.repair(roles, |target, source| {
-            repair_control_destinations(target, source, font_dict, doc, program.as_deref())
+            let sources: Vec<&ToUnicodeCMap> =
+                source.into_iter().chain(program_source.as_ref()).collect();
+            repair_control_destinations(target, &sources, font_dict, doc, program.as_deref())
         });
         return Some(entry);
     }
@@ -1076,7 +1089,10 @@ impl ToUnicodeCMap {
     /// code whose entry is a control destination reads as). Returns the text
     /// with the number of codes that contributed to it and the decode's
     /// counts: an empty text and no contributing code when too many codes
-    /// were unmapped, the counts either way.
+    /// were unmapped, the counts either way. A code whose entry is a control
+    /// destination counts as unmapped, but not towards abandoning the text:
+    /// its U+FFFD is the CMap's own reading of the code, not a sign that the
+    /// CMap is the wrong reading of the string.
     pub(crate) fn decode_cids_with(
         &self,
         bytes: &[u8],
@@ -1085,6 +1101,7 @@ impl ToUnicodeCMap {
         let mut result = String::new();
         let mut stats = CidDecodeStats::default();
         let mut contributing = 0usize;
+        let mut control_destinations = 0u32;
 
         if self.code_byte_length == 1 {
             // Single-byte codes: each byte is a code
@@ -1100,6 +1117,7 @@ impl ToUnicodeCMap {
                         result.push('\u{FFFD}');
                         contributing += 1;
                         stats.unmapped += 1;
+                        control_destinations += 1;
                     }
                     _ => {
                         // For single-byte unmapped codes, try as Latin-1
@@ -1127,6 +1145,7 @@ impl ToUnicodeCMap {
                             result.push('\u{FFFD}');
                             contributing += 1;
                             stats.unmapped += 1;
+                            control_destinations += 1;
                         }
                         _ => {
                             if self.cid_passthrough {
@@ -1163,8 +1182,10 @@ impl ToUnicodeCMap {
         }
 
         // If too many codes were unmapped, signal failure by returning empty
-        // so the caller can fall through to other decoding methods
-        if stats.codes > 0 && stats.unmapped > stats.codes / 2 {
+        // so the caller can fall through to other decoding methods. A code
+        // whose entry is a control destination is read, as U+FFFD, by the
+        // CMap itself: it does not count against the reading.
+        if stats.codes > 0 && stats.unmapped - control_destinations > stats.codes / 2 {
             return CidDecoding {
                 text: String::new(),
                 contributing: 0,
@@ -3062,29 +3083,35 @@ impl FontCMaps {
                     None
                 };
                 let encoding_fallback = build_fallback_tounicode_from_encoding(font_dict, doc);
-                let fallback = if sparse {
-                    encoding_fallback.or_else(|| {
-                        program_for_fallback
-                            .then(|| program_fallback_cmap(font_dict, doc, program.as_deref()))
-                            .flatten()
-                    })
-                } else {
-                    // Primary is rich enough; only the cheap encoding fallback
-                    encoding_fallback
-                };
-                let repair_source = if program_for_repair && fallback.is_none() {
-                    program_fallback_cmap(font_dict, doc, program.as_deref())
-                } else {
-                    None
+                // The program's reading: the fallback of a sparse CMap when
+                // the CID collection gives none, and a repair source
+                // whenever the CMap has control destinations — besides the
+                // collection's reading when that is the fallback.
+                let program_reading =
+                    if (sparse && program_for_fallback && encoding_fallback.is_none())
+                        || program_for_repair
+                    {
+                        program_fallback_cmap(font_dict, doc, program.as_deref())
+                    } else {
+                        None
+                    };
+                let (fallback, program_source) = match encoding_fallback {
+                    // Primary is rich enough, or the collection reads the
+                    // font: the cheap encoding fallback is the fallback.
+                    Some(collection) => (Some(collection), program_reading),
+                    None if sparse && program_for_fallback => (program_reading, None),
+                    None => (None, program_reading),
                 };
                 // The repair follows the roles to the CMap the entry keeps,
                 // and reads the fallback where it went.
                 let (mut entry, roles) =
                     cmap_entry_with_roles(primary, remapped, fallback, obj_num, false);
                 entry.repair(roles, |target, source| {
+                    let sources: Vec<&ToUnicodeCMap> =
+                        source.into_iter().chain(program_source.as_ref()).collect();
                     repair_control_destinations(
                         target,
-                        repair_source.as_ref().or(source),
+                        &sources,
                         font_dict,
                         doc,
                         program.as_deref(),
@@ -3960,6 +3987,84 @@ endbfrange
     }
 
     #[test]
+    fn a_string_of_mostly_control_destinations_keeps_its_markers() {
+        // One letter and three control destinations: the markers are the
+        // CMap's own reading of those codes, not a sign that the CMap is
+        // the wrong reading of the string, so the string is not abandoned
+        // — while the coverage still counts the three as unmapped.
+        let cmap = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+              4 beginbfchar\n<0001> <0063>\n<0002> <0002>\n<0003> <0003>\n<0004> <0004>\nendbfchar\n",
+        )
+        .unwrap();
+        let (text, stats) = cmap.decode_cids_with_stats(&[0, 1, 0, 2, 0, 3, 0, 4]);
+        assert_eq!(text, "c\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(
+            stats,
+            CidDecodeStats {
+                codes: 4,
+                interpolated: 0,
+                unmapped: 3
+            }
+        );
+        // Codes without any entry still abandon the reading past half.
+        let (text, stats) = cmap.decode_cids_with_stats(&[0, 1, 0, 9, 0, 9, 0, 9]);
+        assert_eq!(text, "");
+        assert_eq!(stats.unmapped, 3);
+    }
+
+    #[test]
+    fn a_repair_reads_the_fallback_first_and_the_program_for_what_it_lacks() {
+        // A rich CMap — twelve entries, so it keeps the primary role — with
+        // two control destinations, at 3 (a ligature) and at 5. The font's
+        // fallback, the reading of its character collection, has code 5
+        // and not code 3; the embedded program names both glyphs. Composed
+        // as the entry builders compose them, the sources read in that
+        // order: the collection's character for 5, the program's ligature
+        // for 3, which the collection could not give.
+        let mut lines = String::from(
+            "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>\n<0005> <0005>\n",
+        );
+        for code in 6..=12u16 {
+            lines.push_str(&format!("<{code:04X}> <{:04X}>\n", 0x60 + code));
+        }
+        let primary = ToUnicodeCMap::parse(
+            format!("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n12 beginbfchar\n{lines}endbfchar\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        let two_byte = |entries: &[(u16, &str)]| {
+            let mut cmap = ToUnicodeCMap::new();
+            cmap.code_byte_length = 2;
+            for &(code, text) in entries {
+                cmap.char_map.insert(code, text.to_string());
+            }
+            cmap.refresh_gap_fills();
+            cmap
+        };
+        let collection = two_byte(&[(1, " "), (2, "!"), (4, "#"), (5, "$")]);
+        let program = two_byte(&[(3, "ff"), (5, "x")]);
+        let (mut entry, roles) = cmap_entry_with_roles(primary, None, Some(collection), 0, false);
+        assert_eq!(roles.source, Some(CMapRole::Fallback));
+        entry.repair(roles, |target, source| {
+            let sources: Vec<&ToUnicodeCMap> = source.into_iter().chain(Some(&program)).collect();
+            repair_control_destinations(
+                target,
+                &sources,
+                &lopdf::Dictionary::new(),
+                &Document::new(),
+                None,
+            );
+        });
+        assert_eq!(entry.primary.lookup(3).as_deref(), Some("ff"));
+        assert_eq!(entry.primary.lookup(5).as_deref(), Some("$"));
+        assert_eq!(
+            entry.primary.decode_cids(&[0, 1, 0, 2, 0, 3, 0, 4, 0, 5]),
+            "coffe$"
+        );
+    }
+
+    #[test]
     fn a_repair_refreshes_the_gaps_the_entries_read() {
         // A at 36, a control destination at 37, C at 38 and E at 40. The
         // run 36..38 does not rise while 37 reads as no text, so the gap at
@@ -3977,7 +4082,7 @@ endbfrange
         program.refresh_gap_fills();
         repair_control_destinations(
             &mut cmap,
-            Some(&program),
+            &[&program],
             &lopdf::Dictionary::new(),
             &Document::new(),
             None,
