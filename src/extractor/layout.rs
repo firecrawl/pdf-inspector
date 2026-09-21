@@ -4041,12 +4041,13 @@ mod tests {
 
     #[test]
     fn is_list_marker_column_detects_bullets() {
-        let items = vec![
-            make_item(1, 90.0, 100.0, "●"),
-            make_item(1, 90.0, 114.0, "●"),
-            make_item(1, 90.0, 128.0, "●"),
-            make_item(1, 90.0, 142.0, "●"),
-        ];
+        // Cover every unambiguous marker, including the newly supported ‣ and ⁃.
+        let markers = ["•", "●", "○", "◦", "▪", "▫", "‣", "⁃"];
+        let items: Vec<TextItem> = markers
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| make_item(1, 90.0, 100.0 + index as f32 * 14.0, marker))
+            .collect();
         let refs: Vec<&TextItem> = items.iter().collect();
         let wrapped: Vec<&&TextItem> = refs.iter().collect();
         assert!(is_list_marker_column(&wrapped));
