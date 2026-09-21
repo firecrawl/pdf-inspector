@@ -747,20 +747,22 @@ fn extract_pages_markdown_mem_impl(
 
         let has_decoding_issue = has_text_quality_issue
             || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
-        if has_decoding_issue {
-            add_ocr_reason(
-                &mut ocr_reasons_by_page,
-                page_1idx,
-                OCR_REASON_SUSPECTED_GARBLED_TEXT,
-            );
-        }
-        // Ahead of `scanned`, which classification's reason list leaves
-        // out for such a page, so the first reason is the same in both.
+        // First among a page's reasons, as classification's
+        // `page_ocr_reasons` lists it too, so both surfaces name the same
+        // first reason: a page whose whole text layer is hidden under a
+        // scan is a scan whatever its fonts are.
         if has_invisible_text_layer {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,
                 page_1idx,
                 OCR_REASON_INVISIBLE_TEXT_LAYER,
+            );
+        }
+        if has_decoding_issue {
+            add_ocr_reason(
+                &mut ocr_reasons_by_page,
+                page_1idx,
+                OCR_REASON_SUSPECTED_GARBLED_TEXT,
             );
         }
         if has_template_image {

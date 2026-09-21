@@ -112,16 +112,23 @@ Changes since 1.22.1.
   classified as a text page, because the operator count never consulted
   the render mode; its raster went unread and the layer, which need not
   say what the page shows, was served as the page. Classification now
-  follows `Tr` through `q`/`Q` and Form XObjects, and flags a page whose
-  every text-showing operator leaves nothing to see under a covering
-  image for OCR with the new reason `invisible_text_layer`
-  (`OCR_REASON_INVISIBLE_TEXT_LAYER`), in `pdf_type`, `pages_needing_ocr`,
-  `ocr_reasons_by_page` and per-page `needs_ocr`/`ocr_reason` alike.
-  Mode-7 text that an image, a shading or a painted path is later drawn
-  through — a title filled with a picture — is visible and not counted.
-  A page whose layer is painted, a page with a visible caption over its
-  image, invisible text with no image under it and an image with no text
-  keep their classification and reasons; what is extracted is unchanged.
+  follows `Tr` and `cm` through `q`/`Q`, and through the Form XObjects
+  the content invokes with `Do`, and flags a page whose every executed
+  text-showing operator leaves nothing to see, while the images it draws
+  cover at least half of the page (each draw clipped to the page; images
+  bound but never drawn, and forms never invoked, do not count), for OCR
+  with the new reason `invisible_text_layer`
+  (`OCR_REASON_INVISIBLE_TEXT_LAYER`) — in `pdf_type`, `pages_needing_ocr`,
+  `ocr_reasons_by_page` and per-page `needs_ocr`/`ocr_reason` alike, and
+  first among a page's reasons on both surfaces. Mode-7 text that an
+  image, a shading, a painted path or visible text is later drawn through
+  — a title filled with a picture — is visible and not counted; a form
+  that paints nothing shows nothing through it. Operators are read past
+  strings, comments and inline image data, so text saying `3 Tr` sets no
+  render mode. A page whose layer is painted, a page with a visible
+  caption over its image, invisible text with no image under it and an
+  image with no text keep their classification and reasons; what is
+  extracted is unchanged.
   ([#566](https://github.com/firecrawl/pdf-inspector/pull/566))
 
 ## [1.22.1] - 2026-09-20
