@@ -330,7 +330,11 @@ fn differences_named_codes(
 /// The glyph is found by CID through the charset of a CID-keyed CFF
 /// program, else through the CIDToGIDMap, else by the CID itself. Nothing
 /// for a simple font, whose blank glyphs are read at decode time, or for a
-/// program that tells nothing of its outlines (see [`ProgramGlyphs`]).
+/// program that tells nothing of its outlines (see [`ProgramGlyphs`]) — nor
+/// for one that outlines nothing at all while more than two of the codes
+/// have glyphs: an invisible text layer's font, whose text is kept, as the
+/// simple-font rule (`blank_glyph_codes`) keeps it; up to two such codes
+/// still read as the space of a subset written for a space painted alone.
 fn blank_cid_glyph_spaces(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
@@ -355,15 +359,23 @@ fn blank_cid_glyph_spaces(
             (None, Some(map)) => map.get(usize::from(cid)).copied().filter(|&gid| gid != 0),
         }
     };
-    codes
+    let mut with_glyph = 0usize;
+    let blanks: Vec<(u16, String)> = codes
         .iter()
         .copied()
         .filter(|&cid| {
-            glyph_of(cid).is_some_and(|gid| glyphs.blank(gid))
-                && cid_advance(cid_font_dict, doc, cid) > 0.0
+            let Some(gid) = glyph_of(cid) else {
+                return false;
+            };
+            with_glyph += 1;
+            glyphs.blank(gid) && cid_advance(cid_font_dict, doc, cid) > 0.0
         })
         .map(|cid| (cid, " ".to_string()))
-        .collect()
+        .collect();
+    if !blanks.is_empty() && with_glyph > 2 && !glyphs.any_outline() {
+        return Vec::new();
+    }
+    blanks
 }
 
 /// The glyphs of a CIDFont's embedded program, as far as a blank among
@@ -403,6 +415,19 @@ impl<'a> ProgramGlyphs<'a> {
             .filter(|cff| cff.glyph_cid(ttf_parser::GlyphId(0)).is_some())
             .map(|cff| cff_cid_to_gid(&cff));
         Some(Self { outlines, charset })
+    }
+
+    /// Whether any glyph of the program has an outline. A program with none
+    /// is an invisible text layer's, or a subset holding a lone blank glyph.
+    fn any_outline(&self) -> bool {
+        match &self.outlines {
+            Outlines::Sfnt(face) => (0..face.number_of_glyphs())
+                .any(|gid| face.glyph_bounding_box(ttf_parser::GlyphId(gid)).is_some()),
+            Outlines::Cff(cff) => (0..cff.number_of_glyphs()).any(|gid| {
+                cff.outline(ttf_parser::GlyphId(gid), &mut NoOutline)
+                    .is_ok()
+            }),
+        }
     }
 
     /// Whether glyph `gid` has no outline. An index at or past the

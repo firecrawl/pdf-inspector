@@ -5897,6 +5897,34 @@ mod tests {
         assert_eq!(decode(true), "co ee");
     }
 
+    /// A program that outlines nothing at all, with more than two codes of
+    /// glyphs under repair, is an invisible text layer's — as for a simple
+    /// font — and tells no blank: its control destinations stay marked,
+    /// where up to two such codes still read as the space of a subset
+    /// written for a space painted on its own.
+    #[test]
+    fn a_program_outlining_nothing_tells_no_blank_for_an_invisible_layer() {
+        // Five glyphs, none outlined; three control destinations at CIDs
+        // 2, 3 and 4, each with a glyph and an advance.
+        let (doc, tounicode_obj, page_id) = cid_font_doc(
+            "<0001> <0063>\n<0002> <0002>\n<0003> <0003>\n<0004> <0004>",
+            sfnt_with_glyph_names(&[None; 5]),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(
+            decode_page_font_string(
+                &doc,
+                tounicode_obj,
+                page_id,
+                true,
+                &[0, 1, 0, 2, 0, 3, 0, 4]
+            ),
+            "c\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+    }
+
     /// An odd-length string through a Type0 font none of whose bytes any
     /// CMap reads: its bytes are counted once, as codes the CMap did not
     /// cover, though the two-byte reading is tried over them afterwards.
