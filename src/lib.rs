@@ -718,6 +718,7 @@ fn extract_pages_markdown_mem_impl(
             let image_regions: Vec<PdfRect> = page_items
                 .iter()
                 .filter_map(supplemental_ocr_image_region)
+                .filter(|region| !region_holds_native_text(&page_items, region))
                 .collect();
             if !image_regions.is_empty() {
                 supplemental_ocr_regions.insert(page_1idx, image_regions);
@@ -901,6 +902,48 @@ fn supplemental_ocr_image_region(item: &TextItem) -> Option<PdfRect> {
             page: item.page,
         },
     )
+}
+
+/// Whether native text already covers a meaningful share of an image region.
+///
+/// Supplemental OCR exists to recover rasterized document structure (a table
+/// shipped as a picture) that the native text layer cannot see. When the
+/// region is already populated by native text, the image is a watermark,
+/// stamp, or background sitting under or over real words: OCR could only
+/// re-read text the extractor already has, and the pixel preflight cannot
+/// tell the image's own ink from the text beneath it. Skipping such regions
+/// keeps the OCR budget proportional to what OCR can add — a court record
+/// carrying a masked 342×127 pt watermark on every page otherwise routed 42
+/// of 50 pages to full-page OCR against 14 recommended by the detector.
+#[cfg(any(test, all(feature = "ocr", not(target_arch = "wasm32"))))]
+fn region_holds_native_text(items: &[TextItem], region: &PdfRect) -> bool {
+    /// Share of the region's area that native text boxes must cover. A
+    /// caption line inside a genuine table image stays far below this; body
+    /// text running under a watermark covers a third or more.
+    const MIN_NATIVE_TEXT_COVERAGE: f32 = 0.05;
+
+    let region_area = region.width * region.height;
+    if !region_area.is_finite() || region_area <= 0.0 {
+        return false;
+    }
+    let right = region.x + region.width;
+    let top = region.y + region.height;
+    let covered: f32 = items
+        .iter()
+        .filter(|item| {
+            matches!(item.item_type, types::ItemType::Text)
+                && item.page == region.page
+                && !item.text.trim().is_empty()
+        })
+        .map(|item| {
+            let x0 = item.x.min(item.x + item.width).max(region.x);
+            let x1 = item.x.max(item.x + item.width).min(right);
+            let y0 = item.y.min(item.y + item.height).max(region.y);
+            let y1 = item.y.max(item.y + item.height).min(top);
+            (x1 - x0).max(0.0) * (y1 - y0).max(0.0)
+        })
+        .sum();
+    covered / region_area >= MIN_NATIVE_TEXT_COVERAGE
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -7216,6 +7259,47 @@ mod tests {
         assert_eq!(region.y, -90.0);
         assert_eq!(region.width, 200.0);
         assert_eq!(region.height, 120.0);
+    }
+
+    #[test]
+    fn supplemental_ocr_regions_skip_images_covered_by_native_text() {
+        // A 342×127 pt masked watermark drawn over body text (x 20..362, y 30..157).
+        let region = supplemental_ocr_image_region(&test_image_item(342.0, 127.0)).unwrap();
+        let body: Vec<TextItem> = (0..6)
+            .map(|line| {
+                test_item(
+                    "본문 텍스트 줄",
+                    25.0,
+                    35.0 + line as f32 * 18.0,
+                    300.0,
+                    10.0,
+                )
+            })
+            .collect();
+        assert!(region_holds_native_text(&body, &region));
+
+        // A single caption inside a genuine table image does not disqualify it.
+        let caption = vec![test_item("Table 1", 25.0, 35.0, 60.0, 8.0)];
+        assert!(!region_holds_native_text(&caption, &region));
+
+        // Text beside the image, on another page, blank, or image items never count.
+        let beside = vec![test_item("beside", 400.0, 35.0, 300.0, 100.0)];
+        assert!(!region_holds_native_text(&beside, &region));
+        let other_page = vec![TextItem {
+            page: 2,
+            ..test_item("elsewhere", 25.0, 35.0, 300.0, 100.0)
+        }];
+        assert!(!region_holds_native_text(&other_page, &region));
+        let blank = vec![test_item("   ", 25.0, 35.0, 300.0, 100.0)];
+        assert!(!region_holds_native_text(&blank, &region));
+        assert!(!region_holds_native_text(
+            &[test_image_item(342.0, 127.0)],
+            &region
+        ));
+
+        // Negative-extent items are normalized the same way as regions.
+        let flipped = vec![test_item("flipped", 325.0, 135.0, -300.0, -100.0)];
+        assert!(region_holds_native_text(&flipped, &region));
     }
 
     #[test]
