@@ -2805,9 +2805,15 @@ mod tests {
         prose.text = "This paragraph continues below the chart into the next prose column".into();
         assert!(!item_is_in_chart_region(&prose, &regions));
 
-        let mut bullet = make_item_w(340.0, 90.0, 5.0, 1);
-        bullet.text = "•".into();
-        assert!(!item_is_in_chart_region(&bullet, &regions));
+        // Pin every chart-padding-guarded standalone glyph (not only •).
+        for glyph in ["•", "▪", "▫", "‣", "⁃"] {
+            let mut bullet = make_item_w(340.0, 90.0, 5.0, 1);
+            bullet.text = glyph.into();
+            assert!(
+                !item_is_in_chart_region(&bullet, &regions),
+                "standalone {glyph} near chart padding must not be claimed as a chart label"
+            );
+        }
     }
 
     #[test]
