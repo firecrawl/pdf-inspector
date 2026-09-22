@@ -1,0 +1,36 @@
+tests/test_python.py
+  s_9d37727abe0b7e::t_90cd33443db8b1 350-403
+CHANGELOG.md
+  s_9d37727abe0b7e::t_90cd33443db8b1 28-30,106-126
+src/extractor/page_box.rs
+  s_9d37727abe0b7e::t_c5e97c44ff7f76 14,71-79,88,90,111-112,415,427-429,432-433,435-440,446
+  s_9d37727abe0b7e::t_90cd33443db8b1 1-13,15-70,80-87,89,91-110,113-414,416-426,430-431,434,441-445,447-449
+docs/publishing.md
+  s_9d37727abe0b7e::t_90cd33443db8b1 28-29,35-36
+pdf_inspector.pyi
+  s_9d37727abe0b7e::t_90cd33443db8b1 87-97,100,102-103,280-297,301-304,337-340,353
+napi/test.mjs
+  s_9d37727abe0b7e::t_90cd33443db8b1 183-212
+src/tables/structured.rs
+  s_9d37727abe0b7e::t_90cd33443db8b1 33-34
+src/python.rs
+  s_9d37727abe0b7e::t_90cd33443db8b1 346-354,360,363-364,880-890,982-983,1006-1009,1027-1030
+napi/README.md
+  s_9d37727abe0b7e::t_90cd33443db8b1 93-114,128,171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "73ef2bdc0ecfc9c19fb9257c0bbfc51d81de975a",
+  "prompts": {},
+  "sessions": {
+    "s_9d37727abe0b7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc8426ba-5c23-49c3-a8f8-b78998896dc0",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

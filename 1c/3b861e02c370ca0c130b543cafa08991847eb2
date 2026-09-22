@@ -1,0 +1,32 @@
+src/tables/detect_heuristic.rs
+  s_e0bc3a40268aa0::t_2bc9e8c352e75f 1962-1966,1969-1981
+  s_e0bc3a40268aa0::t_19684ba2f95e8f 234
+  s_e0bc3a40268aa0::t_4ae267ba35d5e0 140,142-145
+  s_e0bc3a40268aa0::t_1a26a18a53e6e2 305-306
+  s_e0bc3a40268aa0::t_53bf0f598a6c43 1967-1968
+  s_e0bc3a40268aa0::t_68a5f0804335a5 146,168,170,172-179,220
+  s_e0bc3a40268aa0::t_4e48378387c0dc 1942-1961
+  s_e0bc3a40268aa0::t_c036dea5c3a923 180,244
+  s_e0bc3a40268aa0::t_d985ed0226c842 141,147-156,163,166-167,181-194,196,200,204-211,215-219,221,225,232,238,254,266,269-273,292-294
+  s_e0bc3a40268aa0::t_5c150269e60557 212-214,291
+  s_e0bc3a40268aa0::t_bf6b2654d0b57d 289-290
+  s_e0bc3a40268aa0::t_8b9659e7511bd4 1925-1941
+  s_e0bc3a40268aa0::t_7fffd35a899db0 230-231,233,235-237,242-243,245-253,255-265,268
+  s_e0bc3a40268aa0::t_33ed0e27880518 228-229,239-241,267,274-288,295,325,377-381
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "1c3b861e02c370ca0c130b543cafa08991847eb2",
+  "prompts": {},
+  "sessions": {
+    "s_e0bc3a40268aa0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc0f2-05c3-72d2-be98-413996646886",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

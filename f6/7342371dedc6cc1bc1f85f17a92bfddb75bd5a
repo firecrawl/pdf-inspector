@@ -1,0 +1,21 @@
+src/vision/fusion.rs
+  s_509f955ca4bd26::t_aa175ee4ae7472 1236-1273
+  s_509f955ca4bd26::t_f13372c40bc12b 282-283,296,299,305-306,367,386,396,408,425,445
+  s_509f955ca4bd26::t_2c8de7082b8660 284-285,294,298
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f67342371dedc6cc1bc1f85f17a92bfddb75bd5a",
+  "prompts": {},
+  "sessions": {
+    "s_509f955ca4bd26": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fedba-8db3-7521-9f16-05cccc9fa3fb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

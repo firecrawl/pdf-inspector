@@ -1,0 +1,19 @@
+src/tables/detect_rects.rs
+  s_445161c5f6e19f::t_c8237a5adee254 2225,2228,3469-3477
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "eeeafff2f9c0eef76d457adeb09aa289e321d975",
+  "prompts": {},
+  "sessions": {
+    "s_445161c5f6e19f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc8c2-c14f-7122-b05b-1db7eaf7f16c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

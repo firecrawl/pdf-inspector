@@ -1,0 +1,39 @@
+src/extractor/content_stream.rs
+  s_4782d1d6911bf7::t_cc83c88a609508 403-404
+src/extractor/xobjects.rs
+  s_4782d1d6911bf7::t_cc83c88a609508 336-337
+src/extractor/fonts.rs
+  s_4782d1d6911bf7::t_cc83c88a609508 763,784,828,832,844-852,882-885,901-903,923-929,1255-1257,1265-1267,2754-2755
+  s_4782d1d6911bf7::t_caec7a5d4d96ee 904
+  s_4782d1d6911bf7::t_d16ef49449220f 825-827,829,865,867
+  s_4782d1d6911bf7::t_b99b4965e5b12b 857-859,866
+  s_4782d1d6911bf7::t_c0533934e9eb1d 821-824,839-843,893-895
+  s_4782d1d6911bf7::t_a10324589a64a2 771-772,780-781,785-794,816-820,830-831,833-838,853-856,860-864,868-881,886-892,896-898,922,1619-1620,2847-2850
+  s_4782d1d6911bf7::t_09c2e3d8a52c30 899-900,905-921
+  s_4782d1d6911bf7::t_aa216be6857b64 801-805,809-812
+  s_4782d1d6911bf7::t_def0379275fc75 800,806-808,813-815,1461-1470,1473,1475-1479,1481-1485,1487-1504,1506,1617-1618,1621,1626,1635-1639,1641
+src/extractor/blank_glyph_tests.rs
+  s_4782d1d6911bf7::t_27f53764e9bd46 1-225
+  s_4782d1d6911bf7::t_5ad194c4a02516 226-227,234-235,243-244
+  s_4782d1d6911bf7::t_bbfc6b0f8a119a 228-233,236-242
+  s_4782d1d6911bf7::t_aa216be6857b64 245-253
+  s_4782d1d6911bf7::t_c0533934e9eb1d 254-275
+src/types.rs
+  s_4782d1d6911bf7::t_a10324589a64a2 24-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e270ec27e75e7e352edfa0cab3f083ac3e5fd874",
+  "prompts": {},
+  "sessions": {
+    "s_4782d1d6911bf7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5fe77c99-84cc-4a9c-87f6-717508ab9d29",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+Cargo.toml
+  s_a0d60a8caf6eae::t_5c481e9f1005a0 5-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4813832f48eccc691a4d44e6976684db5d992a36",
+  "prompts": {},
+  "sessions": {
+    "s_a0d60a8caf6eae": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "acc53771-94b0-41b3-a525-1b4392792e3c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

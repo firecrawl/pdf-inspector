@@ -1,0 +1,39 @@
+tests/snapshots/shannon-entropy-p1-2.md
+  s_0ebb7b0328103c::t_9955f224e7cb16 13,16-17,37-38
+src/markdown/postprocess.rs
+  s_0ebb7b0328103c::t_7cb4854f6a1d54 210-215,218,221
+  s_0ebb7b0328103c::t_518f4e5a05e05b 248-251
+  s_0ebb7b0328103c::t_5b1f8e6963a528 588-598
+  s_0ebb7b0328103c::t_caccc60341b3a4 277
+  s_0ebb7b0328103c::t_5dd4c703e8ff1d 537-576,599-641
+  s_0ebb7b0328103c::t_09648d83ffdc1c 175-184
+  s_0ebb7b0328103c::t_3c51b6f6f5e8a4 276,278-279
+  s_0ebb7b0328103c::t_9482bc256b1a04 155-161,164-165
+  s_0ebb7b0328103c::t_135a2b834e83e3 234-236
+  s_0ebb7b0328103c::t_e28193c276218c 577-587
+  s_0ebb7b0328103c::t_a811085e632aaa 146-154,166-174,185-195,206-209,216-217,219-220,222-233,237-241,252-275,280-296
+  s_0ebb7b0328103c::t_46486727a26a04 162-163
+  s_0ebb7b0328103c::t_1a02b207b0967d 205
+  s_0ebb7b0328103c::t_45be210dd01684 242-247
+  s_0ebb7b0328103c::t_3f220ac3497951 196-204
+tests/snapshots/real-estate-pricing.md
+  s_0ebb7b0328103c::t_9955f224e7cb16 5,18,45,49,51
+tests/snapshots/td9264.md
+  s_0ebb7b0328103c::t_46486727a26a04 44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5ebb690170343ca43dba482bced4d4742e6e003c",
+  "prompts": {},
+  "sessions": {
+    "s_0ebb7b0328103c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4d1e95cd-1328-4ff8-bea8-b678f87314d0",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

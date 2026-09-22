@@ -1,0 +1,25 @@
+src/extractor/fonts.rs
+  s_12ce94366af290::t_8f293685a1725d 201-220
+  s_12ce94366af290::t_f5931473515237 1660-1665,1668-1669,1672-1675,1704-1705
+  s_12ce94366af290::t_182e28f1a330bb 1659
+  s_12ce94366af290::t_b51ff8b01ff7b6 1657-1658,1666-1667,1670-1671,1676-1703
+  s_12ce94366af290::t_e5eda3a546a70b 221
+src/extractor/base14.rs
+  s_12ce94366af290::t_358ff7ff10a039 153,155,157,245,247,569-587,640-646
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2a7ad5891da309fac086240c4149891cb82e7c7d",
+  "prompts": {},
+  "sessions": {
+    "s_12ce94366af290": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e7e6d727-0ee7-4dc7-982d-31fba9d7e842",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+tests/snapshots/shannon-entropy-p1-2.md
+  s_8ac8f3a6d59f12::t_d6a9c772e0ae34 20,33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "dafcb264171237ca3105e18df6a92cf1843720ae",
+  "prompts": {},
+  "sessions": {
+    "s_8ac8f3a6d59f12": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5323a606-1557-4d25-ab13-436045d9d2c7",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,105 @@
+tests/integration_tests.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 299,330,1354-1492
+src/extractor/geometry.rs
+  s_9d37727abe0b7e::t_92d95be62bea2e 185
+src/tables/cell_text.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 1-241,244-312,315-472
+  s_9d37727abe0b7e::t_dc976e5668717b 242-243,313-314
+src/tables/detect_lines.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 12,229-233,314,317,448,466-471,871,876-881,991,998-1003,1395,2144
+tests/snapshots/author_block_superscripts.md
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 1-8
+src/extractor/links.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 128,465
+src/tables/detect_rects.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 1130-1131,1148-1149,1156-1163,1721-1722,1724,1753,1758-1759,1768-1782,3587,5291,5606
+src/markdown/convert.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 1583
+CHANGELOG.md
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 1-28,46-64,88-97
+  s_9d37727abe0b7e::t_81eadacfbf1ece 29-45,65-87,98-107
+src/text_utils.rs
+  s_9d37727abe0b7e::t_dc976e5668717b 1846
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 1355,1558,1683,1765
+  s_9d37727abe0b7e::t_92d95be62bea2e 940
+pdf_inspector.pyi
+  s_9d37727abe0b7e::t_92d95be62bea2e 104-105
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 114-119
+src/markdown/preprocess.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 256
+tests/test_python.py
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 19-23,44-47,107-120,537-547
+src/extractor/layout.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 508-509,511,594,602,604,610,2933-2935,2937,2943-2946,2956,3038,3085,3836
+src/tables/financial.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 118
+src/markdown/heading.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 531,693
+src/lib.rs
+  s_9d37727abe0b7e::t_dc976e5668717b 7832
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 843,3731-3735,3737,3744,3749,5527,5807,6641
+  s_9d37727abe0b7e::t_92d95be62bea2e 7987
+src/markdown/mod.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 2699
+src/tables/grid.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 477,822,864
+src/tables/format.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 157-166,333-339,344,347,349-351,355-359,365,1069-1077
+src/vision/pdfium.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 268
+src/extractor/scripts.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 1-486,489-848
+  s_9d37727abe0b7e::t_dc976e5668717b 487-488
+.github/workflows/ci.yml
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 304-312
+src/markdown/analysis.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 859
+src/extractor/underline.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 756
+src/types.rs
+  s_9d37727abe0b7e::t_92d95be62bea2e 138-140
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 181-207,281-373,424-432,440-469,490,512-526,546-552,558-566,568-571,591-602,648,661-848
+src/vision/pipeline.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 1154
+docs/python.md
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 230
+tests/snapshots/thermo-freon12.md
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 17-21,25-26,41-42,48,52
+src/extractor/xobjects.rs
+  s_9d37727abe0b7e::t_3570785b6518d2 242,255,272,401-406,483,1170
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 522,777,1008
+src/vision/fusion.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 624,1258,1278,1308,1328
+src/tables/mod.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 5,100-106,126,146,153-158,315,341,508,537-539,541-546,1060-1061,1065,1068,1527,1550
+src/markdown/furniture.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 639
+src/tables/detect_struct.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 474,479-480,490-494,608
+tests/snapshots/shannon-entropy-p1-2.md
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 20,23,33
+src/tables/detect_heuristic.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 6,10,34-37,158-168,1036,1078,2244-2248,2278,2424
+src/extractor/content_stream.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 631,875,1005,1053,1223
+  s_9d37727abe0b7e::t_3570785b6518d2 1067
+  s_9d37727abe0b7e::t_dc976e5668717b 2682,2765
+src/extractor/reading_order.rs
+  s_9d37727abe0b7e::t_019db9cd7eb3ce 71,76,79-80,83,405,407,455
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e0446ae82fb105e15c77a0d691ed07432f72b838",
+  "prompts": {},
+  "sessions": {
+    "s_9d37727abe0b7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc8426ba-5c23-49c3-a8f8-b78998896dc0",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

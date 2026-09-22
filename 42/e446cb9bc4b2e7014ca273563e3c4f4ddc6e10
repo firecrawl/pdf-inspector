@@ -1,0 +1,21 @@
+src/extractor/mod.rs
+  s_a0d60a8caf6eae::t_9fcecbdb5c2717 2869-2874
+src/text_utils.rs
+  s_a0d60a8caf6eae::t_eae0c4d1a2d186 135-137,141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "42e446cb9bc4b2e7014ca273563e3c4f4ddc6e10",
+  "prompts": {},
+  "sessions": {
+    "s_a0d60a8caf6eae": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "acc53771-94b0-41b3-a525-1b4392792e3c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

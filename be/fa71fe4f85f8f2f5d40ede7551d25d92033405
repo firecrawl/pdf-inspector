@@ -1,0 +1,19 @@
+tests/test_python.py
+  s_1fb9b83ffa44a1::t_533ea44535093b 108-109,111,117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "befa71fe4f85f8f2f5d40ede7551d25d92033405",
+  "prompts": {},
+  "sessions": {
+    "s_1fb9b83ffa44a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "34a3cd4d-a5f6-42e2-800a-7e397fc7a8b3",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

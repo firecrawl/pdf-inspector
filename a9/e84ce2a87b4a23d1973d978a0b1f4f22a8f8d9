@@ -1,0 +1,31 @@
+src/extractor/fonts.rs
+  s_445161c5f6e19f::t_6ebc03ffa75cb2 141-227,239-241,246-303,1620-1704
+src/extractor/content_stream.rs
+  s_445161c5f6e19f::t_6ebc03ffa75cb2 17-19,180,517-518,689-690,797-798,950-951
+src/extractor/base14.rs
+  s_445161c5f6e19f::t_6ebc03ffa75cb2 1-649
+src/extractor/mod.rs
+  s_445161c5f6e19f::t_6ebc03ffa75cb2 5
+src/extractor/xobjects.rs
+  s_445161c5f6e19f::t_6ebc03ffa75cb2 11-13,170,418-419,578-579
+tests/integration_tests.rs
+  s_445161c5f6e19f::t_6ebc03ffa75cb2 1313-1324
+tests/snapshots/shannon-entropy-p1-2.md
+  s_445161c5f6e19f::t_6ebc03ffa75cb2 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "a9e84ce2a87b4a23d1973d978a0b1f4f22a8f8d9",
+  "prompts": {},
+  "sessions": {
+    "s_445161c5f6e19f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc8c2-c14f-7122-b05b-1db7eaf7f16c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

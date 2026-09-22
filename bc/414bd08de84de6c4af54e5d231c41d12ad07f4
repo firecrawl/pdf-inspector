@@ -1,0 +1,57 @@
+src/vision/contracts.rs
+  s_3fa7a2abc03ac9::t_cdbd95ddcf8317 240-246
+src/vision/pipeline.rs
+  s_3fa7a2abc03ac9::t_3fc1b8bf392872 34-36,40
+  s_3fa7a2abc03ac9::t_a757d7833e7519 457
+  s_3fa7a2abc03ac9::t_e03bee383f081f 948-951
+  s_3fa7a2abc03ac9::t_98057affdc5167 43-44
+  s_3fa7a2abc03ac9::t_decb02e08b3e3c 37-39,41-42
+  s_3fa7a2abc03ac9::t_76cb460eb855a3 941-947,952-953
+src/vision/oar.rs
+  s_3fa7a2abc03ac9::t_a1be8486044c53 261
+  s_3fa7a2abc03ac9::t_d31ef127145e42 362-363
+  s_3fa7a2abc03ac9::t_1f6ac60495908b 254,260,262-263,265,268,270
+  s_3fa7a2abc03ac9::t_3e949e13e67f88 129
+  s_3fa7a2abc03ac9::t_60c78f7b4f29d5 342
+  s_3fa7a2abc03ac9::t_a7644738226625 346-349,351,354-355,387-388,393,396
+  s_3fa7a2abc03ac9::t_441e86041eeed0 171
+  s_3fa7a2abc03ac9::t_e6dac5463eeb7b 448-451,453-463,465
+  s_3fa7a2abc03ac9::t_fd2f22c8bc3f56 290,298,303,307,323-324
+  s_3fa7a2abc03ac9::t_998c3ce041c49c 352-353
+  s_3fa7a2abc03ac9::t_6bfe1978e9bf52 235,252,280-289,291-297,299-302,304-306,308-322,325-335
+  s_3fa7a2abc03ac9::t_56aac161a45e0d 191,195-199,210-211,219
+  s_3fa7a2abc03ac9::t_9ec39b971edc32 11
+  s_3fa7a2abc03ac9::t_13e10e0f973515 515,522-525
+  s_3fa7a2abc03ac9::t_ae5699b05695f9 430-447
+  s_3fa7a2abc03ac9::t_d07869f8250d48 531-538
+  s_3fa7a2abc03ac9::t_1221f4fca019e4 685-686,690-691
+  s_3fa7a2abc03ac9::t_40d8793b47b7df 98-99,106-108,119
+  s_3fa7a2abc03ac9::t_fafea40f78cb3d 452
+  s_3fa7a2abc03ac9::t_ec674822d094c5 513-514,516,518-521,526-527
+  s_3fa7a2abc03ac9::t_c68e71c26fcb10 125-127,130-134
+  s_3fa7a2abc03ac9::t_ff0387feadecab 76-97,118,121,135-170,172-178,192-194,221,233-234,236-249,251,253,255-259,264,266-267,269,271-279,350
+  s_3fa7a2abc03ac9::t_f82d4f0eb7ee68 111
+  s_3fa7a2abc03ac9::t_5d356c3f734366 179-190,200-209,212-218,220,222
+  s_3fa7a2abc03ac9::t_81beacd7d84c6e 357,360-361,364-374
+  s_3fa7a2abc03ac9::t_040490f258a831 805-842
+  s_3fa7a2abc03ac9::t_a22b932b2c64c4 100-105,109-110,117,120,128
+  s_3fa7a2abc03ac9::t_bf965b248bf88e 345,356
+  s_3fa7a2abc03ac9::t_818e3ac39d9267 4,9-10
+  s_3fa7a2abc03ac9::t_edfd64fa5e2984 512,517,528-530
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "bc414bd08de84de6c4af54e5d231c41d12ad07f4",
+  "prompts": {},
+  "sessions": {
+    "s_3fa7a2abc03ac9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9bb20049-a216-4dbf-9154-e1bfc58f484d",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}

@@ -1,0 +1,28 @@
+src/extractor/content_decode.rs
+  s_8b81192caa100a::t_da86024c0da552 1-97,102-195,199-225,230-235,240-265
+  s_8b81192caa100a::t_f6d1ee51de765c 98-101,196-198,226-229,236-239
+src/extractor/content_stream.rs
+  s_8b81192caa100a::t_f077f712d88fcb 257-270
+  s_8b81192caa100a::t_2a9aeff4f4a7cf 1940-1942,1945-1954
+  s_8b81192caa100a::t_f6d1ee51de765c 1943-1944
+src/extractor/xobjects.rs
+  s_8b81192caa100a::t_316601732be071 235-240
+src/extractor/mod.rs
+  s_8b81192caa100a::t_890cea8eaffc5e 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "7ea39eeca2724c44f2815f3e343347eb76c2f0cb",
+  "prompts": {},
+  "sessions": {
+    "s_8b81192caa100a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "69c52882-fd38-4082-bcc6-5f7987f37382",
+        "model": "grok-4.6"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

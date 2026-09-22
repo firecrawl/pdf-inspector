@@ -1,0 +1,19 @@
+src/extractor/geometry.rs
+  s_9d37727abe0b7e::t_62c52d2aac8b86 129,142-148,183-189,204,206,507,510,534-535,543,546-547,555,559-567,569-578,585-587
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3f619606852f65bfaff756d10c67325a456ca13f",
+  "prompts": {},
+  "sessions": {
+    "s_9d37727abe0b7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc8426ba-5c23-49c3-a8f8-b78998896dc0",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

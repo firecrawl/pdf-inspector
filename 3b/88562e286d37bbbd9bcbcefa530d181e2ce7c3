@@ -1,0 +1,33 @@
+src/lib.rs
+  s_eaf3474cde5240::t_e0fec78c22fcb9 1060-1063,1065-1081,1101-1110,1122-1123,1251,1281-1298,1583-1586,1604-1620,2526-2527,2586-2600,3393-3407
+src/extractor/mod.rs
+  s_eaf3474cde5240::t_e0fec78c22fcb9 168-222
+wasm/Cargo.toml
+  s_eaf3474cde5240::t_10a8517237b187 3
+napi/Cargo.toml
+  s_eaf3474cde5240::t_10a8517237b187 3
+site/index.html
+  s_eaf3474cde5240::t_10a8517237b187 978
+napi/package.json
+  s_eaf3474cde5240::t_10a8517237b187 3,55-60
+pyproject.toml
+  s_eaf3474cde5240::t_10a8517237b187 9
+Cargo.toml
+  s_eaf3474cde5240::t_10a8517237b187 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3b88562e286d37bbbd9bcbcefa530d181e2ce7c3",
+  "prompts": {},
+  "sessions": {
+    "s_eaf3474cde5240": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5c7d2be-9631-4403-bebc-f02f86e58562",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": null
+    }
+  }
+}

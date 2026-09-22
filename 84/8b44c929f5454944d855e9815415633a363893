@@ -1,0 +1,21 @@
+src/extractor/clip_boundaries.rs
+  s_f5ff107f39c26a::t_d65a615f85313c 153-157
+tests/integration_tests.rs
+  s_f5ff107f39c26a::t_79ed0c33adefeb 5195-5217,5219-5226,5228-5229,5231,5233-5244,5248-5258
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "848b44c929f5454944d855e9815415633a363893",
+  "prompts": {},
+  "sessions": {
+    "s_f5ff107f39c26a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07e0d-7783-7e81-b6a9-5492ed984ceb",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,66 @@
+napi/package.json
+  s_eaf3474cde5240::t_10a8517237b187 3,55-60
+docs/python.md
+  s_eaf3474cde5240::t_fd6f5647c8d5c5 80-82,134,136,213-214
+pdf_inspector.pyi
+  s_eaf3474cde5240::t_7fa71bc8beb59a 87-95,98,100-101,234-246,250-253,286-288,301
+src/python.rs
+  s_eaf3474cde5240::t_7fa71bc8beb59a 346-351,357,360-361,855-864,879-880,903-905,923-925
+src/types.rs
+  s_eaf3474cde5240::t_3a892752ac02f0 96-109,114-115,117-119
+src/extractor/mod.rs
+  s_eaf3474cde5240::t_5b8f8316c5ac5c 11,27,79-91,99-100,114-115,135,139-140,145-146,164,183-219,249-256,269,292,313-320,329,340-341,381,384,485-491,509-513,518,520-532
+napi/test.mjs
+  s_eaf3474cde5240::t_7fa71bc8beb59a 140-169
+docs/rust-api.md
+  s_eaf3474cde5240::t_fd6f5647c8d5c5 490-502,522,545
+pyproject.toml
+  s_eaf3474cde5240::t_10a8517237b187 9
+wasm/Cargo.toml
+  s_eaf3474cde5240::t_10a8517237b187 3
+CHANGELOG.md
+  s_eaf3474cde5240::t_fd6f5647c8d5c5 1-37
+tests/test_python.py
+  s_eaf3474cde5240::t_7fa71bc8beb59a 325-372
+tests/integration_tests.rs
+  s_eaf3474cde5240::t_dd1abdc1c3459c 4520-4522,4598,4651-4655
+  s_eaf3474cde5240::t_b69d2a47b3e083 18-22,25-27,53,2421-2428,2500-2506,2508-2517,4470-4519,4523-4597,4599-4650,4656
+site/index.html
+  s_eaf3474cde5240::t_10a8517237b187 978
+napi/Cargo.toml
+  s_eaf3474cde5240::t_10a8517237b187 3
+src/extractor/page_box.rs
+  s_eaf3474cde5240::t_a7186092b8c7f5 229-232,246-249,261-264,286-289,299-302
+  s_eaf3474cde5240::t_f25ba658bccfbe 1-57,65-228,233-245,250-260,265-285,290-298,303-394
+src/lib.rs
+  s_eaf3474cde5240::t_a7186092b8c7f5 1601,3383
+  s_eaf3474cde5240::t_629a4894058887 1022-1026,1060-1064,1136,1251,1281-1283,1285,1295,1580-1583,1602-1603,1613,2519-2520,2579-2581,2593,3384,3398,3586-3588,3706-3708
+napi/src/lib.rs
+  s_eaf3474cde5240::t_7fa71bc8beb59a 91-96,100,102-103,133-135,489-493,598-601,626-627,649-650,703-704,754-755
+docs/publishing.md
+  s_eaf3474cde5240::t_fd6f5647c8d5c5 28-29,35-36
+napi/README.md
+  s_eaf3474cde5240::t_fd6f5647c8d5c5 93-109,123,166
+README.md
+  s_eaf3474cde5240::t_fd6f5647c8d5c5 148
+Cargo.toml
+  s_eaf3474cde5240::t_10a8517237b187 3
+src/tables/structured.rs
+  s_eaf3474cde5240::t_3a892752ac02f0 33-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2c7c9ef78227e7dc667b4dea73e10e3e105e4c1a",
+  "prompts": {},
+  "sessions": {
+    "s_eaf3474cde5240": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5c7d2be-9631-4403-bebc-f02f86e58562",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

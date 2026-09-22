@@ -1,0 +1,49 @@
+src/lib.rs
+  s_509f955ca4bd26::t_4a6630c54807d5 462-463
+  s_509f955ca4bd26::t_878faee6f2325a 464-481,483,598,657-667
+Cargo.toml
+  s_509f955ca4bd26::t_0041d269377af8 64-66,85
+  s_509f955ca4bd26::t_878faee6f2325a 88-90
+docs/rust-api.md
+  s_509f955ca4bd26::t_643cac9d911ceb 140-145,246-272,274-307
+  s_509f955ca4bd26::t_9e44b917e1e6d2 273
+  s_509f955ca4bd26::t_6323892d8d2e23 309-340
+  s_509f955ca4bd26::t_c4cd7b817f4cf3 341-344,348-395
+  s_509f955ca4bd26::t_af1bf8a99e3862 345-347
+src/bin/pdf2md.rs
+  s_509f955ca4bd26::t_ecd3852c4a1e5b 4,111,119,227,456,463
+  s_509f955ca4bd26::t_f0753c0d3aff67 5-8,450-452,478-479,483-484,488-492
+  s_509f955ca4bd26::t_9d494d95dcbb34 112-118,120-126,133-167,169-177,179-182,195-196,198,200-203,205-206,208,211-226,228-238,378-383,395-398,429-449,453-455,457-462,464-477,480-482,485-487,493-564
+  s_509f955ca4bd26::t_af1bf8a99e3862 127-132,168,178,183-194,197,199,204,207,209-210
+src/vision/mod.rs
+  s_509f955ca4bd26::t_0041d269377af8 13-14,23-24,48-50
+  s_509f955ca4bd26::t_4d86b48efa7011 15-16,39-43
+  s_509f955ca4bd26::t_878faee6f2325a 21-22,51-55
+  s_509f955ca4bd26::t_40162511769d70 35-36
+  s_509f955ca4bd26::t_2bdefc82ef64f8 59
+src/vision/pipeline.rs
+  s_509f955ca4bd26::t_a89815ed763d35 1-112,115-156,163-187,194-246,248-317,324-337,339-347,350-359,363-395,406-408
+  s_509f955ca4bd26::t_af1bf8a99e3862 113-114,188-193,247,338,396-405
+  s_509f955ca4bd26::t_c4cd7b817f4cf3 157-162,318-323
+  s_509f955ca4bd26::t_4a6630c54807d5 348-349,360-362
+tests/local_ocr_tests.rs
+  s_509f955ca4bd26::t_5b6725b9b5dd17 3-5,107-122,124-131,133-134
+  s_509f955ca4bd26::t_df910d9e6a6b09 6,132
+  s_509f955ca4bd26::t_8760054f5dface 123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6b212686a993821d30f22ff770984f514ec2fa67",
+  "prompts": {},
+  "sessions": {
+    "s_509f955ca4bd26": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fedba-8db3-7521-9f16-05cccc9fa3fb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

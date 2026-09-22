@@ -1,0 +1,23 @@
+src/markdown/furniture.rs
+  s_3fa7a2abc03ac9::t_ffd409e89af031 563-565,573-575
+  s_3fa7a2abc03ac9::t_eefdaca73a3d07 784-850
+  s_3fa7a2abc03ac9::t_594de54593a625 548-550
+  s_3fa7a2abc03ac9::t_0fa962e935780c 488-494
+  s_3fa7a2abc03ac9::t_e02e5e5d878529 184-187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c93728e8038f670570cbf7834ff76c385f90426c",
+  "prompts": {},
+  "sessions": {
+    "s_3fa7a2abc03ac9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9bb20049-a216-4dbf-9154-e1bfc58f484d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+docs/rust-api.md
+  s_eaf3474cde5240::t_4cc94f5716e89d 492-497,501-504,506-507
+src/python.rs
+  s_eaf3474cde5240::t_4cc94f5716e89d 348-354,867-868,909-910,930-931
+CHANGELOG.md
+  s_eaf3474cde5240::t_4cc94f5716e89d 22
+napi/README.md
+  s_eaf3474cde5240::t_4cc94f5716e89d 98-105
+pdf_inspector.pyi
+  s_eaf3474cde5240::t_4cc94f5716e89d 90-96,240-247,295-296
+docs/python.md
+  s_eaf3474cde5240::t_4cc94f5716e89d 81-82
+src/extractor/page_box.rs
+  s_eaf3474cde5240::t_4cc94f5716e89d 152-162,320-355
+src/extractor/mod.rs
+  s_eaf3474cde5240::t_4cc94f5716e89d 86-93
+napi/src/lib.rs
+  s_eaf3474cde5240::t_4cc94f5716e89d 93-99,602-607
+tests/test_python.py
+  s_eaf3474cde5240::t_4cc94f5716e89d 336-342
+src/types.rs
+  s_eaf3474cde5240::t_4cc94f5716e89d 102-104,106-108,110-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "bf01106ce78bbea10a87d6c2f7e3f279bb46399c",
+  "prompts": {},
+  "sessions": {
+    "s_eaf3474cde5240": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5c7d2be-9631-4403-bebc-f02f86e58562",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

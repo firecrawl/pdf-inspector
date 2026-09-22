@@ -1,0 +1,21 @@
+src/tables/detect_rects.rs
+  s_8b81192caa100a::t_f36957046908d1 148
+  s_8b81192caa100a::t_48b79e6bddfa35 175-176,181-261,267
+  s_8b81192caa100a::t_44f3c614910515 4030-4046
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8c69d7d6ac39e01dc2a9dd7bebc221d9685f40f9",
+  "prompts": {},
+  "sessions": {
+    "s_8b81192caa100a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "69c52882-fd38-4082-bcc6-5f7987f37382",
+        "model": "grok-4.6"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

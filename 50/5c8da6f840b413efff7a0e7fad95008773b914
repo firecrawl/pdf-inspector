@@ -1,0 +1,33 @@
+README.md
+  s_509f955ca4bd26::t_cb17048b958fd7 37,50,183-185
+.github/workflows/ci.yml
+  s_509f955ca4bd26::t_d378ed08cc771a 183-186,220-224
+docs/python.md
+  s_509f955ca4bd26::t_cb17048b958fd7 46-48
+docs/ocr-runtime.md
+  s_509f955ca4bd26::t_d378ed08cc771a 1-9,11,14-97
+  s_509f955ca4bd26::t_c302582d861fa8 10
+  s_509f955ca4bd26::t_de2080394067a4 12-13
+docs/benchmarking.md
+  s_509f955ca4bd26::t_cb17048b958fd7 34-35
+napi/README.md
+  s_509f955ca4bd26::t_cb17048b958fd7 43-45
+docs/rust-api.md
+  s_509f955ca4bd26::t_cb17048b958fd7 385-387
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "505c8da6f840b413efff7a0e7fad95008773b914",
+  "prompts": {},
+  "sessions": {
+    "s_509f955ca4bd26": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fedba-8db3-7521-9f16-05cccc9fa3fb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

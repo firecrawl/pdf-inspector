@@ -1,0 +1,93 @@
+src/vision/pdfium.rs
+  s_83f065935b372e::t_74c5171be30f10 257
+tests/integration_tests.rs
+  s_83f065935b372e::t_f1908c2af1f1bd 313
+  s_83f065935b372e::t_cc8967a9dbc816 285
+src/python.rs
+  s_83f065935b372e::t_2dbe2c6dded836 362-363
+  s_83f065935b372e::t_c9e9277f4e7a3d 582
+src/vision/pipeline.rs
+  s_83f065935b372e::t_74c5171be30f10 1040
+src/markdown/preprocess.rs
+  s_83f065935b372e::t_74c5171be30f10 245
+src/vision/fusion.rs
+  s_83f065935b372e::t_74c5171be30f10 545
+src/bin/pdf2md.rs
+  s_83f065935b372e::t_74c5171be30f10 278
+  s_83f065935b372e::t_168ea58d308af2 90
+  s_83f065935b372e::t_1c85707c5dd260 82
+src/extractor/xobjects.rs
+  s_83f065935b372e::t_74c5171be30f10 466
+  s_83f065935b372e::t_65b961a915d9fa 686,890
+  s_83f065935b372e::t_5216694a285fc0 1074-1083
+src/tables/detect_lines.rs
+  s_83f065935b372e::t_74c5171be30f10 1888
+src/text_utils.rs
+  s_83f065935b372e::t_74c5171be30f10 1323,1523,1645,1724
+src/types.rs
+  s_83f065935b372e::t_2836c9e8a85a5b 109-111,123
+  s_83f065935b372e::t_cb5e3788e23479 113-122
+  s_83f065935b372e::t_74c5171be30f10 356
+napi/src/lib.rs
+  s_83f065935b372e::t_62e3f5c7b62ac1 99
+  s_83f065935b372e::t_e6df2f5e688a65 509
+src/extractor/reading_order.rs
+  s_83f065935b372e::t_74c5171be30f10 443
+src/extractor/content_stream.rs
+  s_83f065935b372e::t_74c5171be30f10 990
+  s_83f065935b372e::t_65b961a915d9fa 591,824,945,1108
+  s_83f065935b372e::t_6d6641ca49f8d1 2065-2075
+src/tables/detect_struct.rs
+  s_83f065935b372e::t_74c5171be30f10 597
+src/extractor/links.rs
+  s_83f065935b372e::t_74c5171be30f10 117,451
+src/markdown/analysis.rs
+  s_83f065935b372e::t_74c5171be30f10 848
+src/tables/detect_heuristic.rs
+  s_83f065935b372e::t_74c5171be30f10 2234,2377
+  s_83f065935b372e::t_e713c929f92f04 127
+src/tables/mod.rs
+  s_83f065935b372e::t_74c5171be30f10 1493,1513
+  s_83f065935b372e::t_9b3c8526bc149f 293,316
+src/markdown/heading.rs
+  s_83f065935b372e::t_cc8967a9dbc816 520,679
+src/lib.rs
+  s_83f065935b372e::t_74c5171be30f10 773,5324,5601,6432
+src/markdown/furniture.rs
+  s_83f065935b372e::t_74c5171be30f10 628
+src/tables/grid.rs
+  s_83f065935b372e::t_74c5171be30f10 520,914,953
+pdf_inspector.pyi
+  s_83f065935b372e::t_538fb638c62ed9 94
+src/extractor/mod.rs
+  s_83f065935b372e::t_e713c929f92f04 1124
+  s_83f065935b372e::t_74c5171be30f10 1428,1687,1704,1721,2508,2525,2542,2570,2587,2604,2634,2671,2709,2726,2743,2768,2908,2925,2952,2969,3012,3059,3106,3146
+src/markdown/mod.rs
+  s_83f065935b372e::t_74c5171be30f10 2552
+src/extractor/layout.rs
+  s_83f065935b372e::t_74c5171be30f10 3067,3815
+src/markdown/convert.rs
+  s_83f065935b372e::t_74c5171be30f10 1572
+src/extractor/underline.rs
+  s_83f065935b372e::t_74c5171be30f10 707
+src/tables/detect_rects.rs
+  s_83f065935b372e::t_74c5171be30f10 3528,5106,5418
+src/tables/financial.rs
+  s_83f065935b372e::t_9b3c8526bc149f 107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d8eb44ee4731511d010b6cc511f1a62e23ca7bcd",
+  "prompts": {},
+  "sessions": {
+    "s_83f065935b372e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca7dc737-9d10-4a4a-b67a-504729d1601b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

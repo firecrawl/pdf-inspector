@@ -1,0 +1,61 @@
+.github/workflows/publish-pypi.yml
+  s_9bf2e0399fd0ed::t_69a083876323b3 31-33
+napi/bun.lock
+  ai_agent 11-16
+site/index.html
+  s_9bf2e0399fd0ed::t_ba7bf8887e4d06 978
+docs/publishing.md
+  s_9bf2e0399fd0ed::t_69a083876323b3 3,5-9,11-12,14-16,18,20-22,24,26,28-34,36-37,39,41-43,45-57
+pyproject.toml
+  s_9bf2e0399fd0ed::t_69a083876323b3 7-8
+  s_9bf2e0399fd0ed::t_9a477af0f1313f 9
+wasm/Cargo.lock
+  ai_agent 727,743
+.gitignore
+  s_9bf2e0399fd0ed::t_c34c69d70257be 34
+README.md
+  s_9bf2e0399fd0ed::t_ae7305d69df6c5 113
+.github/workflows/publish.yml
+  s_9bf2e0399fd0ed::t_69a083876323b3 31-33
+scripts/tests/test_version.py
+  s_9bf2e0399fd0ed::t_ae7305d69df6c5 17,41-45
+  s_9bf2e0399fd0ed::t_fe85c9dbfde80c 1-16,18-40,46-88
+napi/package.json
+  s_9bf2e0399fd0ed::t_9a477af0f1313f 3,55-60
+.github/workflows/publish-wasm.yml
+  s_9bf2e0399fd0ed::t_69a083876323b3 31-33
+.github/workflows/publish-crate.yml
+  s_9bf2e0399fd0ed::t_69a083876323b3 34-36
+wasm/Cargo.toml
+  s_9bf2e0399fd0ed::t_9a477af0f1313f 3
+.github/workflows/ci.yml
+  s_9bf2e0399fd0ed::t_69a083876323b3 27-29
+Cargo.toml
+  s_9bf2e0399fd0ed::t_9a477af0f1313f 3
+scripts/version.py
+  s_9bf2e0399fd0ed::t_e16dcae7154ce0 208-210
+  s_9bf2e0399fd0ed::t_ae7305d69df6c5 40-42,146-153,161,214-222
+  s_9bf2e0399fd0ed::t_fe85c9dbfde80c 1-3,6-39,43-68,73,75-145,154-160,162-207,211-213,223-253
+  s_9bf2e0399fd0ed::t_8b50b434049fc0 69-72,74
+  s_9bf2e0399fd0ed::t_9dde20c5b4f1a6 4-5
+napi/Cargo.lock
+  ai_agent 854,870
+napi/Cargo.toml
+  s_9bf2e0399fd0ed::t_9a477af0f1313f 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "0276471aff8393db4f9ed56d3d5582cacd41e309",
+  "prompts": {},
+  "sessions": {
+    "s_9bf2e0399fd0ed": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fed68-79df-7b11-860a-bc445cab00af",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

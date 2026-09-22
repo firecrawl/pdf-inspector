@@ -1,0 +1,31 @@
+src/extractor/content_stream.rs
+  s_9d37727abe0b7e::t_5180ce1b6d66fe 21
+  s_9d37727abe0b7e::t_d0fd4470e7c0ca 1010,1020
+src/extractor/xobjects.rs
+  s_9d37727abe0b7e::t_344173f31179d3 1136
+  s_9d37727abe0b7e::t_d0fd4470e7c0ca 194-197,207,221,227,240,251,266,301,396,409,428,441,470,481,547-555,650-656,765-778,812,825,847,860,883,900,1521-1563
+  s_9d37727abe0b7e::t_5180ce1b6d66fe 15,395,408,427,440,556-563,684-685,934-935,1564-1580
+src/extractor/mod.rs
+  s_9d37727abe0b7e::t_5180ce1b6d66fe 416-418,420-422,3474-3541
+src/extractor/geometry.rs
+  s_9d37727abe0b7e::t_d0fd4470e7c0ca 313-321
+  s_9d37727abe0b7e::t_5180ce1b6d66fe 60-78,130-134,136-139,141,143,149,258-260,264,266-271
+src/lib.rs
+  s_9d37727abe0b7e::t_5180ce1b6d66fe 3019-3020,3029,3032-3034,3083-3084,3619-3623,3735-3740,3742,7871-7872,7875,7902-7908
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4cacfbf821aa5a7b40cee8918a17898f17c31de1",
+  "prompts": {},
+  "sessions": {
+    "s_9d37727abe0b7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc8426ba-5c23-49c3-a8f8-b78998896dc0",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

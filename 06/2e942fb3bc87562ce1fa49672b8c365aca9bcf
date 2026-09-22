@@ -1,0 +1,38 @@
+napi/Cargo.toml
+  s_46f8ad4c379098::t_c1477502b87439 3
+napi/package.json
+  s_46f8ad4c379098::t_c1477502b87439 3,55-60
+napi/bun.lock
+  ai_agent 11-16
+napi/Cargo.lock
+  ai_agent 2046,2071
+pyproject.toml
+  s_46f8ad4c379098::t_c1477502b87439 9
+wasm/Cargo.toml
+  s_46f8ad4c379098::t_c1477502b87439 3
+CHANGELOG.md
+  s_46f8ad4c379098::t_79c437771cecd5 18
+  s_46f8ad4c379098::t_a0c50a5b4ffcf3 10-17,19-41
+site/index.html
+  s_46f8ad4c379098::t_c1477502b87439 978
+wasm/Cargo.lock
+  ai_agent 728,744
+Cargo.toml
+  s_46f8ad4c379098::t_c1477502b87439 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "062e942fb3bc87562ce1fa49672b8c365aca9bcf",
+  "prompts": {},
+  "sessions": {
+    "s_46f8ad4c379098": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07f11-a41e-7a31-9a1d-34456e984857",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

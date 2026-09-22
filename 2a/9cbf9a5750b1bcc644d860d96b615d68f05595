@@ -1,0 +1,33 @@
+src/lib.rs
+  s_f5ff107f39c26a::t_90c302994e7263 1567-1636,1638-1653,1655-1668
+src/extractor/content_stream.rs
+  s_f5ff107f39c26a::t_4318b52f6f6e9e 250-257,453,460-461,566-568,572-575,587,594-599,601-604,607-608,610,613-618,627-630,636-641,662-663,680-681
+  s_f5ff107f39c26a::t_145986081a9ff6 300-303,452,520-533,535-562,576-586,588-593,606,611-612,619-625,631-635,644-645,649-650,1788
+  s_f5ff107f39c26a::t_6d4fa79f214a6b 95,102,248-249,258-272,299,304,563-565,569-571,600,605,609,626,642-643,646-648,651-653,1789-1790
+src/extractor/painted_rules.rs
+  s_f5ff107f39c26a::t_15e37c5bf4cec4 1-105,107-242
+src/tables/ruled_regions.rs
+  s_f5ff107f39c26a::t_e00a3b3bbdc08f 1-80,83-100,102,104-112,114-115,117-119,121-123,125-127,129-295,309-336
+napi/src/lib.rs
+  s_f5ff107f39c26a::t_90c302994e7263 192-202,742-760
+src/extractor/mod.rs
+  s_f5ff107f39c26a::t_6d4fa79f214a6b 13
+src/extractor/text_paint.rs
+  s_f5ff107f39c26a::t_f1ab6ea444dd48 51,102-103,105-121,123-125,177,195,239-244,330-345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2a9cbf9a5750b1bcc644d860d96b615d68f05595",
+  "prompts": {},
+  "sessions": {
+    "s_f5ff107f39c26a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07e0d-7783-7e81-b6a9-5492ed984ceb",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

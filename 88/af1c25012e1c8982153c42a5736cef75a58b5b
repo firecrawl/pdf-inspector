@@ -1,0 +1,24 @@
+src/extractor/mod.rs
+  s_0ebb7b0328103c::t_45aedbd175e8d5 956-958,961-964,973-975
+  s_0ebb7b0328103c::t_c1917afe08cc74 1043
+  s_0ebb7b0328103c::t_9e440bca4079a1 1040-1042
+  s_0ebb7b0328103c::t_2f738ec0acd7d4 892-896,900,906-908,910,920-921,925-931,955,959-960,966
+  s_0ebb7b0328103c::t_a7589798336a9b 3173-3186
+  s_0ebb7b0328103c::t_469128768bbe86 3120-3121,3125-3131,3138-3155,3157-3169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "88af1c25012e1c8982153c42a5736cef75a58b5b",
+  "prompts": {},
+  "sessions": {
+    "s_0ebb7b0328103c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4d1e95cd-1328-4ff8-bea8-b678f87314d0",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

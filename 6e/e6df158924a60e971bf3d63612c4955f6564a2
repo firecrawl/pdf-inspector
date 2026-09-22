@@ -1,0 +1,57 @@
+src/formula/mod.rs
+  s_3fa7a2abc03ac9::t_5c7788b8e72af0 530-559
+  s_3fa7a2abc03ac9::t_f031e49413a96c 997-1010
+  s_3fa7a2abc03ac9::t_6389663c3c9ebe 336,338,340
+  s_3fa7a2abc03ac9::t_f0cbe4e4cc1870 941
+  s_3fa7a2abc03ac9::t_bb8af777c8c6c0 859-874
+  s_3fa7a2abc03ac9::t_962d97aa66b711 875-886,888-916
+  s_3fa7a2abc03ac9::t_9c2a22577c052f 141
+  s_3fa7a2abc03ac9::t_65de5f79700b8b 158,333
+  s_3fa7a2abc03ac9::t_ead1ec6b15f4d8 355-380
+  s_3fa7a2abc03ac9::t_f4dd3cb3ecefc5 231-257
+  s_3fa7a2abc03ac9::t_b1df32cb3fb668 40-42,122-123,172-187
+  s_3fa7a2abc03ac9::t_0474ab0f4414db 309-318,320
+  s_3fa7a2abc03ac9::t_da67f7b1a6b828 887
+  s_3fa7a2abc03ac9::t_9e35e48204bff3 739-746
+  s_3fa7a2abc03ac9::t_0a3534d80f4477 162
+  s_3fa7a2abc03ac9::t_5f393ec207a54c 803,855
+  s_3fa7a2abc03ac9::t_41fadeb2eee444 584-588,597-600
+  s_3fa7a2abc03ac9::t_987e5f8ef75e16 560-583,589-596,601-630,637
+  s_3fa7a2abc03ac9::t_299b175f014378 136-140,142-143,146-150
+  s_3fa7a2abc03ac9::t_ccd3e0428b7cd1 57-80,84-106,108-114,116,124-127,130-133
+  s_3fa7a2abc03ac9::t_a0fc8cfb709b2d 266-308,319,321-326
+  s_3fa7a2abc03ac9::t_458ce128b3ceed 673-679
+  s_3fa7a2abc03ac9::t_3aee4f7ed4391f 516-522
+  s_3fa7a2abc03ac9::t_b20be6692000f7 1-39,43-56,81-83,107,115,117-121,128-129,134-135,144-145,151-157,159-161,163-171,188-230,258-265,327-332,334-335,337,339,341-354,381-468,474-478,480-482,484-503,507-515,523-526,631-636,638-640,642-672,680-720,725-738,747-802,804-854,1011-1031
+  s_3fa7a2abc03ac9::t_0bfa095164b433 479,483
+  s_3fa7a2abc03ac9::t_cfc62659709983 504-506
+  s_3fa7a2abc03ac9::t_5e7240bd046e38 641
+  s_3fa7a2abc03ac9::t_4944b0620800e0 721-724
+  s_3fa7a2abc03ac9::t_cc879656e14b2e 917-940,942-996
+  s_3fa7a2abc03ac9::t_d0dc0a79320251 469-473
+src/markdown/convert.rs
+  s_3fa7a2abc03ac9::t_b3b03fe060d15a 705-707,1266-1267
+src/formula/unicode_map.rs
+  s_3fa7a2abc03ac9::t_d04e1aa345837b 383-389
+  s_3fa7a2abc03ac9::t_1ad8d43a4cb745 1-191,282-382,390-391
+  s_3fa7a2abc03ac9::t_b1df32cb3fb668 198-199
+  s_3fa7a2abc03ac9::t_882baeb2ef9dfd 192-197,200-281
+src/lib.rs
+  s_3fa7a2abc03ac9::t_49bda2e2ea160c 37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6ee6df158924a60e971bf3d63612c4955f6564a2",
+  "prompts": {},
+  "sessions": {
+    "s_3fa7a2abc03ac9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9bb20049-a216-4dbf-9154-e1bfc58f484d",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}

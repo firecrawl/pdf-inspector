@@ -1,0 +1,9 @@
+src/vision/oar.rs
+  ai_agent 92-99,188-195,201,346-351,849-855,860-861,863,865
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2c26f58e0c0c59152f89e851900a4ce65a4a3999",
+  "prompts": {}
+}

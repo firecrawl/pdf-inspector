@@ -1,0 +1,26 @@
+src/extractor/underline.rs
+  s_e0bc3a40268aa0::t_d68383d7628258 54,459-462,464-490,553
+  s_e0bc3a40268aa0::t_909ad17df05e91 47-53,55,399-419,421-456
+  s_e0bc3a40268aa0::t_1747e12469b524 544-552,554-559
+  s_e0bc3a40268aa0::t_c547dbfc83f4f4 420
+  s_e0bc3a40268aa0::t_05cbfd14b3aa9f 463
+  s_e0bc3a40268aa0::t_a81838ddc8ad92 564-567
+  s_e0bc3a40268aa0::t_f9f6c3d9e18682 721-740
+  s_e0bc3a40268aa0::t_7360424bbab074 701-720,741-762
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b129d3bf620c8c810d7b35286e6de4b9467605ce",
+  "prompts": {},
+  "sessions": {
+    "s_e0bc3a40268aa0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc0f2-05c3-72d2-be98-413996646886",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

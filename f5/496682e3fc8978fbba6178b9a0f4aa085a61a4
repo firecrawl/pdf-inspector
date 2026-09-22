@@ -1,0 +1,29 @@
+.github/workflows/ci.yml
+  s_789560824240a2::t_c23016a8d8a146 17,35,52,74,91
+.github/workflows/pages.yml
+  s_789560824240a2::t_c23016a8d8a146 27,30,36
+.github/workflows/publish-pypi.yml
+  s_789560824240a2::t_c23016a8d8a146 27,101,103,115,127,136,152
+.github/workflows/publish-crate.yml
+  s_789560824240a2::t_c23016a8d8a146 30,88
+.github/workflows/publish-wasm.yml
+  s_789560824240a2::t_c23016a8d8a146 27,74,81
+.github/workflows/publish.yml
+  s_789560824240a2::t_c23016a8d8a146 27,81,107,128,136,165,168,174,197,199,205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f5496682e3fc8978fbba6178b9a0f4aa085a61a4",
+  "prompts": {},
+  "sessions": {
+    "s_789560824240a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01e97385-e51f-48ff-9ffd-24c433c02873",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

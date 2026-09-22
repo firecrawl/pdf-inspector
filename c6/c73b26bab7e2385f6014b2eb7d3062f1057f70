@@ -1,0 +1,36 @@
+src/extractor/mod.rs
+  s_9d37727abe0b7e::t_5c8551447597da 9,310,1067-1073,3469-3481
+src/extractor/content_stream.rs
+  s_9d37727abe0b7e::t_5c8551447597da 21,141,143-148,157,278-283,322,546,758,899,991,1007-1016,1075,1445,1447-1448,1462,1467-1468,1471-1495,1498-1500,1506,1508,1511-1516,1518,1521-1531,1533-1536,1540-1544,1546-1551,1555,1559-1564,1567,1570-1574,1576,1580-1585,2387-2508
+  s_9d37727abe0b7e::t_92051d699faf87 319-321
+src/extractor/xobjects.rs
+  s_9d37727abe0b7e::t_5c8551447597da 1390-1416
+src/lib.rs
+  s_9d37727abe0b7e::t_5c8551447597da 1050,1129-1130,1144-1147,1267,1294-1295,1309-1312,1600-1601,2480,2552,2576-2577,2593-2596,3381,3580-3584,3587,3589-3601,3720-3727,3729-3730,3732-3733,3766-3771,7782-7837
+tests/integration_tests.rs
+  s_9d37727abe0b7e::t_162be1547f9f24 4548-4614
+src/tables/detect_heuristic.rs
+  s_9d37727abe0b7e::t_5c8551447597da 82-88
+src/extractor/geometry.rs
+  s_9d37727abe0b7e::t_5c8551447597da 6-60,154-175
+src/text_utils.rs
+  s_9d37727abe0b7e::t_5c8551447597da 189-192,196-197,1853-1872
+src/types.rs
+  s_9d37727abe0b7e::t_5c8551447597da 129-132,189-209,211,214,537-565
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c6c73b26bab7e2385f6014b2eb7d3062f1057f70",
+  "prompts": {},
+  "sessions": {
+    "s_9d37727abe0b7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc8426ba-5c23-49c3-a8f8-b78998896dc0",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

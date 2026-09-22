@@ -1,0 +1,32 @@
+src/lib.rs
+  s_509f955ca4bd26::t_93b36f32e33912 466-467,738-739
+src/vision/pipeline.rs
+  s_509f955ca4bd26::t_af9f25df5431ff 193,203,207,214,223,226,236-237,243,254,292,295
+  s_509f955ca4bd26::t_8a47066bcc0216 341,357,381,389,393,403,409-410,412-413,418,420-421
+  s_509f955ca4bd26::t_539efdc1a424e8 1,13-15,18,20-24,31,35,38-39,48,51-53,65,71-73,77-85,114,116,127,137,145-146,148-149,151,154,160,162-163,165,168,170,179
+  s_509f955ca4bd26::t_0a4d52e34030b1 369,400
+tests/ocr_tests.rs
+  s_509f955ca4bd26::t_4e5133b43784c1 3,5,107,109,119-124
+docs/rust-api.md
+  s_509f955ca4bd26::t_6b2fd0f6fb4df2 343,345,353,358,361,363-364,379,386,396-397
+src/vision/mod.rs
+  s_509f955ca4bd26::t_93b36f32e33912 53
+src/bin/pdf2md.rs
+  s_509f955ca4bd26::t_91f6262bc3754e 4,6-7,111,119-120,227,378,444,456,459,463,508-510,514,517,520,523,527
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "9a2d51638621a0727d601c431f9244610fba22fb",
+  "prompts": {},
+  "sessions": {
+    "s_509f955ca4bd26": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fedba-8db3-7521-9f16-05cccc9fa3fb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}

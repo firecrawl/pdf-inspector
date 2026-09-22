@@ -1,0 +1,19 @@
+.github/workflows/ci.yml
+  s_1fb9b83ffa44a1::t_dd3421bb7c7c8c 304-312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e53cfeec1ecf0bc743672c8e7dde428a3cd66cea",
+  "prompts": {},
+  "sessions": {
+    "s_1fb9b83ffa44a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "34a3cd4d-a5f6-42e2-800a-7e397fc7a8b3",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
