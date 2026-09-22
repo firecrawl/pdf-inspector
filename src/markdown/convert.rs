@@ -1021,6 +1021,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             options.detect_bold,
             options.detect_italic,
             options.detect_underline,
+            options.include_links,
         );
         let trimmed = text.trim();
 
@@ -1205,8 +1206,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             let prefix = "#".repeat(level);
             // Plain text for headers (no redundant bold/italic inside `#`),
             // but underline is preserved: `<u>` carries meaning `#` doesn't.
-            let heading_text = if options.detect_underline {
-                line.text_with_formatting(false, false, true)
+            let heading_text = if options.detect_underline || options.include_links {
+                line.text_with_formatting(
+                    false,
+                    false,
+                    options.detect_underline,
+                    options.include_links,
+                )
             } else {
                 plain_text.clone()
             };
@@ -1530,6 +1536,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             options.detect_bold,
             options.detect_italic,
             options.detect_underline,
+            options.include_links,
         );
         let trimmed = text.trim();
 
@@ -1623,9 +1630,14 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     paragraph_in_wrapped_bold_run = false;
                 }
                 let prefix = "#".repeat(header_level);
-                // Plain text for headers, except underline (see above).
-                let heading_text = if options.detect_underline {
-                    line.text_with_formatting(false, false, true)
+                // Plain text for headers, except underline and links (see above).
+                let heading_text = if options.detect_underline || options.include_links {
+                    line.text_with_formatting(
+                        false,
+                        false,
+                        options.detect_underline,
+                        options.include_links,
+                    )
                 } else {
                     plain_text.clone()
                 };
@@ -1763,6 +1775,7 @@ mod tests {
             item_type: crate::types::ItemType::Text,
             mcid,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 

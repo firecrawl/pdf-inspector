@@ -641,6 +641,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 

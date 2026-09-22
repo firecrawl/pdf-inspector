@@ -1116,6 +1116,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                                 baseline_shift: 0.0,
+                                link_url: None,
                             });
                             // A short string with word-gap character spacing
                             // shows its spaces once the next run proves the
@@ -1675,6 +1676,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     item_type: ItemType::Text,
                                     mcid: current_mcid(&marked_content_stack),
                                     baseline_shift: 0.0,
+                                    link_url: None,
                                 });
                             }
                         }
@@ -1908,6 +1910,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                                 baseline_shift: 0.0,
+                                link_url: None,
                             });
                             // A short string with word-gap character spacing
                             // shows its spaces once the next run proves the
@@ -2002,6 +2005,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         item_type: ItemType::Image,
                                         mcid: current_mcid(&marked_content_stack),
                                         baseline_shift: 0.0,
+                                        link_url: None,
                                     });
                                 }
                                 XObjectType::Form(form_id) => {
@@ -2241,6 +2245,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         .mcid
                                         .or_else(|| current_mcid(&marked_content_stack)),
                                     baseline_shift: 0.0,
+                                    link_url: None,
                                 });
                             }
                         }
@@ -3379,7 +3384,7 @@ mod tests {
         };
         assert_eq!(line.text(), "Lead body");
         assert_eq!(
-            line.text_with_formatting(true, false, false),
+            line.text_with_formatting(true, false, false, false),
             "**Lead** body"
         );
     }
@@ -4840,6 +4845,7 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            link_url: None,
         };
         let mut image = text(50.0, 50.0);
         image.text = "[Image: Im0]".to_string();
@@ -4927,6 +4933,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (   ) Tj ET",
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            link_url: None,
         };
         let mut image = run.clone();
         image.text = "[Image: Im0]".to_string();

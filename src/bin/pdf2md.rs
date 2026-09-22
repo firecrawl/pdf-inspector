@@ -324,6 +324,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: Some(7),
             baseline_shift: 3.5,
+            link_url: None,
         }];
 
         let json = format_items_json(&items);

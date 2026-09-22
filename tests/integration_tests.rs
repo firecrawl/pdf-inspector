@@ -358,6 +358,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         item_type: ItemType::Text,
         mcid: None,
         baseline_shift: 0.0,
+        link_url: None,
     }
 }
 
@@ -393,6 +394,7 @@ fn make_text_item_with_font(
         item_type: ItemType::Text,
         mcid: None,
         baseline_shift: 0.0,
+        link_url: None,
     }
 }
 
@@ -9755,6 +9757,165 @@ fn make_simple_font_pdf(bfchar: &str, differences_name: Option<&str>) -> Vec<u8>
         "Pages" => pages_id,
     });
     doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+// ============================================================================
+// Link annotation → markdown link tests
+// ============================================================================
+
+/// Build a single-page PDF with text items and link annotations covering some
+/// of them, so we can verify that `[text](url)` markdown links are emitted.
+fn make_link_annotation_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+
+    let font_regular_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let font_bold_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica-Bold",
+    });
+
+    let operations = vec![
+        // Line 1: "Visit our site" — regular text, linked
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+        Operation::new("Td", vec![72.into(), 700.into()]),
+        Operation::new("Tj", vec![Object::string_literal("Visit our site")]),
+        Operation::new("ET", vec![]),
+        // Line 2: bare URL text, linked to the same URL
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+        Operation::new("Td", vec![72.into(), 660.into()]),
+        Operation::new(
+            "Tj",
+            vec![Object::string_literal("https://docs.example.com")],
+        ),
+        Operation::new("ET", vec![]),
+        // Line 3: bold text, linked
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F2".into(), 12.into()]),
+        Operation::new("Td", vec![72.into(), 620.into()]),
+        Operation::new("Tj", vec![Object::string_literal("Bold Link")]),
+        Operation::new("ET", vec![]),
+        // Line 4: plain text, no link
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+        Operation::new("Td", vec![72.into(), 580.into()]),
+        Operation::new("Tj", vec![Object::string_literal("No link here.")]),
+        Operation::new("ET", vec![]),
+        // Line 5: text with ']' character, linked — bracket must be escaped
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+        Operation::new("Td", vec![72.into(), 540.into()]),
+        Operation::new("Tj", vec![Object::string_literal("See [section 3]")]),
+        Operation::new("ET", vec![]),
+        // Line 6: text linked to a URL with spaces
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+        Operation::new("Td", vec![72.into(), 500.into()]),
+        Operation::new("Tj", vec![Object::string_literal("Spaced link")]),
+        Operation::new("ET", vec![]),
+    ];
+    let content = Content { operations }.encode().unwrap();
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+
+    let link1_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![68.into(), 694.into(), 220.into(), 716.into()],
+        "A" => dictionary! {
+            "S" => "URI",
+            "URI" => Object::string_literal("https://example.com"),
+        },
+    });
+    let link2_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![68.into(), 654.into(), 260.into(), 676.into()],
+        "A" => dictionary! {
+            "S" => "URI",
+            "URI" => Object::string_literal("https://docs.example.com"),
+        },
+    });
+    let link3_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![68.into(), 614.into(), 180.into(), 636.into()],
+        "A" => dictionary! {
+            "S" => "URI",
+            "URI" => Object::string_literal("https://bold.example.com"),
+        },
+    });
+    let link4_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![68.into(), 534.into(), 220.into(), 556.into()],
+        "A" => dictionary! {
+            "S" => "URI",
+            "URI" => Object::string_literal("https://example.com/bracket"),
+        },
+    });
+    let link5_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![68.into(), 494.into(), 200.into(), 516.into()],
+        "A" => dictionary! {
+            "S" => "URI",
+            "URI" => Object::string_literal("https://example.com/path with spaces/doc"),
+        },
+    });
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_regular_id,
+                    "F2" => font_bold_id,
+                },
+            },
+            "Contents" => content_id,
+            "Annots" => vec![
+                Object::Reference(link1_id),
+                Object::Reference(link2_id),
+                Object::Reference(link3_id),
+                Object::Reference(link4_id),
+                Object::Reference(link5_id),
+            ],
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
     let mut bytes = Vec::new();
     doc.save_to(&mut bytes).unwrap();
     bytes
@@ -9847,5 +10008,44 @@ fn an_odd_length_string_no_cmap_reads_counts_its_bytes_once() {
             interpolated: 0,
             unmapped: 3,
         }]
+    );
+}
+
+#[test]
+fn link_annotations_produce_markdown_links() {
+    let buf = make_link_annotation_pdf();
+    let mut opts = PdfOptions::new();
+    opts.markdown.detect_headers = false;
+    let result = process_pdf_mem_with_options(&buf, opts).unwrap();
+    let md = result.markdown.unwrap();
+
+    // Line 1: plain text with a link annotation → [text](url)
+    assert!(
+        md.contains("[Visit our site](https://example.com)"),
+        "Expected markdown link for annotated text, got:\n{md}"
+    );
+    // Line 3: bold text with a link annotation → [**text**](url)
+    assert!(
+        md.contains("[**Bold Link**](https://bold.example.com)"),
+        "Expected bold markdown link, got:\n{md}"
+    );
+    // Line 4: no link annotation → plain text
+    assert!(
+        md.contains("No link here."),
+        "Expected plain text without link markup, got:\n{md}"
+    );
+    assert!(
+        !md.contains("[No link here.]"),
+        "Plain text should NOT be wrapped in link markup, got:\n{md}"
+    );
+    // Line 5: ']' in link text must be escaped so markdown link syntax isn't broken
+    assert!(
+        md.contains(r"[See [section 3\]](https://example.com/bracket)"),
+        "Expected escaped bracket in link text, got:\n{md}"
+    );
+    // Line 6: spaces in URL must be percent-encoded
+    assert!(
+        md.contains("[Spaced link](https://example.com/path%20with%20spaces/doc)"),
+        "Expected percent-encoded spaces in URL, got:\n{md}"
     );
 }

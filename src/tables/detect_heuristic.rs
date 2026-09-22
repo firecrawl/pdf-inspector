@@ -172,6 +172,7 @@ fn merge_adjacent_items_preserving(
                 } else {
                     0.0
                 },
+                link_url: first_item.link_url.clone(),
             });
             index_map.push(indices);
 
@@ -2642,6 +2643,7 @@ mod tests {
             mcid: None,
             baseline_shift: 0.0,
             legacy_symbol_rewrite: false,
+            link_url: None,
         }
     }
 
@@ -2987,6 +2989,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -3137,6 +3140,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 

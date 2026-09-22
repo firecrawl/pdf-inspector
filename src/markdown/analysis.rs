@@ -905,6 +905,7 @@ mod tests {
             item_type: crate::types::ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         };
         crate::types::TextLine {
             items: vec![item],

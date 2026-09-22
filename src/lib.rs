@@ -984,6 +984,7 @@ mod ocr_header_footer_tests {
             item_type: types::ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -5861,6 +5862,7 @@ mod text_cluster_column_undercount_tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -6145,6 +6147,7 @@ mod table_candidate_selection_tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -7178,6 +7181,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -8390,6 +8394,7 @@ mod rotated_run_region_tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+            link_url: None,
         }
     }
 

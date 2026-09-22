@@ -343,6 +343,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             item_type: item.item_type.clone(),
             mcid: item.mcid,
             baseline_shift: item.baseline_shift,
+            link_url: item.link_url.clone(),
         });
     }
 
@@ -373,6 +374,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             item_type: item.item_type.clone(),
             mcid: item.mcid,
             baseline_shift: item.baseline_shift,
+            link_url: item.link_url.clone(),
         });
     }
 
@@ -1625,6 +1627,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
@@ -1652,6 +1655,7 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            link_url: None,
         }
     }
 
