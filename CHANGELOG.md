@@ -7,7 +7,7 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## [Unreleased]
+## [1.23.0] - 2026-09-21
 
 Changes since 1.22.1.
 
@@ -42,6 +42,7 @@ Changes since 1.22.1.
   back into the document. The Rust-only `widen_degenerate_form_bboxes_mem`
   (the Python, Node and WebAssembly bindings do not expose it) hands the
   repaired bytes to callers that render elsewhere, as for a zero-area box.
+  ([#560](https://github.com/firecrawl/pdf-inspector/pull/560))
 - Right-to-left text whose runs are shown in reading order — right to left
   across the line, one text object per run — while each run's glyphs are
   stored in visual order with forward advances now reads forwards; every
@@ -76,6 +77,7 @@ Changes since 1.22.1.
   an ASCII letter or digit other than the slot's — or as nothing, for a
   name that spells no character. A font whose CMap agrees with its
   Differences is untouched.
+  ([#562](https://github.com/firecrawl/pdf-inspector/pull/562))
 - A code that reads as several characters of a right-to-left script — a
   ligature glyph named `uni06440627` (lam-alef), or mapped to two code
   points by the ToUnicode CMap — came out with those characters reversed on
@@ -83,6 +85,7 @@ Changes since 1.22.1.
   order turned every character round on its own. The characters one glyph
   reads as are now turned round together and keep the order they were
   named in.
+  ([#562](https://github.com/firecrawl/pdf-inspector/pull/562))
 - A spacing accent shown as a text object of its own over a letter — the
   way some producers set an accented letter: the run up to the letter, one
   glyph of `macron`, `acute`, `caron` or another accent the standard Latin
@@ -199,6 +202,15 @@ Changes since 1.22.1.
   longer guessed from its byte value. Entries that map to TAB, LF or CR, and
   CMaps without such entries, read as before.
   ([#567](https://github.com/firecrawl/pdf-inspector/pull/567))
+- `pdf2md` and `detect-pdf` read the PDF path as the first argument that
+  is not an option, so flags may come before or after it (`--` ends option
+  parsing), and a missing input names the path that could not be opened —
+  `detect-pdf --json document.pdf` used to open `--json` as the file. The
+  built-in CMaps are compiled into the binary instead of being read from
+  the crate checkout at run time, which `cargo install` binaries and
+  published wheels do not have; `PDF_INSPECTOR_BCMAPS_DIR` still overrides
+  them.
+  ([#570](https://github.com/firecrawl/pdf-inspector/pull/570))
 
 ## [1.22.1] - 2026-09-20
 
