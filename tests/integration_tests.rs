@@ -9763,9 +9763,9 @@ fn make_simple_font_pdf(bfchar: &str, differences_name: Option<&str>) -> Vec<u8>
     bytes
 }
 
-// =========================================================================
+// ============================================================================
 // Link annotation → markdown link tests
-// =========================================================================
+// ============================================================================
 
 /// Build a single-page PDF with text items and link annotations covering some
 /// of them, so we can verify that `[text](url)` markdown links are emitted.
@@ -9859,25 +9859,6 @@ fn make_link_annotation_pdf() -> Vec<u8> {
             "URI" => Object::string_literal("https://bold.example.com"),
         },
     });
-    let link4_id = doc.add_object(dictionary! {
-        "Type" => "Annot",
-        "Subtype" => "Link",
-        "Rect" => vec![68.into(), 534.into(), 220.into(), 556.into()],
-        "A" => dictionary! {
-            "S" => "URI",
-            "URI" => Object::string_literal("https://example.com/bracket"),
-        },
-    });
-    let link5_id = doc.add_object(dictionary! {
-        "Type" => "Annot",
-        "Subtype" => "Link",
-        "Rect" => vec![68.into(), 494.into(), 200.into(), 516.into()],
-        "A" => dictionary! {
-            "S" => "URI",
-            "URI" => Object::string_literal("https://example.com/path with spaces/doc"),
-        },
-    });
-
     let link4_id = doc.add_object(dictionary! {
         "Type" => "Annot",
         "Subtype" => "Link",
@@ -10031,7 +10012,7 @@ fn an_odd_length_string_no_cmap_reads_counts_its_bytes_once() {
 }
 
 #[test]
-fn test_link_annotations_produce_markdown_links() {
+fn link_annotations_produce_markdown_links() {
     let buf = make_link_annotation_pdf();
     let mut opts = PdfOptions::new();
     opts.markdown.detect_headers = false;

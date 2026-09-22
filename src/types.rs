@@ -659,9 +659,6 @@ pub(crate) fn stacked_fraction_slash(prev: &TextItem, item: &TextItem) -> bool {
         && prev.x < item.x + item.width
 }
 
-/// Append an item's text, wrapping a super/subscript run in its tag.
-/// Shared by line rendering and table-cell joining so both emit the same
-/// markup for a run.
 fn push_link_text(result: &mut String, text: &str) {
     if text.contains(']') {
         for ch in text.chars() {
@@ -859,7 +856,7 @@ impl TextLine {
                     result.push(' ');
                 }
 
-                if let Some(_url) = item_link {
+                if item_link.is_some() {
                     result.push('[');
                 }
                 current_link = item_link;
