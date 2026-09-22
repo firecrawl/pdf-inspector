@@ -1,0 +1,19 @@
+CHANGELOG.md
+  s_9c82cc1cf02784::t_c6eb8693aa452f 10,45,80,88,205-213
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5e2ea049b098a0c7389df6bc1ce8da1a32ce5634",
+  "prompts": {},
+  "sessions": {
+    "s_9c82cc1cf02784": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b0dd3fc-49f5-4ebf-a3cf-b315e40f11a9",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
