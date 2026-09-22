@@ -343,7 +343,7 @@ fn differences_named_codes(
 /// for a simple font, whose blank glyphs are read at decode time, or for a
 /// program that tells nothing of its outlines (see [`ProgramGlyphs`]) — nor
 /// for one that outlines nothing at all while more than two of the codes
-/// have glyphs: an invisible text layer's font, whose text is kept, as the
+/// have glyphs within its glyph count: an invisible text layer's font, whose text is kept, as the
 /// simple-font rule (`blank_glyph_codes`) keeps it; up to two such codes
 /// still read as the space of a subset written for a space painted alone.
 fn blank_cid_glyph_spaces(
@@ -375,7 +375,9 @@ fn blank_cid_glyph_spaces(
         .iter()
         .copied()
         .filter(|&cid| {
-            let Some(gid) = glyph_of(cid) else {
+            // A CID whose index lies past the program's glyph count has no
+            // glyph, whatever the map says, and counts for nothing here.
+            let Some(gid) = glyph_of(cid).filter(|&gid| glyphs.has(gid)) else {
                 return false;
             };
             with_glyph += 1;
@@ -426,6 +428,15 @@ impl<'a> ProgramGlyphs<'a> {
             .filter(|cff| cff.glyph_cid(ttf_parser::GlyphId(0)).is_some())
             .map(|cff| cff_cid_to_gid(&cff));
         Some(Self { outlines, charset })
+    }
+
+    /// Whether the program has a glyph at `gid`: an index below its glyph
+    /// count.
+    fn has(&self, gid: u16) -> bool {
+        match &self.outlines {
+            Outlines::Sfnt(face) => gid < face.number_of_glyphs(),
+            Outlines::Cff(cff) => gid < cff.number_of_glyphs(),
+        }
     }
 
     /// Whether any glyph of the program has an outline. A program with none

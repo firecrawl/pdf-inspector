@@ -5925,6 +5925,34 @@ mod tests {
         );
     }
 
+    /// The invisible-layer guard counts only codes with a glyph within the
+    /// program's glyph count: an Identity map sends every CID to itself,
+    /// and CIDs past the count have no glyph — they keep their markers and
+    /// do not make a three-glyph program an invisible layer, so its one
+    /// genuine blank still reads as a space.
+    #[test]
+    fn the_invisible_layer_guard_counts_only_cids_with_a_glyph() {
+        // Three glyphs, none outlined; control destinations at CID 2 (a
+        // blank glyph with an advance) and at CIDs 5 and 6 (no glyph).
+        let (doc, tounicode_obj, page_id) = cid_font_doc(
+            "<0001> <0063>\n<0002> <0002>\n<0005> <0005>\n<0006> <0006>",
+            sfnt_with_glyph_names(&[None; 3]),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(
+            decode_page_font_string(
+                &doc,
+                tounicode_obj,
+                page_id,
+                true,
+                &[0, 1, 0, 2, 0, 5, 0, 6]
+            ),
+            "c \u{FFFD}\u{FFFD}"
+        );
+    }
+
     /// An odd-length string through a Type0 font none of whose bytes any
     /// CMap reads: its bytes are counted once, as codes the CMap did not
     /// cover, though the two-byte reading is tried over them afterwards.
