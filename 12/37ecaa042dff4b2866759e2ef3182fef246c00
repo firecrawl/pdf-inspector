@@ -1,0 +1,21 @@
+src/tounicode.rs
+  s_cc307d8834d01f::t_187f6c317d7681 159-162,171-174,176-178,180-183,1749,1753-1755,1757-1768,1823,1837,3881-3903,4022-4023,4025,4027,4933-4959
+src/extractor/blank_glyph_tests.rs
+  s_cc307d8834d01f::t_b4308a2c839c28 282-297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1237ecaa042dff4b2866759e2ef3182fef246c00",
+  "prompts": {},
+  "sessions": {
+    "s_cc307d8834d01f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2e3a83c4-2606-4dbf-ae45-ae99049b6b51",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
