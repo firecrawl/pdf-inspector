@@ -156,8 +156,10 @@ pub(crate) enum CodeMapping {
 }
 
 /// A C0 control character other than TAB, LF and CR, or DEL: a destination
-/// character that stands for no text. NUL is left out, as a destination
-/// padded with it (`<00000041>`) still spells its character.
+/// character that stands for no text. NUL is left out here, as a
+/// destination padded with it (`<00000041>`) still spells its character; a
+/// destination of nothing but NUL is a control destination all the same
+/// (see [`destination_is_control`]).
 fn is_control_destination_char(ch: char) -> bool {
     matches!(
         ch,
@@ -166,10 +168,19 @@ fn is_control_destination_char(ch: char) -> bool {
 }
 
 /// Whether a destination stands for no text: nothing but control
-/// characters, NUL padding aside.
+/// characters, NUL padding aside — or nothing but NUL (`<0000>`, the index
+/// of glyph 0 written as its own destination, as a producer writing each
+/// glyph's index writes it), which a later pass would strip without a
+/// trace. An empty destination is not a control destination.
 fn destination_is_control(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
     let mut chars = text.chars().filter(|&ch| ch != '\0').peekable();
-    chars.peek().is_some() && chars.all(is_control_destination_char)
+    match chars.peek() {
+        None => true,
+        Some(_) => chars.all(is_control_destination_char),
+    }
 }
 
 /// Whether the destinations `base..=base + len` of a range lie in the C0
@@ -1735,12 +1746,26 @@ fn get_w_array_start_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> O
 ///   1. `c [w1 w2 ... wn]` — widths for CIDs c, c+1, ..., c+n-1
 ///   2. `c_first c_last w` — CIDs c_first..c_last all have width w
 fn w_array_covers_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document, target: u16) -> bool {
-    w_array_width(cid_font_dict, doc, target).is_some()
+    w_array_lookup(cid_font_dict, doc, target).is_some()
 }
 
 /// The width the CIDFont's `/W` array gives `target`, when it lists the
-/// CID at all: a width that is not a number reads as 0.
+/// CID and the width reads as a number; a listed CID whose width token
+/// does not (a name, a string) has no width here, and `cid_advance` falls
+/// through to `/DW`.
 fn w_array_width(cid_font_dict: &lopdf::Dictionary, doc: &Document, target: u16) -> Option<f64> {
+    w_array_lookup(cid_font_dict, doc, target).flatten()
+}
+
+/// The `/W` array's entry for `target`: `None` when no entry lists the
+/// CID, `Some(None)` when one does but its width token does not read as a
+/// number, `Some(Some(width))` otherwise. Coverage and width are told
+/// apart so that a spec-invalid width token still counts as a listed CID.
+fn w_array_lookup(
+    cid_font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    target: u16,
+) -> Option<Option<f64>> {
     let w_obj = cid_font_dict.get(b"W").ok()?;
     let arr = match w_obj {
         Object::Array(arr) => arr,
@@ -1795,7 +1820,7 @@ fn w_array_width(cid_font_dict: &lopdf::Dictionary, doc: &Document, target: u16)
             // Format 1: c [w1 ... wn]
             let last = first + widths.len() as i64 - 1;
             if target >= first && target <= last {
-                return Some(resolve_num(&widths[(target - first) as usize]).unwrap_or(0.0));
+                return Some(resolve_num(&widths[(target - first) as usize]));
             }
             i += 1;
         } else if let Some(last) = resolve_int(&arr[i]) {
@@ -1809,7 +1834,7 @@ fn w_array_width(cid_font_dict: &lopdf::Dictionary, doc: &Document, target: u16)
                 None
             };
             if target >= first && target <= last {
-                return Some(width.unwrap_or(0.0));
+                return Some(width);
             }
         } else {
             // Unknown token — abort parsing safely
@@ -3853,6 +3878,29 @@ endbfchar
     /// "coffee" through [`LIGATURE_INDEX_CMAP`]: c, o, the ligature, e, e.
     const LIGATURE_INDEX_CODES: [u8; 10] = [0, 1, 0, 2, 0, 3, 0, 4, 0, 4];
 
+    /// A destination of nothing but NUL — `<0000>`, the index of glyph 0
+    /// written as its own destination — is a control destination, where NUL
+    /// padding inside a longer destination (`<00000041>`) still spells its
+    /// character, and an empty destination is neither.
+    #[test]
+    fn an_all_nul_destination_is_a_control_destination() {
+        assert!(destination_is_control("\0"));
+        assert!(destination_is_control("\0\0"));
+        assert!(!destination_is_control("\0A"));
+        assert!(!destination_is_control(""));
+        let cmap = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+              3 beginbfchar\n<0001> <0000>\n<0002> <00000041>\n<0003> <0041>\nendbfchar",
+        )
+        .unwrap();
+        assert!(matches!(
+            cmap.lookup_code(1),
+            CodeMapping::ControlDestination
+        ));
+        assert!(matches!(cmap.lookup_code(2), CodeMapping::Text(ref t) if t.contains('A')));
+        assert!(matches!(cmap.lookup_code(3), CodeMapping::Text(ref t) if t == "A"));
+    }
+
     #[test]
     fn a_control_destination_is_a_miss_not_text() {
         let cmap = ToUnicodeCMap::parse(LIGATURE_INDEX_CMAP.as_bytes()).unwrap();
@@ -3971,11 +4019,12 @@ endbfchar
 "#;
         let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
         assert_eq!(cmap.decode_cids(&[0, 1, 0, 2, 0, 3]), "\t\n\r");
-        // NUL padding neither hides a character nor makes a control of one.
+        // NUL padding neither hides a character nor makes a control of one;
+        // a destination of nothing but NUL is a control destination.
         assert_eq!(cmap.lookup(4), Some("\0A".to_string()));
-        assert!(cmap.lookup(5).is_some(), "NUL alone is outside the rule");
+        assert_eq!(cmap.lookup_code(5), CodeMapping::ControlDestination);
         assert_eq!(cmap.lookup_code(6), CodeMapping::ControlDestination);
-        assert_eq!(cmap.control_destination_codes(), [6]);
+        assert_eq!(cmap.control_destination_codes(), [5, 6]);
     }
 
     #[test]
@@ -4879,6 +4928,33 @@ endbfrange
         assert!(w_array_covers_cid(&d, &doc, 120));
         assert!(!w_array_covers_cid(&d, &doc, 99));
         assert!(!w_array_covers_cid(&d, &doc, 121));
+    }
+
+    /// A `/W` entry whose width token is not a number still lists its CIDs
+    /// — the remap heuristic reads them as covered, as it always did — but
+    /// gives them no width, so the advance falls through to `/DW`.
+    #[test]
+    fn a_w_entry_whose_width_is_no_number_covers_its_cids_without_a_width() {
+        let doc = Document::new();
+        let mut d = cid_font_dict_with_w(vec![
+            lopdf::Object::Integer(1),
+            lopdf::Object::Integer(5),
+            lopdf::Object::Name(b"Bogus".to_vec()),
+            lopdf::Object::Integer(7),
+            lopdf::Object::Array(vec![
+                lopdf::Object::Name(b"Bogus".to_vec()),
+                lopdf::Object::Integer(400),
+            ]),
+        ]);
+        d.set("DW", lopdf::Object::Integer(750));
+        assert!(w_array_covers_cid(&d, &doc, 3));
+        assert_eq!(w_array_width(&d, &doc, 3), None);
+        assert_eq!(cid_advance(&d, &doc, 3), 750.0);
+        assert!(w_array_covers_cid(&d, &doc, 7));
+        assert_eq!(w_array_width(&d, &doc, 7), None);
+        assert_eq!(w_array_width(&d, &doc, 8), Some(400.0));
+        assert!(!w_array_covers_cid(&d, &doc, 9));
+        assert_eq!(cid_advance(&d, &doc, 9), 750.0);
     }
 
     #[test]

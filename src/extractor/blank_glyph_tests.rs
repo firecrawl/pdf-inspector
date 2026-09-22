@@ -279,6 +279,22 @@ fn blank_glyph_reads_as_space_despite_stale_tounicode() {
     assert_eq!(text_of(&mut doc), "3r r3");
 }
 
+/// A blank glyph with an advance at a code whose ToUnicode entry is a
+/// control destination reads as the space the glyph paints, as the same
+/// glyph of a composite font does: the entry names no text, no name or
+/// encoding reads the code, and a nameless blank glyph with an advance is a
+/// gap — nothing is hidden, and no encoding issue is reported.
+#[test]
+fn blank_glyph_at_a_control_destination_reads_as_a_space() {
+    let tounicode = STALE_TOUNICODE.replace("<24><0024>", "<24><0003>");
+    let (mut doc, _) = doc_with_font(WORD_FOR_MAC, CODES, Some(&tounicode), None, CONTENT);
+    assert_eq!(text_of(&mut doc), "3r r3");
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let result = crate::process_pdf_mem(&bytes).unwrap();
+    assert!(!result.has_encoding_issues);
+}
+
 #[test]
 fn blank_glyph_reads_as_space_without_tounicode() {
     let (mut doc, _) = doc_with_font(WORD_FOR_MAC, CODES, None, None, CONTENT);
