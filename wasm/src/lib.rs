@@ -61,7 +61,27 @@ export interface PdfProcessResult {
   /** 1-indexed page numbers. */
   pagesNeedingOcr: number[];
   ocrReasonsByPage: PageOcrReasons[];
+  /**
+   * The `/Title` of the document information dictionary, decoded as a PDF
+   * text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+   * otherwise). Absent when the entry is missing or not a string; so for the
+   * entries below.
+   */
   title?: string;
+  /** The document information dictionary's `/Author`. */
+  author?: string;
+  /** The document information dictionary's `/Subject`. */
+  subject?: string;
+  /** The document information dictionary's `/Keywords`. */
+  keywords?: string;
+  /** The document information dictionary's `/Creator`: the application the document was authored in. */
+  creator?: string;
+  /** The document information dictionary's `/Producer`: the application that wrote the PDF. */
+  producer?: string;
+  /** The document information dictionary's `/CreationDate` as written, a PDF date string such as `D:20240115103000+01'00'`. */
+  creationDate?: string;
+  /** The document information dictionary's `/ModDate` as written. */
+  modDate?: string;
   confidence: number;
   layout: LayoutComplexity;
   hasEncodingIssues: boolean;
@@ -170,6 +190,13 @@ struct WasmPdfProcessResult {
     pages_needing_ocr: Vec<u32>,
     ocr_reasons_by_page: Vec<WasmPageOcrReasons>,
     title: Option<String>,
+    author: Option<String>,
+    subject: Option<String>,
+    keywords: Option<String>,
+    creator: Option<String>,
+    producer: Option<String>,
+    creation_date: Option<String>,
+    mod_date: Option<String>,
     confidence: f64,
     layout: WasmLayoutComplexity,
     has_encoding_issues: bool,
@@ -190,6 +217,13 @@ impl From<PdfProcessResult> for WasmPdfProcessResult {
                 .map(Into::into)
                 .collect(),
             title: value.title,
+            author: value.author,
+            subject: value.subject,
+            keywords: value.keywords,
+            creator: value.creator,
+            producer: value.producer,
+            creation_date: value.creation_date,
+            mod_date: value.mod_date,
             confidence: value.confidence as f64,
             layout: value.layout.into(),
             has_encoding_issues: value.has_encoding_issues,
@@ -436,6 +470,20 @@ mod tests {
 
         assert_eq!(pdf_type, "TextBased");
         assert!(!markdown.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn reports_document_information() {
+        let result = detect_pdf(TEXT_PDF, JsValue::UNDEFINED).expect("detect PDF");
+        let producer = Reflect::get(&result, &JsValue::from_str("producer"))
+            .expect("producer")
+            .as_string();
+        assert_eq!(producer.as_deref(), Some("pypdf"));
+        for absent in ["title", "author", "creationDate", "modDate"] {
+            assert!(Reflect::get(&result, &JsValue::from_str(absent))
+                .expect(absent)
+                .is_undefined());
+        }
     }
 
     #[wasm_bindgen_test]

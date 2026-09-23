@@ -786,6 +786,97 @@ pub(crate) fn decode_text_string(bytes: &[u8]) -> String {
     }
 }
 
+/// The character a PDFDocEncoding code stands for (ISO 32000-1 Annex D).
+/// Codes 0x18..=0x1F are spacing accents, 0x80..=0x9E punctuation,
+/// ligatures and letters, and 0xA0 the euro sign; every other code is its
+/// Latin-1 character, the undefined 0x7F, 0x9F and 0xAD included.
+fn pdf_doc_encoding_char(byte: u8) -> char {
+    const ACCENTS: [char; 8] = [
+        '\u{02D8}', '\u{02C7}', '\u{02C6}', '\u{02D9}', '\u{02DD}', '\u{02DB}', '\u{02DA}',
+        '\u{02DC}',
+    ];
+    const HIGH: [char; 31] = [
+        '\u{2022}', '\u{2020}', '\u{2021}', '\u{2026}', '\u{2014}', '\u{2013}', '\u{0192}',
+        '\u{2044}', '\u{2039}', '\u{203A}', '\u{2212}', '\u{2030}', '\u{201E}', '\u{201C}',
+        '\u{201D}', '\u{2018}', '\u{2019}', '\u{201A}', '\u{2122}', '\u{FB01}', '\u{FB02}',
+        '\u{0141}', '\u{0152}', '\u{0160}', '\u{0178}', '\u{017D}', '\u{0131}', '\u{0142}',
+        '\u{0153}', '\u{0161}', '\u{017E}',
+    ];
+    match byte {
+        0x18..=0x1F => ACCENTS[usize::from(byte - 0x18)],
+        0x80..=0x9E => HIGH[usize::from(byte - 0x80)],
+        0xA0 => '\u{20AC}',
+        _ => char::from(byte),
+    }
+}
+
+/// UTF-16 text from its code units, two bytes each read by `unit`; an odd
+/// trailing byte is dropped and unpaired surrogates read as U+FFFD.
+fn utf16_text(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| unit(*pair))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// `text` without its language escapes: `ESC`, a language code of one or
+/// two UTF-16 code units (ISO 639, optionally with an ISO 3166 country) and
+/// `ESC` again mark the language of what follows and are not text. An
+/// `ESC` that opens no such escape stays.
+fn strip_language_escapes(text: String) -> String {
+    if !text.contains('\u{1B}') {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find('\u{1B}') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('\u{1B}') {
+            Some(end) if (1..=2).contains(&after[..end].chars().count()) => {
+                rest = &after[end + 1..];
+            }
+            _ => {
+                out.push('\u{1B}');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode a PDF text string, such as an entry of the document information
+/// dictionary, the ways the PDF specification writes one: UTF-16BE after
+/// the byte order mark `FE FF`, UTF-8 after `EF BB BF` (PDF 2.0), and
+/// PDFDocEncoding otherwise. Two producer habits are read as they were
+/// meant: UTF-16LE after `FF FE`, and UTF-8 written without its mark — bytes
+/// that form valid UTF-8 with at least one multi-byte sequence, which text
+/// in PDFDocEncoding practically never does. Language escapes in UTF-16
+/// text and the NULs some producers pad a string's end with are dropped.
+/// ActualText keeps [`decode_text_string`], whose reading the extracted
+/// text depends on.
+pub(crate) fn decode_pdf_text_string(bytes: &[u8]) -> String {
+    let mut text = if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        strip_language_escapes(utf16_text(rest, u16::from_be_bytes))
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        strip_language_escapes(utf16_text(rest, u16::from_le_bytes))
+    } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(rest).into_owned()
+    } else {
+        match std::str::from_utf8(bytes) {
+            Ok(utf8) if !utf8.is_ascii() => utf8.to_owned(),
+            _ => bytes.iter().map(|&b| pdf_doc_encoding_char(b)).collect(),
+        }
+    };
+    let end = text.trim_end_matches('\0').len();
+    text.truncate(end);
+    text
+}
+
 /// Compute effective font size from base size and text matrix
 /// Text matrix is [a, b, c, d, tx, ty] where a,d are scale factors
 pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32 {
@@ -1635,6 +1726,9 @@ mod tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1879,6 +1973,9 @@ mod tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -2008,6 +2105,9 @@ mod tests {
                 font_weight: None,
                 bold_source: None,
                 fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -2094,6 +2194,9 @@ mod tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -2199,6 +2302,9 @@ mod tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,
@@ -2304,5 +2410,65 @@ mod tests {
             (effective_width(&short), effective_height(&short)),
             (6.0, 5.0)
         );
+    }
+
+    #[test]
+    fn pdf_text_strings_decode_from_pdfdocencoding() {
+        assert_eq!(decode_pdf_text_string(b"Annual Report"), "Annual Report");
+        // Latin-1 letters, and the codes where PDFDocEncoding differs from
+        // Latin-1: the euro sign, typographic punctuation, ligatures and
+        // letters above 0x80, spacing accents below 0x20.
+        assert_eq!(decode_pdf_text_string(b"Caf\xE9 \xA0 5"), "Café € 5");
+        assert_eq!(
+            decode_pdf_text_string(b"\x8Dq\x8E \x84 \x80 \x92 \x93 \x97 \x9E"),
+            "\u{201C}q\u{201D} \u{2014} \u{2022} \u{2122} \u{FB01} \u{0160} \u{017E}"
+        );
+        assert_eq!(decode_pdf_text_string(b"\x18\x1F"), "\u{02D8}\u{02DC}");
+        // The codes the encoding leaves undefined read as their Latin-1
+        // characters.
+        assert_eq!(
+            decode_pdf_text_string(b"\x7F\x9F\xAD"),
+            "\u{7F}\u{9F}\u{AD}"
+        );
+    }
+
+    #[test]
+    fn pdf_text_strings_decode_from_unicode_with_a_byte_order_mark() {
+        // UTF-16BE, a supplementary-plane character included.
+        let mut utf16 = vec![0xFE, 0xFF];
+        for unit in "Größe 日本 🙂".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_be_bytes());
+        }
+        assert_eq!(decode_pdf_text_string(&utf16), "Größe 日本 🙂");
+        // An odd trailing byte is dropped; an unpaired surrogate is U+FFFD.
+        assert_eq!(decode_pdf_text_string(b"\xFE\xFF\x00A\x00"), "A");
+        assert_eq!(
+            decode_pdf_text_string(b"\xFE\xFF\xD8\x00\x00A"),
+            "\u{FFFD}A"
+        );
+        // UTF-16LE after its own mark, and UTF-8 after its mark (PDF 2.0).
+        assert_eq!(decode_pdf_text_string(b"\xFF\xFEA\x00\xE9\x00"), "Aé");
+        assert_eq!(decode_pdf_text_string("\u{FEFF}Größe".as_bytes()), "Größe");
+        // A language escape marks the language of the text after it.
+        let mut tagged = vec![0xFE, 0xFF, 0x00, 0x1B, b'e', b'n', 0x00, 0x1B];
+        tagged.extend_from_slice(&[0x00, b'H', 0x00, b'i']);
+        tagged.extend_from_slice(&[0x00, 0x1B, b'd', b'e', b'D', b'E', 0x00, 0x1B]);
+        tagged.extend_from_slice(&[0x00, b'!']);
+        assert_eq!(decode_pdf_text_string(&tagged), "Hi!");
+        assert_eq!(decode_pdf_text_string(b"\xFE\xFF\x00\x1B\x00A"), "\u{1B}A");
+    }
+
+    #[test]
+    fn pdf_text_strings_written_as_utf8_without_a_mark_read_as_utf8() {
+        assert_eq!(
+            decode_pdf_text_string("Größe – ≥ 5".as_bytes()),
+            "Größe – ≥ 5"
+        );
+        // Bytes that are not valid UTF-8 are PDFDocEncoding.
+        assert_eq!(decode_pdf_text_string(b"Gr\xF6\xDFe"), "Größe");
+        // Padding NULs at the end of a string are no text.
+        assert_eq!(decode_pdf_text_string(b"Title\0\0"), "Title");
+        assert_eq!(decode_pdf_text_string(b"\xFE\xFF\x00A\x00\x00"), "A");
+        assert_eq!(decode_pdf_text_string(b""), "");
     }
 }

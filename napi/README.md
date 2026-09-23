@@ -143,6 +143,22 @@ nothing and no two advances differ but fewer than a dozen share one. Many
 producers write `/Flags 4`
 whatever the face, so the flag is only ever read as a yes.
 
+`fillColor` and `strokeColor` are the colours a run was shown with, as sRGB
+`[red, green, blue]` arrays of 0..255: its glyphs are filled with the first in
+render modes 0, 2, 4 and 6 and outlined with the second in modes 1, 2, 5 and
+6. DeviceRGB is read as sRGB, DeviceGray as three equal components and
+DeviceCMYK converted the way the PDF specification converts it to DeviceRGB;
+ICCBased spaces are read by their component count and Indexed spaces through
+their palette. A colour is omitted for any other colour space (Separation,
+DeviceN, Pattern, CalRGB, Lab, ...). `renderMode` is the text render mode
+(`Tr`) the run was shown with, 0..7: runs in mode 3 (invisible, the mode of OCR
+text layers) and mode 7 (clipping only) put no glyphs on the page, so a caller
+can tell visible text from invisible text. The colours and the mode are
+graphics state — they hold across text objects, `q`/`Q` save and restore them,
+and a Form XObject starts with the paint it was invoked under — and reporting
+them changes nothing about which runs are extracted. All three are omitted for
+image, link and form-field items, and a merged item keeps its first run's.
+
 `legacySymbolRewrite: true` marks items whose decoded text includes a character
 changed by legacy symbol cleanup. Merged items retain this evidence from either
 source, and split items conservatively inherit it. The field is omitted when
@@ -250,6 +266,24 @@ interface PdfClassification {
   pageCount: number
   pagesNeedingOcr: number[] // 0-indexed page numbers
   confidence: number        // 0.0 - 1.0
+}
+
+interface PdfResult {       // processPdf / detectPdf (excerpt)
+  pdfType: string
+  markdown?: string         // omitted by detectPdf
+  pageCount: number
+  // The document information dictionary's entries, decoded as PDF text
+  // strings (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+  // otherwise); each omitted when missing or not a string.
+  title?: string
+  author?: string
+  subject?: string
+  keywords?: string
+  creator?: string          // the application the document was authored in
+  producer?: string         // the application that wrote the PDF
+  creationDate?: string     // as written, e.g. "D:20240115103000+01'00'"
+  modDate?: string
+  // ...
 }
 
 interface PageRegions {

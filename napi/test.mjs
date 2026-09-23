@@ -641,6 +641,79 @@ assert.deepEqual(mixedLine(facesAt700), mixedLine(faces));
 assert.deepEqual(facesOn.map(i => i.fixedPitch), faces.map(i => i.fixedPitch));
 console.log('  font metadata: OK');
 
+// --- text paint: fillColor, strokeColor and renderMode; document information ---
+console.log('Testing text paint and document information...');
+
+// One page with a red run, a stroked blue run, a run shown under a `3 Tr` set
+// before its text object, a line shown with `"`, and a Form XObject's text
+// under the page's green fill; the information dictionary holds a UTF-16BE
+// title, a PDFDocEncoding author and a producer.
+function paintPdf() {
+  const widths = `[${Array(256).fill('600').join(' ')}]`;
+  const content =
+    '1 0 0 rg BT /F1 12 Tf 72 700 Td (Red run) Tj ET\n' +
+    '0 0 1 RG 1 Tr BT /F1 12 Tf 72 680 Td (Outlined run) Tj ET\n' +
+    '0 g 3 Tr BT /F1 12 Tf 72 660 Td (Invisible run) Tj ET\n' +
+    '0 Tr BT /F1 12 Tf 14 TL 72 654 Td 2 0.5 (Quoted run) " ET\n' +
+    '0 1 0 rg q /X1 Do Q';
+  const form = 'BT /F1 12 Tf 72 600 Td (Form run) Tj ET';
+  const utf16 = text => `<FEFF${Buffer.from(text, 'utf16le').swap16().toString('hex').toUpperCase()}>`;
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject << /X1 6 0 R >> >> /Contents 4 0 R >>',
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+    `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 0 /LastChar 255 /Widths ${widths} >>`,
+    `<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Length ${Buffer.byteLength(form)} >>\nstream\n${form}\nendstream`,
+    `<< /Title ${utf16('Quarterly – Q3')} /Author (José) /Producer (Test Library) /CreationDate (D:20240115103000Z) >>`,
+  ];
+  let pdf = '%PDF-1.7\n';
+  const offsets = [];
+  objects.forEach((body, index) => {
+    offsets.push(Buffer.byteLength(pdf, 'latin1'));
+    pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf, 'latin1');
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R /Info 7 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf, 'latin1');
+}
+const paintItems = extractTextWithPositions(paintPdf());
+const paintOf = text => {
+  const found = paintItems.find(i => i.text === text);
+  assert.ok(found, `${text} missing: ${JSON.stringify(paintItems.map(i => i.text))}`);
+  return [found.fillColor, found.strokeColor, found.renderMode];
+};
+assert.deepEqual(paintOf('Red run'), [[255, 0, 0], [0, 0, 0], 0]);
+assert.deepEqual(paintOf('Outlined run'), [[255, 0, 0], [0, 0, 255], 1]);
+// Extracted as it always was, and reported as painting nothing.
+assert.deepEqual(paintOf('Invisible run'), [[0, 0, 0], [0, 0, 255], 3]);
+assert.deepEqual(paintOf('Quoted run'), [[0, 0, 0], [0, 0, 255], 0]);
+assert.deepEqual(paintOf('Form run'), [[0, 255, 0], [0, 0, 255], 0]);
+// Text from the fixture reports its paint; image, link and form-field items
+// carry none.
+const fixtureText = items.filter(i => i.itemType === 'Text');
+assert.ok(fixtureText.length > 0);
+assert.ok(fixtureText.every(i => Array.isArray(i.fillColor) && i.fillColor.length === 3));
+assert.ok(fixtureText.every(i => Number.isInteger(i.renderMode) && i.renderMode >= 0 && i.renderMode <= 7));
+assert.ok(items.filter(i => i.itemType !== 'Text').every(i => i.fillColor === undefined && i.renderMode === undefined));
+
+const infoResult = processPdf(paintPdf());
+assert.equal(infoResult.title, 'Quarterly – Q3');
+assert.equal(infoResult.author, 'José');
+assert.equal(infoResult.producer, 'Test Library');
+assert.equal(infoResult.creationDate, 'D:20240115103000Z');
+assert.equal(infoResult.subject, undefined);
+assert.equal(infoResult.modDate, undefined);
+assert.ok(infoResult.markdown.includes('Quoted run'));
+const taggedInfo = detectPdf(taggedFixture);
+assert.equal(taggedInfo.title, 'Firecrawl Documentation - API Reference');
+assert.equal(taggedInfo.author, 'Firecrawl');
+assert.equal(taggedInfo.creationDate, 'D:20260318031744Z');
+assert.equal(detectPdf(fixture).producer, 'pypdf');
+console.log('  text paint and document information: OK');
+
 // --- Error handling ---
 console.log('Testing error handling...');
 assert.throws(() => processPdf(Buffer.from('not a pdf')), /process_pdf/);

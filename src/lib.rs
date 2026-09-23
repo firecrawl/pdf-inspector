@@ -193,8 +193,30 @@ pub struct PdfProcessResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
-    /// Title from PDF metadata (if available).
+    /// The `/Title` of the document information dictionary, decoded as a
+    /// PDF text string (UTF-16 or UTF-8 after a byte order mark,
+    /// PDFDocEncoding otherwise; see [`PdfTypeResult::title`]). `None` when
+    /// the entry is missing or not a string; so for the entries below.
     pub title: Option<String>,
+    /// The document information dictionary's `/Author`.
+    pub author: Option<String>,
+    /// The document information dictionary's `/Subject`.
+    pub subject: Option<String>,
+    /// The document information dictionary's `/Keywords`.
+    pub keywords: Option<String>,
+    /// The document information dictionary's `/Creator`: the application
+    /// the document was authored in.
+    pub creator: Option<String>,
+    /// The document information dictionary's `/Producer`: the application
+    /// that wrote the PDF.
+    pub producer: Option<String>,
+    /// The document information dictionary's `/CreationDate` as written, a
+    /// PDF date string such as `D:20240115103000+01'00'`, neither validated
+    /// nor converted.
+    pub creation_date: Option<String>,
+    /// The document information dictionary's `/ModDate` as written, like
+    /// `creation_date`.
+    pub mod_date: Option<String>,
     /// Detection confidence score (0.0–1.0).
     pub confidence: f32,
     /// Layout complexity analysis (tables, multi-column detection).
@@ -977,6 +999,9 @@ mod ocr_header_footer_tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -4556,6 +4581,13 @@ fn process_document(
     let pdf_type = detection.pdf_type;
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
+    let author = detection.author;
+    let subject = detection.subject;
+    let keywords = detection.keywords;
+    let creator = detection.creator;
+    let producer = detection.producer;
+    let creation_date = detection.creation_date;
+    let mod_date = detection.mod_date;
     let confidence = detection.confidence;
     let detection_ocr_reasons = detection.ocr_reasons_by_page;
 
@@ -4569,6 +4601,13 @@ fn process_document(
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
+            author,
+            subject,
+            keywords,
+            creator,
+            producer,
+            creation_date,
+            mod_date,
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
@@ -4586,6 +4625,13 @@ fn process_document(
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
+            author,
+            subject,
+            keywords,
+            creator,
+            producer,
+            creation_date,
+            mod_date,
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
@@ -4936,6 +4982,13 @@ fn process_document(
             page_ocr_reasons_vec(merged)
         },
         title,
+        author,
+        subject,
+        keywords,
+        creator,
+        producer,
+        creation_date,
+        mod_date,
         confidence,
         layout,
         has_encoding_issues,
@@ -5854,6 +5907,9 @@ mod text_cluster_column_undercount_tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -6138,6 +6194,9 @@ mod table_candidate_selection_tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -7171,6 +7230,9 @@ mod tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -8386,6 +8448,9 @@ mod rotated_run_region_tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,

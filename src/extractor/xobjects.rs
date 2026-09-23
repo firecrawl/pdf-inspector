@@ -530,7 +530,7 @@ fn extract_form_xobject_text_inner(
                     horizontal_scale,
                     text_rise,
                     text_rendering_mode,
-                    text_paint,
+                    text_paint: text_paint.clone(),
                     text_leading,
                     current_font: current_font.clone(),
                     current_font_size,
@@ -581,7 +581,7 @@ fn extract_form_xobject_text_inner(
                                         text_rendering_mode,
                                         text_rise,
                                         horizontal_scale,
-                                        text_paint,
+                                        text_paint.clone(),
                                         fill_is_white,
                                         cmap_decisions,
                                         style_cache,
@@ -621,6 +621,9 @@ fn extract_form_xobject_text_inner(
                                     font_weight: None,
                                     bold_source: None,
                                     fixed_pitch: None,
+                                    fill_color: None,
+                                    stroke_color: None,
+                                    render_mode: None,
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: 0.0,
@@ -927,6 +930,7 @@ fn extract_form_xobject_text_inner(
                             }
                             let painted_bold = paintable_fonts.contains(&current_font)
                                 && text_paint.adds_bold(&text, rendered_size, base_font, &ctm);
+                            let paint = text_paint.run_paint();
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x: geometry.x,
@@ -949,6 +953,9 @@ fn extract_form_xobject_text_inner(
                                     .bold_source
                                     .or(painted_bold.then_some(BoldSource::Painted)),
                                 fixed_pitch: style.fixed_pitch,
+                                fill_color: paint.fill_color,
+                                stroke_color: paint.stroke_color,
+                                render_mode: Some(paint.render_mode),
                                 is_underline: false,
                                 is_strikeout: false,
                                 rotation: geometry.rotation,
@@ -1418,6 +1425,7 @@ fn extract_form_xobject_text_inner(
                                 }
                                 let painted_bold = paintable_fonts.contains(&current_font)
                                     && text_paint.adds_bold(text, rendered_size, base_font, &ctm);
+                                let paint = text_paint.run_paint();
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
                                     x: geometry.x,
@@ -1440,6 +1448,9 @@ fn extract_form_xobject_text_inner(
                                         .bold_source
                                         .or(painted_bold.then_some(BoldSource::Painted)),
                                     fixed_pitch: style.fixed_pitch,
+                                    fill_color: paint.fill_color,
+                                    stroke_color: paint.stroke_color,
+                                    render_mode: Some(paint.render_mode),
                                     is_underline: false,
                                     is_strikeout: false,
                                     rotation: geometry.rotation,
@@ -2167,6 +2178,84 @@ BT 3 Tr /F1 12 Tf 0 1 -1 0 240 100 Tm [(ALSO) -3000 (HIDDEN)] TJ ET";
                 ("Body", false)
             ]
         );
+    }
+
+    /// `(fill_color, stroke_color, render_mode)` of the item reading `text`.
+    fn paint_of(items: &[TextItem], text: &str) -> (Option<[u8; 3]>, Option<[u8; 3]>, Option<u8>) {
+        let item = find(items, text);
+        (item.fill_color, item.stroke_color, item.render_mode)
+    }
+
+    #[test]
+    fn form_text_reports_the_paint_it_inherits_and_restores_it() {
+        // The form starts with the paint in force where the page invokes it;
+        // what it sets inside its own `q`/`Q` ends there, a nested form
+        // starts with the outer form's paint, and nothing leaks back onto
+        // the page when the form returns.
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"1 0 0 rg 0 0 1 RG 1 Tr q /X1 Do Q BT /F1 12 Tf 72 500 Td (Page) Tj ET",
+            &[
+                b"BT /F1 12 Tf 72 700 Td (Inherited) Tj ET
+                  q 0 1 0 rg 0 Tr BT /F1 12 Tf 72 680 Td (Own) Tj ET /X2 Do Q
+                  BT /F1 12 Tf 72 660 Td (Restored) Tj ET",
+                b"BT /F1 12 Tf 72 640 Td [(Nes) (ted)] TJ ET",
+            ],
+        );
+        let (items, _) = extract_page(&doc, page_id, false);
+        let red = Some([255, 0, 0]);
+        let green = Some([0, 255, 0]);
+        let blue = Some([0, 0, 255]);
+        assert_eq!(paint_of(&items, "Inherited"), (red, blue, Some(1)));
+        assert_eq!(paint_of(&items, "Own"), (green, blue, Some(0)));
+        assert_eq!(paint_of(&items, "Nested"), (green, blue, Some(0)));
+        assert_eq!(paint_of(&items, "Restored"), (red, blue, Some(1)));
+        assert_eq!(paint_of(&items, "Page"), (red, blue, Some(1)));
+    }
+
+    #[test]
+    fn form_reads_a_palette_colour_in_the_space_it_inherits() {
+        // The page selects a palette from its own resources and a colour in
+        // it; the form, whose resources know no such space, starts with that
+        // colour and can pick another entry of the inherited palette.
+        let (mut doc, page_id) = doc_with_page_and_forms(
+            b"/Pal cs 1 sc /X1 Do",
+            &[b"BT /F1 12 Tf 72 700 Td (First) Tj ET 2 sc BT /F1 12 Tf 72 680 Td (Second) Tj ET"],
+        );
+        let palette = Object::Array(vec![
+            Object::Name(b"Indexed".to_vec()),
+            Object::Name(b"DeviceRGB".to_vec()),
+            2.into(),
+            Object::String(
+                vec![0, 0, 0, 255, 0, 0, 0, 0, 255],
+                lopdf::StringFormat::Hexadecimal,
+            ),
+        ]);
+        doc.get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .get_mut(b"Resources")
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("ColorSpace", dictionary! { "Pal" => palette });
+        let (items, _) = extract_page(&doc, page_id, false);
+        assert_eq!(paint_of(&items, "First").0, Some([255, 0, 0]));
+        assert_eq!(paint_of(&items, "Second").0, Some([0, 0, 255]));
+    }
+
+    #[test]
+    fn form_items_of_every_show_operator_report_their_paint() {
+        let items = form_items(
+            b"1 0 0 rg 2 Tr BT /F1 12 Tf 12 TL 72 700 Td (Shown) Tj (Quoted) ' 1 0 (Spaced) \" T* [(Ar) (ray)] TJ ET",
+        );
+        for text in ["Shown", "Quoted", "Spaced", "Array"] {
+            assert_eq!(
+                paint_of(&items, text),
+                (Some([255, 0, 0]), Some([0, 0, 0]), Some(2)),
+                "{text}"
+            );
+        }
     }
 
     #[test]

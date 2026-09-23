@@ -33,9 +33,36 @@ pub struct PyPdfResult {
     /// Machine-readable OCR reasons by 1-indexed page.
     #[pyo3(get)]
     pub ocr_reasons_by_page: Vec<PyPageOcrReasons>,
-    /// Title from PDF metadata.
+    /// The /Title of the document information dictionary, decoded as a PDF
+    /// text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+    /// otherwise). None when the entry is missing or not a string; so for
+    /// the entries below.
     #[pyo3(get)]
     pub title: Option<String>,
+    /// The document information dictionary's /Author.
+    #[pyo3(get)]
+    pub author: Option<String>,
+    /// The document information dictionary's /Subject.
+    #[pyo3(get)]
+    pub subject: Option<String>,
+    /// The document information dictionary's /Keywords.
+    #[pyo3(get)]
+    pub keywords: Option<String>,
+    /// The document information dictionary's /Creator: the application the
+    /// document was authored in.
+    #[pyo3(get)]
+    pub creator: Option<String>,
+    /// The document information dictionary's /Producer: the application that
+    /// wrote the PDF.
+    #[pyo3(get)]
+    pub producer: Option<String>,
+    /// The document information dictionary's /CreationDate as written, a PDF
+    /// date string such as "D:20240115103000+01'00'".
+    #[pyo3(get)]
+    pub creation_date: Option<String>,
+    /// The document information dictionary's /ModDate as written.
+    #[pyo3(get)]
+    pub mod_date: Option<String>,
     /// Detection confidence (0.0-1.0).
     #[pyo3(get)]
     pub confidence: f32,
@@ -456,6 +483,28 @@ pub struct PyTextItem {
     /// and for image, link and form-field items.
     #[pyo3(get)]
     pub fixed_pitch: Option<bool>,
+    /// The fill colour the run was shown with, as an sRGB (red, green, blue)
+    /// tuple of 0..255: what its glyphs are filled with in the render modes
+    /// that fill (0, 2, 4, 6). DeviceRGB is read as sRGB, DeviceGray as
+    /// three equal components and DeviceCMYK converted as the PDF
+    /// specification converts it to DeviceRGB; ICCBased spaces are read by
+    /// their component count and Indexed spaces through their palette. None
+    /// for any other colour space (Separation, DeviceN, Pattern, CalRGB,
+    /// Lab, ...), and for image, link and form-field items.
+    #[pyo3(get)]
+    pub fill_color: Option<(u8, u8, u8)>,
+    /// The stroke colour the run was shown with, read like fill_color: what
+    /// its glyph outlines are stroked with in the render modes that stroke
+    /// (1, 2, 5, 6).
+    #[pyo3(get)]
+    pub stroke_color: Option<(u8, u8, u8)>,
+    /// The text render mode (Tr) the run was shown with, 0..7: 0 fill, 1
+    /// stroke, 2 fill and stroke, 3 invisible (the mode of OCR text layers),
+    /// 4..6 as 0..2 and clip, 7 clip only. Runs in modes 3 and 7 put no
+    /// glyphs on the page. Which runs are extracted is unchanged by it. None
+    /// for image, link and form-field items.
+    #[pyo3(get)]
+    pub render_mode: Option<u8>,
     #[pyo3(get)]
     pub is_underline: bool,
     #[pyo3(get)]
@@ -536,6 +585,13 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         pages_needing_ocr: r.pages_needing_ocr,
         ocr_reasons_by_page: to_py_page_ocr_reasons(r.ocr_reasons_by_page),
         title: r.title,
+        author: r.author,
+        subject: r.subject,
+        keywords: r.keywords,
+        creator: r.creator,
+        producer: r.producer,
+        creation_date: r.creation_date,
+        mod_date: r.mod_date,
         confidence: r.confidence,
         is_complex_layout: r.layout.is_complex,
         pages_with_tables: r.layout.pages_with_tables,
@@ -692,6 +748,9 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             font_weight: item.font_weight,
             bold_source: item.bold_source.map(|source| source.as_str().to_string()),
             fixed_pitch: item.fixed_pitch,
+            fill_color: item.fill_color.map(|[r, g, b]| (r, g, b)),
+            stroke_color: item.stroke_color.map(|[r, g, b]| (r, g, b)),
+            render_mode: item.render_mode,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
             rotation: item.rotation,

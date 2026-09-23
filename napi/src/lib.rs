@@ -81,7 +81,28 @@ pub struct PdfResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// The `/Title` of the document information dictionary, decoded as a PDF
+    /// text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+    /// otherwise). Omitted when the entry is missing or not a string; so for
+    /// the entries below.
     pub title: Option<String>,
+    /// The document information dictionary's `/Author`.
+    pub author: Option<String>,
+    /// The document information dictionary's `/Subject`.
+    pub subject: Option<String>,
+    /// The document information dictionary's `/Keywords`.
+    pub keywords: Option<String>,
+    /// The document information dictionary's `/Creator`: the application the
+    /// document was authored in.
+    pub creator: Option<String>,
+    /// The document information dictionary's `/Producer`: the application
+    /// that wrote the PDF.
+    pub producer: Option<String>,
+    /// The document information dictionary's `/CreationDate` as written, a
+    /// PDF date string such as `D:20240115103000+01'00'`.
+    pub creation_date: Option<String>,
+    /// The document information dictionary's `/ModDate` as written.
+    pub mod_date: Option<String>,
     pub confidence: f64,
     pub is_complex_layout: bool,
     pub pages_with_tables: Vec<u32>,
@@ -214,6 +235,29 @@ pub struct TextItem {
     /// Many producers write `/Flags 4` whatever the face, so the flag is
     /// only ever read as a yes.
     pub fixed_pitch: Option<bool>,
+    /// The fill colour the run was shown with, as sRGB `[red, green, blue]`
+    /// of 0..255: what its glyphs are filled with in the render modes that
+    /// fill (0, 2, 4, 6). DeviceRGB is read as sRGB, DeviceGray as three
+    /// equal components and DeviceCMYK converted as the PDF specification
+    /// converts it to DeviceRGB; ICCBased spaces are read by their component
+    /// count and Indexed spaces through their palette. Omitted for any other
+    /// colour space (Separation, DeviceN, Pattern, CalRGB, Lab, ...), and for
+    /// image, link and form-field items. A merged item keeps its first run's.
+    #[napi(ts_type = "[number, number, number]")]
+    pub fill_color: Option<Vec<u32>>,
+    /// The stroke colour the run was shown with, read like `fillColor`: what
+    /// its glyph outlines are stroked with in the render modes that stroke
+    /// (1, 2, 5, 6).
+    #[napi(ts_type = "[number, number, number]")]
+    pub stroke_color: Option<Vec<u32>>,
+    /// The text render mode (`Tr`) the run was shown with, 0..7: 0 fill, 1
+    /// stroke, 2 fill and stroke, 3 invisible (the mode of OCR text layers),
+    /// 4..6 as 0..2 and clip, 7 clip only. Runs in modes 3 and 7 put no
+    /// glyphs on the page. The mode holds across text objects, is saved and
+    /// restored by `q`/`Q` and is inherited by Form XObjects. Which runs are
+    /// extracted is unchanged by it. Omitted for image, link and form-field
+    /// items.
+    pub render_mode: Option<u32>,
     /// Underline detected geometrically (drawn rule/thin rect under the
     /// baseline) — PDFs carry no underline font flag.
     pub is_underline: bool,
@@ -415,6 +459,13 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         pages_needing_ocr: r.pages_needing_ocr,
         ocr_reasons_by_page: to_napi_page_ocr_reasons(r.ocr_reasons_by_page),
         title: r.title,
+        author: r.author,
+        subject: r.subject,
+        keywords: r.keywords,
+        creator: r.creator,
+        producer: r.producer,
+        creation_date: r.creation_date,
+        mod_date: r.mod_date,
         confidence: r.confidence as f64,
         is_complex_layout: r.layout.is_complex,
         pages_with_tables: r.layout.pages_with_tables,
@@ -722,6 +773,14 @@ pub fn extract_text_with_positions(
     })
 }
 
+/// An sRGB colour as the `[red, green, blue]` array the Node API reports.
+fn convert_color(color: [u8; 3]) -> Vec<u32> {
+    color
+        .iter()
+        .map(|&component| u32::from(component))
+        .collect()
+}
+
 fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
     let (item_type, link_url) = convert_item_type(&item.item_type);
     TextItem {
@@ -740,6 +799,9 @@ fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
         font_weight: item.font_weight.map(u32::from),
         bold_source: item.bold_source.map(convert_bold_source),
         fixed_pitch: item.fixed_pitch,
+        fill_color: item.fill_color.map(convert_color),
+        stroke_color: item.stroke_color.map(convert_color),
+        render_mode: item.render_mode.map(u32::from),
         is_underline: item.is_underline,
         is_strikeout: item.is_strikeout,
         rotation: item.rotation as f64,

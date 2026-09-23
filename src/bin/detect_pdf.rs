@@ -57,6 +57,32 @@ fn format_cmap_gaps(gaps: &[pdf_inspector::FontCMapGaps]) -> String {
         .join(",")
 }
 
+/// The document information entries, given in the order of the keys below,
+/// as JSON members from `"title"` to `"mod_date"`, each `null` when the
+/// document has none.
+fn format_document_info(entries: [Option<&str>; 8]) -> String {
+    const KEYS: [&str; 8] = [
+        "title",
+        "author",
+        "subject",
+        "keywords",
+        "creator",
+        "producer",
+        "creation_date",
+        "mod_date",
+    ];
+    KEYS.iter()
+        .zip(entries)
+        .map(|(key, value)| {
+            let value = value
+                .map(|value| format!(r#""{}""#, json_escape(value)))
+                .unwrap_or_else(|| "null".to_string());
+            format!(r#""{key}":{value}"#)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     for ch in s.chars() {
@@ -220,8 +246,18 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
                     .collect();
                 let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
                 let cmap_gaps = format_cmap_gaps(&result.cmap_gaps);
+                let document_info = format_document_info([
+                    result.title.as_deref(),
+                    result.author.as_deref(),
+                    result.subject.as_deref(),
+                    result.keywords.as_deref(),
+                    result.creator.as_deref(),
+                    result.producer.as_deref(),
+                    result.creation_date.as_deref(),
+                    result.mod_date.as_deref(),
+                ]);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"cmap_gaps":[{}],"detection_time_ms":{}}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"cmap_gaps":[{}],{},"detection_time_ms":{}}}"#,
                     pdf_type_str(&result.pdf_type),
                     result.page_count,
                     ocr_pages.join(","),
@@ -230,6 +266,7 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
                     table_pages.join(","),
                     col_pages.join(","),
                     cmap_gaps,
+                    document_info,
                     elapsed.as_millis()
                 );
             } else {
@@ -293,18 +330,24 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                     .map(|p| p.to_string())
                     .collect();
                 let ocr_reasons = format_detector_ocr_reasons(&result.ocr_reasons_by_page);
+                let document_info = format_document_info([
+                    result.title.as_deref(),
+                    result.author.as_deref(),
+                    result.subject.as_deref(),
+                    result.keywords.as_deref(),
+                    result.creator.as_deref(),
+                    result.producer.as_deref(),
+                    result.creation_date.as_deref(),
+                    result.mod_date.as_deref(),
+                ]);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},"title":{},"ocr_recommended":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"detection_time_ms":{}}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},{},"ocr_recommended":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"detection_time_ms":{}}}"#,
                     pdf_type_str(&result.pdf_type),
                     result.page_count,
                     result.pages_sampled,
                     result.pages_with_text,
                     result.confidence,
-                    result
-                        .title
-                        .as_ref()
-                        .map(|t| format!("\"{}\"", json_escape(t)))
-                        .unwrap_or_else(|| "null".to_string()),
+                    document_info,
                     result.ocr_recommended,
                     ocr_pages.join(","),
                     ocr_reasons,
@@ -383,7 +426,24 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_detect_args;
+    use super::{format_document_info, parse_detect_args};
+
+    #[test]
+    fn document_info_json_names_every_entry_in_order() {
+        assert_eq!(
+            format_document_info([
+                Some("Title \"one\""),
+                None,
+                None,
+                Some("a, b"),
+                None,
+                Some("Library"),
+                Some("D:2024"),
+                None,
+            ]),
+            r#""title":"Title \"one\"","author":null,"subject":null,"keywords":"a, b","creator":null,"producer":"Library","creation_date":"D:2024","mod_date":null"#
+        );
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         std::iter::once("detect-pdf".to_string())

@@ -14,6 +14,27 @@ class PdfResult:
     ocr_reasons_by_page: list["PageOcrReasons"]
     """Machine-readable OCR reasons by 1-indexed page."""
     title: Optional[str]
+    """The /Title of the document information dictionary, decoded as a PDF
+    text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+    otherwise). None when the entry is missing or not a string; so for the
+    entries below."""
+    author: Optional[str]
+    """The document information dictionary's /Author."""
+    subject: Optional[str]
+    """The document information dictionary's /Subject."""
+    keywords: Optional[str]
+    """The document information dictionary's /Keywords."""
+    creator: Optional[str]
+    """The document information dictionary's /Creator: the application the
+    document was authored in."""
+    producer: Optional[str]
+    """The document information dictionary's /Producer: the application that
+    wrote the PDF."""
+    creation_date: Optional[str]
+    """The document information dictionary's /CreationDate as written, a PDF
+    date string such as "D:20240115103000+01'00'"."""
+    mod_date: Optional[str]
+    """The document information dictionary's /ModDate as written."""
     confidence: float
     is_complex_layout: bool
     pages_with_tables: list[int]
@@ -169,6 +190,26 @@ class TextItem:
     fewer than a dozen share one, and for image, link and form-field items.
     Many producers write
     ``/Flags 4`` whatever the face, so the flag is only ever read as a yes."""
+    fill_color: Optional[tuple[int, int, int]]
+    """The fill colour the run was shown with, as an sRGB ``(red, green,
+    blue)`` tuple of 0..255: what its glyphs are filled with in the render
+    modes that fill (0, 2, 4, 6). DeviceRGB is read as sRGB, DeviceGray as
+    three equal components and DeviceCMYK converted as the PDF specification
+    converts it to DeviceRGB; ICCBased spaces are read by their component
+    count and Indexed spaces through their palette. ``None`` for any other
+    colour space (Separation, DeviceN, Pattern, CalRGB, Lab, ...), and for
+    image, link and form-field items. A merged item keeps its first run's."""
+    stroke_color: Optional[tuple[int, int, int]]
+    """The stroke colour the run was shown with, read like ``fill_color``:
+    what its glyph outlines are stroked with in the render modes that stroke
+    (1, 2, 5, 6)."""
+    render_mode: Optional[int]
+    """The text render mode (``Tr``) the run was shown with, 0..7: 0 fill, 1
+    stroke, 2 fill and stroke, 3 invisible (the mode of OCR text layers), 4..6
+    as 0..2 and clip, 7 clip only. Runs in modes 3 and 7 put no glyphs on the
+    page. The mode holds across text objects, is saved and restored by
+    ``q``/``Q`` and is inherited by Form XObjects; which runs are extracted is
+    unchanged by it. ``None`` for image, link and form-field items."""
     is_underline: bool
     is_strikeout: bool
     baseline_shift: float

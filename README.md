@@ -142,10 +142,10 @@ cargo install pdf-inspector
 # Convert PDF to Markdown
 pdf2md document.pdf
 
-# JSON output (for piping)
+# JSON output (for piping), with the document information (title, author, producer, dates, ...)
 pdf2md document.pdf --json
 
-# Positioned TextItem JSON (coordinates relative to the visible page box): axis-aligned box, rotation, font, underline metadata
+# Positioned TextItem JSON (coordinates relative to the visible page box): axis-aligned box, rotation, font, paint (fill and stroke colour, render mode), underline metadata
 pdf2md document.pdf --items-json
 
 # Raw markdown only (no headers)

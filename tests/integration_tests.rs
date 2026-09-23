@@ -351,6 +351,9 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         font_weight: None,
         bold_source: None,
         fixed_pitch: None,
+        fill_color: None,
+        stroke_color: None,
+        render_mode: None,
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
@@ -386,6 +389,9 @@ fn make_text_item_with_font(
         font_weight: None,
         bold_source: None,
         fixed_pitch: None,
+        fill_color: None,
+        stroke_color: None,
+        render_mode: None,
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
@@ -2092,6 +2098,13 @@ fn test_pages_needing_ocr_field_accessible() {
         pages_with_text: 1,
         confidence: 1.0,
         title: None,
+        author: None,
+        subject: None,
+        keywords: None,
+        creator: None,
+        producer: None,
+        creation_date: None,
+        mod_date: None,
         ocr_recommended: false,
         pages_needing_ocr: Vec::new(),
         ocr_reasons_by_page: std::collections::BTreeMap::new(),
@@ -2106,6 +2119,13 @@ fn test_pages_needing_ocr_field_accessible() {
         pages_needing_ocr: vec![1, 3],
         ocr_reasons_by_page: Vec::new(),
         title: None,
+        author: None,
+        subject: None,
+        keywords: None,
+        creator: None,
+        producer: None,
+        creation_date: None,
+        mod_date: None,
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
         has_encoding_issues: false,
@@ -9848,4 +9868,194 @@ fn an_odd_length_string_no_cmap_reads_counts_its_bytes_once() {
             unmapped: 3,
         }]
     );
+}
+
+// =========================================================================
+// Text paint and document information
+// =========================================================================
+
+/// One page showing a run in the default black, a red run, a run shown
+/// under a `3 Tr` set before its text object, a run hidden by `3 Tr` inside
+/// its own text object, a line shown with `"`, a Form XObject's text under
+/// the page's blue fill and a run after the form. The information dictionary
+/// holds every text entry, in PDFDocEncoding and UTF-16BE.
+fn synthetic_paint_and_info_pdf() -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+
+    let utf16 = |text: &str| {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        Object::String(bytes, StringFormat::Hexadecimal)
+    };
+    let mut doc = Document::with_version("1.7");
+    let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "FirstChar" => 0,
+        "LastChar" => 255,
+        "Widths" => Object::Array(widths),
+    });
+    let form = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        },
+        b"BT /F1 12 Tf 72 580 Td (Form text) Tj ET".to_vec(),
+    ));
+    let content = b"BT /F1 12 Tf 72 720 Td (Body text) Tj ET
+0.8 0.1 0.1 rg BT /F1 12 Tf 72 700 Td (Red text) Tj ET
+0 g 3 Tr BT /F1 12 Tf 72 680 Td (Invisible text) Tj ET
+0 Tr BT /F1 12 Tf 72 660 Td 3 Tr (Layer text) Tj 0 Tr ET
+BT /F1 12 Tf 14 TL 72 654 Td 2 0.5 (Quoted line) \" ET
+0 0 1 rg q /X1 Do Q
+BT /F1 12 Tf 72 560 Td (After form) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font },
+            "XObject" => dictionary! { "X1" => form },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let info = doc.add_object(dictionary! {
+        "Title" => utf16("Quarterly Report – Q3"),
+        "Author" => Object::String(b"Jos\xE9 Mart\xEDnez".to_vec(), StringFormat::Literal),
+        "Subject" => Object::string_literal("Paint and render modes"),
+        "Keywords" => Object::string_literal("colour, visibility"),
+        "Creator" => Object::string_literal("Test Writer"),
+        "Producer" => utf16("Test Library 1.0"),
+        "CreationDate" => Object::string_literal("D:20240115103000+01'00'"),
+        "ModDate" => Object::string_literal("D:20240116090000Z"),
+    });
+    doc.trailer.set("Info", info);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn text_items_report_their_fill_colour_and_render_mode() {
+    let pdf = synthetic_paint_and_info_pdf();
+    let items = extract_text_with_positions_mem(&pdf).unwrap();
+    let paint = |text: &str| {
+        let item = items
+            .iter()
+            .find(|item| item.text == text)
+            .unwrap_or_else(|| panic!("no item {text:?} in {items:?}"));
+        (item.fill_color, item.stroke_color, item.render_mode)
+    };
+    let black = Some([0, 0, 0]);
+    // The default paint, and a fill colour set before the text object.
+    assert_eq!(paint("Body text"), (black, black, Some(0)));
+    assert_eq!(paint("Red text"), (Some([204, 26, 26]), black, Some(0)));
+    // A run shown under a `3 Tr` set before its text object is extracted as
+    // it always was, and says it paints nothing; a run hidden inside its own
+    // text object is still left out of the positioned text.
+    assert_eq!(paint("Invisible text"), (black, black, Some(3)));
+    assert!(!items.iter().any(|item| item.text.contains("Layer text")));
+    // `"` moves to the next line (the leading below the `Td`) and shows its
+    // string, painted like any other run.
+    let quoted = items
+        .iter()
+        .find(|item| item.text == "Quoted line")
+        .unwrap();
+    assert!((quoted.y - 640.0).abs() < 0.1, "{quoted:?}");
+    assert_eq!(paint("Quoted line"), (black, black, Some(0)));
+    // The form's text is painted with the fill in force where the page
+    // invoked it, and the page keeps that fill after the form.
+    let blue = Some([0, 0, 255]);
+    assert_eq!(paint("Form text"), (blue, black, Some(0)));
+    assert_eq!(paint("After form"), (blue, black, Some(0)));
+}
+
+#[test]
+fn markdown_keeps_invisible_and_quoted_text_as_the_extraction_reads_it() {
+    let result = process_pdf_mem(&synthetic_paint_and_info_pdf()).unwrap();
+    let markdown = result.markdown.unwrap();
+    for text in [
+        "Body text",
+        "Red text",
+        "Invisible text",
+        "Quoted line",
+        "Form text",
+        "After form",
+    ] {
+        assert!(
+            markdown.contains(text),
+            "{text:?} missing from {markdown:?}"
+        );
+    }
+    assert!(!markdown.contains("Layer text"), "{markdown:?}");
+}
+
+#[test]
+fn document_information_entries_are_decoded_in_every_result() {
+    let pdf = synthetic_paint_and_info_pdf();
+    let expected = [
+        Some("Quarterly Report – Q3"),
+        Some("José Martínez"),
+        Some("Paint and render modes"),
+        Some("colour, visibility"),
+        Some("Test Writer"),
+        Some("Test Library 1.0"),
+        Some("D:20240115103000+01'00'"),
+        Some("D:20240116090000Z"),
+    ];
+    let processed = process_pdf_mem(&pdf).unwrap();
+    assert_eq!(
+        [
+            processed.title.as_deref(),
+            processed.author.as_deref(),
+            processed.subject.as_deref(),
+            processed.keywords.as_deref(),
+            processed.creator.as_deref(),
+            processed.producer.as_deref(),
+            processed.creation_date.as_deref(),
+            processed.mod_date.as_deref(),
+        ],
+        expected
+    );
+    let detected = detect_pdf_type_mem(&pdf).unwrap();
+    assert_eq!(
+        [
+            detected.title.as_deref(),
+            detected.author.as_deref(),
+            detected.subject.as_deref(),
+            detected.keywords.as_deref(),
+            detected.creator.as_deref(),
+            detected.producer.as_deref(),
+            detected.creation_date.as_deref(),
+            detected.mod_date.as_deref(),
+        ],
+        expected
+    );
+    // Detection alone reads them too.
+    let detect_only = process_pdf_mem_with_options(&pdf, PdfOptions::detect_only()).unwrap();
+    assert_eq!(detect_only.producer.as_deref(), Some("Test Library 1.0"));
+    assert_eq!(detect_only.author.as_deref(), Some("José Martínez"));
 }

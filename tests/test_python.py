@@ -960,3 +960,103 @@ class TestPositionedTextWithRotations:
         frames = [(r.page, r.rotation) for r in positioned.page_rotations]
         assert frames == [(1, "ccw")]
         assert "PageRotation" in repr(positioned.page_rotations[0])
+
+
+# ---------------------------------------------------------------------------
+# Text paint and document information
+# ---------------------------------------------------------------------------
+
+
+def paint_pdf() -> bytes:
+    """A one-page PDF with a red run, a stroked blue run, a run shown under a
+    ``3 Tr`` set before its text object, a line shown with ``"``, and a Form
+    XObject's text under the page's green fill. Its information dictionary
+    holds a UTF-16BE title, a PDFDocEncoding author and a producer."""
+    widths = "[" + " ".join(["600"] * 256) + "]"
+    content = (
+        "1 0 0 rg BT /F1 12 Tf 72 700 Td (Red run) Tj ET\n"
+        "0 0 1 RG 1 Tr BT /F1 12 Tf 72 680 Td (Outlined run) Tj ET\n"
+        "0 g 3 Tr BT /F1 12 Tf 72 660 Td (Invisible run) Tj ET\n"
+        '0 Tr BT /F1 12 Tf 14 TL 72 654 Td 2 0.5 (Quoted run) " ET\n'
+        "0 1 0 rg q /X1 Do Q"
+    )
+    form = "BT /F1 12 Tf 72 600 Td (Form run) Tj ET"
+    title = "<FEFF" + "Quarterly – Q3".encode("utf-16-be").hex().upper() + ">"
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+        " /Resources << /Font << /F1 5 0 R >> /XObject << /X1 6 0 R >> >> /Contents 4 0 R >>",
+        f"<< /Length {len(content)} >>\nstream\n{content}\nendstream",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 0"
+        f" /LastChar 255 /Widths {widths} >>",
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792]"
+        f" /Resources << /Font << /F1 5 0 R >> >> /Length {len(form)} >>\nstream\n{form}\nendstream",
+        f"<< /Title {title} /Author (Jos\xe9) /Producer (Test Library)"
+        " /CreationDate (D:20240115103000Z) >>",
+    ]
+    pdf = b"%PDF-1.7\n"
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf += f"{number} 0 obj\n{body}\nendobj\n".encode("latin-1")
+    xref = len(pdf)
+    pdf += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("latin-1")
+    for offset in offsets:
+        pdf += f"{offset:010d} 00000 n \n".encode("latin-1")
+    pdf += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R /Info 7 0 R >>"
+        f"\nstartxref\n{xref}\n%%EOF"
+    ).encode("latin-1")
+    return pdf
+
+
+class TestTextPaint:
+    def paint_of(self, items, text):
+        item = next((i for i in items if i.text == text), None)
+        assert item is not None, [i.text for i in items]
+        return (item.fill_color, item.stroke_color, item.render_mode)
+
+    def test_items_report_fill_and_stroke_colour_and_render_mode(self):
+        items = pdf_inspector.extract_text_with_positions_bytes(paint_pdf())
+        assert self.paint_of(items, "Red run") == ((255, 0, 0), (0, 0, 0), 0)
+        assert self.paint_of(items, "Outlined run") == ((255, 0, 0), (0, 0, 255), 1)
+        # Extracted as it always was, and reported as painting nothing.
+        assert self.paint_of(items, "Invisible run") == ((0, 0, 0), (0, 0, 255), 3)
+        assert self.paint_of(items, "Quoted run") == ((0, 0, 0), (0, 0, 255), 0)
+        assert self.paint_of(items, "Form run") == ((0, 255, 0), (0, 0, 255), 0)
+
+    def test_fixture_text_reports_its_paint(self):
+        items = pdf_inspector.extract_text_with_positions(fixture_path("thermo-freon12.pdf"))
+        text = [i for i in items if i.item_type == "text"]
+        assert text
+        for item in text:
+            assert isinstance(item.fill_color, tuple) and len(item.fill_color) == 3
+            assert all(0 <= c <= 255 for c in item.fill_color)
+            assert item.render_mode in range(8)
+        for item in items:
+            if item.item_type != "text":
+                assert item.fill_color is None and item.render_mode is None
+
+
+class TestDocumentInformation:
+    def test_information_entries_are_decoded(self):
+        result = pdf_inspector.process_pdf_bytes(paint_pdf())
+        assert result.title == "Quarterly – Q3"
+        assert result.author == "José"
+        assert result.producer == "Test Library"
+        assert result.creation_date == "D:20240115103000Z"
+        assert result.subject is None
+        assert result.keywords is None
+        assert result.creator is None
+        assert result.mod_date is None
+        assert result.markdown is not None and "Quoted run" in result.markdown
+
+    def test_detection_reads_them_too(self):
+        tagged = pdf_inspector.detect_pdf(fixture_path("firecrawl_docs_tagged.pdf"))
+        assert tagged.title == "Firecrawl Documentation - API Reference"
+        assert tagged.author == "Firecrawl"
+        assert tagged.creation_date == "D:20260318031744Z"
+        plain = pdf_inspector.detect_pdf_bytes(fixture_bytes("thermo-freon12.pdf"))
+        assert plain.producer == "pypdf"
+        assert plain.title is None

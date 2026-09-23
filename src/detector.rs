@@ -58,8 +58,34 @@ pub struct PdfTypeResult {
     pub pages_with_text: u32,
     /// Confidence score (0.0 - 1.0)
     pub confidence: f32,
-    /// Title from metadata (if available)
+    /// The `/Title` of the document information dictionary (the trailer's
+    /// `/Info`), decoded as a PDF text string: UTF-16BE after the byte order
+    /// mark `FE FF`, UTF-8 after `EF BB BF`, PDFDocEncoding otherwise — with
+    /// UTF-16LE after `FF FE` and valid UTF-8 written without a mark read as
+    /// such, language escapes and trailing NULs dropped. `None` when the
+    /// document has no such dictionary, the entry is missing or its value is
+    /// not a string. The other entries below are read the same way; XMP
+    /// metadata is not read.
     pub title: Option<String>,
+    /// The document information dictionary's `/Author`, read like `title`.
+    pub author: Option<String>,
+    /// The document information dictionary's `/Subject`, read like `title`.
+    pub subject: Option<String>,
+    /// The document information dictionary's `/Keywords`, read like `title`.
+    pub keywords: Option<String>,
+    /// The document information dictionary's `/Creator` (the application
+    /// the document was authored in), read like `title`.
+    pub creator: Option<String>,
+    /// The document information dictionary's `/Producer` (the application
+    /// that wrote the PDF), read like `title`.
+    pub producer: Option<String>,
+    /// The document information dictionary's `/CreationDate`, read like
+    /// `title` and returned as written: a PDF date string such as
+    /// `D:20240115103000+01'00'`, neither validated nor converted.
+    pub creation_date: Option<String>,
+    /// The document information dictionary's `/ModDate`, returned as
+    /// written like `creation_date`.
+    pub mod_date: Option<String>,
     /// Whether OCR is recommended for better extraction
     /// True when images provide essential context (e.g., template-based PDFs)
     pub ocr_recommended: bool,
@@ -520,8 +546,17 @@ pub(crate) fn detect_from_document(
         );
     }
 
-    // Try to get title from metadata
-    let title = get_document_title(doc);
+    // The document information dictionary's entries, when it has them.
+    let DocumentInfo {
+        title,
+        author,
+        subject,
+        keywords,
+        creator,
+        producer,
+        creation_date,
+        mod_date,
+    } = read_document_info(doc);
 
     Ok(PdfTypeResult {
         pdf_type,
@@ -530,6 +565,13 @@ pub(crate) fn detect_from_document(
         pages_with_text,
         confidence,
         title,
+        author,
+        subject,
+        keywords,
+        creator,
+        producer,
+        creation_date,
+        mod_date,
         ocr_recommended,
         pages_needing_ocr,
         ocr_reasons_by_page,
@@ -2324,34 +2366,108 @@ fn collect_images_from_resources(
     }
 }
 
-/// Get document title from Info dictionary
-fn get_document_title(doc: &Document) -> Option<String> {
-    let info_ref = doc.trailer.get(b"Info").ok()?.as_reference().ok()?;
-    let info = doc.get_dictionary(info_ref).ok()?;
-    let title_obj = info.get(b"Title").ok()?;
+/// The text entries of a document information dictionary, each decoded as
+/// a PDF text string (see [`PdfTypeResult::title`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DocumentInfo {
+    pub(crate) title: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) subject: Option<String>,
+    pub(crate) keywords: Option<String>,
+    pub(crate) creator: Option<String>,
+    pub(crate) producer: Option<String>,
+    pub(crate) creation_date: Option<String>,
+    pub(crate) mod_date: Option<String>,
+}
 
-    match title_obj {
-        Object::String(bytes, _) => {
-            // Handle UTF-16BE encoding (BOM: 0xFE 0xFF)
-            if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-                let utf16: Vec<u16> = bytes[2..]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|chunk| u16::from_be_bytes(*chunk))
-                    .collect();
-                Some(String::from_utf16_lossy(&utf16))
-            } else {
-                Some(String::from_utf8_lossy(bytes).to_string())
-            }
-        }
+/// Read the document information dictionary the trailer's `/Info` names,
+/// directly or by reference. An entry that is missing, or whose value
+/// (followed through a reference) is not a string, reads as `None`.
+pub(crate) fn read_document_info(doc: &Document) -> DocumentInfo {
+    let info = match doc.trailer.get(b"Info") {
+        Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
+        Ok(Object::Dictionary(dict)) => Some(dict),
         _ => None,
+    };
+    let Some(info) = info else {
+        return DocumentInfo::default();
+    };
+    let entry = |key: &[u8]| -> Option<String> {
+        let value = match info.get(key).ok()? {
+            Object::Reference(id) => doc.get_object(*id).ok()?,
+            value => value,
+        };
+        match value {
+            Object::String(bytes, _) => Some(crate::text_utils::decode_pdf_text_string(bytes)),
+            _ => None,
+        }
+    };
+    DocumentInfo {
+        title: entry(b"Title"),
+        author: entry(b"Author"),
+        subject: entry(b"Subject"),
+        keywords: entry(b"Keywords"),
+        creator: entry(b"Creator"),
+        producer: entry(b"Producer"),
+        creation_date: entry(b"CreationDate"),
+        mod_date: entry(b"ModDate"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_info_entries_are_read_and_decoded() {
+        use lopdf::{dictionary, StringFormat};
+
+        let utf16 = |text: &str| {
+            let mut bytes = vec![0xFE, 0xFF];
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+            Object::String(bytes, StringFormat::Hexadecimal)
+        };
+        let mut doc = Document::with_version("1.7");
+        let keywords = doc.add_object(Object::string_literal("annual, colour"));
+        let info = doc.add_object(dictionary! {
+            "Title" => utf16("Größe – Überblick"),
+            "Author" => Object::string_literal(b"Jos\xE9 Mart\xEDnez \x84 Acme\x92".to_vec()),
+            "Subject" => Object::string_literal("Quarterly results"),
+            "Keywords" => Object::Reference(keywords),
+            "Creator" => Object::string_literal("Writer"),
+            "Producer" => utf16("PDF Library 1.0"),
+            "CreationDate" => Object::string_literal("D:20240115103000+01'00'"),
+            "ModDate" => Object::Name(b"NotAString".to_vec()),
+        });
+        doc.trailer.set("Info", Object::Reference(info));
+        assert_eq!(
+            read_document_info(&doc),
+            DocumentInfo {
+                title: Some("Größe – Überblick".into()),
+                author: Some("José Martínez — Acme™".into()),
+                subject: Some("Quarterly results".into()),
+                keywords: Some("annual, colour".into()),
+                creator: Some("Writer".into()),
+                producer: Some("PDF Library 1.0".into()),
+                creation_date: Some("D:20240115103000+01'00'".into()),
+                mod_date: None,
+            }
+        );
+
+        // An information dictionary written in place of a reference reads
+        // the same; a document without one reads nothing.
+        doc.trailer.set(
+            "Info",
+            dictionary! { "Producer" => Object::string_literal("Inline") },
+        );
+        let inline = read_document_info(&doc);
+        assert_eq!(inline.producer.as_deref(), Some("Inline"));
+        assert_eq!(inline.title, None);
+        doc.trailer.remove(b"Info");
+        assert_eq!(read_document_info(&doc), DocumentInfo::default());
+    }
 
     #[test]
     fn page_ocr_reasons_classify() {

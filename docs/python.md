@@ -160,7 +160,14 @@ class PdfResult:                     # process_pdf / detect_pdf
     processing_time_ms: int
     pages_needing_ocr: list[int]     # 1-indexed
     ocr_reasons_by_page: list[PageOcrReasons]
-    title: str | None
+    title: str | None                # the document information dictionary's entries, decoded as PDF text
+    author: str | None               # strings (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+    subject: str | None              # otherwise); None when missing or not a string
+    keywords: str | None
+    creator: str | None              # the application the document was authored in
+    producer: str | None             # the application that wrote the PDF
+    creation_date: str | None        # as written, e.g. "D:20240115103000+01'00'"
+    mod_date: str | None
     confidence: float                # 0.0 - 1.0
     is_complex_layout: bool
     pages_with_tables: list[int]
@@ -240,6 +247,9 @@ class TextItem:                      # extract_text_with_positions
     font_weight: int | None          # weight class 100..900 (400 regular, 700 bold) from the embedded font's OS/2 table, /FontWeight or a weight word in the name; None when unknown
     bold_source: str | None          # where is_bold came from: "font_name", "font_flags", "weight_class" (with bold_from_weight) or "painted"; None when not bold
     fixed_pitch: bool | None         # True when the FixedPitch flag or the embedded program says so, else measured from the width table (a dozen glyphs sharing one advance: True; two differing: False; neither: None)
+    fill_color: tuple[int, int, int] | None    # sRGB fill colour the run was shown with (device, ICCBased and Indexed spaces); None for other spaces and non-text items
+    stroke_color: tuple[int, int, int] | None  # sRGB stroke colour, read the same way
+    render_mode: int | None          # text render mode (Tr) 0..7: 3 invisible, 7 clip only (neither paints glyphs); None for non-text items
     is_underline: bool
     is_strikeout: bool
     baseline_shift: float            # super/subscript offset from the body baseline (0.0 = normal text; >0 raised, <0 lowered)

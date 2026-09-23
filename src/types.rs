@@ -466,6 +466,44 @@ pub struct TextItem {
     /// item merged from several runs keeps its first run's value, like
     /// `font` and `font_weight`.
     pub fixed_pitch: Option<bool>,
+    /// The fill (non-stroking) colour in force when the run was shown, as
+    /// 8-bit sRGB `[red, green, blue]`: the colour its glyphs are filled
+    /// with in the render modes that fill (0, 2, 4, 6; see `render_mode`).
+    /// DeviceRGB is read as sRGB and DeviceGray as three equal components;
+    /// DeviceCMYK is converted the way the PDF specification converts it to
+    /// DeviceRGB, each of red, green and blue `1 - min(1, ink + black)`. An
+    /// ICCBased space is read as the device space of its component count
+    /// (1, 3 or 4) without applying the profile, and an Indexed space
+    /// through its palette's base space. Components outside their range are
+    /// clamped to it. `None` for any other colour space (Separation,
+    /// DeviceN, Pattern, CalGray, CalRGB, Lab), for a colour operator whose
+    /// operands do not fit its space, and for items that don't come from a
+    /// content-stream show operator (images, links, form fields, OCR). The
+    /// colour is graphics state: `q`/`Q` save and restore it and a Form
+    /// XObject starts with the colour it was invoked under. Runs are not
+    /// kept apart by it: an item merged from several runs keeps its first
+    /// run's value, like `font`.
+    pub fill_color: Option<[u8; 3]>,
+    /// The stroking colour in force when the run was shown, as 8-bit sRGB,
+    /// read like `fill_color`: the colour the glyph outlines are stroked
+    /// with in the render modes that stroke (1, 2, 5, 6). `None` when
+    /// unknown or not from a show operator, as for `fill_color`, and an
+    /// item merged from several runs keeps its first run's value.
+    pub stroke_color: Option<[u8; 3]>,
+    /// The text render mode (`Tr`) the run was shown with, `0..=7`: 0 fill,
+    /// 1 stroke, 2 fill then stroke, 3 neither (invisible text, the mode OCR
+    /// text layers use), 4 to 6 as 0 to 2 while also adding the glyphs to
+    /// the clipping path, 7 clipping only. Runs in modes 3 and 7 put no
+    /// glyphs on the page, so callers can tell visible text from invisible
+    /// text by it. The mode is graphics state: it holds across text objects,
+    /// `q`/`Q` save and restore it, and a Form XObject starts with the mode
+    /// it was invoked under; a `Tr` whose operand is not an integer in
+    /// `0..=7` is ignored, as renderers ignore it. Reporting the mode leaves
+    /// which runs are extracted exactly as before: invisible text is neither
+    /// dropped nor added because of it. `None` for items that don't come
+    /// from a content-stream show operator (images, links, form fields,
+    /// OCR); an item merged from several runs keeps its first run's value.
+    pub render_mode: Option<u8>,
     /// Whether the text is underlined (drawn rule/thin rect under the
     /// baseline — PDFs have no underline font flag, so this is detected
     /// geometrically after extraction; see `extractor::underline`).
@@ -948,6 +986,9 @@ mod formatting_tests {
             font_weight: None,
             bold_source: None,
             fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: strikeout,
             rotation: 0.0,

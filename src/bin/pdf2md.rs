@@ -71,6 +71,36 @@ fn format_cmap_gaps(gaps: &[pdf_inspector::FontCMapGaps]) -> String {
         .join(",")
 }
 
+/// A JSON string, or `null` for `None`.
+fn json_string_or_null(value: Option<&str>) -> String {
+    value
+        .map(|value| format!(r#""{}""#, json_escape(value)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// The document information entries as JSON members, from `"title"` to
+/// `"mod_date"`, each `null` when the document has none.
+fn format_document_info(result: &pdf_inspector::PdfProcessResult) -> String {
+    format!(
+        r#""title":{},"author":{},"subject":{},"keywords":{},"creator":{},"producer":{},"creation_date":{},"mod_date":{}"#,
+        json_string_or_null(result.title.as_deref()),
+        json_string_or_null(result.author.as_deref()),
+        json_string_or_null(result.subject.as_deref()),
+        json_string_or_null(result.keywords.as_deref()),
+        json_string_or_null(result.creator.as_deref()),
+        json_string_or_null(result.producer.as_deref()),
+        json_string_or_null(result.creation_date.as_deref()),
+        json_string_or_null(result.mod_date.as_deref()),
+    )
+}
+
+/// An sRGB colour as a JSON array `[r,g,b]`, or `null` when unknown.
+fn format_color(color: Option<[u8; 3]>) -> String {
+    color
+        .map(|[r, g, b]| format!("[{r},{g},{b}]"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
 fn item_type_label(item_type: &ItemType) -> &'static str {
     match item_type {
         ItemType::Text => "text",
@@ -101,12 +131,16 @@ fn format_items_json(items: &[TextItem]) -> String {
                 .fixed_pitch
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string());
+            let render_mode = item
+                .render_mode
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string());
             let link_url = match &item.item_type {
                 ItemType::Link(url) => format!(r#","url":"{}""#, json_escape(url)),
                 _ => String::new(),
             };
             format!(
-                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"rotation":{:.2},"advance_known":{},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"font_weight":{},"bold_source":{},"fixed_pitch":{},"is_underline":{},"is_strikeout":{},"baseline_shift":{:.2},"item_type":"{}","mcid":{}{}}}"#,
+                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"rotation":{:.2},"advance_known":{},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"font_weight":{},"bold_source":{},"fixed_pitch":{},"fill_color":{},"stroke_color":{},"render_mode":{},"is_underline":{},"is_strikeout":{},"baseline_shift":{:.2},"item_type":"{}","mcid":{}{}}}"#,
                 json_escape(&item.text),
                 item.page,
                 item.x,
@@ -123,6 +157,9 @@ fn format_items_json(items: &[TextItem]) -> String {
                 font_weight,
                 bold_source,
                 fixed_pitch,
+                format_color(item.fill_color),
+                format_color(item.stroke_color),
+                render_mode,
                 item.is_underline,
                 item.is_strikeout,
                 item.baseline_shift,
@@ -293,7 +330,10 @@ fn extract_items_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_items_json, format_items_json, format_ocr_error_json, positional_args};
+    use super::{
+        extract_items_json, format_document_info, format_items_json, format_ocr_error_json,
+        positional_args,
+    };
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     use super::{format_ocr_json, process_pdf_with_ocr, OcrPdfOptions};
     use pdf_inspector::extractor::ItemType;
@@ -317,6 +357,9 @@ mod tests {
             font_weight: Some(300),
             bold_source: Some(BoldSource::FontName),
             fixed_pitch: Some(true),
+            fill_color: Some([255, 128, 0]),
+            stroke_color: None,
+            render_mode: Some(3),
             is_underline: true,
             is_strikeout: true,
             rotation: 90.0,
@@ -337,9 +380,40 @@ mod tests {
         assert!(json.contains(r#""font_weight":300"#));
         assert!(json.contains(r#""bold_source":"font_name""#));
         assert!(json.contains(r#""fixed_pitch":true"#));
+        assert!(json.contains(r#""fill_color":[255,128,0]"#));
+        assert!(json.contains(r#""stroke_color":null"#));
+        assert!(json.contains(r#""render_mode":3"#));
         assert!(json.contains(r#""baseline_shift":3.50"#));
         assert!(json.contains(r#""item_type":"text""#));
         assert!(json.contains(r#""mcid":7"#));
+    }
+
+    #[test]
+    fn document_info_json_names_every_entry_and_escapes_it() {
+        let result = pdf_inspector::PdfProcessResult {
+            pdf_type: pdf_inspector::PdfType::TextBased,
+            markdown: None,
+            page_count: 1,
+            processing_time_ms: 0,
+            pages_needing_ocr: Vec::new(),
+            ocr_reasons_by_page: Vec::new(),
+            title: Some("A \"quoted\" title".to_string()),
+            author: None,
+            subject: Some("Line\nbreak".to_string()),
+            keywords: None,
+            creator: Some("Writer".to_string()),
+            producer: Some("Library".to_string()),
+            creation_date: Some("D:20240115103000+01'00'".to_string()),
+            mod_date: None,
+            confidence: 1.0,
+            layout: pdf_inspector::LayoutComplexity::default(),
+            has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
+        };
+        assert_eq!(
+            format_document_info(&result),
+            r#""title":"A \"quoted\" title","author":null,"subject":"Line\nbreak","keywords":null,"creator":"Writer","producer":"Library","creation_date":"D:20240115103000+01'00'","mod_date":null"#
+        );
     }
 
     #[test]
@@ -780,7 +854,7 @@ fn main() {
                     let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
                     let cmap_gaps = format_cmap_gaps(&result.cmap_gaps);
                     println!(
-                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"cmap_gaps":[{}]}}"#,
+                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"cmap_gaps":[{}],{}}}"#,
                         pdf_type_str,
                         result.page_count,
                         result.processing_time_ms,
@@ -791,6 +865,7 @@ fn main() {
                         col_pages.join(","),
                         result.has_encoding_issues,
                         cmap_gaps,
+                        format_document_info(&result),
                     );
                 } else {
                     eprintln!("Type: {}", pdf_type_str);
@@ -830,7 +905,7 @@ fn main() {
                 let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
                 let cmap_gaps = format_cmap_gaps(&result.cmap_gaps);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"cmap_gaps":[{}],"markdown":"{}"}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"cmap_gaps":[{}],{},"markdown":"{}"}}"#,
                     match result.pdf_type {
                         PdfType::TextBased => "text_based",
                         PdfType::Scanned => "scanned",
@@ -848,6 +923,7 @@ fn main() {
                     col_pages.join(","),
                     result.has_encoding_issues,
                     cmap_gaps,
+                    format_document_info(&result),
                     md_escaped
                 );
             } else if raw_output {
