@@ -541,7 +541,7 @@ read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_with_positions(path)` | Text with its axis-aligned box (visible-page-box frame, see above), `rotation`, and font info |
 | `extract_text_with_positions_mem_in_frame(bytes, pages, frame)` | Positioned text from bytes, limited to 1-indexed `pages`, in the sheet or display frame (`PositionFrame`) |
-| `extract_text_with_positions_mem_with_options(bytes, pages, options)` | The same with every option given as a `PositionOptions` (frame, `bold_from_weight`, `bold_weight_threshold`) |
+| `extract_text_with_positions_mem_with_options(bytes, pages, options)` | The same with every option given as a `PositionOptions` (frame, `include_invisible`, `bold_from_weight`, `bold_weight_threshold`) |
 | `extract_text_with_positions_and_rotations_mem(bytes)` | Positioned text plus the `PageRotation` of every page whose text was predominantly rotated |
 | `extract_text_with_positions_and_rotations_mem_in_frame(bytes, pages, frame)` | The same with a page filter and a frame choice |
 | `extract_text_with_positions_and_rotations_mem_with_options(bytes, pages, options)` | The same with a `PositionOptions` |
@@ -563,6 +563,39 @@ read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 
 Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
 
+### Embedded invisible text
+
+To read visible text alongside embedded text shown with PDF rendering mode 3
+(`Tr = 3`), set `PositionOptions::include_invisible(true)`:
+
+```rust
+use pdf_inspector::{extract_text_with_positions_mem_with_options, PositionOptions};
+
+let bytes = std::fs::read("document.pdf").unwrap();
+let options = PositionOptions::new().include_invisible(true);
+let items = extract_text_with_positions_mem_with_options(&bytes, None, options).unwrap();
+```
+
+The option works in all four `_with_options` position and region APIs above,
+including the rotations and table variants. It includes supported mode-3 text
+in the initial pass even when the page already has valid visible text. It reads
+text already embedded in the PDF; it does not run OCR or load a model.
+
+The default, `false`, preserves each API's existing behavior, including automatic
+invisible-layer recovery where available. It does not guarantee strict exclusion
+of invisible text. In particular, region text extraction can still retry when it
+skipped mode-3 text and found no visible text, adopting a usable recovered layer.
+
+Page selection, coordinate frames, crop and clip handling, decoding, quality
+checks, and resource limits still apply. Region and table detection rules also
+still apply; including text does not guarantee a table cell. This option covers
+mode 3, not every way text can be visually hidden, such as transparent paint or
+covering images, and it does not bypass existing crop or clip rules.
+
+Both embedded copies of the same words may be returned. No new deduplication
+policy is applied. Merged items retain the first run's `render_mode`, so that
+field is not visibility provenance for every character in an item.
+
 ## Types
 
 | Type | Description |
@@ -579,7 +612,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `TextItem` | Text with its axis-aligned box (PDF points from the visible page box's lower-left corner), baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false when the font has no width metrics or an ActualText span's advance could not be recovered), `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline), font info including `font_weight` (the 100..=900 weight class from the embedded font's OS/2 table, `/FontWeight` or a weight word in the name; `None` when unknown), `bold_source` (where `is_bold` came from, a `BoldSource`; `None` when not bold) and `fixed_pitch` (`Some(true)` when the FontDescriptor's FixedPitch flag or the embedded program's `post` table says so, else measured from the width table: `Some(true)` when a dozen or more glyphs share one advance, `Some(false)` when two differ, `None` when neither holds), the paint the run was shown with — `fill_color` and `stroke_color` as 8-bit sRGB `[r, g, b]` (DeviceRGB as sRGB, DeviceGray as equal components, DeviceCMYK as the specification converts it, ICCBased by its component count, Indexed through its palette; `None` for other colour spaces) and `render_mode`, the `Tr` mode `0..=7` (3 invisible and 7 clip-only runs paint no glyphs), all three `None` for items not shown by a text operator and none of them changing what is extracted — page number, and optional structure-tree `mcid` |
 | `PageRotation` | `Upright`, `Ccw`, `Cw`: how a predominantly rotated page's coordinate frame was turned so its text reads left-to-right |
 | `PositionFrame` | `Sheet` (default): the visible page box as laid out in the content stream, `/Rotate` not applied, predominantly rotated pages turned; `Display`: the rendered page, the visible box turned clockwise by the inheritable `/Rotate`, with only the synthetic turn of a predominantly rotated page undone first while individual runs keep their own `rotation` (see [Coordinate frame](#coordinate-frame)) |
-| `PositionOptions` | Options of the `_with_options` position and region functions: `frame` (a `PositionFrame`), `bold_from_weight`, which also reads `TextItem::is_bold` from a `font_weight` at or above `bold_weight_threshold` (600 by default, valid 100..=900) and merges adjacent runs by that verdict rather than by their weight classes; off by default, where `is_bold` and merging are unchanged |
+| `PositionOptions` | Options of the `_with_options` position and region functions: `frame` (a `PositionFrame`); `include_invisible` (false by default), which requests embedded mode-3 text alongside visible text in the initial pass; `bold_from_weight`, which also reads `TextItem::is_bold` from a `font_weight` at or above `bold_weight_threshold` (600 by default, valid 100..=900) and merges adjacent runs by that verdict rather than by their weight classes; off by default, where `is_bold` and merging are unchanged |
 | `BoldSource` | Where `TextItem::is_bold` came from: `FontName`, `FontFlags`, `WeightClass` (with `bold_from_weight`) or `Painted`; the first of them in that order when more than one says bold |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |

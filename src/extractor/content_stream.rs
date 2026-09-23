@@ -3706,6 +3706,31 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
     }
 
     #[test]
+    fn empty_invisible_shows_do_not_report_recoverable_text() {
+        use crate::tounicode::FontCMaps;
+
+        for show in ["() Tj", "[20 -30] TJ", "[() 20 ()] TJ", "() '", "0 0 () \""] {
+            let content = format!("BT /F1 12 Tf 20 TL 72 700 Td 3 Tr {show} ET");
+            let (doc, page_id) = simple_doc_with_content(content.as_bytes());
+            let font_cmaps = FontCMaps::from_doc(&doc);
+            for include_invisible in [false, true] {
+                let ((items, _, _), _, _, skipped_invisible) = extract_page_text_items(
+                    &doc,
+                    page_id,
+                    1,
+                    &font_cmaps,
+                    include_invisible,
+                    &mut FontStyleCache::new(),
+                    &mut FormWalkBudget::new(),
+                )
+                .unwrap();
+                assert!(items.is_empty(), "{show}: {items:?}");
+                assert!(!skipped_invisible, "{show}");
+            }
+        }
+    }
+
+    #[test]
     fn invisible_runs_report_their_mode_and_are_extracted_as_before() {
         use crate::tounicode::FontCMaps;
 
