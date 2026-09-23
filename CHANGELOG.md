@@ -36,6 +36,7 @@ version and date. Earlier releases are described in their
   `fill_color` and `stroke_color` (`tuple[int, int, int]`) and `render_mode`,
   and the `pdf2md --items-json` fields `fill_color`, `stroke_color` (`[r,g,b]`
   or `null`) and `render_mode` report the same values.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
 - The document information dictionary's `/Author`, `/Subject`, `/Keywords`,
   `/Creator`, `/Producer`, `/CreationDate` and `/ModDate`, beside its
   `/Title`: `PdfProcessResult` and `PdfTypeResult` fields `author`,
@@ -51,6 +52,7 @@ version and date. Earlier releases are described in their
   (PDF 2.0) and PDFDocEncoding otherwise, with UTF-16LE after `FF FE` and
   valid UTF-8 written without a mark read as such, and language escapes and
   trailing NULs dropped. XMP metadata is not read.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
 
 ### Changed
 
@@ -58,6 +60,7 @@ version and date. Earlier releases are described in their
   `stroke_color` and `render_mode` fields (`None` for items that don't come
   from a content-stream show operator), and `PdfProcessResult` and
   `PdfTypeResult` literals the new document information fields.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
 
 ### Fixed
 
@@ -67,6 +70,7 @@ version and date. Earlier releases are described in their
   Form XObjects. The page parser skipped the operator altogether, so the
   string was missing from the output and the spacing and the line move it
   makes were lost for the text shown after it.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
 - The document's `/Title` is decoded as a PDF text string, like the entries
   added above. A title in PDFDocEncoding read with U+FFFD in place of its
   accented letters and of the encoding's typographic punctuation, euro sign
@@ -76,6 +80,7 @@ version and date. Earlier releases are described in their
   was not read at all. Titles in UTF-16BE or valid UTF-8 read as before,
   without a UTF-8 byte order mark, language escapes or the NULs some
   producers pad a string's end with.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
 
 ## [1.23.0] - 2026-09-21
 
