@@ -9,6 +9,8 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+Changes since 1.23.0.
+
 ### Added
 
 - `TextItem::fill_color`, `TextItem::stroke_color` and
@@ -94,6 +96,22 @@ version and date. Earlier releases are described in their
   without a UTF-8 byte order mark, language escapes or the NULs some
   producers pad a string's end with.
   ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+||||||| 7a34011
+- Two lines of small type whose baselines lay less than 5 pt apart — a
+  stacked table header at 4.7 pt on a 4.5 pt pitch — fell into one line,
+  and shown glyph by glyph, as kerned small type is, their glyphs
+  interleaved along the baseline into words zipped from both lines.
+  A fragment now joins a line when it lies within that 5 pt window of the
+  line's first fragment, as before, and within 0.6 em of the larger of its
+  own type size and that of a fragment already on the line — no farther
+  than the smaller of the two — so two fragments of 8⅓ pt and
+  above group exactly as they did, a raised or lowered mark, displaced by
+  less than its own em, stays with its line, type of any size pulls a
+  fragment of smaller type no farther than that fragment's em, and the two
+  lines above stay apart. A fragment without a type size, and an image,
+  keeps the 5 pt window.
+  ([#580](https://github.com/firecrawl/pdf-inspector/pull/580))
+
 
 ## [1.23.0] - 2026-09-21
 
