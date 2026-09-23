@@ -29,38 +29,34 @@ use std::collections::HashMap;
 ///   `TextLine::text` renders it as `<sup>…</sup>` / `<sub>…</sub>`.
 ///
 /// Item order is unchanged from the fusion-only version of this pass: items
-/// are bucketed into 5pt rough lines and x-sorted within each, and the result
-/// is that order minus the fused glyphs.
+/// are bucketed into the rough lines the line grouping makes
+/// (`group_indices_into_lines`: the 5 pt window between two fragments of
+/// 8.3 pt and above, narrower where either is small) and x-sorted within
+/// each, and the result is that order minus the fused glyphs.
 pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     if items.len() < 2 {
         return items;
     }
 
-    // Rough (page, y) grouping with a 5pt window, x-sorted per group. This
-    // fixes the OUTPUT ORDER only — stream-order line assembly downstream
-    // depends on it — while script detection below is purely geometric and
-    // so also reaches markers raised further than 5pt on large type.
-    let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<TextItem>)> = Vec::new();
-
-    for item in items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
-            group.push(item);
-        } else {
-            let page = item.page;
-            let y = item.y;
-            line_groups.push((page, y, vec![item]));
-        }
+    // Rough (page, baseline) grouping, x-sorted per group, with the window
+    // the line grouping uses — the fixed 5 pt of old between two fragments
+    // of 8.3 pt and above, narrower where either is small, so two lines of
+    // small type on a pitch under 5 pt keep their order. This fixes the OUTPUT ORDER only —
+    // stream-order line assembly downstream depends on it — while script
+    // detection below is purely geometric and so also reaches markers raised
+    // further than the window on large type.
+    let mut lines = super::group_indices_into_lines(&items);
+    for line in &mut lines {
+        line.sort_by(|&a, &b| items[a].x.total_cmp(&items[b].x));
     }
-
-    let mut ordered: Vec<TextItem> =
-        Vec::with_capacity(line_groups.iter().map(|(_, _, g)| g.len()).sum());
-    for (_, _, mut group) in line_groups {
-        group.sort_by(|a, b| a.x.total_cmp(&b.x));
-        ordered.extend(group);
+    let mut slots: Vec<Option<TextItem>> = items.into_iter().map(Some).collect();
+    let mut ordered: Vec<TextItem> = Vec::with_capacity(slots.len());
+    for line in lines {
+        for index in line {
+            if let Some(item) = slots[index].take() {
+                ordered.push(item);
+            }
+        }
     }
 
     let runs = detect_script_runs(&ordered);
@@ -746,6 +742,25 @@ mod tests {
         assert!(merged[1].is_script() && merged[1].baseline_shift > 0.0);
     }
 
+    /// Two lines of 4.7 pt type on a 4.5 pt pitch keep their order through
+    /// the rough-line bucketing when the lower line starts further left: a
+    /// fixed 5 pt window put both in one bucket and sorted the lower line's
+    /// first word ahead of the upper line.
+    #[test]
+    fn stacked_small_lines_keep_their_order_when_the_lower_starts_further_left() {
+        let items = vec![
+            make_item_fs("Apples", 100.0, 700.0, 16.0, 4.7),
+            make_item_fs("Picked", 118.5, 700.0, 15.0, 4.7),
+            make_item_fs("Oranges", 99.0, 695.5, 19.0, 4.7),
+            make_item_fs("Sold", 120.0, 695.5, 10.0, 4.7),
+        ];
+        let out: Vec<String> = merge_subscript_items(items)
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+        assert_eq!(out, ["Apples", "Picked", "Oranges", "Sold"]);
+    }
+
     #[test]
     fn symbol_marker_beyond_the_rough_line_window_still_attaches() {
         // 16pt title, 10.6pt asterisk raised 6.5pt — past the 5pt rough
@@ -853,7 +868,8 @@ mod tests {
 
     #[test]
     fn output_order_follows_rough_lines_sorted_by_x() {
-        // Ordering contract: 5pt rough groups in discovery order, x-sorted
+        // Ordering contract: rough lines (`group_indices_into_lines`; the
+        // 5 pt window, these being 10 pt) in discovery order, x-sorted
         // within — unchanged from the fusion-only pass.
         let items = vec![
             make_item_fs("b", 200.0, 500.0, 5.0, 10.0),

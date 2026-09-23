@@ -1050,9 +1050,11 @@ pub(crate) fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
 
 /// Merge adjacent text items on the same line into single items.
 ///
-/// Groups items by (page, Y-position) with a 5pt tolerance, sorts within each
-/// group by X, then merges consecutive items that share a similar font size
-/// and are close horizontally.
+/// Groups items into lines ([`group_fragments_into_lines`]: on one page,
+/// within 5 pt of the line's first fragment and within a window that follows
+/// the type size of the nearest fragment already on the line), sorts within
+/// each line by X, then merges consecutive items that share a similar font
+/// size and are close horizontally.
 /// Cap item width for merge-gap computation to guard against Tw inflation.
 ///
 /// When PDF word-spacing (Tw) is large (used for text justification), the
@@ -1184,6 +1186,154 @@ fn has_phrase_continuation_shape(text: &str) -> bool {
         .chars()
         .take(24)
         .any(|ch| ch.is_whitespace() || matches!(ch, '-'))
+}
+
+/// The fraction of an em within which two baselines belong to one line
+/// (see [`baseline_tolerance`]).
+const LINE_BASELINE_TOLERANCE_EM: f32 = 0.6;
+
+/// The widest the line window gets, in points: the fixed window that
+/// grouped lines before the window followed the type, kept as its ceiling
+/// so that a junction of two fragments of ordinary size groups exactly as
+/// it did.
+const LINE_BASELINE_TOLERANCE_MAX_PT: f32 = 5.0;
+
+/// The type size at which [`baseline_tolerance`] reaches its ceiling: the
+/// size a fragment without one is given, so that it keeps the window of old.
+const LINE_BASELINE_LEGACY_EM: f32 = LINE_BASELINE_TOLERANCE_MAX_PT / LINE_BASELINE_TOLERANCE_EM;
+
+/// A fragment's type size for the line test: its rendered em size — the
+/// box height of an unrotated run, the font size of a rotated one, whose
+/// box mixes the advance into its height — else its font size, else the
+/// size that keeps the 5 pt window of old, which an image gets too, its
+/// height being the image's and not a type size.
+fn line_em(item: &TextItem) -> f32 {
+    let em = item.cross_extent();
+    if matches!(item.item_type, crate::types::ItemType::Image) {
+        LINE_BASELINE_LEGACY_EM
+    } else if em > 0.0 {
+        em
+    } else if item.font_size > 0.0 {
+        item.font_size
+    } else {
+        LINE_BASELINE_LEGACY_EM
+    }
+}
+
+/// How far apart two baselines may lie for fragments of type sizes `a` and
+/// `b` to sit on one line: `LINE_BASELINE_TOLERANCE_EM` of the larger of
+/// the two, no farther than the smaller, and never more than
+/// `LINE_BASELINE_TOLERANCE_MAX_PT` — the fixed window of old, which two
+/// fragments of 8.3 pt and above therefore keep. Below that the window
+/// follows the type. A raised or lowered mark is displaced by less than
+/// its own em — a superscript of six tenths of its line's type rises a
+/// third of that type, half its own size — so every such mark stays with
+/// its line, while type of any size cannot pull a fragment of smaller type
+/// farther than that fragment's em: a line of 4 pt labels beside a column
+/// of 11 pt text 5 pt lower keeps its own line, and two lines of small
+/// type on a pitch under 5 pt — a stacked table header at 4.7 pt — stay
+/// apart, where the fixed window put them in one line and, shown glyph by
+/// glyph as small kerned type is, interleaved their glyphs along the
+/// baseline.
+fn baseline_tolerance(a: f32, b: f32) -> f32 {
+    (LINE_BASELINE_TOLERANCE_EM * a.max(b))
+        .min(a.min(b))
+        .min(LINE_BASELINE_TOLERANCE_MAX_PT)
+}
+
+/// The most distinct baselines a line records: more than any line of text
+/// has, while glyph-by-glyph type set on a slight slope would record one
+/// per glyph, and each fragment is tested against every baseline of every
+/// line that starts within its window.
+const LINE_BASELINES_MAX: usize = 16;
+
+/// A line as the fragments are grouped: its page, the baseline of its
+/// first fragment, the distinct baselines its fragments sit on (at most
+/// `LINE_BASELINES_MAX` of them, each with the largest type size seen on
+/// it, so that a small glyph shown first on a baseline — a bullet, a mark
+/// — does not narrow the window for the text that follows it), and the
+/// fragments.
+struct FragmentLine {
+    page: u32,
+    y: f32,
+    baselines: Vec<(f32, f32)>,
+    /// Indices into the fragments being grouped, in stream order.
+    fragments: Vec<usize>,
+}
+
+impl FragmentLine {
+    /// Whether a fragment at baseline `y` with type size `em` belongs to
+    /// this line: within the fixed window of the line's first fragment, as
+    /// always, and within [`baseline_tolerance`] of the nearest baseline a
+    /// fragment of the line already sits on — so a subscript joins the base
+    /// text it hangs from though the line's first fragment lies a little
+    /// higher, while a line of small type a whole pitch away does not. The
+    /// fixed window is tested first, so only the baselines of lines that
+    /// start within it are walked.
+    fn admits(&self, page: u32, y: f32, em: f32) -> bool {
+        page == self.page
+            && (y - self.y).abs() < LINE_BASELINE_TOLERANCE_MAX_PT
+            && self
+                .baselines
+                .iter()
+                .any(|&(line_y, line_em)| (y - line_y).abs() < baseline_tolerance(em, line_em))
+    }
+
+    fn push(&mut self, index: usize, item: &TextItem, em: f32) {
+        let known = self
+            .baselines
+            .iter()
+            .position(|&(line_y, _)| (line_y - item.y).abs() < 0.05);
+        match known {
+            Some(i) => self.baselines[i].1 = self.baselines[i].1.max(em),
+            None if self.baselines.len() < LINE_BASELINES_MAX => {
+                self.baselines.push((item.y, em));
+            }
+            None => {}
+        }
+        self.fragments.push(index);
+    }
+}
+
+/// The lines the fragments of `items` fall into — by page, then by
+/// baseline (see [`FragmentLine::admits`]) — as the fragments' indices,
+/// lines in the order their first fragment was walked and fragments in
+/// stream order within each. The subscript pass buckets its rough lines
+/// with it too, so the order it fixes agrees with the lines made here.
+fn group_indices_into_lines(items: &[TextItem]) -> Vec<Vec<usize>> {
+    let mut lines: Vec<FragmentLine> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let em = line_em(item);
+        match lines
+            .iter_mut()
+            .find(|line| line.admits(item.page, item.y, em))
+        {
+            Some(line) => line.push(index, item, em),
+            None => lines.push(FragmentLine {
+                page: item.page,
+                y: item.y,
+                baselines: vec![(item.y, em)],
+                fragments: vec![index],
+            }),
+        }
+    }
+    lines.into_iter().map(|line| line.fragments).collect()
+}
+
+/// [`group_indices_into_lines`] as (page, baseline of the first fragment,
+/// fragments).
+fn group_fragments_into_lines(items: &[TextItem]) -> Vec<(u32, f32, Vec<&TextItem>)> {
+    group_indices_into_lines(items)
+        .into_iter()
+        .map(|indices| {
+            let first = &items[indices[0]];
+            (
+                first.page,
+                first.y,
+                indices.iter().map(|&i| &items[i]).collect(),
+            )
+        })
+        .collect()
 }
 
 fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
@@ -1892,20 +2042,7 @@ fn merge_text_items_with_clips(
         .filter_map(|(item, clip)| clip.map(|rect| (item as *const TextItem, rect)))
         .collect();
 
-    // Group items by (page, Y position) with 5pt tolerance
-    let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
-
-    for item in &items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
-            group.push(item);
-        } else {
-            line_groups.push((item.page, item.y, vec![item]));
-        }
-    }
+    let line_groups = group_fragments_into_lines(&items);
 
     // Each page's own direction: a line with right-to-left letters on a
     // right-to-left page reads right to left even when its Latin letters
@@ -2573,6 +2710,203 @@ mod tests {
         assert_eq!(preview.chars().count(), 80);
         assert!(text.is_char_boundary(preview.len()));
         assert!(preview.ends_with('\u{FFFD}'));
+    }
+
+    /// `text` shown glyph by glyph at `size`, each glyph its own fragment
+    /// with the advance of Helvetica-Bold, as small kerned type is shown.
+    fn glyph_fragments(text: &str, x0: f32, y: f32, size: f32) -> Vec<TextItem> {
+        let advance = |ch: char| -> f32 {
+            let units = match ch {
+                'A' | 'U' => 722.0,
+                'E' | 'P' | 'S' => 667.0,
+                'M' => 833.0,
+                'O' => 778.0,
+                'W' => 944.0,
+                'd' | 'g' | 'n' | 'o' | 'p' => 611.0,
+                'i' | 'l' => 278.0,
+                'r' => 389.0,
+                't' => 333.0,
+                _ => 556.0,
+            };
+            units * size / 1000.0
+        };
+        let mut items = Vec::new();
+        let mut x = x0;
+        for ch in text.chars() {
+            let w = advance(ch);
+            if ch != ' ' {
+                let mut item = make_merge_item(&ch.to_string(), x, w);
+                item.y = y;
+                item.height = size;
+                item.font_size = size;
+                items.push(item);
+            }
+            x += if ch == ' ' { 278.0 * size / 1000.0 } else { w };
+        }
+        items
+    }
+
+    /// The merged items' letters along each baseline, top line first,
+    /// spaces left out: what a line reads as, whatever its word breaks.
+    fn letters_by_baseline(merged: &[TextItem]) -> Vec<(f32, String)> {
+        let mut lines: Vec<(f32, Vec<&TextItem>)> = Vec::new();
+        for item in merged {
+            match lines.iter_mut().find(|(y, _)| (*y - item.y).abs() < 0.01) {
+                Some((_, line)) => line.push(item),
+                None => lines.push((item.y, vec![item])),
+            }
+        }
+        lines.sort_by(|a, b| b.0.total_cmp(&a.0));
+        lines
+            .into_iter()
+            .map(|(y, mut line)| {
+                line.sort_by(|a, b| a.x.total_cmp(&b.x));
+                (y, line.iter().map(|i| i.text.replace(' ', "")).collect())
+            })
+            .collect()
+    }
+
+    fn sized_item(text: &str, x: f32, width: f32, y: f32, size: f32) -> TextItem {
+        let mut item = make_merge_item(text, x, width);
+        item.y = y;
+        item.height = size;
+        item.font_size = size;
+        item
+    }
+
+    /// Two lines of 4.7 pt type on a 4.5 pt pitch, each shown glyph by
+    /// glyph, keep their own lines and read in order; on a 6 pt pitch they
+    /// always did.
+    #[test]
+    fn small_lines_under_five_points_apart_keep_their_own_lines() {
+        let mut items = glyph_fragments("Apples Picked", 100.0, 700.0, 4.7);
+        items.extend(glyph_fragments("Oranges Sold", 100.6, 695.5, 4.7));
+        assert_eq!(
+            letters_by_baseline(&merge_text_items(items)),
+            vec![
+                (700.0, "ApplesPicked".to_string()),
+                (695.5, "OrangesSold".to_string())
+            ]
+        );
+        let mut items = glyph_fragments("Water Usage", 100.0, 650.0, 4.7);
+        items.extend(glyph_fragments("Energy Mix", 101.2, 644.0, 4.7));
+        assert_eq!(
+            letters_by_baseline(&merge_text_items(items)),
+            vec![
+                (650.0, "WaterUsage".to_string()),
+                (644.0, "EnergyMix".to_string())
+            ]
+        );
+    }
+
+    /// The line window follows the type where either fragment is small and
+    /// is the 5 pt of old between two fragments of ordinary size: markers
+    /// raised a third of an em stay with their line, a run raised 5 pt over
+    /// 12 pt type keeps its own line as it always did, a line of small type
+    /// under larger type keeps its own, a small glyph shown first does not
+    /// narrow the window for the text after it, sloped glyph-by-glyph type
+    /// stays one line past the baselines a line records, images keep the
+    /// window of old without pulling small type, and fragments without a
+    /// type size keep the 5 pt window.
+    #[test]
+    fn the_line_window_follows_the_type_size() {
+        // A 7.97 pt affiliation marker raised 4.3 pt over an 11.96 pt name.
+        let name = sized_item("Huo", 100.0, 20.0, 700.0, 11.96);
+        let marker = sized_item("1", 120.5, 4.0, 704.3, 7.97);
+        assert_eq!(group_fragments_into_lines(&[name, marker]).len(), 1);
+        // A 5.5 pt marker raised 3 pt over 8 pt type.
+        let word = sized_item("word", 100.0, 16.0, 700.0, 8.0);
+        let mark = sized_item("2", 116.2, 3.0, 703.0, 5.5);
+        assert_eq!(group_fragments_into_lines(&[word, mark]).len(), 1);
+        // A run raised 5 pt over 12 pt type is not within the window,
+        // exactly as before.
+        let base = sized_item("base", 100.0, 24.0, 500.0, 12.0);
+        let raised = sized_item("super", 124.0, 30.0, 505.0, 12.0);
+        assert_eq!(group_fragments_into_lines(&[base, raised]).len(), 2);
+        // A 7 pt reference mark raised 4 pt over 12 pt text stays with it.
+        let word = sized_item("word", 100.0, 24.0, 700.0, 12.0);
+        let mark = sized_item("1", 124.2, 3.5, 704.0, 7.0);
+        assert_eq!(group_fragments_into_lines(&[word, mark]).len(), 1);
+        // A 10 pt line 16 pt under a 40 pt heading, a 4 pt line 4.5 pt
+        // under a 7 pt one, and a 4 pt line 4.5 pt under a 12 pt one: type
+        // of any size pulls a fragment of smaller type no farther than that
+        // fragment's em.
+        let heading = sized_item("Title", 100.0, 100.0, 700.0, 40.0);
+        let body = sized_item("body", 100.0, 20.0, 684.0, 10.0);
+        assert_eq!(group_fragments_into_lines(&[heading, body]).len(), 2);
+        let line = sized_item("line", 100.0, 14.0, 700.0, 7.0);
+        let tiny = sized_item("tiny", 100.0, 8.0, 695.5, 4.0);
+        assert_eq!(group_fragments_into_lines(&[line, tiny]).len(), 2);
+        let line = sized_item("line", 100.0, 24.0, 700.0, 12.0);
+        let tiny = sized_item("tiny", 100.0, 8.0, 695.5, 4.0);
+        assert_eq!(group_fragments_into_lines(&[line, tiny]).len(), 2);
+        // Forty 10 pt glyphs on a slope of a tenth of a point each are one
+        // line, past the baselines the line records.
+        let sloped: Vec<TextItem> = (0..40)
+            .map(|i| {
+                sized_item(
+                    "g",
+                    100.0 + 6.0 * i as f32,
+                    6.0,
+                    700.0 + 0.1 * i as f32,
+                    10.0,
+                )
+            })
+            .collect();
+        assert_eq!(group_fragments_into_lines(&sloped).len(), 1);
+        // An image keeps the window of old: a 2 pt tall one 3 pt under a
+        // 10 pt line groups with it, as before, and a tall one 0.4 pt from
+        // a line of 0.55 pt type does not pull a second such line, 0.4 pt
+        // beyond the first, into the same line.
+        let text = sized_item("text", 100.0, 20.0, 700.0, 10.0);
+        let mut rule = sized_item("[Image]", 100.0, 200.0, 697.0, 2.0);
+        rule.item_type = ItemType::Image;
+        rule.font_size = 0.0;
+        assert_eq!(group_fragments_into_lines(&[text, rule]).len(), 1);
+        let mut figure = sized_item("[Image]", 28.7, 564.0, 435.1, 317.5);
+        figure.item_type = ItemType::Image;
+        figure.font_size = 0.0;
+        let upper = sized_item("materials", 87.9, 20.0, 434.68, 0.55);
+        let lower = sized_item("respective", 29.4, 20.0, 434.27, 0.55);
+        let beside_figure = [figure, upper, lower];
+        let lines = group_fragments_into_lines(&beside_figure);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].2.len(), 1);
+        // A 3 pt bullet shown first on the baseline does not narrow the
+        // window for the 10 pt text after it: its 6 pt marker raised 3.5 pt
+        // still joins.
+        let bullet = sized_item("•", 90.0, 3.0, 700.0, 3.0);
+        let text = sized_item("text", 100.0, 20.0, 700.0, 10.0);
+        let marker = sized_item("2", 120.2, 3.0, 703.5, 6.0);
+        assert_eq!(group_fragments_into_lines(&[bullet, text, marker]).len(), 1);
+        // Two 4.7 pt lines 4.5 pt apart, and two 6 pt apart.
+        let a = sized_item("a", 100.0, 3.0, 700.0, 4.7);
+        let b = sized_item("b", 100.0, 3.0, 695.5, 4.7);
+        let c = sized_item("c", 100.0, 3.0, 694.0, 4.7);
+        assert_eq!(group_fragments_into_lines(&[a.clone(), b]).len(), 2);
+        assert_eq!(group_fragments_into_lines(&[a, c]).len(), 2);
+        // The same two lines set 3° off level: each run's box is 10 pt
+        // tall, but its type is still 4.7 pt.
+        let mut a = sized_item("Apples Picked", 100.0, 100.0, 700.0, 4.7);
+        let mut b = sized_item("Oranges Sold", 100.0, 100.0, 695.5, 4.7);
+        for run in [&mut a, &mut b] {
+            run.rotation = 3.0;
+            run.height = 10.0;
+        }
+        assert_eq!(group_fragments_into_lines(&[a, b]).len(), 2);
+        // A 4 pt subscript 2.3 pt under its 7 pt base text, on a line
+        // whose first fragment sits 2 pt above that text: it joins by the
+        // nearest baseline, though the first fragment is 4.3 pt away.
+        let first = sized_item("and time horizons", 56.7, 56.0, 332.92, 7.0);
+        let base = sized_item("tons of CO", 133.2, 130.0, 330.92, 7.0);
+        let sub = sized_item("2", 262.7, 2.2, 328.63, 4.06);
+        assert_eq!(group_fragments_into_lines(&[first, base, sub]).len(), 1);
+        // No type size: the 5 pt window of old.
+        let p = sized_item("p", 100.0, 5.0, 700.0, 0.0);
+        let q = sized_item("q", 110.0, 5.0, 695.1, 0.0);
+        let r = sized_item("r", 100.0, 5.0, 694.9, 0.0);
+        assert_eq!(group_fragments_into_lines(&[p.clone(), q]).len(), 1);
+        assert_eq!(group_fragments_into_lines(&[p, r]).len(), 2);
     }
 
     #[test]

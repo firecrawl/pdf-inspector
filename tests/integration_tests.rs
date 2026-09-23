@@ -1819,6 +1819,18 @@ fn fixture_line_texts(fixture: &str) -> Vec<String> {
     items.into_iter().map(|item| item.text).collect()
 }
 
+/// Two lines of 4.7 pt type on a 4.5 pt pitch — a stacked table header —
+/// each shown glyph by glyph, keep their own lines and read in order; a
+/// fixed 5 pt window put them in one line and interleaved their glyphs
+/// along the baseline. The same lines shown as whole strings read the same,
+/// as they always did, and the control pair 6 pt apart is unchanged.
+#[test]
+fn small_stacked_lines_shown_glyph_by_glyph_keep_their_own_lines() {
+    let expected = ["Apples Picked", "Oranges Sold", "Water Usage", "Energy Mix"];
+    assert_eq!(fixture_line_texts("stacked_header_glyph_runs"), expected);
+    assert_eq!(fixture_line_texts("stacked_header_string_runs"), expected);
+}
+
 /// Non-embedded Symbol and ZapfDingbats without an `/Encoding` read through
 /// their built-in encodings — Greek letters, angle brackets, an arrow, check
 /// marks — instead of as the Latin letters at the same codes. A Symbol font
