@@ -474,8 +474,13 @@ pub struct TextItem {
     /// DeviceRGB, each of red, green and blue `1 - min(1, ink + black)`. An
     /// ICCBased space is read as the device space of its component count
     /// (1, 3 or 4) without applying the profile, and an Indexed space
-    /// through its palette's base space. Components outside their range are
-    /// clamped to it. `None` for any other colour space (Separation,
+    /// (`/Indexed`, or its abbreviation `/I`) through its palette's base
+    /// space, which may be named by another colour space resource.
+    /// Components outside their range are clamped to it, and selecting a
+    /// space with `cs`/`CS` sets the initial colour the PDF specification
+    /// gives it: black, except a four-component ICCBased space, whose
+    /// components all start at 0, which reads as white. `None` for any
+    /// other colour space (Separation,
     /// DeviceN, Pattern, CalGray, CalRGB, Lab), for a colour operator whose
     /// operands do not fit its space, and for items that don't come from a
     /// content-stream show operator (images, links, form fields, OCR). The

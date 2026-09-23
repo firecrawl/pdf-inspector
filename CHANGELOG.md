@@ -19,8 +19,12 @@ version and date. Earlier releases are described in their
   equal components, DeviceCMYK converted the way the PDF specification
   converts it to DeviceRGB (each channel `1 - min(1, ink + black)`), an
   ICCBased space read as the device space of its component count (1, 3 or 4)
-  without applying the profile, and an Indexed space through its palette's
-  base space; components outside their range are clamped. A colour is `None`
+  without applying the profile, and an Indexed space (`/Indexed`, or its
+  abbreviation `/I`) through its palette's base space, which another colour
+  space resource may name; components outside their range are clamped, and
+  `cs`/`CS` start a space at the initial colour the specification gives it
+  (black, but white for a four-component ICCBased space, whose components
+  all start at 0). A colour is `None`
   for Separation, DeviceN, Pattern and the CIE-based spaces, after a colour
   operator whose operands do not fit its space, and for image, link,
   form-field and OCR items. `render_mode` is the `Tr` mode, `0..=7` — 3
@@ -29,7 +33,8 @@ version and date. Earlier releases are described in their
   range is ignored. The paint is graphics state: it holds across text
   objects, `q`/`Q` save and restore it, a Form XObject starts with the paint
   it was invoked under, and an ActualText span reports the paint of its first
-  painted glyph. Reporting it leaves extraction as it was: no run is dropped
+  painted glyph (see below for its weight). Reporting it leaves extraction as
+  it was: no run is dropped
   or kept on its account, markdown is unchanged, and an item merged from
   several runs keeps its first run's values. Node `fillColor` and
   `strokeColor` (`[number, number, number]`) and `renderMode`, Python
@@ -66,10 +71,18 @@ version and date. Earlier releases are described in their
 
 - Text a page's content stream shows with the `"` operator (`aw ac string
   "`: set the word spacing to `aw` and the character spacing to `ac`, move to
-  the next line and show `string`) is extracted, as it already was inside
-  Form XObjects. The page parser skipped the operator altogether, so the
-  string was missing from the output and the spacing and the line move it
-  makes were lost for the text shown after it.
+  the next line and show `string`) inside a text object is extracted, as it
+  already was inside Form XObjects; outside a text object the operator is
+  ignored, as `Tj` and `TJ` are there. The page parser skipped the operator
+  altogether, so the string was missing from the output and the spacing and
+  the line move it makes were lost for the text shown after it.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+- An ActualText span is bold on its paint's account (text filled and
+  stroked to look heavier) when its first painted glyph was painted that
+  way, the paint its colours and render mode are reported from. The paint in
+  force at the span's end decided, so a render mode, line width or colour
+  set after the span's glyphs and before its end made the replacement text
+  bold, or plain, whatever painted the glyphs.
   ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
 - The document's `/Title` is decoded as a PDF text string, like the entries
   added above. A title in PDFDocEncoding read with U+FFFD in place of its

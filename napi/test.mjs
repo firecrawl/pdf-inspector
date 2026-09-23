@@ -645,9 +645,10 @@ console.log('  font metadata: OK');
 console.log('Testing text paint and document information...');
 
 // One page with a red run, a stroked blue run, a run shown under a `3 Tr` set
-// before its text object, a line shown with `"`, and a Form XObject's text
-// under the page's green fill; the information dictionary holds a UTF-16BE
-// title, a PDFDocEncoding author and a producer.
+// before its text object, a line shown with `"`, a Form XObject's text under
+// the page's green fill, an image, a link annotation, a filled-in form field
+// and a few body lines; the information dictionary holds every text entry,
+// the title in UTF-16BE and the author in PDFDocEncoding.
 function paintPdf() {
   const widths = `[${Array(256).fill('600').join(' ')}]`;
   const content =
@@ -655,17 +656,25 @@ function paintPdf() {
     '0 0 1 RG 1 Tr BT /F1 12 Tf 72 680 Td (Outlined run) Tj ET\n' +
     '0 g 3 Tr BT /F1 12 Tf 72 660 Td (Invisible run) Tj ET\n' +
     '0 Tr BT /F1 12 Tf 14 TL 72 654 Td 2 0.5 (Quoted run) " ET\n' +
-    '0 1 0 rg q /X1 Do Q';
+    '0 1 0 rg q /X1 Do Q\n' +
+    'q 20 0 0 20 400 700 cm /Im1 Do Q\n' +
+    // Body lines: a page that draws an image needs ten text operators or
+    // more to be read as a text page.
+    '0 g BT /F1 12 Tf 12 TL 72 430 Td (Body line one) Tj (Body line two) \' (Body line three) \'\n' +
+    '(Body line four) \' (Body line five) \' (Body line six) \' (Body line seven) \' ET';
   const form = 'BT /F1 12 Tf 72 600 Td (Form run) Tj ET';
   const utf16 = text => `<FEFF${Buffer.from(text, 'utf16le').swap16().toString('hex').toUpperCase()}>`;
   const objects = [
-    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [10 0 R] >> >>',
     '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject << /X1 6 0 R >> >> /Contents 4 0 R >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject << /X1 6 0 R /Im1 8 0 R >> >> /Contents 4 0 R /Annots [9 0 R 10 0 R] >>',
     `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
     `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 0 /LastChar 255 /Widths ${widths} >>`,
     `<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Length ${Buffer.byteLength(form)} >>\nstream\n${form}\nendstream`,
-    `<< /Title ${utf16('Quarterly – Q3')} /Author (José) /Producer (Test Library) /CreationDate (D:20240115103000Z) >>`,
+    `<< /Title ${utf16('Quarterly – Q3')} /Author (José) /Subject (Paint and render modes) /Keywords (colour, visibility) /Creator (Test Writer) /Producer (Test Library) /CreationDate (D:20240115103000Z) /ModDate (D:20240116090000Z) >>`,
+    '<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\u0080\nendstream',
+    '<< /Type /Annot /Subtype /Link /Rect [72 500 200 520] /Border [0 0 0] /A << /S /URI /URI (https://example.com/report) >> >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /V (Jane Doe) /Rect [72 450 272 470] /P 3 0 R >>',
   ];
   let pdf = '%PDF-1.7\n';
   const offsets = [];
@@ -691,27 +700,48 @@ assert.deepEqual(paintOf('Outlined run'), [[255, 0, 0], [0, 0, 255], 1]);
 assert.deepEqual(paintOf('Invisible run'), [[0, 0, 0], [0, 0, 255], 3]);
 assert.deepEqual(paintOf('Quoted run'), [[0, 0, 0], [0, 0, 255], 0]);
 assert.deepEqual(paintOf('Form run'), [[0, 255, 0], [0, 0, 255], 0]);
-// Text from the fixture reports its paint; image, link and form-field items
-// carry none.
+// Image, link and form-field items carry none of the three.
+const nonText = paintItems.filter(i => i.itemType !== 'Text');
+for (const type of ['Image', 'Link', 'FormField']) {
+  assert.ok(nonText.some(i => i.itemType === type), `no ${type} item in ${JSON.stringify(nonText)}`);
+}
+for (const item of nonText) {
+  assert.equal(item.fillColor, undefined, item.itemType);
+  assert.equal(item.strokeColor, undefined, item.itemType);
+  assert.equal(item.renderMode, undefined, item.itemType);
+}
+// Text from the fixture reports all three.
 const fixtureText = items.filter(i => i.itemType === 'Text');
 assert.ok(fixtureText.length > 0);
-assert.ok(fixtureText.every(i => Array.isArray(i.fillColor) && i.fillColor.length === 3));
-assert.ok(fixtureText.every(i => Number.isInteger(i.renderMode) && i.renderMode >= 0 && i.renderMode <= 7));
-assert.ok(items.filter(i => i.itemType !== 'Text').every(i => i.fillColor === undefined && i.renderMode === undefined));
+for (const item of fixtureText) {
+  for (const color of [item.fillColor, item.strokeColor]) {
+    assert.ok(Array.isArray(color) && color.length === 3, JSON.stringify(item));
+    assert.ok(color.every(c => Number.isInteger(c) && c >= 0 && c <= 255), JSON.stringify(item));
+  }
+  assert.ok(Number.isInteger(item.renderMode) && item.renderMode >= 0 && item.renderMode <= 7);
+}
 
 const infoResult = processPdf(paintPdf());
 assert.equal(infoResult.title, 'Quarterly – Q3');
 assert.equal(infoResult.author, 'José');
+assert.equal(infoResult.subject, 'Paint and render modes');
+assert.equal(infoResult.keywords, 'colour, visibility');
+assert.equal(infoResult.creator, 'Test Writer');
 assert.equal(infoResult.producer, 'Test Library');
 assert.equal(infoResult.creationDate, 'D:20240115103000Z');
-assert.equal(infoResult.subject, undefined);
-assert.equal(infoResult.modDate, undefined);
+assert.equal(infoResult.modDate, 'D:20240116090000Z');
 assert.ok(infoResult.markdown.includes('Quoted run'));
 const taggedInfo = detectPdf(taggedFixture);
 assert.equal(taggedInfo.title, 'Firecrawl Documentation - API Reference');
 assert.equal(taggedInfo.author, 'Firecrawl');
 assert.equal(taggedInfo.creationDate, 'D:20260318031744Z');
-assert.equal(detectPdf(fixture).producer, 'pypdf');
+// Entries the document does not have are omitted: the fixture's
+// information dictionary holds only a producer.
+const producerOnly = detectPdf(fixture);
+assert.equal(producerOnly.producer, 'pypdf');
+for (const key of ['title', 'author', 'subject', 'keywords', 'creator', 'creationDate', 'modDate']) {
+  assert.equal(producerOnly[key], undefined, key);
+}
 console.log('  text paint and document information: OK');
 
 // --- Error handling ---

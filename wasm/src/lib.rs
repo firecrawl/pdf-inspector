@@ -64,8 +64,8 @@ export interface PdfProcessResult {
   /**
    * The `/Title` of the document information dictionary, decoded as a PDF
    * text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
-   * otherwise). Absent when the entry is missing or not a string; so for the
-   * entries below.
+   * otherwise). Absent when the entry is missing or not a string. The
+   * entries below follow the same decoding and missing-value rule.
    */
   title?: string;
   /** The document information dictionary's `/Author`. */

@@ -160,14 +160,14 @@ class PdfResult:                     # process_pdf / detect_pdf
     processing_time_ms: int
     pages_needing_ocr: list[int]     # 1-indexed
     ocr_reasons_by_page: list[PageOcrReasons]
-    title: str | None                # the document information dictionary's entries, decoded as PDF text
-    author: str | None               # strings (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
-    subject: str | None              # otherwise); None when missing or not a string
-    keywords: str | None
-    creator: str | None              # the application the document was authored in
-    producer: str | None             # the application that wrote the PDF
-    creation_date: str | None        # as written, e.g. "D:20240115103000+01'00'"
-    mod_date: str | None
+    title: str | None                # document information /Title, decoded as a PDF text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding otherwise); None when missing or not a string
+    author: str | None               # /Author; this and the entries below are decoded, and None, the same way
+    subject: str | None              # /Subject
+    keywords: str | None             # /Keywords
+    creator: str | None              # /Creator: the application the document was authored in
+    producer: str | None             # /Producer: the application that wrote the PDF
+    creation_date: str | None        # /CreationDate as written, e.g. "D:20240115103000+01'00'"
+    mod_date: str | None             # /ModDate as written
     confidence: float                # 0.0 - 1.0
     is_complex_layout: bool
     pages_with_tables: list[int]

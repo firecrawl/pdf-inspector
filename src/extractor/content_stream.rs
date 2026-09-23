@@ -23,7 +23,7 @@ use super::geometry::{
     advanced_tm, estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees,
     reading_direction, rise_adjusted, scaled_run_geometry, PageRotation, RunGeometry,
 };
-use super::text_paint::{PaintResources, RunPaint, TextPaint};
+use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
 use super::word_gaps::{
     is_dependent_sign, offset_takes_spacing_back, tj_gap_thresholds, tj_tracking,
@@ -687,7 +687,7 @@ pub(crate) fn extract_page_text_items_with_options(
     let mut actual_text_glyph_rise: Option<f32> = None;
     let mut actual_text_glyph_font: Option<String> = None; // font that painted the span's first glyph
     let mut actual_text_glyph_font_size: Option<f32> = None; // `Tf` size in force for that glyph, sign included
-    let mut actual_text_glyph_paint: Option<RunPaint> = None; // paint in force for that glyph
+    let mut actual_text_glyph_paint: Option<TextPaint> = None; // paint state in force for that glyph
     let mut actual_text_glyphs_measured: bool = true; // every painted font had width metrics
     let mut actual_text_estimate_ts: f32 = 0.0; // estimate accumulated per painted run, its own size and spacing
                                                 // Glyphs painted inside the current ActualText span: sizes the span's box
@@ -959,7 +959,7 @@ pub(crate) fn extract_page_text_items_with_options(
                             actual_text_glyph_tm = Some(text_matrix);
                             actual_text_glyph_rise = Some(text_rise);
                             actual_text_glyph_font = Some(current_font.clone());
-                            actual_text_glyph_paint = Some(text_paint.run_paint());
+                            actual_text_glyph_paint = Some(text_paint.clone());
                             actual_text_glyph_font_size = Some(current_font_size);
                             actual_text_glyph_scale = Some(horizontal_scale);
                         }
@@ -1377,7 +1377,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     ));
                                     actual_text_glyph_rise = Some(text_rise);
                                     actual_text_glyph_font = Some(current_font.clone());
-                                    actual_text_glyph_paint = Some(text_paint.run_paint());
+                                    actual_text_glyph_paint = Some(text_paint.clone());
                                     actual_text_glyph_font_size = Some(current_font_size);
                                     actual_text_glyph_scale = Some(horizontal_scale);
                                 }
@@ -1712,6 +1712,12 @@ pub(crate) fn extract_page_text_items_with_options(
                 }
             }
             "'" | "\"" => {
+                // Outside a text object `"` is ignored, spacing and all, as
+                // `Tj` and `TJ` are here; `'` keeps the reading it has
+                // always had.
+                if op.operator == "\"" && !in_text_block {
+                    continue;
+                }
                 // Move to next line and show text (equivalent to T* then Tj).
                 // `aw ac string "` first sets the word and character
                 // spacing, as `aw Tw ac Tc` would, and they stay in force;
@@ -1750,7 +1756,7 @@ pub(crate) fn extract_page_text_items_with_options(
                     actual_text_glyph_tm = Some(text_matrix);
                     actual_text_glyph_rise = Some(text_rise);
                     actual_text_glyph_font = Some(current_font.clone());
-                    actual_text_glyph_paint = Some(text_paint.run_paint());
+                    actual_text_glyph_paint = Some(text_paint.clone());
                     actual_text_glyph_font_size = Some(current_font_size);
                     actual_text_glyph_scale = Some(horizontal_scale);
                 }
@@ -2151,10 +2157,14 @@ pub(crate) fn extract_page_text_items_with_options(
                                 .take()
                                 .unwrap_or(current_font_size);
                             // So does the paint: the item reports the colours
-                            // and render mode its first glyph was shown with.
-                            let paint = actual_text_glyph_paint
+                            // and render mode its first glyph was shown with,
+                            // and weight added by painting is read from the
+                            // same state, so paint set later in the span
+                            // changes neither.
+                            let glyph_paint = actual_text_glyph_paint
                                 .take()
-                                .unwrap_or_else(|| text_paint.run_paint());
+                                .unwrap_or_else(|| text_paint.clone());
+                            let paint = glyph_paint.run_paint();
                             let rendered_size = effective_font_size(paint_size, &combined)
                                 * type3_scales.get(&paint_font).copied().unwrap_or(1.0);
                             // Advance in text-space units: the text matrix
@@ -2217,19 +2227,21 @@ pub(crate) fn extract_page_text_items_with_options(
                                 logical_text_items.push(items.len());
                                 // The span's own glyphs were left out as they
                                 // were painted; the paint that made them
-                                // heavier is read now, for the font that painted
-                                // them and only when some glyph was painted. The
-                                // replacement is the text the item carries, so
-                                // it stands in for the glyphs in the check for
-                                // alphanumeric content; a symbol face is ruled
-                                // out by the painting font's name.
+                                // heavier is read now, from the paint state
+                                // its first glyph was shown with, for the font
+                                // that painted them and only when some glyph
+                                // was painted. The replacement is the text the
+                                // item carries, so it stands in for the glyphs
+                                // in the check for alphanumeric content; a
+                                // symbol face is ruled out by the painting
+                                // font's name.
                                 let paint_base_font = font_base_names
                                     .get(&paint_font)
                                     .map(|s| s.as_str())
                                     .unwrap_or(&paint_font);
                                 let painted_bold = actual_text_glyph_count > 0
                                     && paintable_fonts.contains(&paint_font)
-                                    && text_paint.adds_bold(
+                                    && glyph_paint.adds_bold(
                                         &at,
                                         rendered_size,
                                         paint_base_font,
@@ -3760,6 +3772,41 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             paint_of(&empty),
             [("Real", Some([0, 0, 255]), Some([0, 0, 0]), Some(0))]
         );
+    }
+
+    #[test]
+    fn actual_text_span_is_made_heavier_by_the_paint_of_its_first_painted_glyph() {
+        // Paint set after the span's first glyph changes neither its
+        // reported render mode nor whether its fill and stroke add weight.
+        let reset = extract_simple_items(
+            b"0.3 w 2 Tr BT /F1 12 Tf 72 700 Td /Span << /ActualText (Real) >> BDC
+              (Fake) Tj 0 Tr EMC ET",
+        );
+        assert_eq!(reset.len(), 1);
+        assert_eq!(reset[0].render_mode, Some(2));
+        assert!(reset[0].is_bold);
+        assert_eq!(reset[0].bold_source, Some(BoldSource::Painted));
+        let set_late = extract_simple_items(
+            b"0.3 w BT /F1 12 Tf 72 700 Td /Span << /ActualText (Real) >> BDC
+              (Fake) Tj 2 Tr EMC ET",
+        );
+        assert_eq!(set_late.len(), 1);
+        assert_eq!(set_late[0].render_mode, Some(0));
+        assert!(!set_late[0].is_bold);
+        assert_eq!(set_late[0].bold_source, None);
+    }
+
+    #[test]
+    fn double_quote_operator_outside_a_text_object_is_ignored() {
+        // Like `Tj` and `TJ` outside a text object, `"` there shows nothing
+        // and sets no spacing: "b c" is measured without the 5pt of word
+        // spacing it would add, 3 glyphs x 7.2pt.
+        let items = extract_simple_items(
+            b"BT /F1 12 Tf 12 TL 72 700 Td (a) Tj ET 5 1 (stray) \" BT /F1 12 Tf 72 680 Td (b c) Tj ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["a", "b c"]);
+        assert!((items[1].width - 21.6).abs() < 0.1, "{:?}", items[1]);
     }
 
     #[test]

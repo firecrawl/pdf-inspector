@@ -55,12 +55,16 @@ impl ColorSpace {
         }
     }
 
-    /// The colour `cs`/`CS` leaves current on selecting this space: black
-    /// for the device spaces and for an ICC-based space of the same
-    /// component count, the palette's first entry for an indexed space.
+    /// The colour `cs`/`CS` leaves current on selecting this space, as the
+    /// PDF specification sets it: black for DeviceGray, DeviceRGB and
+    /// DeviceCMYK (whose initial colour is `0 0 0 1`), every component 0 for
+    /// an ICC-based space — black for one or three components, white for
+    /// four read as CMYK — and the palette's first entry for an indexed
+    /// space.
     fn initial_srgb(&self) -> Option<[u8; 3]> {
         match self {
             Self::Indexed(palette) => palette.first().copied(),
+            Self::Icc(_, n) => device_srgb(&[0.0; 4][..*n]),
             _ => Some([0, 0, 0]),
         }
     }
@@ -104,30 +108,65 @@ fn device_space(name: &[u8]) -> Option<ColorSpace> {
     }
 }
 
+/// A device space named where the base of an indexed space is read: by its
+/// full name, or by the abbreviation inline images give it (`G`, `RGB`,
+/// `CMYK`), which a palette written as `[/I ...]` may use for its base.
+fn palette_base_device_space(name: &[u8]) -> Option<ColorSpace> {
+    device_space(name).or(match name {
+        b"G" => Some(ColorSpace::Gray),
+        b"RGB" => Some(ColorSpace::Rgb),
+        b"CMYK" => Some(ColorSpace::Cmyk),
+        _ => None,
+    })
+}
+
 /// A colour space object that is a device space or an ICC-based space of
-/// one, three or four components, by name or `[/ICCBased stream]`.
+/// one, three or four components, by name or `[/ICCBased stream]`. The
+/// profile's `/N` may be an indirect object.
 fn direct_space(doc: &Document, obj: &Object) -> Option<ColorSpace> {
     match resolve(doc, obj)? {
         Object::Name(name) => device_space(name),
         Object::Array(a) if a.len() == 2 && a[0].as_name().ok() == Some(b"ICCBased") => {
             let id = a[1].as_reference().ok()?;
             let profile = doc.get_object(id).ok()?.as_stream().ok()?;
-            let n = profile.dict.get(b"N").ok()?.as_i64().ok()?;
-            matches!(n, 1 | 3 | 4).then_some(ColorSpace::Icc(id, n as usize))
+            let n = get_number(resolve(doc, profile.dict.get(b"N").ok()?)?)?;
+            [1, 3, 4]
+                .into_iter()
+                .find(|&count| n == count as f32)
+                .map(|count| ColorSpace::Icc(id, count))
         }
         _ => None,
     }
 }
 
+/// Whether a colour space array is an indexed space: `/Indexed`, or `/I`,
+/// the abbreviation inline images use for it.
+fn is_indexed_family(space: &[Object]) -> bool {
+    space
+        .first()
+        .and_then(|o| o.as_name().ok())
+        .is_some_and(|family| matches!(family, b"Indexed" | b"I"))
+}
+
 /// `[/Indexed base hival lookup]` over a base [`direct_space`] reads: the
 /// lookup table's `hival + 1` entries of the base's components, one byte
 /// each mapped to 0..=1, as sRGB. A table shorter than that keeps the
-/// entries it completes.
-fn indexed_space(doc: &Document, space: &[Object]) -> Option<ColorSpace> {
+/// entries it completes. A base given by name is a device space's name or
+/// abbreviation, else the name of a space in `spaces`, the colour space
+/// resources the palette is defined among.
+fn indexed_space(doc: &Document, space: &[Object], spaces: &Dictionary) -> Option<ColorSpace> {
     let [_, base, hival, lookup] = space else {
         return None;
     };
-    let base = direct_space(doc, base)?;
+    let base = match resolve(doc, base)? {
+        Object::Name(name) => palette_base_device_space(name).or_else(|| {
+            spaces
+                .get(name)
+                .ok()
+                .and_then(|named| direct_space(doc, named))
+        })?,
+        base => direct_space(doc, base)?,
+    };
     let hival = usize::try_from(resolve(doc, hival)?.as_i64().ok()?).ok()?;
     if hival > 255 {
         return None;
@@ -170,11 +209,7 @@ impl PaintResources {
         {
             for (name, obj) in spaces {
                 let space = resolve(doc, obj).and_then(|obj| match obj {
-                    Object::Array(a)
-                        if a.first().and_then(|o| o.as_name().ok()) == Some(b"Indexed") =>
-                    {
-                        indexed_space(doc, a)
-                    }
+                    Object::Array(a) if is_indexed_family(a) => indexed_space(doc, a, spaces),
                     other => direct_space(doc, other),
                 });
                 self.spaces.entry(name.clone()).or_insert(space);
@@ -703,7 +738,16 @@ mod tests {
     fn icc_based_spaces_are_read_by_their_component_count() {
         let mut doc = Document::new();
         let mut spaces = Dictionary::new();
-        for (name, n) in [("Gray", 1), ("Rgb", 3), ("Cmyk", 4), ("Two", 2)] {
+        let indirect_four = doc.add_object(Object::Integer(4));
+        for (name, n) in [
+            ("Gray", Object::Integer(1)),
+            ("Rgb", Object::Integer(3)),
+            ("Cmyk", Object::Integer(4)),
+            ("Two", Object::Integer(2)),
+            // `/N` written as an indirect object, or as a real.
+            ("IndirectCmyk", Object::Reference(indirect_four)),
+            ("RealRgb", Object::Real(3.0)),
+        ] {
             let profile = doc.add_object(lopdf::Stream::new(dictionary! { "N" => n }, vec![]));
             spaces.set(
                 name,
@@ -722,9 +766,21 @@ mod tests {
             stroke(b"/Cmyk CS 0 1 0 0 SCN", &resources),
             Some([255, 0, 255])
         );
-        // Selecting a four-component space starts it at black, as for
-        // DeviceCMYK.
-        assert_eq!(fill(b"/Cmyk cs", &resources), Some([0, 0, 0]));
+        assert_eq!(
+            fill(b"/IndirectCmyk cs 0 1 0 0 sc", &resources),
+            Some([255, 0, 255])
+        );
+        assert_eq!(fill(b"/RealRgb cs 0 0 1 sc", &resources), Some([0, 0, 255]));
+        // Selecting an ICC-based space starts it at every component 0, as
+        // the specification sets it: black for one or three components,
+        // white for four (DeviceCMYK itself starts at black, `0 0 0 1`).
+        assert_eq!(fill(b"/Gray cs", &resources), Some([0, 0, 0]));
+        assert_eq!(fill(b"/Rgb cs", &resources), Some([0, 0, 0]));
+        assert_eq!(fill(b"/Cmyk cs", &resources), Some([255, 255, 255]));
+        assert_eq!(
+            stroke(b"/IndirectCmyk CS", &resources),
+            Some([255, 255, 255])
+        );
         // A profile of any other component count names no colour.
         assert_eq!(fill(b"/Two cs 0 0 sc", &resources), None);
     }
@@ -793,6 +849,53 @@ mod tests {
         assert_eq!(fill(b"/Cmyk cs 1 sc", &resources), Some([0, 255, 255]));
         assert_eq!(fill(b"/Short cs 1 sc", &resources), Some([128, 128, 128]));
         assert_eq!(fill(b"/OverSeparation cs 0 sc", &resources), None);
+
+        // The base named by a resource of the same ColorSpace dictionary, and
+        // the `/I` abbreviation with an abbreviated device base.
+        let named = dictionary! {
+            "Profile" => vec![Object::Name(b"ICCBased".to_vec()), Object::Reference(cmyk_profile)],
+            "Gray" => Object::Name(b"DeviceGray".to_vec()),
+            "OverProfile" => indexed(
+                Object::Name(b"Profile".to_vec()),
+                1,
+                Object::Reference(cmyk_lookup),
+            ),
+            "OverGray" => indexed(
+                Object::Name(b"Gray".to_vec()),
+                0,
+                Object::string_literal(vec![64u8]),
+            ),
+            "OverMissing" => indexed(
+                Object::Name(b"Missing".to_vec()),
+                0,
+                Object::string_literal(vec![64u8]),
+            ),
+            "Abbreviated" => Object::Array(vec![
+                Object::Name(b"I".to_vec()),
+                Object::Name(b"RGB".to_vec()),
+                1.into(),
+                Object::string_literal(vec![0u8, 0, 0, 255, 128, 0]),
+            ]),
+        };
+        let mut named_resources = PaintResources::default();
+        named_resources.add(&doc, &dictionary! { "ColorSpace" => named });
+        assert_eq!(
+            fill(b"/OverProfile cs 1 sc", &named_resources),
+            Some([0, 255, 255])
+        );
+        assert_eq!(
+            fill(b"/OverGray cs 0 sc", &named_resources),
+            Some([64, 64, 64])
+        );
+        assert_eq!(fill(b"/OverMissing cs 0 sc", &named_resources), None);
+        assert_eq!(
+            fill(b"/Abbreviated cs 1 sc", &named_resources),
+            Some([255, 128, 0])
+        );
+        assert_eq!(
+            stroke(b"/Abbreviated CS", &named_resources),
+            Some([0, 0, 0])
+        );
 
         // Weight inference still treats a palette colour as unknown.
         let paint = painted(b"0.3 w /Rgb cs /Rgb CS 1 sc 1 SC", &resources);

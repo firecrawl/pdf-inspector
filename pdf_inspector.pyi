@@ -16,8 +16,8 @@ class PdfResult:
     title: Optional[str]
     """The /Title of the document information dictionary, decoded as a PDF
     text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
-    otherwise). None when the entry is missing or not a string; so for the
-    entries below."""
+    otherwise). None when the entry is missing or not a string. The entries
+    below follow the same decoding and missing-value rule."""
     author: Optional[str]
     """The document information dictionary's /Author."""
     subject: Optional[str]
