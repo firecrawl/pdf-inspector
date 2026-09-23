@@ -2806,9 +2806,9 @@ mod tests {
         assert!(!item_is_in_chart_region(&prose, &regions));
 
         // Pin every chart-padding-guarded standalone glyph (not only •).
-        for glyph in ["•", "▪", "▫", "‣", "⁃"] {
+        for glyph in crate::markdown::classify::BULLET_GLYPHS {
             let mut bullet = make_item_w(340.0, 90.0, 5.0, 1);
-            bullet.text = glyph.into();
+            bullet.text = glyph.to_string();
             assert!(
                 !item_is_in_chart_region(&bullet, &regions),
                 "standalone {glyph} near chart padding must not be claimed as a chart label"
