@@ -7,7 +7,7 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## [Unreleased]
+## [1.24.0] - 2026-09-22
 
 Changes since 1.23.0.
 
@@ -96,7 +96,6 @@ Changes since 1.23.0.
   without a UTF-8 byte order mark, language escapes or the NULs some
   producers pad a string's end with.
   ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
-||||||| 7a34011
 - Two lines of small type whose baselines lay less than 5 pt apart — a
   stacked table header at 4.7 pt on a 4.5 pt pitch — fell into one line,
   and shown glyph by glyph, as kerned small type is, their glyphs
@@ -111,7 +110,6 @@ Changes since 1.23.0.
   lines above stay apart. A fragment without a type size, and an image,
   keeps the 5 pt window.
   ([#580](https://github.com/firecrawl/pdf-inspector/pull/580))
-
 
 ## [1.23.0] - 2026-09-21
 
