@@ -1224,7 +1224,7 @@ fn line_em(item: &TextItem) -> f32 {
 /// `b` to sit on one line: `LINE_BASELINE_TOLERANCE_EM` of the larger of
 /// the two, no farther than the smaller, and never more than
 /// `LINE_BASELINE_TOLERANCE_MAX_PT` — the fixed window of old, which two
-/// fragments of 8.3 pt and above therefore keep. Below that the window
+/// fragments of 8⅓ pt and above therefore keep. Below that the window
 /// follows the type. A raised or lowered mark is displaced by less than
 /// its own em — a superscript of six tenths of its line's type rises a
 /// third of that type, half its own size — so every such mark stays with

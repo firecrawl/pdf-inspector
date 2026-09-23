@@ -31,7 +31,7 @@ use std::collections::HashMap;
 /// Item order is unchanged from the fusion-only version of this pass: items
 /// are bucketed into the rough lines the line grouping makes
 /// (`group_indices_into_lines`: the 5 pt window between two fragments of
-/// 8.3 pt and above, narrower where either is small) and x-sorted within
+/// 8⅓ pt and above, narrower where either is small) and x-sorted within
 /// each, and the result is that order minus the fused glyphs.
 pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     if items.len() < 2 {
@@ -40,7 +40,7 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
     // Rough (page, baseline) grouping, x-sorted per group, with the window
     // the line grouping uses — the fixed 5 pt of old between two fragments
-    // of 8.3 pt and above, narrower where either is small, so two lines of
+    // of 8⅓ pt and above, narrower where either is small, so two lines of
     // small type on a pitch under 5 pt keep their order. This fixes the OUTPUT ORDER only —
     // stream-order line assembly downstream depends on it — while script
     // detection below is purely geometric and so also reaches markers raised
