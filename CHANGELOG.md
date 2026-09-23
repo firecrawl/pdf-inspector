@@ -19,8 +19,8 @@ Changes since 1.23.0.
   interleaved along the baseline into words zipped from both lines.
   A fragment now joins a line when it lies within that 5 pt window of the
   line's first fragment, as before, and within 0.6 em of the larger of its
-  own type size and the nearest fragment's already on the line — no
-  farther than the smaller of the two — so two fragments of 8⅓ pt and
+  own type size and that of a fragment already on the line — no farther
+  than the smaller of the two — so two fragments of 8⅓ pt and
   above group exactly as they did, a raised or lowered mark, displaced by
   less than its own em, stays with its line, type of any size pulls a
   fragment of smaller type no farther than that fragment's em, and the two

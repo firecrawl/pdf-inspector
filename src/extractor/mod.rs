@@ -1052,7 +1052,7 @@ pub(crate) fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
 ///
 /// Groups items into lines ([`group_fragments_into_lines`]: on one page,
 /// within 5 pt of the line's first fragment and within a window that follows
-/// the type size of the nearest fragment already on the line), sorts within
+/// the type size of a fragment already on the line), sorts within
 /// each line by X, then merges consecutive items that share a similar font
 /// size and are close horizontally.
 /// Cap item width for merge-gap computation to guard against Tw inflation.
@@ -1241,18 +1241,24 @@ fn baseline_tolerance(a: f32, b: f32) -> f32 {
         .min(LINE_BASELINE_TOLERANCE_MAX_PT)
 }
 
-/// The most distinct baselines a line records: more than any line of text
-/// has, while glyph-by-glyph type set on a slight slope would record one
-/// per glyph, and each fragment is tested against every baseline of every
-/// line that starts within its window.
-const LINE_BASELINES_MAX: usize = 16;
+/// How far apart two baselines must lie to be recorded separately on a
+/// line, in points.
+const LINE_BASELINE_RECORD_SPACING: f32 = 0.05;
 
-/// A line as the fragments are grouped: its page, the baseline of its
-/// first fragment, the distinct baselines its fragments sit on (at most
-/// `LINE_BASELINES_MAX` of them, each with the largest type size seen on
-/// it, so that a small glyph shown first on a baseline — a bullet, a mark
-/// — does not narrow the window for the text that follows it), and the
-/// fragments.
+/// The most distinct baselines a line records: as many as the record
+/// spacing admits inside the fixed window either side of the line's first
+/// fragment, so no fragment inside that window is ever measured against a
+/// stale baseline — glyph-by-glyph type set on a slight slope records one
+/// per glyph — while the walk over them stays bounded.
+const LINE_BASELINES_MAX: usize =
+    (2.0 * LINE_BASELINE_TOLERANCE_MAX_PT / LINE_BASELINE_RECORD_SPACING) as usize;
+
+/// A line as the fragments are grouped: its page, the baseline of the
+/// fragment it was seeded with, the distinct baselines its fragments sit
+/// on (at most `LINE_BASELINES_MAX` of them, each with the largest type
+/// size seen on it, so that a small glyph shown first on a baseline — a
+/// bullet, a mark — does not narrow the window for the text that follows
+/// it), and the fragments.
 struct FragmentLine {
     page: u32,
     y: f32,
@@ -1264,12 +1270,14 @@ struct FragmentLine {
 impl FragmentLine {
     /// Whether a fragment at baseline `y` with type size `em` belongs to
     /// this line: within the fixed window of the line's first fragment, as
-    /// always, and within [`baseline_tolerance`] of the nearest baseline a
-    /// fragment of the line already sits on — so a subscript joins the base
-    /// text it hangs from though the line's first fragment lies a little
-    /// higher, while a line of small type a whole pitch away does not. The
-    /// fixed window is tested first, so only the baselines of lines that
-    /// start within it are walked.
+    /// always, and within [`baseline_tolerance`] of a baseline a fragment
+    /// of the line already sits on, each at its own type size — so a
+    /// subscript joins the base text it hangs from though the line's first
+    /// fragment lies a little higher, a mark joins the text it is raised
+    /// over though a smaller fragment sits nearer to it, and a line of
+    /// small type a whole pitch away does not join. The fixed window is
+    /// tested first, so only the baselines of lines that start within it
+    /// are walked.
     fn admits(&self, page: u32, y: f32, em: f32) -> bool {
         page == self.page
             && (y - self.y).abs() < LINE_BASELINE_TOLERANCE_MAX_PT
@@ -1283,7 +1291,7 @@ impl FragmentLine {
         let known = self
             .baselines
             .iter()
-            .position(|&(line_y, _)| (line_y - item.y).abs() < 0.05);
+            .position(|&(line_y, _)| (line_y - item.y).abs() < LINE_BASELINE_RECORD_SPACING);
         match known {
             Some(i) => self.baselines[i].1 = self.baselines[i].1.max(em),
             None if self.baselines.len() < LINE_BASELINES_MAX => {
@@ -1298,8 +1306,12 @@ impl FragmentLine {
 /// The lines the fragments of `items` fall into — by page, then by
 /// baseline (see [`FragmentLine::admits`]) — as the fragments' indices,
 /// lines in the order their first fragment was walked and fragments in
-/// stream order within each. The subscript pass buckets its rough lines
-/// with it too, so the order it fixes agrees with the lines made here.
+/// stream order within each. The walk is one pass in stream order, as it
+/// always was: the fragment that seeds a line anchors its fixed window,
+/// and a baseline's type size grows as larger type lands on it, so text
+/// shown after a small glyph on its baseline still gets its full window.
+/// The subscript pass buckets its rough lines with it too, so the order
+/// it fixes agrees with the lines made here.
 fn group_indices_into_lines(items: &[TextItem]) -> Vec<Vec<usize>> {
     let mut lines: Vec<FragmentLine> = Vec::new();
     for (index, item) in items.iter().enumerate() {
@@ -2879,6 +2891,28 @@ mod tests {
         let text = sized_item("text", 100.0, 20.0, 700.0, 10.0);
         let marker = sized_item("2", 120.2, 3.0, 703.5, 6.0);
         assert_eq!(group_fragments_into_lines(&[bullet, text, marker]).len(), 1);
+        // A mark joins the text it is raised over though a smaller fragment
+        // sits nearer to it: a 4 pt mark 3.8 pt over 12 pt text, with a 4 pt
+        // glyph hanging 1 pt below that text.
+        let text = sized_item("word", 100.0, 24.0, 700.0, 12.0);
+        let hanging = sized_item("n", 125.0, 2.0, 701.0, 4.0);
+        let mark = sized_item("1", 124.2, 2.0, 703.8, 4.0);
+        assert_eq!(group_fragments_into_lines(&[text, hanging, mark]).len(), 1);
+        // Forty-eight glyphs of 4.7 pt type on a slope of a tenth of a point each
+        // stay one line as far as the fixed window reaches: the line records
+        // every baseline inside it.
+        let sloped: Vec<TextItem> = (0..48)
+            .map(|i| {
+                sized_item(
+                    "g",
+                    100.0 + 3.0 * i as f32,
+                    3.0,
+                    700.0 + 0.1 * i as f32,
+                    4.7,
+                )
+            })
+            .collect();
+        assert_eq!(group_fragments_into_lines(&sloped).len(), 1);
         // Two 4.7 pt lines 4.5 pt apart, and two 6 pt apart.
         let a = sized_item("a", 100.0, 3.0, 700.0, 4.7);
         let b = sized_item("b", 100.0, 3.0, 695.5, 4.7);
@@ -2896,7 +2930,7 @@ mod tests {
         assert_eq!(group_fragments_into_lines(&[a, b]).len(), 2);
         // A 4 pt subscript 2.3 pt under its 7 pt base text, on a line
         // whose first fragment sits 2 pt above that text: it joins by the
-        // nearest baseline, though the first fragment is 4.3 pt away.
+        // base text's baseline, though the first fragment is 4.3 pt away.
         let first = sized_item("and time horizons", 56.7, 56.0, 332.92, 7.0);
         let base = sized_item("tons of CO", 133.2, 130.0, 330.92, 7.0);
         let sub = sized_item("2", 262.7, 2.2, 328.63, 4.06);

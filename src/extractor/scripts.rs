@@ -869,8 +869,9 @@ mod tests {
     #[test]
     fn output_order_follows_rough_lines_sorted_by_x() {
         // Ordering contract: rough lines (`group_indices_into_lines`; the
-        // 5 pt window, these being 10 pt) in discovery order, x-sorted
-        // within — unchanged from the fusion-only pass.
+        // 5 pt window, these being 10 pt) in the order of their first
+        // fragment in the stream, x-sorted within — unchanged from the
+        // fusion-only pass.
         let items = vec![
             make_item_fs("b", 200.0, 500.0, 5.0, 10.0),
             make_item_fs("a", 100.0, 500.0, 5.0, 10.0),
