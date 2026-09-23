@@ -18,6 +18,7 @@ version and date. Earlier releases are described in their
   without OCR; existing selection, clipping, and quality rules still apply.
   Inclusion can return duplicate words from separate embedded layers, and a
   merged item's `render_mode` still describes its first run.
+  ([#583](https://github.com/firecrawl/pdf-inspector/pull/583))
 
 ## [1.24.0] - 2026-09-22
 
