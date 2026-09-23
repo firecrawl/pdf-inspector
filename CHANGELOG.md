@@ -26,6 +26,7 @@ Changes since 1.23.0.
   fragment of smaller type no farther than that fragment's em, and the two
   lines above stay apart. A fragment without a type size, and an image,
   keeps the 5 pt window.
+  ([#580](https://github.com/firecrawl/pdf-inspector/pull/580))
 
 ## [1.23.0] - 2026-09-21
 
