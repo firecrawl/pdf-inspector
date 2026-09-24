@@ -1,0 +1,40 @@
+tests/snapshots/form_field_text_strings.md
+  s_af9ca691a163fd::t_b83c1a2d25b967 1-8
+src/extractor/links.rs
+  s_af9ca691a163fd::t_df63d18b77cf30 745,747-754,756-777,780-898
+  s_af9ca691a163fd::t_b0a745f0eabf35 746,755
+  s_af9ca691a163fd::t_6c39f77be9619e 384
+  s_af9ca691a163fd::t_b3d7dd2ed9655d 304-306,311
+  s_af9ca691a163fd::t_fab58d2ad393aa 778-779
+  s_af9ca691a163fd::t_e185bcd9424ce6 3
+  s_af9ca691a163fd::t_c13fe08afa682c 395
+CHANGELOG.md
+  s_af9ca691a163fd::t_6d4d2ee196b57f 10-30
+tests/integration_tests.rs
+  s_af9ca691a163fd::t_2db93b1ccad62b 2099-2137
+  s_af9ca691a163fd::t_14543327e9c6e4 2138
+examples/form_field_fixtures.rs
+  s_af9ca691a163fd::t_9c0aa8efa74a8a 1-48,50-57,59-80,82-87,89-95,97-102,104-121,123-140,142-211
+  s_af9ca691a163fd::t_36337c225571ca 49,58,81
+  s_af9ca691a163fd::t_1362a0f19fa551 88,96,103,122,141
+src/text_utils.rs
+  s_af9ca691a163fd::t_1258e6c9bd4cf3 854-855
+  s_af9ca691a163fd::t_3cf62a78fe8de9 856-861
+  s_af9ca691a163fd::t_643702d758b3c7 853
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3af567bb9863baa85db16bfb3b5b54c629d792e6",
+  "prompts": {},
+  "sessions": {
+    "s_af9ca691a163fd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48159310-4c5c-46fc-b74a-1ba8f972ad13",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
