@@ -1,0 +1,35 @@
+tests/snapshots/form_field_inherited_values.md
+  s_096c2e2848fc4b::t_ac30ee22868914 1-10
+src/extractor/links.rs
+  s_096c2e2848fc4b::t_62e6dcf5d1f32c 523-526
+  s_096c2e2848fc4b::t_731b2ee54d1ecf 929,1068-1399
+  s_096c2e2848fc4b::t_8c1cddcdf003c0 431,435-439,449,451,453-454,458,470-474,476,478-480,482-484,486-497,500-510
+  s_096c2e2848fc4b::t_7c9eb3671937c9 305-306
+  s_096c2e2848fc4b::t_d67ffe0148f75b 233,273-304,308-309,311,355-360,362-401,404-414,417-426,428-430,432-434,440-448,450,452,455-457,459-466,468,475,477,481,485,498-499,511,513-521,530,545,547,552-555,558-561,563-572,574,589,594
+  s_096c2e2848fc4b::t_7f930a655d201d 900-906,910,914-920,926-928
+  s_096c2e2848fc4b::t_51d3c910117594 522
+  s_096c2e2848fc4b::t_b1f355f90cee6d 930
+examples/form_field_fixtures.rs
+  s_096c2e2848fc4b::t_7bf65ea13e4e1b 1,3-18
+  s_096c2e2848fc4b::t_b2ab7a761b6934 217-498,502
+CHANGELOG.md
+  s_096c2e2848fc4b::t_db9510bbb1a947 32-53
+tests/integration_tests.rs
+  s_096c2e2848fc4b::t_b64a7f60086c19 2139-2204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "056471bb8dd8e8045d0146675a56d1c74253579f",
+  "prompts": {},
+  "sessions": {
+    "s_096c2e2848fc4b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "64513c41-f56b-45be-8590-105e4c772255",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
