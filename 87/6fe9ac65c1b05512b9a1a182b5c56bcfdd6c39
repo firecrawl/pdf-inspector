@@ -1,0 +1,37 @@
+CHANGELOG.md
+  s_b9a78ae337be80::t_05b1374ee9ec9b 10
+Cargo.toml
+  s_b9a78ae337be80::t_b7055abdae355c 3
+napi/Cargo.lock
+  s_b9a78ae337be80::t_b6382a44488945 2041,2067
+napi/Cargo.toml
+  s_b9a78ae337be80::t_d6dc728a852b0f 3
+napi/bun.lock
+  s_b9a78ae337be80::t_fd9f718c2d2346 11-16
+napi/package.json
+  s_b9a78ae337be80::t_f4cbd8bc982634 3,55-60
+pyproject.toml
+  s_b9a78ae337be80::t_8b7c1fcd83d0e1 9
+site/index.html
+  s_b9a78ae337be80::t_1e535ac4d98b13 978
+wasm/Cargo.lock
+  s_b9a78ae337be80::t_aee7caf3c90970 723,740
+wasm/Cargo.toml
+  s_b9a78ae337be80::t_8308c20e9c9fcc 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "876fe9ac65c1b05512b9a1a182b5c56bcfdd6c39",
+  "prompts": {},
+  "sessions": {
+    "s_b9a78ae337be80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_b9a78ae337be80",
+        "model": "unknown"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
