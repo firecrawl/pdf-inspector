@@ -1,0 +1,19 @@
+.github/workflows/publish.yml
+  s_20f2fa93fb6995::t_3c748a10f47345 146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b5ad9466df13e60cc9496fcf125047da90f508ab",
+  "prompts": {},
+  "sessions": {
+    "s_20f2fa93fb6995": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "319d7bcb-bf4b-46ce-8e4d-528e9c905991",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
