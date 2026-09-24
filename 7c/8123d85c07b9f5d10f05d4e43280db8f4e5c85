@@ -1,0 +1,44 @@
+CHANGELOG.md
+  s_af9ca691a163fd::t_acc44226ba8d80 25-31
+  s_af9ca691a163fd::t_6d4d2ee196b57f 10-24,32
+tests/snapshots/form_field_text_strings.md
+  s_af9ca691a163fd::t_b83c1a2d25b967 1-8
+tests/integration_tests.rs
+  s_af9ca691a163fd::t_2db93b1ccad62b 2099-2137
+  s_af9ca691a163fd::t_14543327e9c6e4 2138
+examples/form_field_fixtures.rs
+  s_af9ca691a163fd::t_36337c225571ca 50,59,82
+  s_af9ca691a163fd::t_ecd79237fadc19 7-10
+  s_af9ca691a163fd::t_9c0aa8efa74a8a 1-6,11-49,51-58,60-81,83-88,90-96,98-103,105-122,124-141,143-212
+  s_af9ca691a163fd::t_1362a0f19fa551 89,97,104,123,142
+src/text_utils.rs
+  s_af9ca691a163fd::t_1258e6c9bd4cf3 854-855
+  s_af9ca691a163fd::t_643702d758b3c7 853
+  s_af9ca691a163fd::t_3cf62a78fe8de9 856-861
+src/extractor/links.rs
+  s_af9ca691a163fd::t_c13fe08afa682c 397
+  s_af9ca691a163fd::t_6c39f77be9619e 384
+  s_af9ca691a163fd::t_b0a745f0eabf35 749,758
+  s_af9ca691a163fd::t_69ab53cf81caf3 887-889,901-914
+  s_af9ca691a163fd::t_fab58d2ad393aa 781-782
+  s_af9ca691a163fd::t_1cf11c13457fd7 391-392,402
+  s_af9ca691a163fd::t_df63d18b77cf30 748,750-757,759-780,783-886,890-900,915
+  s_af9ca691a163fd::t_e185bcd9424ce6 3
+  s_af9ca691a163fd::t_b3d7dd2ed9655d 304-306,311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7c8123d85c07b9f5d10f05d4e43280db8f4e5c85",
+  "prompts": {},
+  "sessions": {
+    "s_af9ca691a163fd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48159310-4c5c-46fc-b74a-1ba8f972ad13",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
