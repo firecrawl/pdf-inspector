@@ -1,0 +1,90 @@
+src/markdown/escape.rs
+  s_00ea45a182518d::t_8821b81118c9fd 225
+  s_00ea45a182518d::t_f1619e21547abe 100-104,106-112
+  s_00ea45a182518d::t_0e90c641e2bc2d 271-285
+  s_00ea45a182518d::t_9e451949505003 1-50,52-58,88-99,105,113-208,210-224,226-232,237-270,286-300
+  s_00ea45a182518d::t_6b8aa40b5ed7a3 51
+  s_00ea45a182518d::t_84e667a082a8cb 59-87
+  s_00ea45a182518d::t_892409351a2a2d 209,233-236
+src/tables/cell_text.rs
+  s_00ea45a182518d::t_6eafb1e539b3b2 236
+  s_00ea45a182518d::t_0933dcca992721 442-462
+  s_00ea45a182518d::t_107d832a2eddb9 80,82
+  s_00ea45a182518d::t_2669004527affb 8-12,22
+  s_9450df6ba64548::t_5293d5635ac368 441
+src/lib.rs
+  s_00ea45a182518d::t_e21763d52be89c 3984,3987-3995
+  s_00ea45a182518d::t_86b814eabb8904 1423,2992-2994,3488,8115-8116,8209-8210
+  s_00ea45a182518d::t_8b13336816c895 3963
+  s_00ea45a182518d::t_b4fac7174c1235 4039-4045
+  s_00ea45a182518d::t_de250bc1532651 3236,3239
+src/tables/detect_rects.rs
+  s_00ea45a182518d::t_abac4757ceeeb0 1774,1779-1789
+src/types.rs
+  s_00ea45a182518d::t_b15feb88ea4f66 742
+  s_00ea45a182518d::t_ce7241e7ec162a 909,914
+  s_00ea45a182518d::t_90c5fd83d2c14d 942
+  s_00ea45a182518d::t_c7e50f8d56fff9 1317-1376
+  s_00ea45a182518d::t_6fe0f0a0d980e4 960
+  s_00ea45a182518d::t_3607c83556a5ee 703-713,719,725,740-741,748-776,779
+src/tables/detect_heuristic.rs
+  s_00ea45a182518d::t_d8712d9d869b8a 3
+  s_00ea45a182518d::t_2a680c4a87c485 1298
+  s_00ea45a182518d::t_6441f3c66afd1a 1299
+src/tables/mod.rs
+  s_00ea45a182518d::t_0cf683b38e6e61 1225
+  s_00ea45a182518d::t_a31318203250f8 1238
+  s_00ea45a182518d::t_84c8e87292dbff 1213-1215
+  s_00ea45a182518d::t_f512806edf60bc 1221-1223
+  s_00ea45a182518d::t_11ab66d694083a 1515
+  s_00ea45a182518d::t_46946695a2b906 1511-1514
+  s_00ea45a182518d::t_7731c4f2eaab88 2114-2115,2117-2120
+tests/integration_tests.rs
+  s_00ea45a182518d::t_892409351a2a2d 10113-10114,10130-10147,10174-10175
+  s_00ea45a182518d::t_7cbafe630b4687 10074-10112,10115-10129,10148-10170,10177
+  s_00ea45a182518d::t_4b1af82b08a335 10171-10173,10176
+src/markdown/mod.rs
+  s_00ea45a182518d::t_cae1e2414eddb4 2515-2523
+  s_00ea45a182518d::t_3a8d15b80fbbf7 1375
+  s_00ea45a182518d::t_e58f6d9a11523a 1328-1330
+  s_00ea45a182518d::t_dfd4cbe786c012 1353
+  s_00ea45a182518d::t_c31d2012fb885a 2153
+  s_00ea45a182518d::t_156b30cd91f159 12
+src/markdown/convert.rs
+  s_00ea45a182518d::t_571ae864c35193 1631,1633
+  s_00ea45a182518d::t_4f0db5a23457b5 1530-1531,1538-1539
+  s_00ea45a182518d::t_54867d23afca6a 2156-2208
+  s_00ea45a182518d::t_d57ac27b3fc097 849-850,853
+  s_00ea45a182518d::t_3448f974354806 1020-1021,1028-1029
+  s_00ea45a182518d::t_32134e758605bc 1211,1213
+src/tables/grid.rs
+  s_00ea45a182518d::t_f703206f6be221 433
+CHANGELOG.md
+  s_00ea45a182518d::t_73403eac052dcc 10-36
+src/tables/detect_struct.rs
+  s_00ea45a182518d::t_a6328fbf8bf463 333
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cd4a526b2826c81658aba114f279df5a821d2fb5",
+  "prompts": {},
+  "sessions": {
+    "s_00ea45a182518d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "361478b7-2f68-4651-8103-a62e0309efa5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    },
+    "s_9450df6ba64548": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c0c2112-ad7a-431a-be6a-20866ba43c20",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
