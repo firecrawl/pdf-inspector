@@ -26,7 +26,7 @@ use pdf_inspector::{
     extract_text_with_positions_mem_in_frame, PositionFrame,
 };
 use pdf_inspector::{
-    extract_text_in_regions_mem_with_options,
+    extract_tables_in_regions_mem_with_options, extract_text_in_regions_mem_with_options,
     extract_text_with_positions_and_rotations_mem_with_options,
     extract_text_with_positions_mem_with_options, BoldSource, PositionOptions,
 };
@@ -3495,6 +3495,16 @@ fn test_extract_regions_mem_recovers_invisible_ocr_layer() {
         !region.needs_ocr,
         "recovered OCR layer must not fall back to GPU OCR"
     );
+    for include in [false, true] {
+        let with_options = extract_text_in_regions_mem_with_options(
+            &buf,
+            &full_page_regions(1),
+            PositionOptions::new().include_invisible(include),
+        )
+        .unwrap();
+        assert_eq!(with_options[0].regions[0].text, region.text);
+        assert!(!with_options[0].regions[0].needs_ocr);
+    }
 }
 
 /// ANY visible text on the page — even a single short line — must block the
@@ -3521,6 +3531,20 @@ fn test_extract_regions_mem_visible_text_blocks_invisible_layer() {
         1,
         "visible text must appear exactly once, got: {:?}",
         region.text
+    );
+    let included = extract_text_in_regions_mem_with_options(
+        &buf,
+        &full_page_regions(1),
+        PositionOptions::new().include_invisible(true),
+    )
+    .unwrap();
+    assert_eq!(included[0].regions[0].text.matches("Folio 142").count(), 1);
+    assert_eq!(
+        included[0].regions[0]
+            .text
+            .matches("quick brown fox")
+            .count(),
+        1
     );
 }
 
@@ -3606,6 +3630,23 @@ fn test_extract_regions_mem_punctuation_visible_blocks_invisible_layer() {
         1,
         "visible punctuation must be preserved exactly once, got: {:?}",
         region.text
+    );
+    let included = extract_text_in_regions_mem_with_options(
+        &buf,
+        &full_page_regions(1),
+        PositionOptions::new().include_invisible(true),
+    )
+    .unwrap();
+    assert_eq!(
+        included[0].regions[0].text.matches("... --- ...").count(),
+        1
+    );
+    assert_eq!(
+        included[0].regions[0]
+            .text
+            .matches("quick brown fox")
+            .count(),
+        1
     );
 }
 
@@ -7637,6 +7678,28 @@ BT /F1 12 Tf 0 1 -1 0 70 420 Tm (WORLD) Tj ET";
     assert_eq!(display_region_text(&buf, world_rect).trim(), "WORLD");
     // Read in the sheet frame, the same rects land on empty paper.
     assert_eq!(region_text(&buf, hello_rect).trim(), "");
+
+    // An explicitly included hidden line uses the same predominant-page
+    // correction and display coordinates as its visible counterpart.
+    let hidden = make_text_pdf_with_rotate(
+        &content.replace("(WORLD)", "3 Tr (WORLD)"),
+        "0 0 612 792",
+        None,
+        Some(90),
+        None,
+        HELVETICA_FONT,
+    );
+    let options = PositionOptions::new()
+        .frame(PositionFrame::Display)
+        .include_invisible(true);
+    let (included, hidden_rotations) =
+        extract_text_with_positions_and_rotations_mem_with_options(&hidden, None, options).unwrap();
+    assert_same_geometry(&display, &included);
+    assert_eq!(hidden_rotations, rotations);
+    let regions =
+        extract_text_in_regions_mem_with_options(&hidden, &[(0, vec![world_rect])], options)
+            .unwrap();
+    assert_eq!(regions[0].regions[0].text, "WORLD");
 }
 
 #[test]
@@ -7824,6 +7887,324 @@ BT /F1 12 Tf 330 660 Td (2.25) Tj ET";
     assert!(text_from_sheet.contains("Apple"), "got {text_from_sheet:?}");
     assert_eq!(display_region_text(&buf, display_rect), text_from_sheet);
     assert_eq!(region_text(&buf, display_rect).trim(), "");
+}
+
+// =========================================================================
+// Explicit invisible-text inclusion in the position and region APIs
+// =========================================================================
+
+#[test]
+fn test_position_options_include_invisible_with_substantial_visible_text() {
+    let content = "BT /F1 12 Tf 72 700 Td \
+        (This visible paragraph already provides valid text for inspection.) Tj \
+        0 -20 Td (A short embedded reference must still be available on request.) Tj \
+        0 -40 Td 3 Tr (ID42) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+    let plain = extract_text_with_positions_mem(&buf).unwrap();
+    assert!(plain
+        .iter()
+        .any(|item| item.text.contains("visible paragraph")));
+    assert!(!plain.iter().any(|item| item.text.contains("ID42")));
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    assert!(!regions[0].regions[0].text.contains("ID42"));
+
+    let items = extract_text_with_positions_mem_with_options(
+        &buf,
+        None,
+        PositionOptions::new().include_invisible(true),
+    )
+    .unwrap();
+    assert!(items.iter().any(|item| item.text == "ID42"), "{items:?}");
+
+    let explicit_false = extract_text_with_positions_mem_with_options(
+        &buf,
+        None,
+        PositionOptions::new().include_invisible(false),
+    )
+    .unwrap();
+    assert_same_geometry(&plain, &explicit_false);
+    let shown: Vec<_> = items
+        .iter()
+        .filter(|item| item.text != "ID42")
+        .cloned()
+        .collect();
+    assert_same_geometry(&plain, &shown);
+    assert_eq!(find_item(&items, "ID42").render_mode, Some(3));
+
+    // Region fallback is page-wide: visible text outside the requested
+    // region blocks recovery too. An explicit request still reads ID42.
+    let region = item_region(find_item(&items, "ID42"), 792.0);
+    let defaults = extract_text_in_regions_mem(&buf, &[(0, vec![region])]).unwrap();
+    assert!(defaults[0].regions[0].text.is_empty());
+    let included = extract_text_in_regions_mem_with_options(
+        &buf,
+        &[(0, vec![region])],
+        PositionOptions::new().include_invisible(true),
+    )
+    .unwrap();
+    assert_eq!(included[0].regions[0].text, "ID42");
+    assert!(!included[0].regions[0].needs_ocr);
+}
+
+#[test]
+fn test_position_options_include_invisible_text_operators() {
+    for show in [
+        "(Hidden) Tj",
+        "[(Hid) -20 (den)] TJ",
+        "(Hidden) '",
+        "0 0 (Hidden) \"",
+    ] {
+        let content = format!("BT /F1 12 Tf 20 TL 72 700 Td (Visible) Tj 0 -20 Td 3 Tr {show} ET");
+        let buf = make_text_pdf(&content, "0 0 612 792");
+        let plain = extract_text_with_positions_mem(&buf).unwrap();
+        assert_eq!(plain.len(), 1, "{show}");
+        assert_eq!(plain[0].text, "Visible");
+        let included = extract_text_with_positions_mem_with_options(
+            &buf,
+            None,
+            PositionOptions::new().include_invisible(true),
+        )
+        .unwrap();
+        assert_eq!(included.len(), 2, "{show}: {included:?}");
+        assert_eq!(find_item(&included, "Hidden").render_mode, Some(3));
+        let visible = make_text_pdf(&content.replace("3 Tr", "0 Tr"), "0 0 612 792");
+        assert_same_geometry(
+            &extract_text_with_positions_mem(&visible).unwrap(),
+            &included,
+        );
+    }
+}
+
+#[test]
+fn test_position_options_include_invisible_preserves_adjacent_and_overlapping_runs() {
+    for content in [
+        "BT /F1 12 Tf 72 700 Td (Visible ) Tj 3 Tr (Hidden) Tj ET",
+        "BT /F1 12 Tf 72 700 Td (Visible) Tj 3 Tr 1 0 0 1 72 700 Tm (Hidden) Tj ET",
+        "BT /F1 12 Tf 72 700 Td (Repeated) Tj 3 Tr 1 0 0 1 72 700 Tm (Repeated) Tj ET",
+    ] {
+        let buf = make_text_pdf(content, "0 0 612 792");
+        let items = extract_text_with_positions_mem_with_options(
+            &buf,
+            None,
+            PositionOptions::new().include_invisible(true),
+        )
+        .unwrap();
+        let text: String = items.iter().map(|item| item.text.as_str()).collect();
+        if content.contains("Repeated") {
+            assert_eq!(text.matches("Repeated").count(), 2, "{items:?}");
+        } else {
+            assert_eq!(text.matches("Visible").count(), 1, "{items:?}");
+            assert_eq!(text.matches("Hidden").count(), 1, "{items:?}");
+        }
+    }
+}
+
+#[test]
+fn test_position_options_include_invisible_only_and_visible_only_pages() {
+    let content = "BT /F1 12 Tf 3 Tr 72 700 Td (Embedded text) Tj ET";
+    let hidden = make_text_pdf(content, "0 0 612 792");
+    assert!(extract_text_with_positions_mem(&hidden).unwrap().is_empty());
+    let options = PositionOptions::new().include_invisible(true);
+    let items = extract_text_with_positions_mem_with_options(&hidden, None, options).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].text, "Embedded text");
+
+    // Includes blank and image-only pages: nothing synthetic is added.
+    for buf in [
+        make_text_pdf(&content.replace("3 Tr", "0 Tr"), "0 0 612 792"),
+        make_text_pdf("", "0 0 612 792"),
+        make_pdf_with_image([100.0, 0.0, 0.0, 100.0, 72.0, 500.0]),
+    ] {
+        let plain = extract_text_with_positions_mem(&buf).unwrap();
+        let included = extract_text_with_positions_mem_with_options(&buf, None, options).unwrap();
+        assert_same_geometry(&plain, &included);
+        let regions = full_page_regions(1);
+        let plain = extract_text_in_regions_mem(&buf, &regions).unwrap();
+        let included = extract_text_in_regions_mem_with_options(&buf, &regions, options).unwrap();
+        assert_eq!(plain[0].regions[0].text, included[0].regions[0].text);
+        assert_eq!(
+            plain[0].regions[0].needs_ocr,
+            included[0].regions[0].needs_ocr
+        );
+    }
+}
+
+#[test]
+fn test_position_options_include_invisible_table_cells() {
+    use lopdf::{dictionary, Document, Stream};
+
+    // Reuse the supported stroked-grid fixture, hiding its second row.
+    let mut doc = Document::load_mem(&synthetic_vector_grid_pdf(false)).unwrap();
+    let page_id = doc.get_pages()[&1];
+    let content = String::from_utf8(doc.get_page_content(page_id)).unwrap();
+    let content = content.replace("(A2) Tj", "3 Tr (A2) Tj");
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    doc.get_dictionary_mut(page_id)
+        .unwrap()
+        .set("Contents", content_id);
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+    let regions = [(0, vec![[40.0, 50.0, 220.0, 760.0]])];
+    let plain = extract_tables_in_regions_mem(&buf, &regions).unwrap();
+    assert!(!plain[0].regions[0].text.contains("A2"));
+    let included = extract_tables_in_regions_mem_with_options(
+        &buf,
+        &regions,
+        PositionOptions::new().include_invisible(true),
+    )
+    .unwrap();
+    let table = &included[0].regions[0];
+    assert!(!table.needs_ocr, "{table:?}");
+    assert!(table.text.contains('|'), "{table:?}");
+    for cell in ["A1", "B1", "A2", "B2"] {
+        assert_eq!(table.text.matches(cell).count(), 1, "{table:?}");
+    }
+    let defaults = extract_tables_in_regions_mem_with_options(
+        &buf,
+        &regions,
+        PositionOptions::new().include_invisible(false),
+    )
+    .unwrap();
+    assert_eq!(plain[0].regions[0].text, defaults[0].regions[0].text);
+}
+
+#[test]
+fn test_position_options_include_invisible_nested_forms_and_split_streams() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let buf = make_pdf_with_form(
+        "",
+        "0 0 612 792",
+        "BT /F1 12 Tf 72 680 Td (OuterHidden) Tj ET \
+         q 0 Tr BT /F1 12 Tf 72 640 Td (InnerVisible) Tj ET Q /Fm2 Do",
+    );
+    let mut doc = Document::load_mem(&buf).unwrap();
+    let inner = doc.add_object(Stream::new(dictionary! {
+        "Type" => "XObject", "Subtype" => "Form",
+        "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => Object::Reference((5, 0)) } },
+    }, b"BT /F1 12 Tf 72 600 Td (NestedHidden) Tj ET".to_vec()));
+    doc.get_object_mut((6, 0))
+        .unwrap()
+        .as_stream_mut()
+        .unwrap()
+        .dict
+        .get_mut(b"Resources")
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("XObject", dictionary! { "Fm2" => inner });
+    let streams: Vec<Object> = [
+        "q BT /F1 12 Tf 3 Tr",
+        "72 720 Td (StreamHidden) Tj ET /Fm1 Do Q \
+         BT /F1 12 Tf 72 560 Td (PageVisible) Tj ET",
+    ]
+    .iter()
+    .map(|content| {
+        doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()))
+            .into()
+    })
+    .collect();
+    let page_id = doc.get_pages()[&1];
+    doc.get_dictionary_mut(page_id)
+        .unwrap()
+        .set("Contents", streams);
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+    let plain = extract_text_with_positions_mem(&buf).unwrap();
+    assert_eq!(
+        plain
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        ["InnerVisible", "PageVisible"]
+    );
+    let options = PositionOptions::new().include_invisible(true);
+    let items = extract_text_with_positions_mem_with_options(&buf, None, options).unwrap();
+    assert_eq!(items.len(), 5, "{items:?}");
+    for text in ["StreamHidden", "OuterHidden", "NestedHidden"] {
+        assert_eq!(find_item(&items, text).render_mode, Some(3));
+    }
+    for text in ["InnerVisible", "PageVisible"] {
+        assert_eq!(find_item(&items, text).render_mode, Some(0));
+    }
+    let regions =
+        extract_text_in_regions_mem_with_options(&buf, &full_page_regions(1), options).unwrap();
+    for item in &items {
+        assert_eq!(regions[0].regions[0].text.matches(&item.text).count(), 1);
+    }
+}
+
+#[test]
+fn test_position_options_include_invisible_respects_coordinates_and_selection() {
+    let mut content = "BT /F1 12 Tf 100 300 Td (Visible) Tj 0 -40 Td 3 Tr (Hidden) Tj ET \
+        q 90 90 200 250 re W n BT /F1 12 Tf 3 Tr 100 60 Td (Clipped) Tj ET Q\n"
+        .to_string();
+    // The existing crop policy removes coherent neighboring-page text,
+    // not isolated short fragments. Use a paragraph that meets that gate.
+    for line in 0..10 {
+        content.push_str(&format!(
+            "BT /F1 12 Tf 3 Tr 100 {} Td (Outside crop paragraph line {line}) Tj ET\n",
+            500 + 16 * line,
+        ));
+    }
+    for rotate in [0, 90, 180, 270] {
+        let buf = make_text_pdf_with_rotate(
+            &content,
+            "0 0 612 792",
+            Some("50 40 450 440"),
+            Some(rotate),
+            None,
+            HELVETICA_FONT,
+        );
+        let visible = make_text_pdf_with_rotate(
+            &content.replace("3 Tr", "0 Tr"),
+            "0 0 612 792",
+            Some("50 40 450 440"),
+            Some(rotate),
+            None,
+            HELVETICA_FONT,
+        );
+        for frame in [PositionFrame::Sheet, PositionFrame::Display] {
+            let options = PositionOptions::new()
+                .include_invisible(true)
+                .frame(frame)
+                .bold_from_weight(true)
+                .bold_weight_threshold(700);
+            let pages = HashSet::from([1]);
+            let (items, rotations) = extract_text_with_positions_and_rotations_mem_with_options(
+                &buf,
+                Some(&pages),
+                options,
+            )
+            .unwrap();
+            let (expected, expected_rotations) =
+                extract_text_with_positions_and_rotations_mem_with_options(
+                    &visible,
+                    Some(&pages),
+                    options.include_invisible(false),
+                )
+                .unwrap();
+            assert_same_geometry(&expected, &items);
+            assert_eq!(rotations, expected_rotations);
+            assert_eq!(items.len(), 2, "{items:?}");
+            let selected =
+                extract_text_with_positions_mem_with_options(&buf, Some(&pages), options).unwrap();
+            assert_same_geometry(&items, &selected);
+            let excluded = extract_text_with_positions_and_rotations_mem_with_options(
+                &buf,
+                Some(&HashSet::from([2])),
+                options,
+            )
+            .unwrap();
+            assert!(excluded.0.is_empty());
+            assert!(excluded.1.is_empty());
+            let hidden = find_item(&items, "Hidden");
+            let regions = [(0, vec![item_region(hidden, 400.0)])];
+            let result = extract_text_in_regions_mem_with_options(&buf, &regions, options).unwrap();
+            assert_eq!(result[0].regions[0].text, "Hidden");
+        }
+    }
 }
 
 // =========================================================================

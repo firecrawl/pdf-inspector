@@ -7,6 +7,19 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Added
+
+- `PositionOptions::include_invisible` and its builder let Rust callers request
+  embedded mode-3 text alongside visible text in the initial pass of all four
+  `_with_options` positioned-text and region APIs. The default is `false`,
+  preserving existing extraction and automatic recovery. This reads PDF text
+  without OCR; existing selection, clipping, and quality rules still apply.
+  Inclusion can return duplicate words from separate embedded layers, and a
+  merged item's `render_mode` still describes its first run.
+  ([#583](https://github.com/firecrawl/pdf-inspector/pull/583))
+
 ## [1.24.0] - 2026-09-22
 
 Changes since 1.23.0.

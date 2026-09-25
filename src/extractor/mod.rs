@@ -46,6 +46,7 @@ pub use display_frame::PositionFrame;
 ///
 /// let options = PositionOptions::new()
 ///     .frame(PositionFrame::Display)
+///     .include_invisible(true)
 ///     .bold_from_weight(true)
 ///     .bold_weight_threshold(700);
 /// ```
@@ -55,6 +56,21 @@ pub struct PositionOptions {
     /// Coordinate frame items are reported in and region rects are read
     /// in; [`PositionFrame::Sheet`] by default.
     pub frame: PositionFrame,
+    /// Include supported invisible text (PDF rendering mode 3) alongside
+    /// visible text in the initial extraction pass, even when visible text
+    /// is already present. Reads embedded text without running OCR.
+    ///
+    /// False by default: preserves each API's existing behavior, including
+    /// automatic invisible-layer retries where available. False does not
+    /// guarantee that all invisible text is excluded.
+    ///
+    /// Existing selection, coordinates, clipping, decoding, quality checks,
+    /// and resource limits still apply. This is not an option to extract
+    /// every visually hidden object or off-page text. Separate embedded
+    /// layers may repeat words; no new deduplication policy is applied.
+    /// Merged items keep their first run's `TextItem::render_mode`, not
+    /// per-character visibility provenance.
+    pub include_invisible: bool,
     /// Read bold from the font's weight class as well. When set,
     /// `TextItem::is_bold` is also `true` for items whose
     /// `TextItem::font_weight` is `bold_weight_threshold` (600, SemiBold,
@@ -78,6 +94,7 @@ impl Default for PositionOptions {
     fn default() -> Self {
         Self {
             frame: PositionFrame::default(),
+            include_invisible: false,
             bold_from_weight: false,
             bold_weight_threshold: content_stream::DEFAULT_BOLD_WEIGHT_THRESHOLD,
         }
@@ -86,7 +103,8 @@ impl Default for PositionOptions {
 
 impl PositionOptions {
     /// The defaults: sheet frame, bold not read from the weight class, a
-    /// threshold of 600 for when it is.
+    /// threshold of 600 for when it is, and no explicit invisible-text
+    /// inclusion (existing automatic recovery remains available).
     pub fn new() -> Self {
         Self::default()
     }
@@ -94,6 +112,13 @@ impl PositionOptions {
     /// Set the coordinate frame.
     pub fn frame(mut self, frame: PositionFrame) -> Self {
         self.frame = frame;
+        self
+    }
+
+    /// Set whether to include embedded mode-3 text alongside visible text.
+    /// See [`Self::include_invisible`] for default and extraction semantics.
+    pub fn include_invisible(mut self, include_invisible: bool) -> Self {
+        self.include_invisible = include_invisible;
         self
     }
 
@@ -111,9 +136,9 @@ impl PositionOptions {
     }
 
     /// The content-stream switches these options ask for.
-    pub(crate) fn text_extraction(self, include_invisible: bool) -> TextExtractionOptions {
+    pub(crate) fn text_extraction(self, fallback_requested: bool) -> TextExtractionOptions {
         TextExtractionOptions {
-            include_invisible,
+            include_invisible: self.include_invisible || fallback_requested,
             bold_from_weight: self.bold_from_weight,
             bold_weight_threshold: self.bold_weight_threshold.clamp(100, 900),
             // The position readers report no CMap coverage.
@@ -282,8 +307,9 @@ pub fn extract_text_with_positions_mem_in_frame(
 }
 
 /// [`extract_text_with_positions_mem_in_frame`] with every option of the
-/// positioned-text APIs given as a [`PositionOptions`]: the frame, and
-/// whether bold is also read from the font's weight class
+/// positioned-text APIs given as a [`PositionOptions`]: the frame, explicit
+/// embedded mode-3 text inclusion (`include_invisible`), and whether bold is
+/// also read from the font's weight class
 /// (`bold_from_weight`). The default options are that function with
 /// [`PositionFrame::Sheet`].
 pub fn extract_text_with_positions_mem_with_options(
