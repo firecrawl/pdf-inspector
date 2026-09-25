@@ -1836,7 +1836,23 @@ fn convert_items_with_rects_lines_and_table_output(
 
             // 2. Line-based detection on unclaimed items (when rects didn't find tables)
             if rect_claimed.is_empty() {
-                let line_tables = detect_tables_from_lines(band_items, band_lines, page);
+                // A table whose rules are hairline *fills* rather than strokes
+                // reaches this point with no lines at all, and its slivers are
+                // far too small for rect clustering. Re-express them as the
+                // segments they draw so the grid becomes visible here instead
+                // of being left to the heuristic pass, which sees only the
+                // columns its gap histogram happens to survive.
+                let synthesized = crate::tables::synthesize_lines_from_thin_rects(band_rects, page);
+                let mut combined_lines: Vec<crate::types::PdfLine> = Vec::new();
+                let effective_lines: &[crate::types::PdfLine] = if synthesized.is_empty() {
+                    band_lines
+                } else {
+                    combined_lines.reserve(band_lines.len() + synthesized.len());
+                    combined_lines.extend(band_lines.iter().cloned());
+                    combined_lines.extend(synthesized);
+                    &combined_lines
+                };
+                let line_tables = detect_tables_from_lines(band_items, effective_lines, page);
                 for table in &line_tables {
                     for &idx in &table.item_indices {
                         rect_claimed.insert(idx);
@@ -2010,6 +2026,9 @@ fn convert_items_with_rects_lines_and_table_output(
         // 5. Thin-rect border synthesis: last resort for PDFs that draw table
         //    borders as thin filled rectangles (common in spreadsheet exports).
         //    Only runs when ALL other methods found nothing on this page.
+        //    Segments stay as drawn here, unlike the welded set the line pass
+        //    above uses: with no grid left to find, a per-cell rule's
+        //    endpoints are the only column boundaries still on offer.
         if !table_output.has_detected_tables_on_page(page) {
             let page_rects: Vec<&crate::types::PdfRect> =
                 rects.iter().filter(|r| r.page == page).collect();

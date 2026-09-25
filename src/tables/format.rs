@@ -296,6 +296,20 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
     let mut cleaned: Vec<Vec<String>> = Vec::new();
     let mut footnotes: Vec<String> = Vec::new();
 
+    // A first column left empty by nearly every row is a row-group label
+    // column: one spanning cell drawn once for a block of rows ("Grupo WBC",
+    // "Q1"). There an empty first cell is the norm, so it cannot be read as
+    // "this row continues the previous one" the way it can in a table whose
+    // first column normally carries an entry label.
+    let data_rows = cells.len().saturating_sub(1);
+    let empty_first_cells = cells
+        .iter()
+        .skip(1)
+        .filter(|row| row.first().is_some_and(|cell| cell.trim().is_empty()))
+        .count();
+    let first_column_is_row_group_label =
+        data_rows >= 4 && empty_first_cells * 4 >= data_rows * 3;
+
     for row in cells {
         // Check if this row is empty
         if row.iter().all(|c| c.trim().is_empty()) {
@@ -421,6 +435,23 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && filled_cells == 1
             && header_filled >= 3
             && looks_like_plain_section_label(first_cell);
+        // A row of a row-group table that fills exactly the columns the row
+        // above fills, and opens every one of them like a fresh value, is the
+        // next entry of the group rather than text spilling out of the row
+        // above: wrapped text carries a lowercase tail, and it rarely lands
+        // in precisely the same columns as the row it came from.
+        let filled_pattern: Vec<bool> = row.iter().skip(1).map(|c| !c.trim().is_empty()).collect();
+        let previous_filled_pattern: Vec<bool> = cleaned
+            .last()
+            .map(|prev| prev.iter().skip(1).map(|c| !c.trim().is_empty()).collect())
+            .unwrap_or_default();
+        let has_wrapped_tail = plain_cells
+            .iter()
+            .any(|cell| starts_with_lowercase_alpha(cell));
+        let looks_like_row_group_data_row = first_column_is_row_group_label
+            && non_first_cells.len() >= 2
+            && !has_wrapped_tail
+            && filled_pattern == previous_filled_pattern;
         // Classic continuation: first cell empty, content in other cells
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
@@ -428,6 +459,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && !looks_like_data_row
             && !looks_like_spanning_first_column_row
             && !looks_like_hierarchical_subrow
+            && !looks_like_row_group_data_row
             && cleaned.len() > 1;
 
         // Wrapped-cell continuation: row has fewer filled cells than the header
