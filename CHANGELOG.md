@@ -7,7 +7,9 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## Unreleased
+## [1.25.0] - 2026-09-25
+
+Changes since 1.24.0.
 
 ### Added
 
@@ -17,6 +19,7 @@ version and date. Earlier releases are described in their
   the event loop, so a slow page no longer blocks the caller's process.
   Invalid options throw when the call is made, as in the sync call, and the
   buffer is copied before the call returns.
+  ([#592](https://github.com/firecrawl/pdf-inspector/pull/592))
 
 ### Fixed
 
@@ -29,6 +32,14 @@ version and date. Earlier releases are described in their
   with every rule still counted in the repetition checks, so the marks are
   unchanged and that page takes under 0.5 s. `extractTextWithPositions` and
   the Markdown extraction paths both run this pass.
+  ([#592](https://github.com/firecrawl/pdf-inspector/pull/592))
+- The `@firecrawl/pdf-inspector-linux-x64-gnu` Node binary loads on glibc
+  2.17 and later again. Since 1.13.0 it was built on the release runner's own
+  glibc and required GLIBC_2.35, so it failed with `ERR_DLOPEN_FAILED` on
+  Amazon Linux 2023 (the managed AWS Lambda Node runtimes), RHEL 9 and
+  Debian 11. It is now cross-built like the arm64 gnu binary, and the
+  release checks every gnu binary's glibc floor before publishing.
+  ([#586](https://github.com/firecrawl/pdf-inspector/pull/586))
 
 ## [1.24.0] - 2026-09-22
 
