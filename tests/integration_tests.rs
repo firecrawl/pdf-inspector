@@ -10071,3 +10071,21 @@ fn document_information_entries_are_decoded_in_every_result() {
     assert_eq!(detect_only.producer.as_deref(), Some("Test Library 1.0"));
     assert_eq!(detect_only.author.as_deref(), Some("José Martínez"));
 }
+
+#[test]
+fn monospace_code_listing_preserves_linebreaks_and_indentation() {
+    let pdf = std::fs::read("tests/fixtures/monospace_code_listing.pdf").unwrap();
+    let markdown = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    let expected = "```
+# repro.py
+def outer(items):
+    total = 0
+    for item in items:
+        if item > 0:
+            total += item
+        else:
+            total -= item
+    return total
+```";
+    assert!(markdown.contains(expected), "{markdown:?}");
+}
