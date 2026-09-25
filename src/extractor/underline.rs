@@ -138,6 +138,17 @@ fn discard_repeated_ruling_rules(
 
     rules
         .iter()
+        // Only a rule that could decorate some text item can change the
+        // result: every use of the kept rules downstream tests them against
+        // the page's items (underline window, strike band, tabular and
+        // fraction checks), never against each other. A page drawn from
+        // vector art can carry a hundred thousand thin rects and only a
+        // few dozen text items; the checks below compare each rule with
+        // every other, so running them on rules that touch no text cost
+        // minutes of CPU while deciding nothing. All rules stay the context
+        // those checks compare against, so a rule near text is judged
+        // exactly as before.
+        .filter(|rule| may_decorate_text(rule, items))
         .filter(|rule| {
             // A rule snugly owned by one text line is an underline even when
             // span-similar rules repeat down the page — documents that
@@ -157,6 +168,15 @@ fn discard_repeated_ruling_rules(
         })
         .cloned()
         .collect()
+}
+
+/// True when the rule falls in the underline window or the strike band of
+/// at least one text item that can carry a decoration.
+fn may_decorate_text(rule: &Rule, items: &[TextItem]) -> bool {
+    items.iter().any(|item| {
+        is_underline_candidate(item)
+            && (rule_matches_item(rule, item) || rule_strikes_item(rule, item))
+    })
 }
 
 /// True when a single text item both matches the rule vertically (baseline
@@ -827,6 +847,24 @@ mod tests {
         let rects = vec![thin_rect(100.0, 497.8, 60.0)];
         mark_underlined_items(&mut items, &rects, &[], 1);
         assert!(items[0].is_underline);
+    }
+
+    #[test]
+    fn thin_rects_far_from_text_leave_the_verdict_unchanged() {
+        // Vector art drawn as thousands of thin filled rects (a map, a
+        // chart's hatching) sits far from the page's text. Those rules can
+        // decorate nothing, so they must not change the text's own
+        // underline, and are only context for the repetition checks.
+        let mut items = vec![item("underlined", 100.0, 500.0, 60.0, 10.0)];
+        let mut rects = vec![thin_rect(100.0, 497.8, 60.0)];
+        for i in 0..5_000 {
+            let col = (i % 50) as f32;
+            let row = (i / 50) as f32;
+            rects.push(thin_rect(300.0 + col * 3.0, 100.0 + row * 1.5, 2.5));
+        }
+        mark_underlined_items(&mut items, &rects, &[], 1);
+        assert!(items[0].is_underline);
+        assert!(!items[0].is_strikeout);
     }
 
     #[test]

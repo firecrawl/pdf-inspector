@@ -7,6 +7,20 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## Unreleased
+
+### Fixed
+
+- Underline and strikeout detection no longer takes quadratic time on pages
+  drawn from many thin filled rects or short strokes. Every such shape is a
+  rule candidate, and each candidate was compared with every other one
+  before anything looked at the text; a page of vector art made of about
+  200,000 thin rects and 25 text items took about 40 s. Only rules that fall
+  in the underline window or strike band of a text item are classified now,
+  with every rule still counted in the repetition checks, so the marks are
+  unchanged and that page takes under 0.5 s. `extractTextWithPositions` and
+  the Markdown extraction paths both run this pass.
+
 ## [1.24.0] - 2026-09-22
 
 Changes since 1.23.0.
