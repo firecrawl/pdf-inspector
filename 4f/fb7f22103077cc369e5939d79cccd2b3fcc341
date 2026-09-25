@@ -1,0 +1,19 @@
+napi/README.md
+  s_b0bf00a0cfc418::t_458ce25c741c7d 95-97,250,252,255,262-263
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4ffb7f22103077cc369e5939d79cccd2b3fcc341",
+  "prompts": {},
+  "sessions": {
+    "s_b0bf00a0cfc418": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "46346ded-fc00-42c0-9992-5d6401e8ce9f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
