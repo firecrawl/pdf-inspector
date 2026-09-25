@@ -92,6 +92,9 @@ console.log(result.confidence)     // 0.875
 
 ### `extractTextWithPositions(buffer: Buffer, pages?: number[], options?: FrameOptions): TextItem[]`
 
+An async variant, `extractTextWithPositionsAsync`, takes the same arguments and
+resolves to the same items (see [Async variants](#async-variants)).
+
 Every text item (plus image placeholders, links and form fields) with its font
 and position. `x`/`y` are PDF points relative to the page's **visible page
 box** (`CropBox ∩ MediaBox`, else the MediaBox), origin at the box's lower-left
@@ -244,18 +247,20 @@ for (const region of result[0].regions) {
 
 ### Async variants
 
-`processPdf`, `classifyPdf`, and `extractPagesMarkdown` are synchronous and parse on the calling thread — in Node, that's the event loop. For a one-off call in a script that's fine, but in a server a large document can hold the loop for tens to hundreds of milliseconds.
+`processPdf`, `classifyPdf`, `extractPagesMarkdown`, and `extractTextWithPositions` are synchronous and parse on the calling thread — in Node, that's the event loop. For a one-off call in a script that's fine, but in a server a large document can hold the loop for tens to hundreds of milliseconds, and an unusual one for much longer.
 
-`processPdfAsync`, `classifyPdfAsync`, and `extractPagesMarkdownAsync` take the same arguments and produce the same results, but run the parse on the libuv thread pool and return a promise, keeping the event loop free. The input buffer is copied before the call returns, so it's safe to reuse or mutate immediately:
+`processPdfAsync`, `classifyPdfAsync`, `extractPagesMarkdownAsync`, and `extractTextWithPositionsAsync` take the same arguments and produce the same results, but run the parse on the libuv thread pool and return a promise, keeping the event loop free. Invalid options still throw when the call is made. The input buffer is copied before the call returns, so it's safe to reuse or mutate immediately:
 
 ```typescript
-import { classifyPdfAsync, extractPagesMarkdownAsync } from '@firecrawl/pdf-inspector'
+import { classifyPdfAsync, extractPagesMarkdownAsync, extractTextWithPositionsAsync } from '@firecrawl/pdf-inspector'
 
 const classification = await classifyPdfAsync(pdf)
 if (classification.pdfType === 'TextBased') {
   const { pages } = await extractPagesMarkdownAsync(pdf)
   // ...
 }
+
+const items = await extractTextWithPositionsAsync(pdf, [1, 2], { frame: 'display' })
 ```
 
 ## Types
