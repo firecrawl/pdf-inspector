@@ -612,6 +612,13 @@ mod tests {
     }
 
     #[test]
+    fn square_bullet_line_is_not_classified_as_heading() {
+        // title_like is the regression-sensing check: a single bold ▪ line
+        // never reaches classify_heading_sequences promotion (group.len() < 2).
+        assert!(!title_like("▪ Short item", false, true));
+    }
+
+    #[test]
     fn singleton_bold_label_does_not_form_sequence() {
         let lines = vec![
             line(

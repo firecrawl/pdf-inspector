@@ -7,7 +7,7 @@
 //! - Paragraphs
 
 pub(crate) mod analysis;
-mod classify;
+pub(crate) mod classify;
 mod convert;
 mod furniture;
 mod heading;
@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
-use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
+use classify::{format_list_item, is_caption_line, is_code_like, is_list_item, is_standalone_bullet_glyph};
 use convert::{
     merge_continuation_tables, to_markdown_from_lines_with_tables_and_images, ChartProseOrder,
     PositionedMarkdown,
@@ -32,7 +32,10 @@ const CHART_SEPARATOR_PAD: f32 = 8.0;
 
 fn is_chart_adjacent_label(item: &TextItem, region: (f32, f32, f32, f32)) -> bool {
     let text = item.text.trim();
-    let is_bare_bullet = matches!(text, "•" | "●" | "○" | "◦" | "-" | "*");
+    // Keep ASCII list markers and the shared standalone glyph set (▪▫‣⁃ etc.)
+    // out of chart-label filtering so list markers in chart padding survive.
+    let is_bare_bullet = matches!(text, "-" | "*")
+        || is_standalone_bullet_glyph(text);
     if text.is_empty() || is_list_item(text) || is_bare_bullet {
         return false;
     }
@@ -2812,9 +2815,15 @@ mod tests {
         prose.text = "This paragraph continues below the chart into the next prose column".into();
         assert!(!item_is_in_chart_region(&prose, &regions));
 
-        let mut bullet = make_item_w(340.0, 90.0, 5.0, 1);
-        bullet.text = "•".into();
-        assert!(!item_is_in_chart_region(&bullet, &regions));
+        // Pin every chart-padding-guarded standalone glyph (not only •).
+        for glyph in crate::markdown::classify::BULLET_GLYPHS {
+            let mut bullet = make_item_w(340.0, 90.0, 5.0, 1);
+            bullet.text = glyph.to_string();
+            assert!(
+                !item_is_in_chart_region(&bullet, &regions),
+                "standalone {glyph} near chart padding must not be claimed as a chart label"
+            );
+        }
     }
 
     #[test]
