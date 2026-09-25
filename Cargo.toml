@@ -89,6 +89,14 @@ lopdf = { version = "0.45.0", default-features = false, features = ["wasm_js"] }
 [dev-dependencies]
 tempfile = "3.3"
 
+# Matches the release profile already used in napi/ and wasm/: LTO and a
+# single codegen unit trade build time for a smaller, faster binary. Debug
+# builds are untouched, so the local dev loop isn't affected.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+
 [features]
 default = []
 python = ["pyo3", "ocr"]
