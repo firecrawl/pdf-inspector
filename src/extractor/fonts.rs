@@ -5443,7 +5443,9 @@ mod tests {
         // The twelve entries of `LIGATURE_INDEX_BFCHAR`, keyed by two-byte
         // glyph indices 0x21..=0x2C; the program names glyph 0x23 `f_f`.
         let bfchar = LIGATURE_INDEX_BFCHAR.replace("<2", "<002");
-        let mut names = vec![None; 0x2D];
+        // A program of fewer glyphs than the CMap's highest key, as a renumbered
+        // subset is: one with a glyph for every key was not renumbered.
+        let mut names = vec![None; 0x24];
         names[0x23] = Some("f_f");
         let (mut doc, tounicode_obj, page_id) =
             cid_font_doc(&bfchar, sfnt_with_glyph_names(&names), None, false, None);

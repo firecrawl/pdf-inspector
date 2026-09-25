@@ -1880,6 +1880,29 @@ fn parse_cid_to_gid_stream(data: &[u8]) -> Option<Vec<u16>> {
     Some(map)
 }
 
+/// Whether more of the CMap's source codes are CIDs the CIDToGIDMap draws a
+/// glyph for than are glyph indices it draws: then the CMap is keyed by CID.
+fn cmap_is_keyed_by_cid(cmap: &ToUnicodeCMap, cid_to_gid: &[u16]) -> bool {
+    let gids: HashSet<u16> = cid_to_gid.iter().copied().filter(|&gid| gid != 0).collect();
+    let codes: HashSet<u16> = cmap
+        .char_map
+        .keys()
+        .copied()
+        .chain(cmap.ranges.iter().flat_map(|&(start, end, _)| start..=end))
+        .take(1 << 17)
+        .collect();
+    let as_cid = codes
+        .iter()
+        .filter(|&&code| {
+            cid_to_gid
+                .get(usize::from(code))
+                .is_some_and(|&gid| gid != 0)
+        })
+        .count();
+    let as_gid = codes.iter().filter(|code| gids.contains(code)).count();
+    as_cid > as_gid
+}
+
 /// Build a CID→Unicode CMap by applying a CIDToGIDMap to an existing CMap that maps GID→Unicode.
 fn build_cmap_with_cid_to_gid_map(
     cmap: &ToUnicodeCMap,
@@ -1955,6 +1978,14 @@ fn try_remap_subset_cmap(
 
     // If there's an explicit CIDToGIDMap, build a repaired CMap using it.
     if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
+        // A CMap keyed by CID, as PDF 32000-1 9.10.3 has it, needs no repair:
+        // read by glyph index it turns each CID into whatever character the CMap
+        // gives the code equal to its GID, so a subset's low GIDs all read as its
+        // first few characters ("TCE" as "TAE").
+        if cmap_is_keyed_by_cid(&cmap, &cid_to_gid) {
+            debug!("CIDToGIDMap repair skipped for obj={obj_num}: the CMap is keyed by CID");
+            return (cmap, None);
+        }
         if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
             debug!(
                 "CIDToGIDMap repair applied for obj={}: {} entries",
@@ -1982,6 +2013,21 @@ fn try_remap_subset_cmap(
                 "Subset remap skipped for obj={}: W array covers CMap max CID {}",
                 obj_num, max_cid
             );
+            return (cmap, None);
+        }
+    }
+
+    // CIDs are glyph indices here. A program with a glyph for every code the
+    // CMap maps was not renumbered (LibreOffice keeps a subset's original
+    // glyph indices), and remapping it would read each code as another.
+    if let Some(max_cid) = cmap.max_source_cid() {
+        let glyphs = font_program(cid_font_dict, doc).and_then(|data| {
+            ttf_parser::Face::parse(&data, 0)
+                .ok()
+                .map(|face| face.number_of_glyphs())
+        });
+        if glyphs.is_some_and(|glyphs| glyphs > max_cid) {
+            debug!("Subset remap skipped for obj={obj_num}: the program has a glyph for CMap max CID {max_cid}");
             return (cmap, None);
         }
     }
@@ -5121,6 +5167,48 @@ endbfrange
         );
         // The original CMap must still resolve its own CIDs.
         assert_eq!(primary.lookup(0x0200), Some("\u{0410}".to_string()));
+    }
+
+    #[test]
+    fn test_cid_to_gid_repair_skips_a_cmap_keyed_by_cid() {
+        // A TrueType subset (TRMD's TORM-SemiBold) whose CMap is keyed by CID, as
+        // the spec has it, with CIDs 3, 4, 0x1E, 0x1F drawn by glyphs 1-4. Read by
+        // glyph index, CID 0x1F (GID 4) took the entry of code 4: "C" read as "A".
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+3 beginbfrange
+<0003> <0003> <0020>
+<0004> <0004> <0041>
+<001E> <001F> <0042>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        let mut doc = Document::new();
+        let mut cid_to_gid = vec![0u8; 0x20 * 2];
+        for (cid, gid) in [(0x03usize, 1u8), (0x04, 2), (0x1E, 3), (0x1F, 4)] {
+            cid_to_gid[cid * 2 + 1] = gid;
+        }
+        let cid_to_gid_id =
+            doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), cid_to_gid));
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType2".to_vec()));
+        cid_font.set("CIDToGIDMap", lopdf::Object::Reference(cid_to_gid_id));
+        let cid_font_id = doc.add_object(cid_font);
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set("Encoding", lopdf::Object::Name(b"Identity-H".to_vec()));
+        font_dict.set(
+            "DescendantFonts",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
+        );
+
+        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 205);
+        assert!(
+            remapped.is_none(),
+            "a CMap keyed by CID must not be read by GID"
+        );
+        assert_eq!(primary.lookup(0x1F), Some("C".to_string()));
     }
 
     #[test]
