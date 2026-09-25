@@ -16,6 +16,7 @@ import {
   detectVectorGridInRegion,
   extractPagesMarkdown,
   extractPagesMarkdownAsync,
+  extractTextWithPositionsAsync,
 } from './index.js';
 
 const fixture = readFileSync('../tests/fixtures/thermo-freon12.pdf');
@@ -410,6 +411,23 @@ assert.equal(asyncPicked.pages.length, 2);
 assert.equal(asyncPicked.pages[0].page, 2);
 assert.equal(asyncPicked.pages[1].page, 0);
 console.log('  extractPagesMarkdownAsync with pages: OK');
+
+// extractTextWithPositionsAsync matches the sync result, with and without
+// a page filter and position options
+for (const [pages, options] of [
+  [undefined, undefined],
+  [[1], { frame: 'display' }],
+  [undefined, { frame: 'display', boldFromWeight: true }],
+]) {
+  const asyncItems = await extractTextWithPositionsAsync(fixture, pages, options);
+  assert.deepEqual(asyncItems, extractTextWithPositions(fixture, pages, options));
+}
+// invalid options are rejected when the call is made, as in the sync call
+assert.throws(
+  () => extractTextWithPositionsAsync(fixture, undefined, { frame: 'bogus' }),
+  /unknown frame/,
+);
+console.log('  extractTextWithPositionsAsync: OK');
 
 // input buffer is copied at call time: mutating it immediately after the
 // call must not affect the in-flight parse

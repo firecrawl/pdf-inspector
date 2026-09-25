@@ -761,16 +761,68 @@ pub fn extract_text_with_positions(
     let bytes: Vec<u8> = buffer.to_vec();
     let position = position_options(options.as_ref(), "extract_text_with_positions")?;
     catch_panic("extract_text_with_positions", move || {
-        let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
-        let items = pdf_inspector::extract_text_with_positions_mem_with_options(
-            &bytes,
-            page_set.as_ref(),
-            position,
-        )
-        .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?;
-
-        Ok(items.into_iter().map(convert_text_item).collect())
+        extract_text_with_positions_impl(&bytes, pages, position)
     })
+}
+
+fn extract_text_with_positions_impl(
+    bytes: &[u8],
+    pages: Option<Vec<u32>>,
+    position: pdf_inspector::PositionOptions,
+) -> Result<Vec<TextItem>> {
+    let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
+    let items = pdf_inspector::extract_text_with_positions_mem_with_options(
+        bytes,
+        page_set.as_ref(),
+        position,
+    )
+    .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?;
+
+    Ok(items.into_iter().map(convert_text_item).collect())
+}
+
+pub struct ExtractTextWithPositionsTask {
+    bytes: Vec<u8>,
+    pages: Option<Vec<u32>>,
+    position: pdf_inspector::PositionOptions,
+}
+
+impl Task for ExtractTextWithPositionsTask {
+    type Output = Vec<TextItem>;
+    type JsValue = Vec<TextItem>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let pages = self.pages.take();
+        let position = self.position;
+        catch_panic(
+            "extract_text_with_positions",
+            panic::AssertUnwindSafe(move || extract_text_with_positions_impl(&bytes, pages, position)),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Async variant of [`extractTextWithPositions`]: same result, but the
+/// extraction runs on the libuv thread pool instead of the event loop and
+/// the call returns a promise. Options are validated before the call
+/// returns (an unknown frame throws synchronously, as in the sync call), and
+/// the buffer is copied then, so it may be reused or mutated immediately.
+#[napi(ts_return_type = "Promise<Array<TextItem>>")]
+pub fn extract_text_with_positions_async(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+    options: Option<FrameOptions>,
+) -> Result<AsyncTask<ExtractTextWithPositionsTask>> {
+    let position = position_options(options.as_ref(), "extract_text_with_positions_async")?;
+    Ok(AsyncTask::new(ExtractTextWithPositionsTask {
+        bytes: buffer.to_vec(),
+        pages,
+        position,
+    }))
 }
 
 /// An sRGB colour as the `[red, green, blue]` array the Node API reports.

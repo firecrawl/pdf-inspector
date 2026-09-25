@@ -9,6 +9,15 @@ version and date. Earlier releases are described in their
 
 ## Unreleased
 
+### Added
+
+- Node: `extractTextWithPositionsAsync`, the async variant of
+  `extractTextWithPositions`. It takes the same arguments and returns the
+  same items, but the extraction runs on the libuv thread pool instead of
+  the event loop, so a slow page no longer blocks the caller's process.
+  Invalid options throw when the call is made, as in the sync call, and the
+  buffer is copied before the call returns.
+
 ### Fixed
 
 - Underline and strikeout detection no longer takes quadratic time on pages
