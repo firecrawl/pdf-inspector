@@ -1,0 +1,21 @@
+CHANGELOG.md
+  s_b0bf00a0cfc418::t_bfd10ad77cc057 10-23
+src/extractor/underline.rs
+  s_b0bf00a0cfc418::t_dee38592495e64 141-151,173-181,852-869
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ef63676a1deb86a02f211982ab6bdd1310ea75bc",
+  "prompts": {},
+  "sessions": {
+    "s_b0bf00a0cfc418": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "46346ded-fc00-42c0-9992-5d6401e8ce9f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
