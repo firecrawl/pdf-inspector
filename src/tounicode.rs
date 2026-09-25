@@ -2216,6 +2216,13 @@ pub(crate) fn glyph_text(
 
 /// Build a ToUnicodeCMap from pdf.js built-in binary CMaps (bcmaps).
 fn build_cmap_from_builtin_cmap(ordering: &str) -> Option<ToUnicodeCMap> {
+    // `ordering` comes from the PDF's CIDSystemInfo and is interpolated into a
+    // file name, so restrict it to a plain alphanumeric token. Real Adobe
+    // orderings (Japan1, GB1, CNS1, Korea1, ...) match this, while separators
+    // and "." components that could escape the bcmaps directory do not.
+    if ordering.is_empty() || !ordering.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
     let name = format!("Adobe-{}-UCS2.bcmap", ordering);
     let data = read_builtin_cmap_file(&name)?;
     let mut cmap = parse_binary_cmap(&data).ok()?;
