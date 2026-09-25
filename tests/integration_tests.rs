@@ -10071,3 +10071,17 @@ fn document_information_entries_are_decoded_in_every_result() {
     assert_eq!(detect_only.producer.as_deref(), Some("Test Library 1.0"));
     assert_eq!(detect_only.author.as_deref(), Some("José Martínez"));
 }
+
+#[test]
+fn literal_html_is_escaped_without_escaping_engine_markup() {
+    let pdf = std::fs::read("tests/fixtures/literal_html_markup.pdf").unwrap();
+    let markdown = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    assert!(
+        markdown.contains("# &lt;b&gt;Escape &amp; test&lt;/b&gt;"),
+        "{markdown:?}"
+    );
+    assert!(
+        markdown.contains("&lt;a test&gt; &amp; value <u>underline</u> &lt;u&gt;underline&lt;/u&gt;"),
+        "{markdown:?}"
+    );
+}

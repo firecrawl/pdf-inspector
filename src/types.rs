@@ -719,9 +719,22 @@ pub(crate) fn push_item_text(result: &mut String, item: &TextItem, text: &str) {
     result.push('>');
 }
 
+fn push_item_text_escaped(result: &mut String, item: &TextItem, text: &str) {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+    }
+    push_item_text(result, item, &escaped);
+}
+
 impl TextLine {
     pub fn text(&self) -> String {
-        self.text_with_formatting(false, false, false)
+        self.text_plain(false)
     }
 
     /// Get text with optional bold/italic/decorative markdown formatting.
@@ -735,7 +748,7 @@ impl TextLine {
         format_decorations: bool,
     ) -> String {
         if !format_bold && !format_italic && !format_decorations {
-            return self.text_plain();
+            return self.text_plain(true);
         }
 
         let single_char_threshold = self.adaptive_threshold;
@@ -865,12 +878,12 @@ impl TextLine {
                     result.push('<');
                     result.push_str(tag);
                     result.push('>');
-                    push_item_text(&mut result, item, text_trimmed);
+                    push_item_text_escaped(&mut result, item, text_trimmed);
                     result.push_str("</");
                     result.push_str(tag);
                     result.push('>');
                 }
-                None => push_item_text(&mut result, item, text_trimmed),
+                None => push_item_text_escaped(&mut result, item, text_trimmed),
             }
         }
 
@@ -898,7 +911,7 @@ impl TextLine {
     /// `<sup>…</sup>` / `<sub>…</sub>`: without the tags the marker digits
     /// would be indistinguishable from the body text they follow
     /// ("Yibo Yan1,2,3" vs "Yibo Yan<sup>1,2,3</sup>").
-    fn text_plain(&self) -> String {
+    fn text_plain(&self, escape_html: bool) -> String {
         let single_char_threshold = self.adaptive_threshold;
 
         let mut result = String::new();
@@ -916,7 +929,11 @@ impl TextLine {
             if i > 0 && stacked_fraction_slash(&self.items[i - 1], item) {
                 result.push('/');
             }
-            push_item_text(&mut result, item, item.text.as_str());
+            if escape_html {
+                push_item_text_escaped(&mut result, item, item.text.as_str());
+            } else {
+                push_item_text(&mut result, item, item.text.as_str());
+            }
         }
         result
     }
