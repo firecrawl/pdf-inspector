@@ -51,7 +51,8 @@ pub use models::{
 pub use oar::{OarOcrEngine, OarOcrError, ONNX_RUNTIME_LIBRARY_ENV};
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 pub use pipeline::{
-    process_pdf_with_ocr, process_pdf_with_ocr_mem, OcrPdfOptions, OcrPdfResult, OcrPipelineError,
+    plan_ocr_routes_mem, process_pdf_with_ocr, process_pdf_with_ocr_mem, OcrPdfOptions,
+    OcrPdfResult, OcrPipelineError, OcrRoutePlan,
 };
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use render::{
