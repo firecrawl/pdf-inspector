@@ -1,0 +1,19 @@
+src/extractor/fonts.rs
+  s_95e92f530fa61a::t_bf76cc81c5f983 2829-2833,2848,3293,3320-3324,3327,3333-3339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9884c2e9abaaceb5ab24889bfb8d80dc775f3547",
+  "prompts": {},
+  "sessions": {
+    "s_95e92f530fa61a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "830949b2-a19e-4ced-a006-7e1d540b2639",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
