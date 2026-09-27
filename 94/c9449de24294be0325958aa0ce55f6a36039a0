@@ -1,0 +1,19 @@
+src/extractor/fonts.rs
+  s_95e92f530fa61a::t_ef3c6a21ff5bb9 3192,3226,3289-3294,3322,3412-3416,3433-3451,3484,3567,3690,3762,4005,4050,4068,5040,5353,5403,5587,6276,6325
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "94c9449de24294be0325958aa0ce55f6a36039a0",
+  "prompts": {},
+  "sessions": {
+    "s_95e92f530fa61a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "830949b2-a19e-4ced-a006-7e1d540b2639",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
