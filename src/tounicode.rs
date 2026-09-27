@@ -2252,10 +2252,100 @@ fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
 }
 
 fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
+    let decoded = decode_binary_cmap(data)?;
+
+    let mut cmap = ToUnicodeCMap::new();
+    for record in decoded.records {
+        match record {
+            BcmapRecord::BfChar { code, dst } => {
+                if let Some(s) = bytes_to_unicode_string(&dst) {
+                    cmap.char_map.insert(code as u16, s);
+                }
+            }
+            BcmapRecord::BfRange { start, end, dst } => {
+                let start_code = start as u16;
+                let end_code = end as u16;
+                if let Some(s) = bytes_to_unicode_string(&dst) {
+                    if s.chars().count() == 1 {
+                        let base = s.chars().next().unwrap() as u32;
+                        cmap.ranges.push((start_code, end_code, base));
+                    } else {
+                        // Expand multi-char sequences
+                        let mut cid = start_code;
+                        for ch in s.chars() {
+                            cmap.char_map.insert(cid, ch.to_string());
+                            if cid == end_code {
+                                break;
+                            }
+                            cid = cid.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            // CID mappings and code space ranges say nothing about Unicode.
+            _ => {}
+        }
+    }
+
+    cmap.ranges.sort_unstable_by_key(|&(start, _, _)| start);
+    if let Some(name) = decoded.use_cmap {
+        if let Some(base) = load_builtin_cmap_by_name(&name) {
+            cmap = merge_cmaps(base, cmap);
+        } else {
+            warn!("bcmap usecmap={} could not be loaded", name);
+        }
+    }
+    cmap.refresh_gap_fills();
+    Ok(cmap)
+}
+
+/// One mapping from a pdf.js binary CMap, with every delta already applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BcmapRecord {
+    /// A `codespacerange` of codes `size` bytes long.
+    CodespaceRange { size: usize },
+    /// A `cidchar`: one code to one CID.
+    CidChar { size: usize, code: u32, cid: u32 },
+    /// A `cidrange`: `start..=end` to consecutive CIDs from `cid`.
+    CidRange {
+        size: usize,
+        start: u32,
+        end: u32,
+        cid: u32,
+    },
+    /// A `bfchar`: one two-byte code to the UTF-16BE bytes `dst`.
+    BfChar { code: u32, dst: Vec<u8> },
+    /// A `bfrange`: `start..=end` to `dst`, then `dst` with its last byte
+    /// incremented, and so on.
+    BfRange { start: u32, end: u32, dst: Vec<u8> },
+}
+
+struct DecodedBcmap {
+    records: Vec<BcmapRecord>,
+    use_cmap: Option<String>,
+}
+
+/// Decodes a pdf.js binary CMap (the `.bcmap` files in `external/bcmaps`).
+///
+/// A port of pdf.js's `BinaryCMapReader.process`, which defines the format.
+/// Each record holds a run of entries of one type. Only the first entry of a
+/// run is stored in full, as raw bytes; every later one is stored relative to
+/// the entry before it:
+///
+/// - a code (or range start) is the previous one plus one, plus a varint
+///   delta unless the record's sequence bit says the codes are consecutive;
+/// - a range end is its start plus a varint delta;
+/// - a `cidchar` CID is the previous CID plus one plus a signed varint;
+/// - a `bfchar` destination is the previous one plus one plus a signed
+///   varint delta, while a `bfrange` destination is always stored in full.
+///
+/// `bfchar` and `bfrange` codes are always two bytes, whatever the record's
+/// data size, which there gives the size of the destination instead.
+fn decode_binary_cmap(data: &[u8]) -> Result<DecodedBcmap, String> {
     let mut stream = BinaryCMapStream::new(data);
     let _header = stream.read_byte().ok_or("unexpected EOF in bcmap header")?;
 
-    let mut cmap = ToUnicodeCMap::new();
+    let mut records = Vec::new();
     let mut use_cmap: Option<String> = None;
 
     while let Some(b) = stream.read_byte() {
@@ -2266,8 +2356,7 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
                     stream.read_string()?;
                 }
                 1 => {
-                    let name = stream.read_string()?;
-                    use_cmap = Some(name);
+                    use_cmap = Some(stream.read_string()?);
                 }
                 _ => {}
             }
@@ -2278,77 +2367,146 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
         if data_size + 1 > 16 {
             return Err("invalid dataSize in bcmap".to_string());
         }
+        const UCS2_DATA_SIZE: usize = 1;
+        // As in pdf.js, a record's first entry is read whatever its count.
         let subitems = stream.read_number()? as usize;
+        let size = data_size + 1;
+
         match typ {
+            // codespacerange, and notdefrange (which also carries a CID)
+            0 | 1 => {
+                let mut start = stream.read_hex(data_size)?;
+                let mut end = stream.read_hex_number(data_size)?;
+                add_hex(&mut end, &start);
+                if typ == 1 {
+                    stream.read_number()?;
+                } else {
+                    records.push(BcmapRecord::CodespaceRange { size });
+                }
+                for _ in 1..subitems {
+                    inc_hex(&mut end);
+                    start = stream.read_hex_number(data_size)?;
+                    add_hex(&mut start, &end);
+                    end = stream.read_hex_number(data_size)?;
+                    add_hex(&mut end, &start);
+                    if typ == 1 {
+                        stream.read_number()?;
+                    } else {
+                        records.push(BcmapRecord::CodespaceRange { size });
+                    }
+                }
+            }
+            // cidchar
+            2 => {
+                let mut code = stream.read_hex(data_size)?;
+                let mut cid = stream.read_number()?;
+                records.push(BcmapRecord::CidChar {
+                    size,
+                    code: hex_to_u32(&code),
+                    cid,
+                });
+                for _ in 1..subitems {
+                    inc_hex(&mut code);
+                    if !sequence {
+                        let delta = stream.read_hex_number(data_size)?;
+                        add_hex(&mut code, &delta);
+                    }
+                    cid = (cid as i64 + 1 + stream.read_signed()? as i64) as u32;
+                    records.push(BcmapRecord::CidChar {
+                        size,
+                        code: hex_to_u32(&code),
+                        cid,
+                    });
+                }
+            }
+            // cidrange
+            3 => {
+                let mut start = stream.read_hex(data_size)?;
+                let mut end = stream.read_hex_number(data_size)?;
+                add_hex(&mut end, &start);
+                let cid = stream.read_number()?;
+                records.push(BcmapRecord::CidRange {
+                    size,
+                    start: hex_to_u32(&start),
+                    end: hex_to_u32(&end),
+                    cid,
+                });
+                for _ in 1..subitems {
+                    inc_hex(&mut end);
+                    if sequence {
+                        start.copy_from_slice(&end);
+                    } else {
+                        start = stream.read_hex_number(data_size)?;
+                        add_hex(&mut start, &end);
+                    }
+                    end = stream.read_hex_number(data_size)?;
+                    add_hex(&mut end, &start);
+                    let cid = stream.read_number()?;
+                    records.push(BcmapRecord::CidRange {
+                        size,
+                        start: hex_to_u32(&start),
+                        end: hex_to_u32(&end),
+                        cid,
+                    });
+                }
+            }
+            // bfchar
             4 => {
-                // bfchar
-                for i in 0..subitems {
-                    let src = stream.read_hex_number(1)?;
-                    let dst = stream.read_hex_bytes(data_size + 1)?;
-                    let src_code = hex_to_u32(&src) as u16;
-                    if let Some(s) = bytes_to_unicode_string(&dst) {
-                        cmap.char_map.insert(src_code, s);
+                let mut code = stream.read_hex(UCS2_DATA_SIZE)?;
+                let mut dst = stream.read_hex(data_size)?;
+                records.push(BcmapRecord::BfChar {
+                    code: hex_to_u32(&code),
+                    dst: dst.clone(),
+                });
+                for _ in 1..subitems {
+                    inc_hex(&mut code);
+                    if !sequence {
+                        let delta = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                        add_hex(&mut code, &delta);
                     }
-                    if i + 1 < subitems && sequence {
-                        // sequence handled by encoded data, nothing to do
-                    }
+                    inc_hex(&mut dst);
+                    let delta = stream.read_hex_signed(data_size)?;
+                    add_hex(&mut dst, &delta);
+                    records.push(BcmapRecord::BfChar {
+                        code: hex_to_u32(&code),
+                        dst: dst.clone(),
+                    });
                 }
             }
+            // bfrange
             5 => {
-                // bfrange
-                for _ in 0..subitems {
-                    let start = stream.read_hex_number(1)?;
-                    let end_delta = stream.read_hex_number(1)?;
-                    let mut end = start.clone();
-                    add_hex(&mut end, &end_delta);
-                    let dst = stream.read_hex_bytes(data_size + 1)?;
-                    let start_code = hex_to_u32(&start) as u16;
-                    let end_code = hex_to_u32(&end) as u16;
-                    if let Some(s) = bytes_to_unicode_string(&dst) {
-                        if s.chars().count() == 1 {
-                            let base = s.chars().next().unwrap() as u32;
-                            cmap.ranges.push((start_code, end_code, base));
-                        } else {
-                            // Expand multi-char sequences
-                            let mut cid = start_code;
-                            for ch in s.chars() {
-                                cmap.char_map.insert(cid, ch.to_string());
-                                if cid == end_code {
-                                    break;
-                                }
-                                cid = cid.saturating_add(1);
-                            }
-                        }
+                let mut start = stream.read_hex(UCS2_DATA_SIZE)?;
+                let mut end = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                add_hex(&mut end, &start);
+                let dst = stream.read_hex(data_size)?;
+                records.push(BcmapRecord::BfRange {
+                    start: hex_to_u32(&start),
+                    end: hex_to_u32(&end),
+                    dst,
+                });
+                for _ in 1..subitems {
+                    inc_hex(&mut end);
+                    if sequence {
+                        start.copy_from_slice(&end);
+                    } else {
+                        start = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                        add_hex(&mut start, &end);
                     }
+                    end = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                    add_hex(&mut end, &start);
+                    let dst = stream.read_hex(data_size)?;
+                    records.push(BcmapRecord::BfRange {
+                        start: hex_to_u32(&start),
+                        end: hex_to_u32(&end),
+                        dst,
+                    });
                 }
             }
-            _ => {
-                // Skip unsupported types by consuming their payload.
-                // We only implement bfchar/bfrange for UCS2 maps.
-                for _ in 0..subitems {
-                    // Best-effort skip: read a few fields based on type.
-                    if typ <= 3 {
-                        let _ = stream.read_hex_number(data_size)?;
-                        let _ = stream.read_hex_number(data_size)?;
-                        if typ >= 1 {
-                            let _ = stream.read_number()?;
-                        }
-                    }
-                }
-            }
+            _ => return Err(format!("unknown bcmap record type {typ}")),
         }
     }
 
-    cmap.ranges.sort_unstable_by_key(|&(start, _, _)| start);
-    if let Some(name) = use_cmap {
-        if let Some(base) = load_builtin_cmap_by_name(&name) {
-            cmap = merge_cmaps(base, cmap);
-        } else {
-            warn!("bcmap usecmap={} could not be loaded", name);
-        }
-    }
-    cmap.refresh_gap_fills();
-    Ok(cmap)
+    Ok(DecodedBcmap { records, use_cmap })
 }
 
 struct BinaryCMapStream<'a> {
@@ -2412,13 +2570,38 @@ impl<'a> BinaryCMapStream<'a> {
         Ok(out)
     }
 
-    fn read_hex_bytes(&mut self, len: usize) -> Result<Vec<u8>, String> {
+    /// `size + 1` raw bytes: the first entry of a run, stored in full.
+    fn read_hex(&mut self, size: usize) -> Result<Vec<u8>, String> {
+        let len = size + 1;
         if self.pos + len > self.data.len() {
             return Err("unexpected EOF in bcmap".to_string());
         }
         let out = self.data[self.pos..self.pos + len].to_vec();
         self.pos += len;
         Ok(out)
+    }
+
+    /// A varint whose lowest bit is the sign, as pdf.js's `readSigned`.
+    fn read_signed(&mut self) -> Result<i32, String> {
+        let n = self.read_number()?;
+        Ok(if n & 1 != 0 {
+            !((n >> 1) as i32)
+        } else {
+            (n >> 1) as i32
+        })
+    }
+
+    /// A `size + 1`-byte two's-complement delta, as pdf.js's `readHexSigned`:
+    /// a varint number whose lowest bit is the sign.
+    fn read_hex_signed(&mut self, size: usize) -> Result<Vec<u8>, String> {
+        let mut num = self.read_hex_number(size)?;
+        let sign: u16 = if num[size] & 1 != 0 { 0xff } else { 0 };
+        let mut c: u16 = 0;
+        for byte in num.iter_mut() {
+            c = ((c & 1) << 8) | *byte as u16;
+            *byte = ((c >> 1) ^ sign) as u8;
+        }
+        Ok(num)
     }
 
     fn read_string(&mut self) -> Result<String, String> {
@@ -2438,6 +2621,17 @@ fn hex_to_u32(bytes: &[u8]) -> u32 {
         n = (n << 8) | b as u32;
     }
     n
+}
+
+/// Adds one to a big-endian number, carrying, as pdf.js's `incHex`.
+fn inc_hex(a: &mut [u8]) {
+    for byte in a.iter_mut().rev() {
+        let (value, carry) = byte.overflowing_add(1);
+        *byte = value;
+        if !carry {
+            break;
+        }
+    }
 }
 
 fn add_hex(a: &mut [u8], b: &[u8]) {
@@ -2782,81 +2976,35 @@ fn assign_encoding_cid(
 }
 
 fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
-    let mut stream = BinaryCMapStream::new(data);
-    let _header = stream.read_byte().ok_or("unexpected EOF in bcmap header")?;
+    let decoded = decode_binary_cmap(data)?;
     let mut map: HashMap<u16, u16> = HashMap::new();
     let mut max_code_size: u8 = 1;
-    let mut use_cmap: Option<String> = None;
+    let use_cmap = decoded.use_cmap;
 
-    while let Some(b) = stream.read_byte() {
-        let typ = b >> 5;
-        if typ == 7 {
-            match b & 0x1f {
-                0 => {
-                    stream.read_string()?;
-                }
-                1 => {
-                    let name = stream.read_string()?;
-                    use_cmap = Some(name);
-                }
-                _ => {}
+    for record in decoded.records {
+        match record {
+            BcmapRecord::CodespaceRange { size } => {
+                max_code_size = max_code_size.max(size as u8);
             }
-            continue;
-        }
-        let _sequence = (b & 0x10) != 0;
-        let data_size = (b & 0x0f) as usize;
-        if data_size + 1 > 16 {
-            return Err("invalid dataSize in bcmap".to_string());
-        }
-        max_code_size = max_code_size.max((data_size + 1) as u8);
-        let subitems = stream.read_number()? as usize;
-        match typ {
-            2 => {
-                // cidchar
-                let mut prev_code: u32 = 0;
-                for i in 0..subitems {
-                    let code_bytes = stream.read_hex_number(data_size)?;
-                    let code = hex_to_u32(&code_bytes);
-                    let cid = stream.read_number()? as u16;
-                    if i == 0 {
-                        prev_code = code;
-                        map.insert(code as u16, cid);
-                        continue;
-                    }
-                    if _sequence {
-                        prev_code = prev_code.saturating_add(1);
-                        map.insert(prev_code as u16, cid);
-                    } else {
-                        map.insert(code as u16, cid);
-                        prev_code = code;
-                    }
+            BcmapRecord::CidChar { size, code, cid } => {
+                max_code_size = max_code_size.max(size as u8);
+                map.insert(code as u16, cid as u16);
+            }
+            BcmapRecord::CidRange {
+                size,
+                start,
+                end,
+                cid,
+            } => {
+                max_code_size = max_code_size.max(size as u8);
+                let mut cid = cid as u16;
+                for code in start as u16..=end as u16 {
+                    map.insert(code, cid);
+                    cid = cid.saturating_add(1);
                 }
             }
-            3 => {
-                // cidrange
-                for _ in 0..subitems {
-                    let start = stream.read_hex_number(data_size)?;
-                    let end_delta = stream.read_hex_number(data_size)?;
-                    let mut end = start.clone();
-                    add_hex(&mut end, &end_delta);
-                    let cid_start = stream.read_number()? as u16;
-                    let start_code = hex_to_u32(&start) as u16;
-                    let end_code = hex_to_u32(&end) as u16;
-                    let mut cid = cid_start;
-                    for code in start_code..=end_code {
-                        map.insert(code, cid);
-                        cid = cid.saturating_add(1);
-                    }
-                }
-            }
-            _ => {
-                // Skip other types
-                for _ in 0..subitems {
-                    let _ = stream.read_hex_number(data_size)?;
-                    let _ = stream.read_hex_number(data_size)?;
-                    let _ = stream.read_number()?;
-                }
-            }
+            // Unicode mappings say nothing about CIDs.
+            BcmapRecord::BfChar { .. } | BcmapRecord::BfRange { .. } => {}
         }
     }
 
@@ -3590,6 +3738,115 @@ fn build_fallback_cmap_for_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mappings a bcmap holds, counting each code of a range.
+    fn decoded_mapping_count(name: &str) -> usize {
+        let data = read_builtin_cmap_file(&format!("{name}.bcmap")).unwrap();
+        let decoded = decode_binary_cmap(&data).unwrap_or_else(|err| panic!("{name}: {err}"));
+        decoded
+            .records
+            .iter()
+            .map(|record| match record {
+                BcmapRecord::BfChar { .. } | BcmapRecord::CidChar { .. } => 1,
+                BcmapRecord::BfRange { start, end, .. }
+                | BcmapRecord::CidRange { start, end, .. } => (end - start + 1) as usize,
+                BcmapRecord::CodespaceRange { .. } => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn builtin_ucs2_cmaps_decode_whole() {
+        // The counts are what pdf.js's BinaryCMapReader reads from the same
+        // files: every run decodes past its first entry, and the stream ends
+        // where the file does.
+        for (name, mappings) in [
+            ("Adobe-Japan1-UCS2", 23058),
+            ("Adobe-GB1-UCS2", 30284),
+            ("Adobe-CNS1-UCS2", 19088),
+            ("Adobe-Korea1-UCS2", 18076),
+        ] {
+            assert_eq!(decoded_mapping_count(name), mappings, "{name}");
+        }
+    }
+
+    #[test]
+    fn japan1_collection_maps_cids_to_text() {
+        use lopdf::dictionary;
+
+        let cmap = build_cmap_from_cid_system_info(
+            &dictionary! {
+                "CIDSystemInfo" => dictionary! {
+                    "Registry" => Object::string_literal("Adobe"),
+                    "Ordering" => Object::string_literal("Japan1"),
+                    "Supplement" => 6,
+                },
+            },
+            &Document::new(),
+        )
+        .expect("Adobe-Japan1 has a predefined mapping");
+
+        // The reproduction in #573: A, B, C and HIRAGANA LETTER A.
+        for (cid, text) in [(34, "A"), (35, "B"), (36, "C"), (843, "あ")] {
+            assert_eq!(cmap.lookup(cid).as_deref(), Some(text), "CID {cid}");
+        }
+        // Entries far into the file, which only decode if every delta
+        // before them did.
+        for (cid, text) in [
+            (924, "ん"),
+            (1125, "亜"),
+            (4000, "輪"),
+            (7000, "錏"),
+            (20000, "驁"),
+        ] {
+            assert_eq!(cmap.lookup(cid).as_deref(), Some(text), "CID {cid}");
+        }
+    }
+
+    #[test]
+    fn korea1_bcmap_agrees_with_the_compiled_table() {
+        // Two independent sources for one collection: the table compiled
+        // into the crate and the bcmap shipped beside the others. They are
+        // built from different Adobe data and choose differently for a few
+        // dozen symbols (U+30FB or U+00B7 for a middle dot), but a Hangul
+        // syllable or a Han ideograph has one reading, and there they must
+        // agree, or the decoder is wrong.
+        let data = read_builtin_cmap_file("Adobe-Korea1-UCS2.bcmap").unwrap();
+        let bcmap = parse_binary_cmap(&data).unwrap();
+        let is_letter = |u: u16| matches!(u, 0xAC00..=0xD7A3 | 0x4E00..=0x9FFF | 0xF900..=0xFAFF);
+        let mut compared = 0;
+        for &(cid, unicode) in crate::adobe_korea1::ADOBE_KOREA1_CID_TO_UNICODE {
+            if !is_letter(unicode) {
+                continue;
+            }
+            let Some(from_bcmap) = bcmap.lookup(cid) else {
+                continue;
+            };
+            let expected = char::from_u32(unicode as u32).unwrap().to_string();
+            assert_eq!(from_bcmap, expected, "CID {cid}");
+            compared += 1;
+        }
+        assert!(compared > 15_000, "only {compared} CIDs compared");
+    }
+
+    #[test]
+    fn builtin_encoding_cmaps_decode_whole() {
+        // Shift-JIS: half-width A is CID 264, あ 843, 亜 1125.
+        let rksj = load_builtin_encoding_cmap("90ms-RKSJ-H").unwrap();
+        assert_eq!(rksj.map.get(&0x41), Some(&264));
+        assert_eq!(rksj.map.get(&0x82a0), Some(&843));
+        assert_eq!(rksj.map.get(&0x889f), Some(&1125));
+        assert_eq!(rksj.code_byte_length, 2);
+
+        for (name, mappings) in [
+            ("90ms-RKSJ-H", 7883),
+            ("UniJIS-UCS2-H", 9772),
+            ("GBK-EUC-H", 22118),
+            ("UniGB-UCS2-H", 28840),
+        ] {
+            assert_eq!(decoded_mapping_count(name), mappings, "{name}");
+        }
+    }
 
     #[test]
     fn builtin_cmaps_are_embedded_in_the_binary() {
