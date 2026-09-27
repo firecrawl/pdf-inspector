@@ -352,6 +352,22 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     // page margin.
     const EDGE_LINE_COUNT: usize = 5;
 
+    /// Rows whose baselines sit within the same tolerance `is_y_at_edge`
+    /// uses to match a line. Two-column text often places the columns a
+    /// fraction of a point apart; counting those as separate rows makes a
+    /// short page look tall enough for a full margin zone.
+    fn distinct_rows(ys: &[f32]) -> usize {
+        let mut count = 0usize;
+        let mut last = 0.0f32;
+        for &y in ys {
+            if count == 0 || y - last >= 0.1 {
+                count += 1;
+                last = y;
+            }
+        }
+        count
+    }
+
     /// Returns true if the given Y position is among the first or last N distinct
     /// Y positions on the specified page.
     fn is_y_at_edge(y: f32, page: u32, page_sorted_ys: &HashMap<u32, Vec<f32>>, n: usize) -> bool {
@@ -359,9 +375,12 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             Some(ys) => ys,
             None => return false,
         };
-        if ys.len() <= n * 2 {
-            // Page has very few lines — everything is near the edge
-            return true;
+        // A margin needs an interior. When the two N-row zones would meet,
+        // every line is "at the edge" and repeated body text (a large-print
+        // page that carries the previous page's sentences) is stripped.
+        let rows = distinct_rows(ys);
+        if rows <= n * 2 {
+            return false;
         }
         // Check if this Y is among the first or last N
         let pos = match ys.iter().position(|&py| (py - y).abs() < 0.1) {
@@ -1314,5 +1333,140 @@ mod tests {
             .find(|l| l.text().contains("VOICE OF SOUTH MARION"))
             .unwrap();
         assert_eq!(first_header.page, 1, "first occurrence should be on page 1");
+    }
+
+    #[test]
+    fn repeated_body_on_a_short_page_is_kept() {
+        // Eight distinct rows is inside the old "everything is an edge" zone
+        // (2 * N). The same sentences on three pages are body text that a
+        // large-print page repeats, not a running header.
+        let story = [
+            "left page story opens with a red book on the table",
+            "the next sentence keeps the same characters in the room",
+            "dialogue continues across the wide printed lines here",
+            "a fourth sentence still belongs to the page body text",
+            "fifth sentence of the repeated passage stays in place",
+            "sixth sentence should not vanish once neighbors arrive",
+            "seventh sentence of the short page is still the story",
+            "eighth sentence closes the passage without being a footer",
+        ];
+        let mut lines = Vec::new();
+        for page in [1u32, 2, 5] {
+            for (row, text) in story.iter().enumerate() {
+                lines.push(make_line(
+                    text,
+                    10.0,
+                    page,
+                    700.0 - row as f32 * 40.0,
+                    None,
+                ));
+            }
+        }
+        for page in [3u32, 4, 6] {
+            for row in 0..8u32 {
+                lines.push(make_line(
+                    &format!("different page {page} body sentence number {row} here"),
+                    10.0,
+                    page,
+                    700.0 - row as f32 * 40.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 6);
+        assert_eq!(
+            result.iter().filter(|l| l.page == 2).count(),
+            story.len(),
+            "short-page body that repeats on other pages must stay"
+        );
+    }
+
+    #[test]
+    fn offset_column_baselines_stay_one_sparse_page() {
+        // Six logical rows, each with a second column 0.05pt lower. Counting
+        // those baselines separately yields twelve rows and the fixed zone
+        // then covers the body.
+        let mut lines = Vec::new();
+        for page in [1u32, 2, 5] {
+            for row in 0..6u32 {
+                let y = 700.0 - row as f32 * 40.0;
+                lines.push(make_line(
+                    &format!("left column story sentence number {row} continues onward"),
+                    10.0,
+                    page,
+                    y,
+                    None,
+                ));
+                lines.push(make_line(
+                    &format!("right column story sentence number {row} continues onward"),
+                    10.0,
+                    page,
+                    y + 0.05,
+                    None,
+                ));
+            }
+        }
+        for page in [3u32, 4, 6] {
+            for row in 0..6u32 {
+                let y = 700.0 - row as f32 * 40.0;
+                lines.push(make_line(
+                    &format!("other page {page} left sentence number {row} unique"),
+                    10.0,
+                    page,
+                    y,
+                    None,
+                ));
+                lines.push(make_line(
+                    &format!("other page {page} right sentence number {row} unique"),
+                    10.0,
+                    page,
+                    y + 0.05,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 6);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.page == 2 && l.text().contains("column story"))
+                .count(),
+            12,
+            "a short two-column page must not lose repeated body rows"
+        );
+    }
+
+    #[test]
+    fn repeated_header_on_a_tall_page_still_strips() {
+        // Just past the sparse cutoff: eleven rows, so the top line is a
+        // real margin and a running header still drops after its first page.
+        let mut lines = Vec::new();
+        for page in 1..=6u32 {
+            lines.push(make_line(
+                "Quarterly Bulletin running header text",
+                10.0,
+                page,
+                760.0,
+                None,
+            ));
+            for row in 0..10u32 {
+                lines.push(make_line(
+                    &format!("unique body words page {page} row {row} lorem ipsum"),
+                    10.0,
+                    page,
+                    700.0 - row as f32 * 20.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 6);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("Quarterly Bulletin"))
+                .count(),
+            1,
+            "a header above a real interior must still strip"
+        );
     }
 }
