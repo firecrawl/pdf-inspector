@@ -1,0 +1,27 @@
+tests/integration_tests.rs
+  s_95e92f530fa61a::t_688a80130d0aea 10351,10353-10363,10365-10366,10368,10384,10395-10396,10398
+  s_95e92f530fa61a::t_52ffab4500e293 10074-10350,10352,10364,10367,10369-10383,10385,10387,10397,10399-10413,10415
+  s_95e92f530fa61a::t_8b118d27f7effe 10386,10388-10394,10414
+CHANGELOG.md
+  s_95e92f530fa61a::t_e037e793339ae5 10-28
+src/extractor/fonts.rs
+  s_95e92f530fa61a::t_88ef88a0572db3 108-110
+  s_95e92f530fa61a::t_1e341b459f7882 3016-3020,3028,3035-3050,3052-3080
+  s_95e92f530fa61a::t_12cefe81a1a647 3090-3100,3109,3130-3131,3134-3138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b4b40428e895b1eec4b29438f5f3e1035819bcc9",
+  "prompts": {},
+  "sessions": {
+    "s_95e92f530fa61a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "830949b2-a19e-4ced-a006-7e1d540b2639",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
