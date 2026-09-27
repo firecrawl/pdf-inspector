@@ -3030,8 +3030,11 @@ fn test_image_drawn_off_the_page_does_not_cover_it() {
     let detected = detect_pdf_type_mem(&buf).unwrap();
     assert_eq!(detected.pdf_type, PdfType::TextBased);
     assert!(detected.pages_needing_ocr.is_empty());
+    // The layer is render mode 3, so it is not shown even when the image
+    // misses the page. Detection still says the image is not a covering scan.
     let pages = extract_pages_markdown_mem(&buf, None).unwrap();
-    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.is_empty());
 
     let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
         image_dx: -100,
@@ -3375,8 +3378,9 @@ fn test_invisible_text_layer_is_the_first_reason_on_both_surfaces() {
         .any(|reason| reason == OCR_REASON_VECTOR_TEXT));
 }
 
-/// Invisible text with no image under it is not a scan: the page stays a
-/// text page and its layer is served, as before.
+/// Invisible text with no image under it is not a scan: detection keeps the
+/// page a text page. The layer is render mode 3, so extraction does not
+/// serve it, and the empty markdown recommends OCR.
 #[test]
 fn test_invisible_text_without_an_image_stays_text() {
     let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
@@ -3388,10 +3392,11 @@ fn test_invisible_text_without_an_image_stays_text() {
     assert!(detected.pages_needing_ocr.is_empty());
     let processed = process_pdf_mem(&buf).unwrap();
     assert_eq!(processed.pdf_type, PdfType::TextBased);
-    assert!(processed.pages_needing_ocr.is_empty());
+    assert_eq!(processed.pages_needing_ocr, vec![1]);
+    assert!(processed.markdown.as_deref().unwrap_or("").is_empty());
     let pages = extract_pages_markdown_mem(&buf, None).unwrap();
-    assert!(!pages.pages[0].needs_ocr);
-    assert!(!pages.pages[0].markdown.is_empty());
+    assert!(pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.is_empty());
 }
 
 /// A visible caption over the covering image means the page shows text of
@@ -3399,7 +3404,7 @@ fn test_invisible_text_without_an_image_stays_text() {
 #[test]
 fn test_visible_caption_over_covering_image_stays_text() {
     let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
-        caption: Some("Figure 1. A photograph"),
+        caption: Some("Figure 1. A photograph of the courtyard taken from the north gate."),
         ..SCAN_WITH_INVISIBLE_LAYER
     }]);
     let detected = detect_pdf_type_mem(&buf).unwrap();
@@ -7236,7 +7241,7 @@ fn clipping_preserves_prose_and_text_operator_fragments_within_one_clip() {
 #[test]
 fn clip_sidecar_stays_aligned_across_skipped_text_and_graphics_restore() {
     let content = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
-        + "BT /F1 12 Tf 3 Tr (Hidden) Tj () TJ ET\n"
+        + "BT /F1 12 Tf 3 Tr (Hidden) Tj () TJ ET 0 Tr\n"
         + &clipped_field("84 98 25 15 re W n", 84.0, "Beta");
     let items = clipped_run_items(&content);
     assert_eq!(
@@ -9886,10 +9891,10 @@ fn an_odd_length_string_no_cmap_reads_counts_its_bytes_once() {
 // Text paint and document information
 // =========================================================================
 
-/// One page showing a run in the default black, a red run, a run shown
-/// under a `3 Tr` set before its text object, a run hidden by `3 Tr` inside
-/// its own text object, a line shown with `"`, a Form XObject's text under
-/// the page's blue fill and a run after the form. The information dictionary
+/// One page showing a run in the default black, a red run, a run hidden by
+/// a `3 Tr` set before its text object, a run hidden by `3 Tr` inside its
+/// own text object, a line shown with `"`, a Form XObject's text under the
+/// page's blue fill and a run after the form. The information dictionary
 /// holds every text entry, in PDFDocEncoding and UTF-16BE.
 fn synthetic_paint_and_info_pdf() -> Vec<u8> {
     use lopdf::{dictionary, Document, Object, Stream, StringFormat};
@@ -9985,10 +9990,11 @@ fn text_items_report_their_fill_colour_and_render_mode() {
     // The default paint, and a fill colour set before the text object.
     assert_eq!(paint("Body text"), (black, black, Some(0)));
     assert_eq!(paint("Red text"), (Some([204, 26, 26]), black, Some(0)));
-    // A run shown under a `3 Tr` set before its text object is extracted as
-    // it always was, and says it paints nothing; a run hidden inside its own
-    // text object is still left out of the positioned text.
-    assert_eq!(paint("Invisible text"), (black, black, Some(3)));
+    // `3 Tr` is graphics state, so it hides the following text object as
+    // well as a run that sets the mode inside its own text object.
+    assert!(!items
+        .iter()
+        .any(|item| item.text.contains("Invisible text")));
     assert!(!items.iter().any(|item| item.text.contains("Layer text")));
     // `"` moves to the next line (the leading below the `Td`) and shows its
     // string, painted like any other run.
@@ -10012,7 +10018,6 @@ fn markdown_keeps_invisible_and_quoted_text_as_the_extraction_reads_it() {
     for text in [
         "Body text",
         "Red text",
-        "Invisible text",
         "Quoted line",
         "Form text",
         "After form",
@@ -10022,7 +10027,94 @@ fn markdown_keeps_invisible_and_quoted_text_as_the_extraction_reads_it() {
             "{text:?} missing from {markdown:?}"
         );
     }
+    assert!(!markdown.contains("Invisible text"), "{markdown:?}");
     assert!(!markdown.contains("Layer text"), "{markdown:?}");
+}
+
+fn helvetica_page(content: &[u8]) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.7");
+    let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "FirstChar" => 0,
+        "LastChar" => 255,
+        "Widths" => Object::Array(widths),
+    });
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn positioned_text(content: &str) -> Vec<String> {
+    extract_text_with_positions_mem(&helvetica_page(content.as_bytes()))
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect()
+}
+
+/// `Tr` is graphics state. A mode set inside one text object still hides the
+/// next, a mode set before any text object hides every object that follows,
+/// and `Q` restores the mode that was in force at `q`.
+#[test]
+fn text_rendering_mode_persists_across_text_objects() {
+    let carried = positioned_text(
+        "BT /F1 12 Tf 72 700 Td 3 Tr (alpha) Tj ET\n\
+         BT /F1 12 Tf 72 680 Td (beta) Tj ET\n",
+    );
+    assert!(
+        carried.is_empty(),
+        "mode set inside the first text object must hide the next: {carried:?}"
+    );
+
+    let outside = positioned_text(
+        "3 Tr\n\
+         BT /F1 12 Tf 72 700 Td (alpha) Tj ET\n\
+         BT /F1 12 Tf 72 680 Td (beta) Tj ET\n",
+    );
+    assert!(
+        outside.is_empty(),
+        "mode set outside a text object must hide the page: {outside:?}"
+    );
+
+    let restored = positioned_text(
+        "q 3 Tr BT /F1 12 Tf 72 700 Td (hidden) Tj ET Q\n\
+         BT /F1 12 Tf 72 680 Td (shown) Tj ET\n",
+    );
+    assert_eq!(restored, vec!["shown".to_string()], "{restored:?}");
+
+    let reset = positioned_text(
+        "BT /F1 12 Tf 3 Tr 72 700 Td (hidden) Tj ET\n\
+         0 Tr BT /F1 12 Tf 72 680 Td (shown) Tj ET\n",
+    );
+    assert_eq!(reset, vec!["shown".to_string()], "{reset:?}");
 }
 
 #[test]

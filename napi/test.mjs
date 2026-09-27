@@ -662,7 +662,7 @@ console.log('  font metadata: OK');
 // --- text paint: fillColor, strokeColor and renderMode; document information ---
 console.log('Testing text paint and document information...');
 
-// One page with a red run, a stroked blue run, a run shown under a `3 Tr` set
+// One page with a red run, a stroked blue run, a run hidden by a `3 Tr` set
 // before its text object, a line shown with `"`, a Form XObject's text under
 // the page's green fill, an image, a link annotation, a filled-in form field
 // and a few body lines; the information dictionary holds every text entry,
@@ -714,8 +714,8 @@ const paintOf = text => {
 };
 assert.deepEqual(paintOf('Red run'), [[255, 0, 0], [0, 0, 0], 0]);
 assert.deepEqual(paintOf('Outlined run'), [[255, 0, 0], [0, 0, 255], 1]);
-// Extracted as it always was, and reported as painting nothing.
-assert.deepEqual(paintOf('Invisible run'), [[0, 0, 0], [0, 0, 255], 3]);
+// `3 Tr` before the text object hides the run, the same as a viewer.
+assert.ok(!paintItems.some(i => i.text === 'Invisible run'), JSON.stringify(paintItems.map(i => i.text)));
 assert.deepEqual(paintOf('Quoted run'), [[0, 0, 0], [0, 0, 255], 0]);
 assert.deepEqual(paintOf('Form run'), [[0, 255, 0], [0, 0, 255], 0]);
 // Image, link and form-field items carry none of the three.

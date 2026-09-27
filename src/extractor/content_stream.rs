@@ -808,13 +808,13 @@ pub(crate) fn extract_page_text_items_with_options(
                 }
             }
             "BT" => {
-                // Begin text block
+                // Begin text object. Text rendering mode is graphics state
+                // (ISO 32000-1 §9.3.6): a `Tr` set in one text object, or
+                // before any text object, still applies to the next. The
+                // form walker already leaves it alone here.
                 in_text_block = true;
                 text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
                 line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-                // Keep the existing invisible-layer extraction policy. The
-                // separate paint state retains Tr for weight inference.
-                text_rendering_mode = 0;
             }
             "ET" => {
                 // End text block. A wide-spaced boundary string is continued
@@ -3425,17 +3425,18 @@ mod tests {
     }
 
     #[test]
-    fn painted_bold_preserves_invisible_layer_extraction_policy() {
+    fn invisible_render_mode_persists_until_it_is_reset() {
         let items = extract_simple_items(
             b"0.3 w 3 Tr BT /F1 12 Tf 72 700 Td (First) Tj ET
               BT /F1 12 Tf 72 680 Td 3 Tr (Hidden) Tj ET
-              BT /F1 12 Tf 72 660 Td (Layer body) Tj ET",
+              BT /F1 12 Tf 72 660 Td (Layer body) Tj ET
+              0 Tr BT /F1 12 Tf 72 640 Td (Shown) Tj ET",
         );
         assert_eq!(
             items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
-            ["First", "Layer body"]
+            ["Shown"]
         );
-        assert!(items.iter().all(|i| !i.is_bold));
+        assert!(!items[0].is_bold);
     }
 
     #[test]
@@ -3706,13 +3707,12 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
     }
 
     #[test]
-    fn invisible_runs_report_their_mode_and_are_extracted_as_before() {
+    fn invisible_render_mode_carries_into_the_next_text_object() {
         use crate::tounicode::FontCMaps;
 
-        // "Hidden" is shown under `3 Tr` inside its own text object and is
-        // left out unless the invisible layer is asked for. "Carried" is
-        // shown in the next text object, where the extractor has always
-        // kept it; the mode still in force is 3 and it reports so.
+        // "Hidden" sets mode 3 inside its text object. "Carried" is the next
+        // text object and stays hidden until `0 Tr`. Asking for the invisible
+        // layer returns both, still reporting mode 3.
         let content = b"BT /F1 12 Tf 72 700 Td (Shown) Tj 0 -20 Td 3 Tr (Hidden) Tj ET
               BT /F1 12 Tf 72 660 Td (Carried) Tj ET
               0 Tr BT /F1 12 Tf 72 640 Td (Again) Tj ET";
@@ -3741,10 +3741,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
                 .map(|&(text, mode)| (text.to_string(), Some(mode)))
                 .collect()
         };
-        assert_eq!(
-            extract(false),
-            (owned(&[("Shown", 0), ("Carried", 3), ("Again", 0)]), true)
-        );
+        assert_eq!(extract(false), (owned(&[("Shown", 0), ("Again", 0)]), true));
         assert_eq!(
             extract(true),
             (
