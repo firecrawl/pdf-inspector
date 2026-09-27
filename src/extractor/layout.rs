@@ -3048,13 +3048,15 @@ fn group_single_column(
                         .map(|i| i.text.trim())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let line_wordy = line_text.split_whitespace().count() >= 2
+                    let line_words = line_text.split_whitespace().count();
+                    let line_wordy = line_words >= 2
                         && line_text.chars().filter(|c| c.is_alphabetic()).count() >= 8;
                     // Lowercase starts are mid-sentence continuations and
-                    // split on prose signals alone. Uppercase starts also
-                    // need a bold-style mismatch between the runs — a bold
-                    // heading beside regular body text — otherwise same-style
-                    // label rows (feature tiles, legends) would shatter.
+                    // split on prose signals alone. A bold heading beside
+                    // regular body text splits too. Same-style uppercase
+                    // splits only when both runs are full clauses (six or
+                    // more words): a feature-tile row is a few words and
+                    // stays on one line.
                     let starts_lower = item
                         .text
                         .trim()
@@ -3064,7 +3066,19 @@ fn group_single_column(
                     // The whole line must be bold (a heading), not merely
                     // its last run — mixed bold-label/value rows stay joined.
                     let style_mismatch = last_line.items.iter().all(|i| i.is_bold) && !item.is_bold;
-                    if line_wordy && incoming_wordy && (starts_lower || style_mismatch) {
+                    let both_clauses = line_words >= 6 && item.text.split_whitespace().count() >= 6;
+                    if line_wordy
+                        && incoming_wordy
+                        && (starts_lower || style_mismatch || both_clauses)
+                    {
+                        return false;
+                    }
+                    // Wrapped leftovers ("checksum." / "order.") and a
+                    // right-aligned tag beside a title sit a column-width
+                    // void apart. Table header cells on this scale are
+                    // closer than 8em and 100pt, and digit page numbers
+                    // never reach this branch.
+                    if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0) {
                         return false;
                     }
                 }
@@ -3559,6 +3573,96 @@ mod tests {
         ];
         let lines = group_single_column(items, 0.10, false);
         assert_eq!(lines.len(), 1, "numbered table cells stay on one line");
+    }
+
+    #[test]
+    fn same_baseline_same_style_clauses_split() {
+        // Two column sentences, same face, gutter too narrow for column
+        // detection (en-22-mixed-layout.pdf: 42pt run ending near 282, next
+        // run at 318). Both clauses are long, so this is not a label row.
+        let mut left = make_item(
+            1,
+            42.0,
+            584.0,
+            "Left column: record source type, page count, and",
+        );
+        left.font_size = 10.0;
+        left.width = 240.0;
+        let mut right = make_item(
+            1,
+            318.0,
+            584.0,
+            "Right column: inspect tables, images, links, and reading",
+        );
+        right.font_size = 10.0;
+        right.width = 250.0;
+        let lines = group_single_column(vec![left, right], 0.10, false);
+        assert_eq!(lines.len(), 2, "same-style column clauses must not fuse");
+    }
+
+    #[test]
+    fn column_sized_void_splits_short_leftovers() {
+        // The wrapped second line of each column is one word, ~230pt apart.
+        let mut left = make_item(1, 42.0, 569.0, "checksum.");
+        left.font_size = 10.0;
+        left.width = 50.0;
+        let mut right = make_item(1, 318.0, 569.0, "order.");
+        right.font_size = 10.0;
+        right.width = 40.0;
+        let lines = group_single_column(vec![left, right], 0.10, false);
+        assert_eq!(lines.len(), 2, "a column-width void is not a word space");
+    }
+
+    #[test]
+    fn right_aligned_tag_does_not_join_a_title() {
+        // "Mixed layout report" at x=42 and "EN-22" at x=544, baselines 1pt apart.
+        let mut title = make_item(1, 42.0, 755.0, "Mixed layout report");
+        title.font_size = 16.0;
+        title.width = 160.0;
+        title.is_bold = true;
+        let mut tag = make_item(1, 544.0, 756.0, "EN-22");
+        tag.font_size = 9.0;
+        tag.width = 36.0;
+        let lines = group_single_column(vec![title, tag], 0.10, false);
+        assert_eq!(lines.len(), 2, "a far tag must not extend the title");
+    }
+
+    #[test]
+    fn same_baseline_table_headers_stay_joined() {
+        // Header cells ~70pt apart stay one row. Digit page numbers on a
+        // title line stay joined too: they never enter the alphabetic branch.
+        let mut cells = Vec::new();
+        for (x, text) in [(47.0, "Status"), (147.0, "Metric"), (247.0, "Value")] {
+            let mut item = make_item(1, x, 459.0, text);
+            item.font_size = 8.5;
+            item.width = text.len() as f32 * 4.5;
+            item.is_bold = true;
+            cells.push(item);
+        }
+        assert_eq!(group_single_column(cells, 0.10, false).len(), 1);
+
+        let mut title = make_item(1, 72.0, 700.0, "Introduction");
+        title.width = 90.0;
+        let mut page_no = make_item(1, 500.0, 700.0, "12");
+        page_no.width = 16.0;
+        assert_eq!(
+            group_single_column(vec![title, page_no], 0.10, false).len(),
+            1,
+            "a TOC page number stays on the entry line"
+        );
+    }
+
+    #[test]
+    fn same_style_label_row_stays_joined() {
+        let mut left = make_item(1, 40.0, 500.0, "Fast setup");
+        left.width = 70.0;
+        let mut right = make_item(1, 160.0, 500.0, "Live preview");
+        right.width = 80.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            1,
+            "a short same-style label row stays one line"
+        );
     }
 
     #[test]
