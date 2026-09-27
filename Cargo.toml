@@ -41,6 +41,9 @@ log = "0.4"
 
 # Text processing
 regex = "1.10"
+# Owner-password recovery (PDF standard security, revisions 2–4) until
+# lopdf publishes the fix from J-F-Liu/lopdf#573.
+md-5 = "0.11"
 once_cell = "1.19"
 # Built-in CMaps. Embedded on every target: a cargo-installed binary's
 # CARGO_MANIFEST_DIR is the registry checkout, which is not a stable

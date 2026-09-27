@@ -41,6 +41,7 @@ pub mod glyph_names;
 mod mac_glyph_order;
 pub mod markdown;
 mod overlong_numerals;
+mod owner_password;
 pub mod process_mode;
 pub mod structure_tree;
 pub mod tables;
@@ -4405,11 +4406,19 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
 /// non-empty password was supplied but rejected.
 fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
     let pw = password.unwrap_or("");
+    // lopdf 0.45.0 accepts an owner password, then derives the file key from
+    // that literal password. Algorithm 2 needs the user password, which
+    // Algorithm 7 recovers from `/O` when the two differ. The release that
+    // fixes this inside lopdf is not on crates.io yet (J-F-Liu/lopdf#573,
+    // merged after 0.45.0), so resolve it here before handing the password
+    // back to lopdf. A user password is left unchanged.
+    let resolved =
+        owner_password::user_password_for_file_key(buf, pw).unwrap_or_else(|| pw.to_string());
     let with_password = |pw: &str| lopdf::LoadOptions {
         password: Some(pw.to_string()),
         ..bounded_load_options()
     };
-    match Document::load_mem_with_options(buf, with_password(pw)) {
+    match Document::load_mem_with_options(buf, with_password(&resolved)) {
         Ok(doc) => Ok(doc),
         Err(inner) if !pw.is_empty() => {
             Document::load_mem_with_options(buf, with_password("")).map_err(|_| inner)

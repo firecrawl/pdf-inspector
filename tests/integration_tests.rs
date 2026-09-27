@@ -6629,6 +6629,94 @@ fn encrypted_pdf_decrypts_with_correct_password() {
     );
 }
 
+/// Regression for #524. lopdf 0.45.0 authenticates a distinct owner password
+/// and then derives the file key from that password, so the text comes out
+/// empty and the file is classified as scanned. The user password Algorithm 7
+/// recovers from `/O` is what has to be decrypted with.
+#[test]
+fn owner_password_decrypts_when_it_differs_from_the_user_password() {
+    let pdf = pdf_encrypted_with_distinct_passwords("OwnerSecret", "usersecret");
+
+    let as_owner = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("OwnerSecret"))
+        .expect("owner password should open the file");
+    let md = as_owner.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Password Protected Content"),
+        "owner password yielded type={:?} ocr={:?} md={md:?}",
+        as_owner.pdf_type,
+        as_owner.pages_needing_ocr
+    );
+    assert_ne!(as_owner.pdf_type, PdfType::Scanned);
+
+    let as_user = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("usersecret"))
+        .expect("user password should open the file");
+    assert!(as_user
+        .markdown
+        .unwrap_or_default()
+        .contains("Password Protected Content"));
+
+    let wrong = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("nope"));
+    assert!(
+        matches!(wrong, Err(PdfError::Encrypted)),
+        "wrong password should stay encrypted, got {wrong:?}"
+    );
+}
+
+fn pdf_encrypted_with_distinct_passwords(owner_password: &str, user_password: &str) -> Vec<u8> {
+    use lopdf::{
+        dictionary, Document, EncryptionState, EncryptionVersion, Object, Permissions, Stream,
+    };
+
+    let mut doc = Document::with_version("1.4");
+    let id = Object::String(b"0123456789abcdef".to_vec(), lopdf::StringFormat::Literal);
+    doc.trailer.set("ID", vec![id.clone(), id]);
+
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let content = b"BT /F1 24 Tf 72 720 Td (Password Protected Content) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+    let page_id = doc.new_object_id();
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![Object::Reference(page_id)],
+        "Count" => 1,
+    });
+    doc.objects.insert(
+        page_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content_id),
+            "Resources" => Object::Reference(resources_id),
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+
+    let state = EncryptionState::try_from(EncryptionVersion::V2 {
+        document: &doc,
+        owner_password,
+        user_password,
+        key_length: 128,
+        permissions: Permissions::all(),
+    })
+    .expect("encryption state");
+    doc.encrypt(&state).expect("encrypt");
+    let mut out = Vec::new();
+    doc.save_to(&mut out).expect("save");
+    out
+}
+
 /// Regression for the #231 review finding: `extract_pages_markdown`'s
 /// `has_template_image` check must be gated the same way
 /// `classify_pdf`/`detect_pdf_type` gates it (image_count <= 1, few text
