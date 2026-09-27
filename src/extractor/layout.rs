@@ -3006,24 +3006,21 @@ fn is_roman_folio(text: &str) -> bool {
     index == bytes.len() && index > 0
 }
 
-/// Gap past which a right-hand roman token is a contents folio rather
-/// than the next column. The mixed-layout sample's column gutter is
-/// about 226pt; a preface line's folio sits further across the page.
-const FOLIO_LEADER_GAP: f32 = 300.0;
+/// A wrapped column leftover ends the sentence (`checksum.`). A contents
+/// entry (`Preface`) does not, so a folio beside it stays on the line
+/// even when the gap is only a little over 100pt.
+fn is_wrapped_fragment(text: &str) -> bool {
+    text.trim().ends_with(['.', '?', '!'])
+}
 
-/// The roman token is the right-hand page number of an entry across a
-/// leader gap. A column-sized void, even beside `iii`, is not a folio.
-fn roman_folio_beside_entry(
-    entry: &TextItem,
-    entry_text: &str,
-    folio: &TextItem,
-    gap: f32,
-) -> bool {
-    gap >= FOLIO_LEADER_GAP
-        && folio.x > entry.x
+/// The roman token is the right-hand page number of an entry. A sentence
+/// fragment beside `iii` is the next column, not a folio.
+fn roman_folio_beside_entry(entry: &TextItem, entry_text: &str, folio: &TextItem) -> bool {
+    folio.x > entry.x
         && is_roman_folio(&folio.text)
         && !is_roman_folio(entry_text)
         && entry_text.chars().any(|c| c.is_alphabetic())
+        && !is_wrapped_fragment(entry_text)
 }
 
 /// Group items from a single column into lines
@@ -3154,12 +3151,11 @@ fn group_single_column(
                     // right-aligned tag beside a title sit a column-width
                     // void apart. Table header cells on this scale are
                     // closer than 8em and 100pt. Digit page numbers never
-                    // reach this branch. A front-matter folio stays only
-                    // across a leader gap, so a column leftover beside
-                    // `iii` still splits.
-                    let folio_on_entry =
-                        roman_folio_beside_entry(last_item, &line_text, &item, gap)
-                            || roman_folio_beside_entry(&item, item.text.trim(), last_item, gap);
+                    // reach this branch. A front-matter folio stays on an
+                    // entry that is not a wrapped sentence. `checksum.`
+                    // beside `iii` still splits.
+                    let folio_on_entry = roman_folio_beside_entry(last_item, &line_text, &item)
+                        || roman_folio_beside_entry(&item, item.text.trim(), last_item);
                     if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0)
                         && !folio_on_entry
                     {
@@ -3757,8 +3753,8 @@ mod tests {
 
     #[test]
     fn roman_numeral_across_a_column_gutter_still_splits() {
-        // Same geometry as the wrapped column leftovers. `iii` is a
-        // numeral, but the void is a column gutter, not a contents leader.
+        // Same geometry as the wrapped column leftovers. The period marks
+        // a sentence fragment, so `iii` does not stay attached.
         let mut left = make_item(1, 42.0, 569.0, "checksum.");
         left.font_size = 10.0;
         left.width = 50.0;
@@ -3768,7 +3764,22 @@ mod tests {
         assert_eq!(
             group_single_column(vec![left, right], 0.10, false).len(),
             2,
-            "a column gutter beside a roman token is not a folio"
+            "a wrapped fragment beside a roman token is not a folio"
+        );
+    }
+
+    #[test]
+    fn closer_front_matter_folio_stays_on_the_entry() {
+        // Gap is about 118pt: over the 100pt void split, under the old
+        // 300pt leader floor. A contents entry still keeps its folio.
+        let mut title = make_item(1, 72.0, 700.0, "Preface");
+        title.width = 60.0;
+        let mut folio = make_item(1, 250.0, 700.0, "xiv");
+        folio.width = 18.0;
+        assert_eq!(
+            group_single_column(vec![title, folio], 0.10, false).len(),
+            1,
+            "a folio within 300pt stays on the entry"
         );
     }
 
