@@ -1,0 +1,29 @@
+CHANGELOG.md
+  s_95e92f530fa61a::t_ebe6d9455a96dc 45-49
+src/extractor/scripts.rs
+  s_3438976bd8bdb5::t_58eeb578721b72 282-298,710-735
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "975dd68a96eed9ee9db362df73fe49222364bc48",
+  "prompts": {},
+  "sessions": {
+    "s_3438976bd8bdb5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e4d18637-e467-4aca-864e-db110518d0f4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    },
+    "s_95e92f530fa61a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "830949b2-a19e-4ced-a006-7e1d540b2639",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
