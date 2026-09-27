@@ -2954,6 +2954,72 @@ fn should_use_y_sorting(items: &[TextItem]) -> bool {
     chaos_ratio > 0.4
 }
 
+/// Horizontal space between two runs. Negative when they overlap.
+/// Which run comes first does not matter, so a right-to-left stream still
+/// sees the gutter.
+fn horizontal_gap(a: &TextItem, b: &TextItem) -> f32 {
+    let a_right = a.x + a.width;
+    let b_right = b.x + b.width;
+    if a.x <= b.x {
+        b.x - a_right
+    } else {
+        a.x - b_right
+    }
+}
+
+/// A table-of-contents folio written as a roman numeral (`iii`, `xiv.`).
+fn is_roman_folio(text: &str) -> bool {
+    let trimmed = text.trim().trim_end_matches(['.', ')']).trim();
+    if trimmed.is_empty() || !trimmed.is_ascii() || trimmed.len() > 8 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut index = 0;
+    let mut thousands = 0;
+    while index < bytes.len() && bytes[index] == b'm' && thousands < 4 {
+        index += 1;
+        thousands += 1;
+    }
+    if index + 1 < bytes.len() && matches!(&bytes[index..index + 2], b"cm" | b"cd") {
+        index += 2;
+    } else {
+        if index < bytes.len() && bytes[index] == b'd' {
+            index += 1;
+        }
+        let mut hundreds = 0;
+        while index < bytes.len() && bytes[index] == b'c' && hundreds < 3 {
+            index += 1;
+            hundreds += 1;
+        }
+    }
+    if index + 1 < bytes.len() && matches!(&bytes[index..index + 2], b"xc" | b"xl") {
+        index += 2;
+    } else {
+        if index < bytes.len() && bytes[index] == b'l' {
+            index += 1;
+        }
+        let mut tens = 0;
+        while index < bytes.len() && bytes[index] == b'x' && tens < 3 {
+            index += 1;
+            tens += 1;
+        }
+    }
+    if index + 1 < bytes.len() && matches!(&bytes[index..index + 2], b"ix" | b"iv") {
+        index += 2;
+    } else {
+        if index < bytes.len() && bytes[index] == b'v' {
+            index += 1;
+        }
+        let mut ones = 0;
+        while index < bytes.len() && bytes[index] == b'i' && ones < 3 {
+            index += 1;
+            ones += 1;
+        }
+    }
+    index == bytes.len()
+}
+
 /// Group items from a single column into lines
 /// Uses heuristics to decide between PDF stream order and Y-position sorting.
 /// `page_rtl` is the direction of the page the column belongs to, which
@@ -3026,7 +3092,7 @@ fn group_single_column(
             // numbers, dot leaders, and outline-numbered table cells (which
             // start with digits) stay joined.
             if let Some(last_item) = last_line.items.last() {
-                let gap = item.x - (last_item.x + last_item.width);
+                let gap = horizontal_gap(last_item, &item);
                 if gap > (item.font_size.max(last_item.font_size) * 3.0).max(30.0)
                     && item
                         .text
@@ -3067,18 +3133,26 @@ fn group_single_column(
                     // its last run — mixed bold-label/value rows stay joined.
                     let style_mismatch = last_line.items.iter().all(|i| i.is_bold) && !item.is_bold;
                     let both_clauses = line_words >= 6 && item.text.split_whitespace().count() >= 6;
+                    // A same-style clause split needs a real gutter. The
+                    // sample column gap is ~59pt at 10pt; a ~30pt hole in
+                    // one justified line stays together.
+                    let clause_gutter =
+                        gap > (item.font_size.max(last_item.font_size) * 5.0).max(50.0);
                     if line_wordy
                         && incoming_wordy
-                        && (starts_lower || style_mismatch || both_clauses)
+                        && (starts_lower || style_mismatch || (both_clauses && clause_gutter))
                     {
                         return false;
                     }
                     // Wrapped leftovers ("checksum." / "order.") and a
                     // right-aligned tag beside a title sit a column-width
                     // void apart. Table header cells on this scale are
-                    // closer than 8em and 100pt, and digit page numbers
-                    // never reach this branch.
-                    if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0) {
+                    // closer than 8em and 100pt. Digit page numbers never
+                    // reach this branch; a roman folio (`iii`) must not
+                    // split off its entry either.
+                    if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0)
+                        && !is_roman_folio(&item.text)
+                    {
                         return false;
                     }
                 }
@@ -3587,7 +3661,9 @@ mod tests {
             "Left column: record source type, page count, and",
         );
         left.font_size = 10.0;
-        left.width = 240.0;
+        // Helvetica at 10pt: the left run ends near x=259, so the gutter
+        // to x=318 is ~59pt.
+        left.width = 217.0;
         let mut right = make_item(
             1,
             318.0,
@@ -3598,6 +3674,74 @@ mod tests {
         right.width = 250.0;
         let lines = group_single_column(vec![left, right], 0.10, false);
         assert_eq!(lines.len(), 2, "same-style column clauses must not fuse");
+    }
+
+    #[test]
+    fn same_style_clauses_with_a_small_hole_stay_one_line() {
+        // Two long runs separated by ~36pt are one justified line, not columns.
+        let mut left = make_item(
+            1,
+            42.0,
+            584.0,
+            "Left column: record source type, page count, and",
+        );
+        left.font_size = 10.0;
+        left.width = 240.0;
+        let mut right = make_item(
+            1,
+            318.0,
+            584.0,
+            "Right column: inspect tables, images, links, and reading",
+        );
+        right.font_size = 10.0;
+        right.width = 250.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            1,
+            "a sub-50pt hole in one line stays joined"
+        );
+    }
+
+    #[test]
+    fn right_to_left_stream_still_splits_the_column_gutter() {
+        let mut right = make_item(
+            1,
+            318.0,
+            584.0,
+            "Right column: inspect tables, images, links, and reading",
+        );
+        right.font_size = 10.0;
+        right.width = 250.0;
+        let mut left = make_item(
+            1,
+            42.0,
+            584.0,
+            "Left column: record source type, page count, and",
+        );
+        left.font_size = 10.0;
+        left.width = 217.0;
+        let lines = group_single_column(vec![right, left], 0.10, true);
+        assert_eq!(
+            lines.len(),
+            2,
+            "the gutter is the same when the right run arrives first"
+        );
+    }
+
+    #[test]
+    fn roman_folio_stays_on_the_entry_line() {
+        let mut title = make_item(1, 72.0, 700.0, "Preface");
+        title.width = 60.0;
+        let mut folio = make_item(1, 500.0, 700.0, "iii");
+        folio.width = 16.0;
+        assert_eq!(
+            group_single_column(vec![title, folio], 0.10, false).len(),
+            1,
+            "a roman-numeral page number stays on the entry"
+        );
+        assert!(is_roman_folio("xiv."));
+        assert!(!is_roman_folio("order."));
+        assert!(!is_roman_folio("EN-22"));
     }
 
     #[test]
