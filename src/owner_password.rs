@@ -18,20 +18,19 @@ const PAD_BYTES: [u8; 32] = [
 
 /// Password to give lopdf so Algorithm 2 derives the right file key.
 ///
+/// `doc` is the structural load the caller already has. This reads `/O` from
+/// that document and does not parse the file again.
+///
 /// `None` means `supplied` is already that password (the user password, an
 /// empty password, or a case this recovery cannot prove).
-pub(crate) fn user_password_for_file_key(buf: &[u8], supplied: &str) -> Option<String> {
-    if supplied.is_empty() {
-        return None;
-    }
-    let doc = Document::load_mem_with_options(buf, crate::bounded_load_options()).ok()?;
-    if !doc.is_encrypted() {
+pub(crate) fn user_password_for_file_key(doc: &Document, supplied: &str) -> Option<String> {
+    if supplied.is_empty() || !doc.is_encrypted() {
         return None;
     }
     if doc.authenticate_user_password(supplied).is_ok() {
         return None;
     }
-    let recovered = recover_padded_user_password(&doc, supplied.as_bytes())?;
+    let recovered = recover_padded_user_password(doc, supplied.as_bytes())?;
     let user = strip_password_padding(&recovered);
     let user = String::from_utf8(user).ok()?;
     if user == supplied {
