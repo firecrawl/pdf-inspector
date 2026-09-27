@@ -1,5 +1,6 @@
 //! Hyperlink and AcroForm field extraction.
 
+use crate::text_utils::decode_pdf_text_string;
 use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -305,7 +306,7 @@ pub(crate) fn walk_form_fields(
         .get(b"T")
         .ok()
         .and_then(|o| o.as_str().ok())
-        .map(|s| String::from_utf8_lossy(s).to_string())
+        .map(decode_pdf_text_string)
         .unwrap_or_default();
 
     let full_name = if parent_name.is_empty() {
@@ -378,7 +379,7 @@ pub(crate) fn walk_form_fields(
             // Text or Choice field — value is a string or array of strings
             match value {
                 Object::String(s, _) => {
-                    let s = String::from_utf8_lossy(s).to_string();
+                    let s = decode_pdf_text_string(s);
                     if s.is_empty() {
                         return;
                     }
@@ -389,7 +390,7 @@ pub(crate) fn walk_form_fields(
                         .iter()
                         .filter_map(|o| {
                             if let Object::String(s, _) = o {
-                                Some(String::from_utf8_lossy(s).to_string())
+                                Some(decode_pdf_text_string(s))
                             } else {
                                 None
                             }
@@ -738,5 +739,53 @@ mod tests {
         let page_map = HashMap::new();
         let items = extract_form_fields(&doc, &page_map);
         assert_eq!(items.len(), 1);
+    }
+
+    fn utf16be(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn pdf_text(bytes: Vec<u8>) -> Object {
+        Object::String(bytes, lopdf::StringFormat::Literal)
+    }
+
+    #[test]
+    fn utf16be_and_pdf_doc_field_text_decodes() {
+        // /T and /V are PDF text strings: UTF-16BE after FE FF, otherwise
+        // PDFDocEncoding (0xA0 is the euro sign, not U+00A0).
+        let mut doc = Document::new();
+        let text_field = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => pdf_text(utf16be("Prénom")),
+            "V" => pdf_text(utf16be("Zoë")),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        });
+        let choice_field = doc.add_object(dictionary! {
+            "FT" => "Ch",
+            "T" => Object::string_literal("price"),
+            "V" => vec![pdf_text(vec![0xA0]), Object::string_literal("5")],
+            "Rect" => vec![10.into(), 50.into(), 110.into(), 70.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(text_field), Object::Reference(choice_field)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut items = extract_form_fields(&doc, &HashMap::new());
+        items.sort_by(|a, b| a.text.cmp(&b.text));
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Prénom: Zoë", "price: €, 5"]
+        );
     }
 }
