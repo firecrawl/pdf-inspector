@@ -2958,8 +2958,8 @@ fn should_use_y_sorting(items: &[TextItem]) -> bool {
 /// Which run comes first does not matter, so a right-to-left stream still
 /// sees the gutter.
 fn horizontal_gap(a: &TextItem, b: &TextItem) -> f32 {
-    let a_right = a.x + a.width;
-    let b_right = b.x + b.width;
+    let a_right = a.x + effective_width(a);
+    let b_right = b.x + effective_width(b);
     if a.x <= b.x {
         b.x - a_right
     } else {
@@ -2967,43 +2967,29 @@ fn horizontal_gap(a: &TextItem, b: &TextItem) -> f32 {
     }
 }
 
-/// A table-of-contents folio written as a roman numeral (`iii`, `xiv.`).
+/// A front-matter folio (`iii`, `xiv.`) beside a contents entry.
+///
+/// Only `i`/`v`/`x` numerals (1–39) count. A token that needs `l`, `c`,
+/// `d`, or `m` is a word that happens to be roman-shaped (`mix`) or a
+/// body-page number, and the column split must still see it.
 fn is_roman_folio(text: &str) -> bool {
     let trimmed = text.trim().trim_end_matches(['.', ')']).trim();
-    if trimmed.is_empty() || !trimmed.is_ascii() || trimmed.len() > 8 {
+    if trimmed.is_empty()
+        || !trimmed.is_ascii()
+        || trimmed.len() > 8
+        || trimmed.split_whitespace().count() != 1
+    {
         return false;
     }
-    let lower = trimmed.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = trimmed.to_ascii_lowercase().into_bytes();
+    if bytes.iter().any(|b| !matches!(b, b'i' | b'v' | b'x')) {
+        return false;
+    }
     let mut index = 0;
-    let mut thousands = 0;
-    while index < bytes.len() && bytes[index] == b'm' && thousands < 4 {
+    let mut tens = 0;
+    while index < bytes.len() && bytes[index] == b'x' && tens < 3 {
         index += 1;
-        thousands += 1;
-    }
-    if index + 1 < bytes.len() && matches!(&bytes[index..index + 2], b"cm" | b"cd") {
-        index += 2;
-    } else {
-        if index < bytes.len() && bytes[index] == b'd' {
-            index += 1;
-        }
-        let mut hundreds = 0;
-        while index < bytes.len() && bytes[index] == b'c' && hundreds < 3 {
-            index += 1;
-            hundreds += 1;
-        }
-    }
-    if index + 1 < bytes.len() && matches!(&bytes[index..index + 2], b"xc" | b"xl") {
-        index += 2;
-    } else {
-        if index < bytes.len() && bytes[index] == b'l' {
-            index += 1;
-        }
-        let mut tens = 0;
-        while index < bytes.len() && bytes[index] == b'x' && tens < 3 {
-            index += 1;
-            tens += 1;
-        }
+        tens += 1;
     }
     if index + 1 < bytes.len() && matches!(&bytes[index..index + 2], b"ix" | b"iv") {
         index += 2;
@@ -3017,7 +3003,16 @@ fn is_roman_folio(text: &str) -> bool {
             ones += 1;
         }
     }
-    index == bytes.len()
+    index == bytes.len() && index > 0
+}
+
+/// The roman token is the right-hand page number of an entry, not a
+/// column word that merely shares the baseline.
+fn roman_folio_beside_entry(entry: &TextItem, entry_text: &str, folio: &TextItem) -> bool {
+    folio.x > entry.x
+        && is_roman_folio(&folio.text)
+        && !is_roman_folio(entry_text)
+        && entry_text.chars().any(|c| c.is_alphabetic())
 }
 
 /// Group items from a single column into lines
@@ -3148,10 +3143,12 @@ fn group_single_column(
                     // right-aligned tag beside a title sit a column-width
                     // void apart. Table header cells on this scale are
                     // closer than 8em and 100pt. Digit page numbers never
-                    // reach this branch; a roman folio (`iii`) must not
-                    // split off its entry either.
+                    // reach this branch. A front-matter folio stays only
+                    // when it is the right-hand numeral of this entry.
+                    let folio_on_entry = roman_folio_beside_entry(last_item, &line_text, &item)
+                        || roman_folio_beside_entry(&item, item.text.trim(), last_item);
                     if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0)
-                        && !is_roman_folio(&item.text)
+                        && !folio_on_entry
                     {
                         return false;
                     }
@@ -3742,6 +3739,41 @@ mod tests {
         assert!(is_roman_folio("xiv."));
         assert!(!is_roman_folio("order."));
         assert!(!is_roman_folio("EN-22"));
+        assert!(!is_roman_folio("mix"));
+    }
+
+    #[test]
+    fn roman_shaped_word_still_splits_across_a_column_void() {
+        // "mix" is a roman numeral (1009) but not a front-matter folio.
+        let mut left = make_item(1, 42.0, 569.0, "checksum.");
+        left.font_size = 10.0;
+        left.width = 50.0;
+        let mut right = make_item(1, 318.0, 569.0, "mix");
+        right.font_size = 10.0;
+        right.width = 18.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            2,
+            "a roman-shaped column word is not a page number"
+        );
+    }
+
+    #[test]
+    fn negative_width_does_not_invent_a_column_gap() {
+        // A backwards measured width must not push the right edge left of
+        // the glyph. Half an em per character puts these runs 14pt apart;
+        // the raw negative width invents a 160pt void and would split them.
+        let mut left = make_item(1, 40.0, 700.0, "Staff notes");
+        left.font_size = 12.0;
+        left.width = -80.0;
+        let mut right = make_item(1, 120.0, 700.0, "they had no plans");
+        right.font_size = 12.0;
+        right.width = 90.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            1,
+            "a zero or negative width is not a wide gutter"
+        );
     }
 
     #[test]
