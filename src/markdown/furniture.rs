@@ -352,42 +352,45 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     // page margin.
     const EDGE_LINE_COUNT: usize = 5;
 
-    /// Rows whose baselines sit within the same tolerance `is_y_at_edge`
-    /// uses to match a line. Two-column text often places the columns a
-    /// fraction of a point apart; counting those as separate rows makes a
-    /// short page look tall enough for a full margin zone.
-    fn distinct_rows(ys: &[f32]) -> usize {
-        let mut count = 0usize;
-        let mut last = 0.0f32;
+    /// One representative baseline per row. Column mates within 0.1pt share
+    /// a row; that is the same tolerance the edge match uses.
+    fn cluster_rows(ys: &[f32]) -> Vec<f32> {
+        let mut rows = Vec::new();
         for &y in ys {
-            if count == 0 || y - last >= 0.1 {
-                count += 1;
-                last = y;
+            match rows.last() {
+                Some(&last) if y - last < 0.1 => {}
+                _ => rows.push(y),
             }
         }
-        count
+        rows
     }
 
-    /// Returns true if the given Y position is among the first or last N distinct
-    /// Y positions on the specified page.
-    fn is_y_at_edge(y: f32, page: u32, page_sorted_ys: &HashMap<u32, Vec<f32>>, n: usize) -> bool {
-        let ys = match page_sorted_ys.get(&page) {
-            Some(ys) => ys,
+    let page_rows: HashMap<u32, Vec<f32>> = page_sorted_ys
+        .iter()
+        .map(|(&page, ys)| (page, cluster_rows(ys)))
+        .collect();
+
+    /// Returns true if the given Y position is among the first or last N
+    /// clustered rows on the specified page. `page_rows` is computed once.
+    fn is_y_at_edge(y: f32, page: u32, page_rows: &HashMap<u32, Vec<f32>>, n: usize) -> bool {
+        let rows = match page_rows.get(&page) {
+            Some(rows) => rows,
             None => return false,
         };
-        // A margin needs an interior. When the two N-row zones would meet,
-        // every line is "at the edge" and repeated body text (a large-print
-        // page that carries the previous page's sentences) is stripped.
-        let rows = distinct_rows(ys);
-        if rows <= n * 2 {
+        let count = rows.len();
+        // One or two rows have no interior, so they are not a margin.
+        if count <= 2 {
             return false;
         }
-        // Check if this Y is among the first or last N
-        let pos = match ys.iter().position(|&py| (py - y).abs() < 0.1) {
+        // On a short page the full N-row zones meet and would mark the body
+        // as furniture. Keep only the outermost row, which is still enough
+        // for a running header or footer. Tall pages keep the N-row zone.
+        let edge = if count <= n * 2 { 1 } else { n };
+        let pos = match rows.iter().position(|&py| (py - y).abs() < 0.1) {
             Some(p) => p,
             None => return false,
         };
-        pos < n || pos >= ys.len() - n
+        pos < edge || pos + edge >= count
     }
 
     // Average page span for normalizing Y variance
@@ -432,7 +435,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     let mut freq: HashMap<String, HashSet<u32>> = HashMap::new();
     let mut y_positions: HashMap<String, Vec<f32>> = HashMap::new();
     for line in &lines {
-        if !is_y_at_edge(line.y, line.page, &page_sorted_ys, EDGE_LINE_COUNT) {
+        if !is_y_at_edge(line.y, line.page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
         let text = line.text();
@@ -462,7 +465,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue; // single-line bands are already in the individual map
         }
         let band_y = lines[indices[0]].y;
-        if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
+        if !is_y_at_edge(band_y, page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
         let (_, coalesced, normalized) = coalesced_band(&lines, indices);
@@ -536,7 +539,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     // Track which page first shows each candidate (to preserve first occurrence)
     let mut first_page_individual: HashMap<String, u32> = HashMap::new();
     for (idx, line) in lines.iter().enumerate() {
-        if !is_y_at_edge(line.y, line.page, &page_sorted_ys, EDGE_LINE_COUNT) {
+        if !is_y_at_edge(line.y, line.page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
         let text = line.text();
@@ -567,7 +570,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue;
         }
         let band_y = lines[indices[0]].y;
-        if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
+        if !is_y_at_edge(band_y, page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
         let (_, _, normalized) = coalesced_band(&lines, indices);
@@ -584,7 +587,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue;
         }
         let band_y = lines[indices[0]].y;
-        if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
+        if !is_y_at_edge(band_y, page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
         let (sorted_indices, coalesced, normalized) = coalesced_band(&lines, indices);
@@ -609,7 +612,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue;
         }
         let band_y = lines[indices[0]].y;
-        if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
+        if !is_y_at_edge(band_y, page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
         if indices.iter().any(|idx| removal_set.contains(idx)) {
@@ -1374,10 +1377,56 @@ mod tests {
             }
         }
         let result = strip_repeated_lines(lines, 6);
+        // The outermost rows can still be a header and a footer. The
+        // interior of the passage must stay on every page that carries it.
         assert_eq!(
             result.iter().filter(|l| l.page == 2).count(),
-            story.len(),
-            "short-page body that repeats on other pages must stay"
+            story.len() - 2,
+            "short-page body must keep its interior rows"
+        );
+        assert!(
+            result.iter().any(|l| l.page == 2 && l.text().contains("next sentence")),
+            "an interior sentence must survive on the repeated page"
+        );
+    }
+
+    #[test]
+    fn short_page_still_strips_an_outer_running_header() {
+        // Eight body rows plus one header is still inside the short-page
+        // zone. Only the outermost row is furniture, so the header drops
+        // and the body stays.
+        let mut lines = Vec::new();
+        for page in 1..=6u32 {
+            lines.push(make_line(
+                "Chapter notes running header text",
+                10.0,
+                page,
+                760.0,
+                None,
+            ));
+            for row in 0..8u32 {
+                lines.push(make_line(
+                    &format!("unique short page {page} body sentence number {row}"),
+                    10.0,
+                    page,
+                    700.0 - row as f32 * 40.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 6);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("Chapter notes"))
+                .count(),
+            1,
+            "the outer header on a short page must still strip"
+        );
+        assert_eq!(
+            result.iter().filter(|l| l.page == 2).count(),
+            8,
+            "the short page body must stay"
         );
     }
 
@@ -1431,8 +1480,14 @@ mod tests {
                 .iter()
                 .filter(|l| l.page == 2 && l.text().contains("column story"))
                 .count(),
-            12,
-            "a short two-column page must not lose repeated body rows"
+            8,
+            "interior rows of a short two-column page must stay"
+        );
+        assert!(
+            result.iter().any(|l| {
+                l.page == 2 && l.text().contains("left column story sentence number 1")
+            }),
+            "a column mate 0.05pt off the row must stay with that row"
         );
     }
 
