@@ -1,0 +1,28 @@
+src/extractor/fonts.rs
+  s_95e92f530fa61a::t_b84850585712d6 3097,3150
+  s_95e92f530fa61a::t_1e341b459f7882 3016-3020,3028,3035-3051,3053-3087
+  s_95e92f530fa61a::t_88ef88a0572db3 108-110
+  s_95e92f530fa61a::t_12cefe81a1a647 3098-3108,3117,3135-3137,3141-3142,3145-3149
+tests/integration_tests.rs
+  s_95e92f530fa61a::t_688a80130d0aea 10390,10392-10402,10404-10405,10407,10423,10434-10435,10437
+  s_95e92f530fa61a::t_52ffab4500e293 10074-10389,10391,10403,10406,10408-10422,10424,10426,10436,10438-10452,10454
+  s_95e92f530fa61a::t_8b118d27f7effe 10425,10427-10433,10453
+CHANGELOG.md
+  s_95e92f530fa61a::t_e037e793339ae5 10-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "45e06555732b68aeff4f4d9342c80d58c9ef1fef",
+  "prompts": {},
+  "sessions": {
+    "s_95e92f530fa61a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "830949b2-a19e-4ced-a006-7e1d540b2639",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
