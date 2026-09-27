@@ -3006,11 +3006,20 @@ fn is_roman_folio(text: &str) -> bool {
     index == bytes.len() && index > 0
 }
 
-/// A wrapped column leftover ends the sentence (`checksum.`). A contents
-/// entry (`Preface`) does not, so a folio beside it stays on the line
-/// even when the gap is only a little over 100pt.
-fn is_wrapped_fragment(text: &str) -> bool {
-    text.trim().ends_with(['.', '?', '!'])
+/// A wrapped column leftover is a short token that ends a sentence
+/// (`checksum.`). A contents title may end in `?` or `!` (`Why?`), and a
+/// bold heading keeps its folio even when the title ends with a period.
+fn is_wrapped_fragment(entry: &TextItem, entry_text: &str) -> bool {
+    if entry.is_bold {
+        return false;
+    }
+    let trimmed = entry_text.trim();
+    if trimmed.ends_with(['?', '!']) {
+        return false;
+    }
+    trimmed.ends_with('.')
+        && !trimmed.ends_with("...")
+        && trimmed.split_whitespace().count() <= 3
 }
 
 /// The roman token is the right-hand page number of an entry. A sentence
@@ -3020,7 +3029,7 @@ fn roman_folio_beside_entry(entry: &TextItem, entry_text: &str, folio: &TextItem
         && is_roman_folio(&folio.text)
         && !is_roman_folio(entry_text)
         && entry_text.chars().any(|c| c.is_alphabetic())
-        && !is_wrapped_fragment(entry_text)
+        && !is_wrapped_fragment(entry, entry_text)
 }
 
 /// Group items from a single column into lines
@@ -3780,6 +3789,20 @@ mod tests {
             group_single_column(vec![title, folio], 0.10, false).len(),
             1,
             "a folio within 300pt stays on the entry"
+        );
+    }
+
+    #[test]
+    fn punctuated_contents_title_keeps_its_folio() {
+        // "Why?" is a contents title, not a wrapped sentence fragment.
+        let mut title = make_item(1, 72.0, 700.0, "Why?");
+        title.width = 36.0;
+        let mut folio = make_item(1, 250.0, 700.0, "iii");
+        folio.width = 16.0;
+        assert_eq!(
+            group_single_column(vec![title, folio], 0.10, false).len(),
+            1,
+            "a title that ends in ? keeps its page number"
         );
     }
 
