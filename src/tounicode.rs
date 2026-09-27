@@ -2265,21 +2265,22 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
             BcmapRecord::BfRange { start, end, dst } => {
                 let start_code = start as u16;
                 let end_code = end as u16;
-                if let Some(s) = bytes_to_unicode_string(&dst) {
-                    if s.chars().count() == 1 {
-                        let base = s.chars().next().unwrap() as u32;
-                        cmap.ranges.push((start_code, end_code, base));
-                    } else {
-                        // Expand multi-char sequences
-                        let mut cid = start_code;
-                        for ch in s.chars() {
-                            cmap.char_map.insert(cid, ch.to_string());
-                            if cid == end_code {
-                                break;
-                            }
-                            cid = cid.saturating_add(1);
-                        }
+                // One UTF-16 unit: consecutive code points, kept as a range.
+                if let [high, low] = dst[..] {
+                    if let Some(ch) = char::from_u32(u16::from_be_bytes([high, low]) as u32) {
+                        cmap.ranges.push((start_code, end_code, ch as u32));
                     }
+                    continue;
+                }
+                // Anything longer — a surrogate pair, or several characters —
+                // maps every code to the whole destination, its last byte
+                // incremented per code, as pdf.js's `mapBfRange` does.
+                let mut dst = dst;
+                for code in start_code..=end_code {
+                    if let Some(s) = bytes_to_unicode_string(&dst) {
+                        cmap.char_map.insert(code, s);
+                    }
+                    inc_hex(&mut dst);
                 }
             }
             // CID mappings and code space ranges say nothing about Unicode.
@@ -2304,6 +2305,9 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
 enum BcmapRecord {
     /// A `codespacerange` of codes `size` bytes long.
     CodespaceRange { size: usize },
+    /// A `notdefrange` of codes `size` bytes long. Its codes and CID say
+    /// nothing either reader uses; its size counts toward the code length.
+    NotdefRange { size: usize },
     /// A `cidchar`: one code to one CID.
     CidChar { size: usize, code: u32, cid: u32 },
     /// A `cidrange`: `start..=end` to consecutive CIDs from `cid`.
@@ -2378,22 +2382,24 @@ fn decode_binary_cmap(data: &[u8]) -> Result<DecodedBcmap, String> {
                 let mut start = stream.read_hex(data_size)?;
                 let mut end = stream.read_hex_number(data_size)?;
                 add_hex(&mut end, &start);
-                if typ == 1 {
+                records.push(if typ == 1 {
                     stream.read_number()?;
+                    BcmapRecord::NotdefRange { size }
                 } else {
-                    records.push(BcmapRecord::CodespaceRange { size });
-                }
+                    BcmapRecord::CodespaceRange { size }
+                });
                 for _ in 1..subitems {
                     inc_hex(&mut end);
                     start = stream.read_hex_number(data_size)?;
                     add_hex(&mut start, &end);
                     end = stream.read_hex_number(data_size)?;
                     add_hex(&mut end, &start);
-                    if typ == 1 {
+                    records.push(if typ == 1 {
                         stream.read_number()?;
+                        BcmapRecord::NotdefRange { size }
                     } else {
-                        records.push(BcmapRecord::CodespaceRange { size });
-                    }
+                        BcmapRecord::CodespaceRange { size }
+                    });
                 }
             }
             // cidchar
@@ -2651,13 +2657,15 @@ fn bytes_to_unicode_string(bytes: &[u8]) -> Option<String> {
         // Treat as latin-1 bytes
         return Some(bytes.iter().map(|&b| b as char).collect());
     }
-    let mut out = String::new();
-    for chunk in bytes.as_chunks::<2>().0 {
-        let cp = u16::from_be_bytes(*chunk) as u32;
-        if let Some(ch) = char::from_u32(cp) {
-            out.push(ch);
-        }
-    }
+    // UTF-16BE, surrogate pairs included: a character outside the BMP is two
+    // units, and neither is a character on its own. An unpaired surrogate is
+    // dropped, as a lone unit always was.
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_be_bytes(*chunk));
+    let out: String = char::decode_utf16(units).filter_map(Result::ok).collect();
     if out.is_empty() {
         None
     } else {
@@ -2983,7 +2991,7 @@ fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
 
     for record in decoded.records {
         match record {
-            BcmapRecord::CodespaceRange { size } => {
+            BcmapRecord::CodespaceRange { size } | BcmapRecord::NotdefRange { size } => {
                 max_code_size = max_code_size.max(size as u8);
             }
             BcmapRecord::CidChar { size, code, cid } => {
@@ -3750,7 +3758,7 @@ mod tests {
                 BcmapRecord::BfChar { .. } | BcmapRecord::CidChar { .. } => 1,
                 BcmapRecord::BfRange { start, end, .. }
                 | BcmapRecord::CidRange { start, end, .. } => (end - start + 1) as usize,
-                BcmapRecord::CodespaceRange { .. } => 0,
+                BcmapRecord::CodespaceRange { .. } | BcmapRecord::NotdefRange { .. } => 0,
             })
             .sum()
     }
@@ -3767,6 +3775,50 @@ mod tests {
             ("Adobe-Korea1-UCS2", 18076),
         ] {
             assert_eq!(decoded_mapping_count(name), mappings, "{name}");
+        }
+    }
+
+    #[test]
+    fn ucs2_cmaps_read_characters_outside_the_bmp() {
+        // Destinations outside the BMP are UTF-16 surrogate pairs. Read one
+        // unit at a time, neither half is a character, and every such CID
+        // mapped to nothing: 384 in Adobe-Japan1, 1,695 in Adobe-CNS1.
+        let japan1 = build_cmap_from_builtin_cmap("Japan1").unwrap();
+        // A bfchar: CID 7641 is U+28CDD.
+        assert_eq!(japan1.lookup(7641).as_deref(), Some("\u{28CDD}"));
+        // A bfrange: every code maps to the whole pair, its last byte
+        // incremented per code, as pdf.js's mapBfRange does.
+        assert_eq!(japan1.lookup(17671).as_deref(), Some("\u{22B4F}"));
+        assert_eq!(japan1.lookup(17672).as_deref(), Some("\u{22B50}"));
+    }
+
+    #[test]
+    fn every_ucs2_mapping_resolves() {
+        // Each code a UCS2 bcmap maps must read back as text, except a
+        // destination that is a control character, which is a miss by design.
+        for ordering in ["Japan1", "GB1", "CNS1", "Korea1"] {
+            let data = read_builtin_cmap_file(&format!("Adobe-{ordering}-UCS2.bcmap")).unwrap();
+            let cmap = parse_binary_cmap(&data).unwrap();
+            let mut unresolved = Vec::new();
+            for record in decode_binary_cmap(&data).unwrap().records {
+                let (start, end, dst) = match record {
+                    BcmapRecord::BfChar { code, dst } => (code, code, dst),
+                    BcmapRecord::BfRange { start, end, dst } => (start, end, dst),
+                    _ => continue,
+                };
+                let control = dst.len() == 2 && dst[0] == 0 && dst[1] < 0x20;
+                for code in start..=end {
+                    if !control && cmap.lookup(code as u16).is_none() {
+                        unresolved.push(code);
+                    }
+                }
+            }
+            assert!(
+                unresolved.is_empty(),
+                "{ordering}: {} codes unresolved, e.g. {:?}",
+                unresolved.len(),
+                &unresolved[..unresolved.len().min(5)]
+            );
         }
     }
 
