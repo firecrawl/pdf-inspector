@@ -10012,7 +10012,7 @@ fn text_items_report_their_fill_colour_and_render_mode() {
 }
 
 #[test]
-fn markdown_keeps_invisible_and_quoted_text_as_the_extraction_reads_it() {
+fn markdown_omits_invisible_text_and_keeps_quoted_text() {
     let result = process_pdf_mem(&synthetic_paint_and_info_pdf()).unwrap();
     let markdown = result.markdown.unwrap();
     for text in [

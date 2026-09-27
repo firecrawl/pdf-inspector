@@ -843,9 +843,13 @@ pub(crate) fn extract_page_text_items_with_options(
                 }
             }
             "Tr" => {
-                // Set text rendering mode (3 = invisible / OCR overlay)
+                // Set text rendering mode. A mode outside the integers
+                // 0..=7 is ignored, as a viewer ignores it. Mode 3 is
+                // invisible text.
                 if let Some(mode) = op.operands.first().and_then(get_number) {
-                    text_rendering_mode = mode as i32;
+                    if mode.fract() == 0.0 && (0.0..=7.0).contains(&mode) {
+                        text_rendering_mode = mode as i32;
+                    }
                 }
             }
             "Tc" => {
@@ -2214,74 +2218,83 @@ pub(crate) fn extract_page_text_items_with_options(
                             );
                             actual_text_bounds.apply_to(&mut geometry);
                             if !at.trim().is_empty() {
-                                rotation_votes.cast_direction(reading_direction(
-                                    &combined,
-                                    paint_size * paint_scale,
-                                ));
-                                let base_font = font_base_names
-                                    .get(&current_font)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or(&current_font);
-                                let style =
-                                    font_styles.get(&current_font).copied().unwrap_or_default();
-                                logical_text_items.push(items.len());
-                                // The span's own glyphs were left out as they
-                                // were painted; the paint that made them
-                                // heavier is read now, from the paint state
-                                // its first glyph was shown with, for the font
-                                // that painted them and only when some glyph
-                                // was painted. The replacement is the text the
-                                // item carries, so it stands in for the glyphs
-                                // in the check for alphanumeric content; a
-                                // symbol face is ruled out by the painting
-                                // font's name.
-                                let paint_base_font = font_base_names
-                                    .get(&paint_font)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or(&paint_font);
-                                let painted_bold = actual_text_glyph_count > 0
-                                    && paintable_fonts.contains(&paint_font)
-                                    && glyph_paint.adds_bold(
-                                        &at,
-                                        rendered_size,
-                                        paint_base_font,
-                                        &ctm,
-                                    );
-                                items.push(TextItem {
-                                    text: expand_ligatures(&at),
-                                    x: geometry.x,
-                                    y: geometry.y,
-                                    width: geometry.width,
-                                    height: geometry.height,
-                                    font: crate::extractor::fonts::item_font_name(
-                                        &current_font,
-                                        base_font,
-                                    )
-                                    .to_string(),
-                                    font_tag: current_font.clone(),
-                                    legacy_symbol_rewrite: false,
-                                    font_size: rendered_size,
-                                    page: page_num,
-                                    is_bold: style.bold || painted_bold,
-                                    is_italic: style.italic,
-                                    font_weight: style.weight,
-                                    bold_source: style
-                                        .bold_source
-                                        .or(painted_bold.then_some(BoldSource::Painted)),
-                                    fixed_pitch: style.fixed_pitch,
-                                    fill_color: paint.fill_color,
-                                    stroke_color: paint.stroke_color,
-                                    render_mode: Some(paint.render_mode),
-                                    is_underline: false,
-                                    is_strikeout: false,
-                                    rotation: geometry.rotation,
-                                    advance_known: geometry.advance_known,
-                                    item_type: ItemType::Text,
-                                    mcid: entry
-                                        .mcid
-                                        .or_else(|| current_mcid(&marked_content_stack)),
-                                    baseline_shift: 0.0,
-                                });
+                                // The replacement stands in for glyphs shown
+                                // under the span's render mode. Mode 3 hides
+                                // it the same way it hides a normal run, and
+                                // the skip is reported so the invisible-text
+                                // retry can recover the span.
+                                if paint.render_mode == 3 && !include_invisible {
+                                    skipped_invisible = true;
+                                } else {
+                                    rotation_votes.cast_direction(reading_direction(
+                                        &combined,
+                                        paint_size * paint_scale,
+                                    ));
+                                    let base_font = font_base_names
+                                        .get(&current_font)
+                                        .map(|s| s.as_str())
+                                        .unwrap_or(&current_font);
+                                    let style =
+                                        font_styles.get(&current_font).copied().unwrap_or_default();
+                                    logical_text_items.push(items.len());
+                                    // The span's own glyphs were left out as they
+                                    // were painted; the paint that made them
+                                    // heavier is read now, from the paint state
+                                    // its first glyph was shown with, for the font
+                                    // that painted them and only when some glyph
+                                    // was painted. The replacement is the text the
+                                    // item carries, so it stands in for the glyphs
+                                    // in the check for alphanumeric content; a
+                                    // symbol face is ruled out by the painting
+                                    // font's name.
+                                    let paint_base_font = font_base_names
+                                        .get(&paint_font)
+                                        .map(|s| s.as_str())
+                                        .unwrap_or(&paint_font);
+                                    let painted_bold = actual_text_glyph_count > 0
+                                        && paintable_fonts.contains(&paint_font)
+                                        && glyph_paint.adds_bold(
+                                            &at,
+                                            rendered_size,
+                                            paint_base_font,
+                                            &ctm,
+                                        );
+                                    items.push(TextItem {
+                                        text: expand_ligatures(&at),
+                                        x: geometry.x,
+                                        y: geometry.y,
+                                        width: geometry.width,
+                                        height: geometry.height,
+                                        font: crate::extractor::fonts::item_font_name(
+                                            &current_font,
+                                            base_font,
+                                        )
+                                        .to_string(),
+                                        font_tag: current_font.clone(),
+                                        legacy_symbol_rewrite: false,
+                                        font_size: rendered_size,
+                                        page: page_num,
+                                        is_bold: style.bold || painted_bold,
+                                        is_italic: style.italic,
+                                        font_weight: style.weight,
+                                        bold_source: style
+                                            .bold_source
+                                            .or(painted_bold.then_some(BoldSource::Painted)),
+                                        fixed_pitch: style.fixed_pitch,
+                                        fill_color: paint.fill_color,
+                                        stroke_color: paint.stroke_color,
+                                        render_mode: Some(paint.render_mode),
+                                        is_underline: false,
+                                        is_strikeout: false,
+                                        rotation: geometry.rotation,
+                                        advance_known: geometry.advance_known,
+                                        item_type: ItemType::Text,
+                                        mcid: entry
+                                            .mcid
+                                            .or_else(|| current_mcid(&marked_content_stack)),
+                                        baseline_shift: 0.0,
+                                    });
+                                }
                             }
                         }
                         suppress_glyph_extraction =
@@ -3746,6 +3759,80 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             extract(true),
             (
                 owned(&[("Shown", 0), ("Hidden", 3), ("Carried", 3), ("Again", 0)]),
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn out_of_range_render_mode_leaves_the_mode_in_force() {
+        let shown = extract_simple_items(
+            b"BT /F1 12 Tf 72 700 Td (Shown) Tj ET
+              8 Tr BT /F1 12 Tf 72 680 Td (After eight) Tj ET
+              3.5 Tr BT /F1 12 Tf 72 660 Td (After fraction) Tj ET
+              2.0 Tr BT /F1 12 Tf 72 640 Td (Stroke) Tj ET",
+        );
+        assert_eq!(
+            shown
+                .iter()
+                .map(|item| (item.text.as_str(), item.render_mode))
+                .collect::<Vec<_>>(),
+            [
+                ("Shown", Some(0)),
+                ("After eight", Some(0)),
+                ("After fraction", Some(0)),
+                ("Stroke", Some(2)),
+            ]
+        );
+        let hidden = extract_simple_items(
+            b"3 Tr BT /F1 12 Tf 72 700 Td (Hidden) Tj ET
+              8 Tr BT /F1 12 Tf 72 680 Td (Still hidden) Tj ET
+              -1 Tr BT /F1 12 Tf 72 660 Td (Still hidden too) Tj ET
+              0 Tr BT /F1 12 Tf 72 640 Td (Shown) Tj ET",
+        );
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Shown"]
+        );
+    }
+
+    #[test]
+    fn inherited_invisible_mode_omits_the_actual_text_replacement() {
+        use crate::tounicode::FontCMaps;
+
+        let content = b"3 Tr
+              BT /F1 12 Tf 72 700 Td /Span << /ActualText (Secret) >> BDC (xxxx) Tj EMC ET
+              0 Tr BT /F1 12 Tf 72 680 Td /Span << /ActualText (Shown) >> BDC (yyyy) Tj EMC ET";
+        let (doc, page_id) = simple_doc_with_content(content);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let extract = |include_invisible: bool| {
+            let ((items, _, _), _, _, skipped_invisible) = extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &font_cmaps,
+                include_invisible,
+                &mut FontStyleCache::new(),
+                &mut FormWalkBudget::new(),
+            )
+            .unwrap();
+            let modes: Vec<(String, Option<u8>)> = items
+                .into_iter()
+                .map(|item| (item.text, item.render_mode))
+                .collect();
+            (modes, skipped_invisible)
+        };
+        assert_eq!(extract(false), (vec![("Shown".to_string(), Some(0))], true));
+        assert_eq!(
+            extract(true),
+            (
+                vec![
+                    ("Secret".to_string(), Some(3)),
+                    ("Shown".to_string(), Some(0))
+                ],
                 false
             )
         );
